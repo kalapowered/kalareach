@@ -434,9 +434,58 @@ fn an_entry_that_inflates_beyond_what_it_says_writes_no_more_than_it_says() {
         .max()
         .unwrap_or(0);
     assert!(
+        outcome.is_err(),
+        "an entry that lies about its size is refused"
+    );
+    assert!(
         largest <= 4,
         "no file is larger than its entry says: {largest} bytes, and the reading said {outcome:?}"
     );
+}
+
+/// KR-REQ-26.06: a name the rules would keep every prefix of is refused by its length and its depth
+/// before the rules see it, and an archive whose directory takes more bytes than a release's does
+/// is refused before the directory is read: one long name must not take memory that grows with the
+/// square of its parts, and nothing is written for any of them.
+#[test]
+fn a_name_too_long_or_too_deep_and_a_directory_too_large_are_refused_before_they_are_kept() {
+    let deep = vec!["a"; 40].join("/");
+    let long = "b".repeat(2000);
+    for (name, members, limits) in [
+        (
+            "a name of 65,535 bytes",
+            vec![Member::directory(format!("{TOP}/{}", "x/".repeat(32_000)))],
+            Limits::DEFAULT,
+        ),
+        (
+            "a name beyond the bytes",
+            vec![Member::stored(format!("{TOP}/{long}"), b"x")],
+            Limits::DEFAULT,
+        ),
+        (
+            "a name beyond the depth",
+            vec![Member::stored(format!("{TOP}/{deep}"), b"x")],
+            Limits::DEFAULT,
+        ),
+        (
+            "a directory beyond the bytes",
+            vec![
+                Member::stored(format!("{TOP}/one.bin"), b"x"),
+                Member::stored(format!("{TOP}/two.bin"), b"x"),
+            ],
+            Limits {
+                directory_bytes: 100,
+                ..Limits::DEFAULT
+            },
+        ),
+    ] {
+        let case = Case::new();
+        assert!(
+            case.read(&archive_of(&members), &limits).is_err(),
+            "{name} is refused"
+        );
+        assert!(case.staged().is_empty(), "{name}: nothing was written");
+    }
 }
 
 /// Nothing is written outside the staging directory by an archive that names a place beyond it.

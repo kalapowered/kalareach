@@ -34,6 +34,13 @@ pub struct Limits {
     pub total_bytes: u64,
     /// The most bytes one file holds, as its entry says.
     pub entry_bytes: u64,
+    /// The most bytes the archive's directory of entries takes, which is read whole before any
+    /// entry is looked at.
+    pub directory_bytes: u64,
+    /// The longest an entry's name may be, in bytes.
+    pub name_bytes: usize,
+    /// The most parts an entry's name may have.
+    pub depth: usize,
 }
 
 impl Limits {
@@ -43,6 +50,9 @@ impl Limits {
         entries: 50_000,
         total_bytes: 8 * 1024 * 1024 * 1024,
         entry_bytes: 2 * 1024 * 1024 * 1024,
+        directory_bytes: 64 * 1024 * 1024,
+        name_bytes: 1024,
+        depth: 32,
     };
 }
 
@@ -55,7 +65,7 @@ struct Planned {
 }
 
 /// Why a name breaks a rule, said without repeating the name, which came from the archive.
-const fn reason_of(fault: &PathFault) -> &'static str {
+pub(super) const fn reason_of(fault: &PathFault) -> &'static str {
     match fault {
         PathFault::Component { fault, .. } => match fault {
             NameFault::Empty => "has an entry that is an absolute path or has an empty part",
@@ -95,24 +105,30 @@ pub fn unpack(
     if !file.metadata().is_ok_and(|about| about.is_file()) {
         return Err(unreadable("is not a regular file"));
     }
-    let declared = file
+    // What the archive's directory says of itself is judged before it is parsed, since the parser
+    // reads all of it into memory.
+    let Some(declared) = file
         .try_clone()
-        .and_then(|mut copy| declared_entries(&mut copy))
-        .map_err(|_| unreadable("is not a zip archive this host reads"))?;
-    let mut zipped = ZipArchive::new(std::io::BufReader::new(file))
-        .map_err(|_| unreadable("is not a zip archive this host reads"))?;
-    if zipped.is_empty() {
+        .and_then(|mut copy| declared_directory(&mut copy))
+        .map_err(|_| unreadable("is not a zip archive this host reads"))?
+    else {
+        return Err(unreadable("is not a zip archive this host reads"));
+    };
+    if declared.entries == 0 {
         return Err(unreadable("is empty"));
     }
+    if declared.entries > limits.entries as u64 {
+        return Err(unreadable("holds more entries than a release does"));
+    }
+    if declared.bytes > limits.directory_bytes {
+        return Err(unreadable("has a directory larger than any a release has"));
+    }
+    let mut zipped = ZipArchive::new(std::io::BufReader::new(file))
+        .map_err(|_| unreadable("is not a zip archive this host reads"))?;
     // The reader keeps one entry for each name, the last of two that share one, so an archive that
     // names a file twice shows fewer entries than its directory declares.
-    if declared != Some(zipped.len() as u64) {
-        return Err(unreadable(
-            "has the same name twice, or a directory that does not say how many entries it has",
-        ));
-    }
-    if zipped.len() > limits.entries {
-        return Err(unreadable("holds more entries than a release does"));
+    if zipped.len() as u64 != declared.entries {
+        return Err(unreadable("has the same name twice"));
     }
 
     // The first look: every entry is judged before anything is written.
@@ -151,6 +167,17 @@ pub fn unpack(
         let name = member.name();
         let directory = name.ends_with('/');
         let name = name.strip_suffix('/').unwrap_or(name);
+        // Before the rules, which keep every prefix of the name.
+        if name.len() > limits.name_bytes {
+            return Err(unreadable(
+                "has an entry name longer than any a release has",
+            ));
+        }
+        if name.split('/').count() > limits.depth {
+            return Err(unreadable(
+                "has an entry nested deeper than any a release is",
+            ));
+        }
         rules
             .admit(name, directory)
             .map_err(|fault| unreadable(reason_of(&fault)))?;
@@ -224,10 +251,18 @@ pub fn unpack(
     Ok((directory, written))
 }
 
-/// The number of entries an archive's end-of-central-directory record declares, read from the tail
-/// of the file: the last record whose comment ends the file, with the 64-bit record that follows its
-/// locator where the count does not fit in 16 bits. `None` where there is no such record.
-fn declared_entries(file: &mut std::fs::File) -> std::io::Result<Option<u64>> {
+/// What an archive's end-of-central-directory record declares of its directory of entries.
+struct Declared {
+    /// How many entries the directory holds.
+    entries: u64,
+    /// How many bytes the directory takes.
+    bytes: u64,
+}
+
+/// Reads what an archive declares of its directory from the tail of the file: the last end record
+/// whose comment ends the file, and the 64-bit record its locator points at where a count or a size
+/// does not fit the end record. `None` where there is no such record.
+fn declared_directory(file: &mut std::fs::File) -> std::io::Result<Option<Declared>> {
     use std::io::{Read as _, Seek as _, SeekFrom};
 
     const END: [u8; 4] = [0x50, 0x4b, 0x05, 0x06];
@@ -247,14 +282,21 @@ fn declared_entries(file: &mut std::fs::File) -> std::io::Result<Option<u64>> {
         return Ok(None);
     };
     let entries = u16::from_le_bytes([tail[at + 10], tail[at + 11]]);
-    if entries != u16::MAX {
-        return Ok(Some(u64::from(entries)));
+    let bytes = u32::from_le_bytes([tail[at + 12], tail[at + 13], tail[at + 14], tail[at + 15]]);
+    if entries != u16::MAX && bytes != u32::MAX {
+        return Ok(Some(Declared {
+            entries: u64::from(entries),
+            bytes: u64::from(bytes),
+        }));
     }
     let Some(locator) = at
         .checked_sub(20)
         .filter(|&locator| tail[locator..locator + 4] == LOCATOR)
     else {
-        return Ok(Some(u64::from(entries)));
+        return Ok(Some(Declared {
+            entries: u64::from(entries),
+            bytes: u64::from(bytes),
+        }));
     };
     let mut offset = [0_u8; 8];
     offset.copy_from_slice(&tail[locator + 8..locator + 16]);
@@ -266,5 +308,10 @@ fn declared_entries(file: &mut std::fs::File) -> std::io::Result<Option<u64>> {
     }
     let mut total = [0_u8; 8];
     total.copy_from_slice(&record[32..40]);
-    Ok(Some(u64::from_le_bytes(total)))
+    let mut size = [0_u8; 8];
+    size.copy_from_slice(&record[40..48]);
+    Ok(Some(Declared {
+        entries: u64::from_le_bytes(total),
+        bytes: u64::from_le_bytes(size),
+    }))
 }

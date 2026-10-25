@@ -613,6 +613,10 @@ pub fn copy_tree(tree: &Path, staging: &Path) -> Result<(PathBuf, Written)> {
     let copy = staging.join("release");
     create_directories(staging, &copy)?;
     let mut written = Written::new();
+    // What Windows would read as another name is refused here as it is in an archive, since a tree
+    // reached through verbatim paths can hold names a copy could not keep as they are.
+    #[cfg(windows)]
+    let mut rules = kr_ipc::install::names::PathRules::new();
     let mut pending: Vec<(PathBuf, Vec<String>)> = vec![(tree.to_path_buf(), Vec::new())];
     while let Some((directory, relative)) = pending.pop() {
         let entries = std::fs::read_dir(&directory).map_err(|error| {
@@ -643,6 +647,10 @@ pub fn copy_tree(tree: &Path, staging: &Path) -> Result<(PathBuf, Written)> {
             })?;
             let mut path = relative.clone();
             path.push(name);
+            #[cfg(windows)]
+            rules
+                .admit(&path.join("/"), kind.is_dir())
+                .map_err(|fault| refused_tree(tree, super::archive::reason_of(&fault)))?;
             let destination = path.iter().fold(copy.clone(), |at, part| at.join(part));
             if kind.is_dir() {
                 create_directories(staging, &destination)?;
