@@ -732,6 +732,14 @@ pub struct HostPolicy {
     /// not written with the policy, and found again at every start and every pass. The owner at
     /// this machine clears it by revoking what the request names.
     withdrawal_unverified: bool,
+    /// True while this host waits for the person at this machine to confirm the policy it holds,
+    /// because it found that policy restored from an earlier state ([`super::restored`]).
+    ///
+    /// Unlike [`Self::behind_its_feed`] it is not lifted when the host has caught up: the feed
+    /// carries withdrawals and revisions and no policy, so the row stays the restored one, and
+    /// only the person at this machine ends the wait. It is not written with the policy: the
+    /// record of the restore is a store of its own, which a start reads.
+    restored_policy_waits: bool,
 }
 
 /// The offline cell a policy starts with, before the daemon has anchored anything: a bound that has
@@ -781,6 +789,7 @@ impl HostPolicy {
             feed_removed: false,
             behind_its_feed: false,
             withdrawal_unverified: false,
+            restored_policy_waits: false,
         }
     }
 
@@ -1244,6 +1253,7 @@ impl HostPolicy {
             feed_removed: false,
             behind_its_feed: false,
             withdrawal_unverified: false,
+            restored_policy_waits: false,
         }
     }
 
@@ -1289,6 +1299,20 @@ impl HostPolicy {
     #[must_use]
     pub const fn withdrawal_unverified(&self) -> bool {
         self.withdrawal_unverified
+    }
+
+    /// Records whether this host waits for the person at this machine to confirm the policy it
+    /// holds, which it found restored from an earlier state.
+    ///
+    /// While it does, every grant is refused for an ingress other than the owner at this machine.
+    pub const fn set_restored_policy_waits(&mut self, waits: bool) {
+        self.restored_policy_waits = waits;
+    }
+
+    /// Whether this host waits for the person at this machine to confirm the policy it holds.
+    #[must_use]
+    pub const fn restored_policy_waits(&self) -> bool {
+        self.restored_policy_waits
     }
 
     /// Chooses a bounded offline-validity policy for personal remote access.
@@ -1390,6 +1414,9 @@ impl HostPolicy {
         if request.ingress != ActorIngress::LocalIpc {
             if self.behind_its_feed {
                 return Err(Refusal::BehindItsFeed);
+            }
+            if self.restored_policy_waits {
+                return Err(Refusal::RestoredPolicyWaits);
             }
             if self.withdrawal_unverified {
                 return Err(Refusal::WithdrawalUnverified);

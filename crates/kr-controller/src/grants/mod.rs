@@ -173,6 +173,9 @@ pub enum Refusal {
     /// catching up with revocations its records do not have, and refuses every grant but the
     /// owner's at this machine until it has.
     BehindItsFeed,
+    /// This host found the policy it holds restored from an earlier state, so it refuses every
+    /// grant but the owner's at this machine until the person at this machine has confirmed it.
+    RestoredPolicyWaits,
     /// The authority feed this host reads shows complete a revocation by an owner this host does not
     /// know, so the devices it names may be live here against that owner's word, and this host
     /// refuses every grant but the owner's at this machine until that owner has dealt with them.
@@ -272,6 +275,12 @@ impl Refusal {
             Self::BehindItsFeed => {
                 "this host is catching up with its authority feed, which holds revocations its own \
                  records do not, so it refuses remote access until it has"
+                    .to_owned()
+            }
+            Self::RestoredPolicyWaits => {
+                "this host found the policy it holds restored from an earlier state, so it refuses \
+                 remote access until the person at this machine has confirmed it with `kr host \
+                 policy --confirm`"
                     .to_owned()
             }
             Self::WithdrawalUnverified => {
