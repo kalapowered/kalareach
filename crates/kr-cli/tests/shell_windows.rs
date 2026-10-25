@@ -102,9 +102,41 @@ fn fingerprint(path: &Path) -> String {
     }
 }
 
-/// One case at a time writes the account's profiles: they are the account's, and a second case that
-/// saved them while the first had written would put the first's entries back.
-static PROFILE_WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Held by the case that is running.
+static CASE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A case's turn: one case at a time runs in this process, from before it places anything until it
+/// has put everything back.
+///
+/// The profiles are the account's, and a second case that saved them while the first had written
+/// would put the first's entries back. The programs a case places beside this test's executable are
+/// the ones the daemon this process hosts finds, so a second case that started its daemon while they
+/// were there would run the first case's forwarder.
+struct Turn(std::sync::MutexGuard<'static, ()>);
+
+impl Turn {
+    /// Waits for the case that has the turn.
+    fn take() -> Self {
+        Self(
+            CASE.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+}
+
+/// The turn, and then the tree a case starts its daemon on with the programs its worker needs placed
+/// in it, so that nothing is placed before the case has its turn.
+fn take_a_turn() -> (Turn, Prepared) {
+    let turn = Turn::take();
+    (turn, Prepared::new())
+}
+
+/// As [`take_a_turn`], with the worker and the forwarder beside this test's executable instead of
+/// in the tree.
+fn take_a_turn_beside_the_test() -> (Turn, Prepared) {
+    let turn = Turn::take();
+    (turn, Prepared::beside_the_test())
+}
 
 /// The two profile files PowerShell reads for this account, as they were before a case wrote to
 /// them, and the directories above them that did not exist; put back when this is dropped.
@@ -116,7 +148,8 @@ struct Profiles {
     files: Vec<(PathBuf, Option<Vec<u8>>)>,
     made: Vec<PathBuf>,
     copies: Option<tempfile::TempDir>,
-    _writer: std::sync::MutexGuard<'static, ()>,
+    /// Released after the profiles are back, and so after everything the case placed has gone.
+    _turn: Turn,
 }
 
 impl Profiles {
@@ -125,15 +158,12 @@ impl Profiles {
     /// # Panics
     ///
     /// Panics when a file that is there cannot be read, since it could not be put back.
-    fn saved(package: &ShellPackage) -> Self {
+    fn saved(package: &ShellPackage, turn: Turn) -> Self {
         assert!(
             std::env::var(PROFILE_SWITCH).is_ok_and(|value| value == "1"),
             "this case writes the account's PowerShell profiles; set {PROFILE_SWITCH}=1 where that \
              is allowed"
         );
-        let writer = PROFILE_WRITER
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let layout = HomeLayout::from_environment().launching(PowerShell::of_package(package));
         let mut paths: Vec<PathBuf> = layout
             .targets(ShellKind::PowerShell)
@@ -189,7 +219,7 @@ impl Profiles {
             files,
             made,
             copies: Some(copies),
-            _writer: writer,
+            _turn: turn,
         }
     }
 }
@@ -252,12 +282,13 @@ struct Managed {
 }
 
 impl Managed {
-    /// Publishes the package, saves the profiles, and starts the daemon on `prepared`.
-    async fn start(prepared: Prepared) -> Self {
+    /// Publishes the package, saves the profiles, and starts the daemon on `prepared`, which `turn`
+    /// made.
+    async fn start(turn: Turn, prepared: Prepared) -> Self {
         let packages = tempfile::tempdir().expect("a directory on the internal disk");
         let directory = publish(packages.path());
         let package = ShellPackage::read(&directory).expect("the host reads the published package");
-        let profiles = Profiles::saved(&package);
+        let profiles = Profiles::saved(&package, turn);
         let host = prepared.start(Some(packages.path().to_path_buf())).await;
         Self {
             host,
@@ -455,12 +486,26 @@ fn collect_integration(value: &serde_json::Value, plugin: &str, into: &mut Strin
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = writes_profiles!()]
 async fn a_default_session_is_refused_without_the_entry_and_managed_with_it() {
-    let managed = Managed::start(Prepared::new()).await;
+    let (turn, prepared) = take_a_turn();
+    let managed = Managed::start(turn, prepared).await;
 
     let refused = managed.host.kr_new(&[]).await;
     assert!(
         !refused.succeeded(),
         "a create went ahead with no entry in the profile: {}",
+        refused.said()
+    );
+    // The worker's own refusal, which names the missing entry. The words of a wait that ran out
+    // name the command too, so they are not what shows that the create was refused at once.
+    assert_eq!(
+        refused.document["code"],
+        "SHELL_INTEGRATION_UNSUPPORTED",
+        "{}",
+        refused.said()
+    );
+    assert!(
+        refused.said().contains("no startup entry"),
+        "the refusal is not the worker's, made before a shell started: {}",
         refused.said()
     );
     assert!(
@@ -630,11 +675,11 @@ async fn the_bundled_agents_typed_at_the_managed_prompt_are_launched_through_the
 
     // The package's flags name the forwarder by placeholder, which the daemon and the worker have
     // to write as one path.
-    let prepared = Prepared::beside_the_test();
+    let (turn, prepared) = take_a_turn_beside_the_test();
     let _claude_published =
         install_package(&prepared, &bundled_package("claude-code"), "claude").await;
     let _qoder_published = install_package(&prepared, &bundled_package("qoder-cli"), "qoder").await;
-    let managed = Managed::start(prepared).await;
+    let managed = Managed::start(turn, prepared).await;
     managed.install_entries().await;
     for plugin in ["kalareach/claude-code", "kalareach/qoder-cli"] {
         let enabled = managed
@@ -831,11 +876,11 @@ fn well_behaved() -> Vec<u8> {
 #[ignore = writes_profiles!()]
 async fn a_program_whose_package_ships_a_component_starts_the_plugin_host_on_windows() {
     let component = well_behaved();
-    let prepared = Prepared::new();
+    let (turn, prepared) = take_a_turn();
     let package = tempfile::tempdir().expect("a directory on the internal disk");
     let directory = component_package(package.path(), &component);
     let _published = install_package(&prepared, &directory, "development").await;
-    let managed = Managed::start(prepared).await;
+    let managed = Managed::start(turn, prepared).await;
     managed.install_entries().await;
     let enabled = managed
         .host

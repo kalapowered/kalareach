@@ -309,9 +309,26 @@ static BESIDE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl Drop for Beside {
     fn drop(&mut self) {
+        let mut left = Vec::new();
         for program in &self.placed {
-            let _ = std::fs::remove_file(program);
+            match std::fs::remove_file(program) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    left.push(format!("{}: {error}", program.display()));
+                }
+                _ => {}
+            }
         }
+        if left.is_empty() {
+            return;
+        }
+        eprintln!("PROGRAMS NOT REMOVED: {}", left.join(", "));
+        // A case that is already failing is not made to panic twice.
+        assert!(
+            std::thread::panicking(),
+            "the programs placed beside this test are still there, and the next run refuses to \
+             start until they are removed: {}",
+            left.join(", ")
+        );
     }
 }
 
