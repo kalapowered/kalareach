@@ -1,0 +1,20 @@
+[package]
+name = "kr-keys"
+description = "KalaReach terminal input encoder: the bytes a key, a paste or a pointer event is spelled as under the encoding an application negotiated, shared by every client and by the terminal library"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The keyboard encoding a host projects, which the encoder reads the negotiated spelling from.
+kr-protocol.workspace = true
+
+[dev-dependencies]
+# The hand-written vectors in `fixtures/terminal/client-encodings.json`.
+serde_json.workspace = true
+
+[lints]
+workspace = true

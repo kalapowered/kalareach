@@ -1558,7 +1558,6 @@ plain!(
     crate::cursors::OutOfOrder,
     crate::drafts::NotSubmittable,
     crate::sync::membership::PlanRefusal,
-    crate::encoder::Unsupported,
     crate::viewport::NotSwitching,
     crate::controls::Hidden,
     crate::controls::NotInvocable,

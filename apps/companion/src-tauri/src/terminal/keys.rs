@@ -1,4 +1,4 @@
-//! The person's keys, text and paste, as a view hands them to the client's shared encoder.
+//! The person's keys, text and paste, as a view hands them to the shared key encoder.
 //!
 //! The page names each key as its platform reported it: the key, the character it makes with
 //! nothing held where the platform said, the keypad key it is, the modifiers and locks, and whether
@@ -17,10 +17,10 @@
 
 use std::collections::BTreeMap;
 
-use kr_client::encoder::{
+use kr_client::projection::{ProjectedModeSpelling, Screen};
+use kr_keys::{
     Arrow, Key, KeyEvent, KeyEventKind, KeyboardEncoding, Keypad, Locks, Modifiers, Unsupported,
 };
-use kr_client::projection::{ProjectedModeSpelling, Screen};
 use kr_protocol::limits::MAX_INPUT_FRAME_LEN;
 use serde::Deserialize;
 
@@ -28,8 +28,7 @@ use serde::Deserialize;
 const KITTY_FLAGS: u8 = KeyboardEncoding::KITTY_DISAMBIGUATE | KeyboardEncoding::KITTY_EVENT_TYPES;
 
 /// The bytes bracketed paste adds around a paste: its two delimiters.
-pub const PASTE_FRAMING: usize =
-    kr_client::encoder::PASTE_START.len() + kr_client::encoder::PASTE_END.len();
+pub const PASTE_FRAMING: usize = kr_keys::PASTE_START.len() + kr_keys::PASTE_END.len();
 
 /// Why an input cannot reach the program while the view holds no screen of the session.
 pub const NO_SCREEN: &str = "the view is waiting for the session's screen";

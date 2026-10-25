@@ -47,6 +47,9 @@ kr-crypto.workspace = true
 kr-flush.workspace = true
 # Where the host on this machine keeps its runtime directory and its controller endpoint.
 kr-ipc.workspace = true
+# The bytes a typed key, a paste and a wheel turn are spelled as under the encoding the program
+# negotiated.
+kr-keys.workspace = true
 # The candidate's attempt budget, kept on this computer's disk under its own secret store.
 kr-pairing.workspace = true
 kr-protocol.workspace = true

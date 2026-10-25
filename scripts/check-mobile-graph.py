@@ -49,6 +49,7 @@ SHARED = {
     "kr-crypto": "docs/crypto/README.md: purpose-separated keys and secret storage",
     "kr-flush": "the directory flush every local store uses",
     "kr-ipc": "docs/host/README.md: runtime directories and typed frames the client's local connection uses",
+    "kr-keys": "docs/terminal/README.md: the input encoder every client spells a key with",
     "kr-pairing": "docs/pairing/README.md: the pairing flows a device runs",
     "kr-plugin-sdk": "docs/plugins/sdk.md: the package contract types a client reads",
     "kr-protocol": "docs/protocol/README.md: wire types and the method table",

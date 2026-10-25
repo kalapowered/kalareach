@@ -30,6 +30,8 @@ queries, and one destination for side effects.
 | `terminfo` | The private pinned `xterm-256color` database and the XTGETTCAP responder |
 | `unicode` | The pinned width model, whose functions live in `kr-width` so that a phone measures with the same tables |
 
+The input encoder is not a module of `kr-term`. It is the crate `kr-keys`, which depends on `kr-protocol` alone, so that every client, a phone included, spells a key, a paste and a pointer event the same way. `crates/kr-keys/tests/encoder_vectors.rs` holds it to the hand-written vectors in `fixtures/terminal/client-encodings.json`.
+
 ## The class table
 
 Every sequence gets exactly one class. There is no sixth class for "probably harmless".
@@ -1634,7 +1636,7 @@ with `kr-term-probe`.
 | `profile.json` | What kr-vt/1 advertises, what it refuses, the identity bytes, and the library record | KR-REQ-08.10, KR-REQ-04.02, KR-REQ-04.24 |
 | `terminfo-xterm-256color.json` | The pinned database and the class of every advertised capability | KR-REQ-08.11, KR-REQ-08.35 |
 | `input-encodings.json` | The console's key records and the bytes the win32 input mode encodes each as, written by hand; `tests/win32_input.rs` checks the encoder against them | KR-REQ-08.52, KR-REQ-08.56 |
-| `client-encodings.json` | The bytes the client's input encoder spells a key as under the ordinary encoding, `modifyOtherKeys` and the Kitty protocol, written by hand from xterm's documentation and the protocol's specification. `crates/kr-client/tests/encoder_vectors.rs` checks the encoder against them; a vector made from the encoder's own output would compare it with itself | KR-REQ-08.59 |
+| `client-encodings.json` | The bytes the client's input encoder spells a key as under the ordinary encoding, `modifyOtherKeys` and the Kitty protocol, written by hand from xterm's documentation and the protocol's specification. `crates/kr-keys/tests/encoder_vectors.rs` checks the encoder against them; a vector made from the encoder's own output would compare it with itself | KR-REQ-08.59 |
 | `projection.json` | What the client renders from a projection, written by hand | KR-REQ-08.40, KR-ACC-023 |
 | `physical/*.json` | One physical terminal build's cursor answers to the probe corpus, beside the grid's | KR-REQ-08.03 |
 | `capabilities.json` | The manifest: the six things the specification gives it, each with the fixtures that pin it and their digests | KR-REQ-08.11 |

@@ -1295,6 +1295,7 @@ dependencies = [
  "kr-describe",
  "kr-flush",
  "kr-ipc",
+ "kr-keys",
  "kr-loopback",
  "kr-pairing",
  "kr-protocol",
@@ -4501,6 +4502,7 @@ dependencies = [
  "kr-describe",
  "kr-flush",
  "kr-ipc",
+ "kr-keys",
  "kr-pairing",
  "kr-plugin-catalogue",
  "kr-plugin-sdk",
@@ -4884,6 +4886,14 @@ dependencies = [
  "uuid",
  "widestring",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "kr-keys"
+version = "0.1.0"
+dependencies = [
+ "kr-protocol",
+ "serde_json",
 ]
 
 [[package]]

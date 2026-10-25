@@ -18,13 +18,13 @@
 //!
 //! The wheel reaches the program only as the program asked for it: as wheel events at a cell of the
 //! session's grid, while it reports the mouse, in the encoding it chose. A wheel never becomes arrow
-//! keys. Keys, text and paste reach it through the client's shared encoder, in the encoding the
+//! keys. Keys, text and paste reach it through the shared key encoder, in the encoding the
 //! program negotiated (`keys`); the page names keys and never spells a byte.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use kr_client::encoder::{self, Modifiers, MouseAction, MouseEncoding, MouseEvent, WheelDirection};
 use kr_client::projection::{ProjectedModeSpelling, Screen};
+use kr_keys::{Modifiers, MouseAction, MouseEncoding, MouseEvent, WheelDirection};
 use kr_protocol::envelope::ParamsValue;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{InputLeaseEpoch, InputSequence, RequestId};
@@ -183,7 +183,7 @@ impl Input {
                     control: *control,
                     superkey: false,
                 },
-                locks: kr_client::encoder::Locks {
+                locks: kr_keys::Locks {
                     caps_lock: *caps_lock,
                     num_lock: *num_lock,
                 },
@@ -270,7 +270,7 @@ pub fn wheel_reports(
     } else {
         MouseEncoding::X10
     };
-    let report = encoder::mouse(
+    let report = kr_keys::mouse(
         MouseEvent {
             action: MouseAction::Wheel(turns.direction()),
             column,
@@ -595,7 +595,7 @@ mod tests {
         .expect("a key");
         let (typed, _) = input.typed_key().expect("a key input");
         let event = typed
-            .event(kr_client::encoder::KeyEventKind::Press)
+            .event(kr_keys::KeyEventKind::Press)
             .expect("a key event");
         (
             typed.identity(),

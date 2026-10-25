@@ -57,7 +57,7 @@ impl Encoders {
     ///
     /// Alternate-key reporting is **not** among the flags. That flag asks a controller to report
     /// the shifted and base forms of a key alongside the one that was pressed, and
-    /// `kr_client::encoder` carries the base key but reports no alternates, so claiming it would
+    /// `kr_keys` carries the base key but reports no alternates, so claiming it would
     /// advertise an encoding this build's own encoder does not produce.
     pub const TYPED: Self = Self {
         modify_other_keys: 2,
