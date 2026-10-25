@@ -26,11 +26,14 @@
 # and saves a screenshot of the screen to the path given: the very frame that was found to show the
 # page, so it is taken while that condition holds and not after other checks. Each wait ends when its
 # condition holds; the deadline (KR_LAUNCH_DEADLINE, 240 seconds) only ends a step that is hung, and
-# the message names the condition. A process that ends is not waited out: once the application has a
-# process, every wait stops when that process is found gone and says how it ended, from the device's
-# log (a crash, or a device short of memory that kills the application's web view renderer or the
-# application itself). A question to the device that it does not answer is asked again, and is not
-# taken for a process that is gone. The device is named by its serial (--serial, or ANDROID_SERIAL),
+# the message names the condition. A call of adb that has not returned by the deadline of the wait it
+# is made in (or by the deadline, outside a wait; four times it for the install, thirty seconds at
+# most for the clean-up) is ended, and counts as a call the device did not answer. A process that ends is not waited out: once the application has a process, every wait
+# stops when that process is found gone and says how it ended, from the device's log (a crash, or a
+# device short of memory that kills the application's web view renderer or the application itself).
+# A question to the device that it does not answer is asked again, within the deadline of the wait
+# it is asked in, or within one deadline for the two looks that follow the last wait together, and
+# is not taken for a process that is gone. The device is named by its serial (--serial, or ANDROID_SERIAL),
 # never taken for being the first one listed: it is the caller's, it is not started or stopped
 # here, a copy of the application already on it is uninstalled first, with its data, and the
 # application is uninstalled again when this ends.
@@ -78,16 +81,49 @@ for tool in python3 curl; do
     command -v "$tool" > /dev/null 2>&1 || die "$tool is needed and is not on the path"
 done
 [ -n "$serial" ] || die "android needs --serial (or ANDROID_SERIAL), the serial of the device to run on: no device is taken for being the first listed"
-case "$("$adb" devices | awk -v serial="$serial" '$1 == serial { print $2 }')" in
+# When the wait that is running began (0 outside one), which a call of adb and a question to the
+# device that it does not answer are held to (a condition that keeps its own time reads it too).
+wait_started=0
+
+# Runs a command and ends it if it has not returned in `$1` seconds, with status 124. A call of adb
+# that hangs (a transport that stopped answering, a server that does not come up) would otherwise
+# hold the run for ever, past the deadline that every wait keeps.
+IFS= read -r -d '' bounded_program << 'PYTHON' || true
+import subprocess
+import sys
+
+try:
+    status = subprocess.run(sys.argv[2:], timeout=float(sys.argv[1])).returncode
+except subprocess.TimeoutExpired:
+    print("android-app-launch: a call of adb did not return in " + sys.argv[1] + " seconds", file=sys.stderr)
+    sys.exit(124)
+sys.exit(status if status >= 0 else 128 - status)
+PYTHON
+bounded() { python3 -I -c "$bounded_program" "$@"; }
+
+case "$(bounded "$deadline" "$adb" devices | awk -v serial="$serial" '$1 == serial { print $2 }')" in
     device) ;;
     *) die "no Android device with the serial $serial is running" ;;
 esac
 
-dev() { "$adb" -s "$serial" "$@"; }
+# adb on the device, held to what is left of the wait it is called in, or to the deadline outside
+# one.
+dev() {
+    local left=$deadline
+    if [ "$wait_started" -ne 0 ]; then
+        left=$((wait_started + deadline - $(date +%s)))
+        [ "$left" -ge 1 ] || left=1
+    fi
+    bounded "$left" "$adb" -s "$serial" "$@"
+}
 
 installed=0
 forwarded=""
 cleanup() {
+    # The run may end inside a wait or a look, whose window is over: the clean-up keeps a bound of
+    # its own, and a device that is hung is not waited for.
+    wait_started=0
+    [ "$deadline" -le 30 ] || deadline=30
     [ -z "$forwarded" ] || dev forward --remove "tcp:$forwarded" > /dev/null 2>&1 || true
     [ "$installed" -eq 0 ] || dev uninstall "$package" > /dev/null 2>&1 || true
 }
@@ -95,10 +131,6 @@ trap cleanup EXIT
 
 # The application's process, once it has one: every wait after that is held to it.
 watched=""
-
-# When the wait that is running began, which a question to the device that it does not answer is
-# held to (a condition that keeps its own time reads it too).
-wait_started=0
 
 # The process numbers the device gives the application, on one line (none when there is no process),
 # and 0 when the device answered. A call of adb that fails (a device that dropped off for a moment, a
@@ -127,16 +159,12 @@ application_runs() {
 }
 
 # What the device says of the watched process, asked again every second for as long as it does not
-# answer: 0 when the process runs, 1 when it does not. Inside a wait the questions end with the
-# wait's deadline, and outside one (the looks after the screen and the log were read) a deadline of
-# their own: a device that gives no answer until then fails the run, saying so.
+# answer: 0 when the process runs, 1 when it does not. The questions end with the deadline of the
+# wait they are asked in, or of the look they are asked for (`application_has_ended` opens one
+# outside a wait): a device that gives no answer until then fails the run, saying so.
 application_answer() {
     local until answer
-    if [ "$wait_started" -ne 0 ]; then
-        until=$((wait_started + deadline))
-    else
-        until=$(($(date +%s) + deadline))
-    fi
+    until=$((wait_started + deadline))
     while :; do
         application_runs
         answer=$?
@@ -150,12 +178,21 @@ application_answer() {
 }
 
 # True when the process being watched is gone. A look that finds it gone is looked at again after a
-# second.
+# second. Outside a wait the two questions share one deadline, which the look opens and closes: a
+# device that answers the first late and not the second does not get a deadline for each.
 application_has_ended() {
     [ -n "$watched" ] || return 1
-    application_answer && return 1
-    sleep 1
-    ! application_answer
+    local own_window=0 ended=0
+    if [ "$wait_started" -eq 0 ]; then
+        own_window=1
+        wait_started=$(date +%s)
+    fi
+    if ! application_answer; then
+        sleep 1
+        application_answer || ended=1
+    fi
+    [ "$own_window" -eq 0 ] || wait_started=0
+    [ "$ended" -eq 1 ]
 }
 
 # What the device has to spare: a device that is short of memory ends the application's processes,
@@ -225,6 +262,8 @@ PYTHON
 # Fails the run because the watched process ended `$1` (a phrase that says when), with how it ended
 # as far as the device's log tells.
 ended() {
+    # The wait that found the process gone is over: reading the log is held to a deadline of its own.
+    wait_started=0
     printf "android-app-launch: FAIL: the application's process (%s) ended %s\n" "$watched" "$1" >&2
     dev logcat -d -b all | tr -d '\r' | python3 -I -c "$ended_program" "$watched" "$package" >&2
     printf 'android-app-launch: %s\n' "$(device_memory)" >&2
@@ -259,7 +298,9 @@ wait_for "the device to finish starting" booted
 say "device: $serial, API $(dev shell getprop ro.build.version.sdk | tr -d '\r'), $(dev shell getprop ro.product.cpu.abilist | tr -d '\r')"
 
 dev uninstall "$package" > /dev/null 2>&1 || true
-dev install -r "$apk" > /dev/null || { echo "android-app-launch: FAIL: the application did not install" >&2; exit 1; }
+# An install of the whole package is not a question to the device and takes as long as the device
+# takes to write it: it is held to four deadlines, which only a hung call reaches.
+bounded $((deadline * 4)) "$adb" -s "$serial" install -r "$apk" > /dev/null || { echo "android-app-launch: FAIL: the application did not install" >&2; exit 1; }
 installed=1
 say "ok: the application installed"
 
