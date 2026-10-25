@@ -24,8 +24,8 @@ use kr_protocol::hello::{
     HostSelection, PROTOCOL_VERSION, ProtocolVersion, ReceiveLimits,
 };
 use kr_protocol::ids::{
-    ActionWindowId, AttachmentId, BuildId, ConnectionId, ControllerGeneration, EnvironmentId,
-    RequestId, SessionId, TransferId,
+    ActionWindowId, AttachmentId, BuildId, CapabilityId, ConnectionId, ControllerGeneration,
+    EnvironmentId, RequestId, SessionId, TransferId,
 };
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::scalars::{CanonicalSet, DurationMs, EndpointKey, Nullable, TimestampMs, Uuid};
@@ -1724,8 +1724,18 @@ enum HostScript {
     NoReply,
     /// Refuses the offer with this error.
     RefuseOffer(ProtocolError),
-    /// Selects limits the client cannot work within.
+    /// Selects limits the client cannot work within, and ends the stream.
     SelectUnusableLimits,
+    /// Selects exactly what the client offered, and ends the stream.
+    SelectCorrectly,
+    /// Selects a protocol version the client did not offer, and ends the stream.
+    SelectUnofferedVersion,
+    /// Selects with a client nonce other than the one the offer carried, and ends the stream.
+    SelectWrongNonce,
+    /// Selects a capability the client did not offer, and ends the stream.
+    SelectUnofferedCapability,
+    /// Selects an input frame limit above what the client offered to receive, and ends the stream.
+    SelectLimitAboveOffer,
     /// Selects, reads the connection proof, and ends the stream without a reply.
     NoProofReply,
     /// Selects, reads the connection proof, and refuses it with this error.
@@ -1772,6 +1782,29 @@ fn spawn_scripted(host: &Side, script: HostScript) -> JoinHandle<()> {
             extensions: extension::select(&offer.extensions, &[]),
         };
         match script {
+            HostScript::SelectUnusableLimits => {
+                selection.limits.max_send_queue_bytes = kr_protocol::scalars::U64::new(
+                    kr_transport::scheduler::MIN_SEND_QUEUE_BYTES as u64 - 1,
+                );
+            }
+            HostScript::SelectUnofferedVersion => {
+                selection.selected_version = ProtocolVersion::new(PROTOCOL_VERSION.major + 1, 0);
+            }
+            HostScript::SelectWrongNonce => {
+                selection.client_nonce = fresh_nonce().expect("a nonce");
+            }
+            HostScript::SelectUnofferedCapability => {
+                selection.capabilities = [CapabilityId::new("not_offered").expect("a capability")]
+                    .into_iter()
+                    .collect();
+            }
+            HostScript::SelectLimitAboveOffer => {
+                selection.limits.max_input_frame_len =
+                    kr_protocol::scalars::U64::new(offer.max_receive.max_input_frame_len.get() + 1);
+            }
+            _ => {}
+        }
+        match script {
             HostScript::NoReply => {
                 writer.finish_and_flush(Duration::from_secs(1)).await;
             }
@@ -1781,14 +1814,17 @@ fn spawn_scripted(host: &Side, script: HostScript) -> JoinHandle<()> {
                     .await
                     .expect("the refusal is sent");
             }
-            HostScript::SelectUnusableLimits => {
-                selection.limits.max_send_queue_bytes = kr_protocol::scalars::U64::new(
-                    kr_transport::scheduler::MIN_SEND_QUEUE_BYTES as u64 - 1,
-                );
+            HostScript::SelectUnusableLimits
+            | HostScript::SelectCorrectly
+            | HostScript::SelectUnofferedVersion
+            | HostScript::SelectWrongNonce
+            | HostScript::SelectUnofferedCapability
+            | HostScript::SelectLimitAboveOffer => {
                 writer
                     .write_message(&HelloReply::Selected(Box::new(selection.clone())))
                     .await
                     .expect("the selection is sent");
+                writer.finish_and_flush(Duration::from_secs(1)).await;
             }
             HostScript::NoProofReply
             | HostScript::RefuseProof(_)
@@ -2001,5 +2037,77 @@ async fn a_candidates_refusals_are_told_apart_from_what_it_concluded() {
     assert_eq!(
         concluded(candidate_ending(HostScript::AnswerAnotherRequest).await).code,
         ErrorCode::InvalidArgument
+    );
+}
+
+/// KR-REQ-20.24: a candidate checks the host's selection against its own offer as the paired client
+/// does, and a selection that answers the offer connects. Each refusal changes one thing the host
+/// selected from a selection the control case shows is accepted.
+#[tokio::test]
+async fn a_candidate_connects_when_the_selection_answers_its_offer() {
+    let (host, client) = paired_pair().await;
+    let answering = spawn_scripted(&host, HostScript::SelectCorrectly);
+    let connection = client
+        .endpoint
+        .connect(direct_addr(&host), ALPN)
+        .await
+        .expect("a connection");
+    let candidate = handshake::connect_unpaired(&connection, &client.identity)
+        .await
+        .expect("a selection that answers the offer connects");
+    assert_eq!(candidate.selection.selected_version, PROTOCOL_VERSION);
+    drop(connection);
+    answering.abort();
+}
+
+/// The binding failure a candidate ends with against a host that plays `script`, and the check it
+/// names.
+async fn candidate_binding_failure(script: HostScript) -> &'static str {
+    let TransportError::Crypto(kr_crypto::CryptoError::BindingMismatch { what }) =
+        candidate_ending(script).await
+    else {
+        panic!("a selection that does not answer the offer is a binding failure");
+    };
+    what
+}
+
+/// KR-REQ-20.24: a candidate refuses a selected version it did not offer.
+#[tokio::test]
+async fn a_candidate_refuses_a_version_outside_its_offer() {
+    let what = candidate_binding_failure(HostScript::SelectUnofferedVersion).await;
+    assert!(what.contains("version"), "{what}");
+}
+
+/// KR-REQ-20.24: a candidate refuses a selection that does not echo its nonce.
+#[tokio::test]
+async fn a_candidate_refuses_a_selection_that_does_not_echo_its_nonce() {
+    let what = candidate_binding_failure(HostScript::SelectWrongNonce).await;
+    assert!(what.contains("nonce"), "{what}");
+}
+
+/// KR-REQ-20.24: a candidate refuses a selected capability it did not offer.
+#[tokio::test]
+async fn a_candidate_refuses_a_capability_it_did_not_offer() {
+    let what = candidate_binding_failure(HostScript::SelectUnofferedCapability).await;
+    assert!(what.contains("capability"), "{what}");
+}
+
+/// KR-REQ-20.24: a candidate refuses a negotiated limit above what it offered to receive.
+#[tokio::test]
+async fn a_candidate_refuses_a_limit_above_its_offer() {
+    let what = candidate_binding_failure(HostScript::SelectLimitAboveOffer).await;
+    assert!(what.contains("limit"), "{what}");
+}
+
+/// KR-REQ-20.24: a candidate refuses negotiated limits below the floor a connection needs, as the
+/// paired client does, and names the field.
+#[tokio::test]
+async fn a_candidate_refuses_limits_below_the_floor() {
+    let error = concluded(candidate_ending(HostScript::SelectUnusableLimits).await);
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    assert!(
+        error.message.contains("max_send_queue_bytes"),
+        "{}",
+        error.message
     );
 }
