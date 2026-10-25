@@ -504,27 +504,31 @@ impl Controller {
         {
             return true;
         }
+        // A worker hands its closure over before it exits, and the closure erases its registry
+        // row and its descriptor. The reservation still names the process the launch ran, and that
+        // process is the worker until the kernel says it ended: until then the worker may still
+        // write the stores a collection or a migration would open.
+        let launched = reservation.and_then(|reservation| reservation.launcher_identity.as_ref());
+        let launch_ended = launched.is_some_and(|launched| {
+            matches!(
+                kr_ipc::identity::process_state(launched),
+                kr_ipc::identity::ProcessState::Ended
+            )
+        });
+        // A closure that lists a worker it never saw end is a claim made when the session closed,
+        // and the kernel's later answer about the process the launch ran is the proof that the
+        // claim no longer holds. Without that proof, or with a launch that names no process, the
+        // worker may remain.
         if let Some(closure) = closure
             && closure
                 .surviving
                 .iter()
                 .any(|resource| resource.kind == UNACCOUNTED_WORKER)
+            && !launch_ended
         {
             return true;
         }
-        // A worker hands its closure over before it exits, and the closure erases its registry
-        // row and its descriptor. The reservation still names the process the launch ran, and that
-        // process is the worker until the kernel says it ended: until then the worker may still
-        // write the stores a collection or a migration would open.
-        if reservation
-            .and_then(|reservation| reservation.launcher_identity.as_ref())
-            .is_some_and(|launched| {
-                !matches!(
-                    kr_ipc::identity::process_state(launched),
-                    kr_ipc::identity::ProcessState::Ended
-                )
-            })
-        {
+        if launched.is_some() && !launch_ended {
             return true;
         }
         self.archive().a_worker_may_still_own(session_id)
