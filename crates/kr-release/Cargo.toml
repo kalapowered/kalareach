@@ -23,6 +23,9 @@ jiff.workspace = true
 # the catalogue reads it.
 kr-plugin-sdk.workspace = true
 kr-protocol.workspace = true
+# The terminal's capability manifest and its terminfo database, which a release carries as the
+# engine makes them.
+kr-term.workspace = true
 # How a host starts each shell and where it puts its marked entry in the person's own startup
 # files, which a release states for each shell package it carries.
 kr-shell-integration.workspace = true
@@ -40,8 +43,6 @@ tokio = { workspace = true, features = ["rt"] }
 tough.workspace = true
 
 [dev-dependencies]
-# The database a release tree carries, which a test reads back from the engine that compiles it.
-kr-term.workspace = true
 tempfile.workspace = true
 
 [lints]
