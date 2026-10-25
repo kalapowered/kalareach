@@ -176,5 +176,6 @@ records both offers and narrows the claim to them.
 `upstream.md` beside this file is the register of the sources each package tracks, the triage
 record for security-relevant changes, and the update target each package is published under. The
 qualification reads it: the pins in the register have to be the pins the builder uses and the
-identity the build wrote, and a triage row past its target release date has to be flagged with its
+identity the build wrote, and a triage row that is still `scheduled` past its target release date,
+and is the newest assessment of its change for a package, has to be flagged with its
 compatibility-mode choices rather than leaving a stale package as a silent default.
