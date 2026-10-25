@@ -3991,6 +3991,69 @@ async fn a_session_packed_while_held_back_is_not_packed_again_when_its_journal_h
     assert!(detail.contains("nothing has changed"), "{detail}");
 }
 
+/// KR-REQ-24.18: a session whose journal is of an earlier schema and whose migration fails is packed
+/// with the summary the closure alone gives. Once the migration can be made, the generation is made
+/// again with what the session's own record says, however little else changed.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_whose_journal_failed_to_migrate_is_packed_again_once_it_migrates() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let timer = HeldTimer::held();
+    let mut closed = None;
+    let rig = Rig::start_with(Arrangement::NORMAL, Arc::clone(&timer), |host| {
+        let session = closed_session(host, b"a session\r\n", 9_000);
+        journal_of_an_earlier_build(host, session, true);
+        let path = host.environment().journal_database(session);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400))
+            .expect("the journal is made read-only");
+        assert!(
+            kr_worker::journal::Journal::open(&path).is_err(),
+            "an account that ignores file permissions cannot make this migration fail"
+        );
+        closed = Some(session);
+    })
+    .await;
+    let session = closed.expect("a closed session");
+    let journal = rig.host.environment().journal_database(session);
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    rig.set_up();
+    rig.until("the first generation is published", |rig| rig.published(1))
+        .await;
+    let cwd_of = |members: &std::collections::BTreeMap<String, Vec<u8>>| {
+        let document: serde_json::Value =
+            serde_json::from_slice(&members[&format!("sessions/{session}.json")])
+                .expect("a session export");
+        document["session"]["cwd"].clone()
+    };
+    assert!(
+        cwd_of(&opened_members(&rig, 1)).is_null(),
+        "built from the closure alone while the migration fails"
+    );
+
+    // The files beside the journal were made with its read-only mode by the looks that failed.
+    for suffix in ["", "-wal", "-shm"] {
+        let mut name = journal.as_os_str().to_owned();
+        name.push(suffix);
+        let file = std::path::PathBuf::from(name);
+        if file.exists() {
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
+                .expect("the journal can be written again");
+        }
+    }
+    timer.advance_day(Duration::from_secs(25 * 3600));
+    timer.run_by_itself();
+    rig.controller.backup().signals().produce.notify_one();
+    rig.until("the second generation is published", |rig| rig.published(2))
+        .await;
+    assert_eq!(
+        cwd_of(&opened_members(&rig, 2)),
+        "/recovered",
+        "and made again from the session's own record once the migration can be made"
+    );
+}
+
 /// The sizes a generation is held to are the convention's, which a restore accepts: an external
 /// fact the producer and the restore must agree on, so the production value is written out here.
 #[test]
