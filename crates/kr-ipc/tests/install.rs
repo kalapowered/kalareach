@@ -732,6 +732,52 @@ fn a_release_that_is_gone_or_being_removed_is_not_pinned() {
     drop(removing);
 }
 
+/// KR-REQ-26.06: asking whether a release is held opens its manifest for an instant with no sharing
+/// at all, and a program that starts in that instant is not refused: it waits out the question and
+/// holds the release. Pinned two thousand times while another thread asks without a pause, every
+/// pin is granted.
+#[cfg(windows)]
+#[test]
+fn a_program_that_starts_is_not_refused_by_a_question_whether_its_release_is_held() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let test = TestStore::create();
+    let one = release("0.1.0+aaaaaaaaaaaa");
+    test.install(&one);
+    let asking = Arc::new(AtomicBool::new(true));
+    let asked = {
+        let store = Store::at(test.store.root());
+        let asking = Arc::clone(&asking);
+        let one = one.clone();
+        std::thread::spawn(move || {
+            let mut asked = 0_u64;
+            while asking.load(Ordering::Relaxed) {
+                store.held(&one).expect("asks");
+                asked += 1;
+            }
+            asked
+        })
+    };
+    let mut refused = Vec::new();
+    for round in 0..2000 {
+        match test.store.pin(&one) {
+            Ok(Some(pin)) => drop(pin),
+            other => refused.push(format!(
+                "round {round}: {:?}",
+                other.map(|pin| pin.is_some())
+            )),
+        }
+    }
+    asking.store(false, Ordering::Relaxed);
+    let asked = asked.join().expect("the asking thread ends");
+    assert!(asked > 0, "the question was asked");
+    assert!(
+        refused.is_empty(),
+        "a program that starts is refused by a question: {refused:?}"
+    );
+}
+
 /// The variable that makes the late helper act, naming the directory it talks through.
 const LATE: &str = "KR_INSTALL_TEST_LATE";
 
