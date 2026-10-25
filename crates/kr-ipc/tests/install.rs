@@ -775,6 +775,36 @@ fn a_program_that_starts_is_not_refused_by_a_question_whether_its_release_is_hel
     );
 }
 
+/// KR-REQ-26.06: a release a program holds cannot be moved or deleted by anyone, whatever the state
+/// the check whether it is held was made in: the hold itself, the open manifest, refuses the rename
+/// of the release's directory and of the directories above it, and the deletion of the manifest.
+/// Once the hold is let go, the same rename goes through.
+#[cfg(windows)]
+#[test]
+fn a_release_a_program_holds_cannot_be_renamed_or_deleted_by_anyone() {
+    let test = TestStore::create();
+    let one = release("0.1.0+aaaaaaaaaaaa");
+    test.install(&one);
+    let directory = test.store.release_directory(&one);
+    let elsewhere = test.root.join("elsewhere");
+    let pin = test.store.pin(&one).expect("asks").expect("held");
+    assert!(
+        std::fs::rename(&directory, &elsewhere).is_err(),
+        "the release's directory is not renamed under a program"
+    );
+    assert!(
+        std::fs::rename(test.store.versions(), test.root.join("versions-elsewhere")).is_err(),
+        "nor is the directory above it"
+    );
+    assert!(
+        std::fs::remove_file(test.store.manifest(&one)).is_err(),
+        "nor is the manifest deleted"
+    );
+    assert!(directory.is_dir() && test.store.manifest(&one).is_file());
+    drop(pin);
+    std::fs::rename(&directory, &elsewhere).expect("once nothing holds it, it moves");
+}
+
 /// The variable that makes the late helper act, naming the directory it talks through.
 const LATE: &str = "KR_INSTALL_TEST_LATE";
 
