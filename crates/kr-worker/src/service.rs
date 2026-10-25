@@ -364,6 +364,11 @@ pub struct WorkerService {
     /// preparation for as long as they need. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     preparation_stall: crate::testing::Stall,
+    /// How long, in milliseconds, an admitted operation has to reach its upstream, which this
+    /// host's own tests shorten to reach the deadline without waiting out the shipped one. It is
+    /// compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    upstream_deadline_ms: std::sync::atomic::AtomicU64,
     /// A pause in the binding of a question's or an alert's source to the session, which this
     /// host's own tests arm to stand a caller there while a keystroke arrives. It is compiled
     /// away in every shipped build.
@@ -717,6 +722,10 @@ impl WorkerService {
             fence_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
             preparation_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            upstream_deadline_ms: std::sync::atomic::AtomicU64::new(
+                u64::try_from(UPSTREAM_SUBMIT_DEADLINE.as_millis()).unwrap_or(u64::MAX),
+            ),
             #[cfg(feature = "testing")]
             refused_for_the_boundary: tokio::sync::watch::Sender::new(0),
             #[cfg(feature = "testing")]
@@ -1217,6 +1226,34 @@ impl WorkerService {
         std::sync::mpsc::Sender<()>,
     ) {
         self.fence_stall.arm()
+    }
+
+    /// Sets how long an admitted operation has to reach its upstream before the worker records an
+    /// outcome nobody can establish.
+    ///
+    /// It exists so that this host's own tests can reach the deadline without waiting out the
+    /// shipped one. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn set_upstream_deadline_for_tests(&self, deadline: std::time::Duration) {
+        self.upstream_deadline_ms.store(
+            u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+
+    /// How long an admitted operation has to reach its upstream.
+    fn upstream_deadline(&self) -> std::time::Duration {
+        #[cfg(feature = "testing")]
+        {
+            std::time::Duration::from_millis(
+                self.upstream_deadline_ms
+                    .load(std::sync::atomic::Ordering::Acquire),
+            )
+        }
+        #[cfg(not(feature = "testing"))]
+        {
+            UPSTREAM_SUBMIT_DEADLINE
+        }
     }
 
     /// Stops the next accepted action's preparation before it begins, for this host's own tests.
@@ -5163,7 +5200,7 @@ impl WorkerService {
         // Everything the broker settles happens on this task, and the resource an answer resolves
         // is settled before the receipt is recorded and before the caller hears: at the deadline,
         // what `carry` was waiting for is dropped here, and an answer's claim goes with it.
-        let deadline = tokio::time::Instant::now() + UPSTREAM_SUBMIT_DEADLINE;
+        let deadline = tokio::time::Instant::now() + self.upstream_deadline();
         let mut handoff = pending.handoff;
         let claim = handoff.claim.take();
         let outcome = handoff.carry(deadline).await;

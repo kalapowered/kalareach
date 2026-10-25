@@ -785,9 +785,11 @@ struct Forwarded {
 /// It is the owner's, not a dispatch's: two dispatches of one connection that each kept their own
 /// would put two requests under one identifier, and an answer to either would be read as an answer
 /// to the other.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Outstanding {
     next: AtomicU64,
+    /// How long, in milliseconds, the upstream has to answer one operation after it was written.
+    acknowledgement_ms: AtomicU64,
     waiting:
         std::sync::Mutex<BTreeMap<UpstreamRequestId, tokio::sync::oneshot::Sender<UpstreamReply>>>,
     /// The requests the native client made, by the identifier this host sent them under.
@@ -802,7 +804,25 @@ struct Outstanding {
     forwarded: std::sync::Mutex<BTreeMap<UpstreamRequestId, Forwarded>>,
 }
 
+impl Default for Outstanding {
+    fn default() -> Self {
+        Self {
+            next: AtomicU64::new(0),
+            acknowledgement_ms: AtomicU64::new(
+                u64::try_from(ACKNOWLEDGEMENT_DEADLINE.as_millis()).unwrap_or(u64::MAX),
+            ),
+            waiting: std::sync::Mutex::default(),
+            forwarded: std::sync::Mutex::default(),
+        }
+    }
+}
+
 impl Outstanding {
+    /// How long the upstream has to answer one operation after it was written.
+    fn acknowledgement(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.acknowledgement_ms.load(Ordering::Acquire))
+    }
+
     /// Mints the next identifier in this host's own namespace.
     fn allocate(&self) -> Result<UpstreamRequestId> {
         let next = self.next.fetch_add(1, Ordering::Relaxed).saturating_add(1);
@@ -1656,6 +1676,7 @@ impl Dispatch {
             .queue(&body)
             .inspect_err(|_| self.failed(MetricOutcome::Unavailable))?;
         let turn_id = request.turn_id.clone();
+        let acknowledgement = self.outstanding.acknowledgement();
         let counted = self.counted.clone();
         let failed = move |outcome| {
             if let Some(counted) = &counted {
@@ -1669,13 +1690,13 @@ impl Dispatch {
             }
             // The bytes went. What the upstream did with them is the upstream's to say, and until
             // it says so the operation is not one this host can record as applied.
-            let Some(reply) = answered.within(ACKNOWLEDGEMENT_DEADLINE).await else {
+            let Some(reply) = answered.within(acknowledgement).await else {
                 failed(MetricOutcome::Timeout);
                 return Err(BrokerError::UpstreamUnavailable {
                     detail: format!(
                         "the operation reached the upstream and it did not answer within {} \
                          seconds, so whether it acted on it cannot be established",
-                        ACKNOWLEDGEMENT_DEADLINE.as_secs()
+                        acknowledgement.as_secs()
                     ),
                 });
             };
@@ -2605,6 +2626,18 @@ impl Duplex {
     pub fn reverse_operations_running(&self) -> usize {
         crate::broker::host::MAX_REVERSE_IN_FLIGHT
             .saturating_sub(self.reverse_slots.available_permits())
+    }
+
+    /// Sets how long the upstream has to answer one operation of this host's after it was written.
+    ///
+    /// It exists so that this host's own tests can reach the deadline without waiting out the
+    /// shipped one. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn set_acknowledgement_deadline(&self, deadline: std::time::Duration) {
+        self.outstanding.acknowledgement_ms.store(
+            u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Release,
+        );
     }
 
     /// Sets how long this connection's reverse operations have before the upstream is told they
