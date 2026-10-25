@@ -98,12 +98,15 @@ final class SealedPreviewTests: XCTestCase {
         return try XCTUnwrap(handedBack)
     }
 
-    /// Keys that hold the read of the host's key until the test lets it go, so that the system's call
-    /// that the time is up can be made while the extension is still opening the preview.
+    /// Keys that hold the first read of the host's key until the test lets it go, so that the system's
+    /// call that the time is up can be made while the extension is still opening the preview. Later
+    /// reads (the extension reads the key again after the preview has opened) are not held.
     private final class HeldKeys: PreviewKeyReading {
         let inner: GoldenKeys
         let reading = DispatchSemaphore(value: 0)
         let release = DispatchSemaphore(value: 0)
+        private let lock = NSLock()
+        private var held = false
 
         init(_ inner: GoldenKeys) { self.inner = inner }
 
@@ -112,8 +115,14 @@ final class SealedPreviewTests: XCTestCase {
         }
 
         func senderKey(forSender senderKeyID: Data) throws -> Data {
-            reading.signal()
-            _ = release.wait(timeout: .now() + 30)
+            lock.lock()
+            let first = !held
+            held = true
+            lock.unlock()
+            if first {
+                reading.signal()
+                _ = release.wait(timeout: .now() + 30)
+            }
             return try inner.senderKey(forSender: senderKeyID)
         }
     }
