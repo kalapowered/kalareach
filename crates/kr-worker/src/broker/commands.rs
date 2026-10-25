@@ -1548,7 +1548,6 @@ impl CommandBackends {
             held_image: Arc::new(Mutex::new(None)),
             #[cfg(windows)]
             pinned: Arc::new(Mutex::new(None)),
-            #[cfg(windows)]
             launch_failure: Mutex::new(None),
             stopped: Arc::new(AtomicBool::new(false)),
             removed: Mutex::new(false),

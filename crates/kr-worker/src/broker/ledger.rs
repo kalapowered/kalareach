@@ -45,7 +45,7 @@ use kr_protocol::gateway::{
 };
 use kr_protocol::ids::{
     ApplicationInstanceId, BrokerBindingId, GatewayConnectionId, PendingResourceId,
-    SourceEventHandle, StreamCursor, UpstreamMethod, UpstreamRequestId,
+    SourceEventHandle, UpstreamMethod, UpstreamRequestId,
 };
 use kr_protocol::scalars::{TimestampMs, Uuid};
 use kr_protocol::session::Durability;
