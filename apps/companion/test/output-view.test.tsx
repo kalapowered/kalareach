@@ -338,7 +338,7 @@ describe('the retained output (KR-REQ-13.15)', () => {
     expect(screen.queryByText("This session's output could not be read")).toBeNull()
   })
 
-  it('begins where a paired device’s grant reaches, and says the output before it is not shown to the device', async () => {
+  it('begins where a paired device’s grant reaches, and says the output before it is not available to the device', async () => {
     const { port, asked, controls } = recording()
     controls.reachAsPairedDevice()
     const end = controls.records.outputEnd(SESSION_MAIN)
@@ -356,17 +356,13 @@ describe('the retained output (KR-REQ-13.15)', () => {
     await waitFor(() => {
       expect(held()).toEqual([String(reach), String(end - 3000n)])
     })
-    expect(screen.getByTestId('output-gap')).toHaveTextContent('Output before this is not shown to this device.')
+    expect(screen.getByTestId('output-gap')).toHaveTextContent('Output before this is not available to this device.')
     expect(screen.getByTestId('output-gap')).not.toHaveTextContent('not kept')
-    // The reach ends the read: scrolling to the top again asks the host nothing more.
+    // The reach ends the read: scrolling to the top again asks the host nothing more. The view
+    // decides that before it asks, in the scroll's own turn, so nothing is waited for.
     const reads = asked.length
     act(() => {
       scrollTo(10)
-    })
-    await act(async () => {
-      await new Promise((resolve) => {
-        setTimeout(resolve, 60)
-      })
     })
     expect(asked).toHaveLength(reads)
   })

@@ -11,8 +11,8 @@
  * A live session's output is read from its own worker and an ended one's from the host's archive,
  * by native code, with the same method and the same answer. Over a host this device is paired with,
  * the host serves the output the device's grant reaches, from the first of it: what comes before is
- * not the host's to lose but the device's not to see, and the view says that rather than that the
- * host kept nothing.
+ * not for the device to see, and the view says it is not available to the device rather than that
+ * the host kept nothing, which it may well still hold.
  */
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
@@ -369,7 +369,7 @@ export function RetainedOutput({
             {cause !== null
               ? `Output before this is not kept: ${GAP_WORDS[cause]}.`
               : paired
-                ? 'Output before this is not shown to this device.'
+                ? 'Output before this is not available to this device.'
                 : 'Output before this is not kept.'}
           </p>
         ) : null}
