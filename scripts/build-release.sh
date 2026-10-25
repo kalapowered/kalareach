@@ -8,10 +8,11 @@
 #       [--macos-identity <identity>]
 #
 # The tree is `bin/` with the host's programs, `shells/` with the shell packages, `share/` with the
-# update channel's root, the record, the terminal's capability manifest and terminfo database and the
-# licences, and `release.json`, which `kr-release sign` then signs. What the tree holds is checked by `kr-release`, not here: a package built from other
-# inputs than this checkout's, a missing module directory and a file a release does not hold stop
-# the manifest, so a tree that is wrong is never written down as a release.
+# update channel's root, the record, the terminal's capability manifest and terminfo database and
+# the licences, and `release.json`, which `kr-release sign` then signs. What the tree holds is
+# checked by `kr-release`, not here: a package built from other inputs than this checkout's, a
+# missing module directory and a file a release does not hold stop the manifest, so a tree that is
+# wrong is never written down as a release.
 #
 # Every file of a package is copied as a file of its own, because the build names one binary twice
 # and an archive writes the second name as a link. A directory the build left empty is left out,

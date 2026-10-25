@@ -24,13 +24,6 @@ pub const CAPABILITIES: &str = "share/terminal-capabilities.json";
 /// Where a release keeps the terminfo database, with the layout a library reads below it.
 pub const TERMINFO: &str = "share/terminfo";
 
-/// The database's files, one for each name a library looks for the entry by: the first letter, and
-/// that letter's code in hex, which a library built for a case-insensitive file system uses.
-const DATABASE: [&str; 2] = [
-    "share/terminfo/x/xterm-256color",
-    "share/terminfo/78/xterm-256color",
-];
-
 fn fixtures(checkout: &Path) -> PathBuf {
     checkout.join("fixtures/terminal")
 }
@@ -95,11 +88,17 @@ pub fn held(tree: &Path, checkout: &Path) -> Result<()> {
         refuse!("{CAPABILITIES} is not the manifest this checkout makes of its fixtures");
     }
     let database = compiled()?;
-    for path in DATABASE {
-        let carried =
-            read(&tree.join(path)).map_err(|_| Refusal(format!("the tree carries no {path}")))?;
+    // Where the engine itself puts the entry, one file for each name a library looks for it by.
+    let root = tree.join(TERMINFO);
+    for path in kr_term::terminfo::Description::pinned().entry_paths(&root) {
+        let shown = path
+            .strip_prefix(tree)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        let carried = read(&path).map_err(|_| Refusal(format!("the tree carries no {shown}")))?;
         if carried != database {
-            refuse!("{path} is not the database this checkout compiles");
+            refuse!("{shown} is not the database this checkout compiles");
         }
     }
     Ok(())

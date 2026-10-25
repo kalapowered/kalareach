@@ -749,17 +749,28 @@ fn a_windows_tree_carries_the_powershell_package_as_files() {
         "the tree carries the manifest this checkout commits"
     );
     // A tree that lacks either, or whose copy is not the checkout's, is refused by name.
-    for (path, named) in [
-        (database[1], "share/terminfo"),
-        (database[0], "share/terminfo"),
-        ("share/terminal-capabilities.json", "terminal-capabilities"),
-    ] {
+    for path in [database[1], database[0], "share/terminal-capabilities.json"] {
         let file = tree.join(path);
         let original = std::fs::read(&file).expect("a file of the tree");
         std::fs::remove_file(&file).expect("removed");
+        // A directory the file leaves empty is refused first, as a tree never holds one, so the
+        // directory goes with it and the refusal is the one for the missing file.
+        let directory = file.parent().expect("a directory").to_owned();
+        let emptied = std::fs::read_dir(&directory)
+            .expect("the directory")
+            .next()
+            .is_none();
+        if emptied {
+            std::fs::remove_dir(&directory).expect("an empty directory goes");
+        }
         let refused = run(&manifest_arguments_for(&tree, WINDOWS, "windows=10.0"));
         assert!(!refused.status.success(), "{path} is gone");
-        assert!(why(&refused).contains(named), "{}", why(&refused));
+        assert!(
+            why(&refused).contains(&format!("the tree carries no {path}")),
+            "{}",
+            why(&refused)
+        );
+        std::fs::create_dir_all(&directory).expect("put the directory back");
         std::fs::write(&file, &original).expect("put back");
     }
     for path in [database[0], "share/terminal-capabilities.json"] {
