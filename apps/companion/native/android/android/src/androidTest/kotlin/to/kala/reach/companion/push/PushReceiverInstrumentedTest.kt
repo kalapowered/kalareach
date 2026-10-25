@@ -21,7 +21,9 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import to.kala.reach.companion.mobile.NotificationPlan
 import to.kala.reach.companion.mobile.PendingFile
+import to.kala.reach.companion.mobile.Posting
 import to.kala.reach.companion.mobile.PreviewKeySet
 import to.kala.reach.companion.mobile.PushStores
 import to.kala.reach.platform.KeystoreSealer
@@ -180,6 +182,26 @@ class PushReceiverInstrumentedTest {
             until(30) { shownText(tag) == golden.getString("alert") }
         )
         assertTrue(shownText(tag) != golden.getString("summary"))
+    }
+
+    // KR-REQ-16.15: a preview that opens replaces the alert while it is up, and is not posted over an
+    // alert the person tapped or dismissed meanwhile.
+    @Test
+    fun aPreviewReplacesTheAlertWhileItIsUpAndIsNotPostedOverOneThePersonDismissed() {
+        val tag = "instrumented-" + UUID.randomUUID()
+        val alert = NotificationPlan(tag, "Something needs your attention", "opening")
+        val preview = NotificationPlan(tag, "Allow scripts/release.sh?", "")
+        Notifier.show(context, alert, Posting.NEW)
+        assertTrue("the alert is up", until(30) { shownText(tag) == alert.body })
+
+        Notifier.show(context, preview, Posting.REPLACEMENT)
+        assertTrue("the preview took its place", until(30) { shownText(tag) == preview.body })
+
+        val posted = notifications.activeNotifications.first { it.tag == tag }
+        notifications.cancel(tag, posted.id)
+        assertTrue("the person's dismissal took effect", until(30) { shownText(tag) == null })
+        Notifier.show(context, preview, Posting.REPLACEMENT)
+        assertTrue("the preview is not posted again", !until(5) { shownText(tag) != null })
     }
 
     /** A gateway on this device's loopback interface that answers a post with 200 once it is up. */

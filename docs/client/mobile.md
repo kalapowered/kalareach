@@ -285,8 +285,11 @@ decision in the same order.
 On iOS the extension shows the generic alert the payload carried unless a preview was opened. On
 Android the receiver shows the notification itself where the payload alone decides the content; a
 message that needs the host, or that would run past the callback's budget, goes to the scheduler, whose
-worker makes the same decision and shows the same notification. The decision itself, in both places,
-is:
+worker makes the same decision and shows the same notification. A message that carries a sealed
+preview has its generic alert posted before the preview is opened, and a preview that opens replaces
+it in place, under the same tag and without sounding again, unless the person has tapped or dismissed
+the alert meanwhile: opening runs native code, and a process the system ends in the middle of it
+leaves the alert and not nothing. The decision itself, in both places, is:
 
 1. A message with no preview shows the generic alert the host chose.
 2. A preview this build cannot read, or one whose lifetime has run out, or one addressed to a key
