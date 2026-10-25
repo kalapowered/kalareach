@@ -19,13 +19,17 @@
 use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::io::Write as _;
-use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
+use std::path::Component;
+use std::path::{Path, PathBuf};
 
 use kr_client::shown;
 use kr_client::shown::Shown;
 use kr_protocol::scalars::Digest256;
+#[cfg(unix)]
+use kr_protocol::update::FileMode;
 use kr_protocol::update::{
-    FileMode, FloorSystem, FloorVersion, MANIFEST_FILE, MAX_MANIFEST_LEN, ReleaseManifest,
+    FloorSystem, FloorVersion, MANIFEST_FILE, MAX_MANIFEST_LEN, ReleaseManifest,
 };
 use sha2::Digest as _;
 

@@ -2300,10 +2300,10 @@ fn restart_of(
 /// All of these hold, or the update is deferred before it stops anything and says why: the daemon's
 /// configuration document chooses the standalone start; the daemon was started with exactly the
 /// arguments and in the directory the task's starter gives a daemon, the environment's roots and its
-/// state directory, and no other (a key store named `file` or a worker program among them); it reads
-/// the configuration document this command's environment names; and the task is this installation's
-/// own, as it registers it, so that the task, run after the switch, starts the daemon of the release
-/// `current` then names.
+/// state directory, and no other (a key store named `file` or a worker program among them); and the
+/// task is this installation's own, as it registers it, so that the task, run after the switch,
+/// starts the daemon of the release `current` then names. The daemon's variables are not compared:
+/// the roots are its arguments, and a Windows daemon keeps nothing where a variable says.
 #[cfg(windows)]
 fn restart_by_task(
     environment: &inventory::Environment,
@@ -2354,21 +2354,6 @@ fn restart_by_task(
     if !same(&started_as.working_directory, environment.paths.state_dir()) {
         return Err(deferred(Shown::said(
             "it was started in another directory than the environment's state directory",
-        )));
-    }
-    let ours = crate::doctor::configuration::document_path(&environment.paths);
-    let theirs = started_as
-        .configuration_directory
-        .as_ref()
-        .map(|directory| {
-            std::path::Path::new(directory).join(kr_protocol::hostinfo::configuration::FILE_NAME)
-        });
-    if !theirs.as_deref().is_some_and(|theirs| {
-        ours.to_str()
-            .is_some_and(|ours| same(ours, theirs.as_path()))
-    }) {
-        return Err(deferred(Shown::said(
-            "it reads another configuration document than this command's environment names",
         )));
     }
     crate::startup::task_is_this_installation_s(&environment.paths).map_err(deferred)
