@@ -1934,14 +1934,28 @@ impl Host {
     /// `program` is the daemon the task is to start, which has to be the store's `current`.
     #[cfg(windows)]
     async fn start_daemon(&mut self, program: &Path) {
+        let current = self
+            .store
+            .current()
+            .expect("reads")
+            .map(|name| self.program(&name, Program::Controller));
+        assert!(
+            program == self.store.stable(Program::Controller)
+                || Some(program) == current.as_deref(),
+            "the task starts the daemon of the store's current release"
+        );
+        let program = self.store.stable(Program::Controller);
+        let program = program.as_path();
+        self.register_the_standalone_start();
+        self.start_daemon_by_task(program).await;
+    }
+
+    /// Asks the environment's task, whatever program it names, for a daemon, through a request its
+    /// starter takes, and waits for the daemon to answer.
+    #[cfg(windows)]
+    async fn start_daemon_by_task(&mut self, program: &Path) {
         use kr_controller::supervision::windows as scheduled;
 
-        assert_eq!(
-            program,
-            self.store.stable(Program::Controller),
-            "the task starts the daemon through the store's current release"
-        );
-        self.register_the_standalone_start();
         let environment = self.tree.environment();
         let user = kr_ipc::starter::current_user_sid().expect("this account");
         let definition = scheduled::TaskDefinition::for_setup(user, &environment, program);
@@ -1972,6 +1986,36 @@ impl Host {
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
+
+    /// Starts `program` as this host's daemon by hand, as a person would from a shell and not
+    /// through the environment's task: with `arguments` in `directory`, and with each of `set` added
+    /// to the variables [`Host::command`] gives, and waits for it to answer.
+    #[cfg(windows)]
+    async fn start_daemon_by_hand(
+        &mut self,
+        program: &Path,
+        arguments: &[&str],
+        directory: &Path,
+        set: &[(&str, &Path)],
+    ) {
+        let mut command = self.command(program, arguments);
+        command.current_dir(directory);
+        for (name, value) in set {
+            command.env(name, value);
+        }
+        self.start_daemon_as(command).await;
+    }
+
+    /// The arguments the environment's task gives a daemon: this host's roots, and nothing else.
+    #[cfg(windows)]
+    fn arguments_of_the_tasks_daemon(&self) -> Vec<String> {
+        vec![
+            "--runtime-dir".to_owned(),
+            self.tree.paths().runtime_root().display().to_string(),
+            "--state-dir".to_owned(),
+            self.tree.paths().state_root().display().to_string(),
+        ]
     }
 
     /// Takes this host's task away, as a test that registered one must before it ends.
@@ -2024,7 +2068,6 @@ impl Host {
     }
 
     /// Starts `command` as this host's daemon, in the directory it names, and waits for it to answer.
-    #[cfg(unix)]
     async fn start_daemon_as(&mut self, mut command: Command) {
         let log = self
             .tree
@@ -2407,17 +2450,7 @@ impl Host {
     /// Records an update from `one` to `two` as switched, with the daemon of this host to be
     /// started as it was, whatever runs and whatever `current` names.
     fn record_the_update_as_switched(&self, one: &Assembled, two: &Assembled) {
-        let restart = serde_json::json!({
-            "environment": self.tree.environment_id(),
-            "runtime_root": self.tree.paths().runtime_root(),
-            "state_root": self.tree.paths().state_root(),
-            "start": {
-                "arguments": {
-                    "arguments": self.daemon_arguments(),
-                    "working_directory": self.tree.root(),
-                }
-            },
-        });
+        let restart = self.restart();
         let record = serde_json::json!({
             "format": EARLIER_RECORD_FORMAT,
             "previous": null,
@@ -2440,16 +2473,22 @@ impl Host {
     /// The restart of this host's daemon an update records, as a released build recorded it: how it
     /// is started again, with the arguments it was started with and none of its variables.
     fn restart(&self) -> Value {
-        serde_json::json!({
-            "environment": self.tree.environment_id(),
-            "runtime_root": self.tree.paths().runtime_root(),
-            "state_root": self.tree.paths().state_root(),
-            "start": {
+        // A daemon on Windows is started again by the environment's task and by nothing else.
+        let start = if cfg!(windows) {
+            serde_json::json!("service")
+        } else {
+            serde_json::json!({
                 "arguments": {
                     "arguments": self.daemon_arguments(),
                     "working_directory": self.tree.root(),
                 }
-            },
+            })
+        };
+        serde_json::json!({
+            "environment": self.tree.environment_id(),
+            "runtime_root": self.tree.paths().runtime_root(),
+            "state_root": self.tree.paths().state_root(),
+            "start": start,
         })
     }
 

@@ -1250,17 +1250,7 @@ async fn a_daemon_an_update_prepared_is_taken_back_only_once_no_stop_of_it_can_e
         .attempt
         .0
         .expect("it answers the attempt it began");
-    let restart = serde_json::json!({
-        "environment": host.tree.environment_id(),
-        "runtime_root": host.tree.paths().runtime_root(),
-        "state_root": host.tree.paths().state_root(),
-        "start": {
-            "arguments": {
-                "arguments": host.daemon_arguments(),
-                "working_directory": host.tree.root(),
-            }
-        },
-    });
+    let restart = host.restart();
     let record = serde_json::json!({
         "format": EARLIER_RECORD_FORMAT,
         "update": {
@@ -2618,7 +2608,7 @@ fn a_store_s_startup_entry_sources_the_current_release_s_entry() {
 /// A small release: two files, its root and its manifest, signed by `signer`.
 fn small_release(signer: &Ed25519KeyPair) -> (ReleaseManifest, BTreeMapFiles, String) {
     let files: BTreeMapFiles = [
-        ("bin/kr".to_owned(), b"#!/bin/sh\n".to_vec()),
+        (format!("bin/{}", exe("kr")), b"#!/bin/sh\n".to_vec()),
         (
             "share/update-root.json".to_owned(),
             the_root().as_bytes().to_vec(),
@@ -2633,7 +2623,11 @@ fn small_release(signer: &Ed25519KeyPair) -> (ReleaseManifest, BTreeMapFiles, St
         commit: CommitId::new("b".repeat(40)).expect("a commit"),
         target: this_target().to_owned(),
         os_floor: OsFloor {
-            system: FloorSystem::Macos,
+            system: if cfg!(windows) {
+                FloorSystem::Windows
+            } else {
+                FloorSystem::Macos
+            },
             version: FloorVersion { major: 1, minor: 0 },
         },
         protocol_version: PACKAGE_VERSION,
@@ -3063,7 +3057,6 @@ fn a_sparse_entry_is_refused_as_one() {
 
 /// KR-REQ-26.09: what was written is checked against the manifest: every listed file with its
 /// length and digest, and nothing unlisted.
-#[cfg(unix)]
 #[test]
 fn a_release_is_every_file_its_manifest_lists_and_nothing_else() {
     let (manifest, files, _) = small_release(&keys().targets);
@@ -3088,10 +3081,11 @@ fn a_release_is_every_file_its_manifest_lists_and_nothing_else() {
         (1, Digest256::from_bytes([0; 32])),
     );
     assert!(kr_cli::update::release::check_files(&manifest, &whole).is_ok());
+    let program = format!("bin/{}", exe("kr"));
     let mut changed = files.clone();
-    changed.insert("bin/kr".to_owned(), b"#!/bin/zsh\n".to_vec());
+    changed.insert(program.clone(), b"#!/bin/zsh\n".to_vec());
     let mut missing = files.clone();
-    missing.remove("bin/kr");
+    missing.remove(&program);
     let mut extra = files;
     extra.insert("share/extra".to_owned(), b"x".to_vec());
     for (what, files) in [("changed", changed), ("missing", missing), ("extra", extra)] {
@@ -10304,4 +10298,229 @@ fn the_digest_follows_what_a_store_keeps_and_not_how_it_is_written() {
         "string",
         "a property that is called description is a property, not prose"
     );
+}
+
+/* -------------------------------------------------------------------------------------------- */
+/* Windows: the environment's task starts a daemon again                                         */
+/* -------------------------------------------------------------------------------------------- */
+
+/// Runs `kr host update` for `archive` and checks the update refused to go on: exit 9 naming the
+/// task, the daemon the process it was, `one` still current and nothing recorded.
+#[cfg(windows)]
+async fn the_update_stops_nothing(host: &Host, one: &Assembled, archive: &str, what: &str) {
+    let before = host.daemon_process().await;
+    let (output, said) = host.kr_json(&["host", "update", "--archive", archive, "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(9),
+        "{what}: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let message = said["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("so the update stops nothing"),
+        "{what}: {said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone()),
+        "{what}: nothing was switched"
+    );
+    assert_eq!(
+        host.daemon_process().await,
+        before,
+        "{what}: the daemon it found was never stopped"
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name()),
+        "{what}"
+    );
+    let record = host.record();
+    assert!(record["update"].is_null(), "{what}: {record}");
+}
+
+/// KR-REQ-26.10: an update leaves no host without its daemon. A daemon is created by the
+/// environment's task and by nothing else, so an update stops a daemon only when the task starts it
+/// again as it is: one that was started by hand with another key store, in another directory or with
+/// a home elsewhere, is left running and the update waits, exit 9; one the task would start as it is
+/// is stopped and started again by the task, from the new release.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_stops_no_daemon_the_task_would_not_start_again_as_it_is() {
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    for what in [
+        "a key store of its own",
+        "another working directory",
+        "a home elsewhere",
+    ] {
+        let mut host = Host::bare();
+        host.install(&one);
+        host.register_the_standalone_start();
+        let archive = host.scratch("archives").join("two.zip");
+        two.archive(&archive);
+        let archive = archive.display().to_string();
+        let controller = host.store.stable(Program::Controller);
+        let mut arguments = host.arguments_of_the_tasks_daemon();
+        let mut directory = host.tree.environment().state_dir().to_path_buf();
+        let elsewhere = host.scratch("elsewhere");
+        let mut variables: Vec<(&str, &Path)> = Vec::new();
+        match what {
+            "a key store of its own" => {
+                arguments.extend(["--secret-store".to_owned(), "file".to_owned()]);
+            }
+            "another working directory" => directory = host.tree.root().to_path_buf(),
+            _ => variables.push(("HOME", &elsewhere)),
+        }
+        let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+        host.start_daemon_by_hand(&controller, &arguments, &directory, &variables)
+            .await;
+        the_update_stops_nothing(&host, &one, &archive, what).await;
+        assert!(
+            host.daemons
+                .iter_mut()
+                .all(|daemon| matches!(daemon.try_wait(), Ok(None))),
+            "{what}: the daemon this test started runs on"
+        );
+    }
+
+    // The control: a daemon started by hand exactly as the task starts one is stopped, and the
+    // task starts the new release's daemon.
+    let mut host = Host::bare();
+    host.install(&one);
+    host.register_the_standalone_start();
+    let archive = host.scratch("archives").join("two.zip");
+    two.archive(&archive);
+    let archive = archive.display().to_string();
+    let controller = host.store.stable(Program::Controller);
+    let arguments = host.arguments_of_the_tasks_daemon();
+    let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+    let directory = host.tree.environment().state_dir().to_path_buf();
+    host.start_daemon_by_hand(&controller, &arguments, &directory, &[])
+        .await;
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", two.name()),
+        "the task started the new release's daemon"
+    );
+}
+
+/// KR-REQ-26.10: an update stops no daemon when the environment's task is missing or is not the one
+/// this installation registers, and says to register it; once it is registered as this installation
+/// registers it, the same update goes through.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_stops_no_daemon_when_the_task_is_stale_or_missing() {
+    use kr_controller::supervision::windows as scheduled;
+
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    for what in ["a task that names another program", "no task"] {
+        let mut host = Host::bare();
+        host.install(&one);
+        let controller = host.store.stable(Program::Controller);
+        host.start_daemon(&controller).await;
+        let archive = host.scratch("archives").join("two.zip");
+        two.archive(&archive);
+        let archive = archive.display().to_string();
+        if what == "no task" {
+            host.remove_the_standalone_start();
+        } else {
+            let user = kr_ipc::starter::current_user_sid().expect("this account");
+            let definition = scheduled::TaskDefinition::for_setup(
+                user,
+                &host.tree.environment(),
+                &host.program(one.name(), Program::Kr),
+            );
+            scheduled::register(&definition).expect("the task is made to name another program");
+        }
+        the_update_stops_nothing(&host, &one, &archive, what).await;
+        let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+        let message = said["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("kr host startup --set standalone"),
+            "{what}: the way out is named: {said}"
+        );
+        drop(output);
+
+        host.register_the_standalone_start();
+        let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+        assert!(
+            output.status.success(),
+            "{what}: kr host update: {said} {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            host.daemon_build().await,
+            format!("kr-controller/{}", two.name()),
+            "{what}"
+        );
+    }
+}
+
+/// KR-REQ-26.06: the first install over a build that was run in place leaves that build's task
+/// alone, and the store's `kr` says the task is not this installation's and how to repair it; once
+/// the daemon of the build has been stopped and the task repaired, a session starts under the
+/// store's release.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_first_install_over_a_build_run_in_place_is_started_by_the_repaired_task() {
+    let mut host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let loose = host.scratch("loose");
+    one.write(&loose);
+    let loose_kr = loose.join("bin").join(Program::Kr.file_name());
+    let loose_controller = loose.join("bin").join(Program::Controller.file_name());
+    let started = host.run(&loose_kr, &["host", "startup", "--set", "standalone"]);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    host.start_daemon_by_task(&loose_controller).await;
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name()),
+        "the build run in place serves"
+    );
+
+    host.install(&one);
+    let refused = host.run(
+        &host.store.stable(Program::Kr),
+        &[
+            "new",
+            "--shell-mode",
+            "native_compat",
+            "--invisible",
+            "--headless",
+            "--shell",
+            &default_shell(),
+        ],
+    );
+    assert!(!refused.status.success(), "the stale task is refused");
+    let said = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        said.contains("kr host startup --set standalone"),
+        "the repair is named: {said}"
+    );
+
+    assert!(
+        host.stop_the_daemon().await,
+        "the daemon of the build run in place is stopped through its own door"
+    );
+    host.register_the_standalone_start();
+    let (display, session) = host.new_session(&host.store.stable(Program::Kr));
+    assert_eq!(
+        host.worker_build(session).await,
+        format!("kr-worker/{}", one.name()),
+        "the session runs the store's release"
+    );
+    host.close(&host.store.stable(Program::Kr), &display);
 }
