@@ -239,6 +239,39 @@ impl Door {
         Session::start(Arc::new(transport)).expect("a session")
     }
 
+    /// The loopback socket the host listened on when the device paired, which the device dials.
+    /// A host that is told to bind there keeps the address across a restart.
+    pub fn host_socket(&self) -> std::net::SocketAddr {
+        self.payload
+            .network_config
+            .direct_addresses
+            .iter()
+            .filter_map(|hint| hint.as_str().parse::<std::net::SocketAddr>().ok())
+            .find(|socket| socket.is_ipv4())
+            .expect("the invitation names the host's loopback socket")
+    }
+
+    /// Dials the host once more as the same device and sends it a first request, and says what the
+    /// host answered: nothing when it serves the device, and the refusal when it does not, whether
+    /// the connection was refused or the first request was. A host that is not answering at all
+    /// fails the case, as it does for [`Self::connect_again`].
+    pub async fn is_served_again(&self) -> Result<(), kr_client::ClientError> {
+        let transport = pairing::connect_until_answered(
+            &self.endpoint,
+            pairing::host_addr(&self.payload),
+            &self.identity,
+            &self.host,
+        )
+        .await?;
+        let session = Session::start(Arc::new(transport)).expect("a session");
+        let served = session
+            .read::<(), kr_protocol::hostinfo::HostDoctorResult>(Method::HostDoctor, &())
+            .await
+            .map(|_| ());
+        session.close();
+        served
+    }
+
     /// Pairs a second device, called `name`, as a guest: it holds no right and no session, as a
     /// person who is shown one session holds none until a share names it. The first owner confirms
     /// it with this device's keys.

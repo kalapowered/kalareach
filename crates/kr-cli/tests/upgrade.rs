@@ -539,6 +539,23 @@ struct ContactPipes {
     from_server: PathBuf,
 }
 
+/// Writes the configuration document that puts `host`'s daemon on the network, bound to `address`
+/// on loopback, with no relay and no discovery. A daemon reads it when it starts.
+fn bind_the_network_at(host: &Host, address: &str) {
+    let mut document = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
+    document.revision = 1;
+    document.network.enabled = Nullable::some(true);
+    document.network.bind_address = Nullable::some(address.to_owned());
+    let path = kr_worker::config::document_path(&host.tree.environment());
+    std::fs::create_dir_all(path.parent().expect("the document has a directory"))
+        .expect("the state directory");
+    kr_ipc::paths::write_owner_only_file(
+        &path,
+        kr_protocol::hostinfo::configuration::contents(&document).as_bytes(),
+    )
+    .expect("the configuration document");
+}
+
 impl Updated {
     async fn new() -> Self {
         Self::start(Setup::default()).await
@@ -613,18 +630,7 @@ impl Updated {
         if on_the_network {
             // The document is what puts a host on the network: this one joins on loopback alone,
             // and selects no relay and no discovery.
-            let mut document = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
-            document.revision = 1;
-            document.network.enabled = Nullable::some(true);
-            document.network.bind_address = Nullable::some("127.0.0.1:0".to_owned());
-            let path = kr_worker::config::document_path(&host.tree.environment());
-            std::fs::create_dir_all(path.parent().expect("the document has a directory"))
-                .expect("the state directory");
-            kr_ipc::paths::write_owner_only_file(
-                &path,
-                kr_protocol::hostinfo::configuration::contents(&document).as_bytes(),
-            )
-            .expect("the configuration document");
+            bind_the_network_at(&host, "127.0.0.1:0");
         }
         if plugin {
             install_plugin(&host).await;
@@ -3985,26 +3991,50 @@ async fn a_stored_apply_node_is_admitted_across_an_update_and_a_rollback() {
 }
 
 /// KR-REQ-26.10, KR-REQ-26.08, KR-REQ-24.15: the record that a restored policy waits for the person
-/// at the machine is a store of its own that the release before does not name. A rollback to it is
-/// not refused, and it leaves the record where it was, unread: the release before serves the policy
-/// to remote devices as it always did, which is the loss the guide states. An update again finds the
-/// record, and the host waits again, with the record rewritten to name the policy it holds and the
-/// moment the restore was found kept, until the person at the machine confirms.
+/// at the machine is a store of its own that the release before does not name. A host that reads it
+/// refuses an owner device for the wait. A rollback to the release before is not refused, and it
+/// leaves the record where it was, unread: the release before serves the same device, which is the
+/// loss the guide states. An update again finds the record, and the host waits again, refusing the
+/// device and with the record rewritten to name the policy it holds and the moment the restore was
+/// found kept, until the person at the machine confirms.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_leaves_the_record_of_a_restored_policy_and_an_update_again_waits_on_it() {
     use kr_controller::grants::restored::{self, Found, Record};
     use kr_protocol::organisation::{HostPolicyConfirmParams, HostPolicyConfirmResult};
 
-    let updated = Updated::on_the_network().await;
-    let host = &updated.host;
-    let environment = host.tree.environment();
+    let mut updated = Updated::on_the_network().await;
+    let environment = updated.host.tree.environment();
     let file = restored::file_beside(&environment.registry_database());
+    let endpoint = environment.controller_endpoint().expect("an endpoint");
+
+    // An owner device is paired with this release's daemon, and the host binds where it listens
+    // now, so that the device dials the same socket after each restart.
+    let door =
+        door::Door::pair_the_first_owner(&endpoint, updated.host.tree.environment_id()).await;
+    door.is_served_again()
+        .await
+        .expect("the control: with no wait standing the owner device is served");
+    assert!(updated.host.stop_the_daemon().await, "the daemon stops");
+    bind_the_network_at(&updated.host, &door.host_socket().to_string());
     let found = Record::of(
         kr_protocol::scalars::Digest256::from_bytes([7; 32]),
         kr_protocol::scalars::TimestampMs::new(1_000),
     );
     restored::write(&file, &found).expect("a record of a restore");
     let written = std::fs::read(&file).expect("the record reads");
+    let controller = updated.host.store.stable(Program::Controller);
+    updated.host.start_daemon(&controller).await;
+    let host = &updated.host;
+    let refusal = door
+        .is_served_again()
+        .await
+        .expect_err("a daemon that reads the record refuses the device for the wait");
+    assert!(
+        refusal
+            .to_string()
+            .contains("restored from an earlier state"),
+        "refused for the restored policy: {refusal}"
+    );
 
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
@@ -4023,6 +4053,9 @@ async fn a_rollback_leaves_the_record_of_a_restored_policy_and_an_update_again_w
         written,
         "the release before leaves the record alone"
     );
+    door.is_served_again()
+        .await
+        .expect("the release before does not read the record, and serves the device");
 
     let archive = host.scratch("archives").join("two-again.tar.gz");
     updated.two.archive(&archive);
@@ -4055,8 +4088,17 @@ async fn a_rollback_leaves_the_record_of_a_restored_policy_and_an_update_again_w
         named.found_at_ms, found.found_at_ms,
         "and the moment the restore was found stays"
     );
+    let refusal = door
+        .is_served_again()
+        .await
+        .expect_err("the host waits again and refuses the device");
+    assert!(
+        refusal
+            .to_string()
+            .contains("restored from an earlier state"),
+        "refused for the restored policy again: {refusal}"
+    );
 
-    let endpoint = environment.controller_endpoint().expect("an endpoint");
     let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
         .await
         .expect("reaches the daemon");
@@ -4071,6 +4113,9 @@ async fn a_rollback_leaves_the_record_of_a_restored_policy_and_an_update_again_w
     .expect("the person at this machine confirms");
     assert!(confirmed.lifted, "the update again found a wait to end");
     assert_eq!(restored::read(&file), Found::Missing, "and it ended it");
+    door.is_served_again()
+        .await
+        .expect("the confirmation lifts the refusal and the device is served");
     updated.the_worker_is_as_it_was().await;
     host.close(&updated.kr_before(), &updated.display);
     host.worker_ended(&updated.worker).await;
