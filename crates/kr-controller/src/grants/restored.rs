@@ -158,23 +158,34 @@ fn publish(file: &Path, bytes: &[u8]) -> Result<()> {
         .map_err(|error| ControllerError::registry(error.to_string()))
 }
 
+/// Flushes the directory the file is in, after a name in it was given or taken away.
+fn flush_beside(file: &Path) -> std::io::Result<()> {
+    kr_flush::flush_directory(
+        file.parent().unwrap_or_else(|| Path::new(".")),
+        kr_flush::NameKind::File,
+    )
+}
+
 /// Removes the file, flushing the directory so that a stop that follows does not bring it back.
 /// A file that is not there is removed already.
 ///
 /// # Errors
 ///
 /// Returns an error when the file cannot be removed: while another program holds it, or when
-/// something other than a file is there.
+/// something other than a file is there. When the file was removed and the directory then could
+/// not be flushed, the file is gone and the error says the removal is not known to be durable.
 pub fn remove(file: &Path) -> Result<()> {
     let refused = |error: std::io::Error| {
         ControllerError::registry(format!("could not remove {}: {error}", file.display()))
     };
     match kr_flush::retry_while_held(|| std::fs::remove_file(file)) {
-        Ok(()) => kr_flush::flush_directory(
-            file.parent().unwrap_or_else(|| Path::new(".")),
-            kr_flush::NameKind::File,
-        )
-        .map_err(refused),
+        Ok(()) => flush_beside(file).map_err(|error| {
+            ControllerError::registry(format!(
+                "removed {}, but the directory could not be flushed, so the removal is not known \
+                 to be durable: {error}",
+                file.display()
+            ))
+        }),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(refused(error)),
     }
@@ -183,8 +194,9 @@ pub fn remove(file: &Path) -> Result<()> {
 /// The record this daemon knows to be on disk, and where.
 ///
 /// A record counts as durable only when a write of it returned success in this run, or a start read
-/// it from disk. A write that failed after the rename leaves a file with the right bytes that a
-/// crash can still lose, so a matching file proves nothing: the next call writes again.
+/// it from disk and then flushed the directory it is in. A write that failed after the rename
+/// leaves a file with the right bytes that a crash can still lose, so a matching file proves
+/// nothing: the next call writes again.
 #[derive(Debug)]
 pub struct Kept {
     file: PathBuf,
@@ -207,9 +219,14 @@ impl Kept {
         &self.file
     }
 
-    /// Takes a record a start read from disk as durable.
+    /// Takes a record a start read from disk as durable once the directory it is in is flushed.
+    ///
+    /// An earlier run can have stopped after the rename that gave the file its name, when the
+    /// flush that makes the name survive a crash failed. The file reads the same, so the flush is
+    /// made here. A flush that fails leaves the record unproven, and the next call to
+    /// [`Self::ensure`] writes it again.
     pub fn adopt(&mut self, record: Record) {
-        self.durable = Some(record);
+        self.durable = flush_beside(&self.file).is_ok().then_some(record);
     }
 
     /// The record known to be durable.
@@ -255,11 +272,16 @@ impl Kept {
     ///
     /// # Errors
     ///
-    /// Returns the removal's error; the file and what the daemon knows are then as they were.
+    /// Returns the removal's error. The file and what the daemon knows are then as they were,
+    /// except when the file was removed and the directory could not be flushed: the file is gone,
+    /// the daemon no longer holds it as on disk, and the error says the removal is not known to be
+    /// durable.
     pub fn lift(&mut self) -> Result<()> {
-        remove(&self.file)?;
-        self.durable = None;
-        Ok(())
+        let removed = remove(&self.file);
+        if matches!(self.file.try_exists(), Ok(false)) {
+            self.durable = None;
+        }
+        removed
     }
 }
 
@@ -483,7 +505,7 @@ mod tests {
     }
 
     /// A write that fails after the rename leaves a file with the right bytes that a crash can
-    /// lose, so the daemon writes again, with the moment the restore was first found.
+    /// lose, so the daemon writes again, and the moment kept is that of the write that held.
     #[test]
     fn a_write_that_failed_after_the_rename_is_written_again() {
         let (_directory, file) = tree();
@@ -522,5 +544,78 @@ mod tests {
         kept.lift().expect("lifted");
         assert!(kept.record().is_none());
         assert_eq!(read(&file), Found::Missing);
+    }
+
+    /// A flush that failed leaves the renamed file readable. A daemon that starts and reads it does
+    /// not count it as durable, or a pass would carry out and raise the registry on a record that
+    /// a crash can still lose.
+    #[test]
+    fn a_record_whose_directory_could_not_be_flushed_is_written_again_after_a_start() {
+        let (_directory, file) = tree();
+        let subject = subject_of(&row());
+        let directory = file.parent().expect("a directory").to_path_buf();
+        let refused = kr_flush::testing::refuse_flushes_of(directory);
+        let mut earlier = Kept::new(file.clone());
+        assert!(
+            earlier.ensure(subject, 100).is_err(),
+            "the write is not known to be durable"
+        );
+        let Found::Record(read) = read(&file) else {
+            panic!("the bytes are there");
+        };
+
+        let mut started = Kept::new(file.clone());
+        started.adopt(read.clone());
+        assert!(
+            started.record().is_none(),
+            "a record read while the directory cannot be flushed is not proven"
+        );
+        let mut written = 0;
+        let again = started.ensure_by(subject, 200, |file, bytes| {
+            written += 1;
+            publish(file, bytes)
+        });
+        assert!(again.is_err(), "and the write still cannot be proven");
+        assert_eq!(written, 1, "the record is written again");
+
+        drop(refused);
+        let mut flushed = Kept::new(file);
+        flushed.adopt(read.clone());
+        assert_eq!(
+            flushed.record(),
+            Some(&read),
+            "durable once the flush holds"
+        );
+        flushed
+            .ensure_by(subject, 300, |_, _| {
+                panic!("a durable record is not written again")
+            })
+            .expect("nothing to do");
+    }
+
+    /// A removal whose directory flush failed has taken the file away: the daemon no longer holds
+    /// the record as on disk, and the next finding writes it again.
+    #[test]
+    fn a_removal_whose_directory_could_not_be_flushed_is_not_held_as_on_disk() {
+        let (_directory, file) = tree();
+        let subject = subject_of(&row());
+        let mut kept = Kept::new(file.clone());
+        kept.ensure(subject, 100).expect("written");
+        {
+            let directory = file.parent().expect("a directory").to_path_buf();
+            let _refused = kr_flush::testing::refuse_flushes_of(directory);
+            assert!(
+                kept.lift().is_err(),
+                "the removal is not known to be durable"
+            );
+        }
+        assert_eq!(read(&file), Found::Missing, "the file is gone");
+        assert!(
+            kept.record().is_none(),
+            "and the daemon does not hold it as on disk"
+        );
+        kept.ensure(subject, 200)
+            .expect("a finding writes it again");
+        assert!(matches!(read(&file), Found::Record(_)));
     }
 }
