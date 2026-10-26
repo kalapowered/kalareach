@@ -4152,3 +4152,48 @@ async fn a_press_that_names_more_than_the_command_and_its_quote_is_refused_unrea
     assert_eq!(refused["code"], "INVALID_ARGUMENT", "{refused}");
     assert!(link.quiet_for(QUIET).await, "nothing reached the session");
 }
+
+/// KR-REQ-13.11: a launch the session has not answered when the view ends may have been installed,
+/// so the page is told the outcome is unknown and never that nothing was typed. A launch that never
+/// reached the session, because the view had ended before it, is still told as a lost lease.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_launch_still_waiting_when_its_view_ends_is_an_unknown_outcome() {
+    let press = json!({
+        "command": { "arguments": ["claude"] },
+        "expected_prompt_generation": "12",
+        "expected_buffer_revision": "3",
+    });
+    for ending in ["lost", "closed"] {
+        let mut worker = ScriptedWorker::start(Challenge::Answered);
+        let page = Page::new(worker.paths());
+        let mut lease = WorkerLease::default();
+        let (view, mut link) =
+            controlling(&page, &mut worker, 3, &reporting(Mouse::Sgr), &mut lease).await;
+        let pressing = page.invoke_later(
+            "terminal_view_launch",
+            json!({ "view": view, "press": press }),
+        );
+        link.expect(Method::ShellLaunch).await;
+        if ending == "lost" {
+            drop(link);
+        } else {
+            page.close(&view);
+        }
+        let told = pressing
+            .await
+            .expect("joins")
+            .expect_err("the view ended before the session answered");
+        assert_eq!(code(&told), "OUTCOME_UNKNOWN", "{ending}: {told}");
+        page.held_becomes(0).await;
+
+        let late = page
+            .invoke_later(
+                "terminal_view_launch",
+                json!({ "view": view, "press": press }),
+            )
+            .await
+            .expect("joins")
+            .expect_err("the view has ended");
+        assert_eq!(code(&late), "LEASE_LOST", "{ending}: {late}");
+    }
+}

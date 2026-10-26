@@ -80,6 +80,10 @@ pub(super) type Reply<T> = tokio::sync::oneshot::Sender<Result<T, CommandError>>
 /// What a view says to a launch surface read or a launch that reaches it before it is attached.
 const STILL_OPENING: &str = "This view is still opening.";
 
+/// What a view says to a launch the session had not answered when the view ended.
+const LAUNCH_UNANSWERED: &str =
+    "This view ended before the session said whether the launch was installed.";
+
 /// How many recoveries in a row may pass without a complete screen before the view ends.
 ///
 /// A recovery asks the session for a fresh screen. A host whose screens never decode would have the
@@ -266,6 +270,7 @@ pub(super) async fn run(
     };
     view.publish_state();
     let ended = view.serve(&mut commands).await;
+    view.end_launches();
     if let Some(reason) = ended.reason {
         (view.publish)(TerminalViewState::Ended { reason });
     }
@@ -1313,14 +1318,27 @@ impl View {
     async fn launch(&mut self, press: Press, reply: Reply<ShellLaunchResult>) -> Option<Ending> {
         let params = press.for_session(self.session_id);
         let request_id = self.next_id();
+        // Kept before the write: a write that failed may have left in part, and the launch is then
+        // not known to have failed.
+        self.launches.insert(request_id, reply);
         if !self
             .mutation(request_id, Method::ShellLaunch, &params)
             .await
         {
             return Some(self.lost());
         }
-        self.launches.insert(request_id, reply);
         None
+    }
+
+    /// Answers every launch still waiting when the view ends: the session may have installed it
+    /// before the link went, so it is not known to have failed.
+    fn end_launches(&mut self) {
+        for reply in std::mem::take(&mut self.launches).into_values() {
+            let _ = reply.send(Err(CommandError::stated(
+                ErrorCode::OutcomeUnknown,
+                LAUNCH_UNANSWERED,
+            )));
+        }
     }
 
     /// Writes one read on the link without waiting for its answer.
