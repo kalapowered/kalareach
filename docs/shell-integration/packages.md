@@ -142,8 +142,9 @@ callback therefore classifies typeahead wrongly. So:
   keeps the reader's idle report and mailbox read from running, since the characters it is taking
   are not yet ones the reader has acted on.
 - **`rl_read_key` records the input source** in four of its branches: pending input, a macro, the
-  reader's own buffer, and the terminal. The branch that calls the event hook records none, so a
-  character read there keeps the source of the one before it.
+  reader's own buffer, and the terminal. The branch that calls the event hook records none and
+  reads no mailbox, so the patch leaves it as it is: the Bash this package pins never sets an
+  event hook, and no read reaches that branch.
 - **A cancellation returns a negative key.** `KR_RL_CANCEL` is negative and distinct from `EOF` and
   `READERR`, so `_rl_dispatch_subseq`, `_rl_insert_next`, `rl_digit_loop` and `rl_vi_domove` each
   end their own operation through the path they already have for a negative key, which runs

@@ -104,20 +104,7 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
  
        /* If the user has an event function, then call it periodically. */
        if (rl_event_hook)
-@@ -814,13 +836,25 @@
- 	      RL_CHECK_SIGNALS ();
- 	      if (rl_done)		/* XXX - experimental */
- 		return ('\n');
-+	      /* The reader has nothing buffered, so its mailbox is read here too. */
-+	      if (kr_rl_fd () >= 0)
-+		{
-+		  kr_rl_idle ();
-+		  if (kr_rl_wait ())
-+		    return (KR_RL_CANCEL);
-+		}
- 	      (*rl_event_hook) ();
- 	    }
- 	}
+@@ -820,7 +842,12 @@
        else
  	{
  	  if (rl_get_char (&c) == 0)
@@ -131,7 +118,7 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
  /* fprintf(stderr, "rl_read_key: calling RL_CHECK_SIGNALS: _rl_caught_signal = %d\r\n", _rl_caught_signal); */
  	  RL_CHECK_SIGNALS ();
  	}
-@@ -837,10 +871,22 @@
+@@ -837,10 +864,22 @@
    int fd;
  #if defined (HAVE_PSELECT) || defined (HAVE_SELECT)
    sigset_t empty_set;
@@ -155,7 +142,7 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
    while (1)
      {
        osig = _rl_caught_signal;
-@@ -870,16 +916,38 @@
+@@ -870,16 +909,38 @@
        /* At this point, if we have pselect, we're using select/pselect for the
  	 timeouts. We handled MinGW above. */
        FD_ZERO (&readfds);
