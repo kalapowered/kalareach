@@ -5,7 +5,7 @@
 //! person's clients attach, and are checked against the session's own screen until after the next
 //! buffer switch. What is checked is written in `kr_faults::restore`.
 //!
-//! The last three tests plant a defect in the terminal of the session's size, and show that each
+//! The tests that end the file plant a defect in what the clients are given, and show that each
 //! check fails on the defect it is there for: a check that could not fail would pass here for
 //! nothing.
 
@@ -43,9 +43,13 @@ fn restored(name: &str) -> Outcome {
     outcome
 }
 
-/// What the session holds of each screen's Kitty keyboard flags at the end of every write of a
-/// corpus: the buffer that is showing, then the primary buffer's flags and the alternate buffer's.
-fn flags_after_each_write(corpus: &Corpus) -> Vec<(ActiveBuffer, Option<u8>, Option<u8>)> {
+/// One screen's Kitty keyboard negotiation: the flags in force and the stack behind them.
+type Negotiation = (Option<u8>, Vec<u8>);
+
+/// What the session holds of each screen's Kitty keyboard negotiation at the end of every write of
+/// a corpus: the buffer that is showing, then the primary buffer's negotiation and the alternate
+/// buffer's.
+fn negotiation_after_each_write(corpus: &Corpus) -> Vec<(ActiveBuffer, Negotiation, Negotiation)> {
     let size = GridSize {
         cols: u32::from(corpus.columns),
         rows: u32::from(corpus.rows),
@@ -67,10 +71,11 @@ fn flags_after_each_write(corpus: &Corpus) -> Vec<(ActiveBuffer, Option<u8>, Opt
         .map(|write| {
             engine.feed(write, 0);
             let (snapshot, _) = engine.snapshot_without_rows(viewport, 0);
+            let keyboard = snapshot.keyboard;
             (
                 snapshot.active_buffer,
-                snapshot.keyboard.primary.flags,
-                snapshot.keyboard.alternate.flags,
+                (keyboard.primary.flags, keyboard.primary.stack),
+                (keyboard.alternate.flags, keyboard.alternate.stack),
             )
         })
         .collect()
@@ -129,27 +134,28 @@ fn a_client_arriving_after_a_cursor_was_saved_in_origin_mode_holds_the_screen() 
 }
 
 /// KR-REQ-27.06: a client that arrives before, inside or after a full-screen application's switch
-/// into the alternate buffer holds the Kitty keyboard flags of both screens, the one that is not
-/// showing included, while the shell and the application each hold flags of their own: the shell's
-/// are the ones in force again when the application leaves, and the application's are not the
-/// shell's.
+/// into the alternate buffer holds the Kitty keyboard flags and stack of both screens, the one
+/// that is not showing included, and a terminal drawn from them encodes keys for the screen in
+/// view. The shell's are the ones in force when the application leaves with its own still set, and
+/// the application's stay on the alternate buffer.
 #[test]
 fn a_client_arriving_across_a_switch_holds_the_keyboard_flags_of_both_screens() {
     use ActiveBuffer::{Alternate, Primary};
+    let none = || -> Negotiation { (None, Vec::new()) };
     let corpus = corpus("keyboard-flags");
     assert_eq!(
-        flags_after_each_write(&corpus),
+        negotiation_after_each_write(&corpus),
         [
-            (Primary, None, None),
-            (Primary, Some(5), None),
-            (Alternate, Some(5), None),
-            (Alternate, Some(5), Some(3)),
-            (Alternate, Some(5), Some(11)),
-            (Primary, Some(5), Some(0)),
-            (Primary, Some(1), Some(0)),
+            (Primary, none(), none()),
+            (Primary, (Some(5), vec![]), none()),
+            (Alternate, (Some(5), vec![]), none()),
+            (Alternate, (Some(5), vec![]), (Some(3), vec![])),
+            (Alternate, (Some(5), vec![]), (Some(11), vec![3])),
+            (Primary, (Some(5), vec![]), (Some(11), vec![3])),
+            (Primary, (Some(1), vec![]), (Some(11), vec![3])),
         ],
-        "the corpus puts flags on each screen, with the other screen's in force while the \
-         application shows"
+        "the corpus puts flags on each screen, with the shell's in force while the application \
+         shows and the application's left behind when it leaves"
     );
     let outcome = restored("keyboard-flags");
     assert!(
@@ -308,9 +314,10 @@ fn a_terminal_handed_the_output_from_where_it_arrived_fails_the_check_it_is_ther
     );
 }
 
-/// A restoration whose snapshot leaves out the keyboard flags of the buffer that is not showing
-/// leaves a client without the flags its session holds there, whether it draws the projection
-/// itself or has a terminal drawn from it, and the check taken while the application runs says so.
+/// A session whose projection snapshots leave out the keyboard flags of the buffer that is not
+/// showing leaves every client without the flags the output negotiated there, whether it draws the
+/// projection itself or has a terminal drawn from it, and the check taken while the application
+/// runs says so.
 #[test]
 fn a_restoration_without_the_keyboard_of_the_other_buffer_fails_the_check_it_is_there_for() {
     let outcome = run(&corpus("keyboard-flags"), Strategy::WithoutOtherKeyboard)

@@ -87,8 +87,9 @@ pub enum Strategy {
     /// A restoration whose switches into and out of the buffer that is not showing go the other
     /// way, so that buffer's rows land in the one that shows and the other way round.
     ReversedSwitch,
-    /// A projection whose snapshot carries the keyboard negotiation of the buffer that is showing
-    /// and none of the one that is not, as though only the screen in view were restored.
+    /// A session whose projection snapshots carry the keyboard negotiation of the buffer that is
+    /// showing and none of the one that is not, to every client and to the probe that reads the
+    /// session's own screen, as though only the screen in view were restored.
     WithoutOtherKeyboard,
 }
 
@@ -407,6 +408,11 @@ fn compare(client: &mut Client, expected: &View) -> Result<Vec<String>, String> 
                 if parts == Parts::Painted && waiting_to_wrap {
                     differences.retain(|line| !line.starts_with("cursor at"));
                 }
+                // A painter installs the flags and the level in force, whichever buffer it
+                // draws, so the terminal then encodes the next key as the session expects.
+                if parts == Parts::Painted {
+                    differences.extend(got.encoding_differences(expected));
+                }
                 found.extend(
                     differences
                         .into_iter()
@@ -580,7 +586,7 @@ pub(crate) struct Stage {
     strategy: Strategy,
     /// What each direct client's terminal is in when its restoration reaches it.
     beforehand: Beforehand,
-    /// The terminal each direct client says it is.
+    /// The terminal each client says it is.
     terminal: String,
     /// An engine of the profile fed the same output, which a corpus run reads the keyboard
     /// protocol the screen should hold from. The session's screen reaches every client through one
@@ -983,11 +989,7 @@ impl Stage {
     }
 
     fn projected(&mut self, client: &mut Client, event: ProjectionEvent) -> Result<(), String> {
-        let event = if self.strategy == Strategy::WithoutOtherKeyboard {
-            without_the_keyboard_of_the_buffer_not_showing(event)
-        } else {
-            event
-        };
+        let event = self.mutated(event);
         let refused = matches!(client.projection.apply(event.clone()), Applied::Refused(_));
         let mut again = refused;
         if client.form == Form::Direct
@@ -1007,6 +1009,15 @@ impl Stage {
             self.subscribe(client)?;
         }
         Ok(())
+    }
+
+    /// A projection event as the strategy has the session produce it.
+    fn mutated(&self, event: ProjectionEvent) -> ProjectionEvent {
+        if self.strategy == Strategy::WithoutOtherKeyboard {
+            without_the_keyboard_of_the_buffer_not_showing(event)
+        } else {
+            event
+        }
     }
 
     /// Reads byte `point` of the corpus into the session, as the read loop would.
@@ -1051,7 +1062,7 @@ impl Stage {
         while let Some(delivery) = stream.try_recv() {
             stream.written(delivery.len());
             if let OutputDelivery::Projection { event, .. } = delivery {
-                let _ = projection.apply(*event);
+                let _ = projection.apply(self.mutated(*event));
             }
         }
         let _ = self.session.detach(probe);

@@ -1,17 +1,17 @@
 {
   "format": "kalareach.restore-corpus/1",
   "name": "keyboard-flags",
-  "about": "a shell that negotiates Kitty keyboard flags, a full-screen application that negotiates its own on the alternate buffer (set, pushed and popped) and leaves, and the shell negotiating again",
+  "about": "a shell that sets Kitty keyboard flags, a full-screen application that sets and then pushes its own on the alternate buffer (entered through mode 1047, which saves no cursor) and leaves them in force, and the shell setting its flags again",
   "columns": 24,
   "rows": 5,
   "terminal": "xterm-kitty",
   "writes": [
     { "text": "$ ls\r\nfile1  file2\r\n" },
     { "text": "\u001b[=5;1u$ vi notes\r\n" },
-    { "text": "\u001b[?1049h\u001b[H\u001b[2J" },
-    { "text": "\u001b[>3u\u001b[1;1H notes \u001b[2;1Hline one" },
-    { "text": "\u001b[=11;1u\u001b[3;1Hline two" },
-    { "text": "\u001b[<u\u001b[?1049l" },
+    { "text": "\u001b[?1047h\u001b[H\u001b[2J" },
+    { "text": "\u001b[=3;1u\u001b[1;1H notes \u001b[2;1Hline one" },
+    { "text": "\u001b[>11u\u001b[3;1Hline two" },
+    { "text": "\u001b[?1047l" },
     { "text": "$ \u001b[=1;1u" }
   ]
 }

@@ -12,14 +12,14 @@
 //!   "about": "a full-screen application entered and left through mode 1049",
 //!   "columns": 24,
 //!   "rows": 6,
-//!   "terminal": "xterm-kitty",
 //!   "writes": [{ "text": "shell$ vi\r\n" }, { "hex": "1b5b3f3130343968" }]
 //! }
 //! ```
 //!
-//! `terminal` is optional: it names the terminal the client of the session's size says it is, which
-//! decides the keyboard encodings that client can be given the input lease for. A corpus whose
-//! application negotiates the Kitty keyboard protocol names a terminal that implements it.
+//! A corpus may also name the `terminal` both clients say they are, `"xterm-256color"` when it names
+//! none. It decides which keyboard encodings the client of the session's size can be given the input
+//! lease for, so a corpus whose application negotiates the Kitty keyboard protocol names a terminal
+//! that implements it: `"terminal": "xterm-kitty"`.
 
 use std::path::{Path, PathBuf};
 
@@ -28,8 +28,8 @@ use serde::Deserialize;
 /// The format every corpus names, so a file of another shape is refused rather than misread.
 pub const FORMAT: &str = "kalareach.restore-corpus/1";
 
-/// The terminal a client of the session's size says it is, unless its corpus names another: one
-/// the session hands its stream to.
+/// The terminal the clients say they are, unless their corpus names another: one the session hands
+/// its stream to.
 pub const TERMINAL: &str = "xterm-256color";
 
 /// Where the corpora are kept, from this crate's own directory.
@@ -49,7 +49,7 @@ pub struct Corpus {
     pub columns: u16,
     /// The session's rows.
     pub rows: u16,
-    /// The terminal the client of the session's size says it is.
+    /// The terminal both clients say they are.
     pub terminal: String,
     /// The writes, in order.
     pub writes: Vec<Vec<u8>>,

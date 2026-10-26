@@ -283,6 +283,28 @@ impl View {
             .ok_or_else(|| "the installation did not complete a screen".to_owned())
     }
 
+    /// Where the keys this view's terminal would encode differ from `expected`'s: the
+    /// `modifyOtherKeys` level and the Kitty flags of the buffer each view shows. Nothing else of the
+    /// keyboard protocol decides how the next key is written.
+    #[must_use]
+    pub fn encoding_differences(&self, expected: &Self) -> Vec<String> {
+        let in_force = |view: &Self| {
+            let buffer = match view.active {
+                ProjectedBuffer::Primary => &view.keyboard.primary,
+                ProjectedBuffer::Alternate => &view.keyboard.alternate,
+            };
+            (view.keyboard.modify_other_keys, buffer.flags)
+        };
+        let mut found = Vec::new();
+        field(
+            &mut found,
+            "the keyboard encoding in force",
+            &in_force(self),
+            &in_force(expected),
+        );
+        found
+    }
+
     /// The same view with its keyboard protocol read from `keyboard`, a terminal engine's own
     /// account of what the output negotiated, rather than from a screen that went through the
     /// session's installation. Kitty flags nobody set read as the flags `0`, as they do in
