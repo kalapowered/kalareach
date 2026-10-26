@@ -731,6 +731,21 @@ fn windows() -> Vec<Step> {
                 ],
             )
         },
+        Step {
+            reading: Reading::Build,
+            ..Step::cargo(
+                Group::Rust,
+                "the description process the update suite assembles into releases",
+                &[
+                    "build",
+                    "--locked",
+                    "-p",
+                    "kr-describe-model",
+                    "--bin",
+                    "kr-describe-inference",
+                ],
+            )
+        },
         Step::cargo(
             Group::Rust,
             "the terminal engine, the repository boundary, the attach client and pairing",
