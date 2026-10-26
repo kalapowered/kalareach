@@ -940,19 +940,127 @@ async fn a_root_shell_ended_from_outside_closes_its_session_and_is_not_started_a
     );
 }
 
+/// How many closes are made, at most, for one that the watch saw in full.
+///
+/// Every timing check of the close below is a bound read from a watch that samples the shell. A
+/// watch that was not scheduled at a moment a check depends on, or a close that a busy machine
+/// delayed past what the checks allow for, has seen neither a pass nor a failure: that close says
+/// so, and another is made. A force before five seconds fails at once.
+#[cfg(windows)]
+const CLOSE_ATTEMPTS: usize = 3;
+
+/// Between which moments a watch saw one process end, on both clocks.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+struct Seen {
+    /// The start of the last sample that found it running.
+    running: std::time::Instant,
+    /// The same moment on the system clock, which the closure record is in.
+    running_at: std::time::SystemTime,
+    /// The end of the first sample that found it gone.
+    gone: std::time::Instant,
+    /// The same moment on the system clock.
+    gone_at: std::time::SystemTime,
+}
+
+/// Watches a process from a thread of its own, so that a test whose runtime is busy cannot make
+/// the watch late, and returns once a sample has found the process running.
+///
+/// The process ended after the start of the last sample that found it running and before the end of
+/// the first that found it gone. A watch that is held up afterwards can only leave the interval
+/// between the two wider; it cannot narrow it or move it. A sample the system cannot answer is no
+/// sample: it leaves the interval as it was.
+///
+/// # Panics
+///
+/// Panics when the process is found gone before it was found running, which everything the watch
+/// is for depends on, and when it has not ended within the liveness bound.
+#[cfg(windows)]
+fn watch(root: kr_protocol::identity::ProcessStartIdentity) -> std::thread::JoinHandle<Seen> {
+    use kr_ipc::identity::{ProcessState, process_state};
+    use std::time::{Instant, SystemTime};
+
+    let (ready, began) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        let started = Instant::now();
+        let mut running = None;
+        let mut ready = Some(ready);
+        let gone = loop {
+            let before = (Instant::now(), SystemTime::now());
+            match process_state(&root) {
+                ProcessState::Running => running = Some(before),
+                ProcessState::Ended => break (Instant::now(), SystemTime::now()),
+                ProcessState::Unknown { .. } => {}
+            }
+            // Said after the first sample that found the process running.
+            if running.is_some()
+                && let Some(ready) = ready.take()
+            {
+                let _ = ready.send(());
+            }
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "the shell was still running after {LIVENESS_DEADLINE:?}"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        let (running, running_at) = running.expect("the shell was never seen running");
+        Seen {
+            running,
+            running_at,
+            gone: gone.0,
+            gone_at: gone.1,
+        }
+    });
+    began.recv_timeout(LIVENESS_DEADLINE).unwrap_or_else(|_| {
+        panic!("the watch found the shell running in no sample within {LIVENESS_DEADLINE:?}")
+    });
+    thread
+}
+
 /// KR-REQ-07.53: closing sets the session closing at once and refuses input from then on; what
 /// ignores the request to stop is not forced before five seconds from the request, and is after;
 /// the final status names the reason and the process that needed force, and is recorded within the
 /// two seconds output may drain for.
 ///
-/// The shell here is PowerShell with the console's interrupt turned into a key it never reads,
-/// which is the one request this platform makes of a shell. Whether the five seconds were kept is
-/// read from the first moment the shell is seen gone, polled every 50 ms from the request: a force
-/// before five seconds can only make that moment earlier, and a loaded machine only later.
+/// The shell here is PowerShell with the console's interrupt turned into a key, which is the one
+/// request this platform makes of a shell. It reads the key, records when it did and goes on, so
+/// the grace is counted from the request the worker made and not from the close being asked for;
+/// where it records nothing the grace is counted from the close being asked for, which is no
+/// later than the request, and the case says so. The shell ended after the moment
+/// it was last seen running and before the moment it was first seen gone. A shell gone before
+/// five seconds after the request was forced early, and that fails at once. A shell not seen gone
+/// well past the five seconds, a final status recorded long after the drain and a watch that could
+/// not place the moments may each be a busy machine: that close shows nothing either way and is
+/// made again, and a worker that is late in every close fails.
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_close_forces_what_ignores_it_only_after_five_seconds_and_records_the_final_status() {
+    let mut missed = Vec::new();
+    for attempt in 1..=CLOSE_ATTEMPTS {
+        match a_stubborn_shell_is_closed().await {
+            Ok(()) => return,
+            Err(reason) => {
+                eprintln!("attempt {attempt} shows nothing either way: {reason}");
+                missed.push(reason);
+            }
+        }
+    }
+    panic!(
+        "the moments the checks depend on were missed in each of {CLOSE_ATTEMPTS} attempts: \
+         {missed:?}"
+    );
+}
+
+/// One close of a session whose shell ignores it, watched from before the request.
+///
+/// Returns what the watch missed when it was not scheduled at a moment a check depends on, or the
+/// machine delayed the close past what the checks allow for: such a close shows nothing either
+/// way, and the caller makes another. A force before the five seconds were up fails here.
+#[cfg(windows)]
+async fn a_stubborn_shell_is_closed() -> Result<(), String> {
     use kr_ipc::identity::{ProcessState, process_state};
+    use std::time::{Instant, SystemTime};
 
     /// The grace section 7 gives an owned process between the request to stop and force, and the
     /// time it lets output drain after the owned processes have stopped. They are the specification's
@@ -961,15 +1069,41 @@ async fn a_close_forces_what_ignores_it_only_after_five_seconds_and_records_the_
     const DRAIN_PERIOD: Duration = Duration::from_secs(2);
     /// What the worker is allowed beyond the drain to be scheduled and write the record.
     const RECORD_ALLOWANCE: Duration = Duration::from_secs(1);
-    /// How often the shell is looked for, and so how close to a moment a sample speaks for it.
+    /// How close to a moment a sample has to be to speak for it.
     const RESOLUTION: Duration = Duration::from_millis(50);
+    /// How long the request may take from the worker writing it to the shell reading the key.
+    const REQUEST_LATENCY: Duration = Duration::from_millis(250);
+    /// How far past five seconds after the request the shell may be first seen gone and still be
+    /// held to the grace.
+    ///
+    /// The worker looks for survivors every 50 ms and then forces; where the shell records no
+    /// request it also takes the close up some moments after the close was asked for. A shell not
+    /// seen gone later than that shows nothing either way: a grace that ran on for seconds and a
+    /// watch that was late look the same from here.
+    const GRACE_TOLERANCE: Duration = Duration::from_secs(2);
 
-    let host = host_running(kr_worker::testing::powershell_command(
+    // The shell ignores the interrupt as a signal and reads it as a key, records the time it read
+    // it at, which is the request as the worker made it, and goes on sleeping. A shell that cannot
+    // read keys sleeps from the start and records nothing.
+    let marks = tempfile::tempdir().expect("a directory on the internal disk");
+    let asked_file = marks.path().join("asked");
+    let shell = format!(
         "[Console]::TreatControlCAsInput = $true; \
          Write-Host -NoNewline 'kr-stubborn-ready.'; \
+         try {{ \
+           while ($true) {{ \
+             $key = [Console]::ReadKey($true); \
+             if ($key.KeyChar -eq [char]3) {{ \
+               [IO.File]::WriteAllText('{}', \
+                 [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds().ToString()); \
+               break \
+             }} \
+           }} \
+         }} catch {{ }}; \
          Start-Sleep -Seconds 300",
-    ))
-    .await;
+        asked_file.display()
+    );
+    let host = host_running(kr_worker::testing::powershell_command(&shell)).await;
     let (mut client, mut keys) = attached_holding_the_keys(&host).await;
     common::produced(&host.runtime, b"kr-stubborn-ready.").await;
     let root = host
@@ -978,9 +1112,11 @@ async fn a_close_forces_what_ignores_it_only_after_five_seconds_and_records_the_
         .root_identity()
         .expect("the session has a root shell");
     assert!(matches!(process_state(&root), ProcessState::Running));
+    let shell_watch = watch(root.clone());
 
     // Closing is set at once, whatever the shell does about the request.
-    let requested = std::time::Instant::now();
+    let requested = Instant::now();
+    let requested_at = SystemTime::now();
     let (acceptance, gate) = host.runtime.close(ClosureReason::CloseRequested);
     assert_eq!(
         acceptance.state,
@@ -998,22 +1134,44 @@ async fn a_close_forces_what_ignores_it_only_after_five_seconds_and_records_the_
         "a closing session takes no input"
     );
 
-    // The shell ignores the request, so it is there until the five seconds are over.
-    let gone = loop {
-        if !matches!(process_state(&root), ProcessState::Running) {
-            break requested.elapsed();
+    // The shell ignores the request, so it is there until the five seconds are over, and is forced
+    // then. It ended after how long past the request it was last seen running, and before how long
+    // past the request it was first seen gone. The request is when the shell read the key, which
+    // is no earlier than the worker wrote it; with no record of that it is when the close was
+    // asked for, which is no later than the worker wrote it.
+    let seen = tokio::task::spawn_blocking(move || shell_watch.join().expect("the watch ends"))
+        .await
+        .expect("the watch is waited for");
+    let asked = std::fs::read_to_string(&asked_file)
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .map(|ms| SystemTime::UNIX_EPOCH + Duration::from_millis(ms))
+        .and_then(|read_at| read_at.duration_since(requested_at).ok());
+    match asked {
+        Some(after) => {
+            eprintln!("the shell read the request {after:?} after the close was asked for")
         }
-        assert!(
-            requested.elapsed() < LIVENESS_DEADLINE,
-            "the shell was never ended"
-        );
-        tokio::time::sleep(RESOLUTION).await;
+        None => eprintln!(
+            "the shell recorded no request: the grace is counted from the close being asked for"
+        ),
+    }
+    let (since, slack) = match asked {
+        Some(after) => (after, RESOLUTION + REQUEST_LATENCY),
+        None => (Duration::ZERO, RESOLUTION),
     };
-    let gone_at = std::time::SystemTime::now();
+    let at_most = seen.gone.duration_since(requested).saturating_sub(since);
     assert!(
-        gone + RESOLUTION >= GRACE_PERIOD,
-        "the shell was forced {gone:?} after the request, before the five seconds were up"
+        at_most + slack >= GRACE_PERIOD,
+        "the shell was gone at most {at_most:?} after the request, before the five seconds were up"
     );
+    let at_least = seen.running.duration_since(requested).saturating_sub(since);
+    let mut missed = Vec::new();
+    if at_least + slack < GRACE_PERIOD || at_most > GRACE_PERIOD + GRACE_TOLERANCE {
+        missed.push(format!(
+            "the shell ended between {at_least:?} and {at_most:?} after the request, which the \
+             five seconds cannot be held to"
+        ));
+    }
 
     // The final status: why the session closed and what it needed force for, recorded within the
     // drain.
@@ -1026,14 +1184,30 @@ async fn a_close_forces_what_ignores_it_only_after_five_seconds_and_records_the_
             .any(|process| process.identity == root && process.forced),
         "the record names the shell among what needed force: {record:?}"
     );
-    let recorded_at = std::time::UNIX_EPOCH + Duration::from_millis(record.closed_at_ms.get());
-    assert!(
-        recorded_at.duration_since(gone_at).unwrap_or_default() <= DRAIN_PERIOD + RECORD_ALLOWANCE,
-        "the final status was recorded more than {DRAIN_PERIOD:?} after the shell was gone"
-    );
+
+    // The shell stopped after the last sample that found it running and before the first that found
+    // it gone, and the worker took the record's time within the millisecond that time names; the
+    // drain lies between the two bounds that makes.
+    let recorded_from = SystemTime::UNIX_EPOCH + Duration::from_millis(record.closed_at_ms.get());
+    let recorded_until = recorded_from + Duration::from_millis(1);
+    let longest = recorded_until.duration_since(seen.running_at).ok();
+    let shortest = recorded_from.duration_since(seen.gone_at).ok();
+    if shortest.is_none() || longest.is_none_or(|longest| longest > DRAIN_PERIOD + RECORD_ALLOWANCE)
+    {
+        missed.push(format!(
+            "the drain lay between {shortest:?} and {longest:?}, which the {DRAIN_PERIOD:?} output \
+             may drain for cannot be held to"
+        ));
+    }
+
     let (_, sent) = until_the_closure(&mut client).await;
     assert_eq!(
         sent, record,
         "the attachment was sent the session's own record"
     );
+    if missed.is_empty() {
+        Ok(())
+    } else {
+        Err(missed.join("; "))
+    }
 }
