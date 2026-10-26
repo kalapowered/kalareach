@@ -3982,49 +3982,37 @@ async fn a_view_reads_the_launch_surface_on_its_own_link() {
     );
 }
 
-/// KR-REQ-13.11: a host that does not list the read refuses it as it refuses any method it does not
-/// list, which a grant that lost its right is refused too. The view tells the two apart by what the
-/// same right reads: where `session.read` is answered, the read is asked once more, and a second
-/// refusal is a host that does not serve it; where `session.read` is refused too, the page is given
-/// that refusal.
+/// KR-REQ-13.11: a worker that stated that it serves the launch surface and refuses the read has
+/// refused it for the grant: the page is given that refusal as it is, and the view asks the session
+/// nothing else first. (A paired host's daemon says nothing of its worker, and the view tells an
+/// unlisted method from a lost right there by what the same right reads.)
 #[tokio::test(flavor = "multi_thread")]
-async fn a_host_that_does_not_list_the_launch_surface_is_told_from_a_lost_right() {
+async fn a_worker_that_serves_the_launch_surface_and_refuses_it_is_not_taken_for_one_that_does_not()
+{
     let mut worker = ScriptedWorker::start(Challenge::Answered);
     let page = Page::new(worker.paths());
     let (view, mut link) = showing(&page, &mut worker, 3).await;
 
     let reading = page.invoke_later("terminal_view_launch_surface", json!({ "view": view }));
     let first = link.expect(Method::ShellLaunchSurface).await;
-    link.refuse_with(
-        &first,
-        ErrorCode::PermissionDenied,
-        "not a method this host lists",
-    )
-    .await;
-    let probe = link.expect(Method::SessionRead).await;
-    link.answer(&probe, &json!({})).await;
-    let again = link.expect(Method::ShellLaunchSurface).await;
-    link.refuse_with(
-        &again,
-        ErrorCode::PermissionDenied,
-        "not a method this host lists",
-    )
-    .await;
-    let told = reading.await.expect("joins").expect("an answer");
-    assert_eq!(told, json!({ "state": "not_served" }));
-
-    let reading = page.invoke_later("terminal_view_launch_surface", json!({ "view": view }));
-    let first = link.expect(Method::ShellLaunchSurface).await;
     link.refuse_with(&first, ErrorCode::PermissionDenied, "the right is gone")
         .await;
-    let probe = link.expect(Method::SessionRead).await;
-    link.refuse_with(&probe, ErrorCode::PermissionDenied, "the right is gone")
-        .await;
-    let refused = reading
+    // Answered by the refusal alone: a view that asked the session anything else first would wait
+    // for an answer this test does not give.
+    let refused = tokio::time::timeout(WATCHDOG, reading)
         .await
+        .expect("the page was answered without the view asking anything else")
         .expect("joins")
         .expect_err("the refusal is the grant's");
     assert_eq!(refused["code"], "PERMISSION_DENIED", "{refused}");
+
+    // The next read is the next call on the link: nothing was asked in between.
+    let reading = page.invoke_later("terminal_view_launch_surface", json!({ "view": view }));
+    let again = link.expect(Method::ShellLaunchSurface).await;
+    link.answer(&again, &a_surface_held_here(worker.session_id))
+        .await;
+    let told = reading.await.expect("joins").expect("served");
+    assert_eq!(told["state"], "served", "{told}");
 }
 
 /// KR-REQ-13.11: a worker that lists the read and is of a release that does not serve it refuses it
