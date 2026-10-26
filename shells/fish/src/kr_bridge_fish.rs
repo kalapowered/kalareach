@@ -146,7 +146,6 @@ unsafe extern "C" {
     fn kr_bridge_wants_write() -> c_int;
     fn kr_bridge_cancel_settled();
     fn kr_bridge_lost(loss: c_int, detail: *const c_char);
-    fn kr_bridge_launch_pending() -> c_int;
     fn kr_bridge_take_fence_retry() -> c_int;
     fn kr_bridge_root_process() -> c_int;
     fn kr_bridge_resolve(
@@ -248,12 +247,8 @@ struct BridgeState {
     cancel_requested: bool,
     /// The old lease's undelivered input, dropped once the reader is out of what it was inside.
     cancel_drain: bool,
-    /// The text a launch installed, so a revocation takes exactly that back out.
-    installed: Option<WString>,
     /// Set by the core when it accepts a line; acted on once the core's call has returned.
     accept_requested: bool,
-    /// True once the acceptance has been submitted and the reader has not left with it yet.
-    accept_submitted: bool,
 
     /// The gesture key the named binding is installed on, and what was bound in each mode it
     /// went on before it.
@@ -295,9 +290,7 @@ static STATE: BridgeStateCell = BridgeStateCell(UnsafeCell::new(BridgeState {
     idle_reported: false,
     cancel_requested: false,
     cancel_drain: false,
-    installed: None,
     accept_requested: false,
-    accept_submitted: false,
     gesture_key: None,
     gesture_previous: Vec::new(),
     gesture_bound: false,
@@ -548,40 +541,7 @@ pub unsafe extern "C" fn kr_shell_install_command(text: *const c_char, len: usiz
     let line = bytes2wcstring(bytes);
     data.kr_set_command_line(&line);
 
-    let installed = data.kr_command_line().to_owned();
-    let state = state();
-    let went_in = !installed.is_empty();
-    state.installed = went_in.then_some(installed);
-    c_int::from(went_in)
-}
-
-/// Removes text a launch installed that has not been accepted. Returns non-zero when it came out.
-///
-/// The acceptance this bridge submitted goes with it: a line that was on its way to the editor's
-/// own execute is taken off that way as well as out of the buffer, so a revoked launch leaves
-/// nothing behind wherever the reader had got to.
-#[unsafe(no_mangle)]
-pub extern "C" fn kr_shell_remove_installed() -> c_int {
-    let Some(installed) = state().installed.take() else {
-        return 0;
-    };
-    {
-        let state = state();
-        state.accept_requested = false;
-        state.accept_submitted = false;
-    }
-    let Some(data) = parked_data() else {
-        return 0;
-    };
-    // The acceptance this bridge put in the queue has not run yet if it is still there.
-    data.input_data.queue.retain(|event| {
-        !matches!(event, CharEvent::Readline(readline) if readline.cmd == ReadlineCmd::Execute)
-    });
-    // Only the text this launch installed comes out, and only while it is still all there.
-    if data.kr_command_line() == installed {
-        data.kr_clear_command_line();
-    }
-    1
+    c_int::from(!data.kr_command_line().is_empty())
 }
 
 /// Accepts the installed line.
@@ -831,9 +791,7 @@ pub fn editor_enter(reader: &mut Reader<'_>) {
         state.idle_reported = false;
         state.cancel_requested = false;
         state.cancel_drain = false;
-        state.installed = None;
         state.accept_requested = false;
-        state.accept_submitted = false;
     }
 
     // A reassigned gesture takes effect at the prompt it names, which is this one.
@@ -882,9 +840,7 @@ pub fn editor_leave(reader: &mut Reader<'_>, reason: c_int) {
     {
         let state = state();
         state.reader_depth -= 1;
-        state.installed = None;
         state.accept_requested = false;
-        state.accept_submitted = false;
         state.cancel_requested = false;
         state.cancel_drain = false;
     }
@@ -957,10 +913,7 @@ fn serviced(reader: &mut Reader<'_>) -> (bool, bool) {
 fn settle(reader: &mut Reader<'_>) -> bool {
     let mut interrupted = false;
     if std::mem::take(&mut state().accept_requested) {
-        // The line goes through the editor's own acceptance, submitted at this boundary. The
-        // record of what was installed stays until the reader actually leaves with it: until
-        // then a revocation still has text to take back out.
-        state().accept_submitted = true;
+        // The line goes through the editor's own acceptance, submitted at this boundary.
         reader.push_front(CharEvent::from_readline(ReadlineCmd::Execute, vec![]));
         interrupted = true;
     }
@@ -1073,12 +1026,6 @@ pub fn pass_end(reader: &mut Reader<'_>) {
         });
     }
     let _ = service(reader);
-}
-
-/// True while a launch this bridge installed is waiting to be accepted.
-pub fn launch_pending() -> bool {
-    // Safety: the core keeps this flag and asks nothing of ours to report it.
-    unsafe { kr_bridge_launch_pending() != 0 }
 }
 
 // ---- the commands a line runs -------------------------------------------------------------------

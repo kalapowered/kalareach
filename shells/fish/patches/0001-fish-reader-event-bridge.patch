@@ -623,7 +623,7 @@
  use libc::{
      _POSIX_VDISABLE, SIGINT, STDIN_FILENO, STDOUT_FILENO, VMIN, VQUIT, VSUSP, VTIME, c_char,
  };
-@@ -795,6 +796,82 @@
+@@ -795,6 +796,76 @@
      }
  }
  
@@ -660,12 +660,6 @@
 +    pub(super) fn kr_set_command_line(&mut self, text: &wstr) {
 +        self.set_buffer_maintaining_pager(text, text.len());
 +        self.clear_pager();
-+    }
-+
-+    /// Takes a launch's command back out.
-+    pub(super) fn kr_clear_command_line(&mut self) {
-+        self.clear(EditableLineTag::Commandline);
-+        self.update_buff_pos(EditableLineTag::Commandline, None);
 +    }
 +
 +    /// True while the reader is waiting for a terminal query's own answer.
@@ -706,7 +700,7 @@
  /// Read commands from \c fd until encountering EOF.
  /// The fd is not closed.
  pub fn reader_read(parser: &mut Parser, fd: RawFd, io: &IoChain) -> Result<(), ErrorCode> {
-@@ -2606,6 +2683,10 @@
+@@ -2606,6 +2677,10 @@
          }
          self.exec_prompt(true, false);
  
@@ -717,7 +711,7 @@
          // Start out as initially dirty.
          self.force_exec_prompt_and_repaint = true;
  
-@@ -2622,6 +2703,9 @@
+@@ -2622,6 +2697,9 @@
              if self.handle_char_event(None).is_break() || self.rls().finished {
                  break;
              }
@@ -727,7 +721,7 @@
          }
  
          // Disable tty protocols now that we're going to execute a command.
-@@ -2678,6 +2762,17 @@
+@@ -2678,6 +2756,17 @@
              }
              Outputter::stdoutput().borrow_mut().reset_text_face();
          }
@@ -745,7 +739,7 @@
          let result = self
              .rls()
              .finished
-@@ -2723,6 +2818,9 @@
+@@ -2723,6 +2812,9 @@
          let mut accumulated_chars = WString::new();
  
          while accumulated_chars.len() < limit {
@@ -755,7 +749,7 @@
              let evt = self.read_char();
              let CharEvent::Key(kevt) = &evt else {
                  event_needing_handling = Some(evt);
-@@ -2747,6 +2845,8 @@
+@@ -2747,6 +2839,8 @@
              }
          }
  
@@ -764,7 +758,7 @@
          if !accumulated_chars.is_empty() {
              let (elt, _el) = self.active_edit_line();
              self.insert_string(elt, accumulated_chars);
-@@ -3393,6 +3493,11 @@
+@@ -3393,6 +3487,11 @@
                      self.exit_loop_requested = true;
                      check_exit_loop_maybe_warning(Some(self));
                  }

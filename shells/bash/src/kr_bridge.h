@@ -117,9 +117,6 @@ void kr_shell_reader_state(kr_reader_state *out);
 /* Installs `text` in the empty edit buffer. Returns non-zero when it went in. */
 int kr_shell_install_command(const char *text, size_t len);
 
-/* Removes text a launch installed that has not been accepted. Returns non-zero when it came out. */
-int kr_shell_remove_installed(void);
-
 /* Accepts the installed line, returning from the read loop at the next boundary. */
 void kr_shell_accept_line(void);
 
@@ -215,9 +212,6 @@ void kr_bridge_cancel_settled(void);
 
 /* Reports that the ground the integration stood on has gone. */
 void kr_bridge_lost(int loss, const char *detail);
-
-/* Non-zero while a launch this bridge installed is waiting to be accepted. */
-int kr_bridge_launch_pending(void);
 
 /*
  * Non-zero once, after the worker has said it holds no fence for this reader (an exchange that

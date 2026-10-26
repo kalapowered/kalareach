@@ -94,9 +94,6 @@ static int kr_pending_paste_open;
 /* A takeover's cancellation: requested inside the wait, acted on by the next read. */
 static int kr_cancel_requested;
 
-/* A launch this reader installed, so a revocation can take exactly that text back out. */
-static int kr_installed_chars;
-
 /* True from a line's acceptance until the next primary reader: its commands are running. */
 static int kr_line_running;
 
@@ -255,27 +252,8 @@ kr_shell_install_command (const char *text, size_t len)
   rl_replace_line (line, 0);
   free (line);
   rl_point = rl_end;
-  kr_installed_chars = rl_end;
   kr_track_buffer ();
   return rl_end > 0;
-}
-
-int
-kr_shell_remove_installed (void)
-{
-  if (kr_installed_chars <= 0)
-    return 0;
-  /* Only the text this launch installed comes out, and only while it is still all there. */
-  if (rl_end == kr_installed_chars)
-    {
-      rl_replace_line ("", 0);
-      rl_point = rl_end = 0;
-    }
-  kr_installed_chars = 0;
-  rl_done = 0;
-  RL_UNSETSTATE (RL_STATE_DONE);
-  kr_track_buffer ();
-  return 1;
 }
 
 void
@@ -458,7 +436,6 @@ kr_rl_enter (void)
   kr_track_cwd ();
   kr_buffer_hash = kr_hash_line ();
   kr_buffer_revision++;
-  kr_installed_chars = 0;
   kr_cancel_requested = 0;
   kr_gathering = 0;
   kr_pending_quoted = kr_pending_paste_open = 0;
@@ -504,7 +481,6 @@ kr_rl_leave (int accepted)
       return;
     }
   kr_inside_reader = 0;
-  kr_installed_chars = 0;
   kr_cancel_requested = 0;
   kr_bridge_cancel_settled ();
   if (accepted)

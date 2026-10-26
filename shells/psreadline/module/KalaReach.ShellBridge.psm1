@@ -1040,7 +1040,6 @@ function Invoke-KalaReachReadLine {
     if (-not $nested) { $script:State.PromptGeneration++ }
     $script:State.ReaderRevision++
     $script:State.InsideReader++
-    $script:State.Installed = ''
     $script:State.AcceptRequested = $false
     $script:State.IdleReported = $false
     $script:State.InvokingKeys = [byte[]]::new(0)

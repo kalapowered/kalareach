@@ -213,30 +213,10 @@ function Invoke-KrInstallCommand {
     }
     $installed = Get-KrBufferText
     if ($installed.Length -eq 0) { return $false }
-    $State.Installed = $installed
     $State.BufferSeen = $installed
     $State.BufferRevision++
     $true
 }
-
-# Takes text a launch installed back out, while it is still all there.
-function Invoke-KrRemoveInstalled {
-    param([hashtable]$State)
-    if ([string]::IsNullOrEmpty($State.Installed)) { return $false }
-    $installed = $State.Installed
-    $State.Installed = ''
-    $State.AcceptRequested = $false
-    if ((Get-KrBufferText) -ne $installed) { return $false }
-    try {
-        $script:Rl::Replace(0, $installed.Length, '')
-    } catch {
-        return $false
-    }
-    $State.BufferSeen = Get-KrBufferText
-    $State.BufferRevision++
-    $true
-}
-
 
 # Accepts the installed line through the editor's own acceptance, once.
 #
@@ -246,7 +226,6 @@ function Invoke-KrRemoveInstalled {
 # cleared by the editor's own initialisation, so no launch is decided there at all.
 function Invoke-KrAcceptLine {
     param([hashtable]$State)
-    $State.Installed = ''
     if (-not $State.Reading) {
         Write-KrTrace 'the acceptance was asked for outside the reader'
         return $false

@@ -56,8 +56,6 @@ $script:Kr = @{
     Hint               = 'Use kr detach --attachment <id> to detach.'
     Hinted             = $false
     HintedPrompt       = [uint64]0
-    LaunchPending      = $false
-    LaunchTransaction  = [byte[]]::new(16)
     Revoked            = [System.Collections.Generic.List[string]]::new()
     FrameAtMs          = [uint64]0
     Servicing          = $false
@@ -96,7 +94,6 @@ $script:State = @{
     InvokingKeys     = [byte[]]::new(0)
     Cancelled        = $false
     LastStatus       = $true
-    Installed        = ''
     AcceptRequested  = $false
     IdleReported     = $false
     Reading          = $false
@@ -748,7 +745,6 @@ function Send-KrEditorEnter {
 function Send-KrEditorLeave {
     param([string]$Reason)
     if (-not $script:Kr.Registered) { return }
-    $script:Kr.LaunchPending = $false
     $reader = Get-KrReaderState $script:State
     Send-KrEvent 'editor_leave' @{
         reason            = $Reason
@@ -1166,9 +1162,6 @@ function Invoke-KrAnswerLaunch {
         Send-KrLaunchRejection $Id $transaction $fenceId 'buffer_not_empty' $reader; return
     }
 
-    $script:Kr.LaunchPending = $true
-    $script:Kr.LaunchTransaction = $transaction
-
     Send-KrAnswer $Id 'launch' @{
         accepted = @{
             fence_id          = $fenceId
@@ -1179,8 +1172,8 @@ function Invoke-KrAnswerLaunch {
             prompt_generation = $reader.prompt_generation
         }
     }
-    # Installed and accepted. The transaction stays this bridge's own until the reader actually
-    # leaves, because a revocation that arrives in that window still has text to take back out.
+    # The answer is final: the command is in the editor and the line is accepted, so a revocation
+    # read after this changes nothing.
     $script:State.AcceptRequested = $true
 }
 
@@ -1315,8 +1308,9 @@ function Add-KrRevocation {
     $script:Kr.Revoked.Add($key)
 }
 
-# Whether a revocation for this transaction is in the frames this step has read, which the ordered
-# endpoint makes the same question as whether the worker sent one before this step.
+# Whether a revocation for this transaction is in the frames this step has read. The endpoint is
+# ordered, so a revocation the worker sent before this step and that has reached the reader is one
+# of them; one still in transit is not, and the launch it names is then accepted.
 function Test-KrRevoked {
     param([byte[]]$Transaction)
     $key = [Convert]::ToBase64String($Transaction)
@@ -1348,12 +1342,6 @@ function Read-KrRevocation {
     $transaction = [byte[]]$Frame['transaction']
     if ($null -eq $transaction -or $transaction.Length -ne 16) { return }
     Add-KrRevocation $transaction
-    if ($script:Kr.LaunchPending -and
-        [System.Linq.Enumerable]::SequenceEqual([byte[]]$script:Kr.LaunchTransaction, $transaction)) {
-        # Installed but not accepted: the text comes out, so a revoked launch leaves nothing behind.
-        Invoke-KrRemoveInstalled $script:State | Out-Null
-        $script:Kr.LaunchPending = $false
-    }
 }
 
 # Takes the answer a command is waiting for out of what has already arrived.
