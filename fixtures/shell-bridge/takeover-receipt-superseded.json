@@ -1,6 +1,6 @@
 {
   "id": "takeover-receipt-superseded",
-  "purpose": "A takeover's receipt belongs to the cancellation that opened it: a departure supersedes that cancellation, so the receipt closes saying the reader's own discards are unknown rather than taking the departure's count, and the superseded report is ignored.",
+  "purpose": "A takeover's receipt belongs to the cancellation that opened it: a departure supersedes that cancellation, so the receipt closes saying the reader's own discards are unknown rather than taking the departure's count, the superseded report is ignored, and so is a report that names a reader the cancellation was not asked of.",
   "covers": [
     "KR-REQ-07.78",
     "KR-REQ-07.82"
@@ -228,6 +228,37 @@
               },
               "buffer_preserved": true,
               "discarded_bytes": "2"
+            }
+          },
+          "expect": {
+            "state": "unfenced",
+            "fence": null,
+            "held": [],
+            "actions": [
+              {
+                "ignore_stale": "reader_event"
+              }
+            ],
+            "detach_target": null
+          }
+        },
+        {
+          "at_ms": "35",
+          "stimulus": {
+            "cancellation_reported": {
+              "sequence": "2",
+              "epoch": "4",
+              "prompt_generation": "1",
+              "reader_revision": "2",
+              "cancelled": {
+                "partial_escape": false,
+                "quoted_insertion": false,
+                "vi_motion": false,
+                "multikey_sequence": false,
+                "macro_input": false
+              },
+              "buffer_preserved": true,
+              "discarded_bytes": "5"
             }
           },
           "expect": {

@@ -330,8 +330,9 @@ pub struct CancellationReport {
     pub prompt_generation: PromptGeneration,
     /// The reader revision it was asked for.
     ///
-    /// A report from a reader the worker did not ask says nothing about the one it did, so it is
-    /// ignored rather than acted on.
+    /// A report that names another prompt generation or reader revision than the cancellation
+    /// was asked of says nothing about the reader it was asked of, so it is ignored rather than
+    /// acted on, and the cancellation stays outstanding.
     pub reader_revision: ReaderRevision,
     /// What was ended.
     pub cancelled: CancelledOperations,

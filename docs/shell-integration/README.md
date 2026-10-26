@@ -427,9 +427,11 @@ fence answer is matched on its fence identifier: one for an exchange the worker 
 on is ignored, and one for the current exchange that names another prompt generation or reader
 revision than the exchange was asked at is acted on, as a reader that has moved: the fence is
 withheld, the held input is released and `EDITOR_BUSY` is sent. A launch answer is matched on its
-transaction alone, and a cancellation report on its `sequence` alone, so a report whose `sequence`
-is not the one the worker is waiting on is ignored. A leave or an idle report from a reader the
-worker has already replaced is ignored. Two takeovers can happen at one prompt in one reader, and a
+transaction alone, and a cancellation report on its `sequence` and on the prompt generation and
+reader revision it was asked of, so a report whose `sequence` is not the one the worker is waiting
+on, or that names another prompt generation or reader revision, is ignored and the cancellation
+stays outstanding. A leave or an idle report from a reader the worker has already replaced is
+ignored. Two takeovers can happen at one prompt in one reader, and a
 departure can happen at the epoch a takeover just produced, which is why the cancellation carries a
 sequence of its own beside its epoch: neither the reader's identity nor the epoch tells one
 cancellation from the next.
@@ -912,7 +914,7 @@ cargo run -p kr-shell-integration --bin kr-shell-fixtures -- --check
 | `detach-condition-exclusions` | The eligible case and each of the ten exclusions |
 | `takeover-partial-escape`, `takeover-quoted-insertion`, `takeover-vi-motion`, `takeover-incomplete-chord`, `takeover-macro` | A takeover during each kind of incomplete operation: the cancellation and what it ended, the reader's own discarded bytes, a withheld fence while a queue still holds input, a retry at the idle callback, and the edit buffer intact |
 | `takeover-destructive-cancellation` | A cancellation that lost the buffer, the fence the worker therefore withholds, and a report from a reader it did not ask |
-| `takeover-receipt-superseded` | A departure that supersedes a takeover's cancellation, and the receipt that closes as unknown rather than taking the departure's count |
+| `takeover-receipt-superseded` | A departure that supersedes a takeover's cancellation, the receipt that closes as unknown rather than taking the departure's count, and a report that names another reader than the one asked |
 | `two-outstanding-confirmations` | Two unresolved transactions, each keeping its own answer |
 | `attachment-removed-during-exchange` | An attachment that goes away mid-exchange, taking the exchange and its lease with it |
 | `deadline-meets-departure` | A hold that expires at the same moment as a removal or a closure, and input from an attachment that is no longer the holder |

@@ -1953,7 +1953,8 @@ fn takeover_receipt_superseded() -> Scenario {
         "takeover-receipt-superseded",
         "A takeover's receipt belongs to the cancellation that opened it: a departure supersedes \
          that cancellation, so the receipt closes saying the reader's own discards are unknown \
-         rather than taking the departure's count, and the superseded report is ignored.",
+         rather than taking the departure's count, the superseded report is ignored, and so is a \
+         report that names a reader the cancellation was not asked of.",
         &["KR-REQ-07.78", "KR-REQ-07.82"],
         every_shell(),
         held_by_a(),
@@ -2007,6 +2008,18 @@ fn takeover_receipt_superseded() -> Scenario {
                     true,
                     2,
                 ),
+                expect(
+                    FenceState::Unfenced,
+                    None,
+                    &[],
+                    vec![ActionShape::IgnoreStale(StaleMessage::ReaderEvent)],
+                ),
+            ),
+            // A report that carries the departure's sequence but names another reader is no answer
+            // from the reader that was asked, so the cancellation stays outstanding.
+            step(
+                35,
+                cancellation(2, 4, 1, 2, CancelledOperations::NONE, true, 5),
                 expect(
                     FenceState::Unfenced,
                     None,
