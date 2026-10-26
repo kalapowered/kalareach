@@ -124,18 +124,36 @@ impl<R: Runtime> Platform<R> {
 ///
 /// # Errors
 ///
-/// Returns an error when the task itself is lost.
+/// Returns an error when the first poll panics, as Tauri's does on Android when no activity is
+/// registered to send the command to: nothing went out, so no answer follows. It returns an error
+/// too when the task itself is lost.
 #[cfg(any(mobile, test))]
 async fn to_its_end<T: Send + 'static>(
     call: impl std::future::Future<Output = T> + Send + 'static,
 ) -> Result<T, PlatformError> {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::task::Poll;
 
     let mut call = Box::pin(call);
-    if let Poll::Ready(answer) =
-        std::future::poll_fn(|context| Poll::Ready(call.as_mut().poll(context))).await
-    {
-        return Ok(answer);
+    let first = std::future::poll_fn(|context| {
+        Poll::Ready(catch_unwind(AssertUnwindSafe(|| {
+            call.as_mut().poll(context)
+        })))
+    })
+    .await;
+    match first {
+        Ok(Poll::Ready(answer)) => return Ok(answer),
+        Ok(Poll::Pending) => {}
+        Err(panic) => {
+            let said = panic
+                .downcast_ref::<&str>()
+                .map(|said| (*said).to_owned())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "it panicked".to_owned());
+            return Err(PlatformError::new(format!(
+                "the platform's call failed: {said}"
+            )));
+        }
     }
     tauri::async_runtime::spawn(call)
         .await
@@ -245,5 +263,18 @@ mod tests {
         );
         drop(waiting);
         let _ = release.send(());
+    }
+
+    /// The first poll is the caller's, and on Android Tauri's send panics there when no activity is
+    /// registered: the caller gets that as the platform's error, as it did when a task of its own
+    /// caught the panic, and does not unwind with it.
+    #[tokio::test]
+    async fn a_call_that_panics_in_its_first_poll_is_the_platforms_error() {
+        let call =
+            std::future::poll_fn(|_| -> std::task::Poll<u8> { panic!("no available activity") });
+        let error = to_its_end(call)
+            .await
+            .expect_err("the call never went out, so it has no answer");
+        assert!(error.0.contains("no available activity"), "{error}");
     }
 }
