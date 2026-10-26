@@ -1283,6 +1283,15 @@ fn selecting_and_using_the_standalone_start_installs_nothing_and_seeks_no_privil
     // What the daemon asks when it is asked about itself, which is what `kr doctor` asks.
     let _: HostInfoResult = host.ask(Method::HostInfo, &());
     host.close(&created);
+    assert!(
+        !host
+            .tree
+            .paths()
+            .state_root()
+            .join("terminal-profiles.json")
+            .exists(),
+        "the standalone start records no terminal profile"
+    );
 
     let daemons = host.launched();
     let recorded = recorded_calls(&calls);

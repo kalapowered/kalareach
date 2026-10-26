@@ -7,8 +7,19 @@
 //! written before the profile, and removal works from that record alone.
 
 pub mod record;
+pub mod words;
+
+mod files;
+mod konsole;
+
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use record::{FileWrote, HeldProfiles, RecordError, RecordedProfile, Wrote};
+
+/// The name every profile is given.
+pub const PROFILE_NAME: &str = "KalaReach";
 
 /// A terminal emulator a profile can be written into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -62,4 +73,474 @@ impl ProfileTerminal {
     pub fn from_id(text: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|terminal| terminal.id() == text)
     }
+}
+
+impl ProfileTerminal {
+    /// The emulators a profile can be written into on this platform, in the order they are listed.
+    #[must_use]
+    pub const fn on_this_platform() -> &'static [Self] {
+        #[cfg(target_os = "linux")]
+        {
+            &[Self::Konsole]
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            &[]
+        }
+    }
+
+    /// The name a person knows the emulator by.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Iterm2 => "iTerm2",
+            Self::AppleTerminal => "Terminal",
+            Self::GnomeTerminal => "GNOME Terminal",
+            Self::Ptyxis => "Ptyxis",
+            Self::Konsole => "Konsole",
+            Self::WindowsTerminal => "Windows Terminal",
+        }
+    }
+}
+
+/// The places a profile is written and read from, for one person: their home and the places the
+/// emulators keep their files under it. A test names a directory of its own for each.
+#[derive(Clone, Debug)]
+pub struct ProfileHome {
+    /// The person's home directory.
+    pub home: PathBuf,
+    /// The data home (`XDG_DATA_HOME`, else `~/.local/share`).
+    pub data_home: PathBuf,
+    /// The configuration home (`XDG_CONFIG_HOME`, else `~/.config`).
+    pub config_home: PathBuf,
+    /// The directories programs are found in.
+    pub programs: Vec<PathBuf>,
+}
+
+impl ProfileHome {
+    /// This user's places, from the environment, or `None` when there is no absolute home.
+    #[must_use]
+    pub fn of_this_user() -> Option<Self> {
+        let absolute = |name: &str| {
+            std::env::var_os(name)
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+        };
+        let home = absolute("HOME").or_else(|| absolute("USERPROFILE"))?;
+        Some(Self {
+            data_home: absolute("XDG_DATA_HOME").unwrap_or_else(|| home.join(".local/share")),
+            config_home: absolute("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config")),
+            programs: std::env::var_os("PATH")
+                .map(|path| std::env::split_paths(&path).collect())
+                .unwrap_or_default(),
+            home,
+        })
+    }
+
+    /// The places under a home directory of its own, with programs found in `programs`.
+    #[must_use]
+    pub fn under(home: &Path, programs: Vec<PathBuf>) -> Self {
+        Self {
+            home: home.to_path_buf(),
+            data_home: home.join(".local/share"),
+            config_home: home.join(".config"),
+            programs,
+        }
+    }
+
+    /// Whether a program of this name is in one of the directories programs are found in.
+    #[must_use]
+    pub fn has_program(&self, name: &str) -> bool {
+        self.programs
+            .iter()
+            .any(|directory| directory.join(name).is_file())
+    }
+}
+
+/// Why a profile was not written or taken out.
+#[derive(Debug, thiserror::Error)]
+pub enum ProfileError {
+    /// The emulator is not installed.
+    #[error("{} is not installed here", .0.name())]
+    NotInstalled(ProfileTerminal),
+    /// This platform has no profile to write for the emulator.
+    #[error("{} has no profile this platform writes", .0.name())]
+    NotOnThisPlatform(ProfileTerminal),
+    /// A file is at the profile's place that this kr did not write.
+    #[error("{} is there and kr did not write it; it was left alone", .place.display())]
+    Foreign {
+        /// What is there.
+        place: PathBuf,
+    },
+    /// The profile the record names was changed after kr wrote it.
+    #[error("{} was changed after kr wrote it, so it is no longer kr's to replace", .place.display())]
+    Changed {
+        /// What was changed.
+        place: PathBuf,
+    },
+    /// Konsole expands a `$` and a leading `~` in a profile's command, and the command has one.
+    #[error("Konsole expands a $ and a leading ~ in a profile's command, so it cannot run {}", .word.display())]
+    KonsoleExpands {
+        /// The word.
+        word: PathBuf,
+    },
+    /// The record names a profile for the emulator that is not where this install writes it.
+    #[error("the record names {}'s profile at {}, not where this install writes it", .terminal.name(), .recorded.display())]
+    RecordedElsewhere {
+        /// The emulator.
+        terminal: ProfileTerminal,
+        /// Where the record says it is.
+        recorded: PathBuf,
+    },
+    /// The record names a profile for the emulator that is not of the kind this install writes.
+    #[error("the record names {}'s profile as another kind of write than this platform makes", .0.name())]
+    RecordedOtherwise(ProfileTerminal),
+    /// A file could not be read or written.
+    #[error("{}: {source}", .place.display())]
+    Io {
+        /// The file.
+        place: PathBuf,
+        /// What failed.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The record could not be used.
+    #[error(transparent)]
+    Record(#[from] RecordError),
+}
+
+impl ProfileError {
+    fn io(place: &Path, source: std::io::Error) -> Self {
+        Self::Io {
+            place: place.to_path_buf(),
+            source,
+        }
+    }
+}
+
+/// Whether `terminal` is installed.
+#[must_use]
+pub fn is_present(terminal: ProfileTerminal, home: &ProfileHome) -> bool {
+    match terminal {
+        ProfileTerminal::Konsole => konsole::present(home),
+        _ => false,
+    }
+}
+
+/// What an install of one profile would write, worked out before anything is written.
+#[derive(Clone, Debug)]
+pub struct Plan {
+    /// The emulator.
+    pub terminal: ProfileTerminal,
+    /// The argument vector the profile runs.
+    pub command: Vec<String>,
+    /// What the record is told the install intends to write.
+    pub wrote: Wrote,
+    /// How it is written.
+    how: How,
+}
+
+/// What a plan writes, as a person is told it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Place<'a> {
+    /// A file.
+    File(&'a Path),
+}
+
+impl Plan {
+    /// What the install writes.
+    #[must_use]
+    pub fn place(&self) -> Place<'_> {
+        match &self.how {
+            How::File { destination, .. } => Place::File(destination),
+        }
+    }
+}
+
+/// How a plan is carried out.
+#[derive(Clone, Debug)]
+enum How {
+    /// A file, published whole.
+    File {
+        destination: PathBuf,
+        staging: PathBuf,
+        text: String,
+        made: Vec<PathBuf>,
+        replace: bool,
+    },
+}
+
+/// Works out what installing `terminal`'s profile with `command` would write, and refuses what it
+/// must not write over. `recorded` is what the record names for the emulator now.
+///
+/// Nothing is written: this is the whole of a dry run.
+///
+/// # Errors
+///
+/// Returns why the profile is not written.
+pub fn plan(
+    terminal: ProfileTerminal,
+    home: &ProfileHome,
+    command: &[String],
+    recorded: Option<&RecordedProfile>,
+) -> Result<Plan, ProfileError> {
+    if !is_present(terminal, home) {
+        return Err(ProfileError::NotInstalled(terminal));
+    }
+    match terminal {
+        ProfileTerminal::Konsole => plan_file(
+            terminal,
+            &konsole::profile_path(home),
+            &konsole::watched(home),
+            konsole::profile_text(command)?,
+            command,
+            recorded,
+        ),
+        _ => Err(ProfileError::NotOnThisPlatform(terminal)),
+    }
+}
+
+/// The plan of a profile that is one file in a directory the emulator watches.
+fn plan_file(
+    terminal: ProfileTerminal,
+    destination: &Path,
+    watched: &Path,
+    text: String,
+    command: &[String],
+    recorded: Option<&RecordedProfile>,
+) -> Result<Plan, ProfileError> {
+    let place = destination.to_path_buf();
+    let staging = watched
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| ProfileError::io(destination, std::io::ErrorKind::NotFound.into()))?;
+    let earlier = match recorded.map(|profile| &profile.wrote) {
+        Some(Wrote::File(wrote)) => Some(wrote),
+        Some(_) => return Err(ProfileError::RecordedOtherwise(terminal)),
+        None => None,
+    };
+    let (replace, made) = match (earlier, files::presence(destination)) {
+        // Nothing the record names is there, and something is: it is not kr's.
+        (None, files::Presence::File(_) | files::Presence::Other) => {
+            return Err(ProfileError::Foreign { place });
+        }
+        (None, files::Presence::Missing) => {
+            (false, files::missing_directories(&parent_of(destination)))
+        }
+        (Some(earlier), presence) => {
+            let recorded_file = earlier.file()?;
+            if recorded_file != destination {
+                return Err(ProfileError::RecordedElsewhere {
+                    terminal,
+                    recorded: recorded_file,
+                });
+            }
+            match presence {
+                files::Presence::File(sha) if sha == earlier.sha256 => {
+                    (true, earlier.made_directories()?)
+                }
+                files::Presence::File(_) | files::Presence::Other => {
+                    return Err(ProfileError::Changed { place });
+                }
+                // Gone since: written again, and the directories it needed are made again.
+                files::Presence::Missing => {
+                    (false, files::missing_directories(&parent_of(destination)))
+                }
+            }
+        }
+    };
+    let wrote = Wrote::File(FileWrote::intending(destination, &text, &made));
+    Ok(Plan {
+        terminal,
+        command: command.to_vec(),
+        wrote,
+        how: How::File {
+            destination: destination.to_path_buf(),
+            staging,
+            text,
+            made,
+            replace,
+        },
+    })
+}
+
+/// The directory a file is in.
+fn parent_of(path: &Path) -> PathBuf {
+    path.parent().map_or_else(PathBuf::new, Path::to_path_buf)
+}
+
+/// Installs the profile `plan` describes: the record is told first, then the profile is written,
+/// and a write that fails takes the record's entry back.
+///
+/// # Errors
+///
+/// Returns the failure of the record or of the write.
+pub fn install(held: &HeldProfiles<'_>, plan: &Plan) -> Result<(), ProfileError> {
+    let before = held.profile(plan.terminal)?;
+    held.put(RecordedProfile {
+        terminal: plan.terminal,
+        command: plan.command.clone(),
+        wrote: plan.wrote.clone(),
+    })?;
+    if let Err(error) = write(plan) {
+        match before {
+            Some(profile) => held.put(profile)?,
+            None => held.forget(plan.terminal)?,
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Carries out a plan.
+fn write(plan: &Plan) -> Result<(), ProfileError> {
+    match &plan.how {
+        How::File {
+            destination,
+            staging,
+            text,
+            made,
+            replace,
+        } => files::publish(destination, staging, text, made, *replace)
+            .map_err(|error| ProfileError::io(destination, error)),
+    }
+}
+
+/// Where a recorded profile stands against what is there now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Standing {
+    /// It is there and holds what was written.
+    Matches,
+    /// It is there and holds something else.
+    Changed,
+    /// It is not there.
+    Missing,
+}
+
+/// What `status` knows of one emulator.
+#[derive(Clone, Debug)]
+pub struct Status {
+    /// The emulator.
+    pub terminal: ProfileTerminal,
+    /// Whether it is installed.
+    pub present: bool,
+    /// What the record names for it, if anything.
+    pub recorded: Option<RecordedProfile>,
+    /// Where the recorded profile stands, when one is recorded.
+    pub standing: Option<Standing>,
+    /// Whether something is at the profile's place that the record does not name.
+    pub foreign: bool,
+    /// Whether the recorded profile is the emulator's default.
+    pub default: bool,
+}
+
+/// Reads the state of `terminal`'s profile. It writes nothing and holds nothing.
+#[must_use]
+pub fn status(
+    terminal: ProfileTerminal,
+    home: &ProfileHome,
+    recorded: Option<RecordedProfile>,
+) -> Status {
+    let standing = recorded.as_ref().map(standing);
+    let foreign = recorded.is_none()
+        && match terminal {
+            ProfileTerminal::Konsole => {
+                files::presence(&konsole::profile_path(home)) != files::Presence::Missing
+            }
+            _ => false,
+        };
+    let default = recorded.is_some() && is_default(terminal, home);
+    Status {
+        terminal,
+        present: is_present(terminal, home),
+        recorded,
+        standing,
+        foreign,
+        default,
+    }
+}
+
+/// Where a recorded profile stands.
+fn standing(profile: &RecordedProfile) -> Standing {
+    match &profile.wrote {
+        Wrote::File(wrote) => match wrote.file().map(|file| files::presence(&file)) {
+            Ok(files::Presence::Missing) => Standing::Missing,
+            Ok(files::Presence::File(sha)) if sha == wrote.sha256 => Standing::Matches,
+            _ => Standing::Changed,
+        },
+        Wrote::Settings(_) | Wrote::Preferences(_) => Standing::Changed,
+    }
+}
+
+/// Whether the profile is the emulator's default.
+fn is_default(terminal: ProfileTerminal, home: &ProfileHome) -> bool {
+    match terminal {
+        ProfileTerminal::Konsole => konsole::is_default(home),
+        _ => false,
+    }
+}
+
+/// What a removal came to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Removed {
+    /// The record named nothing for the emulator.
+    NotRecorded,
+    /// The profile is taken out.
+    Removed,
+    /// The profile was already gone.
+    AlreadyGone,
+    /// The profile was changed after kr wrote it. It is left, and the record forgets it.
+    Changed {
+        /// Where the changed profile is.
+        left_at: String,
+    },
+    /// The profile is the emulator's default. It is left and the record keeps it.
+    Default,
+}
+
+/// Takes `terminal`'s profile out, working from the record alone.
+///
+/// # Errors
+///
+/// Returns the failure of the record or of the removal; the record keeps the entry then.
+pub fn remove(
+    held: &HeldProfiles<'_>,
+    terminal: ProfileTerminal,
+    home: &ProfileHome,
+) -> Result<Removed, ProfileError> {
+    let Some(profile) = held.profile(terminal)? else {
+        return Ok(Removed::NotRecorded);
+    };
+    let removed = match &profile.wrote {
+        Wrote::File(wrote) => {
+            let destination = wrote.file()?;
+            if standing(&profile) != Standing::Missing && is_default(terminal, home) {
+                return Ok(Removed::Default);
+            }
+            let staging = match terminal {
+                ProfileTerminal::Konsole => konsole::staging(&destination),
+                _ => None,
+            }
+            .ok_or_else(|| ProfileError::io(&destination, std::io::ErrorKind::NotFound.into()))?;
+            match files::remove_if_unchanged(
+                &destination,
+                &staging,
+                &wrote.sha256,
+                &wrote.made_directories()?,
+            )
+            .map_err(|error| ProfileError::io(&destination, error))?
+            {
+                files::Removal::Gone => Removed::AlreadyGone,
+                files::Removal::Removed => Removed::Removed,
+                files::Removal::Changed { left_at, .. } => Removed::Changed {
+                    left_at: left_at.display().to_string(),
+                },
+            }
+        }
+        Wrote::Settings(_) | Wrote::Preferences(_) => {
+            return Err(ProfileError::NotOnThisPlatform(terminal));
+        }
+    };
+    held.forget(terminal)?;
+    Ok(removed)
 }

@@ -87,6 +87,7 @@ pub mod shown;
 pub mod skill;
 pub mod startup;
 pub mod terminal;
+pub mod terminal_profile;
 pub mod update;
 pub mod windows;
 pub mod workflow;

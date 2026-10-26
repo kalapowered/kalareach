@@ -7582,6 +7582,10 @@ async fn every_command_that_writes_a_stored_record_is_refused_a_version_current_
             &["host", "terminal", "--set", "apple-terminal", "--json"][..],
         ),
         ("shell-entries", &["shell", "remove", "--json"][..]),
+        (
+            "terminal-profiles",
+            &["host", "terminal-profile", "remove", "--json"][..],
+        ),
     ] {
         let writes = release_stores()
             .into_iter()
@@ -7607,6 +7611,11 @@ async fn every_command_that_writes_a_stored_record_is_refused_a_version_current_
         );
         let record = match store {
             "terminal-preference" => refused.tree.environment().state_dir().join("terminal.json"),
+            "terminal-profiles" => refused
+                .tree
+                .paths()
+                .state_root()
+                .join("terminal-profiles.json"),
             _ => refused.tree.paths().state_root().join("shell-entries.json"),
         };
         assert!(!record.exists(), "{store}: nothing was written");
