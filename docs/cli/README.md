@@ -1504,9 +1504,10 @@ only while the reference holds the value `--reference-at` gives. The host makes 
 object is one the repository already holds. The host moves a reference that exists and does not
 create one: `absent` works only with `--preflight` and no `--reference-to`, and then nothing moves.
 Moving the reference back is another apply that names the earlier value as `--reference-to` and the
-later one as `--reference-at`. If the host stops during the move, read the reference to see where
-it stands before you run the command again: each run is a new action, and it finds the reference
-moved, which is `DRAFT_CONFLICT`, or not moved, and moves it. A host of an earlier release
+later one as `--reference-at`. If the host stops during the move, or Git reports a failure and the
+reference then holds the object `--reference-to` names, read the reference to see where it stands
+before you run the command again: each run is a new action, and it finds the reference moved, which
+is `DRAFT_CONFLICT`, or not moved, and moves it. A host of an earlier release
 refuses a request that carries `--reference-to`. Windows refuses every repository
 operation, so this destination is not available there. `working-tree` writes the workspace's own
 files in place. Every destination but a bare proposal names `--workspace`.
@@ -1527,7 +1528,13 @@ An apply or a revert that began and did not finish exits with 1: `DRAFT_CONFLICT
 destination stopped being what the request expected part way, `OUTCOME_UNKNOWN` when the host
 stopped before it finished or cannot say what the destination holds. The text names each path
 that changed or could not be established and the versions to recover from, and the `--json`
-document is the host's whole result with the failure's code and status beside it.
+document is the host's whole result with the failure's code and status beside it. A `reference`
+apply has no path and no result of that kind: the host refuses it, with exit code 8. The code is
+`DRAFT_CONFLICT` when the reference does not hold the value `--reference-at` gives, or when Git
+reports a failure and the reference holds neither that value nor the object `--reference-to`
+names. It is `OUTCOME_UNKNOWN` when Git reports a failure and the reference holds that object,
+because the host cannot tell its own update from another writer's. A reference that still holds the
+expected value after a failure, or one the host cannot read, is the Git failure itself.
 
 ## `kr workflow`
 
