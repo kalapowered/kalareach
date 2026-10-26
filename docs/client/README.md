@@ -1508,6 +1508,32 @@ managed resources and keep the product.
 `services::NullService` implements every trait by saying so. It exists so a caller can hold a
 service client unconditionally and get an accurate answer rather than a silent default.
 
+### The release matrix
+
+`services::matrix` reads the signed release matrix that `GET /api/release-matrix` publishes. A
+reply is accepted only when its schema version is 1; its first tier is the compatible one, its
+alternatives and tiers are not empty, its window is positive, and every range is three numbers with
+the minimum not above the maximum; its revision is a decimal counter of at most 18 digits; and its
+signature verifies under the build's pinned key over the bytes the client rebuilds, field by field,
+in the order the service signs them. The notes, the `serve` answer and the published key are read
+as data and never trusted. Each failed rule is a `Refusal` class and none of them is a verdict
+about a build.
+
+`HeldMatrix` keeps the newest accepted copy. A higher revision replaces it, the same revision with
+the same signed bytes refreshes the read time and the build that read it, and a lower revision, or
+the same revision over other bytes, is refused with the copy untouched. `Document::serve` chooses
+the first tier, in the signed order, whose client range holds the build's package version. A build
+in no tier gets a `RouteError`: `UNSUPPORTED_CAPABILITY`, the revision, and the signed alternatives
+this client knows, each in its own words, with `direct` left out for a host that only uses relays.
+
+`ReleaseGate` is what the managed relay lease service and the pairing admission ask before they
+send a request that takes a new lease (`gated_by`). It is closed only for a skew that a verified
+copy of that origin, read by this build, found; its refusal is a `ClientError::Refused` with
+`UNSUPPORTED_CAPABILITY` and the action `Update`, and nothing leaves the host. A request that names
+a lease the host holds, a revocation and the payer sign-in are never gated. A missing, unverified,
+older or other-build copy leaves the gate open. `check_release` asks the same question of a
+release: whether the published, verified matrix serves a package version.
+
 ### What a deployment answers
 
 Every other suite here checks this client against something this repository wrote: a mock, a
