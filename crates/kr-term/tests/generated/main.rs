@@ -296,7 +296,7 @@ fn the_checks_name_a_query_in_the_tail_of_an_oversized_string_that_acts() {
 /// each stream passes.
 #[test]
 fn the_scan_names_a_forwarded_question_or_action_the_class_table_would_have_to_catch() {
-    let cases: [&[u8]; 20] = [
+    let cases: [&[u8]; 18] = [
         b"ok\x1bPq~\x1b\\",
         b"ok\x1b_Gi=1;\x1b\\",
         b"ok\x1b]52;c;aGk=\x07",
@@ -311,8 +311,6 @@ fn the_scan_names_a_forwarded_question_or_action_the_class_table_would_have_to_c
         b"ok\x1b[>0q",
         b"ok\x1b[?u",
         b"ok\x1b[18t",
-        b"ok\x1b[6\x00n",
-        b"ok\x1b[\x7f6n",
         b"ok\x1b]10;?\x07",
         b"ok\x1b[x",
         b"ok\x1b[?1;1S",
@@ -343,7 +341,7 @@ fn with_the_control(template: &[u8], control: u8) -> Vec<u8> {
 /// end a sequence, so a question they cut short is text. The engine's own run of each stream passes.
 #[test]
 fn the_scan_follows_a_sequence_a_terminal_collects_around_a_control() {
-    let questions: [&[u8]; 7] = [
+    let questions: [&[u8]; 8] = [
         b"ok\x1b[6\xffn",
         b"ok\x1b[\xff6n",
         b"ok\x1b[1\xff8t",
@@ -351,6 +349,7 @@ fn the_scan_follows_a_sequence_a_terminal_collects_around_a_control() {
         b"ok\x1b\xff[6n",
         b"ok\x1b\xff[c",
         b"ok\x1b\xffZ",
+        b"ok\x1b\xff]52;c;aGk=\x07",
     ];
     let carried_on = (0x00..=0x1f)
         .chain([0x7f])
