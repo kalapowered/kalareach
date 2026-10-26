@@ -2136,22 +2136,25 @@ impl Store {
                 std::io::Error::other(error),
             )
         })?;
+        // The trash is opened once, as a plain directory and without following a link, and the
+        // release is moved into it and removed from it through that handle.
+        let trash = windows::Trash::open(&self.trash())
+            .map_err(|error| InstallError::io("open", self.trash(), error))?;
         windows::at(windows::Moment::TrashChecked, &self.trash());
-        let removed = self
-            .trash()
-            .join(format!("{release}-{}", crate::new_uuid()));
-        match std::fs::rename(&directory, &removed) {
+        let name = std::ffi::OsString::from(format!("{release}-{}", crate::new_uuid()));
+        match trash.take(&directory, &name) {
             Ok(()) => {}
             Err(error) if windows::is_in_use(&error) => return Ok(false),
             Err(error) => return Err(InstallError::io("move", &directory, error)),
         }
         sync_directory(&self.versions())?;
-        if let Err(source) = remove_sealed_tree(&removed)
-            && !windows::is_in_use(&source)
-        {
-            return Err(InstallError::io("remove", &removed, source));
+        // What a running program keeps from being deleted stays in the trash for the next sweep.
+        match trash.remove(&name) {
+            Err(source) if !windows::is_in_use(&source) => {
+                Err(InstallError::io("remove", self.trash().join(&name), source))
+            }
+            _ => Ok(true),
         }
-        Ok(true)
     }
 
     /// Deletes what earlier removals left in `trash/` because a program was running from it, and
@@ -2164,21 +2167,17 @@ impl Store {
     /// Returns [`InstallError::Io`] when the directory cannot be read, and the first refusal that no
     /// running program caused, after everything else that could be deleted was.
     pub fn sweep_trash(&self, _held: &StoreLock) -> Result<()> {
-        let trash = self.trash();
-        let entries = match std::fs::read_dir(&trash) {
-            Ok(entries) => entries,
+        let path = self.trash();
+        // Opened once, as a plain directory and without following a link: a junction in its place
+        // is refused, and what it names is never listed.
+        let trash = match windows::Trash::open(&path) {
+            Ok(trash) => trash,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(InstallError::io("read", &trash, error)),
+            Err(error) => return Err(InstallError::io("open", &path, error)),
         };
-        let mut refused = None;
-        for entry in entries.flatten() {
-            if let Err(source) = remove_sealed_tree(&entry.path())
-                && !windows::is_in_use(&source)
-            {
-                refused.get_or_insert(InstallError::io("remove", entry.path(), source));
-            }
-        }
-        refused.map_or(Ok(()), Err)
+        trash
+            .sweep()
+            .map_err(|source| InstallError::io("remove", path, source))
     }
 }
 

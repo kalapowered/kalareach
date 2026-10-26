@@ -78,7 +78,7 @@ const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 /// The share mode of a handle that lets every other handle read and write but not rename or delete
 /// the name, which then stays where it is for as long as this handle is open: the one a removal
 /// acts through, from the open to the last thing it does.
-const KEPT_WHERE_IT_IS: u32 = SHARE_ALL;
+const KEPT_WHERE_IT_IS: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
 
 /// Reads this process's own image from the kernel: the file the process was created from, with
 /// every junction and link on the way it was started through resolved.

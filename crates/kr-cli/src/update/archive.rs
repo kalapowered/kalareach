@@ -274,6 +274,11 @@ const NOT_A_ZIP: &str = "is not a zip archive this host reads";
 /// The signature of the end record.
 const END_RECORD: [u8; 4] = *b"PK\x05\x06";
 
+/// The signatures of the end record, of its 64-bit form and of that form's locator: what the
+/// parser looks for backwards from the end of the file, and falls back to when the last end record
+/// does not serve.
+const END_RECORDS: [[u8; 4]; 3] = [END_RECORD, *b"PK\x06\x06", *b"PK\x06\x07"];
+
 /// The most extra data an entry of the directory may carry. The packer writes none.
 const EXTRA_BYTES: usize = 1024;
 
@@ -283,8 +288,15 @@ const EXTRA_BYTES: usize = 1024;
 /// before it, which hold that many entries one after another, with a name and extra data within
 /// bounds and no comment. The archive a release is packed into has this shape; any other is
 /// refused, so the parser has one end record to follow and the bytes it will read are the bytes
-/// judged here. The bytes of the directory are not searched for signatures: a checksum or a size
-/// can spell one, and the parser takes the last end record first.
+/// judged here.
+///
+/// The parser takes the last end record first and falls back to an earlier one, found by its
+/// signature anywhere in the file, when an entry it reads does not parse, and it sizes what it keeps
+/// for the entries that record counts before anything here checks them. So no name or extra data
+/// holds the signature of an end record, of its 64-bit form or of that form's locator, however the
+/// entry is made to fail. The fixed fields of an entry are not searched: a checksum, a size or an
+/// offset can spell a signature in a release no fault of whose, and such a record is held to the
+/// start and count checks after the parse and, as a 32-bit record, to at most 65,534 entries.
 ///
 /// Returns the refusal where the archive is not of this shape, or beyond the limits.
 fn read_tail(
@@ -341,6 +353,19 @@ fn read_tail(
         }
         if name > limits.name_bytes {
             return Ok(Err("has an entry name longer than any a release has"));
+        }
+        // The name and the extra data, and the last three bytes before them, which a signature can
+        // begin in: no entry of a release's has a name that begins as one ends.
+        let Some(variable) = judged.get(at + 43..at + 46 + name + extra) else {
+            return Ok(Err(NOT_A_ZIP));
+        };
+        if variable
+            .windows(4)
+            .any(|window| END_RECORDS.iter().any(|record| record == window))
+        {
+            return Ok(Err(
+                "holds the signature of an end record in an entry's name or extra data",
+            ));
         }
         at += 46 + name + extra;
     }
