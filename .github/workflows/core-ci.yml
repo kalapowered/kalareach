@@ -633,6 +633,9 @@ jobs:
       #     `supervision::windows`, the `task_supervisor` suite (with a daemon refused in a login
       #     session other than the one its work runs in), the `plugin_runtime_service` suite over
       #     the plugin test components built for it, and `kr-cli`'s `startup_windows`;
+      #   - the plugin host's launcher: `kr-plugin-service`'s library filter `launcher::`, which
+      #     holds the endpoint name a host of another release derives for its protocol, in its
+      #     Windows form (a pipe's name);
       #   - the daemon's other Windows suites: the library filters `catalogue::integrations`,
       #     `catalogue::launch_probes`, `agent_tools`, `machine`, `registry` and `singleton`, and
       #     the `agent_tools`, `contact_skill`, `catalogue`, `voice_broker` (the sign-in cases),
@@ -1098,6 +1101,14 @@ jobs:
       - name: Start the plugin host through the environment's scheduled task
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-controller --test plugin_runtime_service
+
+      # The launcher that starts the plugin host and publishes its descriptor. The name of the
+      # endpoint a host of another release derives for its protocol is held there as a literal, and
+      # on this platform it is a pipe's name, which no Unix leg can run.
+      - name: Test the plugin host's launcher
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        # Quoted: a plain YAML scalar cannot end in `:`.
+        run: "cargo test --locked -p kr-plugin-service --lib launcher::"
 
       # kr new through the environment's scheduled task, as the standalone start runs it here: three
       # first commands at once meet one daemon that serves every caller, the daemon is in none of

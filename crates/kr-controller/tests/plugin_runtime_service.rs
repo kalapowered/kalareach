@@ -101,8 +101,8 @@ async fn the_plugin_host_is_started_by_the_platform_when_the_worker_asks_and_rep
     let host = hosted.published().expect("the host is published");
     // The host publishes the endpoint its protocol names. The endpoint is derived from the protocol
     // by one function that every release that speaks the protocol calls, so this shows the host
-    // and the daemon agree on it here. The launcher's own case spells the name out: it runs on
-    // Unix, and its Windows form is compiled for Windows but not run there.
+    // and the daemon agree on it here. The launcher's own case spells the name out, in the form of
+    // each platform.
     let published = launcher::read_descriptor(&hosted.environment(), &HostProtocol::THIS)
         .expect("the descriptor reads")
         .expect("the host is published");

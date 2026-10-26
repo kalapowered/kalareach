@@ -1169,6 +1169,18 @@ fn windows() -> Vec<Step> {
                 "plugin_runtime_service",
             ],
         ),
+        qualified_only(
+            "the plugin host's launcher",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-plugin-service",
+                "--lib",
+                "launcher::",
+            ],
+            "launcher::",
+        ),
         // kr new through the environment's scheduled task. The daemon the task starts keeps its
         // keys in this machine's credential store, so these cases are ignored in an ordinary run
         // and fail before anything is started unless KR_TEST_PLATFORM_SECRET_STORE=1 says the run
