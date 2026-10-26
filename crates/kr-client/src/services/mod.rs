@@ -6,7 +6,7 @@
 //! storage, relay bandwidth and operation, and a fork can point these traits at its own
 //! infrastructure without changing anything else in the client.
 //!
-//! The traits and one null implementation live here, and thirteen modules hold the managed
+//! The traits and one null implementation live here, and fourteen modules hold the managed
 //! implementations this crate carries. [`account`] is the account sign-in: the request a system
 //! browser is handed, the checks on what comes back, and the grant a device keeps under one lock,
 //! with the account service's trait beside them. [`relay`] is the relay-lease client, because a lease is the
@@ -27,7 +27,10 @@
 //! the one signed call those of them that speak the section 23 `Services` group share, and [`http`]
 //! is the exchange underneath all of them: one gateway origin, finite deadlines, bounded answers
 //! and no retry of its own. [`json`] is the one reader of what any of them is answered, and it
-//! refuses an answer that names a member twice before anything reads it. A self-hosted deployment
+//! refuses an answer that names a member twice before anything reads it. [`matrix`] is the signed
+//! release matrix, the one thing here that is read from a service and acted on only after its
+//! signature verifies under a key the build pins: which client builds the managed service is meant
+//! to work with, and the route error a build in no tier is given. A self-hosted deployment
 //! supplies its own, and a client with no managed service configured is a complete client: direct
 //! connections, local sessions, plugins, local descriptions and user-operated alternatives need
 //! none of these.
@@ -72,6 +75,7 @@
 //! | [`storage::UploadPart`] | A part's ciphertext | Its number and length |
 //! | [`storage::ObjectRange`] | A range of stored ciphertext | Where it starts and its length |
 //! | [`backup::FetchedGeneration`] | A writer's publication: every wrapped manifest key and a signature | The archive and the generation |
+//! | [`matrix::Saved`] | The published release matrix as it was received, with its signature | When it was read |
 //! | `signed::Content` | What a read was answered with: ciphertext | Its length, or the refusal's code and status |
 //!
 //! A type that holds one of these only through one of these, as [`relay::RelayLeaseAnswer`] holds a
@@ -122,6 +126,7 @@ pub mod backup;
 pub mod http;
 pub mod json;
 pub mod mailbox;
+pub mod matrix;
 pub mod organisation;
 pub mod push;
 pub mod relay;

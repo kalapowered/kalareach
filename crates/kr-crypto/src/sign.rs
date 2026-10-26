@@ -3,10 +3,12 @@
 //! Section 23 requires every signature to cover the exact validated encoding under a stated domain
 //! and purpose, and forbids signing only parameters or a diagnostic JSON rendering. The functions
 //! below take a domain and the elements it separates, build
-//! `CBOR([domain, element, ...])` through `kr-cbor`, and sign those bytes. There is no way to sign
-//! a bare message with this module, because there is no correct use for one.
+//! `CBOR([domain, element, ...])` through `kr-cbor`, and sign those bytes. The one other shape is
+//! `CBOR({domain: value})`, which a signer outside this repository writes and
+//! [`SigningTranscript::keyed`] checks. There is no way to sign a bare message with this module,
+//! because there is no correct use for one.
 
-use kr_cbor::{CanonicalValue, signing_value};
+use kr_cbor::{CanonicalMap, CanonicalValue, signing_value};
 use kr_protocol::scalars::{AuthorisationKey, Digest256, Signature64};
 use serde::Serialize;
 
@@ -23,7 +25,8 @@ use crate::sodium;
 pub struct SigningTranscript {
     /// The domain the array starts with, which every constructor is given.
     domain: String,
-    /// `CBOR([domain, element, ...])`, exactly as it is signed.
+    /// `CBOR([domain, element, ...])`, or `CBOR({domain: value})` for a keyed transcript, exactly as
+    /// it is signed.
     bytes: Vec<u8>,
 }
 
@@ -62,6 +65,26 @@ impl SigningTranscript {
             domain,
             vec![kr_cbor::to_canonical_value(value)?],
         ))
+    }
+
+    /// Builds `CBOR({domain: value})` from one serialisable object: the domain is the map's one
+    /// key, not the first element of an array.
+    ///
+    /// A signer outside this repository that names its domain this way (the release matrix's
+    /// publisher does) is checked here, in the one module that signs and verifies, so no caller
+    /// builds those bytes by hand. It is still a transcript of a stated domain over an exact
+    /// canonical encoding: there is no way to reach a signature over a bare message through it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a CBOR error when the value is outside KR-CBOR-1.
+    pub fn keyed<T: Serialize>(domain: &str, value: &T) -> Result<Self> {
+        let mut map = CanonicalMap::new();
+        map.insert(domain.to_owned(), kr_cbor::to_canonical_value(value)?)?;
+        Ok(Self {
+            domain: domain.to_owned(),
+            bytes: kr_cbor::encode(&CanonicalValue::Map(map)),
+        })
     }
 
     /// Accepts bytes another module has already built, after checking that they are a canonical
