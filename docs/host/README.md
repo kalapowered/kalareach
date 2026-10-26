@@ -3749,7 +3749,7 @@ Each worker has its own SQLite journal in write-ahead-logging mode with full syn
 | `closure` | the session's final record |
 | `session` | the session's own summary, so a reader with no worker can still say what the session was |
 | `owned_processes` | one row: the processes the session owns that had not ended when last observed, each by identifier and start value, with the boot, the control group the worker ran in, and what it could not establish, so a control daemon can stop what a crashed worker left |
-| `host_events` | an application notice that had no attachment to go to, and where in the output stream it happened |
+| `host_events` | an application notice that had no attachment to go to, and where in the output stream it happened; an agent turn that ended and a command that failed, each by a line of identifiers and fixed words |
 | `outbox` | the event each state transition committed with: its immutable identifier, the stream, the subsystem, the actor and action, the subject revision and the content class |
 | `outbox_cursors` | one row per consumer: how far it has taken the outbox and how much it has taken |
 | `journal_gaps` | one row per interval durable writing was unavailable, so no reader reads continuity across it |
@@ -5629,7 +5629,8 @@ notices about its authority feed. The three of a session are: the question ledge
 a request became pending; the transitions the session's broker records for the requests an
 application makes of a person, which is how an approval an application raises comes to be
 pending; and the journal's host events, which are the terminal side effects that had no
-attachment to go to. An approval is raised by the transition that interpreted it, the one that
+attachment to go to and the session's own work, the agent turns that ended and the commands that
+failed. An approval is raised by the transition that interpreted it, the one that
 gave it a meaning a person can answer, and ended by the state it reaches when it is answered,
 withdrawn, expired or left uncertain; a request nothing has interpreted, a claim taken and given
 back and every other transition move the cursor and raise nothing. A transition made while the
@@ -5648,6 +5649,28 @@ event or a privacy transition, and after at most thirty seconds otherwise, so a 
 session is in the inbox within moments rather than at some later pass. A broker transition of any
 other request waits to go with the next page. A page that ends before the broker's newest record is
 answered at once, so the transition of an approval behind a full page is not read late.
+
+The worker writes a host event of its own kind when it reads an agent's server say that a turn
+ended, and another when a command finishes with a status other than nought. A turn dropped with
+its binding did not end, so it is no record; a turn that was interrupted did end, and its result
+is review work. A report that a command ended, repeated for a command the session holds as ended,
+is not a second record. The first line of a record's detail is the turn or the status and the
+rest is fixed words, so the record keeps no command line. A page carries the work as a member of
+its own beside the words, and the words stay behind privacy mode like those of any host event, so
+a session in privacy mode still raises what the work is about and serves none of its words. The
+record's number is the version of the turn's result and the identity of the command. It only
+goes up, and a worker started again over the journal goes on from it, so a turn that ends
+again, even under the same turn identifier, is a later version and new review work, and two
+commands that read alike are two failures. Each failed command is an item of its own, so the
+sixty-second window never merges two of them. A session that closes writes what it has queued
+before it commits its closure. A journal that refuses a record keeps it queued while the worker
+lives; if the worker ends first the record is lost, and the closure says it is not durable. A
+command can be recorded twice if its report is repeated after the session has dropped the older
+of the sixty-four command blocks it holds, or after the worker started again, and a report that
+a command ended is missed when it has no start and reuses the prompt generation of a block the
+session holds as ended. A release that does not know these kinds reads them as events that raise
+nothing, and serves the text of an item this release raised from them with the line of
+identifiers before the words.
 
 A page is read in a fixed order: the moment, then each source's newest record and the records after
 the cursor up to it, then the session's privacy record. A page that reaches the newest record of
@@ -6031,8 +6054,9 @@ grant is when the host committed the pairing. A reminder's date is that of the q
 about, not when it fires. A gap or a review does not have a date; it is displayed by session
 only.
 
-An item's text and a change's text come from retained content: a question's wording, a command
-line, what an application printed. The store keeps none of it. When the owner reads the inbox, the
+An item's text and a change's text come from retained content: a question's wording, what an
+application printed, the fixed words of a turn that ended or a command that failed. The store
+keeps none of it. When the owner reads the inbox, the
 daemon asks each session for the text of the items it is about to serve, all at once: the live
 worker over its attention connection, or a finished session's journal. A session that does not
 answer within three seconds, one closed over a worker the host could not account for, or a record
