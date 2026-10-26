@@ -17,8 +17,10 @@ use super::{Controller, encode, error_reply, net, parse, respond};
 
 /// The local write methods this daemon performs itself that take no admission into a service:
 /// the environment record, the update handover, the setting up of backups, the person's deletion of
-/// a copy privacy mode lists and the host's own sign-in and sign-out. The deletion asks the
-/// registration again in the write that records it; the others change nothing the revision or the
+/// a copy privacy mode lists, the person's confirmation of a policy the host found restored and the
+/// host's own sign-in and sign-out. The deletion asks the registration again in the write that
+/// records it, and the confirmation asks the registration and the deadline again where it removes
+/// the record of the wait, under that record's lock; the others change nothing the revision or the
 /// deadline decides.
 ///
 /// The fence check and the registration check run for each of them before it does anything. A
@@ -982,7 +984,7 @@ impl Controller {
             // answers that it lifted nothing.
             Method::HostPolicyConfirm => {
                 match accepted.filter(|accepted| self.clock.now() < accepted.deadline) {
-                    Some(_) => self.confirm_the_restored_policy().await,
+                    Some(_) => self.confirm_the_restored_policy(carried).await,
                     None => Err(ControllerError::WindowExpired {
                         detail: "the deadline this action was admitted under passed before it \
                                  could run"
