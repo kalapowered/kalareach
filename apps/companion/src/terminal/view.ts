@@ -567,8 +567,10 @@ export function useTerminalView(
     }
   }, [waitingOnAFrame, stamp])
 
+  // The open is answered before native code attaches, and a view that is not attached yet has no
+  // link to read or press on: it is the view's first state that says it is.
   const openView =
-    opened?.scope === scope && opened.attempt === attempt && state?.state !== 'ended'
+    opened?.scope === scope && opened.attempt === attempt && state !== null && state.state !== 'ended'
       ? opened.view
       : null
   const launch = useMemo(
