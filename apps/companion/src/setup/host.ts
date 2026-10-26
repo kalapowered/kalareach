@@ -1,11 +1,12 @@
 /**
- * The three things a desktop installation offers, and the two it only offers.
+ * The four things a desktop installation offers, and the two it only offers.
  *
- * Section 26 keeps the graphical host, the headless host and a terminal profile as separate
- * offers, because they are separate decisions: somebody who wants a machine that keeps working
- * after they log out wants a different thing from somebody who wants their terminal to know about
- * sessions, and installing all three because one was asked for is how an installer earns
- * suspicion.
+ * Section 26 keeps the graphical host, the headless host, the shell startup entry and a terminal
+ * profile as separate offers, because they are separate decisions: somebody who wants a machine
+ * that keeps working after they log out wants a different thing from somebody who wants their
+ * shell to know about sessions, and from somebody who wants one terminal application to open a
+ * session for each window. Installing all of them because one was asked for is how an installer
+ * earns suspicion.
  *
  * The other two are offers and nothing more. Automatic sleep is the machine's own policy and
  * KalaReach does not change it quietly, so the setting is presented with what it would do and left
@@ -20,7 +21,7 @@ import type { ProfilePersistence } from '@kalareach/protocol'
 /** One thing a desktop installation can put on this machine. */
 export interface Installable {
   /** What the interface calls it. */
-  readonly id: 'gui_host' | 'headless_host' | 'terminal_profile'
+  readonly id: 'gui_host' | 'headless_host' | 'shell_startup' | 'terminal_profile'
   /** The name a person reads. */
   readonly name: string
   /** What it does. */
@@ -33,7 +34,7 @@ export interface Installable {
   readonly profile?: ProfilePersistence['profile']
 }
 
-/** The three offers, each on its own. */
+/** The four offers, each on its own. */
 export const INSTALLABLES: readonly Installable[] = [
   {
     id: 'gui_host',
@@ -54,12 +55,25 @@ export const INSTALLABLES: readonly Installable[] = [
     profile: 'headless_user'
   },
   {
-    id: 'terminal_profile',
-    name: 'A terminal profile',
+    id: 'shell_startup',
+    name: 'A shell startup entry',
     purpose:
       'Teaches your shell about sessions, so `kr` and your prompt agree about which one you are in.',
     installs: 'One block in your shell startup file, marked so it can be removed again.',
     command: 'kr shell install'
+  },
+  {
+    id: 'terminal_profile',
+    name: 'A terminal profile',
+    purpose:
+      "This adds only a profile, called 'KalaReach', to a terminal application you already use. " +
+      "Whenever you open a new window or tab with the 'KalaReach' profile, it will be a session " +
+      'of its own. If the command fails, the window will wait for you to press a key so that you ' +
+      'can read why before it closes.',
+    installs:
+      "It will add one profile to that application's own list of profiles. It will not affect " +
+      'your other profiles, the default profile, or the startup files of your shell.',
+    command: 'kr host terminal-profile install <terminal>'
   }
 ]
 
