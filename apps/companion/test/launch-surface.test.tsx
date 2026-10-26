@@ -437,4 +437,43 @@ describe('what a read is taken to say', () => {
     expect(screen.queryByTestId('launch-unread')).toBeNull()
     expect(screen.queryByTestId('launch-surface')).toBeNull()
   })
+
+  // A view whose listeners could not be registered says so, and "Try again" registers them again
+  // before it reads again, on either pane that draws the surface.
+  it.each(['semantic', 'terminal'] as const)(
+    'registers its listeners again when the person tries again, on the %s pane',
+    async (pane) => {
+      const person = userEvent.setup()
+      const { port } = fakeHost()
+      let refusing = true
+      render(
+        <AppProvider
+          port={{
+            ...port,
+            onConnection: (listener) =>
+              refusing
+                ? Promise.reject({
+                    code: 'INTERNAL',
+                    message: 'The shell did not register the listener.',
+                    user_action: 'retry'
+                  })
+                : port.onConnection(listener)
+          }}
+          initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane }}
+        >
+          <App />
+        </AppProvider>
+      )
+      expect(await screen.findByTestId('launch-unread')).toHaveTextContent(
+        'The launch surface could not be read'
+      )
+
+      refusing = false
+      await person.click(screen.getByRole('button', { name: 'Try again' }))
+      // The connection's rights are not known on this port either, which could not register that
+      // listener: the surface is read, and says this device can look and not start.
+      expect(await screen.findByTestId('launch-cannot-start')).toBeInTheDocument()
+      expect(screen.queryByTestId('launch-unread')).toBeNull()
+    }
+  )
 })
