@@ -276,6 +276,10 @@ fn every_neutralised_key_the_fixture_names_is_exposed_as_a_limitation() {
     }
 }
 
+/// KR-REQ-14.23, the part about the options that would restore what the profile disables: a
+/// configuration override (`-c`, `--config-env`), a template (`--template`), an exec path, a
+/// Git or work-tree directory and an upload or receive pack program are each refused as an
+/// argument this service does not pass.
 #[test]
 fn a_subcommand_that_discards_the_users_work_cannot_be_run_at_all() {
     // The one place a subprocess is started refuses these, so "never clean, stash or discard
@@ -577,7 +581,8 @@ fn no_configuration_outside_the_repository_reaches_a_git_invocation() {
 }
 
 /// KR-REQ-14.23, the part about the audit: reading a planted repository's own configuration through
-/// the profile finds its filter driver by name and blanks its fsmonitor, and no sentinel appears.
+/// the profile finds its filter driver by name and classifies its fsmonitor for blanking, and no
+/// sentinel appears.
 #[test]
 fn the_audit_reads_the_repositorys_own_configuration_through_the_profile() {
     // The classifier is unit-tested against recorded listings; this proves it reads a real
@@ -779,8 +784,8 @@ fn a_submodules_own_filter_never_runs_because_this_host_never_enters_one() {
 }
 
 /// KR-REQ-14.24, KR-REQ-14.23 and KR-ACC-030, the part about spellings of a driver's name: a
-/// filter whose name differs in case, and one whose name holds an equals sign, are each found by the
-/// audit and neither runs during a status.
+/// filter whose name differs in case, and one whose name holds an equals sign, are each found by
+/// the audit and neither runs during a status.
 #[test]
 fn a_driver_named_in_a_spelling_an_override_could_miss_still_never_runs() {
     // A configuration subsection is case-sensitive, and a command-line `-c` splits its argument at
@@ -988,7 +993,7 @@ fn a_configuration_key_that_carries_a_credential_is_not_repeated_in_a_diagnostic
 
 /// KR-REQ-14.23, the part about the options that would restore what the profile disables: a
 /// template (`--t`, `--templ`) and a configuration override (`--conf`) named by an abbreviation
-/// Git accepts are each refused as an invalid argument, as the spelled-out forms are.
+/// Git accepts are each refused as an invalid argument.
 #[test]
 fn the_shortest_abbreviation_of_a_forbidden_option_is_refused() {
     // Git accepts an unambiguous abbreviation of a long option, so a check that only looks at the
