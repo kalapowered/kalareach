@@ -93,13 +93,18 @@ impl Gsettings {
         self.run(&["reset", target, key]).map(|_| ())
     }
 
-    /// The schemas the database knows.
+    /// The schemas the database knows: those with a place of their own, and the relocatable ones a
+    /// profile's keys are, which `list-schemas` leaves out.
     fn schemas(&self) -> Result<Vec<String>, ToolFailure> {
-        Ok(self
-            .run(&["list-schemas"])?
-            .lines()
-            .map(|line| line.trim().to_owned())
-            .collect())
+        let mut known = Vec::new();
+        for listing in ["list-schemas", "list-relocatable-schemas"] {
+            known.extend(
+                self.run(&[listing])?
+                    .lines()
+                    .map(|line| line.trim().to_owned()),
+            );
+        }
+        Ok(known)
     }
 
     /// The keys of a schema.
