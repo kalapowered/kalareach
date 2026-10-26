@@ -25,13 +25,15 @@ The four families are kept apart: each has a key of its own, held in its own pla
 checks an update only against the channel root it trusts (on macOS and Linux, the newest of the roots the first row names), and a catalogue only against the
 root it adopted, followed forward through the successor roots a sync verified; a relay checks a lease against the issuer keys it pins when the lease is installed, and does not check them again when it restores the lease at its next start; and an organisation's
 lease or policy only against the chain the host enrolled for that organisation. A root that names
-one key for two of its roles is refused where each is read: an update channel root by the release
-tool and by a host; a catalogue root by the pipeline that builds a generation (it checks every
+one key for two of its roles is refused where each is read: an update channel root by
+`kr-release verify` and by a host; a catalogue root by the pipeline that builds a generation (it checks every
 root the generation ships) and by a host, when the owner is asked to adopt it, when the bundled
 generation's root is trusted, and for the root a sync ends on before that root is kept. The
 pipeline refuses a key in a spelling it cannot reduce to its bytes; a host compares the keys as the
 TUF client parsed them, so in a root the pipeline did not build, one key written two ways is not
-found as one, and the key ceremony reduces those. The channel root names a key of its own for each of its four roles, the
+found as one, and the key ceremony reduces those. A root that names one key under two identifiers
+in a single role is refused by `kr-release verify` and by a host, and the pipeline does not look for
+it. The channel root names a key of its own for each of its four roles, the
 snapshot and timestamp roles included, though a host verifies no signature by those two and does not require them. The release tool's and the host's comparison of a channel root look at the 32 bytes of each key, so neither finds a key's negation or a small-order shift of it; the catalogue pipeline's comparison does read the spellings of a key and finds an elliptic-curve key's negation, which a host's comparison of a catalogue root does not. A host that holds an
 update channel root made by an older `kr-release dev-keys`, which gave the root key to three roles,
 is installed again in a new store.
