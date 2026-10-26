@@ -2681,11 +2681,16 @@ pub(crate) mod tests {
     /// the floor is not on disk the device is not told of an expiry, which a clock wound back
     /// before the next start would reverse: the answer is that the floor is unrecorded. Once it
     /// is on disk, the expiry is answered.
+    ///
+    /// The daemon starts once its first passes are over, so that the sweep and the maintenance pass
+    /// it makes as it starts do not read the clock after the fault is in place. A pass that does
+    /// fails its write and owes the floor, and the case's own decision is then answered that the
+    /// floor is unrecorded, whatever the clock decided.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_clock_refusal_whose_record_failed_is_written_by_the_next_decision_and_outlives_a_restart()
      {
         let temp = kr_ipc::testing::TempHost::create();
-        let controller = daemon(&temp).await;
+        let controller = daemon_after_its_first_passes(&temp).await;
         let revision = controller.policy().authority_revision();
         let now = kr_ipc::now_ms().get();
         let expires = now + 60 * 60 * 1000;
