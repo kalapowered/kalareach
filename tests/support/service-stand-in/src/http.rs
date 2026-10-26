@@ -111,7 +111,10 @@ async fn connection(mut socket: TcpStream, web: Arc<ServiceWeb>) {
     let carries_content = received
         .header("content-type")
         .is_some_and(|kind| kind.starts_with("application/octet-stream"));
-    let parsed = if crate::organisation::is_organisation_route(&received.path) {
+    let parsed = if received.path == crate::matrix::PATH {
+        // A read: public, no body and no credential, so it is not a signed request.
+        Ok(serde_json::json!({ "body": serde_json::Value::Null }))
+    } else if crate::organisation::is_organisation_route(&received.path) {
         // Proven by the account's bearer token alone: the body is the request, and a read has none.
         if received.body.is_empty() {
             Ok(serde_json::json!({ "body": serde_json::Value::Null }))
