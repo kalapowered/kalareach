@@ -7106,36 +7106,59 @@ async fn a_window_the_host_can_refuse_never_reaches_the_marker() {
 // KR-REQ-24.27: what a receipt carries beyond its metadata, where privacy mode withholds it
 // ---------------------------------------------------------------------------------------------
 
-/// What a crash leaves of a worker's journal: its database and the write-ahead log beside it as
-/// they stand while the worker is stopped, copied where nothing holds them open.
-fn crash_image(journal_path: &std::path::Path, into: &std::path::Path) -> std::path::PathBuf {
-    let image = into.join(journal_path.file_name().expect("a file name"));
-    std::fs::copy(journal_path, &image).expect("copies the store");
-    let mut log = journal_path.as_os_str().to_owned();
-    log.push("-wal");
-    if std::path::Path::new(&log).exists() {
-        let mut copy = image.as_os_str().to_owned();
-        copy.push("-wal");
-        std::fs::copy(&log, copy).expect("copies the write-ahead log");
-    }
-    image
+/// What the journal on disk holds of one receipt, read through a connection of its own: its state,
+/// whether it carries the intent envelope, and whether it holds a result.
+///
+/// The worker is stopped just after a commit when this is read, so what a second connection sees
+/// is the committed state a crash at that point leaves for the next reader of the store.
+fn held_on_disk(store: &std::path::Path, action_id: ActionId) -> (String, bool, bool) {
+    rusqlite::Connection::open_with_flags(
+        store,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .expect("opens the store")
+    .query_row(
+        "SELECT state, intent IS NOT NULL,
+                EXISTS (SELECT 1 FROM results
+                        WHERE results.actor_id = receipts.actor_id
+                          AND results.action_id = receipts.action_id)
+         FROM receipts WHERE action_id = ?1",
+        [action_id.get().as_bytes().as_slice()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .expect("the receipt is on disk")
 }
 
-/// What a store on disk holds of one receipt: its state, whether it carries the intent envelope,
-/// and whether it holds a result.
-fn held_on_disk(store: &std::path::Path, action_id: ActionId) -> (String, bool, bool) {
-    rusqlite::Connection::open(store)
-        .expect("opens the store")
-        .query_row(
-            "SELECT state, intent IS NOT NULL,
-                    EXISTS (SELECT 1 FROM results
-                            WHERE results.actor_id = receipts.actor_id
-                              AND results.action_id = receipts.action_id)
-             FROM receipts WHERE action_id = ?1",
-            [action_id.get().as_bytes().as_slice()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .expect("the receipt is on disk")
+/// Sends `mutation` and holds the worker the moment after the receipt it settles or rejects has
+/// committed, and returns what the journal on disk holds of that action then.
+///
+/// The worker is let go afterwards and its answer is returned with the connection, so a case can
+/// go on with a worker that has finished.
+async fn held_on_disk_at_settlement<C: Codec + Send + 'static>(
+    host: &Host,
+    mut client: Client<C>,
+    mutation: MutationRequest,
+) -> ((String, bool, bool), Outcome, Client<C>) {
+    let (arrived, release) = host
+        .service
+        .runtime()
+        .session()
+        .journal_mut()
+        .expect("a journal")
+        .stall_after_next_settlement();
+    let action = mutation.action_id;
+    let sending = tokio::spawn(async move {
+        let outcome = send_mutation(&mut client, mutation).await;
+        (client, outcome)
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(60), arrived)
+        .await
+        .expect("the worker reaches its settlement")
+        .expect("the settlement is reported");
+    let held = held_on_disk(&host.journal_path, action);
+    release.send(()).expect("the worker is let go");
+    let (client, outcome) = sending.await.expect("the client's task ends");
+    (held, outcome, client)
 }
 
 /// KR-REQ-24.27: a worker that stops the moment after an action settled under privacy mode, which
@@ -7153,14 +7176,7 @@ async fn a_worker_that_stops_as_an_action_settles_under_privacy_mode_leaves_no_c
                 .enable_privacy(kr_worker::privacy::PrivacyGeneration::new(1), &mut [])
                 .expect("privacy mode is turned on");
         }
-        let (arrived, release) = host
-            .service
-            .runtime()
-            .session()
-            .journal_mut()
-            .expect("a journal")
-            .stall_after_next_settlement();
-        let mut client = controller_client(&host).await;
+        let client = controller_client(&host).await;
         let mutation = close_mutation(
             &client,
             &host,
@@ -7168,25 +7184,14 @@ async fn a_worker_that_stops_as_an_action_settles_under_privacy_mode_leaves_no_c
             ParamsValue::empty(),
         );
         let action = mutation.action_id;
-        let sending = tokio::spawn(async move {
-            let outcome = send_mutation(&mut client, mutation).await;
-            (client, outcome)
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(60), arrived)
-            .await
-            .expect("the worker reaches its settlement")
-            .expect("the settlement is reported");
-        let temp = tempfile::tempdir().expect("a directory");
-        let image = crash_image(&host.journal_path, temp.path());
-        release.send(()).expect("the worker is let go");
-        let (mut client, outcome) = sending.await.expect("the client's task ends");
+        let (held, outcome, mut client) = held_on_disk_at_settlement(&host, client, mutation).await;
         assert!(matches!(outcome, Outcome::Ok(_)), "the close is accepted");
         client
             .confirm_delivery(action)
             .await
             .expect("the delivery is confirmed");
 
-        let (state, envelope, result) = held_on_disk(&image, action);
+        let (state, envelope, result) = held;
         assert_eq!(state, "applied", "the commit is on disk");
         assert_eq!(
             (envelope, result),
@@ -7204,7 +7209,6 @@ async fn a_rejection_under_privacy_mode_commits_the_receipt_without_the_envelope
     for private in [true, false] {
         let host = host().await;
         let mut client = cli(&host).await;
-        let caller = actor(&format!("local:{}", kr_ipc::paths::current_uid()));
         let attachment = attach(&mut client, &host).await;
         if private {
             host.service
@@ -7230,22 +7234,18 @@ async fn a_rejection_under_privacy_mode_commits_the_receipt_without_the_envelope
                 ParamsValue::empty(),
             )
         };
-        let action = release.action_id;
-        let Outcome::Error(error) = send_mutation(&mut client, release).await else {
+        let (held, outcome, _client) = held_on_disk_at_settlement(&host, client, release).await;
+        let Outcome::Error(error) = outcome else {
             panic!("a release from an attachment that holds no lease is refused");
         };
         assert_eq!(error.code, ErrorCode::LeaseLost);
-        rejected(&host, &caller, action);
 
-        let mut session = host.service.runtime().session();
-        let journal = session.journal_mut().expect("a journal");
+        let (state, envelope, result) = held;
+        assert_eq!(state, "rejected", "the commit is on disk");
         assert_eq!(
-            journal
-                .read_intent(&caller, action)
-                .expect("reads")
-                .is_some(),
-            !private,
-            "the envelope of a rejected action (privacy mode on: {private})"
+            (envelope, result),
+            (!private, false),
+            "what a crash right after the rejection leaves (privacy mode on: {private})"
         );
     }
 }
