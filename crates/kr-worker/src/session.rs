@@ -57,7 +57,7 @@ const STALE_TOKEN: &str = "the capability this caller presented is not one this 
                            Use kr detach --attachment <id> to detach";
 
 /// How long an owned process group has to stop before it is forced.
-pub const GRACE_PERIOD: Duration = Duration::from_secs(5);
+pub const GRACE_PERIOD: Duration = Duration::from_secs(4);
 
 /// How long the terminal is read after the processes have stopped.
 ///
