@@ -621,9 +621,9 @@ worker supplies the same default as on Unix, the terminal's end-of-file byte 4, 
 PSReadLine module puts its decision on Ctrl+d when its hooks go live. A Windows console has no line
 discipline to read an end-of-file character from, so when the first prompt begins the module reports
 the gesture as disabled, in every edit mode, effective at that prompt. It takes its decision off
-Ctrl+d when it promotes that report, which is at the first Ctrl+d that reaches the module at the
-prompt (one pressed in the Vi command table does not) or at the next prompt's entry while the bridge
-is registered, whichever comes first, and a Ctrl+d that promotes it runs `DeleteCharOrExit` whatever was bound to the key, which at
+Ctrl+d when it promotes that report, which is at the first Ctrl+d that reaches the module at that
+prompt or a later one (one pressed in the Vi command table does not) or at the next prompt's entry
+while the bridge is registered, whichever comes first, and a Ctrl+d that promotes it runs `DeleteCharOrExit` whatever was bound to the key, which at
 an empty line ends the shell. From then on no key detaches the session there, and
 `kr detach --attachment <id>` is the way. The protocol also carries a gesture
 as a chord (`chord` with `keys`), which the module honours and the worker does not send.
@@ -805,10 +805,10 @@ binds into it: it wraps the host's own read-line entry point for the reader's bo
 editor's own operations so the reader has a boundary to answer at and the states they wait in are
 observable, and puts its end-of-file decision on the configured gesture in front of whatever was
 bound there. A handler the person wrote themselves is left exactly as it is, identified by what the
-editor holds rather than by the name a handler carries, and what the module installed is put back
-when it is removed, except where the person has since bound that key themselves (and, in the Vi edit
-mode, a key that both tables bind: see below). Four things hold for
-the key the gesture is on and for no other. The module binds its decision there in front of whatever
+editor holds rather than by the name a handler carries, and the editor's own binding is put back on
+each key the module took when it is removed, except where the person has since bound that key
+themselves (and, in the Vi edit mode, a key whose lookup returns both tables' entries: see below).
+Four things hold for the key the gesture is on and for no other. The module binds its decision there in front of whatever
 was bound, the person's own script included, which it runs outside the detach condition. When the
 decision comes off that key it writes back the binding it found and does not look at what the key
 holds by then. In the Emacs edit mode and in the Vi insert table the editor has an operation on
@@ -816,8 +816,8 @@ Ctrl+d, which the module wraps like any other bound key before it binds the deci
 it finds there is its own wrapper, and removing the module writes that wrapper back: Ctrl+d keeps
 calling the module's function and not the editor's operation. And the module moves its decision to a
 changed gesture's key when it promotes the change, which is the first end-of-file decision at the
-prompt the change names or the next prompt's entry while the bridge is registered, whichever comes
-first, and not when it reports the change: until then the new key has no decision on it, and the press of the old key that promotes the change runs
+prompt the change names or after it, or the next prompt's entry while the bridge is registered,
+whichever comes first, and not when it reports the change: until then the new key has no decision on it, and the press of the old key that promotes the change runs
 what the new key held in place of the old key's own binding. Where a key held nothing, the module
 runs `SelfInsert` if the chord it has bound by then is one character long and `DeleteCharOrExit` for
 any other chord, and both run with the key information of the press that happened. The press that
@@ -829,8 +829,8 @@ puts a binding made without `-ViMode` there, and the module wraps none of the co
 which the editor lists in angle brackets (`<Ctrl+d>`). In the command table, which Escape opens,
 Ctrl+d stays the editor's own `ViAcceptLineOrExit`, which ends the shell at an empty line, and no
 key of that table takes the decision or reads the mailbox. A lookup of a key that both tables bind
-returns both entries, so removing the module takes such a key for one the person has rebound and
-leaves its wrapper on it.
+returns both entries, except for Escape, whose command table entry is `Ignore`. Removing the module
+takes such a key for one the person has rebound and leaves its wrapper on it.
 
 What it pins is a range rather than a release: PowerShell 7.4 or later with PSReadLine 2.3.4 up to
 3.0. The module declares the versions it found in its handshake and the worker refuses an editor
@@ -846,9 +846,10 @@ method, and that is exactly what it cannot do:
 - **The reader is reached when it steps.** The module's queue is serviced on the reader's own
   thread, after each of the editor's own operations has run: every chord the editor has a binding
   for, except the keys of the Vi command table, goes through the module, which runs the editor's
-  operation and then reads the queue, unless the editor's own key queue still holds keys the person
-  typed, which go first. The read-line entry reports the reader and reads the mailbox once, before the editor's read starts, and the editor clears its buffer when its read starts. The module has no check of its own that
-  holds a launch back from that one read; what keeps one from reaching it is the contract's order,
+  operation and then reads the queue, unless the editor's own key queue still holds keys, which go
+  first. The read-line entry reports the reader and reads the mailbox once, before the editor's read
+  starts, and the editor clears its buffer when its read starts. The module has no check of its own
+  that holds a launch back from that one read; what keeps one from reaching it is the contract's order,
   since a launch quotes a fence the worker publishes only after the reader has acknowledged one. A
   key the person bound to a script of their own is theirs and carries no boundary, and an ordinary
   character goes straight to the editor's own insertion, so a request that arrives at a parked
@@ -878,8 +879,8 @@ method, and that is exactly what it cannot do:
   inside its own key read, where nothing of the module's runs. What the module reports is the
   editor's own key queue and the operations it is inside; a sequence the editor has begun to
   decode and not finished is in neither, so the queue proof here is as good as that queue and no
-  better. A fence asked while the reader is blocked on a key is answered at its next step,
-  against the state it has then.
+  better. A fence asked while the reader is blocked on a key is answered at the next point where
+  the module reads its mailbox (the first point above), against the state it has then.
 - **The buffer belongs to the read that is in progress.** Between one line being accepted and the
   next read starting, the editor still holds the line that has gone; the module reports the buffer
   it is about to have, which is empty, and counts no change the person did not make.
