@@ -77,7 +77,9 @@ const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 
 /// The share mode of a handle that lets every other handle read and write but not rename or delete
 /// the name, which then stays where it is for as long as this handle is open: the one a removal
-/// acts through, from the open to the last thing it does.
+/// acts through, from the open to the last thing it does. The system counts a handle in the
+/// sharing of a file only if it was opened with a right to read, write or delete it, so a handle
+/// opened with this mode keeps the name where it is only when its access holds one of those.
 const KEPT_WHERE_IT_IS: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
 
 /// Reads this process's own image from the kernel: the file the process was created from, with
@@ -786,7 +788,7 @@ impl Trash {
     /// Returns the operating system's error when `from` cannot be opened or moved: access denied or
     /// a sharing violation when a program holds something inside it ([`is_in_use`]).
     pub(super) fn take(&self, from: &Path, name: &OsStr) -> io::Result<()> {
-        let source = open_name(from, DELETE, SHARE_ALL)?;
+        let source = open_name(from, DELETE, KEPT_WHERE_IT_IS)?;
         let wide: Vec<u16> = name.encode_wide().collect();
         if wide.is_empty()
             || wide
@@ -1074,8 +1076,8 @@ fn list_next(handle: &File, restart: bool) -> io::Result<Option<Vec<Listed>>> {
 /// on a file deny its owner that right. A refusal is therefore either the seal or a program that
 /// runs from the file, and the right is asked for to tell which. When the file's list is the
 /// seal's own, the whole of it, the file is given back to its owner, the one change to a file's
-/// access list a removal makes, and the delete is tried again. A list that denies the right and is
-/// not the seal's is somebody else's, and it is left as it is and reported.
+/// access list a removal makes, and deleted through the handle that did it. A list that denies the
+/// right and is not the seal's is somebody else's, and it is left as it is and reported.
 ///
 /// # Errors
 ///
@@ -1091,8 +1093,10 @@ fn remove_name(reach: Reach<'_>, shown: &Path) -> io::Result<()> {
                 Err(not_allowed) if denied(&not_allowed) => {}
                 Err(other) => return Err(refused("cannot reach", shown, &other)),
             }
+            // One handle for the reset and the deletion that follows it, opened with the right to
+            // delete so that nobody can rename or delete the name while it is open.
             let sealed = reach
-                .open(READ_CONTROL | WRITE_DAC, KEPT_WHERE_IT_IS)
+                .open(DELETE | READ_CONTROL | WRITE_DAC, KEPT_WHERE_IT_IS)
                 .map_err(|error| refused("cannot give back", shown, &error))?;
             at(Moment::AboutToGiveBack, shown);
             if !has_the_seals_list(&sealed)
@@ -1106,7 +1110,7 @@ fn remove_name(reach: Reach<'_>, shown: &Path) -> io::Result<()> {
             }
             set_list_on(&sealed, OWNER_ONLY)
                 .map_err(|error| refused("cannot give back", shown, &error))?;
-            delete_name(reach, shown)
+            mark_for_deletion(&sealed)
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         done => done,
