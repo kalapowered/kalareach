@@ -33,6 +33,30 @@ pub async fn with_account_origin<F: Future>(origin: Option<String>, start: F) ->
 }
 
 tokio::task_local! {
+    /// The keys the signed release matrix is verified against, for the daemon being started in
+    /// this task.
+    static RELEASE_MATRIX_PINS: kr_client::services::matrix::Pins;
+}
+
+/// Runs `start` so that the daemon it starts verifies the signed release matrix against `pins` in
+/// place of the key this build pins.
+///
+/// The production key's private half is not here, so a suite that serves a matrix signs it with a
+/// key of its own and has the daemon pin that key for the length of one start. A shipped build has
+/// no way to change its pin.
+pub async fn with_release_matrix_pins<F: Future>(
+    pins: kr_client::services::matrix::Pins,
+    start: F,
+) -> F::Output {
+    RELEASE_MATRIX_PINS.scope(pins, start).await
+}
+
+/// The keys a suite gave the start in progress, when it did.
+pub(crate) fn release_matrix_pins() -> Option<kr_client::services::matrix::Pins> {
+    RELEASE_MATRIX_PINS.try_with(Clone::clone).ok()
+}
+
+tokio::task_local! {
     /// The bound a brokered Git read is given, for the daemon being started in this task.
     static GIT_READ_BOUND: Duration;
 }

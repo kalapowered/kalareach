@@ -218,7 +218,7 @@ impl Controller {
     /// Returns an error when another daemon owns the environment, the registry cannot be opened,
     /// or the controller identity is missing.
     pub async fn start(setup: ControllerSetup) -> Result<Arc<Self>> {
-        Self::start_with(setup, Clocks::system(), Arc::new(RealTimer), None).await
+        Self::start_with(setup, Clocks::system(), Arc::new(RealTimer), None, None).await
     }
 
     /// Starts the daemon on the clocks a test gives it, by the same path [`Self::start`] takes on
@@ -229,7 +229,7 @@ impl Controller {
     /// As [`Self::start`].
     #[cfg(feature = "testing")]
     pub async fn start_on_clocks(setup: ControllerSetup, clocks: Clocks) -> Result<Arc<Self>> {
-        Self::start_with(setup, clocks, Arc::new(RealTimer), None).await
+        Self::start_with(setup, clocks, Arc::new(RealTimer), None, None).await
     }
 
     /// Starts the daemon with the wait between the passes of its backup carrier in the hands of
@@ -243,7 +243,7 @@ impl Controller {
         setup: ControllerSetup,
         timer: Arc<dyn Timer>,
     ) -> Result<Arc<Self>> {
-        Self::start_with(setup, Clocks::system(), timer, None).await
+        Self::start_with(setup, Clocks::system(), timer, None, None).await
     }
 
     /// Starts the daemon on the clocks a test gives it, with the waits of its carriers in the hands
@@ -258,11 +258,12 @@ impl Controller {
         clocks: Clocks,
         timer: Arc<dyn Timer>,
     ) -> Result<Arc<Self>> {
-        Self::start_with(setup, clocks, timer, None).await
+        Self::start_with(setup, clocks, timer, None, None).await
     }
 
     /// As [`Self::start_on_clocks_and_timer`], with the waits of the reader of the host's own
-    /// mailbox in the hands of `mailbox_timer` and not of `timer`.
+    /// mailbox in the hands of `mailbox_timer` and the waits of the reader of the signed release
+    /// matrix in the hands of `release_matrix_timer`, and not of `timer`.
     ///
     /// A suite that holds the carriers' waits and reads the order they were asked for in has no
     /// use for the waits of a task it is not about, and gives that task a timer of its own, which
@@ -277,8 +278,16 @@ impl Controller {
         clocks: Clocks,
         timer: Arc<dyn Timer>,
         mailbox_timer: Arc<dyn Timer>,
+        release_matrix_timer: Arc<dyn Timer>,
     ) -> Result<Arc<Self>> {
-        Self::start_with(setup, clocks, timer, Some(mailbox_timer)).await
+        Self::start_with(
+            setup,
+            clocks,
+            timer,
+            Some(mailbox_timer),
+            Some(release_matrix_timer),
+        )
+        .await
     }
 
     async fn start_with(
@@ -286,6 +295,7 @@ impl Controller {
         clocks: Clocks,
         timer: Arc<dyn Timer>,
         mailbox_timer: Option<Arc<dyn Timer>>,
+        release_matrix_timer: Option<Arc<dyn Timer>>,
     ) -> Result<Arc<Self>> {
         // The start is a long chain of steps, and its state is large. It is kept on the heap, so
         // that a caller that polls it from a small stack, as a test's thread is, does not hold it.
@@ -295,18 +305,21 @@ impl Controller {
             PassSchedule::every(DEBT_PASS_INTERVAL),
             timer,
             mailbox_timer,
+            release_matrix_timer,
         ))
         .await
     }
 
     /// The one start, with the schedule its debt pass keeps, the timer its carriers wait by and
-    /// the timer the reader of the host's own mailbox waits by, when it is another.
+    /// the timers the reader of the host's own mailbox and the reader of the signed release matrix
+    /// wait by, when they are others.
     pub(super) async fn start_passing(
         setup: ControllerSetup,
         clocks: Clocks,
         passes: PassSchedule,
         timer: Arc<dyn Timer>,
         mailbox_timer: Option<Arc<dyn Timer>>,
+        release_matrix_timer: Option<Arc<dyn Timer>>,
     ) -> Result<Arc<Self>> {
         let Clocks {
             continuous: clock,
@@ -753,6 +766,16 @@ impl Controller {
                 Some((origin, writer))
             }
         };
+        // The signed release matrix, read only when `relay.origin` is the managed service. The
+        // copy a run kept is loaded and verified here, so a build the matrix lists no tier for is
+        // known before the lease service is asked for anything, and the gate the lease service
+        // asks through is built just below. Nothing is read until the daemon exists.
+        let release_matrix = crate::release_matrix::ReleaseMatrixRuntime::for_host(
+            &started,
+            setup.paths.state_dir(),
+            Self::outbound_of(&started)?.proxy()?,
+            release_matrix_timer.unwrap_or_else(|| Arc::clone(&timer)),
+        )?;
         // The clients this host holds for its whole life, built here from that document and from
         // nothing a process inherited. They go through the proxy this daemon started with, the
         // endpoint's own, and nothing runs yet: settling comes before the store is reconciled,
@@ -769,6 +792,7 @@ impl Controller {
                         binding: backup.binding(),
                     }
                 }),
+                release_gate: None,
             },
         )?;
         let (backup_runtime, relay_parts, backup_production) = match storage_parts {
@@ -1166,6 +1190,7 @@ impl Controller {
             feed_runtime,
             relay_keeper,
             mailbox_reader,
+            release_matrix,
             feed_notice_wake: Arc::new(tokio::sync::Notify::new()),
             feed_notice_task: std::sync::OnceLock::new(),
             feed_notice_attempts: tokio::sync::watch::channel(0).0,
@@ -1482,6 +1507,9 @@ impl Controller {
         if let Some(reader) = &controller.mailbox_reader {
             reader.run(&controller, Arc::clone(controller.devices()));
         }
+        // The first read of the signed release matrix runs on its own task: the daemon never waits
+        // for it.
+        let _ = &controller.release_matrix;
         // The network comes up last. A paired device must not reach a daemon that has not yet
         // recovered its reservations and rebuilt its worker directory, because it would be told
         // that sessions this host is running do not exist. Registering it also lends the project
