@@ -107,8 +107,9 @@ adds three things to it and nothing else.
   them to the terminal's writer in the order the machine releases them.
 
 Every consequence is one of the machine's own actions, carried out in the order the outcome lists
-them. There is no second state machine and no heuristic fence: nothing in the worker concludes
-anything about the reader from a prompt, a timestamp or a byte count.
+them. There is no second state machine and no heuristic fence: nothing in the worker proves a fence from
+a prompt, a timestamp or a byte count, and a count of the host's own queued answers can only withhold
+or invalidate one.
 
 A loss that leaves the session below `qualified` is followed by an `editor_left` stimulus naming the
 reader the bridge last reported, so the machine deregisters it. Without that the machine would keep
