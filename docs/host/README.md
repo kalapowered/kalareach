@@ -6894,10 +6894,10 @@ floors, the moment of the last synchronisation and the lease records, which ordi
 rewrites. While the record stands the host refuses every grant for an ingress other than the owner at
 the machine, an organisation's and a personal one alike, workflows and plugins under a grant
 included, with `PERMISSION_DENIED` saying that it found the policy it holds restored from an earlier
-state. Having caught up with the feed does not end it. A remote owner device's
-confirmation is not spent while it stands. A request on the feed is still judged and carried out, because the feed
-is how a known owner reaches the host then: it can only revoke, and the keys the host names to the feed
-can only remove the host from it. A device that the owner revoked at the machine after the copy, and
+state. Having caught up with the feed does not end the refusal. A remote owner device's
+confirmation is not spent while it stands. A request on the feed is still judged and carried out,
+because the feed is how a known owner reaches the host then: it can only revoke, and the keys the
+host names to the feed can only remove the host from it. A device that the owner revoked at the machine after the copy, and
 that the restore brought back, is judged live on the feed until the owner has confirmed and revoked it
 again. `kr doctor` shows a `restored-policy` warning, whether or not the host reads a feed, with the
 number of enrolments, whether exclusive management is on and the bound.
@@ -6921,12 +6921,12 @@ which the wait refuses, so it comes after the confirmation. The bound has no com
 own lapse. The call is refused while the host is still catching up with its feed, and the host
 keeps no record of it: asked again after a lost reply it answers that it lifted nothing. No owner
 device can make it, since the wait refuses every owner device, and a ceremony would need a new
-subject of an owner confirmation, which changes the level of the protocol. So it is an exception to
-the rule that an owner operation which enlarges what the host answers to takes the owner's
-confirmation. It ends a refusal the host raised against itself and changes no policy, and the account
-that can open the socket can already remove the record and start the daemon again. It is a method of
-recovery: a host that is exclusively organisation-managed serves it to a local owner whose lease has
-lapsed, which may be what the restore lost. A current organisation policy does not end the wait. It
+subject of an owner confirmation, which changes the level of the protocol. The call is therefore an
+exception to the rule that an owner operation which enlarges what the host answers to takes the
+owner's confirmation. It ends a refusal the host raised against itself and changes no policy, and the
+account that can open the socket can already remove the record and start the daemon again. The method
+is a recovery method, so a host that is exclusively organisation-managed serves it to a local owner
+whose lease has lapsed, which may be what the restore lost. A current organisation policy does not end the wait. It
 states an adapter list and a revision and cannot say that the owner left an organisation or ended
 exclusive management. A record removed by hand ends the wait at the next start, not before.
 
