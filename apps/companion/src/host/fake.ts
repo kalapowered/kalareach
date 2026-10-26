@@ -859,7 +859,7 @@ export interface FakeTerminalView {
   deliverInFlight(state: TerminalViewState): void
 }
 
-/** A read the fake host can hold, named as the port names it. */
+/** A read, or a launch, the fake host can hold, named as the port names it. */
 export type HeldRead =
   | 'connectionState'
   | 'accountStatus'
@@ -867,6 +867,7 @@ export type HeldRead =
   | 'questionRead'
   | 'sessionRead'
   | 'launchSurface'
+  | 'launch'
   | 'openSession'
   | 'sessionAgents'
   | 'agentCapabilities'
@@ -2224,10 +2225,15 @@ export function fakeHost(
               requireConnection()
               return launching.read(sessionId, controls, stockShellOf(sessionId))
             }),
+          // The host acts on a launch when it arrives; a held one is answered later.
           press: (controls, press) =>
-            attempting(() => {
-              requireConnection()
-              return launching.press(sessionId, controls, press)
+            new Promise<ShellLaunchResult>((resolve) => {
+              resolve(
+                reading('launch', () => {
+                  requireConnection()
+                  return launching.press(sessionId, controls, press)
+                })
+              )
             })
         }
       )
