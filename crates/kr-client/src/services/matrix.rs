@@ -448,7 +448,7 @@ impl Document {
 
         Ok(Self {
             revision,
-            digest: transcript.digest().into_bytes(),
+            digest: *transcript.digest().as_bytes(),
             tiers,
             alternatives,
             unknown_alternatives,
