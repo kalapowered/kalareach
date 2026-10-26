@@ -119,10 +119,16 @@ pub fn unpack(
     // else, so that no other record can be found for it to follow; once it has its list of entries
     // it reads the file itself.
     let building = Arc::new(AtomicBool::new(true));
-    let entries = tail.entries;
+    let (entries, start) = (tail.entries, tail.start);
     let mut zipped = ZipArchive::new(Shown::new(file, tail, Arc::clone(&building)))
         .map_err(|_| unreadable(NOT_A_ZIP))?;
     building.store(false, Ordering::Release);
+    // The parser falls back to an earlier end record when the last does not serve, and takes the
+    // directory that record names. It is held to the directory judged above: it started where the
+    // end record says, or the archive is refused.
+    if zipped.central_directory_start() != start {
+        return Err(unreadable(NOT_A_ZIP));
+    }
     // The reader keeps one entry for each name, the last of two that share one, so an archive that
     // names a file twice shows fewer entries than its directory declares.
     if zipped.len() as u64 != entries {
@@ -265,8 +271,8 @@ struct Tail {
 /// What a refusal of the archive's shape says.
 const NOT_A_ZIP: &str = "is not a zip archive this host reads";
 
-/// The signatures of the end record, of its 64-bit form and of that form's locator.
-const END_RECORDS: [[u8; 4]; 3] = [*b"PK\x05\x06", *b"PK\x06\x06", *b"PK\x06\x07"];
+/// The signature of the end record.
+const END_RECORD: [u8; 4] = *b"PK\x05\x06";
 
 /// The most extra data an entry of the directory may carry. The packer writes none.
 const EXTRA_BYTES: usize = 1024;
@@ -275,9 +281,10 @@ const EXTRA_BYTES: usize = 1024;
 /// whole: the end record is the last 22 bytes of the file with no comment, names one disk and
 /// counts and sizes that fit it (so no 64-bit record), and the directory is exactly the bytes
 /// before it, which hold that many entries one after another, with a name and extra data within
-/// bounds, no comment, and no end record or locator among them. The archive a release is packed
-/// into has this shape; any other is refused, so the parser has one end record to follow and the
-/// bytes it will read are the bytes judged here.
+/// bounds and no comment. The archive a release is packed into has this shape; any other is
+/// refused, so the parser has one end record to follow and the bytes it will read are the bytes
+/// judged here. The bytes of the directory are not searched for signatures: a checksum or a size
+/// can spell one, and the parser takes the last end record first.
 ///
 /// Returns the refusal where the archive is not of this shape, or beyond the limits.
 fn read_tail(
@@ -295,7 +302,7 @@ fn read_tail(
     let thirty_two =
         |at: usize| u32::from_le_bytes([end[at], end[at + 1], end[at + 2], end[at + 3]]);
     let (entries, size, start) = (sixteen(10), thirty_two(12), thirty_two(16));
-    if end[..4] != END_RECORDS[0]
+    if end[..4] != END_RECORD
         || sixteen(4) != 0
         || sixteen(6) != 0
         || sixteen(8) != entries
@@ -337,14 +344,8 @@ fn read_tail(
         }
         at += 46 + name + extra;
     }
-    // The entries tile the directory, and nothing in it is an end record: the parser looks for one
-    // by its signature and falls back to an earlier one when the last does not serve. The end
-    // record after it cannot make one with the directory's last bytes, which it begins with `P`.
-    if at != directory
-        || judged
-            .windows(4)
-            .any(|window| END_RECORDS.iter().any(|record| record == window))
-    {
+    // The entries tile the directory.
+    if at != directory {
         return Ok(Err(NOT_A_ZIP));
     }
     Ok(Ok(Tail {
@@ -433,64 +434,5 @@ impl Seek for Shown {
         };
         self.at = target;
         Ok(target)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Write as _;
-
-    /// A directory of one entry named `a` with `extra` after the name, and the end record after it.
-    fn archive_ending(extra: &[u8]) -> Vec<u8> {
-        let mut bytes = b"PK\x01\x02".to_vec();
-        bytes.extend_from_slice(&[0; 24]);
-        bytes.extend_from_slice(&1_u16.to_le_bytes());
-        bytes.extend_from_slice(&u16::try_from(extra.len()).expect("short").to_le_bytes());
-        bytes.extend_from_slice(&[0; 14]);
-        bytes.push(b'a');
-        bytes.extend_from_slice(extra);
-        let size = u32::try_from(bytes.len()).expect("small");
-        bytes.extend_from_slice(b"PK\x05\x06");
-        bytes.extend_from_slice(&[0; 4]);
-        bytes.extend_from_slice(&1_u16.to_le_bytes());
-        bytes.extend_from_slice(&1_u16.to_le_bytes());
-        bytes.extend_from_slice(&size.to_le_bytes());
-        bytes.extend_from_slice(&0_u32.to_le_bytes());
-        bytes.extend_from_slice(&0_u16.to_le_bytes());
-        bytes
-    }
-
-    fn judged(bytes: &[u8]) -> bool {
-        let mut file = tempfile::tempfile().expect("a file");
-        file.write_all(bytes).expect("written");
-        read_tail(&mut file, &Limits::DEFAULT)
-            .expect("reads")
-            .is_ok()
-    }
-
-    /// KR-REQ-26.06: the parser falls back to an earlier end record when the last does not serve,
-    /// so a directory that holds the signature of an end record, of its 64-bit form or of that
-    /// form's locator, anywhere among its entries is refused before the parser sees it; the same
-    /// directory without it is judged whole.
-    #[test]
-    fn a_directory_that_holds_the_signature_of_an_end_record_is_refused() {
-        assert!(judged(&archive_ending(b"")), "the control is judged whole");
-        assert!(
-            judged(&archive_ending(b"PK\x05")),
-            "a part of a signature is not one"
-        );
-        for record in END_RECORDS {
-            assert!(
-                !judged(&archive_ending(&record)),
-                "{record:?} among the entries is refused"
-            );
-            let mut later = b"zz".to_vec();
-            later.extend_from_slice(&record);
-            assert!(
-                !judged(&archive_ending(&later)),
-                "{record:?} after other extra data is refused"
-            );
-        }
     }
 }
