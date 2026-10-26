@@ -124,7 +124,9 @@ stops, so a limit that a part has is written in that part's own document.
   steer or cancel a turn and answer an approval act only where a binding has evidence for them, so
   what an agent offers depends on its package and its build. The Claude Code and Gemini CLI
   bridges are applied only where a signed index names a qualified build of the agent's executable,
-  and no index names one yet: Claude Code's approvals are then answered over its bridge channel and
+  and no index names one yet. The host applies no bridge to an executable that is a script, and the
+  `gemini` that npm installs is one, so a signed index cannot make the Gemini CLI bridge apply to that
+  distribution. Where a bridge applies, Claude Code's approvals are answered over its bridge channel and
   Gemini CLI's hooks reach the worker. The Qoder CLI package reports an agent's hooks to the worker
   with no bridge. An approval is only ever created from the agent's own protocol: [the
   broker](host/README.md#the-broker), [the bridges](bridges/claude-code/README.md) and
