@@ -9,6 +9,7 @@
 pub mod record;
 pub mod words;
 
+mod apple;
 mod files;
 mod gsettings;
 mod iterm2;
@@ -91,7 +92,7 @@ impl ProfileTerminal {
         }
         #[cfg(target_os = "macos")]
         {
-            &[Self::Iterm2]
+            &[Self::Iterm2, Self::AppleTerminal]
         }
         #[cfg(windows)]
         {
@@ -137,6 +138,8 @@ pub struct ProfileHome {
     pub applications: Vec<PathBuf>,
     /// iTerm2's preferences: the domain, or the path of a file standing in for it.
     pub iterm_preferences: String,
+    /// Terminal's preferences: the domain, or the path of a file standing in for it.
+    pub terminal_preferences: String,
     /// How the settings database is reached for the applications that keep profiles in it.
     pub settings: gsettings::Gsettings,
 }
@@ -159,8 +162,13 @@ impl ProfileHome {
             programs: std::env::var_os("PATH")
                 .map(|path| std::env::split_paths(&path).collect())
                 .unwrap_or_default(),
-            applications: vec![PathBuf::from("/Applications"), home.join("Applications")],
+            applications: vec![
+                PathBuf::from("/Applications"),
+                PathBuf::from("/System/Applications/Utilities"),
+                home.join("Applications"),
+            ],
             iterm_preferences: "com.googlecode.iterm2".to_owned(),
+            terminal_preferences: "com.apple.Terminal".to_owned(),
             settings: gsettings::Gsettings::of_this_session(),
             home,
         })
@@ -183,6 +191,12 @@ impl ProfileHome {
                 .join("Library")
                 .join("Preferences")
                 .join("com.googlecode.iterm2")
+                .display()
+                .to_string(),
+            terminal_preferences: home
+                .join("Library")
+                .join("Preferences")
+                .join("com.apple.Terminal")
                 .display()
                 .to_string(),
             // A keyfile of the home's own, so nothing here reaches the person's settings.
@@ -255,6 +269,14 @@ pub enum ProfileError {
     /// The record names a profile for the emulator that is not of the kind this install writes.
     #[error("the record names {}'s profile as another kind of write than this platform makes", .0.name())]
     RecordedOtherwise(ProfileTerminal),
+    /// The person's own Terminal is running, and an outside write to its preferences while it does
+    /// is not one anything is known to survive.
+    #[error("{} is running", .0.name())]
+    Running(ProfileTerminal),
+    /// There is no profile to copy: the preferences hold no dictionary of profiles, or none that
+    /// kr can copy.
+    #[error("{} has no profile in its preferences to copy", .0.name())]
+    NoProfiles(ProfileTerminal),
     /// The settings program is not there.
     #[error("{} keeps its profiles in the settings database, and gsettings is not there", .0.name())]
     ToolMissing(ProfileTerminal),
@@ -313,8 +335,15 @@ pub fn is_present(terminal: ProfileTerminal, home: &ProfileHome) -> bool {
         ProfileTerminal::WindowsTerminal => windows_terminal::present(home),
         ProfileTerminal::GnomeTerminal => home.has_program("gnome-terminal"),
         ProfileTerminal::Ptyxis => home.has_program("ptyxis"),
-        ProfileTerminal::AppleTerminal => false,
+        ProfileTerminal::AppleTerminal => apple::present(home),
     }
+}
+
+/// Whether the person's own application is running, which it must not be for a write to its
+/// preferences.
+#[must_use]
+pub fn is_running(terminal: ProfileTerminal) -> bool {
+    terminal == ProfileTerminal::AppleTerminal && apple::is_running()
 }
 
 /// What an install of one profile would write, worked out before anything is written.
@@ -342,6 +371,15 @@ pub enum Place<'a> {
         /// The path of the profile's keys.
         path: &'a str,
     },
+    /// An entry of a dictionary in an application's preferences.
+    Preferences {
+        /// The preferences' domain.
+        domain: &'a str,
+        /// The key of the dictionary.
+        key: &'a str,
+        /// The entry's name in it.
+        entry: &'a str,
+    },
 }
 
 impl Plan {
@@ -353,6 +391,11 @@ impl Plan {
             How::Settings(plan) => Place::Settings {
                 schema: &plan.wrote.schema,
                 path: &plan.wrote.path,
+            },
+            How::Preferences(plan) => Place::Preferences {
+                domain: &plan.domain,
+                key: &plan.wrote.key,
+                entry: &plan.wrote.entry,
             },
         }
     }
@@ -370,7 +413,9 @@ enum How {
         replace: bool,
     },
     /// Keys of a settings schema, and a place in a shared list.
-    Settings(gsettings::SettingsPlan),
+    Settings(Box<gsettings::SettingsPlan>),
+    /// An entry of a preferences dictionary.
+    Preferences(Box<apple::PreferencesPlan>),
 }
 
 /// Works out what installing `terminal`'s profile with `command` would write, and refuses what it
@@ -461,10 +506,23 @@ pub fn plan(
                 terminal,
                 command: command.to_vec(),
                 wrote: Wrote::Settings(plan.wrote.clone()),
-                how: How::Settings(plan),
+                how: How::Settings(Box::new(plan)),
             })
         }
-        ProfileTerminal::AppleTerminal => Err(ProfileError::NotOnThisPlatform(terminal)),
+        ProfileTerminal::AppleTerminal => {
+            let earlier = match recorded.map(|profile| &profile.wrote) {
+                Some(Wrote::Preferences(wrote)) => Some(wrote),
+                Some(_) => return Err(ProfileError::RecordedOtherwise(terminal)),
+                None => None,
+            };
+            let plan = apple::plan(home, &words::shell_words(command), earlier)?;
+            Ok(Plan {
+                terminal,
+                command: command.to_vec(),
+                wrote: Wrote::Preferences(plan.wrote.clone()),
+                how: How::Preferences(Box::new(plan)),
+            })
+        }
     }
 }
 
@@ -585,6 +643,7 @@ fn write(plan: &Plan) -> Result<(), (ProfileError, bool)> {
         } => files::publish(destination, staging, text, made, *replace)
             .map_err(|error| (ProfileError::io(destination, error), false)),
         How::Settings(plan) => gsettings::write(plan),
+        How::Preferences(plan) => apple::write(plan).map_err(|error| (error, false)),
     }
 }
 
@@ -629,7 +688,8 @@ pub fn status(
             .is_some_and(|path| files::presence(&path) != files::Presence::Missing)
             || settings_spec(terminal).is_ok_and(|spec| {
                 is_present(terminal, home) && gsettings::foreign(&home.settings, spec)
-            }));
+            })
+            || (terminal == ProfileTerminal::AppleTerminal && apple::foreign(home)));
     let default = recorded
         .as_ref()
         .is_some_and(|profile| is_default(terminal, home, profile));
@@ -659,7 +719,11 @@ fn standing(profile: &RecordedProfile, home: &ProfileHome) -> Standing {
                 gsettings::Reading::Changed => Standing::Changed,
             },
         ),
-        Wrote::Preferences(_) => Standing::Changed,
+        Wrote::Preferences(wrote) => match apple::reading(&wrote.domain, wrote) {
+            apple::Reading::Matches => Standing::Matches,
+            apple::Reading::Changed => Standing::Changed,
+            apple::Reading::Missing => Standing::Missing,
+        },
     }
 }
 
@@ -692,7 +756,10 @@ fn is_default(terminal: ProfileTerminal, home: &ProfileHome, profile: &RecordedP
                 .is_ok_and(|spec| gsettings::is_default(&home.settings, spec, wrote)),
             _ => false,
         },
-        ProfileTerminal::AppleTerminal => false,
+        ProfileTerminal::AppleTerminal => match &profile.wrote {
+            Wrote::Preferences(wrote) => apple::is_default(&wrote.domain, wrote),
+            _ => false,
+        },
     }
 }
 
@@ -773,7 +840,23 @@ pub fn remove(
                 },
             }
         }
-        Wrote::Preferences(_) => return Err(ProfileError::NotOnThisPlatform(terminal)),
+        Wrote::Preferences(wrote) => {
+            if apple::reading(&wrote.domain, wrote) != apple::Reading::Missing
+                && is_default(terminal, home, &profile)
+            {
+                return Ok(Removed::Default);
+            }
+            match apple::reading(&wrote.domain, wrote) {
+                apple::Reading::Missing => Removed::AlreadyGone,
+                apple::Reading::Matches => {
+                    apple::take_out(&wrote.domain)?;
+                    Removed::Removed
+                }
+                apple::Reading::Changed => Removed::Changed {
+                    left_at: format!("{}.{}", wrote.key, wrote.entry),
+                },
+            }
+        }
     };
     held.forget(terminal)?;
     Ok(removed)
