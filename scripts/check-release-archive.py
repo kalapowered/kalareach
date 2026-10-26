@@ -10,12 +10,11 @@ refuse, from the archive alone and never from a host:
 
   * a zip whose end is not the one form a host reads: an end record that is the last 22 bytes of the
     file, with no comment, one disk and no 64-bit form, a directory that is exactly the bytes before
-    it and holds that many entries one after another (each with a name and extra data within the
-    host's bounds and no comment, and none holding the signature of an end record, of its 64-bit
-    form or of that form's locator in its name or extra data), no more entries than a host reads, and
-    a directory that the zip library reads from where the end record says;
-  * an entry named with more parts than a host reads, compressed any way but stored or deflated, or
-    carrying a 64-bit extra field, which a host and this check read differently;
+    it and holds that many entries one after another (each with a name within the host's bounds, no
+    extra data and no comment), no more entries than a host reads, and a directory that the zip
+    library reads from where the end record says;
+  * an entry named with more parts than a host reads or with a control character in its name, or
+    compressed any way but stored or deflated;
   * an entry that is a link, a hard link, a device, a pipe or a sparse file, or anything but a file
     or a directory;
   * an absolute path, a path that climbs out of the top directory (`..`), a path with a backslash,
@@ -44,6 +43,7 @@ import struct
 import sys
 import tarfile
 import tempfile
+import unicodedata
 import zipfile
 import zlib
 
@@ -67,22 +67,21 @@ def digest_text(raw):
 # What a host reads of a zip's end (crates/kr-cli/src/update/archive.rs): one end record, the last 22
 # bytes of the file, and the directory of entries exactly before it.
 ZIP_END_RECORD = b"PK\x05\x06"
-ZIP_SIGNATURES = (ZIP_END_RECORD, b"PK\x06\x06", b"PK\x06\x07")
 ZIP_DEPTH = 32
 ZIP_ENTRY_HEADER = b"PK\x01\x02"
 ZIP_ENTRIES = 50_000
 ZIP_DIRECTORY_BYTES = 64 * 1024 * 1024
 ZIP_NAME_BYTES = 1024
-ZIP_EXTRA_BYTES = 1024
 
 
 def check_zip_shape(archive):
     """Refuses a zip whose end or directory is not the form a host gives its reader, and returns the
     number of entries and where the directory starts.
 
-    The names and the extra data are searched for the signature of an end record, of its 64-bit form
-    and of that form's locator, which a reader falls back to when an entry does not parse. The other
-    bytes of the directory are not: a file's checksum can spell one.
+    An entry carries no extra data: a reader that cannot take an entry's extra data (a Unicode path
+    field whose checksum is not the name's is one) falls back to another end record, and the fields
+    of a directory can spell one, a file's checksum among them, so a host refuses every entry that
+    has any, and the packer writes none.
     """
     with open(archive, "rb") as handle:
         handle.seek(0, os.SEEK_END)
@@ -111,26 +110,16 @@ def check_zip_shape(archive):
         if len(header) < 46 or header[:4] != ZIP_ENTRY_HEADER:
             raise Refused("has a directory that does not hold the entries the end record counts")
         name, extra, remark, first_disk = struct.unpack_from("<HHHH", header, 28)
-        if remark or first_disk or extra > ZIP_EXTRA_BYTES:
-            raise Refused("has an entry with a comment, on another disk or with more extra data than a host reads")
+        if remark or first_disk:
+            raise Refused("has an entry with a comment or on another disk")
+        if extra:
+            raise Refused("has an entry with extra data, which a host does not read")
         if name > ZIP_NAME_BYTES:
             raise Refused("has an entry name longer than a host reads")
-        variable = directory[at + 46 : at + 46 + name + extra]
-        if any(signature in variable for signature in ZIP_SIGNATURES):
-            raise Refused("holds the signature of an end record in an entry's name or extra data")
-        at += 46 + name + extra
+        at += 46 + name
     if at != len(directory):
         raise Refused("has a directory with bytes beyond its entries")
     return entries, start
-
-
-def zip_extra_fields(extra):
-    """The (kind, data) of each field of an entry's extra data, as far as it is well formed."""
-    at = 0
-    while at + 4 <= len(extra):
-        kind, size = struct.unpack_from("<HH", extra, at)
-        yield kind, extra[at + 4 : at + 4 + size]
-        at += 4 + size
 
 
 def split(name):
@@ -164,10 +153,10 @@ def members(archive):
             for info in opened.infolist():
                 if len(info.filename.rstrip("/").split("/")) > ZIP_DEPTH:
                     raise Refused(f"{info.filename!r} is nested deeper than a host reads")
+                if any(unicodedata.category(character) == "Cc" for character in info.filename):
+                    raise Refused(f"{info.filename!r} holds a control character, which a host's name rules refuse")
                 if info.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
                     raise Refused(f"{info.filename!r} is compressed in a way a host does not read")
-                if any(kind == 0x0001 for kind, _ in zip_extra_fields(info.extra)):
-                    raise Refused(f"{info.filename!r} carries a 64-bit extra field, which readers take differently")
                 mode = info.external_attr >> 16
                 if (mode & 0o170000) not in (0, 0o100000, 0o040000):
                     raise Refused(f"{info.filename!r} is neither a file nor a directory")
@@ -485,12 +474,30 @@ def self_test():
         expect_zip("a zip with bytes after its end record", True, lambda: with_tail(b"\x00"))
         expect_zip("a zip in the 64-bit form", True, in_the_64_bit_form)
         expect_zip("a zip with a comment on an entry", True, lambda: zipped(entry_comment=b"a comment"))
-        extra_data = struct.pack("<HH", 0xAAAA, ZIP_EXTRA_BYTES + 100) + b"x" * (ZIP_EXTRA_BYTES + 100)
-        expect_zip("a zip with more extra data on an entry than a host reads", True, lambda: zipped(entry_extra=extra_data))
-        embedded = struct.pack("<HH", 0xAAAA, 4 + 22) + b"x" * 4 + ZIP_END_RECORD + b"\x00" * 18
-        expect_zip("a zip with an end record in an entry's extra data", True, lambda: zipped(entry_extra=embedded))
+        # The extra data of an entry: any is refused, and a host's reader gives up on a Unicode path
+        # field whose checksum is not the name's, which the zip library here reads past.
         expect_zip(
-            "a zip with an end record in a name",
+            "a zip with extra data on an entry",
+            True,
+            lambda: zipped(entry_extra=struct.pack("<HH", 0xAAAA, 4) + b"x" * 4),
+        )
+        manifest_name = f"{ztop}/{MANIFEST}".encode()
+
+        def unicode_path(checksum):
+            return struct.pack("<HHBI", 0x7075, 5 + 5, 1, checksum) + b"other"
+
+        expect_zip(
+            "a zip with a Unicode path field whose checksum is not the name's",
+            True,
+            lambda: zipped(entry_extra=unicode_path(zlib.crc32(manifest_name) ^ 1)),
+        )
+        expect_zip(
+            "a zip with a Unicode path field whose checksum is the name's",
+            True,
+            lambda: zipped(entry_extra=unicode_path(zlib.crc32(manifest_name))),
+        )
+        expect_zip(
+            "a zip with an end record's signature, and so control characters, in a name",
             True,
             lambda: zipped(files={**good_files(), "share/PK\x05\x06": b"x"}),
         )
@@ -500,7 +507,8 @@ def self_test():
         zip64_field = struct.pack("<HHQQ", 0x0001, 16, 1, 1)
         expect_zip("a zip with a 64-bit extra field on an entry", True, lambda: zipped(entry_extra=zip64_field))
         # A file whose checksum is the four bytes of an end record's signature is no fault: the
-        # directory's fixed fields are not searched for signatures.
+        # directory's fixed fields are not searched for signatures, and with no entry a reader gives
+        # up on, no record there is followed.
         spelling = four_bytes_with_checksum(struct.unpack("<I", ZIP_END_RECORD)[0])
         expect_zip(
             "a zip whose file has the checksum of an end record's signature",
