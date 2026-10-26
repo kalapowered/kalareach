@@ -65,10 +65,11 @@ export function LaunchSurface({
   // Whether a press waits for the session's answer.
   const [pressing, setPressing] = useState(false)
   // The last press that settled: the newest read started by then, which no read numbered no higher
-  // is taken to say anything of, and whether the session refused it.
-  const [settled, setSettled] = useState<{ readonly after: number; readonly refused: boolean } | null>(
-    null
-  )
+  // is taken to say anything of, and how it ended.
+  const [settled, setSettled] = useState<{
+    readonly after: number
+    readonly ended: 'installed' | 'refused' | 'unconfirmed'
+  } | null>(null)
   const [shown, setShown] = useState<string | null>(null)
 
   const drawn = reading === null ? null : drawing(reading, mayType)
@@ -162,9 +163,11 @@ export function LaunchSurface({
             ? 'Start something from the terminal view, which holds the input.'
             : stale
               ? 'The prompt changed since these were drawn. Nothing will be typed into it.'
-              : settled?.refused === true && !readSince
+              : settled?.ended === 'refused' && !readSince
                 ? 'The last launch was refused. Reading the prompt again.'
-                : null
+                : settled?.ended === 'unconfirmed' && !readSince
+                  ? 'The terminal could not confirm the last launch. Reading the prompt again.'
+                  : null
       return (
         <section
           className="launch-surface"
@@ -191,13 +194,16 @@ export function LaunchSurface({
                   }).then(
                     () => {
                       setPressing(false)
-                      setSettled({ after: newest(), refused: false })
+                      setSettled({ after: newest(), ended: 'installed' })
                       say(`${offer.label} started.`, 'success')
                       again()
                     },
                     (failure: unknown) => {
                       setPressing(false)
-                      setSettled({ after: newest(), refused: true })
+                      setSettled({
+                        after: newest(),
+                        ended: failureCode(failure) === 'OUTCOME_UNKNOWN' ? 'unconfirmed' : 'refused'
+                      })
                       say(pressRefusal(failureCode(failure), failureWords(failure)), 'danger')
                       again()
                     }
