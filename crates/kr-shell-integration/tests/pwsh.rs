@@ -823,6 +823,27 @@ fn the_gesture_key_goes_back_to_the_editors_own_operation_and_a_later_binding_st
         "a script the person bound after the decision went on was written over:\n{script}"
     );
 
+    // A chord of two keys is found in the editor's table of chords and goes back as well.
+    let chord = in_the_package_host(
+        r#"Set-PSReadLineOption -EditMode Emacs;
+           & $module { $script:Hooks.Wrapped = Install-KrObservedHandlers };
+           $during = Get-PSReadLineKeyHandler -Chord 'Escape,b';
+           Write-Output "kr-key[chord-during]=[$($during.Description -like 'KalaReach*')]";
+           & $module { Restore-KrObservedHandlers };
+           $held = Get-PSReadLineKeyHandler -Chord 'Escape,b';
+           Write-Output "kr-key[chord]=[$($held.Function)|$($held.Description -like 'KalaReach*')]""#,
+    );
+    assert_eq!(
+        said(&chord, "chord-during"),
+        "True",
+        "the module was not in front of a chord of two keys while it was installed:\n{chord}"
+    );
+    assert_eq!(
+        said(&chord, "chord"),
+        "BackwardWord|False",
+        "a chord of two keys did not go back to the editor's own operation:\n{chord}"
+    );
+
     // A key the Vi insert table does not bind is unbound, whatever the command table holds on it.
     let unbound = in_the_package_host(
         r#"Set-PSReadLineOption -EditMode Vi;

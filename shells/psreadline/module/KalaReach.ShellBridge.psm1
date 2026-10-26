@@ -909,24 +909,28 @@ function Get-KrBindingOn {
             $keys = $type.GetField('_viInsKeyMap', 'NonPublic,Static').GetValue($null)
             $chords = $type.GetField('_viInsChordTable', 'NonPublic,Static').GetValue($null)
         }
-        $spelled = @($Chord -split ',')
-        $table = $null
-        if ($spelled.Count -eq 1) {
-            $table = $keys
-        } elseif ($spelled.Count -eq 2) {
-            foreach ($first in $chords.GetEnumerator()) {
-                if ("$($first.Key)" -ceq $spelled[0]) { $table = $first.Value; break }
-            }
+        # The chord is a key of the table when the table spells it so. Otherwise it is two keys: the
+        # first names a table of chords, and the second is a key of that one.
+        $handler = $null
+        foreach ($entry in $keys.GetEnumerator()) {
+            if ("$($entry.Key)" -ceq $Chord) { $handler = $entry.Value; break }
         }
-        if ($null -eq $table) { return $null }
-        foreach ($entry in $table.GetEnumerator()) {
-            if ("$($entry.Key)" -ceq $spelled[-1]) {
-                return [pscustomobject]@{
-                    Key         = $Chord
-                    Function    = "$($entry.Value.BriefDescription)"
-                    Description = "$($entry.Value.LongDescription)"
+        $parts = @($Chord -split ',', 2)
+        if ($null -eq $handler -and $parts.Count -eq 2) {
+            foreach ($first in $chords.GetEnumerator()) {
+                if ("$($first.Key)" -ceq $parts[0]) {
+                    foreach ($entry in $first.Value.GetEnumerator()) {
+                        if ("$($entry.Key)" -ceq $parts[1]) { $handler = $entry.Value; break }
+                    }
+                    break
                 }
             }
+        }
+        if ($null -eq $handler) { return $null }
+        return [pscustomobject]@{
+            Key         = $Chord
+            Function    = "$($handler.BriefDescription)"
+            Description = "$($handler.LongDescription)"
         }
     } catch { }
     $null
