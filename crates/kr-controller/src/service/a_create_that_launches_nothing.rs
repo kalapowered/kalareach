@@ -3297,9 +3297,9 @@ async fn still_counted_after_the_worker_ends(
     holds.has_session(session_id)
 }
 
-/// KR-REQ-14.32: the registration of a session whose create no claim took ends once the kernel
-/// says the worker's process has ended, whatever the worker's journal holds, because a worker
-/// that no claim took starts no session.
+/// The registration of a session whose create no claim took ends once the kernel says the
+/// worker's process has ended, whatever the worker's journal holds, because a worker that no claim
+/// took starts no session.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_registration_of_a_create_no_claim_took_ends_when_its_worker_ends() {
@@ -3310,10 +3310,10 @@ async fn the_registration_of_a_create_no_claim_took_ends_when_its_worker_ends() 
     );
 }
 
-/// KR-REQ-14.32: a worker that was claimed and that kept no journal shows nothing about what its
-/// session left running (it starts its shell even when it cannot open a journal), so the
-/// registration stays; a journal with no closure in it, and one whose closure lists a survivor,
-/// keep it too; a journal whose closure lists nothing lets it go.
+/// A worker that was claimed and that kept no journal shows nothing about what its session left
+/// running (it starts its shell even when it cannot open a journal), so the registration stays; a
+/// journal with no closure in it, and one whose closure lists a survivor, keep it too; a journal
+/// whose closure lists nothing lets it go.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_registration_of_a_claimed_failed_create_follows_what_the_workers_journal_shows() {
@@ -3357,12 +3357,12 @@ async fn the_registration_of_a_claimed_failed_create_follows_what_the_workers_jo
     }
 }
 
-/// KR-REQ-14.32 and KR-REQ-24.18: the look at a worker whose process the kernel has just said ended
-/// does not ask the daemon's evidence that a worker may remain. A session closed over a worker this
-/// daemon could not confirm ended has a closure in the registry that lists it, which is that evidence
-/// for every other reader for as long as it stands; the registration still ends with the launch's
-/// process when the journal the worker kept shows a closure that lists nothing, and the look has
-/// brought that journal forward to read it.
+/// KR-REQ-24.18: the look at a worker whose process the kernel has just said ended does not ask
+/// the daemon's evidence that a worker may remain. A session closed over a worker this daemon could
+/// not confirm ended has a closure in the registry that lists it, which is that evidence for every
+/// other reader for as long as it stands; the registration still ends with the launch's process
+/// when the journal the worker kept shows a closure that lists nothing, and the look has brought
+/// that journal forward to read it.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_registration_of_a_session_closed_over_an_unaccounted_worker_ends_with_its_launchs_process()
@@ -3437,9 +3437,9 @@ impl WorkerSupervisor for StartsAWorkerTheTestEnds {
     }
 }
 
-/// KR-REQ-14.32: a worker whose claim the host refused is told no launch specification and starts
-/// no session, so the registration of the create that waited for it ends with the worker's
-/// process, though the create is told it failed and no journal was ever written.
+/// A worker whose claim the host refused is told no launch specification and starts no session, so
+/// the registration of the create that waited for it ends with the worker's process, though the
+/// create is told it failed and no journal was ever written.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refused_claim_leaves_no_registration_once_its_worker_has_ended() {
