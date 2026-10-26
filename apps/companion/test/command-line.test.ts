@@ -6,14 +6,14 @@
  * else, so the same argument vector reads differently in each.
  */
 
+import type { LaunchShell } from '@kalareach/protocol'
 import { describe, expect, it } from 'vitest'
 
 import powershellLines from '../../../fixtures/shells/powershell-launch-lines.json'
 import { commandLine } from '../src/model/command-line'
-import type { ShellKind } from '../src/model/pending'
 
 /** Every shell that quotes like a POSIX shell does. */
-const POSIX: readonly ShellKind[] = ['sh', 'zsh', 'bash']
+const POSIX: readonly LaunchShell[] = ['sh', 'zsh', 'bash']
 
 describe('a command written for the shell that reads it', () => {
   it('leaves a command made only of plain words as it is, in every shell that reads one so', () => {

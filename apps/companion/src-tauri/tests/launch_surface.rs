@@ -180,3 +180,32 @@ async fn a_worker_that_does_not_state_the_launch_surface_is_not_asked_for_it() {
         kr_client::LaunchSurfaceRead::NotServed
     );
 }
+
+/// KR-REQ-13.11: the command gives the page what the worker answered, tagged as the page reads it,
+/// and tells the page that the host does not serve the read when the worker did not state it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_command_gives_the_page_the_workers_answer_or_that_the_host_does_not_serve_it() {
+    let worker = worker().await;
+    let page = Page::new(worker.temp.environment());
+    let told = question_page::answered(page.call(
+        "launch_surface",
+        serde_json::json!({ "params": { "session_id": worker.session_id } }),
+    ))
+    .await
+    .expect("the surface is read");
+    assert_eq!(told["state"], "served", "{told}");
+    assert_eq!(told["surface"]["editor"]["reason"], "stock_shell", "{told}");
+    assert_eq!(told["surface"]["input"], "free", "{told}");
+
+    worker
+        .service
+        .withhold_capability(kr_protocol::local::SHELL_LAUNCH_SURFACE_READ);
+    let silent = Page::new(worker.temp.environment());
+    let told = question_page::answered(silent.call(
+        "launch_surface",
+        serde_json::json!({ "params": { "session_id": worker.session_id } }),
+    ))
+    .await
+    .expect("an answer");
+    assert_eq!(told, serde_json::json!({ "state": "not_served" }));
+}

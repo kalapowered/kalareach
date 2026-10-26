@@ -113,9 +113,13 @@ first. A managed shell is the host's qualified package: Ctrl-D at an empty promp
 (PowerShell on Windows reports no such key, and in its Vi command mode Ctrl-D ends the shell
 instead), and the host reads the shell's editor, so it knows when the prompt is empty. A stock shell is the
 system's own, for compatibility: Ctrl-D does what the shell does and can close the session, and the
-editor is not read. Where the host describes a session's launch surface, a managed shell's launch
-buttons start an agent at the prompt, and a stock shell's show the command to type and start
-nothing. Attaching, detaching, closing, file transfer, agents and the terminal work in both. The
+editor is not read. The host describes a session's launch surface, and the terminal view reads it on
+its own link, the one that holds the session's input. A managed shell's launch buttons start an
+agent at the prompt once the person has taken control of the terminal and the host has verified the
+prompt empty; a stock shell's show the command to type and start nothing. The conversation shows
+the same surface in words and never lights a button, since the link it reads on holds no input.
+Where the host does not serve the read, the screen says that starting something is not available
+on that host. Attaching, detaching, closing, file transfer, agents and the terminal work in both. The
 creation sheet shows the two side by side before anything exists, and a stock shell is labelled in
 the session list, the session's header and settings, and the phone's list. A managed shell the host
 cannot qualify is refused with the host's reason; a stock shell is created only when the person
@@ -144,8 +148,12 @@ Once a file is uploaded, the application binds it on the host as a manual termin
 A prompt sent from a draft carries its text only, so a draft that holds a file is not sent until the person removes the file.
 
 Nothing that needs a right is offered before the connection has said what it
-may do. In a session, when the launch surface was read at an older prompt generation than the view
-has heard since, its buttons start disabled.
+may do. The launch surface is read again every few seconds while a session is on screen, when the
+person takes control or gives it back, and after a launch. A button drawn at one prompt stays
+disabled once the prompt moves, until the person says they have looked at it. A launch quotes the
+prompt generation and the buffer revision of the newest read, and the host refuses a quote that has
+gone stale before anything is typed; every button is then disabled until the surface is read again.
+A launch whose outcome the editor could not confirm is not reported as nothing typed.
 
 On the phone, a host that stops answering while the session is in front detaches the session's draft from the conversation it was written for, as a suspension does: the text, its revision and its files are untouched, the composer says the draft is kept here and is not in contact with the host, and Send is off. When the host answers again and the conversation is unchanged, the draft is bound to it again; a draft written for a conversation that has moved on is the person's to settle. The placeholder in the field is the same in the conversation and the terminal view, and Send sends the text to the agent in both.
 

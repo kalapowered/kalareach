@@ -18,7 +18,7 @@
  * line shown here is the one for the words as given.
  */
 
-import type { ShellKind } from './pending'
+import type { LaunchShell } from '@kalareach/protocol'
 
 /** Characters every other shell here reads as themselves. */
 const PLAIN = /^[\w@%+=:,./-]+$/
@@ -39,7 +39,7 @@ function powershellWord(argument: string): string {
 }
 
 /** One argument as a single word of a shell other than PowerShell. */
-function word(argument: string, kind: Exclude<ShellKind, 'powershell'>): string {
+function word(argument: string, kind: Exclude<LaunchShell, 'powershell'>): string {
   // Zsh reads a word that starts with `=` as the path of a command, and Fish reads `%self` as a
   // process number, so neither is left bare.
   const bare = PLAIN.test(argument) && !argument.startsWith('=') && !argument.startsWith('%')
@@ -49,7 +49,7 @@ function word(argument: string, kind: Exclude<ShellKind, 'powershell'>): string 
 }
 
 /** The vector `argv` as one line for the shell `kind`. */
-export function commandLine(argv: readonly string[], kind: ShellKind): string {
+export function commandLine(argv: readonly string[], kind: LaunchShell): string {
   if (kind === 'powershell') {
     if (argv.length === 0) return ''
     // A quoted word at the start of a line is a string to print, and the call operator is what

@@ -259,49 +259,29 @@ describe('creating a session (KR-REQ-07.21)', () => {
 
   it('shows a stock shell’s launch buttons as the command to type, and types nothing', async () => {
     const person = userEvent.setup()
-    const { port } = fakeHost()
-    const launched: unknown[] = []
-    const watched: HostPort = {
-      ...port,
-      shellLaunch: (params, subject) => {
-        launched.push(params)
-        return port.shellLaunch(params, subject)
-      }
-    }
+    const { port, controls } = fakeHost()
     const created = await port.sessionCreate(stockCreation('/Users/rs/work/notes'), {})
-    open(watched, { view: 'session', sessionId: created.value?.session.session_id ?? '', pane: 'semantic' })
+    open(port, { view: 'session', sessionId: created.value?.session.session_id ?? '', pane: 'semantic' })
 
     const surface = await screen.findByTestId('launch-instructions')
     expect(surface).toHaveTextContent('nothing is typed into it for you')
     expect(screen.queryByTestId('launch-surface')).toBeNull()
-    await person.click(within(surface).getByRole('button', { name: 'Codex' }))
+    await person.click(within(surface).getByRole('button', { name: 'Codex CLI' }))
     expect(within(surface).getByTestId('launch-instruction')).toHaveTextContent('Type this at the prompt: codex')
-    await person.click(within(surface).getByRole('button', { name: /Run the test suite/ }))
-    expect(within(surface).getByTestId('launch-instruction')).toHaveTextContent(
-      'Type this at the prompt: pnpm test'
-    )
-    // A command that is not installed here has nothing to type.
-    expect(within(surface).getByRole('button', { name: 'Kimi' })).toBeDisabled()
-    expect(launched).toEqual([])
+    await person.click(within(surface).getByRole('button', { name: 'Gemini CLI' }))
+    expect(within(surface).getByTestId('launch-instruction')).toHaveTextContent('Type this at the prompt: gemini')
+    expect(controls.launches).toEqual([])
   })
 
   // The same command, written for the shell the stock session runs: what a person types at a
-  // PowerShell prompt is not what they type at a POSIX one.
+  // PowerShell prompt is not what they type at a POSIX one. How a hard word is quoted in each is
+  // held by the command-line cases.
   it.each([
-    [
-      'zsh',
-      "'/Users/rs/My Notes/open-notes' --title 'It’s a draft' '--note=don'\\''t' --tags=a,b @today"
-    ],
-    [
-      'fish',
-      "'/Users/rs/My Notes/open-notes' --title 'It’s a draft' '--note=don\\'t' --tags=a,b @today"
-    ],
-    [
-      'powershell',
-      "& '/Users/rs/My Notes/open-notes' '--title' 'It’’s a draft' '--note=don''t' '--tags=a,b' '@today'"
-    ]
+    ['zsh', 'codex'],
+    ['fish', 'codex'],
+    ['powershell', "& 'codex'"]
   ] as const)(
-    'shows a stock %s session’s command in that shell’s own quoting',
+    'shows a stock %s session’s command as that shell reads it',
     async (shell, expected) => {
       const person = userEvent.setup()
       const { port } = fakeHost({ stockShell: shell })
@@ -313,7 +293,7 @@ describe('creating a session (KR-REQ-07.21)', () => {
       })
 
       const surface = await screen.findByTestId('launch-instructions')
-      await person.click(within(surface).getByRole('button', { name: /Open my notes/ }))
+      await person.click(within(surface).getByRole('button', { name: 'Codex CLI' }))
       expect(within(surface).getByTestId('launch-instruction')).toHaveTextContent(
         `Type this at the prompt: ${expected}`
       )
