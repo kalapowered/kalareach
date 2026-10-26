@@ -325,7 +325,8 @@ path, so the publish says so and the session can use `--shell-mode native_compat
 
 [README.md](README.md) states what this mechanism can and cannot establish. The short of it is that
 the reader is reached when it steps: the module's queue is serviced on the reader's own thread, and
-a request that arrives while the reader is parked in its key wait is answered at its next boundary.
+a request that arrives while the reader is parked in its key wait is answered at the next point where the
+module reads its mailbox.
 
 ## What the packages add
 
