@@ -1380,7 +1380,13 @@ kr_zle_boundary(void)
     source = kr_source_is_pushed_back ? KR_SOURCE_PUSHED_BACK
                                       : (kr_pending_paste_open ? KR_SOURCE_PASTE
                                                                : KR_SOURCE_TERMINAL);
-    consumed = kr_bridge_pre_eof(lastchar, source) == KR_CONSUME;
+    /*
+     * The decision is about the sequence just resolved. A read that ended with none, as an interrupt
+     * ends it, leaves `lastchar` at the key before it, and deciding on that key again would take
+     * the gesture a person made once for a later key. ZLE's own end-of-file test is made only for a
+     * resolved sequence too.
+     */
+    consumed = bindk != NULL && kr_bridge_pre_eof(lastchar, source) == KR_CONSUME;
     /* The next wait is a fresh chance to be idle. */
     kr_idle_reported = 0;
     return consumed;

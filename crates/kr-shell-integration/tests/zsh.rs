@@ -88,6 +88,13 @@ fn a_detach_the_worker_refuses_is_consumed_with_the_hint() {
 /// KR-REQ-07.72
 #[test]
 #[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_cancellation_after_a_detach_does_not_detach_the_next_attachment() {
+    shellpkg::a_cancellation_after_a_detach_does_not_detach_the_next_attachment(ZSH);
+}
+
+/// KR-REQ-07.72
+#[test]
+#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
 fn outside_the_detach_condition_zle_keeps_the_key() {
     shellpkg::the_detach_condition_excludes_what_the_corpus_names(ZSH);
 }
