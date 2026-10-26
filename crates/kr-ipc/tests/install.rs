@@ -1448,9 +1448,13 @@ fn removing_a_release_follows_no_link_and_touches_nothing_outside_it() {
 #[cfg(windows)]
 #[test]
 fn a_directory_made_a_junction_after_it_was_checked_leads_the_removal_nowhere() {
+    use kr_ipc::install::removal_race;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    let _alone = HOOKED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let test = TestStore::create();
     let one = release("0.1.0+aaaaaaaaaaaa");
     test.install(&one);
@@ -1462,11 +1466,15 @@ fn a_directory_made_a_junction_after_it_was_checked_leads_the_removal_nowhere() 
     std::fs::write(outside.join("kept"), b"kept").expect("written");
     std::fs::write(outside.join("inner/kept"), b"kept too").expect("written");
     let target = outside.clone();
+    let root = test.root.clone();
     let turned = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&turned);
-    kr_ipc::install::removal_race::after_pin(Some(Arc::new(move |pinned: &Path| {
-        if pinned.file_name().is_some_and(|name| name == "empty") {
-            kr_ipc::install::removal_race::make_junction_in_place(pinned, &target)
+    removal_race::hook(Some(Arc::new(move |moment, pinned: &Path| {
+        if moment == removal_race::Moment::Pinned
+            && pinned.file_name().is_some_and(|name| name == "empty")
+            && pinned.starts_with(&root)
+        {
+            removal_race::make_junction_in_place(pinned, &target)
                 .expect("the pinned directory becomes a junction");
             counted.fetch_add(1, Ordering::SeqCst);
         }
@@ -1478,7 +1486,7 @@ fn a_directory_made_a_junction_after_it_was_checked_leads_the_removal_nowhere() 
         .expect("nothing else updates");
 
     let answer = test.store.retire(&one, &update);
-    kr_ipc::install::removal_race::after_pin(None);
+    removal_race::hook(None);
 
     assert_eq!(turned.load(Ordering::SeqCst), 1, "the race was run once");
     assert!(
@@ -1497,6 +1505,198 @@ fn a_directory_made_a_junction_after_it_was_checked_leads_the_removal_nowhere() 
     );
     let in_the_trash = std::fs::read_dir(test.store.trash()).map(|entries| entries.count());
     assert_eq!(in_the_trash.ok(), Some(0), "nothing of the release is left");
+}
+
+/// Held by each case that sets the removal hook: the hook is the process's, and the cases of this
+/// binary run side by side.
+#[cfg(windows)]
+static HOOKED: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A store whose trash is a junction to a folder with a directory and a file of its own in it, as
+/// another process of the account can leave it. Returns the folder.
+#[cfg(windows)]
+fn trash_made_a_junction(test: &TestStore) -> PathBuf {
+    let outside = test.root.join("outside");
+    std::fs::create_dir_all(outside.join("decoy")).expect("a folder elsewhere");
+    std::fs::write(outside.join("decoy/file"), b"kept").expect("written");
+    std::fs::write(outside.join("other"), b"kept too").expect("written");
+    std::fs::remove_dir(test.store.trash()).expect("the trash is empty");
+    let made = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(test.store.trash())
+        .arg(&outside)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("mklink runs");
+    assert!(made.success(), "a junction in place of the trash");
+    outside
+}
+
+/// KR-REQ-26.06: the sweep of the trash is opened once without following a link and refused when it
+/// is not a plain directory: with a junction in its place it lists nothing, and what the junction
+/// names is neither listed, nor reset, nor deleted.
+#[cfg(windows)]
+#[test]
+fn a_junction_in_place_of_the_trash_leads_the_sweep_nowhere() {
+    let test = TestStore::create();
+    let outside = trash_made_a_junction(&test);
+    let update = test
+        .store
+        .try_lock_update()
+        .expect("locks")
+        .expect("nothing else updates");
+
+    let swept = test.store.sweep_trash(&update);
+
+    assert!(swept.is_err(), "a trash that is not a directory is refused");
+    assert_eq!(
+        std::fs::read(outside.join("decoy/file")).ok().as_deref(),
+        Some(&b"kept"[..]),
+        "what the junction names keeps its directory"
+    );
+    assert_eq!(
+        std::fs::read(outside.join("other")).ok().as_deref(),
+        Some(&b"kept too"[..]),
+        "and its file"
+    );
+}
+
+/// KR-REQ-26.06: a release is moved into the trash through the handle the trash was opened by, so a
+/// trash that another process of the account makes a junction after it was checked takes nothing
+/// out of the store: the release stays where it was and the folder the junction names is as it was.
+#[cfg(windows)]
+#[test]
+fn a_trash_made_a_junction_after_it_was_checked_takes_no_release_out_of_the_store() {
+    use kr_ipc::install::removal_race;
+    use std::sync::Arc;
+
+    let _alone = HOOKED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let test = TestStore::create();
+    let one = release("0.1.0+aaaaaaaaaaaa");
+    test.install(&one);
+    let outside = test.root.join("outside");
+    std::fs::create_dir_all(&outside).expect("a folder elsewhere");
+    let trash = test.store.trash();
+    let target = outside.clone();
+    removal_race::hook(Some(Arc::new(move |moment, at: &Path| {
+        if moment == removal_race::Moment::TrashChecked && at == trash {
+            std::fs::remove_dir(&trash).expect("the trash is empty");
+            let made = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&trash)
+                .arg(&target)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .expect("mklink runs");
+            assert!(made.success(), "a junction in place of the trash");
+        }
+    })));
+    let update = test
+        .store
+        .try_lock_update()
+        .expect("locks")
+        .expect("nothing else updates");
+
+    let answer = test.store.retire(&one, &update);
+    removal_race::hook(None);
+
+    assert!(
+        answer.is_err(),
+        "a trash that is not a directory is refused: {answer:?}"
+    );
+    assert!(
+        test.store.manifest(&one).is_file(),
+        "the release is where it was"
+    );
+    assert_eq!(
+        std::fs::read_dir(&outside)
+            .map(|entries| entries.count())
+            .ok(),
+        Some(0),
+        "and nothing of it is in the folder the junction names"
+    );
+}
+
+/// KR-REQ-26.06: the handle a name is deleted through, and the one its access list is reset
+/// through, allow nobody to delete or rename the name while they are open, so a name cannot be
+/// moved out of the release between the open and the deletion or the reset: the other process's
+/// move is refused, and the release goes whole.
+#[cfg(windows)]
+#[test]
+fn a_name_cannot_be_moved_out_of_a_release_between_its_open_and_its_removal() {
+    use kr_ipc::install::removal_race;
+    use std::sync::Arc;
+
+    let _alone = HOOKED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let test = TestStore::create();
+    let one = release("0.1.0+aaaaaaaaaaaa");
+    test.install(&one);
+    let directory = test.store.release_directory(&one);
+    std::fs::write(directory.join("bin/plain"), b"plain").expect("written");
+    std::fs::write(directory.join("bin/sealed"), b"sealed").expect("written");
+    kr_ipc::install::seal_file(&directory.join("bin/sealed")).expect("a file is sealed");
+    let outside = test.root.join("outside");
+    std::fs::create_dir_all(&outside).expect("a folder elsewhere");
+    let tried: Arc<std::sync::Mutex<Vec<(String, bool)>>> = Arc::default();
+    let root = test.root.clone();
+    let (to, note) = (outside.clone(), Arc::clone(&tried));
+    removal_race::hook(Some(Arc::new(move |moment, at: &Path| {
+        let name = at.file_name().and_then(|name| name.to_str()).unwrap_or("");
+        let acts = matches!(
+            (moment, name),
+            (removal_race::Moment::Opened, "plain")
+                | (removal_race::Moment::AboutToGiveBack, "sealed")
+        );
+        if acts && at.starts_with(&root) {
+            let moved = std::fs::rename(at, to.join(name)).is_ok();
+            note.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((format!("{moment:?} {name}"), moved));
+        }
+    })));
+    let update = test
+        .store
+        .try_lock_update()
+        .expect("locks")
+        .expect("nothing else updates");
+
+    let answer = test.store.retire(&one, &update);
+    removal_race::hook(None);
+
+    let tried = tried
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert_eq!(
+        tried,
+        [
+            ("Opened plain".to_owned(), false),
+            ("AboutToGiveBack sealed".to_owned(), false)
+        ],
+        "both moves were tried and both were refused"
+    );
+    assert!(
+        answer.as_ref().is_ok_and(|removed| *removed),
+        "the release goes whole: {answer:?}"
+    );
+    assert_eq!(
+        std::fs::read_dir(test.store.trash())
+            .map(|entries| entries.count())
+            .ok(),
+        Some(0),
+        "and nothing of it is left"
+    );
+    assert_eq!(
+        std::fs::read_dir(&outside)
+            .map(|entries| entries.count())
+            .ok(),
+        Some(0),
+        "and nothing of it is outside"
+    );
 }
 
 /// KR-REQ-26.06: `current` is a junction to the release's own directory, `Store::current` reads the
