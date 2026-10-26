@@ -8,11 +8,17 @@ repository's signed index to name qualified builds of Gemini CLI's executable: a
 must be on the search path, and every `gemini` file found in any directory of the path must be a
 build the index names at Gemini CLI 0.60.0, the one version the recipe admits, so a single other
 `gemini` on the path refuses the recipe (see "Native bridge recipes" in [the plugin
-reference](../../plugins/README.md#one-contract-for-every-application)). No signed index names a build yet,
-so no recipe is applied, the worker admits no Gemini CLI hook, and a Gemini CLI session gets no hook
-observation. The guide describes the extension the package declares and what its hooks report, as
-read from Gemini CLI 0.60.0. The command integration is separate and applies when the owner turns it
-on: `GEMINI_CLI_NO_RELAUNCH` is set in the launch, with the effects under "Limits".
+reference](../../plugins/README.md#one-contract-for-every-application)). The host also refuses an
+executable that is a script, because the program a script runs is its interpreter and the host reads no
+identity for it, and the `gemini` that npm installs is one (the entry script `bundle/gemini.js`), so for
+that distribution no signed index makes the recipe apply, and the pipeline names no build of a script.
+No signed index names a build yet, so no recipe is applied, the worker admits no Gemini CLI hook, and a
+Gemini CLI session gets no hook observation. The guide describes the extension the package declares and
+what its hooks report, as read from Gemini CLI 0.60.0. The command integration is separate and applies
+when the owner turns it on and the first `gemini` the shell finds is a program the host can read, which a
+script is not: `GEMINI_CLI_NO_RELAUNCH` is then set in the launch, with the effects under "Limits". Where
+the first hit is a script, as it is for the npm distribution, an invocation runs as typed and `kr doctor`
+says why.
 
 Gemini CLI runs a hook for an event and reads what the hook answers. The Gemini CLI connector
 package installs a small extension that makes Gemini CLI start `kr-hook`, the core forwarder, for
