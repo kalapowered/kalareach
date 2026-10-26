@@ -2222,7 +2222,7 @@ With `--json`, `kr host update` returns JSON with the keys `source`, `target`, `
 `from` is the schema the registry was at and `to` the schema the migration brought it to), `not_reached` (the
 recorded environments it could not reach, each a map with the keys `runtime_root`, `state_root` and
 `reason`) and `removed` (the releases it removed) and `not_removed` (what it could not remove for a reason no running
-program gave, each a map with the keys `release`, which is null when the failure is not one release's (what an earlier removal left in the store's trash, or the failure to read which releases exist or which one is current, which keeps the update from removing any), and `reason`)
+program gave, each a map with the keys `release`, which is null when the failure is not one release's (what an earlier removal left in the store's trash, the failure to read which releases exist or which one is current, which keeps the update from removing any, or the directory the update unpacked the archive into), and `reason`)
 and `rolled_back` (whether it went back to an older release, which is what
 `kr host rollback` returns). `kr host versions` returns one object per
 release, with the keys `release`, `sequence`, and whether it is `current`, `previous`, `staged` or
