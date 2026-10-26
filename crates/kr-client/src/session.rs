@@ -70,12 +70,23 @@ impl std::fmt::Debug for Answer {
 }
 
 /// What a read of a session's launch surface came to.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum LaunchSurfaceRead {
     /// The host served the read.
     Served(ShellLaunchSurfaceResult),
     /// The host is of a release that does not serve the read.
     NotServed,
+}
+
+impl std::fmt::Debug for LaunchSurfaceRead {
+    /// Whether the host served the read, and never what it answered: the answer names the agents
+    /// the host offers.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Served(_) => formatter.write_str("Served(..)"),
+            Self::NotServed => formatter.write_str("NotServed"),
+        }
+    }
 }
 
 /// How the host settled one mutation.
