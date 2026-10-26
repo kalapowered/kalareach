@@ -533,9 +533,11 @@ pub enum Standing {
         /// How much is outstanding.
         outstanding: u64,
     },
-    /// Its worker says something is in the way.
+    /// Something is in the way of its cleanup: its worker says a store refused part of it, or,
+    /// for a session whose worker has ended, the archive's last removal of what the worker
+    /// retained left something behind.
     Unavailable {
-        /// What its worker said.
+        /// What its worker said, or what the archive's removal reported.
         reason: String,
     },
     /// Its worker ended before it said its cleanup was complete. What it retained is the

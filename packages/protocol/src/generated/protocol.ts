@@ -2051,7 +2051,7 @@ export type PrivacySessionStanding =
     }
   | {
       /**
-       * What its worker said.
+       * What its worker said, or what the archive's removal reported.
        */
       reason: string
       state: 'unavailable'
@@ -22544,7 +22544,7 @@ export interface PrivacySession {
       }
     | {
         /**
-         * What its worker said.
+         * What its worker said, or what the archive's removal reported.
          */
         reason: string
         state: 'unavailable'

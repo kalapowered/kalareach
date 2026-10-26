@@ -13,8 +13,10 @@
 //!   it is, live or closed, including one created after it went on; or
 //! * the host lists it among the sessions that still owe privacy cleanup, whatever the switch says
 //!   now. A session whose worker ended before it said its cleanup was complete stays on that list
-//!   after privacy mode is turned off, because what it kept is the archive's and nothing removes
-//!   it.
+//!   after privacy mode is turned off, because what it kept is the archive's: the daemon's archive
+//!   removes the session's retained output and the content of its settled receipts, tries again
+//!   on a schedule that lengthens when a removal leaves something, and ends the obligation only
+//!   when nothing is left.
 //!
 //! Nothing else is private. Turning privacy mode off starts new retention from that point, so a
 //! session that ran through a private interval and owes nothing now is not. That includes one
