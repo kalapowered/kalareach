@@ -1412,8 +1412,8 @@ async fn a_key_reaches_the_application_while_the_catalogue_meets_a_mirror_limit_
 
     // The repository publishes a second release whose signed length for its presentation is
     // shorter than the presentation's bytes, and the second generation that lists it. Nothing has
-    // read it yet: the first leg refuses to synchronise it, and the third leg's repository is
-    // built from it.
+    // read it yet: the first leg refuses to synchronise it, and the second leg synchronises it and
+    // fails to install its release.
     let second = generations::Generation::build(
         &home.path().join("second"),
         generations::GenerationSpec {
@@ -1592,7 +1592,7 @@ async fn still_serves(
         .expect("a readable store");
     assert!(
         matches!(complete, kr_plugin_catalogue::PackageCheck::Complete(_)),
-        "the installed release's files are all where they were put"
+        "the installed release's files are not all where they were put: {complete:?}"
     );
 }
 
