@@ -33,17 +33,18 @@ shells/psreadline/
 
 ## Why a patched reader at all
 
-A prompt hook cannot say whose keystrokes reached the line editor, and a key binding runs after the
-reader has already decided what an empty-line Ctrl-D means. Both shells recognise that end of file
-before an ordinary binding gets a look, so the decision has to be taken inside the reader, at the
-instant the character is selected. The same is true of everything else the contract asks for: the
+A prompt hook cannot say whose keystrokes reached the line editor. In Zsh and Bash a key binding runs
+after the reader has already decided what an empty-line Ctrl-D means: ZLE and Readline recognise that
+end of file before an ordinary binding gets a look, so the decision has to be taken inside the
+reader, at the instant the character is selected. The same is true of everything else the contract asks for: the
 queues a fence rests on, the moment a line is accepted, and the ability to end a key wait without
 throwing away what the person typed. None of it can be done from outside.
 
-So each package changes a small number of lines in its shell's reader and adds one bridge that
-speaks `kr-shell-bridge/1` over a Unix socket. The changes are published as ordered patch files,
-which is what `scripts/build-shells.sh` applies and what continuous integration verifies applies
-cleanly.
+So the Zsh, Bash and Fish packages each change a small number of lines in their shell's reader and
+add one bridge that speaks `kr-shell-bridge/1` over a Unix socket. The changes are published as
+ordered patch files, which is what `scripts/build-shells.sh` applies and what continuous integration
+verifies applies cleanly. The PSReadLine package changes no shell: its module speaks the same
+protocol, wraps the editor's own entry points and puts its decision on the gesture's key.
 
 ## What Zsh changes
 
@@ -185,7 +186,7 @@ probes.
 
 | Patch | Files | What it adds |
 | --- | --- | --- |
-| `0001-fish-reader-event-bridge` | `src/input/input.rs`, `src/input/decode.rs`, `src/input/binding.rs`, `src/reader/input.rs`, `src/reader/mod.rs`, `src/reader/reader.rs` | The mailbox, the reader's boundaries, the named binding and the bridge's view of the reader |
+| `0001-fish-reader-event-bridge` | `src/env/environment.rs`, `src/fd_readable_set.rs`, `src/input/input.rs`, `src/input/decode.rs`, `src/input/binding.rs`, `src/reader/input.rs`, `src/reader/mod.rs`, `src/reader/reader.rs` | The mailbox, the reader's boundaries, the named binding and the bridge's view of the reader |
 | `0002-fish-reader-state` | `src/input/binding.rs` | The states the detach condition needs that this reader keeps no flag for |
 | `0003-fish-bridge-activation` | `build.rs`, `src/bin/fish.rs`, `src/builtins/mod.rs`, `src/builtins/shared/misc.rs` | The core compiled in, the `kr-bridge` builtin, and the bridge loading before the startup files |
 | `0004-fish-command-resolve` | `src/exec.rs`, `src/reader/reader.rs` | The line the root shell runs as a command block with its capability, and the question in front of each command of that line, with the launcher its answer can name |
@@ -201,7 +202,8 @@ The first patch does five things:
   runs, and one immediately before the reader blocks, which is also where a reader with nothing
   left to read says so.
 - **`kr-eof-decide` joins the reader's own command table**, so the gesture is a named binding with
-  the actual reader context rather than a wrapper downstream of the decision.
+  the actual reader context. This reader decides end of file in a binding, so the named binding is
+  the decision and not a wrapper around one made elsewhere.
 - **`readline` reports the reader's boundaries**: the entry after the prompt has been drawn and
   before the read loop, and the leave with the reason the reader's own state gives.
 - **The bridge's view of the reader** is one small block of accessors: which reader is running, the
@@ -268,7 +270,7 @@ The editor's own queue is read live and refused when it cannot be: the two field
 
 The module goes in front of the host's read-line entry point when it loads, before the person's profiles run. A check that ends the last profile asks whether the host would still call the module's own function or the editor's own function, by identity and by the text the editor's own file gives the function, compared character for character, and not by module name. An editor whose file does not define the function once is refused as `psreadline_reader_unreadable`. Any other command under that name is refused as `reader_replaced`, and the session being created closes with that loss. The commands refused are a function that replaces the entry point, one that wraps the one before it, one that calls the editor directly, one made inside the editor's module scope, an alias, and the editor's own function replaced where it lives and exported again. The editor imported again puts its own function back, and the module goes back in front of it.
 
-Two behaviours follow from wrapping the editor's functions. An end-of-file key at an empty prompt ends the shell the way the editor's own would. When a wrapped handler runs, the exit the editor signals is recognised through the exception chain and carried out by replacing the empty line with `exit` and accepting it, so the word `exit` is drawn and enters the person's history. The module also binds only a chord that the editor stores under the spelling it was given. The editor keeps `Ctrl+Alt+?` under the plain question mark, which is the key a terminal sends for it, so binding that chord would take over the plain question mark and whatever the person had there would go. The module leaves such a chord alone, and a configured gesture whose chord is one is refused as `gesture_chord_unbindable`. An editor that does not say how it spells a chord is refused as `psreadline_key_spelling_unreadable` when the hooks activate, because no chord could then be bound safely.
+Two behaviours follow from wrapping the editor's functions. A key that reaches the editor's own end-of-file handling, which is every end-of-file key outside the detach condition, ends the shell at an empty prompt the way the editor's own would. When a wrapped handler runs, the exit the editor signals is recognised through the exception chain and carried out by replacing the empty line with `exit` and accepting it, so the word `exit` is drawn and enters the person's history. The module also binds only a chord that the editor stores under the spelling it was given. The editor keeps `Ctrl+Alt+?` under the plain question mark, which is the key a terminal sends for it, so binding that chord would take over the plain question mark and whatever the person had there would go. The module leaves such a chord alone, and a configured gesture whose chord is one is refused as `gesture_chord_unbindable`. An editor that does not say how it spells a chord is refused as `psreadline_key_spelling_unreadable` when the hooks activate, because no chord could then be bound safely.
 
 This module is the part that communicates with KalaReach's worker. Its main purpose is reporting to the worker the lines of text that it sees through its read-line wrapper, and relaying information about them. To this end, the first thing it does every time the user accepts a line by pressing Enter is report to the worker the text returned by `ReadLine`, which is the accepted line. The end of that line is the next entry to the wrapper, which reads the value of the automatic variable `$?` before anything else. On accepting the line, after telling the worker the line's text (the whole text, in case it's multi-line) and the directory in which native commands are to be started (that of the current `FileSystem` location's provider), the module tells the worker the revision of its working directory and awaits its answer for at most a second, and sets `$env:KR_DETACH_TOKEN` to the token the answer carries. In any case, when the wrapper is next entered, the module reports to the worker the end of the block it was processing and removes the variable from the environment, whether the worker answered or not. The variable is also removed by `Remove-KalaReachHooks`. Its removal is done by setting it to the `null` value of a string, which leaves no empty variable behind on Unix systems and adds no entry to the automatic variable `$Error`. Failure to send the data is traced but ignored, so that the module never takes away the user's PSReadLine.
 
@@ -392,7 +394,8 @@ arguments by itself, and the module does not reject any of them.
 
 Losing the bridge does not turn a managed root shell back into an ordinary one. The handshake
 leaves a mark that is never cleared, so a shell whose worker has gone holds no fence, consumes an
-eligible gesture with the hint, and does not end itself on an empty-prompt Ctrl-D.
+eligible gesture with the hint, and does not end itself on an empty-prompt Ctrl-D. On Windows the
+PowerShell module reports no gesture, so there no key is consumed and Ctrl+d is the editor's own.
 
 ## The guarded startup entry
 
@@ -517,8 +520,9 @@ library with no link-time dependency on either shell.
 
 ## What is not here
 
-Running the PSReadLine module on Windows, where the endpoint is a named pipe and the gesture is the
-configured chord rather than the line discipline's own character, is qualified separately.
+Running the PSReadLine module on Windows, where the endpoint is a named pipe and the console has no
+line discipline to name an end-of-file character, so that the module reports the gesture as disabled
+at its first prompt, is qualified separately.
 
 Signing the built executables and modules, and qualifying the hardened-runtime loading
 configuration they are signed for, belongs to packaging rather than to the build script here.
