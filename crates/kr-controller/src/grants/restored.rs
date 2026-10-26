@@ -175,20 +175,34 @@ fn flush_beside(file: &Path) -> std::io::Result<()> {
 /// something other than a file is there. When the file was removed and the directory then could
 /// not be flushed, the file is gone and the error says the removal is not known to be durable.
 pub fn remove(file: &Path) -> Result<()> {
-    let refused = |error: std::io::Error| {
-        ControllerError::registry(format!("could not remove {}: {error}", file.display()))
-    };
-    match kr_flush::retry_while_held(|| std::fs::remove_file(file)) {
-        Ok(()) => flush_beside(file).map_err(|error| {
-            ControllerError::registry(format!(
-                "removed {}, but the directory could not be flushed, so the removal is not known \
-                 to be durable: {error}",
-                file.display()
-            ))
-        }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(refused(error)),
+    if unlink(file)? {
+        flush_after_removal(file)
+    } else {
+        Ok(())
     }
+}
+
+/// Takes the file away. Says whether it was there.
+fn unlink(file: &Path) -> Result<bool> {
+    match kr_flush::retry_while_held(|| std::fs::remove_file(file)) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(ControllerError::registry(format!(
+            "could not remove {}: {error}",
+            file.display()
+        ))),
+    }
+}
+
+/// Flushes the directory after the file was taken away.
+fn flush_after_removal(file: &Path) -> Result<()> {
+    flush_beside(file).map_err(|error| {
+        ControllerError::registry(format!(
+            "removed {}, but the directory could not be flushed, so the removal is not known to \
+             be durable: {error}",
+            file.display()
+        ))
+    })
 }
 
 /// The record this daemon knows to be on disk, and where.
@@ -236,7 +250,8 @@ impl Kept {
     }
 
     /// Makes sure a record naming `subject` is durable, and writes one if it is not. The moment
-    /// the restore was first found stays as it was.
+    /// the restore was first found stays as it was while the daemon holds a record as durable; a
+    /// record it cannot prove durable is written again with the moment of that write.
     ///
     /// # Errors
     ///
@@ -277,11 +292,13 @@ impl Kept {
     /// the daemon no longer holds it as on disk, and the error says the removal is not known to be
     /// durable.
     pub fn lift(&mut self) -> Result<()> {
-        let removed = remove(&self.file);
-        if matches!(self.file.try_exists(), Ok(false)) {
+        if unlink(&self.file)? {
             self.durable = None;
+            flush_after_removal(&self.file)
+        } else {
+            self.durable = None;
+            Ok(())
         }
-        removed
     }
 }
 
@@ -560,12 +577,12 @@ mod tests {
             earlier.ensure(subject, 100).is_err(),
             "the write is not known to be durable"
         );
-        let Found::Record(read) = read(&file) else {
+        let Found::Record(first) = read(&file) else {
             panic!("the bytes are there");
         };
 
         let mut started = Kept::new(file.clone());
-        started.adopt(read.clone());
+        started.adopt(first);
         assert!(
             started.record().is_none(),
             "a record read while the directory cannot be flushed is not proven"
@@ -579,11 +596,14 @@ mod tests {
         assert_eq!(written, 1, "the record is written again");
 
         drop(refused);
+        let Found::Record(on_disk) = read(&file) else {
+            panic!("the bytes are there");
+        };
         let mut flushed = Kept::new(file);
-        flushed.adopt(read.clone());
+        flushed.adopt(on_disk.clone());
         assert_eq!(
             flushed.record(),
-            Some(&read),
+            Some(&on_disk),
             "durable once the flush holds"
         );
         flushed
