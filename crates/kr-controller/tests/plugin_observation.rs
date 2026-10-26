@@ -322,15 +322,19 @@ async fn kr_req_11_39_the_terminal_drains_and_is_answered_while_the_runtime_has_
     plugin_world::acting::signal(&host, rustix::process::Signal::STOP);
     std::fs::write(&gate, b"").expect("the gate opens");
 
-    // The terminal finishes printing and is answered, and the runtime is still stopped.
-    let drained = tokio::time::timeout(plugin_world::PATIENCE, async {
-        while !world.output().contains("kalareach-done") {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
+    // The terminal finishes printing and is answered, and the runtime is still stopped. Eight
+    // megabytes take as long as the machine takes to work through them, so the wait gives up when
+    // the output stops growing and not when a fixed time has passed.
+    let drained = plugin_world::until_the_work_stops(|| {
+        let output = world.output();
+        (
+            output.contains("kalareach-done").then_some(()),
+            output.len(),
+        )
     })
     .await;
     assert!(
-        drained.is_ok(),
+        drained.is_some(),
         "the terminal did not drain while the runtime was stopped: {}",
         world.diagnostics(1)
     );
