@@ -1606,7 +1606,7 @@ mod tests {
     /// kernel gives it.
     ///
     /// It reads its input to the end, so closing that input is what ends it, on every platform:
-    /// `cat` where there is one and `more` on Windows.
+    /// `cat` where there is one and `more.com` on Windows.
     struct Held {
         child: std::process::Child,
         identity: ProcessStartIdentity,
@@ -1614,7 +1614,16 @@ mod tests {
 
     impl Held {
         fn start() -> Self {
-            let program = if cfg!(windows) { "more" } else { "cat" };
+            // On Windows the program is named by its full path: `Command` looks for `more.exe` and
+            // ignores `PATHEXT`, and the system ships `more.com`.
+            #[cfg(windows)]
+            let program = std::path::Path::new(
+                &std::env::var_os("SystemRoot").expect("the system directory"),
+            )
+            .join("System32")
+            .join("more.com");
+            #[cfg(not(windows))]
+            let program = "cat";
             let child = std::process::Command::new(program)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::null())
