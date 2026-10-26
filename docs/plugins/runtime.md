@@ -969,7 +969,10 @@ Where the build trusts the root, the seed enrols the official repository against
 budgets the configuration allows and no capability beyond the default ceiling, and with no full
 offline mirror. It leaves alone an enrolment of the owner's own: where a repository already trusts a
 root of the bundled lineage, or one named `official` is enrolled with other keys, the seed enrols
-nothing and records that it declined. It then activates the generation through the ordinary update
+nothing and records that it declined. The repository the seed does enrol is never refused a
+publisher's name that another repository's root holds, so an owner's own enrolment of a repository
+under another root that lists a shipped publisher is the one refused, at its next sync and its next
+install ([Enrolment comes first](catalogue.md#enrolment-comes-first)). It then activates the generation through the ordinary update
 client over a transport made of the bundle's own bytes, so no network is asked. Expiry is waived for
 that one generation, which the host reports as expired when it is; a later sync enforces expiry as
 it does for any repository, and the client's own trust checkpoint still refuses a clock that went
