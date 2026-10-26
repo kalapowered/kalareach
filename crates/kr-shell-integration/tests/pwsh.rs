@@ -754,8 +754,9 @@ fn a_chord_the_editor_spells_as_another_key_never_takes_that_key_over() {
 /// then puts its decision on that key over the wrapper it finds there. What goes back is the
 /// editor's own operation, in the Emacs and in the Vi edit mode alike, and not the wrapper. A
 /// binding the person made on the key after the decision went on is theirs, and taking the hooks off
-/// leaves it as it is. Each case is a host of its own, because what one binds is what the next
-/// reads.
+/// leaves it as it is. The Vi editor's insert table is the one the module binds into, whichever
+/// table the editor is in when the hooks go, and a key that table leaves unbound stays unbound. Each
+/// case is a host of its own, because what one binds is what the next reads.
 #[test]
 #[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
 fn the_gesture_key_goes_back_to_the_editors_own_operation_and_a_later_binding_stays_the_persons() {
@@ -820,6 +821,43 @@ fn the_gesture_key_goes_back_to_the_editors_own_operation_and_a_later_binding_st
         said(&script, "script"),
         "theirs|the person wrote this",
         "a script the person bound after the decision went on was written over:\n{script}"
+    );
+
+    // A key the Vi insert table does not bind is unbound, whatever the command table holds on it.
+    let unbound = in_the_package_host(
+        r#"Set-PSReadLineOption -EditMode Vi;
+           Remove-PSReadLineKeyHandler -Chord 'Ctrl+d';
+           & $module { $script:Kr.GestureChord = 'Ctrl+d'; $script:Kr.GestureDisabled = $false;
+                       $null = Install-KrGestureHandler; Restore-KrGestureHandler };
+           $held = Get-PSReadLineKeyHandler -Chord 'Ctrl+d' | Where-Object { $_.Key -ceq 'Ctrl+d' };
+           Write-Output "kr-key[unbound]=[$($held.Function)]""#,
+    );
+    assert_eq!(
+        said(&unbound, "unbound"),
+        "",
+        "a key the person left unbound in the Vi insert table was bound to the command table's operation:\n{unbound}"
+    );
+
+    // The Vi editor in command mode lists its command table, and what the module bound is in the
+    // insert table: the key still goes back to the editor's own operation.
+    let command = in_the_package_host(
+        r#"Set-PSReadLineOption -EditMode Vi;
+           & $module { $script:Kr.GestureChord = 'Ctrl+d'; $script:Kr.GestureDisabled = $false;
+                       $null = Install-KrGestureHandler };
+           $editor = [Microsoft.PowerShell.PSConsoleReadLine];
+           $singleton = $editor.GetField('_singleton', 'NonPublic,Static').GetValue($null);
+           $table = $editor.GetField('_dispatchTable', 'NonPublic,Instance');
+           $insert = $table.GetValue($singleton);
+           $table.SetValue($singleton, $editor.GetField('_viCmdKeyMap', 'NonPublic,Static').GetValue($null));
+           & $module { Restore-KrGestureHandler };
+           $table.SetValue($singleton, $insert);
+           $held = Get-PSReadLineKeyHandler -Chord 'Ctrl+d' | Where-Object { $_.Key -ceq 'Ctrl+d' };
+           Write-Output "kr-key[command]=[$($held.Function)|$($held.Description -like 'KalaReach*')]""#,
+    );
+    assert_eq!(
+        said(&command, "command"),
+        "ViAcceptLineOrExit|False",
+        "the module's decision stayed on the gesture key after it went, in command mode:\n{command}"
     );
 }
 

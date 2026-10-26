@@ -815,13 +815,6 @@ function Enable-KalaReachHooks {
     $script:Hooks.Wrapped = $installed
 }
 
-# Puts this module in front of every key the editor has a binding for.
-#
-# This is where the reader reaches its own queue: the wrapper runs the editor's own function and
-# then reads the mailbox, so a request the worker sent is answered after the next key has run, on
-# the reader's own thread, with the editor between operations. The few operations that run an inner
-# read loop also record the state they wait in. A handler the person wrote themselves is left
-# exactly as it is.
 # How the editor stores a binding made with this chord, or nothing when it does not say.
 #
 # The editor keys its table by the key a terminal sends, which is not always the chord as it is
@@ -853,6 +846,13 @@ function Test-KrKeySpelling {
     }
 }
 
+# Puts this module in front of every key the editor has a binding for.
+#
+# This is where the reader reaches its own queue: the wrapper runs the editor's own function and
+# then reads the mailbox, so a request the worker sent is answered after the next key has run, on
+# the reader's own thread, with the editor between operations. The few operations that run an inner
+# read loop also record the state they wait in. A handler the person wrote themselves is left
+# exactly as it is.
 function Install-KrObservedHandlers {
     $wrapped = [System.Collections.Generic.List[hashtable]]::new()
     $bound = try { Get-PSReadLineKeyHandler -Bound } catch { @() }
@@ -890,15 +890,45 @@ function Install-KrObservedHandlers {
     $wrapped
 }
 
-# The binding the editor holds on a chord in the mode it is in, or nothing. The Vi editor lists the
-# chord's command-mode binding beside it, spelled in angle brackets, and that one is not the key
-# this module binds.
+# The binding the editor holds on a chord in the table this module binds into, or nothing.
+#
+# `Set-PSReadLineKeyHandler` and `Remove-PSReadLineKeyHandler` work on the Vi editor's insert table
+# whichever table it is in, while the editor's own listing is of the table it is in, with the
+# command table's bindings beside it spelled in angle brackets. A lookup through the listing would
+# read the command table once the editor is in command mode, and would give the command table's
+# binding for a key that has none in the insert table. So the table is read from the editor's
+# own, and a chord of two keys is looked up in its table of chords.
 function Get-KrBindingOn {
     param([string]$Chord)
-    $found = try { @(Get-PSReadLineKeyHandler -Chord $Chord -ErrorAction SilentlyContinue) } catch { @() }
-    $own = @($found | Where-Object { "$($_.Key)" -ceq $Chord })
-    if ($own.Count -gt 0) { return $own[0] }
-    if ($found.Count -gt 0) { return $found[0] }
+    try {
+        $type = [Microsoft.PowerShell.PSConsoleReadLine]
+        $singleton = $type.GetField('_singleton', 'NonPublic,Static').GetValue($null)
+        $keys = $type.GetField('_dispatchTable', 'NonPublic,Instance').GetValue($singleton)
+        $chords = $type.GetField('_chordDispatchTable', 'NonPublic,Instance').GetValue($singleton)
+        if ([object]::ReferenceEquals($keys, $type.GetField('_viCmdKeyMap', 'NonPublic,Static').GetValue($null))) {
+            $keys = $type.GetField('_viInsKeyMap', 'NonPublic,Static').GetValue($null)
+            $chords = $type.GetField('_viInsChordTable', 'NonPublic,Static').GetValue($null)
+        }
+        $spelled = @($Chord -split ',')
+        $table = $null
+        if ($spelled.Count -eq 1) {
+            $table = $keys
+        } elseif ($spelled.Count -eq 2) {
+            foreach ($first in $chords.GetEnumerator()) {
+                if ("$($first.Key)" -ceq $spelled[0]) { $table = $first.Value; break }
+            }
+        }
+        if ($null -eq $table) { return $null }
+        foreach ($entry in $table.GetEnumerator()) {
+            if ("$($entry.Key)" -ceq $spelled[-1]) {
+                return [pscustomobject]@{
+                    Key         = $Chord
+                    Function    = "$($entry.Value.BriefDescription)"
+                    Description = "$($entry.Value.LongDescription)"
+                }
+            }
+        }
+    } catch { }
     $null
 }
 
