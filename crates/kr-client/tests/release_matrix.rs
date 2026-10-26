@@ -500,7 +500,11 @@ mod nothing_unverified_is_acted_on {
         };
         let forged = |body: Vec<u8>, expected| (body, expected);
 
-        for held_matrix in [skew_matrix("5"), supported_matrix("5")] {
+        // The same revision with the other matrix's content is a conflict whichever is held.
+        for (held_matrix, other_content) in [
+            (skew_matrix("5"), supported_matrix("5")),
+            (supported_matrix("5"), skew_matrix("5")),
+        ] {
             let held = HeldMatrix::none();
             take(&held, &key, &held_matrix, this_build(), NOW).expect("a held copy");
             refusals(
@@ -515,7 +519,7 @@ mod nothing_unverified_is_acted_on {
                     forged(not_json.clone(), Refusal::Unreadable),
                     forged(names_a_member_twice.clone(), Refusal::Unreadable),
                     forged(reply(&skew_matrix("4"), &key), Refusal::Older),
-                    forged(reply(&supported_matrix("5"), &key), Refusal::Conflicts),
+                    forged(reply(&other_content, &key), Refusal::Conflicts),
                 ],
             );
         }
@@ -526,11 +530,18 @@ mod nothing_unverified_is_acted_on {
         let key = AuthorisationKeyPair::generate().expect("a key pair");
         let stranger = AuthorisationKeyPair::generate().expect("a key pair");
         let held = HeldMatrix::none();
+        // The build pins `key`, and the reply is signed by a key it does not pin.
         assert_eq!(
-            take(&held, &stranger, &skew_matrix("9"), this_build(), NOW),
-            Err(Refusal::Signature)
+            held.accept(
+                &pins(&key),
+                ORIGIN,
+                this_build(),
+                NOW,
+                &reply(&skew_matrix("9"), &stranger)
+            )
+            .err(),
+            Some(Refusal::Signature)
         );
-        let _ = key;
         assert_eq!(standing(&held), None, "no verdict is made of it");
         assert!(held.route_error(ORIGIN, this_build(), false).is_none());
     }

@@ -43,6 +43,16 @@
 //! its sixteen bytes in CBOR. JSON is therefore never what a signature covers, and a client that
 //! formatted its request differently still produces the digest the service rebuilds.
 //!
+//! # The release gate
+//!
+//! A client can be given a [`ReleaseGate`] ([`ManagedRelayLeaseService::gated_by`]), which answers for
+//! the signed release matrix: when a verified copy of it, read by this build, lists no tier for this
+//! build, a request that takes a **new** lease is refused with the route error before anything is
+//! signed or sent. A request that names a lease the host holds (a refill or a raise), a
+//! revocation and the payer's sign-in are never gated: a matrix change does not cut a route
+//! that works mid-lease, a lease the host wants ended must always reach the service, and the sign-in
+//! takes no capacity. See [`super::matrix`].
+//!
 //! # The credential
 //!
 //! Every managed-service method is proven by one credential: a signature over the gateway
@@ -69,6 +79,7 @@ use serde::{Deserialize, Serialize};
 
 use super::ServiceFuture;
 use super::account::AccountToken;
+use super::matrix::ReleaseGate;
 use super::{LeaseEndReason, LeasePayer, LeaseRequest, RelayDirection, RelayLeaseService};
 use crate::error::{ClientError, Result};
 use crate::retry::UserAction;
@@ -758,6 +769,8 @@ pub struct ManagedRelayLeaseService {
     origin: GatewayOrigin,
     http: Arc<dyn ServiceHttp>,
     signer: Arc<dyn ServiceSigner>,
+    /// Asked before a request for a new lease is sent, when the host reads the release matrix.
+    gate: Option<Arc<ReleaseGate>>,
 }
 
 crate::debug_fields!(ManagedRelayLeaseService { origin });
@@ -774,6 +787,27 @@ impl ManagedRelayLeaseService {
             origin,
             http,
             signer,
+            gate: None,
+        }
+    }
+
+    /// The same client, asking `gate` before it sends a request that takes a new lease.
+    #[must_use]
+    pub fn gated_by(mut self, gate: Arc<ReleaseGate>) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
+    /// The route error, when the release gate is closed for a request that takes a new lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal a service client returns when the signed release matrix lists no tier
+    /// for this build.
+    pub(crate) fn when_the_gate_is_open(&self) -> Result<()> {
+        match self.gate.as_ref().and_then(|gate| gate.closed()) {
+            Some(error) => Err(error.into_client_error()),
+            None => Ok(()),
         }
     }
 
@@ -849,6 +883,11 @@ impl ManagedRelayLeaseService {
 impl RelayLeaseService for ManagedRelayLeaseService {
     fn issue<'a>(&'a self, request: &'a LeaseRequest) -> ServiceFuture<'a, RelayLeaseAnswer> {
         Box::pin(async move {
+            // A request that names a lease the host holds is a refill or a raise, which a matrix
+            // change never cuts.
+            if request.lease_id.is_none() {
+                self.when_the_gate_is_open()?;
+            }
             let body = RelayLeaseIssueBody::of(request);
             let signing_input = body.signing_input()?;
             let data = self
