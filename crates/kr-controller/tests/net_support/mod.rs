@@ -325,6 +325,21 @@ pub struct Waits {
     /// waits by a timer of its own that nothing releases, so that a suite reading the order of the
     /// carriers' waits meets only theirs.
     pub reader_shares_the_timer: bool,
+    /// The signed release matrix as the daemon reads it, when the suite serves one: the key the
+    /// daemon verifies it against and the timer the daemon's reads of it wait by.
+    pub release_matrix: Option<ReleaseMatrixStage>,
+}
+
+/// How a suite stands the signed release matrix up for a daemon.
+#[derive(Clone)]
+pub struct ReleaseMatrixStage {
+    /// The timer the daemon's reads of the matrix wait by.
+    pub timer: Arc<kr_controller::testing::HeldTimer>,
+    /// The keys the daemon verifies the matrix against.
+    pub pins: kr_client::services::matrix::Pins,
+    /// The proxy the configuration document sends every request of the daemon's through, when the
+    /// suite puts one in the way.
+    pub proxy_url: Option<String>,
 }
 
 impl Host {
@@ -522,6 +537,7 @@ impl Host {
             Waits {
                 timer: Some(timer),
                 reader_shares_the_timer: false,
+                ..Waits::default()
             },
         )
         .await;
@@ -569,6 +585,7 @@ impl Host {
             Waits {
                 timer: Some(timer),
                 reader_shares_the_timer: true,
+                ..Waits::default()
             },
         )
         .await;
@@ -623,6 +640,25 @@ impl Host {
         timer: Arc<dyn kr_controller::quiet::Timer>,
         clocks: Clocks,
     ) -> Self {
+        Self::start_with_relay_and_matrix(
+            owner, host_keys, origin, account_at, sign_in, endpoint, timer, clocks, None,
+        )
+        .await
+    }
+
+    /// As [`Self::start_with_relay_on`], with the signed release matrix stood up as `matrix` says.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_with_relay_and_matrix(
+        owner: &DeviceKeys,
+        host_keys: &DeviceKeys,
+        origin: Option<&str>,
+        account_at: AccountAt,
+        sign_in: Option<kr_client::services::account::IssuedGrant>,
+        endpoint: EndpointConfig,
+        timer: Arc<dyn kr_controller::quiet::Timer>,
+        clocks: Clocks,
+        matrix: Option<ReleaseMatrixStage>,
+    ) -> Self {
         let temp = kr_ipc::testing::TempHost::create();
         let secrets = open_store_in(&temp.environment().secrets_dir())
             .expect("a secret store for the test environment");
@@ -634,6 +670,16 @@ impl Host {
         .expect("the host's keys are stored");
         drop(secrets);
         write_relay_document(&temp, origin);
+        if let Some(proxy) = matrix.as_ref().and_then(|stage| stage.proxy_url.as_deref()) {
+            let mut document = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
+            document.revision = 1;
+            document.relay.origin = origin
+                .map_or_else(kr_protocol::scalars::Nullable::null, |origin| {
+                    kr_protocol::scalars::Nullable::some(origin.to_owned())
+                });
+            document.network.proxy_url = kr_protocol::scalars::Nullable::some(proxy.to_owned());
+            write_document(&temp, &document);
+        }
         let mut host = Self::start_on(
             temp,
             room::TestRoom::new(),
@@ -648,6 +694,7 @@ impl Host {
             Waits {
                 timer: Some(timer),
                 reader_shares_the_timer: false,
+                release_matrix: matrix,
             },
         )
         .await;
@@ -803,25 +850,43 @@ impl Host {
             kr_controller::testing::with_git_read_bound(
                 kr_controller::testing::HUNG_GIT_READ,
                 kr_controller::testing::with_account_origin(account_origin.clone(), async {
-                    match &waits.timer {
-                        Some(timer) if waits.reader_shares_the_timer => {
-                            Box::pin(Controller::start_on_clocks_and_timer(
-                                setup,
-                                clocks.clone(),
-                                Arc::clone(timer),
-                            ))
+                    let started = async {
+                        match &waits.timer {
+                            Some(timer) if waits.reader_shares_the_timer => {
+                                Box::pin(Controller::start_on_clocks_and_timer(
+                                    setup,
+                                    clocks.clone(),
+                                    Arc::clone(timer),
+                                ))
+                                .await
+                            }
+                            Some(timer) => {
+                                Box::pin(Controller::start_on_clocks_and_timers(
+                                    setup,
+                                    clocks.clone(),
+                                    Arc::clone(timer),
+                                    kr_controller::testing::HeldTimer::held(),
+                                    waits.release_matrix.as_ref().map_or_else(
+                                        || kr_controller::testing::HeldTimer::held() as _,
+                                        |stage| Arc::clone(&stage.timer) as _,
+                                    ),
+                                ))
+                                .await
+                            }
+                            None => {
+                                Box::pin(Controller::start_on_clocks(setup, clocks.clone())).await
+                            }
+                        }
+                    };
+                    match waits.release_matrix.as_ref() {
+                        Some(stage) => {
+                            kr_controller::testing::with_release_matrix_pins(
+                                stage.pins.clone(),
+                                started,
+                            )
                             .await
                         }
-                        Some(timer) => {
-                            Box::pin(Controller::start_on_clocks_and_timers(
-                                setup,
-                                clocks.clone(),
-                                Arc::clone(timer),
-                                kr_controller::testing::HeldTimer::held(),
-                            ))
-                            .await
-                        }
-                        None => Box::pin(Controller::start_on_clocks(setup, clocks.clone())).await,
+                        None => started.await,
                     }
                 }),
             )
@@ -1101,7 +1166,7 @@ impl Stopped {
             secrets,
             clocks,
             boot,
-            ..
+            waits,
         } = self;
         let mut host = Host::start_on(
             temp,
@@ -1114,6 +1179,7 @@ impl Stopped {
             Waits {
                 timer: Some(timer),
                 reader_shares_the_timer,
+                release_matrix: waits.release_matrix,
             },
         )
         .await;
