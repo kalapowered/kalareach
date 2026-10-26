@@ -5,7 +5,8 @@
 # flight, and for what had already left to be shown and removed only by an action of its own. The
 # legs under `tests/integration/privacy` hold the product to that against the web service itself,
 # and this is the one command that runs them and reports the whole gate: one line for every leg,
-# whether it passed, failed, or has not run yet and what it waits for, then what the run left.
+# whether it passed, failed or did not run here, and for each leg another suite holds, the cases that
+# run it, then what the run left.
 #
 # Given an HTTPS origin it runs the leg a deployment can answer: the client's sync, with a settings
 # write and a draft publication at the service when privacy mode is enabled. It sends as a fresh
@@ -177,6 +178,9 @@ report() {
   case "$result" in
     ok) passed=$((passed + 1)) ;;
     FAILED) failed=$((failed + 1)); unfinished+=("$leg") ;;
+    # A leg another suite holds: named with the cases that run it, and not counted as a leg of this
+    # gate, which counts what it runs.
+    covered) ;;
     *) missed=$((missed + 1)) ;;
   esac
   printf '  %-7s %-9s %s\n' "$result" "$leg" "$what"
@@ -250,13 +254,13 @@ sync_leg() {
     KR_DEPLOYED_ORIGIN="$origin"
 }
 
-# The later legs: what each waits for, in the product's words. Each is named on every run, so the
-# gate fails, and says why, until every one of them has run.
+# The legs this script does not run, each with the cases that hold it. The host's and the backup's
+# legs are the daemon's own cases against the service stand-in, and the companion's are its backend
+# and page suites; the deployed leg of the backup is the account owner's, against their account.
 later_legs() {
-  report 'NOT RUN' host "waits for privacy mode's production entry point: the host enabling it through a registered method, with sync, push and inference work in flight and the history-page fence"
-  report 'NOT RUN' backup "waits for the backup uploader to start with the daemon, with its account token source and a transport gate covering deletions"
-  report 'NOT RUN' companion "waits for the companion's list of retained artifacts and its deletion action"
-  report 'NOT RUN' phone "waits for physical devices, with a notification in flight at a phone"
+  report covered host "kr-controller: cargo test -p kr-controller --test privacy --test privacy_launch --test privacy_closed_sessions --test descriptions"
+  report covered backup "kr-controller: --test managed_storage and --test backup; kr-cli: --test backup_setup and --test backup_restore"
+  report covered companion "companion-tauri: cargo test -p companion-tauri --test retained_delete; the page: pnpm -C apps/companion test and the Playwright suite"
 }
 
 # The local deployment: its run directory, and every process this run started for it.

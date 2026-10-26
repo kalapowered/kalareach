@@ -21,6 +21,13 @@ The device's state is a directory, named by the environment variable KR_FAKE_DEV
   unanswered-queries
              a number: after the first query for the application's process, that many queries
              for it fail at the transport and print the error of an `adb` that lost its device
+  hangs-on-boot
+             when present, the first read of whether the device finished starting never returns
+             (for five minutes, which no run waits for)
+  silent-after-the-log
+             a number: once the log was read, that many queries for the application's process
+             fail as above, the next is answered, and every later one fails; the file
+             `unanswered-after-the-log` counts the queries that failed
 
 The screen is a small raw frame in the shape `screencap` writes it: a header of width, height,
 format and colour space, then four bytes a pixel. A frame the picture of which was asked for
@@ -119,6 +126,7 @@ def adb(arguments):
         out.write(read("log").encode())
         out.flush()
         ends_at("log")
+        open(state_file("log-read"), "w").close()
     elif command == "forward" and rest[:1] == ["--remove"]:
         pass
     elif command == "forward":
@@ -139,12 +147,23 @@ def adb(arguments):
     elif command == "shell":
         words = " ".join(rest)
         if "sys.boot_completed" in words:
+            if os.path.exists(state_file("hangs-on-boot")) and nth_call("boot") == 1:
+                time.sleep(300)
             out.write(b"1\n")
         elif words.startswith("getprop"):
             out.write(b"36\n" if "sdk" in words else b"x86_64,arm64-v8a\n")
         elif words.startswith("am start"):
             out.write(b"Status: ok\nActivity: to.kala.reach/.MainActivity\n")
         elif words.startswith("pidof"):
+            if os.path.exists(state_file("log-read")) and os.path.exists(state_file("silent-after-the-log")):
+                after = nth_call("pidof-after-the-log")
+                answered = count("silent-after-the-log") + 1
+                if after != answered:
+                    unanswered = count("unanswered-after-the-log") + 1
+                    with open(state_file("unanswered-after-the-log"), "w") as handle:
+                        handle.write(str(unanswered))
+                    sys.stderr.write("error: device offline\n")
+                    sys.exit(1)
             call = nth_call("pidof")
             if 1 < call <= 1 + count("unanswered-queries"):
                 sys.stderr.write("error: device offline\n")

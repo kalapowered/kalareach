@@ -5,7 +5,11 @@
 //! singleton lock: no daemon is running while it does. A worker can outlive its daemon, so a
 //! session's journal is opened only when nothing this host can read says its worker may still be
 //! there - the registry's worker row, a closure in the registry that never confirmed its worker's
-//! end, and the published descriptor - and a source this host cannot read counts as saying so.
+//! end, and the published descriptor - and a source this host cannot read counts as saying so. A
+//! closure's claim that its worker's end was never confirmed is lifted by the kernel's later answer
+//! about the process the session's launch ran, read from the session's reservation. The reservation
+//! is used for nothing else, except that its display number names the endpoint to fence after the
+//! claim is lifted (`closure_leaves_a_worker`).
 //! The registry is read as it is, never brought forward or repaired, and an environment without
 //! one has nothing to say about its workers, so nothing below the ladder is imported there. What is
 //! left of a worker whose end is confirmed, its endpoint and then its descriptor, is removed before
@@ -13,7 +17,7 @@
 
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::SessionId;
-use kr_protocol::session::DisplayNumber;
+use kr_protocol::session::{ClosureRecord, DisplayNumber};
 use kr_worker::journal::Journal;
 use kr_worker::persistence::import::{Imported, import_journal};
 use kr_worker::persistence::migration::OLDEST_MIGRATABLE;
@@ -24,6 +28,31 @@ use crate::registry::Registry;
 
 /// The kind a closure gives a worker whose end this host never confirmed.
 pub const UNACCOUNTED_WORKER: &str = "unaccounted_worker";
+
+/// Whether a closure that lists a worker whose end was never confirmed still leaves one that may
+/// remain.
+///
+/// The list is a claim made when the session closed. The process the session's launch ran is the
+/// worker until the kernel says it ended, so the kernel's later answer about it is the proof that
+/// the claim no longer holds. Without that proof, or with a launch that names no process, the worker
+/// may remain. A closure that lists no such worker leaves none.
+///
+/// The daemon's question whether a worker may remain and the offline import both ask this.
+#[must_use]
+pub(crate) fn closure_leaves_a_worker(
+    closure: &ClosureRecord,
+    launcher: Option<&ProcessStartIdentity>,
+) -> bool {
+    lists_an_unaccounted_worker(closure) && !launcher.is_some_and(confirmed_ended)
+}
+
+/// Whether a closure lists a worker whose end this host never confirmed.
+fn lists_an_unaccounted_worker(closure: &ClosureRecord) -> bool {
+    closure
+        .surviving
+        .iter()
+        .any(|resource| resource.kind == UNACCOUNTED_WORKER)
+}
 
 /// What the import did with one session's journal.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,7 +93,9 @@ pub enum ImportOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RefusalCause {
     /// Something this host can read says the session's worker may still be there, or a source
-    /// that would say so cannot be read or is not there.
+    /// that would say so cannot be read or is not there. A closure that lists a worker whose end was
+    /// never confirmed says so until the kernel says that the process the session's launch ran has
+    /// ended.
     WorkerMayRemain,
     /// What is left of a worker whose end is confirmed is still there after it was fenced.
     NotFenced,
@@ -113,9 +144,11 @@ impl ArchiveService {
     /// The caller holds the environment's singleton lock, which is what makes this the only
     /// process touching these files: `kr host import-journals` takes it before it calls this. The
     /// registry is read as it is, with [`Registry::open_to_read`]: one that is not there, is at
-    /// another schema version or has lost a table it is asked is not evidence this host can weigh,
-    /// so every journal below the ladder is refused by name, and a journal inside it is left alone
-    /// as always.
+    /// another schema version or has lost its workers or closures table is not evidence this host
+    /// can weigh, so every journal below the ladder is refused by name, and a journal inside it is
+    /// left alone as always. A registry that lost its reservations refuses only the journals whose
+    /// closure lists a worker whose end was never confirmed, since those are the sessions the
+    /// reservation is read for.
     ///
     /// # Errors
     ///
@@ -266,18 +299,38 @@ impl ArchiveService {
             }
         }
         match registry.closure(session_id) {
-            Ok(Some(closure))
-                if closure
-                    .surviving
-                    .iter()
-                    .any(|resource| resource.kind == UNACCOUNTED_WORKER) =>
-            {
-                return Evidence {
-                    remains: Some(
-                        "its closure lists a worker whose end was never confirmed".to_owned(),
-                    ),
-                    ended: None,
+            Ok(Some(closure)) if lists_an_unaccounted_worker(&closure) => {
+                // The reservation is read only to lift the closure's claim: it adds no blocker, and
+                // anything short of the kernel's answer that its launch's process ended keeps the
+                // claim, including a reservation that cannot be read.
+                let launched = match registry.reservation_for_session(session_id) {
+                    Ok(reservation) => reservation,
+                    Err(error) => {
+                        return Evidence {
+                            remains: Some(format!(
+                                "its closure lists a worker whose end was never confirmed, and \
+                                 its reservation could not be read: {error}"
+                            )),
+                            ended: None,
+                        };
+                    }
                 };
+                let launcher = launched
+                    .as_ref()
+                    .and_then(|reservation| reservation.launcher_identity.as_ref());
+                if closure_leaves_a_worker(&closure, launcher) {
+                    return Evidence {
+                        remains: Some(
+                            "its closure lists a worker whose end was never confirmed".to_owned(),
+                        ),
+                        ended: None,
+                    };
+                }
+                // A closure lifted by the launch's end names the display number whose endpoint
+                // may be left to fence, as a worker row or a descriptor does.
+                if ended.is_none() {
+                    ended = launched.map(|reservation| reservation.display_number);
+                }
             }
             Ok(_) => {}
             Err(error) => {

@@ -711,6 +711,258 @@ fn kr_req_12_07_a_launch_that_cannot_have_a_server_runs_the_program_as_typed() {
     }
 }
 
+/// KR-REQ-12.05 and KR-REQ-02.10: a launch of a saved conversation that an execution of the session
+/// already holds is not served a second server. The program runs as typed, no server is started
+/// for it and nothing of the launch is left published. The conversation a launch names is the first
+/// bare word after the command's launching word, and it is held for as long as the execution lives.
+///
+/// Controls: a launch of another conversation is served, and so is a launch of the first
+/// conversation again once the execution that held it has ended. The session here holds no claim
+/// on the host, so the conversation is free as soon as the instance ends; with the host's claims
+/// it stays held until the server is retired, and another session is refused, in the case that
+/// follows the next one. Not claimed: Windows, where no gateway runs.
+#[test]
+fn kr_req_12_05_a_launch_of_a_saved_conversation_the_session_already_holds_runs_as_typed() {
+    let shell = answering();
+    let held = |saved: &'static str| {
+        [
+            ("KR_STAND_IN", "stay"),
+            ("KR_STAND_IN_SAVED", saved),
+            ("KR_STAND_IN_COMMAND", COMMAND),
+        ]
+    };
+    let first = shell
+        .establish(&["codex", "resume", "thread-9"])
+        .expect("a backend is established");
+    let mut running =
+        shell.launch_typed(&first, "first", &held("thread-9"), &["resume", "thread-9"]);
+    running.prints("TUI: a turn is running");
+    let owner = shell
+        .broker
+        .conversation_owner("thread-9")
+        .expect("the launch holds the conversation it resumed");
+    assert_eq!(shell.servers().len(), 1);
+
+    // The same conversation again, while the first execution lives.
+    let second = shell
+        .establish(&["codex", "resume", "thread-9"])
+        .expect("a backend is established");
+    let registration = PathBuf::from(&second.environment[0].value);
+    let mut again =
+        shell.launch_typed(&second, "again", &held("thread-9"), &["resume", "thread-9"]);
+    eventually("the second launch ran as typed or was served", || {
+        again.child.try_wait().ok().flatten().is_some()
+            || again.printed().contains("TUI: a turn is running")
+    });
+    assert!(
+        !again.printed().contains("TUI:"),
+        "the second launch was served a server: {}",
+        again.printed()
+    );
+    let status = again.ends();
+    assert_eq!(status.code(), Some(2), "{}", again.said());
+    assert!(
+        again.said().contains("serves `app-server"),
+        "it ran with the arguments it was typed with"
+    );
+    assert_eq!(shell.servers().len(), 1, "no second server was started");
+    assert!(!registration.exists(), "the registration was taken back");
+    assert_eq!(
+        shell.broker.live_bindings().len(),
+        1,
+        "and so was the binding"
+    );
+    assert_eq!(shell.broker.conversation_owner("thread-9"), Some(owner));
+    assert!(
+        shell
+            .last_launch_failure()
+            .is_some_and(|why| why.contains(&owner.to_string())),
+        "the refused launch names the execution that holds the conversation: {:?}",
+        shell.last_launch_failure()
+    );
+
+    // Control: another conversation is served.
+    let other = shell
+        .establish(&["codex", "resume", "thread-8"])
+        .expect("a backend is established");
+    let mut served =
+        shell.launch_typed(&other, "other", &held("thread-8"), &["resume", "thread-8"]);
+    served.prints("TUI: a turn is running");
+    assert_eq!(shell.servers().len(), 2);
+
+    // Control: the first conversation is free once the execution that held it has ended.
+    let _ = running.child.kill();
+    let _ = running.ends();
+    eventually("the conversation is free again", || {
+        shell.broker.conversation_owner("thread-9").is_none()
+    });
+    let third = shell
+        .establish(&["codex", "resume", "thread-9"])
+        .expect("a backend is established");
+    let mut resumed =
+        shell.launch_typed(&third, "third", &held("thread-9"), &["resume", "thread-9"]);
+    resumed.prints("TUI: a turn is running");
+    assert!(shell.broker.conversation_owner("thread-9").is_some());
+}
+
+/// KR-REQ-12.05 and KR-REQ-02.10: a saved conversation a session runs against is not launched
+/// against by another session, and the claim lasts until the server that runs against it is gone:
+/// the program's end, and the instance's with it, is not that. The first session's server ignores
+/// the end of its input and a terminate, so it runs on for the whole of its retirement after the
+/// program was killed; the second session's launch of the conversation runs as typed throughout,
+/// and is served once the server has ended.
+///
+/// The wait is for the server to be seen running at both ends of the refusal, which is no
+/// measure of time. Not claimed: Windows, where no gateway runs.
+#[test]
+fn kr_req_12_05_a_conversation_stays_held_until_the_server_that_runs_against_it_is_gone() {
+    let claims = kr_ipc::testing::TempHost::create();
+    let shape = kr_worker::broker::connectors::fixture::Shape::codex_backend_answering();
+    let (first, second) = (
+        Gateway::claiming(&shape, claims.root()),
+        Gateway::claiming(&shape, claims.root()),
+    );
+    let stubborn = [
+        ("KR_STAND_IN", "stay,ignore-eof,ignore-term"),
+        ("KR_STAND_IN_SAVED", "thread-9"),
+        ("KR_STAND_IN_COMMAND", STUBBORN),
+    ];
+    let answer = first
+        .establish(&["codex", "resume", "thread-9"])
+        .expect("a backend is established");
+    let mut running = first.launch_typed(&answer, "first", &stubborn, &["resume", "thread-9"]);
+    running.prints("TUI: a turn is running");
+    let server = first.servers().remove(0);
+
+    // Another session, while the first lives: the program runs as typed.
+    let claimed = kr_worker::broker::host_claims::HostClaims::new(
+        &kr_ipc::paths::HostPaths::new(claims.root().join("run"), claims.root().join("state"))
+            .expect("the roots the sessions share"),
+    );
+    let refused = |name: &str| {
+        let answer = second
+            .establish(&["codex", "resume", "thread-9"])
+            .expect("a backend is established");
+        let mut again = second.launch_typed(
+            &answer,
+            name,
+            &[("KR_STAND_IN", "stay"), ("KR_STAND_IN_SAVED", "thread-9")],
+            &["resume", "thread-9"],
+        );
+        eventually("the launch ran as typed or was served", || {
+            again.child.try_wait().ok().flatten().is_some()
+                || again.printed().contains("TUI: a turn is running")
+        });
+        let served = again.printed().contains("TUI:");
+        let _ = again.child.kill();
+        let _ = again.ends();
+        // The reason the worker kept for refusing the launch.
+        let held = second
+            .last_launch_failure()
+            .is_some_and(|why| why.contains("still held"));
+        (served, second.servers().len(), held)
+    };
+    assert_eq!(
+        refused("alive"),
+        (false, 0, true),
+        "a second session is not served, because the conversation is held"
+    );
+
+    // The first program ends, and its instance with it. The server is still being retired.
+    let _ = running.child.kill();
+    let _ = running.ends();
+    eventually("the first session's instance ended", || {
+        first.broker.conversation_owner("thread-9").is_none()
+    });
+    assert_eq!(
+        kr_ipc::identity::process_state(&server),
+        kr_ipc::identity::ProcessState::Running,
+        "the server is still running when the instance has ended"
+    );
+    assert_eq!(
+        refused("retiring"),
+        (false, 0, true),
+        "the conversation is held while the server that ran against it runs"
+    );
+    assert_eq!(
+        kr_ipc::identity::process_state(&server),
+        kr_ipc::identity::ProcessState::Running,
+        "and the server ran throughout the refusal"
+    );
+
+    // The server is gone: the conversation is free. The server's end is the first part of its
+    // retirement, which goes on to end what it started, so what is waited for is the claim
+    // itself, taken and let go of.
+    eventually("the server has ended", || {
+        kr_ipc::identity::process_state(&server) == kr_ipc::identity::ProcessState::Ended
+    });
+    eventually("the conversation is free", || {
+        match claimed.take("thread-9") {
+            Ok(_) => true,
+            Err(kr_worker::broker::host_claims::ClaimRefusal::Held) => false,
+            Err(unusable) => panic!("the claim cannot be asked about: {unusable:?}"),
+        }
+    });
+    let answer = second
+        .establish(&["codex", "resume", "thread-9"])
+        .expect("a backend is established");
+    let mut served = second.launch_typed(
+        &answer,
+        "free",
+        &[
+            ("KR_STAND_IN", "stay"),
+            ("KR_STAND_IN_SAVED", "thread-9"),
+            ("KR_STAND_IN_COMMAND", COMMAND),
+        ],
+        &["resume", "thread-9"],
+    );
+    served.prints("TUI: a turn is running");
+    assert_eq!(second.servers().len(), 1);
+}
+
+/// KR-REQ-12.05: a conversation resumed by a name stays held under that name for as long as its
+/// execution lives, after the stream has named the thread the name stands for, and the thread's
+/// identifier is held too: a second launch of either runs as typed.
+#[test]
+fn kr_req_12_05_a_name_a_launch_resumed_by_is_held_after_the_stream_names_the_thread() {
+    let shell = answering();
+    let saved = "my-work=thread-7";
+    let held = [
+        ("KR_STAND_IN", "stay"),
+        ("KR_STAND_IN_SAVED", saved),
+        ("KR_STAND_IN_COMMAND", COMMAND),
+    ];
+    let first = shell
+        .establish(&["codex", "resume", "my-work"])
+        .expect("a backend is established");
+    let mut running = shell.launch_typed(&first, "first", &held, &["resume", "my-work"]);
+    running.prints("TUI: a turn is running");
+    // The stream named the thread the name stands for: it is held by its identifier, and the name
+    // the launch used is held still.
+    eventually("the stream's thread is held", || {
+        shell.broker.conversation_owner("thread-7").is_some()
+    });
+    let owner = shell.broker.conversation_owner("thread-7").expect("held");
+    assert_eq!(shell.broker.conversation_owner("my-work"), Some(owner));
+    for (name, word) in [("by-name", "my-work"), ("by-id", "thread-7")] {
+        let answer = shell
+            .establish(&["codex", "resume", word])
+            .expect("a backend is established");
+        let mut again = shell.launch_typed(&answer, name, &held, &["resume", word]);
+        eventually("the launch ran as typed or was served", || {
+            again.child.try_wait().ok().flatten().is_some()
+                || again.printed().contains("TUI: a turn is running")
+        });
+        assert!(
+            !again.printed().contains("TUI:"),
+            "{name}: the launch was served a server: {}",
+            again.printed()
+        );
+        assert_eq!(again.ends().code(), Some(2), "{name}: {}", again.said());
+        assert_eq!(shell.servers().len(), 1, "{name}: no second server");
+    }
+}
+
 /// KR-REQ-11.35: a connector whose table declares no tested volatile forwarding mode is served no
 /// gateway: the program runs as typed, no server is started, and nothing of the launch is left
 /// published. Control: the same package declaring the mode is served, as the cases around this one

@@ -1394,6 +1394,11 @@ pub fn named() -> Vec<Named> {
         ),
         content(
             StoreScope::StateRoot,
+            "conversation-claims-1",
+            "the locks that keep two launches of one saved conversation apart, across the sessions of the user; empty files named by the digest of the conversation's word, which the workers of every release that carries them open alike",
+        ),
+        content(
+            StoreScope::StateRoot,
             "host",
             "the store of releases on a platform whose default state root holds it; its record is the store install-record, and roots/<digest>.root, roots/<digest>.registered (a command's roots) and roots/<digest>.document (an environment and a path, separated by a NUL byte) are frozen forms (two values separated by a NUL byte) that a change replaces with a file of another name; installer is one line naming the package manager that put the releases there, a file of its own so that the record is as an earlier release wrote it",
         ),

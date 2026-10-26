@@ -148,9 +148,13 @@ broker records none. These questions are application-scoped, their header carrie
 revision, and a thread switch the broker reports claims nothing for them.
 
 A bridge that does attest the thread of each request records the binding revision the request was
-made under, and when it reports a switch, every unanswered question asked under the binding it left
-is invalidated the same way. A helper no bridge describes asks application-scoped questions that end
-with its own process, at the latest after a day.
+made under, and the question's identity header then carries that revision. When the bridge reports a
+switch, every unanswered question asked under the binding it left is invalidated the same way, and
+still reads the revision it was asked under. The revision is known once the application reports the
+finished call, so a record written before that, such as the question's creation event and the result
+of the call that asked it, keeps none; the records written after carry it. A helper no bridge
+describes asks application-scoped questions that end with its own process, at the latest after a
+day.
 
 ## Cancellation
 

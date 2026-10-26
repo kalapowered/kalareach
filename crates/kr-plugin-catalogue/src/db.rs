@@ -626,6 +626,37 @@ impl Records<'_> {
         .transpose()
     }
 
+    /// Returns the publishers one accepted generation lists: the first segment under `packages/`
+    /// of every target it accepted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when a record cannot be read.
+    pub fn listed_publishers(
+        &self,
+        key: &EnrolmentKey,
+        generation: u64,
+    ) -> CatalogueResult<std::collections::BTreeSet<String>> {
+        let mut statement = self
+            .transaction
+            .prepare_cached(
+                "SELECT DISTINCT substr(target, 10, instr(substr(target, 10), '/') - 1)
+                   FROM accepted_targets
+                  WHERE enrolment_key = ?1 AND generation = ?2 AND target LIKE 'packages/%'",
+            )
+            .map_err(|source| self.failure(&source))?;
+        let rows = statement
+            .query_map(params![key.as_str(), number(generation)?], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|source| self.failure(&source))?;
+        let mut publishers = std::collections::BTreeSet::new();
+        for row in rows {
+            publishers.insert(row.map_err(|source| self.failure(&source))?);
+        }
+        Ok(publishers)
+    }
+
     /// Returns every generation one enrolment keeps, the oldest first.
     ///
     /// # Errors

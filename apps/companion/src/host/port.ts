@@ -68,8 +68,11 @@ import type {
   HostInfoResult,
   PaletteState,
   PendingResource,
+  PluginActionInvokeParams,
+  PluginActionInvokeResult,
   PluginListParams,
   PluginListResult,
+  PrivacyExported,
   PrivacyReport,
   ProjectedHyperlink,
   Question,
@@ -695,6 +698,11 @@ export interface PushHostView {
   readonly words: string
   /** True when what stopped it is the system's notification setting, which only the person changes. */
   readonly settings: boolean
+  /**
+   * What the person chose for the notification's text: true shows what needs them, false shows only
+   * that something does. It is the choice as recorded, which the host is told when it is on.
+   */
+  readonly previews: boolean
 }
 
 /** What the screen shows of notifications: whether this device has any, and each paired host's. */
@@ -702,6 +710,13 @@ export interface PushView {
   /** A phone has notifications to turn on. A computer has none, and the screen shows nothing of them. */
   readonly available: boolean
   readonly hosts: readonly PushHostView[]
+  /**
+   * The place of this view among the views native code has read, counted from one: a view read
+   * later has a higher number. Views reach the page by several routes (a change event, the answer
+   * to a command) and do not arrive in the order they were read, so the page keeps the view with
+   * the highest number it has seen and drops any older one.
+   */
+  readonly revision: number
 }
 
 /** Where this device reads a code from, besides the pasteboard. A computer reads from neither. */
@@ -1455,6 +1470,24 @@ export interface Attempts {
   readonly unreadable: number
 }
 
+/** What the page is told once the person has answered the dialog for deleting a copy. */
+export interface RetainedAsked {
+  /** Whether the person said yes. */
+  readonly confirmed: boolean
+  /** Finishes the deletion once, when they did. */
+  readonly token: string | null
+  /** How long the token lasts, in milliseconds. */
+  readonly lasts_ms: number
+}
+
+/** What the page is told once the deletion of a copy has been asked for. */
+export interface RetainedFinished {
+  /** True once the service confirmed it holds the copy no longer. */
+  readonly deleted: boolean
+  /** Where privacy mode stands, for a copy the host listed. */
+  readonly report: PrivacyReport | null
+}
+
 /** What the sheet is told once the host has put a hand-over to the owner devices. */
 export interface HandoverAsked {
   /** Names the hand-over in the commands that follow. */
@@ -1682,7 +1715,17 @@ export interface HostPort {
     params: AgentApprovalRespondParams,
     opening?: string
   ): Promise<Settled<AgentApprovalRespondResult>>
-  pluginActionInvoke(params: unknown, subject: SessionSubject): Promise<Settled>
+  /**
+   * Invokes one action a package registered for the session's agent, on the session's own worker.
+   *
+   * The parameters are the method's own: the package, the action, the instance and the binding
+   * revision the person saw, and the action's arguments as the encoded object the host hashes into
+   * the action's token. The host checks the action's rights against this device's grant.
+   */
+  pluginActionInvoke(
+    params: PluginActionInvokeParams,
+    opening?: string
+  ): Promise<Settled<PluginActionInvokeResult>>
 
   /**
    * The drafts this device keeps, and how many files in its store could not be read.
@@ -1838,6 +1881,28 @@ export interface HostPort {
   privacyStatus(): Promise<PrivacyReport>
 
   /**
+   * The copies the sync service kept of writes it refused this computer, listed as privacy mode
+   * lists what the host sent. They are read from this computer's own records, so they are listed
+   * whether or not a host is connected.
+   */
+  retainedSyncCopies(): Promise<readonly PrivacyExported[]>
+
+  /**
+   * Asks the person, in a dialog native code raises, whether to delete the copy listed under
+   * `reference`. The page cannot answer it. A yes returns the token that finishes the deletion
+   * once; a no returns none. Refuses a reference no one deletable copy is listed under, and a
+   * copy the host lists when this application is not connected to the host on this computer.
+   */
+  retainedDeleteAsk(reference: string): Promise<RetainedAsked>
+  /**
+   * Asks for the deletion of the copy the person said yes to, with the token that yes returned. The
+   * token works once, and not after a cancel or once it has run out.
+   */
+  retainedDeleteFinish(token: string): Promise<RetainedFinished>
+  /** Drops a confirmation that was not used. */
+  retainedDeleteCancel(token: string): Promise<void>
+
+  /**
    * Opens a raw terminal view of one session, `grid` in size. Native code attaches it to the
    * session and holds its screen; every state it is in reaches `listener`, and nothing else does.
    * Resolves with the view as soon as native code holds it, before the host has answered anything.
@@ -1931,6 +1996,13 @@ export interface HostPort {
    * stand at once; later changes arrive through {@link HostPort.onPush}.
    */
   pushEnable(reference: string): Promise<PushView>
+  /**
+   * Chooses whether the notifications of the host `reference` name show what needs the person
+   * (`on`) or only that something does. Resolves with where they stand at once: the choice is
+   * recorded and the host is told; a host that cannot be told shows the words, and the choice
+   * stays recorded.
+   */
+  pushPreviews(reference: string, on: boolean): Promise<PushView>
   /** Looks again at where notifications stand, and mends what changed since the last look. */
   pushRefresh(): Promise<PushView>
   /**

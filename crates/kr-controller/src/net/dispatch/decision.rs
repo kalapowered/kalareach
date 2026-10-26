@@ -16,7 +16,7 @@ use crate::grants::policy::HeldBound;
 use crate::service::net::lifetimes::GrantStanding;
 
 use super::acting::{Acting, Held};
-use super::output::{RELAY_DECISIONS, Written};
+use super::output::{RELAY_DECISIONS, ReadUnder, Written};
 use super::{RemoteConnection, failure};
 
 /// One request of this connection's as the host decided it: what was asked, and the decision,
@@ -37,6 +37,9 @@ pub(super) struct Asked {
     /// is decided as a read of a receipt, under `action.read`'s entry, and is still the answer to
     /// the method it was kept for, so the two differ there.
     pub(super) shown_as: Method,
+    /// For a page of retained output, the privacy state it was read under, which the page is
+    /// released under ([`RemoteConnection::write_answer`]).
+    pub(super) read_under: Option<ReadUnder>,
 }
 
 impl Asked {
@@ -62,6 +65,39 @@ impl Answered {
     #[must_use]
     pub const fn frame(&self) -> &ControlFrame {
         &self.frame
+    }
+}
+
+/// A page of retained output answered with none of its output and the range it covered said to be
+/// gone, and any other answer as it is.
+///
+/// An answer that is not a page this host can read is not passed on in its place.
+fn without_its_output(frame: &ControlFrame) -> ControlFrame {
+    use kr_protocol::envelope::{Outcome, Response};
+
+    let ControlFrame::Response(Response {
+        request_id,
+        outcome: Outcome::Ok(value),
+    }) = frame
+    else {
+        return frame.clone();
+    };
+    let withheld = value
+        .to_typed::<kr_protocol::recovery::HistoryPageResult>()
+        .ok()
+        .and_then(|page| ParamsValue::from_typed(&crate::service::withheld_page(&page)).ok());
+    match withheld {
+        Some(value) => ControlFrame::Response(Response {
+            request_id: *request_id,
+            outcome: Outcome::Ok(value),
+        }),
+        None => failure(
+            *request_id,
+            ProtocolError::new(
+                ErrorCode::ResourceUnavailable,
+                "this page of retained output cannot be shown",
+            ),
+        ),
     }
 }
 
@@ -92,9 +128,18 @@ impl RemoteConnection {
                 &asked.decision.decided.permitted.rights,
                 &asked.acting.grant.history,
             );
+            // A page of retained output goes only under the privacy state it was read under. Once
+            // that has moved it goes with none of its output, and says the range it covered is
+            // gone, as privacy mode left it.
+            let (shown, read_under) = match asked.read_under.as_ref() {
+                Some(read_under) if !read_under.stands() => {
+                    (std::borrow::Cow::Owned(without_its_output(&shown)), None)
+                }
+                other => (shown, other),
+            };
             match self
                 .output
-                .write_held(&shown, &asked.decision.bounds(), None, true)
+                .write_held(&shown, &asked.decision.bounds(), None, true, read_under)
                 .await
             {
                 Written::Sent => return true,
@@ -107,7 +152,11 @@ impl RemoteConnection {
                 asked.entry,
                 asked.claims_geometry,
             ) {
-                Ok(again) => asked = again.answering(asked.shown_as),
+                Ok(again) => {
+                    let read_under = asked.read_under.take();
+                    asked = again.answering(asked.shown_as);
+                    asked.read_under = read_under;
+                }
                 Err(error) => return self.output.send(&failure(request_id, error)).await,
             }
         }
@@ -219,6 +268,7 @@ impl RemoteConnection {
             decision,
             acting,
             shown_as: entry.method,
+            read_under: None,
         })
     }
 
@@ -782,14 +832,27 @@ impl RemoteConnection {
     ) -> std::result::Result<(), ProtocolError> {
         let scope = &acting.history;
         match entry.method {
-            // The only method that returns *retained* history. Its scope is the grant's lower
-            // bound, and nothing on this path can apply one: the bound is a moment in time and a
-            // history page is a byte range. A host that cannot narrow content to a grant refuses
-            // it rather than serving more than the grant allows.
-            Method::HistoryPage => Err(ProtocolError::new(
-                ErrorCode::PermissionDenied,
-                "this host does not serve retained history to a paired device",
-            )),
+            // The only method that returns *retained* history. A page is a byte range and the
+            // grant's scope is a moment in time, so the session's worker narrows the range to the
+            // moment through the record of when each part of the output was produced, from the
+            // scope this connection forwards with the read. What is decided here is whether the
+            // grant reaches retained output at all: a grant with no history bound reaches none, and
+            // is refused by name rather than answered with a page that is empty.
+            Method::HistoryPage => {
+                let reaches = kr_worker::history_filter::HistoryFilter::new(
+                    kr_worker::history_filter::ViewerScope::from_history(scope, true),
+                )
+                .first_moment(kr_worker::history_filter::Surface::EventPage)
+                .is_some();
+                if reaches {
+                    Ok(())
+                } else {
+                    Err(ProtocolError::new(
+                        ErrorCode::PermissionDenied,
+                        "this device's grant does not reach the session's retained output",
+                    ))
+                }
+            }
             // These return the session's current screen and the stream that follows it, which is
             // the live view the scope either includes or does not.
             Method::EventsSubscribe | Method::EventsSnapshot | Method::SessionAttach

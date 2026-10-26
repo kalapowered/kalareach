@@ -72,6 +72,17 @@ count is a lower bound and says "at least". An agent's history goes with it when
 one it was reading ended before its last entries were read. What a package shows arrives on the
 event stream, and a node already held is replaced only by a newer revision of it.
 
+A button that a package shows runs that package's action on the session's own worker. The call
+names the package that recognised the agent, the action, the agent's instance and the binding
+revision the person saw, and it carries no arguments. The worker checks the action against the
+rights this device holds. The conversation records which instance and binding revision each node
+revision was drawn under, and keeps the record with the revision, so it survives a visit to the
+terminal and back. The button sends nothing, and says why, in these cases: no live agent has been
+read; the node arrived before the agent was read, or the agent has moved to another conversation
+since it was drawn, in which case the button works again when the package draws it again; the
+control declares a parameter, or sits in a form with fields or an entry that takes a file, because
+the conversation cannot take that input yet; or the document does not say what the action takes.
+
 A session has three views: the conversation, the raw terminal and its output. The output view reads
 what the session wrote, as the host keeps it, with `history.page`: from the live end, a page at a
 time with a cursor and a byte bound, towards older output as the reader scrolls up and newer output
@@ -79,7 +90,10 @@ as they scroll down. It holds a bounded run of pages and lets pages go from the 
 the reader is looking at stays where it is as pages come and go. It shows the text the session
 printed, decoded across page boundaries, and leaves out what a terminal would act on: colours,
 titles, cursor moves and clipboard writes. Where the host no longer keeps output it says so, and
-why. Each view keeps its own place across a change of view: the conversation and the output return
+why. Over a host this device is paired with, the host serves the output the device's grant reaches,
+from the first of it, and the view says that the output before it is not available to this device
+rather than that the host kept none; a session that has written nothing the grant reaches says so
+too. Each view keeps its own place across a change of view: the conversation and the output return
 the reader to the node or page they were reading, or to the live end if they were following it.
 
 A session exports two files, each where the platform's save dialog puts it. The semantic archive
@@ -308,6 +322,18 @@ that means, and each rule is a fact about a file here rather than a convention:
   is written to a destination the save dialog returned. `src-tauri/tests/recovery.rs` holds this
   one.
 
+- **A copy that left is deleted by the person's answer.** The page lists what has left the host and
+  names a copy by the reference it is listed under. `retained_delete_ask` raises a dialog of this
+  application's own and returns a token only on a yes, `retained_delete_finish` takes the token
+  once, reads the list again and asks for the deletion, and `retained_delete_cancel` drops it. The
+  token is bound to the reference and, for a copy the host lists, to the host's environment and its
+  privacy generation, and it runs out after two minutes. `privacy.retained.delete` is a method only
+  native code calls, and only for the host on this computer. A native dialog is the owner's
+  confirmation at this computer and no proof that a person is present. The dialog has three buttons,
+  "Don't delete", "Delete" and "Cancel", so the button that Return answers and the one that Escape
+  answers do not delete. `src-tauri/tests/retained_delete.rs` holds the rest of this one, and a case
+  in `src-tauri/src/retained.rs` the order of the buttons.
+
 `src-tauri/tests/boundary.rs` reads those files and holds them to those sentences.
 
 One hardening switch is deliberately off. `freezePrototype` freezes `Object.prototype` before the
@@ -358,13 +384,13 @@ connection is refused as such. The host on a computer's own machine is reached i
 whether it was not there when the application started or its connection ended. Each choice of host
 has a number, and a task that keeps the connection of an earlier choice can neither install its
 connection nor record its loss once a later one is made. The Sessions and Hosts screens read their lists again each time the connection
-comes or goes, and show nothing of a host that is not the one reached. The inbox is one list across every host the phone is paired with. The host in use is read by the page; each other host is visited by native code (`src-tauri/src/inbox.rs`, the command `inbox_hosts`), over a connection of its own that the next visit reuses while it answers and that is let go when the host is forgotten or taken into use, while the Attention tab is shown and not otherwise. A visit reuses the connection of a member's device without presenting the device's lease again until the lease the host holds is due to be replaced, or the host refuses a read as not permitted (which may be that lease having ended), because the host keeps a row for each presentation; and a connection belongs to the account that was signed in when it was opened, so one whose account has signed out or been replaced has ended with it and is replaced by a new one, or refused in words when no account is signed in; and the answer, which waits for the slowest host, leaves out a host whose inbox was read for an account that has signed out or been replaced meanwhile. Each visit is bounded to ten seconds, so a host that takes the connection and answers nothing holds up no other host. A visit never cuts off the host in use: one key holds one endpoint on a relay, so a host whose services (its relays, its address lookups) differ from the host in use's and share a relay with them is out of contact for as long as the other is in use. A visit returns the host's whole inbox and the numbers of its sessions, that the host answered and refused with the refusal it sent, that this device could not give a member's host the lease it needs, in words of its own, or that the phone is out of contact with it and since when. Rows are tagged with the name of their host once more than one host is paired, a tap on a row of another host takes that host into use before it opens the session, and the tab's count is the rows waiting for the person on every host. A host that does not answer, the host in use included, is drawn as a row of its own, "out of contact", with the time since this device last heard it and the words that its sessions may still be running. It is never counted among the failures, and the rows last read from the host stay below it, said to be from that read. A host that answers and refuses a visit is another row, "refused", under every filter, in the host's words and with what to do about them, or, for a member's host that this device could not give the lease its organisation signs for it (signed out, the account not a member, the organisation's service not answering, or another account signed in since the connection was made), in the device's own words: it is in contact, so no loss of contact is noted or counted for it, and nothing it held before is listed. The host in use is not visited: when it refuses its connection it is drawn as out of contact, with the host's words as the reason. A host that revoked this phone, or whose grant for it ended, sends no refusal the transport counts as one (it answers as it does an unknown device, or closes the connection), so it is drawn as out of contact. Nothing is written to disk, and a host the phone forgets or begins to use is no longer visited. A connection the host withdrew is
+comes or goes, and show nothing of a host that is not the one reached. The inbox is one list across every host the phone is paired with. The host in use is read by the page; each other host is visited by native code (`src-tauri/src/inbox.rs`, the command `inbox_hosts`), over a connection of its own that the next visit reuses while it answers and that is let go when the host is forgotten or taken into use, while the Attention tab is shown and not otherwise. A visit reuses the connection of a member's device without presenting the device's lease again until the lease the host holds is due to be replaced, or the host refuses a read as not permitted (which may be that lease having ended), because the host keeps a row for each presentation; and a connection belongs to the account that was signed in when it was opened, so one whose account has signed out or been replaced has ended with it and is replaced by a new one, or refused in words when no account is signed in; and the answer, which waits for the slowest host, leaves out a host whose inbox was read for an account that has signed out or been replaced meanwhile. Each visit is bounded to ten seconds, so a host that takes the connection and answers nothing holds up no other host. A visit never cuts off the host in use: one key holds one endpoint on a relay, so a host whose services (its relays, its address lookups) differ from the host in use's and share a relay with them is out of contact for as long as the other is in use. A visit returns the host's whole inbox and the numbers of its sessions, that the host answered and refused with the refusal it sent, that this device could not give a member's host the lease it needs, in words of its own, or that the phone is out of contact with it and since when. Rows are tagged with the name of their host once more than one host is paired, a tap on a row of another host takes that host into use before it opens the session, and the tab's count is the rows waiting for the person on every host. A host that does not answer, the host in use included, is drawn as a row of its own, "out of contact", with the time since this device last heard it and the words that its sessions may still be running. It is never counted among the failures, and the rows last read from the host stay below it, said to be from that read. A host that answers and refuses a visit is another row, "refused", under every filter, in the host's words and with what to do about them, or, for a member's host that this device could not give the lease its organisation signs for it (signed out, the account not a member, the organisation's service not answering, or another account signed in since the connection was made), in the device's own words: it is in contact, so no loss of contact is noted or counted for it, and nothing it held before is listed. The host in use is not visited: when it refuses its connection it is drawn as out of contact, with the host's words as the reason. A host that revoked this phone, or whose grant for it ended, sends no refusal the transport counts as one (it answers as it does an unknown device, or closes the connection), so it is drawn as out of contact. Nothing is written to disk, and a host the phone forgets or begins to use is no longer visited, and is not reported by a pass that was under way when it was: the pass checks every host again once all the visits have ended, and the page weighs each answer against the pairing it reads itself, so a host forgotten or taken into use since the visit shows neither rows, nor a contact row, nor a refusal. A connection the host withdrew is
 replaced by one it admits, `connection_state` counts each replacement in `replaced`, and the window
 says so once for each. Nothing is sent again for the person.
 
 When a session screen loads on the phone, it opens that session before it asks anything about it: it picks a token and passes it, with the session and the share if it holds one, to `session_open`. The host opens the session on a connection of its own, under that grant, and says what the grant allows. Every command about the session carries the token. A token can be used once, and a command that names an opening another has replaced executes nowhere. The connection kept for the host alone serves the host's own reads, and the host refuses it every command that would reach a worker.
 
-A member host's links and views belong to the account too: when it signs out or another signs in, they end, and a new one is opened only under the account signed in then, and only while the keeper of that sign-in holds a lease the host took; until it does, a link ends in words that say the device is still presenting its lease. Each opened link is watched. If its connection is lost and the grant has not ended, the application reaches the host again as the same opening, after a pause that grows, and the page is told `reconnecting` and then `open`. If the share ends, the page is told `ended` with the reason, and no connection under another grant takes the link's place. If the host cannot be reached when a screen opens, the opening stands as `reconnecting` and the application keeps trying. A command made outside any screen, such as the inbox's or a kept answer's, goes over one of at most four links that the application opens under the pairing and lets go when they are idle. At most eight sessions are open at once, and leaving a screen closes its link once the mutations in flight on it have answered.
+A member host's links and views belong to the account too: when it signs out or another signs in, they end, and a new one is opened only under the account signed in then, and only while the keeper of that sign-in holds a lease the host took; until it does, a link ends in the words of the stop the keeper holds against the service, and when it holds none (after a start, a sign-in or a switch, or once a held stop's time has run out), in words that say the device is still presenting its lease. Each opened link is watched. If its connection is lost and the grant has not ended, the application reaches the host again as the same opening, after a pause that grows, and the page is told `reconnecting` and then `open`. If the share ends, the page is told `ended` with the reason, and no connection under another grant takes the link's place. If the host cannot be reached when a screen opens, the opening stands as `reconnecting` and the application keeps trying. A command made outside any screen, such as the inbox's or a kept answer's, goes over one of at most four links that the application opens under the pairing and lets go when they are idle. At most eight sessions are open at once, and leaving a screen closes its link once the mutations in flight on it have answered.
 
 A raw terminal view of a paired host's session has a connection of its own, which the host opens for the session under the grant the screen runs under. The view belongs to its opening and ends with it. When only the view's connection is lost, the application asks the host again, on the opening's live link, what the opening allows, and the page opens a view again. The last screen the view drew stays, and nothing the person typed is sent again.
 
@@ -495,12 +521,56 @@ stops notifications on this phone, and only the host ends a destination. A stop 
 and offers "Try again", and "Open settings" when the system's setting is what the person has to
 change. A computer has no notifications to turn on and the row does not appear.
 
-The page asks four commands of the backend: `push_view`, `push_enable`, `push_refresh` and
-`notification_route`, and is told of a change on the `kr://push` event. `push.rs` sequences the
-steps for the host the person chose and holds the result in `push/push.json` under the data
-directory: per host, whether the person asked, the authorisation identifier this phone issued for it
-(so that asking again issues under the same one), the digest of the token the registration that last
-turned the host on proposed, and the last outcome in words. The file holds no token, no key and no credential. A file that cannot be read, damaged or
+Below those words, once the person has asked for notifications, a switch named "Previews" chooses
+what a notification shows: what needs the person (on, which is the default), or only that something
+does. The switch reads as changed at once and waits while a step runs. Turning it off takes the host's
+key out of what the phone's receivers hold before the host is told, so a preview already on its way is
+not opened; turning it on files the key first. A receiver that is deciding at that moment is ordered
+against the change. On Android, the change of the keys waits until every receiver that is deciding has
+posted what it decided, and a receiver that starts later reads the keys as the person left them; the
+wait is on a thread of the plugin's own, since the command arrives on the main thread. On iOS, the
+extension is another process and shares no lock with the application, so it reads the host's key again
+after it opens the preview and shows the preview only if that key is still there. The time between that
+read and the hand-over to the system is a few operations and does not grow with the time the open
+takes; a notification that passed the read before the key was removed was decided while previews were
+on. The host is then told with `device.push.register`,
+which carries the choice: a host seals nothing and names no recipient key in later notifications when
+it is off. Only that registration is repeated, under the authorisation identifier the phone already
+keeps and with no new token proposal. A host that cannot be told leaves the row needing the person,
+the choice stays recorded, and "Try again" runs the whole sequence with it. A choice that the record
+cannot keep, or whose key cannot be filed for the receivers, is not made: the switch goes back and the
+person is told, so that off is never off in name only. Choices are made one after another, so one
+that is let go never undoes a choice made after it began. The choice a run tells the host is the one
+recorded when the run begins to tell it, before the keys are filed, so the host is told off after the
+receivers were asked to let the key go, whether or not they did; a choice made after that is told by
+the run when it goes round again. The receivers are given ten seconds to answer a filing of the keys. The native call itself is sent in the
+turn of the caller that asks, so that calls reach the platform in the order they were asked, and then
+runs to its end on a task of its own, since Tauri's callback for a native answer panics when the
+caller has gone; a late answer is discarded. One that does not answer in time is a filing that failed, and it
+leaves what the receivers hold unknown: the next filing is made even for a
+set they held before, the rows say that the keys were not filed in time, and a choice that asked for
+the filing is let go. A filing that fails does not stop a run or start one:
+the host is still registered, the rows of hosts that are on say that the receivers could not be handed
+the keys until a filing succeeds, and each look files them again, alone, without the gateway or the
+host. "Try again" on such a row does the same and starts no sequence, since a sequence would spend the
+gateway's issues and retire the credential the host holds without changing what the store refuses.
+A host that refuses a change of previews, or whose answer is lost, after the gateway has issued for it
+may be left with a credential the gateway no longer takes, and the row says that it may not be able to
+notify this phone until it takes a registration. A host that took the registration and then refused
+the preview key, or whose answer to the key was lost, is said to hold this phone as a destination and
+not to have confirmed its key.
+
+The page asks five commands of the backend: `push_view`, `push_enable`, `push_previews`,
+`push_refresh` and `notification_route`, and is told of a change on the `kr://push` event. Every view
+the backend hands the page carries a revision, counted in the order the views are read. The page keeps
+the view with the highest revision it has seen, whether it came on the event or as the answer to a
+command, and drops an older one: an answer read before a change can arrive after it. `push.rs`
+sequences the steps for the host the person chose and holds the result in `push/push.json` under the
+data directory: per host, whether the person asked, the authorisation identifier this phone issued for
+it (so that asking again issues under the same one), the digest of the token the registration that
+last turned the host on proposed, the choice of previews and the choice the host was last told (a
+record from before the choice existed reads as on), and the last outcome in words. The file holds no
+token, no key and no credential. A file that cannot be read, damaged or
 written by a build this one does not know, is moved aside as `push/push.unreadable-<time>.json`
 and never written over, and the failure is logged. The new record marks each host paired at that
 moment as lost: the page shows it as needing the person, in place of off, across restarts, until the
@@ -510,21 +580,43 @@ record, because the start before it ended in between, marks the hosts then. A fi
 to read, one that cannot be moved aside, and a list of paired hosts that cannot be read leave the
 record where it is: nothing is written and no host is started until a start can deal with it, and
 the page says to close the application and open it again for each host that was paired then. A list
-of paired hosts that cannot be read marks none: once it can be read, those hosts show notifications
-as off, with no words, and none is started until the application is opened again. `docs/delivery/README.md` ("What the phone does first") says what
+of paired hosts that cannot be read marks none: once it can be read, a host the record never heard of
+shows as needing the person, in the same words, and none is started until the application is opened
+again. A start drops what the record kept of a host this phone is no longer paired with, once the
+list has been read. A record that cannot be moved aside is tried under at most a thousand names and
+then left where it is. `docs/delivery/README.md` ("What the phone does first") says what
 the steps are. A run changes a member's host only under the account its connection was opened under:
 when that account has signed out or been replaced, the run stops before its next change, in words that
-say so. The application looks again with `push_refresh` when it starts and each time it
+say so. A run the person starts reaches its host as the person's own choice, and may take the relay
+another host's endpoint uses. A run a look starts is a visit: it holds the endpoint of its host while
+its connection is open, which stops other visits and nothing the person asks, and it never cuts off the
+host in use. A host it could not reach without that is asked before anything else, so the gateway and
+the host are asked nothing; the row needs the person, in words that name the relay, and "Try again"
+reaches it as the person's own choice. The application looks again with `push_refresh` when it starts and each time it
 comes to the front, on whichever screen, because a person who left to change the system's setting
-comes back to the screen they left. A tap on a notification opens the application, and
+comes back to the screen they left. A look that cannot read the notification token cannot say that a
+host which is on still has the token it was registered with, so it shows each such host as needing
+the person, in words that say the phone will check again the next time the application is opened,
+and starts no run; the next look that reads a token shows the host on again, or registers it when
+the token is another. A run the system ended with the application is retried by the first look when
+it was last heard of a minute or more before the start, and waits out the rest of the minute
+otherwise. A tap on a notification opens the application, and
 `notification_route` hands the page the screen once; the page goes to the attention screen, where
 what needs the person is.
 
 The platform plugin carries the commands the steps need to native code: the permission, the token,
-the record of the registration being waited for, the limited key store, and the route of a tap. Its
+the record of the registration being waited for, the set of preview keys the receivers hold, and the
+route of a tap. The set is built from the record and the paired hosts under one hold, whole each time
+(this phone's preview seed, and the preview key of each paired host whose record is not lost and whose
+previews are on), and handed over before the host is reached, when a host is forgotten, when the
+choice changes and at each look; the receivers' store is made equal to it, and a list of paired hosts
+that cannot be read hands over nothing. Its
 Android half is `PlatformPlugin.kt` and the receiver in `native/android`; its iOS half forwards to
 the application target through an adapter found by name (`KRPushAdapter`), as the voice call does.
-The receivers answer a registration challenge through one function of the Rust library
+On Android, each read of the token asks Firebase for its current token as well, and waits for
+the answer for at most two seconds: a token that differs from the stored one is stored, and when
+Firebase does not answer in time, or the build has no Firebase configuration, the stored token
+stands. The receivers answer a registration challenge through one function of the Rust library
 (`native/platform/src/push.rs`), reached by JNI on Android and by C symbols on iOS. A debug build
 reads the registration token and the gateway's origin from `kr-probe/push-request.json` in the data
 directory, because a device run has no provider; a release build reads neither.
@@ -628,9 +720,10 @@ A request published to a feed carries an announcement for the host. Native code 
 computer's stored-envelope key to the host's, and the service places it in the host's mailbox beside
 the request. The host reads its mailbox, finds the announcement and reads the feed at once instead
 of at its next poll. The announcement says that the feed changed and nothing about what changed. It
-expires 55 minutes after it is sealed. The service refuses a change whose announcement expires more
-than an hour after the service's own clock, and it admits a request signed up to five minutes ahead
-of that clock, so a longer expiry would let a computer with a fast clock lose the whole revocation.
+expires 55 minutes after it is sealed. The service declines an announcement that expires more than
+an hour after the service's own clock and commits the change without it, and it admits a request
+signed up to five minutes ahead of that clock, so a longer expiry would let a computer with a fast
+clock lose the announcement, and the host would read the feed at its next poll instead of at once.
 A request whose announcement cannot be sealed is published without one.
 
 The host announces back. When it acknowledges a request, it places an announcement that the feed
@@ -761,7 +854,7 @@ and so revokes nothing.
 
 There is a "Sharing" tab in the settings of a session. It lists who has access, and then has a form for sharing the session.
 
-The list contains the grants the host holds for the session. Each item shows: the device name, the role of the share (spelled out), the end time of the share (either the end of the share, or the end of the device's pairing, whichever comes first), and (if appropriate) buttons to either withdraw the share (if it is not yet accepted), or revoke the share (if it is active). If the share is active and carries `session.share`, it also has a "Hand over control" button. Owner devices are also listed, as having access whatever is done to a share.
+The list contains the grants the host holds for the session. Each item shows: the device name, the role of the share (spelled out, with any right the role does not cover named beside it), the end time of the share (either the end of the share, or the end of the device's pairing, whichever comes first), and (if appropriate) buttons to either withdraw the share (if it is not yet accepted), or revoke the share (if it is active). If the share is active and carries `session.share`, it also has a "Hand over control" button. Owner devices are also listed, as having access whatever is done to a share.
 
 When a share is revoked, a separate item is added to the list (the original share is removed when the grant is resolved). It shows when the share was revoked, the authority revision the host gave the revocation, and how many workers of the session have not yet confirmed that the share has been revoked. There is also a "Check again" button, to make a new request to revoke the share, which asks each worker again, and a "Dismiss" button, to remove the item from the list. The item says the same whether the result came straight from the host, from a background repeat by the native code, or from a user-requested repeat, except that a hand-over recovered in the background, or after the page started again, cannot name the device that gave control up.
 
@@ -771,7 +864,7 @@ The lifetimes shown in the share form are only the lifetimes that will end befor
 
 The "Reviewer" role is not offered. If the selected role has consequences, or the invitation lets the recipient answer the agent's questions, the "Invite" button is not enabled until the user has confirmed that they understand the consequences by ticking a box. The tick box is reset every time any setting in the form is changed, even if it is changed back to its previous value.
 
-The consequences are the protocol's own sentences, and the page does not word them itself. The application's native code computes which notices the selected role and options carry (`grant_notices`, a local command that reads the protocol's table, not a request to the host) and the page shows one warning line under the summary of the invitation for each, with the sentence of that notice from the host guide's table, for example "Terminal input runs as your account. Anything this recipient types can do what you can do on this machine." for terminal input, and "This is not a restricted sandbox." in the sentence for prompts, approvals and answers. The tick box reads "I understand this lets" and the device's name "do what the consequences above say", with ", and resize the terminal" added when the invitation includes terminal geometry. When the invitation is issued the page sends back the identifiers of the notices it showed, and the host refuses an invitation whose notices are not the ones the grant carries. The recipient opens the invitation from the phone's "Invitations" list, and its sheet, titled with the host and the session, lists the same consequences under "This lets you", addressed to the recipient and naming the host; the sentence for the delegation notice adds that the phone does not pass shares on and names no host. The "Who has access" list, the phone's "Invitations" list and its "Shared with you" list show each share by its role and its end, and a viewer share that lets the recipient answer the agent's questions is listed as "Viewer" there, without the notice, which only the form and the invitation sheet show.
+The consequences are the protocol's own sentences, and the page does not word them itself. The application's native code computes which notices the selected role and options carry (`grant_notices`, a local command that reads the protocol's table, not a request to the host) and the page shows one warning line under the summary of the invitation for each, with the sentence of that notice from the host guide's table, for example "Terminal input runs as your account. Anything this recipient types can do what you can do on this machine." for terminal input, and "This is not a restricted sandbox." in the sentence for prompts, approvals and answers. The tick box reads "I understand this lets" and the device's name "do what the consequences above say", with ", and resize the terminal" added when the invitation includes terminal geometry. When the invitation is issued the page sends back the identifiers of the notices it showed, and the host refuses an invitation whose notices are not the ones the grant carries. The recipient opens the invitation from the phone's "Invitations" list, and its sheet, titled with the host and the session, lists the same consequences under "This lets you", addressed to the recipient and naming the host; the sentence for the delegation notice adds that the phone does not pass shares on and names no host. The "Who has access" list, the phone's "Invitations" list and its "Shared with you" list show each share by what it allows and by its end. What it allows is the widest role whose rights the share carries in full, with each right the role does not cover named beside it: a viewer share that lets the recipient answer the agent's questions is listed as "Viewer" with "also answers the agent's questions" beside it, and a share that carries no role in full, because it has no `session.view`, as "Custom access" with its rights. These lists do not show the notices, which only the form and the invitation sheet show.
 
 With the live view on, the page reads the lines on the session's screen through the session's own worker and shows them in a scrollable box (scrollable both horizontally and vertically, in case the screen has lines longer than the box). Control and direction characters are made visible. A screen the preview had to cut cannot be shared. The host writes the invitation with the screen it kept. After the share is made, that screen will be compared to the screen shown to the user, regardless of whether the result came directly from the host or as a result of repeating the share. If the screens do not match, the host's copy of the screen will be shown, and a "Withdraw" button will appear to withdraw the share. If the application is started again before the result of the share is read, the user's copy of the screen will no longer be available, so they cannot be compared. In this case the row of the attempt says so and offers Ask the host and Withdraw. Once the host answers, a message says the two could not be compared, shows the host's copy of the screen, and offers "Withdraw".
 
@@ -845,6 +938,8 @@ This computer does not guess which host a draft is for from the host that happen
 Every answer from the service is held until this computer has read the host's privacy mode again and moved the host's store to it, unless the store is already fenced. A host that went private while a publication was out therefore has the answer discarded, and nothing is noted of the draft. A host that cannot be read at that moment is treated as private until the next read: the draft is noted as published when the service applied the write, and what an answer brings down is withheld. A store that cannot follow a host whose state was reset is fenced at the generation it holds, in the same way. Publications that left without an answer are asked about at the start of every pass, in the store of every host that has one.
 
 When a Draft is sent or thrown away, the Service is informed so that it can remove the Draft. Because only 256 objects can be stored in a Collection, it is important to remove the Drafts. The removal is stored in the `removals.json` file before the Draft is removed; if the removal cannot be stored, the Draft is not removed. The removal is owed until the service has made it, and it is retried while the host is private or cannot be reached. Each removal is compared to the newest known place for the Draft on this computer, which can be a Note for the Draft, a Note in the removal, or a place in the Sync Store of any Host for a Publication. A publication that has not been answered is waited for, and one that ended without an answer is found by asking the service what it holds. The removals do not need allowance from the Settings Sync. So if the allowance is spent, the removals can still be done.
+
+The sync service keeps a copy of a write it refused, so that the person can choose between versions, and privacy mode lists that copy among what has left. The settings store and each host's drafts store record it, and `retained_sync_copies` lists them from those records, without asking the service, for the page to show beside what the host lists. Deleting one goes through the dialog a host's copy goes through, with no host asked, so it works whichever host is connected. A settings copy is dropped in the step that asks: the choice is recorded, then the service is asked, and a service that does not answer leaves the copy listed. A drafts copy is recorded in the store of the host the draft was for, and the pass that follows asks the service and asks again until the service has dropped it. A copy is offered while the sync that holds it is on, which for a drafts copy means settings sync and drafts sync both. A record of those stores that this build cannot read is listed beside the copies, as one nothing can be asked of, and when the stores cannot be read at all the page says so and offers to try again, because an empty list would read as nothing having left.
 
 A second device of the same person joins the settings in two steps, and the person has to be present for both. On a computer that holds the settings, the account sheet lists the devices the person's hosts list as theirs that do not hold the key yet. "Share settings" runs the platform's ceremony with "Share your settings with" and the device's name as its reason. After the person confirms, the hosts are asked again, and the key moves on to a new epoch that includes the device only if they still list it and agree on its keys. On the other device, the sheet offers the settings once the sync service lists them for this installation, named for the device the collection was started on, and "Join" runs the ceremony there. Only macOS and Windows have the ceremony, so a computer on any other platform, a phone among them, is offered neither "Share settings" nor "Join", and the sheet says to do it on a Mac or a Windows computer; and a computer that holds the settings offers no device on another platform to share with. A computer that holds no shared settings, or was taken out of them, looks for an offer when the person presses "Look for my devices" and, with settings sync on, when the sheet first opens; with settings sync off it sends nothing to the service until they press. A computer that starts settings sync of its own cannot join another's yet, and cannot leave its own, so to share settings between two computers the person starts settings sync on one of them only and joins from the other. While an offer is waiting, the sheet says this beside "Keep settings in step".
 
@@ -1001,9 +1096,10 @@ On macOS the same command opens real windows for two checks with a main thread o
 has a scripted session worker push events on a link the application reached as it reaches a real
 worker, and a page in a real web view, allowed only what the interface's capability allows, listen
 for them through the event API as the interface does: it checks that the page receives each event in
-order, with its stream, sequence and type, and its payload as JSON or as null.
+order, with its stream, sequence and type, and its payload as JSON or as null. On Windows
+`tests/host_events.rs` runs the same check in WebView2.
 
-On Windows the same command runs `tests/windows_hello.rs`, which reads what Windows reports about
+On Windows the same command also runs `tests/windows_hello.rs`, which reads what Windows reports about
 Windows Hello and checks that the page is sent that ceremony or none. Its tests that raise Windows
 Hello's dialog are ignored: they need a signed-in desktop with Windows Hello set up, and the file
 says how to run them there. They check that the dialog prints the exact message the review gave

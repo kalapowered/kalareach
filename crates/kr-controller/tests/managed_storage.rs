@@ -62,7 +62,8 @@ use kr_protocol::ids::{
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
 use kr_protocol::privacy::{
-    PrivacyCompletion, PrivacyReport, PrivacySetParams, PrivacyStatusParams,
+    PrivacyCompletion, PrivacyExported, PrivacyReport, PrivacyRetainedDeleteParams,
+    PrivacyRetainedDeleteResult, PrivacySetParams, PrivacyStatusParams,
 };
 use kr_protocol::scalars::{AuthorisationKey, Nullable, Signature64, TimestampMs, Uuid};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
@@ -506,6 +507,12 @@ impl Rig {
 
     /// Turns privacy mode on or off, through the daemon's local socket as a person does.
     async fn set_privacy(&self, enabled: bool) -> bool {
+        set_privacy_at(&self.client_endpoint, self.host.environment_id(), enabled).await
+    }
+
+    /// Turns privacy mode on or off, as [`Self::set_privacy`] does, and returns the report the
+    /// daemon answered with.
+    async fn set_privacy_answered(&self, enabled: bool) -> PrivacyReport {
         let mut client = LocalClient::connect(&self.client_endpoint, LocalClientKind::Cli, build())
             .await
             .expect("connects");
@@ -518,7 +525,18 @@ impl Rig {
             )
             .await
             .expect("the call reaches the daemon")
-            .is_ok()
+            .expect("privacy mode changes")
+            .to_typed()
+            .expect("decodes")
+    }
+
+    /// Asks the daemon to delete the copy `privacy.status` lists under `reference`, as a person at
+    /// this machine does.
+    async fn delete_retained(
+        &self,
+        reference: &str,
+    ) -> Result<PrivacyRetainedDeleteResult, ProtocolError> {
+        delete_retained_at(&self.client_endpoint, self.host.environment_id(), reference).await
     }
 
     /// Where privacy mode stands, as `privacy.status` says.
@@ -585,6 +603,50 @@ impl Rig {
         drop(controller);
         (host, served, timer)
     }
+}
+
+/// Turns privacy mode on or off at the daemon listening at `endpoint`, as a person does.
+async fn set_privacy_at(
+    endpoint: &kr_ipc::paths::Endpoint,
+    environment: kr_protocol::ids::EnvironmentId,
+    enabled: bool,
+) -> bool {
+    let mut client = LocalClient::connect(endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    client
+        .mutate(
+            Method::PrivacySet,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(environment),
+            &PrivacySetParams { enabled },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .is_ok()
+}
+
+/// Asks the daemon at `endpoint` to delete the copy `privacy.status` lists under `reference`.
+async fn delete_retained_at(
+    endpoint: &kr_ipc::paths::Endpoint,
+    environment: kr_protocol::ids::EnvironmentId,
+    reference: &str,
+) -> Result<PrivacyRetainedDeleteResult, ProtocolError> {
+    let mut client = LocalClient::connect(endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    client
+        .mutate(
+            Method::PrivacyRetainedDelete,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(environment),
+            &PrivacyRetainedDeleteParams {
+                reference: reference.to_owned(),
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .map(|value| value.to_typed().expect("a result of the declared shape"))
 }
 
 /// Writes the configuration document that selects `origin`, or one that selects nothing.
@@ -1647,8 +1709,9 @@ async fn a_token_that_is_not_usable_never_leaves_the_host() {
     );
 }
 
-/// A privacy fence raised while a part is on its way ends the upload at the service and publishes
-/// nothing, and the daemon does not wait out a delay to do it.
+/// KR-REQ-24.28 and KR-ACC-033: a privacy fence raised while a part is on its way ends the upload
+/// at the service and publishes nothing, and the daemon does not wait out a delay to do it. The
+/// part already on the wire is awaited and not recalled: the upload is abandoned when it answers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn privacy_mode_turned_on_while_a_part_is_on_its_way_abandons_the_upload_and_publishes_nothing()
  {
@@ -2168,8 +2231,8 @@ async fn a_restarted_daemon_finds_the_publication_the_service_holds_whatever_its
     }
 }
 
-/// Privacy mode ends the work in hand and can be turned off again, whatever account token the host
-/// holds when the fence comes: a request the host cannot sign in for is not sent, and the work it
+/// KR-REQ-24.28 and KR-ACC-033: privacy mode ends the work in hand and can be turned off again,
+/// whatever account token the host holds when the fence comes: a request the host cannot sign in for is not sent, and the work it
 /// would have ended ends without it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_cleanup_privacy_mode_owes_ends_the_work_in_hand_whatever_the_token_is() {
@@ -3769,11 +3832,12 @@ async fn the_host_makes_a_backup_of_a_closed_session_and_its_configuration_once_
     );
 }
 
-/// A journal of an earlier build for a closed session: the session's own record in it, at the schema
-/// that build wrote.
+/// A journal of an earlier build for a closed session, at the schema that build wrote: with the
+/// session's own record in it, or with none where `with_the_session` is false.
 fn journal_of_an_earlier_build(
     host: &kr_ipc::testing::TempHost,
     session_id: kr_protocol::ids::SessionId,
+    with_the_session: bool,
 ) {
     use kr_protocol::ids::SessionEpoch;
     use kr_protocol::session::{
@@ -3783,29 +3847,31 @@ fn journal_of_an_earlier_build(
     let path = host.environment().journal_database(session_id);
     std::fs::create_dir_all(path.parent().expect("a directory")).expect("the directory");
     let mut journal = kr_worker::journal::Journal::open(&path).expect("the journal opens");
-    journal
-        .record_session(&SessionSummary {
-            session_id,
-            session_epoch: SessionEpoch::V1,
-            environment_id: host.environment_id(),
-            display_number: DisplayNumber::new(1),
-            state: SessionState::Live,
-            shell_mode: ShellMode::NativeCompat,
-            shell_path: "/bin/sh".to_owned(),
-            cwd: "/recovered".to_owned(),
-            worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
-            desktop: kr_protocol::identity::DesktopBinding::none(),
-            created_at_ms: TimestampMs::new(1_000),
-            dimensions: Dimensions::new(80, 24),
-            attachment_count: kr_protocol::scalars::U64::new(1),
-            application_state: Nullable::null(),
-            root_process: Nullable::null(),
-            closure: Nullable::null(),
-            environment_sources: None,
-            root: None,
-            application: None,
-        })
-        .expect("records the session");
+    if with_the_session {
+        journal
+            .record_session(&SessionSummary {
+                session_id,
+                session_epoch: SessionEpoch::V1,
+                environment_id: host.environment_id(),
+                display_number: DisplayNumber::new(1),
+                state: SessionState::Live,
+                shell_mode: ShellMode::NativeCompat,
+                shell_path: "/bin/sh".to_owned(),
+                cwd: "/recovered".to_owned(),
+                worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+                desktop: kr_protocol::identity::DesktopBinding::none(),
+                created_at_ms: TimestampMs::new(1_000),
+                dimensions: Dimensions::new(80, 24),
+                attachment_count: kr_protocol::scalars::U64::new(1),
+                application_state: Nullable::null(),
+                root_process: Nullable::null(),
+                closure: Nullable::null(),
+                environment_sources: None,
+                root: None,
+                application: None,
+            })
+            .expect("records the session");
+    }
     drop(journal);
     rusqlite::Connection::open(&path)
         .expect("opens the store")
@@ -3832,7 +3898,7 @@ async fn a_session_packed_while_its_journal_was_held_back_is_packed_again_once_i
     let mut recovery = None;
     let rig = Rig::start_with(Arrangement::NORMAL, Arc::clone(&timer), |host| {
         let session = closed_session(host, b"a session\r\n", 9_000);
-        journal_of_an_earlier_build(host, session);
+        journal_of_an_earlier_build(host, session, true);
         recovery = Some(
             kr_controller::archive::ArchiveService::new(host.environment())
                 .take_ownership(
@@ -3872,6 +3938,119 @@ async fn a_session_packed_while_its_journal_was_held_back_is_packed_again_once_i
         cwd_of(&opened_members(&rig, 2)),
         "/recovered",
         "and made again from the session's own record once nothing holds it"
+    );
+}
+
+/// KR-REQ-24.18: a session whose journal is of an earlier schema, and cannot be brought forward
+/// while another recovery holds the session, is packed with the summary the closure alone gives.
+/// When the hold lifts and the journal then holds no record of the session, the summary packed is
+/// the same one, so the generation is not made again: what is packed has not changed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_packed_while_held_back_is_not_packed_again_when_its_journal_holds_no_session() {
+    use kr_protocol::session::DisplayNumber;
+
+    let timer = HeldTimer::held();
+    let mut closed = None;
+    let mut recovery = None;
+    let rig = Rig::start_with(Arrangement::NORMAL, Arc::clone(&timer), |host| {
+        let session = closed_session(host, b"a session\r\n", 9_000);
+        journal_of_an_earlier_build(host, session, false);
+        recovery = Some(
+            kr_controller::archive::ArchiveService::new(host.environment())
+                .take_ownership(
+                    session,
+                    DisplayNumber::new(1),
+                    &kr_ipc::identity::ended_process_identity(4_000_033),
+                )
+                .expect("a recovery holds the session"),
+        );
+        closed = Some(session);
+    })
+    .await;
+    assert!(closed.is_some(), "a closed session");
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    rig.set_up();
+    rig.until("the first generation is published", |rig| rig.published(1))
+        .await;
+
+    // The hold lifts, and a day on the pass finds the journal brought forward with no record of
+    // the session in it.
+    drop(recovery);
+    timer.advance_day(Duration::from_secs(25 * 3600));
+    timer.run_by_itself();
+    let looked = *rig.controller.production_looks().borrow();
+    rig.controller.backup().signals().produce.notify_one();
+    rig.production_looked(looked + 1).await;
+    assert_eq!(
+        rig.controller.backup().generations().expect("a read").len(),
+        1,
+        "the closure-only summary packed is the one the journal gives, so nothing is made again"
+    );
+    let (_, detail) = rig.production_check().await;
+    assert!(detail.contains("nothing has changed"), "{detail}");
+}
+
+/// KR-REQ-24.18: a session whose journal is of an earlier schema and whose migration fails is packed
+/// with the summary the closure alone gives. Once the migration can be made, the generation is made
+/// again with what the session's own record says, however little else changed.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_whose_journal_failed_to_migrate_is_packed_again_once_it_migrates() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let timer = HeldTimer::held();
+    let mut closed = None;
+    let rig = Rig::start_with(Arrangement::NORMAL, Arc::clone(&timer), |host| {
+        let session = closed_session(host, b"a session\r\n", 9_000);
+        journal_of_an_earlier_build(host, session, true);
+        let path = host.environment().journal_database(session);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400))
+            .expect("the journal is made read-only");
+        assert!(
+            kr_worker::journal::Journal::open(&path).is_err(),
+            "an account that ignores file permissions cannot make this migration fail"
+        );
+        closed = Some(session);
+    })
+    .await;
+    let session = closed.expect("a closed session");
+    let journal = rig.host.environment().journal_database(session);
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    rig.set_up();
+    rig.until("the first generation is published", |rig| rig.published(1))
+        .await;
+    let cwd_of = |members: &std::collections::BTreeMap<String, Vec<u8>>| {
+        let document: serde_json::Value =
+            serde_json::from_slice(&members[&format!("sessions/{session}.json")])
+                .expect("a session export");
+        document["session"]["cwd"].clone()
+    };
+    assert!(
+        cwd_of(&opened_members(&rig, 1)).is_null(),
+        "built from the closure alone while the migration fails"
+    );
+
+    // The files beside the journal were made with its read-only mode by the looks that failed.
+    for suffix in ["", "-wal", "-shm"] {
+        let mut name = journal.as_os_str().to_owned();
+        name.push(suffix);
+        let file = std::path::PathBuf::from(name);
+        if file.exists() {
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
+                .expect("the journal can be written again");
+        }
+    }
+    timer.advance_day(Duration::from_secs(25 * 3600));
+    timer.run_by_itself();
+    rig.controller.backup().signals().produce.notify_one();
+    rig.until("the second generation is published", |rig| rig.published(2))
+        .await;
+    assert_eq!(
+        cwd_of(&opened_members(&rig, 2)),
+        "/recovered",
+        "and made again from the session's own record once the migration can be made"
     );
 }
 
@@ -3930,8 +4109,8 @@ async fn the_sessions_past_the_member_bound_are_left_out_and_the_doctor_says_so(
     );
 }
 
-/// Nothing is read or made while privacy mode is on, whatever the setup says, and a generation
-/// follows when it is off again. A setup made while it is on is allowed.
+/// KR-REQ-24.27: nothing is read or made while privacy mode is on, whatever the setup says, and a
+/// generation follows when it is off again. A setup made while it is on is allowed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn nothing_is_made_while_privacy_mode_is_on_and_a_generation_follows_when_it_is_off() {
     let timer = HeldTimer::held();
@@ -3971,6 +4150,60 @@ async fn nothing_is_made_while_privacy_mode_is_on_and_a_generation_follows_when_
     .await;
     rig.until("a generation is published", |rig| rig.published(1))
         .await;
+}
+
+/// KR-REQ-24.27 and KR-REQ-24.28: a session that closed on this host and went into a generation is
+/// settled when privacy mode is turned on. The registry records its end and no journal exists, as
+/// for a worker that was lost; the output it kept is removed, and the change reports complete. The
+/// control is the generation made before, which holds the session's output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn privacy_mode_turned_on_settles_a_closed_session_a_generation_holds() {
+    let timer = HeldTimer::held();
+    let mut closed = None;
+    let rig = Rig::start_with(Arrangement::NORMAL, Arc::clone(&timer), |host| {
+        closed = Some(closed_session(host, b"a session\r\n", 9_000));
+    })
+    .await;
+    let session = closed.expect("a closed session");
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    rig.set_up();
+    rig.until("a generation is published", |rig| rig.published(1))
+        .await;
+    assert!(
+        opened_members(&rig, 1).contains_key(&format!("sessions/{session}.json")),
+        "the control: the generation holds the session"
+    );
+    let segments = || {
+        std::fs::read_dir(rig.host.environment().session_spool(session))
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "out"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    assert!(
+        segments() > 0,
+        "the control: the session's output is on the disk"
+    );
+
+    // The answer to the change is where the person is told what is left to do, so it says the
+    // session is settled, and not that it is owed.
+    let answer = rig.set_privacy_answered(true).await;
+    assert!(
+        answer.sessions.is_empty(),
+        "the session is settled when the change is answered: {:?}",
+        answer.sessions
+    );
+    assert_eq!(segments(), 0, "the output is gone");
+    within("the change taking effect", async {
+        while !rig.privacy_complete().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
 }
 
 /// The members together never pass the total a restore accepts, the configuration among them: it
@@ -4176,7 +4409,7 @@ async fn no_generation_is_staged_while_a_finished_ones_ciphertext_is_still_on_th
         .await;
 }
 
-/// Privacy mode turned on while a pass is between two writes waits for the pass: the backup part
+/// KR-REQ-24.28: privacy mode turned on while a pass is between two writes waits for the pass: the backup part
 /// of the cleanup is reported outstanding and privacy mode is not turned off until the pass has
 /// stopped and taken away what it wrote, and the generation that follows holds nothing from the
 /// private time.
@@ -5495,6 +5728,15 @@ async fn a_replacement_under_another_account_sends_nothing_for_the_earlier_archi
     rig.until("the third generation is published", |rig| rig.published(3))
         .await;
 
+    // The new archive's first generation is the test's, sealed below. The replacement wakes the
+    // daemon's own producer, and a producer with content to pack would admit that same generation
+    // first: it has nothing it may pack, so there is no order to win.
+    rig.controller
+        .lower_producer_bounds(kr_controller::service::ProducerBounds {
+            configuration_member_bytes: 0,
+            members: 0,
+            ..kr_controller::service::ProducerBounds::PRODUCTION
+        });
     // Another account signs in and replaces the setup; its snapshots would delete the oldest.
     rig.sign_in_with("account-two", "the-second-token").await;
     let second = rig.prepared_setup(archive_two(), true);
@@ -6541,4 +6783,372 @@ async fn a_closed_sessions_history_is_backed_up_by_the_daemon_to_a_local_worker_
     eprintln!(
         "history: the daemon backed up a closed session, a kit alone restored it and recorded its generation, and the generation pushed out of two snapshots is a tombstone ({origin})"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The person deletes a copy that privacy mode lists as having left the host.
+// ---------------------------------------------------------------------------------------------
+
+/// The reference `privacy.status` lists a backup generation of the setup's archive under.
+fn reference_of(generation: u64) -> String {
+    format!("{} generation {generation}", archive_id())
+}
+
+/// The copy `privacy.status` lists for a generation of the setup's archive.
+fn listed(report: &PrivacyReport, generation: u64) -> &PrivacyExported {
+    let reference = reference_of(generation);
+    report
+        .exported
+        .iter()
+        .find(|copy| copy.reference == reference)
+        .unwrap_or_else(|| panic!("{reference} is listed: {:?}", report.exported))
+}
+
+impl Rig {
+    /// Records the owner's setup for a host whose first `made` generations the test admitted
+    /// itself, so that the producer numbers the next after them.
+    fn set_up_after(&self, made: u64) {
+        self.set_up();
+        self.controller
+            .backup()
+            .raise_generation_counter(archive_id(), BackupGeneration::new(made))
+            .expect("the count of generations is raised");
+    }
+
+    /// Whether the service holds `object` of the setup's archive.
+    fn held_at_the_service(&self, object: BackupObjectId) -> bool {
+        self.served
+            .web()
+            .stored(&archive_id().to_string(), &object.to_string())
+            .is_some()
+    }
+
+    /// The daemon's rows for the objects of one generation.
+    fn objects_of(&self, generation: u64) -> Vec<kr_controller::backup::store::ObjectRecord> {
+        self.controller
+            .backup()
+            .objects(archive_id(), BackupGeneration::new(generation))
+            .expect("the store reads")
+    }
+}
+
+/// The objects the service holds of generation 1 and of generation 2 in
+/// [`a_host_that_backed_up_twice`]: two members and the manifest, and one member and the manifest.
+fn first_objects() -> [BackupObjectId; 3] {
+    [object_id(1), object_id(2), object_id(0xf1)]
+}
+
+fn second_objects() -> [BackupObjectId; 2] {
+    [object_id(3), object_id(0xf2)]
+}
+
+/// A daemon whose generations 1 and 2 are published at the service, and whose timer is held.
+async fn a_host_that_backed_up_twice(timer: Arc<HeldTimer>) -> Rig {
+    let rig = Rig::start(Arrangement::NORMAL, timer).await;
+    rig.admit(1, &[(1, plaintext(2048)), (2, plaintext(1024))]);
+    rig.until("generation 1 is published", |rig| rig.published(1))
+        .await;
+    rig.admit_to_an_enrolled_archive(2, &[(3, plaintext(2048))]);
+    rig.until("generation 2 is published", |rig| rig.published(2))
+        .await;
+    rig
+}
+
+/// KR-REQ-24.29: privacy mode lists a published generation of the host's own archive as a copy the
+/// person can have deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn privacy_mode_lists_each_published_generation_as_one_the_person_can_have_deleted() {
+    let rig = a_host_that_backed_up_twice(HeldTimer::held()).await;
+    rig.set_up_after(2);
+    rig.fence().await;
+
+    let report = rig.privacy_report().await;
+    for generation in [1, 2] {
+        let copy = listed(&report, generation);
+        assert_eq!(copy.kind, "backup archive");
+        assert!(copy.deletable, "{copy:?}");
+    }
+}
+
+/// KR-REQ-24.29 and KR-ACC-033: under privacy mode, the person's deletion of one
+/// generation asks the service to delete every object of that generation, and no object of another
+/// generation or of another collection of the account. Privacy mode stays on and the report says
+/// what became of the copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_generation_the_person_deletes_under_privacy_mode_goes_from_the_service_and_nothing_else_does()
+ {
+    let rig = a_host_that_backed_up_twice(HeldTimer::held()).await;
+    let web = Arc::clone(rig.served.web());
+    let other = object_id(0x77);
+    web.put_object(
+        &archive_two().to_string(),
+        &other.to_string(),
+        ACCOUNT,
+        vec![7; 64],
+    );
+    rig.set_up_after(2);
+    rig.fence().await;
+    assert_eq!(web.requests_to(DELETE), 0, "the fence deletes nothing");
+
+    let answer = rig
+        .delete_retained(&reference_of(1))
+        .await
+        .expect("the deletion is asked");
+    assert!(answer.deleted, "the service confirmed every object");
+    assert!(answer.report.enabled, "privacy mode stays on");
+
+    for object in first_objects() {
+        assert!(!rig.held_at_the_service(object), "{object} is deleted");
+    }
+    for object in second_objects() {
+        assert!(rig.held_at_the_service(object), "{object} is not asked for");
+    }
+    assert!(
+        web.stored(&archive_two().to_string(), &other.to_string())
+            .is_some(),
+        "another collection of the account is untouched"
+    );
+    assert_eq!(web.requests_to(DELETE), first_objects().len());
+    assert!(
+        rig.objects_of(1)
+            .iter()
+            .all(|object| object.released_at_ms.is_some())
+    );
+
+    let deleted = listed(&answer.report, 1);
+    assert_eq!(
+        deleted.kind,
+        "backup archive, deleted and awaiting removal at the service"
+    );
+    assert!(!deleted.deletable);
+    let kept = listed(&answer.report, 2);
+    assert_eq!(kept.kind, "backup archive");
+    assert!(kept.deletable);
+}
+
+/// KR-REQ-24.29: a copy the host cannot ask the service to delete, and a reference the
+/// list does not hold, are refused by their codes and send nothing. The control is the same call
+/// once the host has its setup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deletion_the_host_cannot_make_is_refused_and_sends_nothing() {
+    let rig = a_host_that_backed_up_twice(HeldTimer::held()).await;
+    let web = Arc::clone(rig.served.web());
+    rig.fence().await;
+
+    // With no setup the generations are listed and none is offered for deletion.
+    let report = rig.privacy_report().await;
+    assert!(!listed(&report, 1).deletable);
+    assert_eq!(
+        rig.delete_retained(&reference_of(1))
+            .await
+            .expect_err("a host with no setup deletes nothing")
+            .code,
+        ErrorCode::PermissionDenied
+    );
+    for reference in [
+        "no such copy".to_owned(),
+        reference_of(3),
+        format!("{} generation 1", archive_two()),
+    ] {
+        assert_eq!(
+            rig.delete_retained(&reference)
+                .await
+                .expect_err("the list holds nothing under that reference")
+                .code,
+            ErrorCode::InvalidArgument,
+            "{reference}"
+        );
+    }
+    assert_eq!(web.requests_to(DELETE), 0);
+    for object in first_objects().into_iter().chain(second_objects()) {
+        assert!(rig.held_at_the_service(object), "{object}");
+    }
+
+    // The control: the setup is recorded and the same call deletes.
+    rig.set_up_after(2);
+    assert!(
+        rig.delete_retained(&reference_of(1))
+            .await
+            .expect("asked")
+            .deleted
+    );
+
+    // A copy that is deleted is not one to delete again, and nothing more is sent for it.
+    assert_eq!(
+        rig.delete_retained(&reference_of(1))
+            .await
+            .expect_err("a copy already deleted is not deletable")
+            .code,
+        ErrorCode::PermissionDenied
+    );
+    assert_eq!(web.requests_to(DELETE), first_objects().len());
+}
+
+/// KR-REQ-24.29: an answer the service did not give leaves the deletion asked and not
+/// confirmed; the list says so, and asking again under privacy mode sends what is still unanswered
+/// and confirms it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deletion_whose_answer_was_lost_is_shown_as_asked_and_completes_when_asked_again() {
+    let rig = a_host_that_backed_up_twice(HeldTimer::held()).await;
+    let web = Arc::clone(rig.served.web());
+    rig.set_up_after(2);
+    rig.fence().await;
+    web.fail(DELETE, 1, Moment::After);
+
+    let first = rig
+        .delete_retained(&reference_of(1))
+        .await
+        .expect("the call is answered");
+    assert!(!first.deleted, "the service has not confirmed");
+    let shown = listed(&first.report, 1);
+    assert_eq!(
+        shown.kind,
+        "backup archive, deletion asked and not yet confirmed"
+    );
+    assert!(shown.deletable, "it can be asked again");
+    assert!(
+        rig.objects_of(1)
+            .iter()
+            .all(|object| object.deletion_asked_at_ms.is_some()),
+        "every object of the generation was written down before a request left"
+    );
+    for object in second_objects() {
+        assert!(rig.held_at_the_service(object), "{object} is not asked for");
+    }
+
+    let second = rig
+        .delete_retained(&reference_of(1))
+        .await
+        .expect("asked again");
+    assert!(second.deleted);
+    assert!(
+        rig.objects_of(1)
+            .iter()
+            .all(|object| object.released_at_ms.is_some())
+    );
+    for object in second_objects() {
+        assert!(rig.held_at_the_service(object), "{object} is not asked for");
+    }
+}
+
+/// KR-REQ-24.29: a deletion asked under privacy mode and not confirmed survives a restart
+/// as its written-down request. While privacy mode stays on the restarted host sends nothing the
+/// person has not just asked for; once it is off the host sends what was asked, with no second ask.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deletion_asked_under_privacy_mode_is_sent_after_a_restart_once_privacy_mode_is_off() {
+    let rig = a_host_that_backed_up_twice(HeldTimer::held()).await;
+    let web = Arc::clone(rig.served.web());
+    rig.set_up_after(2);
+    rig.fence().await;
+    web.fail(DELETE, 1, Moment::After);
+    assert!(
+        !rig.delete_retained(&reference_of(1))
+            .await
+            .expect("the call is answered")
+            .deleted
+    );
+    let sent = web.requests_to(DELETE);
+
+    let environment = rig.host.environment_id();
+    let (host, served, timer) = rig.stop().await;
+    let (controller, endpoint, _serving) = start_daemon(&host, timer).await;
+    let runtime = controller.backup_runtime().expect("a carrier");
+    let mut passes = runtime.passes();
+
+    // Still private: the restarted host looks and sends nothing it was not just asked for.
+    runtime.wake();
+    let seen = *passes.borrow_and_update();
+    within("a pass after the restart", async {
+        while *passes.borrow_and_update() <= seen {
+            passes.changed().await.expect("the carrier is running");
+        }
+    })
+    .await;
+    assert_eq!(served.web().requests_to(DELETE), sent);
+
+    // Off: the request that was written down is sent and confirmed, and nothing else is deleted.
+    assert!(set_privacy_at(&endpoint, environment, false).await);
+    within("the request is sent and confirmed", async {
+        loop {
+            let confirmed = controller
+                .backup()
+                .objects(archive_id(), BackupGeneration::new(1))
+                .expect("the store reads")
+                .iter()
+                .all(|object| object.released_at_ms.is_some());
+            if confirmed {
+                break;
+            }
+            passes.changed().await.expect("the carrier is running");
+        }
+    })
+    .await;
+    let held = |object: BackupObjectId| {
+        served
+            .web()
+            .stored(&archive_id().to_string(), &object.to_string())
+            .is_some()
+    };
+    for object in second_objects() {
+        assert!(held(object), "{object} is not asked for");
+    }
+    for object in first_objects() {
+        assert!(!held(object), "{object} is deleted");
+    }
+}
+
+/// KR-REQ-24.29: a generation the person is deleting does not count as the backup the
+/// host has. When it is the newest, the first pass after privacy mode goes off makes a new
+/// generation although nothing changed and a day has not passed, and the service holds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_next_backup_is_made_when_the_newest_generation_was_deleted_by_the_person() {
+    let timer = HeldTimer::held();
+    let rig = Rig::start(Arrangement::NORMAL, Arc::clone(&timer)).await;
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    rig.set_up();
+    rig.until("the first generation is published", |rig| rig.published(1))
+        .await;
+    let before = opened_members(&rig, 1);
+
+    // The answer to the first request is lost, so the deletion is only partly confirmed when
+    // privacy mode goes off.
+    rig.fence().await;
+    web.fail(DELETE, 1, Moment::After);
+    assert!(
+        !rig.delete_retained(&reference_of(1))
+            .await
+            .expect("the call is answered")
+            .deleted
+    );
+    assert!(rig.set_privacy(false).await);
+
+    rig.until("a new generation is published", |rig| rig.published(2))
+        .await;
+    // Nothing the host holds changed, so the new generation holds what the deleted one held.
+    assert_eq!(
+        opened_members(&rig, 2)["host/configuration.json"],
+        before["host/configuration.json"],
+        "the new generation holds the configuration the deleted one held"
+    );
+    rig.until("the deletion is confirmed", |rig| {
+        rig.objects_of(1)
+            .iter()
+            .all(|object| object.released_at_ms.is_some())
+    })
+    .await;
+    assert!(
+        first_object_ids(&rig)
+            .iter()
+            .all(|object| !rig.held_at_the_service(*object)),
+        "the deleted generation's objects are gone from the service"
+    );
+}
+
+/// The ids of the objects of generation 1 as the daemon's store records them.
+fn first_object_ids(rig: &Rig) -> Vec<BackupObjectId> {
+    rig.objects_of(1)
+        .iter()
+        .map(|object| object.object_id)
+        .collect()
 }

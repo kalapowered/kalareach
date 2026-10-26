@@ -5,14 +5,15 @@
  * because it looked stale. A change set is an immutable captured version: this shows exactly what it
  * holds and what it left out, every version of it beside the one read, and marking one reviewed
  * records that this version was reviewed and changes nothing else. What has left the host is shown
- * as the host reports it, with whether the host has any way to ask for its removal, and nothing
- * here offers an action the host cannot perform.
+ * as the host reports it, with whether the host has any way to ask for its removal, and a copy that
+ * can be deleted is deleted only through the confirmation native code raises ([`LeftTheHost`]).
  */
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 
 import type {
   ChangesetReadResult,
+  PrivacyExported,
   PrivacyReport,
   ReviewReadResult,
   ReviewState
@@ -23,6 +24,7 @@ import { useApp } from '../app/state'
 import { failureCode, failureMessage, watch, type HostPort, type Watch } from '../host/port'
 import { ask } from '../mobile/model/call'
 import { outcomeMessage, outcomeTone } from '../model/receipts'
+import { LeftTheHost } from './LeftTheHost'
 
 /** The largest page of review state one read asks for. */
 const PAGE_REVIEWS = '200'
@@ -115,6 +117,20 @@ export function ChangeSets(): ReactNode {
   // Each listed change set's newest version, by its identifier.
   const [versions, setVersions] = useState<ReadonlyMap<string, ChangesetReadResult>>(new Map())
   const [privacy, setPrivacy] = useState<PrivacyReport | null>(null)
+  // The copies this computer's own sync kept, which are read from its own records and listed
+  // whether or not the host answers.
+  const [syncCopies, setSyncCopies] = useState<readonly PrivacyExported[]>([])
+  // Why those records could not be read: an empty list is then not an answer.
+  const [syncFailure, setSyncFailure] = useState<string | null>(null)
+  const [syncReading, setSyncReading] = useState(false)
+  // Set when the person asked to read again after a failure, so that a second failure is said and
+  // not left to look like nothing happened.
+  const retrying = useRef(false)
+  // The announcer as it is now, read when a read ends: it is no reason to read again.
+  const announce = useRef(say)
+  useEffect(() => {
+    announce.current = say
+  }, [say])
   const [failure, setFailure] = useState<string | null>(null)
   const [selected, setSelected] = useState<string | null>(null)
   // Every read, on opening, after an action and on a retry, is made under one watch with no
@@ -163,6 +179,24 @@ export function ChangeSets(): ReactNode {
       .catch(() => {
         if (!current()) return
         setPrivacy(null)
+      })
+    setSyncReading(true)
+    ask(() => port.retainedSyncCopies())
+      .then((copies) => {
+        if (!current()) return
+        retrying.current = false
+        setSyncCopies(copies)
+        setSyncFailure(null)
+        setSyncReading(false)
+      })
+      .catch((error: unknown) => {
+        if (!current()) return
+        const words = failureMessage(error)
+        if (retrying.current) announce.current(words, 'danger')
+        retrying.current = false
+        setSyncCopies([])
+        setSyncFailure(words)
+        setSyncReading(false)
       })
   }, [port])
 
@@ -329,53 +363,17 @@ export function ChangeSets(): ReactNode {
         </div>
       )}
 
-      {privacy ? (
-        <section className="stack" data-testid="retained-artefacts">
-          <header className="page-heading">
-            <div>
-              <p className="eyebrow">Privacy</p>
-              <h2>What has left this host</h2>
-              <p>
-                {privacy.enabled
-                  ? `Privacy mode is on, at generation ${privacy.generation}. Nothing new is retained. These were sent or shown before then, and they are still out there.`
-                  : 'Privacy mode is off. New sessions retain their history.'}
-              </p>
-            </div>
-          </header>
-          <Card>
-            <div className="card-body">
-              {privacy.exported.length === 0 ? (
-                <p className="muted small">Nothing this host knows of has left it.</p>
-              ) : null}
-              {privacy.exported.map((copy) => (
-                <div className="divided-row" key={`${copy.kind}\n${copy.reference}`}>
-                  <div className="spacer">
-                    <strong>{copy.kind}</strong>
-                    <p className="muted small">
-                      {copy.reference} · left {new Date(Number(copy.left_at_ms)).toLocaleString()}
-                    </p>
-                    <p className="small" data-testid="removal">
-                      {copy.deletable
-                        ? 'This host can ask for its removal. This page does not offer it.'
-                        : 'This host has no way to ask for its removal. Whoever holds the copy can remove it.'}
-                    </p>
-                  </div>
-                </div>
-              ))}
-              {privacy.unlisted.map((missing) => (
-                <p className="small warning-text" data-testid="unlisted" key={missing.subsystem}>
-                  Not everything could be listed. {missing.subsystem}: {missing.reason}.
-                </p>
-              ))}
-              <p className="small faint">
-                A copy somebody else holds cannot be recalled from here, and a device that was let
-                see a session may keep what it was shown after it is revoked. Local deletion is a
-                logical cleanup rather than a secure erase.
-              </p>
-            </div>
-          </Card>
-        </section>
-      ) : null}
+      <LeftTheHost
+        privacy={privacy}
+        syncCopies={syncCopies}
+        syncFailure={syncFailure}
+        syncReading={syncReading}
+        reload={load}
+        retry={() => {
+          retrying.current = true
+          load()
+        }}
+      />
     </>
   )
 }

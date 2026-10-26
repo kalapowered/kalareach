@@ -318,22 +318,33 @@ impl BrokerState {
             .get(&application_instance_id)
             .and_then(|instance| instance.thread_id.clone());
         let mut refusal = None;
-        if current.as_ref() != Some(&thread)
-            && let Err(error) =
-                self.advance_binding(application_instance_id, Some(thread.clone()), now)
-        {
-            // Another live execution owns the conversation the terminal selected. It is never
-            // published as this instance's binding: the binding becomes none, and the instance
-            // says why it waits.
-            let _ = self.advance_binding(application_instance_id, None, now);
-            refusal = Some(format!(
-                "the conversation the terminal selected cannot be bound here: {error}"
-            ));
+        let mut moved = false;
+        if current.as_ref() != Some(&thread) {
+            match self.advance_binding(application_instance_id, Some(thread.clone()), now) {
+                Ok(_) => moved = true,
+                Err(error) => {
+                    // Another live execution owns the conversation the terminal selected. It is
+                    // never published as this instance's binding: the binding becomes none, and
+                    // the instance says why it waits.
+                    let _ = self.advance_binding(application_instance_id, None, now);
+                    refusal = Some(format!(
+                        "the conversation the terminal selected cannot be bound here: {error}"
+                    ));
+                    if let Some(instance) = self.instances.get_mut(&application_instance_id)
+                        && let Some(left) = current.as_ref()
+                    {
+                        instance.note("thread.ended", left.as_str(), now);
+                    }
+                }
+            }
         }
         let selected = refusal.is_none();
         let Some(instance) = self.instances.get_mut(&application_instance_id) else {
             return;
         };
+        if moved {
+            instance.note("thread.started", thread.as_str(), now);
+        }
         instance.stream.adopted = instance.stream.adopted.max(seq);
         // An unlisted frame's suspension lifts when a conversation was named after it by a reply
         // that came when no unlisted request before it was still unanswered or lost.
@@ -371,6 +382,7 @@ impl BrokerState {
                 let Some(instance) = self.instances.get_mut(&application_instance_id) else {
                     return;
                 };
+                instance.note("thread.ended", &left, now);
                 // The conversation is left, and an unknown request before it is not made known by
                 // that: only a selection that is answered ends a hold.
                 instance.stream.adopted = instance.stream.adopted.max(seq);
@@ -744,10 +756,14 @@ impl Broker {
                 continue;
             };
             if started {
+                let text = turn.to_string();
                 instance.turn_id = Some(turn);
+                instance.note("turn.started", &text, now);
                 state.component_changes.notify_one();
                 state.application_changed();
             } else if instance.turn_id.as_ref() == Some(&turn) {
+                // Recorded while the turn is still the one running, so the entry names it.
+                instance.note("turn.ended", turn.as_str(), now);
                 instance.turn_id = None;
                 state.component_changes.notify_one();
                 state.application_changed();
@@ -757,7 +773,7 @@ impl Broker {
             && let Some(thread) = named(&body, path)
         {
             if bound.as_deref() == Some(thread.as_str()) {
-                state.adopt_thread_left(application_instance_id, now);
+                state.adopt_thread_left(application_instance_id, &thread, now);
             }
             mentioned.push(thread);
         }
@@ -849,6 +865,7 @@ impl BrokerState {
     fn adopt_thread_left(
         &mut self,
         application_instance_id: ApplicationInstanceId,
+        left: &str,
         now: TimestampMs,
     ) {
         if self
@@ -857,6 +874,7 @@ impl BrokerState {
             && let Some(instance) = self.instances.get_mut(&application_instance_id)
         {
             instance.thread_unread = Some(THREAD_NOT_READ);
+            instance.note("thread.ended", left, now);
         }
         self.renew_gateway_evidence(application_instance_id, now);
     }

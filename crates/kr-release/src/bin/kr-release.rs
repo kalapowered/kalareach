@@ -3,6 +3,7 @@
 //! ```text
 //! kr-release manifest --tree T --checkout C --release R --sequence N --commit SHA --target TRIPLE --floor macos=14.0
 //! kr-release record   --tree T --checkout C --target TRIPLE [--plugins DIR] [--web DIR]
+//! kr-release terminal --tree T --checkout C
 //! kr-release check    --tree T --checkout C [--plugins DIR] [--web DIR]
 //! kr-release sign     --tree T --checkout C --key KEY... [--plugins DIR] [--web DIR]
 //! kr-release verify   --tree T --root ROOT
@@ -71,6 +72,13 @@ enum Command {
         /// Lets a class of the record stay pending, which a release does not.
         #[arg(long)]
         development: bool,
+    },
+    /// Writes the terminal's capability manifest and terminfo database into a tree.
+    Terminal {
+        #[arg(long)]
+        tree: PathBuf,
+        #[arg(long)]
+        checkout: PathBuf,
     },
     /// Refuses a tree whose `release.json` is not what the tree now makes.
     Check {
@@ -182,6 +190,7 @@ fn run(command: Command) -> Result<()> {
             &tree,
             &record::build(&checkout, &target, &elsewhere.at_hand(), development)?,
         ),
+        Command::Terminal { tree, checkout } => kr_release::terminal::write(&tree, &checkout),
         Command::Check {
             tree,
             checkout,

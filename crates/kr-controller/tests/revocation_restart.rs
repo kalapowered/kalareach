@@ -416,14 +416,29 @@ struct Owing {
     owed: usize,
 }
 
+/// How long the whole arrangement of [`Owing`] may take, every attempt's start, its request and its
+/// shutdown included. It ends an arrangement that is stuck and decides nothing.
+const ARRANGEMENT_LIMIT: Duration = Duration::from_secs(180);
+
 /// Arranges [`Owing`]. A worker that is busy for a moment refuses the announcement, and the answer
 /// is then pending (section 9): nothing has been fenced, so nothing is owing, and a later
 /// announcement does not change the answer the daemon kept of the mutation. When it is pending the
-/// arrangement is made again on a new daemon, until an answer holds. One deadline bounds the
-/// attempts, and a failure says what each attempt answered.
+/// arrangement is made again on a new daemon and a new worker, after the daemon and the worker of
+/// the attempt have been stopped, until an answer holds. One limit bounds the attempts, and a
+/// failure says what each attempt answered.
 async fn a_revocation_that_left_names_owing() -> Owing {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    let mut attempts = Vec::new();
+    let attempts = std::sync::Mutex::new(Vec::new());
+    tokio::time::timeout(ARRANGEMENT_LIMIT, arrange_until_an_answer_holds(&attempts))
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "no answer to a revocation held within {ARRANGEMENT_LIMIT:?}: {:#?}",
+                attempts.lock().expect("the attempts are listed")
+            )
+        })
+}
+
+async fn arrange_until_an_answer_holds(attempts: &std::sync::Mutex<Vec<String>>) -> Owing {
     loop {
         let started = tokio::time::Instant::now();
         let Adopted {
@@ -461,14 +476,13 @@ async fn a_revocation_that_left_names_owing() -> Owing {
             )
             .await
             .expect("the revocation is composed");
-        let first: kr_protocol::sharing::RevocationResult =
-            tokio::time::timeout(Duration::from_secs(60), client.repeat(&mutation))
-                .await
-                .expect("the revocation is answered")
-                .expect("the daemon answers")
-                .expect("the revocation is done")
-                .to_typed()
-                .expect("a revocation result");
+        let first: kr_protocol::sharing::RevocationResult = client
+            .repeat(&mutation)
+            .await
+            .expect("the daemon answers")
+            .expect("the revocation is done")
+            .to_typed()
+            .expect("a revocation result");
         let given = first
             .barrier
             .workers
@@ -489,20 +503,21 @@ async fn a_revocation_that_left_names_owing() -> Owing {
                 owed,
             };
         }
-        attempts.push(format!(
-            "{:?} after {:?}: {}",
-            given.state,
-            started.elapsed(),
-            given.detail
-        ));
+        attempts
+            .lock()
+            .expect("the attempts are listed")
+            .push(format!(
+                "{:?} after {:?}: {}",
+                given.state,
+                started.elapsed(),
+                given.detail
+            ));
         drop(client);
+        // The workers first, while the tree they serve is there to be written to.
+        for worker in workers {
+            worker.stop().await;
+        }
         host.stop().await;
-        drop(workers);
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "no answer to a revocation held within a minute of {} attempts: {attempts:#?}",
-            attempts.len()
-        );
     }
 }
 
@@ -567,11 +582,9 @@ async fn a_restarted_daemon_collects_the_names_a_revocation_left_owing() {
 /// acknowledged and no older one.
 ///
 /// A worker that is inside a dispatch transition when it is asked answers that it is, and the
-/// daemon asks no further: the walk it makes at a start is eight exchanges at most, none asked
-/// again. The daemon's other links to the worker present their generation as the start goes on,
-/// and that is such a moment, so a walk the worker cut by saying so is not the one the claim is
-/// about. The worker counts the announcements it refused for it; a walk that fell short while that
-/// count grew is made again by a new daemon.
+/// daemon asks it again a few times: the daemon's other links to the worker present their
+/// generation as the start goes on, and that is such a moment. The walk the daemon makes at a start
+/// is eight answered exchanges at most for a worker, and the retries of a refusal for now.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_restarted_daemon_asks_a_worker_about_the_newest_eight_revocations_only() {
     let Adopted {
@@ -579,51 +592,109 @@ async fn a_restarted_daemon_asks_a_worker_about_the_newest_eight_revocations_onl
         owner: _,
         workers,
     } = Adopted::start(1).await;
+    let newest_eight = revoke_ten_times(&host).await;
+
+    let stopped = host.shut_down().await;
+    let settings = stopped.settings().clone();
+    let host = stopped.start(settings).await;
+    host.controller()
+        .what_workers_hold_is_read_back_for_tests()
+        .await;
+    let asked = revisions_asked_about(&host);
+    assert_eq!(
+        asked, newest_eight,
+        "the worker is asked about the newest eight revisions it acknowledged and no older one"
+    );
+    host.stop().await;
+    drop(workers);
+}
+
+/// KR-REQ-10.45, 09.13: a worker that refuses the walk's ask for the moment, with its dispatch
+/// boundary held, is asked again, and the walk goes on to the newest eight revisions and no older
+/// one. The case takes the worker's boundary when the walk's first ask has been answered, so that
+/// the ask after it is refused, and lets it go once the worker has refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_restarted_daemons_walk_asks_a_worker_again_that_refused_it_for_the_moment() {
+    let Adopted {
+        host,
+        owner: _,
+        workers,
+    } = Adopted::start(1).await;
+    let newest_eight = revoke_ten_times(&host).await;
+    let stopped = host.shut_down().await;
+
+    let service = std::sync::Arc::clone(&workers[0].service);
+    let arrived = service.announcement_inside_boundary();
+    let refused = service.refusals_for_the_boundary();
+    // The holder takes the boundary when the walk's first ask holds it, and lets it go itself as
+    // soon as the worker has refused an ask, so that the retries that follow meet it free.
+    let runtime = tokio::runtime::Handle::current();
+    let holder = std::thread::spawn({
+        let service = std::sync::Arc::clone(&service);
+        move || {
+            arrived
+                .recv_timeout(Duration::from_secs(60))
+                .expect("an announcement holds the worker's boundary");
+            // Waits for that announcement to let the boundary go, and holds it from then on.
+            let boundary = service.hold_the_dispatch_boundary();
+            runtime.block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(60),
+                    service.refused_for_the_boundary_beyond(refused),
+                )
+                .await
+                .expect("the worker refused an ask of the walk while its boundary was held");
+            });
+            drop(boundary);
+        }
+    });
+    let settings = stopped.settings().clone();
+    let host = stopped.start(settings).await;
+    host.controller()
+        .what_workers_hold_is_read_back_for_tests()
+        .await;
+    holder.join().expect("the holder ends");
+    assert_eq!(
+        revisions_asked_about(&host),
+        newest_eight,
+        "the walk went on past the refusal to the newest eight revisions and no older one"
+    );
+    let first_pages = host
+        .controller()
+        .announcements_sent_for_tests()
+        .iter()
+        .filter(|sent| sent.evidence_from == 0)
+        .count();
+    assert!(
+        first_pages > newest_eight.len(),
+        "the refused ask was made again: {first_pages} first pages for {} revisions",
+        newest_eight.len()
+    );
+    host.stop().await;
+    drop(workers);
+}
+
+/// Revokes this host's authority ten times, each held by the worker before the next, and returns the
+/// newest eight revisions the registry holds the worker as having acknowledged.
+async fn revoke_ten_times(host: &Host) -> std::collections::BTreeSet<u64> {
     for _ in 0..10 {
         host.controller()
             .revoke_authority()
             .await
             .expect("the revocation is recorded");
-        until_the_revision_holds(&host).await;
+        until_the_revision_holds(host).await;
     }
-    let held = acknowledged_in_the_registry(&host);
+    let held = acknowledged_in_the_registry(host);
     assert!(held > 8, "more revocations than a worker keeps names for");
-    let newest_eight: std::collections::BTreeSet<u64> = (held - 7..=held).collect();
+    (held - 7..=held).collect()
+}
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    let mut stopped = host.shut_down().await;
-    let (host, asked) = loop {
-        let refused = workers[0].service.refusals_for_the_boundary();
-        let settings = stopped.settings().clone();
-        let host = stopped.start(settings).await;
-        host.controller()
-            .what_workers_hold_is_read_back_for_tests()
-            .await;
-        let asked: std::collections::BTreeSet<u64> = host
-            .controller()
-            .announcements_sent_for_tests()
-            .iter()
-            .filter(|sent| sent.evidence_from == 0)
-            .map(|sent| sent.revision)
-            .collect();
-        let cut = workers[0].service.refusals_for_the_boundary() > refused;
-        if asked == newest_eight || !cut {
-            break (host, asked);
-        }
-        assert!(
-            asked.is_subset(&newest_eight),
-            "the worker is asked about no revision older than the newest eight: {asked:?}"
-        );
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "no restarted daemon's walk went uncut by the worker: {asked:?}"
-        );
-        stopped = host.shut_down().await;
-    };
-    assert_eq!(
-        asked, newest_eight,
-        "the worker is asked about the newest eight revisions it acknowledged"
-    );
-    host.stop().await;
-    drop(workers);
+/// The revisions the daemon asked the worker for the first page of.
+fn revisions_asked_about(host: &Host) -> std::collections::BTreeSet<u64> {
+    host.controller()
+        .announcements_sent_for_tests()
+        .iter()
+        .filter(|sent| sent.evidence_from == 0)
+        .map(|sent| sent.revision)
+        .collect()
 }

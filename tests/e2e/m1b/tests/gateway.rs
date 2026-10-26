@@ -41,8 +41,8 @@ use kr_plugin_sdk::text::Label;
 use kr_protocol::agent::{
     AgentApprovalRespondParams, AgentApprovalRespondResult, AgentBindingState,
     AgentCapabilitiesParams, AgentCapabilitiesResult, AgentMutationResult, AgentMutationTarget,
-    AgentPromptParams, AgentSteerParams, AgentSubject, PluginActionInvokeParams,
-    PluginActionInvokeResult, PromptText,
+    AgentPromptParams, AgentSnapshotParams, AgentSnapshotResult, AgentSteerParams, AgentSubject,
+    PluginActionInvokeParams, PluginActionInvokeResult, PromptText,
 };
 use kr_protocol::broker::{ActionName, InstanceCapabilityState, IntegrationMode};
 use kr_protocol::envelope::ActionTarget;
@@ -451,6 +451,24 @@ impl Context {
         read.binding
     }
 
+    /// Reads the history the host keeps of an instance, from its first entry.
+    fn history(
+        &self,
+        remote: &Remote,
+        session_id: SessionId,
+        instance: ApplicationInstanceId,
+    ) -> AgentSnapshotResult {
+        self.runtime
+            .block_on(remote.read(
+                Method::AgentSnapshot,
+                &AgentSnapshotParams {
+                    subject: subject(session_id, instance),
+                    from_node: Nullable::null(),
+                },
+            ))
+            .unwrap_or_else(|why| panic!("agent.snapshot: {why}"))
+    }
+
     /// Reads the binding until `holds` is true of it, within the liveness bound.
     fn binding_until(
         &self,
@@ -680,19 +698,27 @@ struct Person {
 impl Person {
     /// Enters a managed shell with `kr new` on a terminal of its own, and waits for its prompt.
     fn enters(ctx: &Context, host: &Host<'_>) -> Self {
+        Self::enters_among(ctx, host, &[])
+    }
+
+    /// Enters a managed shell beside the sessions `others` that the host already has: the same
+    /// person, the same startup file, another terminal and another session.
+    fn enters_among(ctx: &Context, host: &Host<'_>, others: &[SessionId]) -> Self {
         let home = ctx.run.home();
-        std::fs::write(home.join(".zshrc"), ZSHRC).expect("writes the startup file");
         let variables = ctx.variables(host);
-        let mut install = host.command(&["shell", "install", "--json"]);
-        install.env_clear().envs(variables.iter().cloned());
-        let installed = kr_e2e_m1b::run::output_within(install, LIVENESS)
-            .unwrap_or_else(|why| panic!("kr shell install: {why}"));
-        assert!(
-            installed.status.success(),
-            "kr shell install: {}{}",
-            String::from_utf8_lossy(&installed.stdout),
-            String::from_utf8_lossy(&installed.stderr)
-        );
+        if others.is_empty() {
+            std::fs::write(home.join(".zshrc"), ZSHRC).expect("writes the startup file");
+            let mut install = host.command(&["shell", "install", "--json"]);
+            install.env_clear().envs(variables.iter().cloned());
+            let installed = kr_e2e_m1b::run::output_within(install, LIVENESS)
+                .unwrap_or_else(|why| panic!("kr shell install: {why}"));
+            assert!(
+                installed.status.success(),
+                "kr shell install: {}{}",
+                String::from_utf8_lossy(&installed.stdout),
+                String::from_utf8_lossy(&installed.stderr)
+            );
+        }
         let window = Window::open(
             &ctx.run,
             "kr new",
@@ -716,8 +742,16 @@ impl Person {
         answered(&window, window.answer_capability_queries(0));
         let _ =
             window.wait_for_screen(PROMPT.trim_end(), "the managed shell reads at the terminal");
-        let sessions = host.live_sessions();
-        assert_eq!(sessions.len(), 1, "one live session: {sessions:?}");
+        let sessions: Vec<_> = host
+            .live_sessions()
+            .into_iter()
+            .filter(|session| {
+                !others
+                    .iter()
+                    .any(|known| session["session_id"].as_str() == Some(&known.to_string()))
+            })
+            .collect();
+        assert_eq!(sessions.len(), 1, "one new live session: {sessions:?}");
         let session_id: SessionId = sessions[0]["session_id"]
             .as_str()
             .expect("a session identifier")
@@ -745,12 +779,17 @@ impl Person {
     ///
     /// A row of the screen is what a person would read, whichever bytes painted it, so a row left
     /// by an earlier line is told from one the next line made only when the earlier ones are gone.
+    /// What an earlier line leaves is what the stand-in as a program says, as a terminal and as
+    /// typed, and what the launcher says: the clear has happened when none of them is on the
+    /// screen, and not before the shell has acted on the key.
     fn clears_the_screen(&self) {
         self.window.type_text(b"\x0c");
         let started = Instant::now();
         loop {
             let rows = self.window.screen();
-            if !rows.iter().any(|row| row.contains(RAN_AS_TYPED)) {
+            if !rows.iter().any(|row| {
+                row.contains(RAN_AS_TYPED) || row.contains("TUI:") || row.contains("kr-hook:")
+            }) {
                 return;
             }
             assert!(
@@ -806,6 +845,51 @@ impl Person {
                 started.elapsed()
             );
             std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Types `line`, which runs through the integration, and waits until the launcher says the
+    /// backend refused the launch and ran the program as typed.
+    ///
+    /// The launcher says that when the worker closed the connection without admitting it, and
+    /// for no other cause than a refusal the worker made: a worker that answered late, or a
+    /// launcher out of time, is told apart by what it prints. A line the shell ran as typed before
+    /// the worker answered (its bound for the answer is one second) says nothing of the launch and
+    /// is typed again, as [`Person::types_until_it_shows`] does. A line a gateway serves fails the
+    /// case at once, where waiting for the refusal would only time out. What the worker refused
+    /// it for is the caller's to establish: the claim, in a session whose worker has served.
+    fn types_until_the_launch_is_refused(&self, line: &str, why: &str) -> Vec<String> {
+        const REFUSED: &str = "did not admit this launch (the backend refused it)";
+        let started = Instant::now();
+        loop {
+            self.clears_the_screen();
+            self.types(line);
+            loop {
+                let rows = self.window.screen();
+                if rows.iter().any(|row| row.contains(REFUSED)) {
+                    return rows;
+                }
+                assert!(
+                    !rows.iter().any(|row| row.contains("TUI:")),
+                    "{why}: the line was served a gateway, and the screen is:\n{}",
+                    rows.join("\n")
+                );
+                if rows.iter().any(|row| row.contains(RAN_AS_TYPED)) {
+                    break;
+                }
+                assert!(
+                    started.elapsed() < LIVENESS,
+                    "{why}: waited {:?} for the launcher's refusal, and the screen is:\n{}",
+                    started.elapsed(),
+                    rows.join("\n")
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert!(
+                started.elapsed() < LIVENESS,
+                "{why}: the line ran as typed each time it was typed in {:?}",
+                started.elapsed()
+            );
         }
     }
 
@@ -1113,6 +1197,183 @@ fn kr_req_12_07_a_codex_typed_in_a_managed_root_shell_is_served_by_a_gateway_and
     let _ = ctx.instances_until(&remote, person.session_id, "the adopted one ends", |read| {
         read.agent_instances.instances.is_empty()
     });
+    ctx.close(&host);
+}
+
+/// Waits until the claim on the conversation known as `word` is free on this host, which is when
+/// the process that ran against it is gone and its retirement has ended what it started. The claim
+/// is taken and let go of, as a worker's launch takes it; its directory, file name and lock are what
+/// workers of different builds agree on.
+fn wait_until_the_claim_is_free(host: &Host<'_>, word: &str) {
+    use kr_worker::broker::host_claims::ClaimRefusal;
+
+    let claims = kr_worker::broker::host_claims::HostClaims::new(host.roots());
+    let started = Instant::now();
+    loop {
+        match claims.take(word) {
+            Ok(_) => return,
+            Err(ClaimRefusal::Held) => {}
+            Err(ClaimRefusal::Unavailable(why)) => {
+                panic!("the claim on {word} cannot be asked about: {why}")
+            }
+        }
+        assert!(
+            started.elapsed() < LIVENESS,
+            "the claim on {word} was not let go of"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The server a launch started that is not one of `known`, once it runs.
+fn server_besides(
+    ctx: &Context,
+    what: &str,
+    known: &[&ProcessStartIdentity],
+) -> ProcessStartIdentity {
+    let started = Instant::now();
+    loop {
+        if let Some(identity) = kr_e2e_m1b::run::processes_under(ctx.run.root())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(pid, _)| ctx.run.record_named(pid, what, &["app-server"]))
+            .find(|identity| !known.contains(&identity))
+        {
+            return identity;
+        }
+        assert!(started.elapsed() < LIVENESS, "{what} is not running");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// KR-REQ-12.05 and KR-REQ-02.10: two sessions of one person on one host do not run against one
+/// saved conversation. The first session resumes a conversation behind a gateway. The second
+/// session, which has served another conversation of its own, asks for the first session's, and
+/// the launcher says the backend refused it, before anything is started: the program runs as
+/// typed, there is still the one server and the one gateway socket, and the first session's
+/// instance is still the gateway's. When the first session's program has ended, and its server
+/// with it, the claim is let go of and the second session's line is served.
+///
+/// The second session serves a conversation first so that the refusal is the claim's: its worker
+/// has answered a launch, so it has read the executable, and a refusal that came from a worker
+/// still reading it, or a launcher out of time, is not taken for one. The host is the real daemon
+/// with two real workers, the shell is the managed zsh, the application is the Codex stand-in, and
+/// the person is `kr` on two terminals. Not claimed: Windows, where no gateway runs.
+#[test]
+fn kr_req_12_05_a_second_session_is_not_served_a_conversation_the_first_runs_against() {
+    let Some(ctx) = Context::start("gateway-claim") else {
+        return;
+    };
+    let host = ctx.host();
+    let (_device, _paired, remote) = ctx.pair(&host);
+    let first = Person::enters(&ctx, &host);
+    first.exports(&ctx, "stay");
+    first.types("export KR_STAND_IN_SAVED=thread-9,thread-10");
+    let _ = first.types_until_it_shows(
+        "codex resume thread-9",
+        "TUI: turn/completed",
+        "the first session's line is served",
+    );
+    let held = first_instance(&ctx, &remote, first.session_id);
+    assert_eq!(held.mode, IntegrationMode::Gateway);
+    let server = process_running(&ctx.run, "the first session's server", &["app-server"]);
+    let sockets = gateway_sockets(host.roots().runtime_root());
+    assert_eq!(sockets.len(), 1, "one gateway socket is bound: {sockets:?}");
+
+    // The second session is served another conversation beside it, and ends that.
+    let second = Person::enters_among(&ctx, &host, &[first.session_id]);
+    second.exports(&ctx, "stay");
+    second.types("export KR_STAND_IN_SAVED=thread-9,thread-10");
+    let _ = second.types_until_it_shows(
+        "codex resume thread-10",
+        "TUI: turn/completed",
+        "the second session is served another conversation",
+    );
+    let other = server_besides(&ctx, "the second session's server", &[&server]);
+    second.window.type_text(b"\x03");
+    assert!(ended_within(&other, LIVENESS), "the second server ends");
+    wait_until_the_claim_is_free(&host, "thread-10");
+
+    // It asks for the first session's conversation, and the launcher says the backend refused it.
+    // Nothing was started for it, and the conversation is held by a worker at that moment.
+    let _ = second.types_until_the_launch_is_refused(
+        "codex resume thread-9",
+        "the second session's line for the first session's conversation",
+    );
+    assert!(
+        matches!(
+            kr_worker::broker::host_claims::HostClaims::new(host.roots()).take("thread-9"),
+            Err(kr_worker::broker::host_claims::ClaimRefusal::Held)
+        ),
+        "the first session's worker holds the claim on the conversation that was refused"
+    );
+    assert_eq!(
+        gateway_sockets(host.roots().runtime_root()),
+        sockets,
+        "no second gateway socket"
+    );
+    let servers: Vec<_> = kr_e2e_m1b::run::processes_under(ctx.run.root())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, command)| command.contains("app-server"))
+        .collect();
+    assert_eq!(servers.len(), 1, "one server runs: {servers:?}");
+    assert!(
+        kr_e2e_m1b::run::running(&server),
+        "and it is the first session's"
+    );
+    let still = first_instance(&ctx, &remote, first.session_id);
+    assert!(
+        still.mode == IntegrationMode::Gateway && still.ended_at.0.is_none(),
+        "the first session's instance is untouched: {still:?}"
+    );
+
+    // Control: the second session's worker serves another conversation right after the refusal, so
+    // the refusal was of this conversation and not of a worker that could not serve.
+    let _ = second.types_until_it_shows(
+        "codex resume thread-10",
+        "TUI: turn/completed",
+        "the second session is served another conversation after the refusal",
+    );
+    let again = server_besides(
+        &ctx,
+        "the second session's second server",
+        &[&server, &other],
+    );
+    second.window.type_text(b"\x03");
+    assert!(ended_within(&again, LIVENESS), "the second server ends");
+    wait_until_the_claim_is_free(&host, "thread-10");
+
+    // The first session's program ends and its server with it: the conversation is free once the
+    // retirement has ended what the server started.
+    first.window.type_text(b"\x03");
+    assert!(ended_within(&server, LIVENESS), "the first server ends");
+    let _ = ctx.instances_until(
+        &remote,
+        first.session_id,
+        "the first instance ends",
+        |read| read.agent_instances.instances.is_empty(),
+    );
+    wait_until_the_claim_is_free(&host, "thread-9");
+    let _ = second.types_until_it_shows(
+        "codex resume thread-9",
+        "TUI: turn/completed",
+        "the second session's line is served once the first session's execution has ended",
+    );
+    let served = server_besides(
+        &ctx,
+        "the second session's server",
+        &[&server, &other, &again],
+    );
+    assert!(
+        kr_e2e_m1b::run::running(&served),
+        "behind a gateway of its own"
+    );
+    assert_eq!(
+        gateway_sockets(host.roots().runtime_root()).len(),
+        1,
+        "which is the one gateway socket"
+    );
     ctx.close(&host);
 }
 
@@ -1736,6 +1997,66 @@ fn kr_req_11_33_a_device_answers_an_approval_the_terminal_holds_and_the_late_ter
     assert_eq!(
         done.agent_resources.resources[0].resource_id,
         pending.resource_id
+    );
+    ctx.close(&host);
+}
+
+/// KR-REQ-12.04: a paired device reads, as history of the instance, the conversation and the turn
+/// the server's stream named, each entry under the binding revision and the turn it was seen
+/// under.
+///
+/// Not claimed: Windows, where no gateway runs.
+#[test]
+fn kr_req_12_04_a_device_reads_the_conversation_and_the_turn_the_stream_named_as_history() {
+    let Some(ctx) = Context::start_released("gateway-history") else {
+        return;
+    };
+    let host = ctx.host();
+    let (_device, _paired, remote) = ctx.pair(&host);
+    let person = Person::enters(&ctx, &host);
+    person.exports(
+        &ctx,
+        "answer-when-released,keep-reading,ping-when-released,stay",
+    );
+    let _ = person.types_until_it_shows(
+        "codex",
+        ASKED,
+        "the terminal reaches the server through the gateway",
+    );
+    let instance = first_instance(&ctx, &remote, person.session_id).application_instance_id;
+    let binding = ctx.binding_until(
+        &remote,
+        person.session_id,
+        instance,
+        "the stream names the thread and the turn",
+        |binding| names(binding, "thread-1", Some("turn-1")),
+    );
+    let read = ctx.history(&remote, person.session_id, instance);
+    let entries: Vec<_> = read
+        .entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.kind.as_str(),
+                entry.text.as_str(),
+                entry.binding_revision,
+                entry.turn_id.0.as_ref().map(ToString::to_string),
+            )
+        })
+        .collect();
+    assert!(
+        entries.contains(&("thread.started", "thread-1", binding.binding_revision, None)),
+        "the conversation the stream named is history under the revision it was named at: \
+         {entries:?}"
+    );
+    assert!(
+        entries.contains(&(
+            "turn.started",
+            "turn-1",
+            binding.binding_revision,
+            Some("turn-1".to_owned())
+        )),
+        "the turn it started is history under that turn: {entries:?}"
     );
     ctx.close(&host);
 }

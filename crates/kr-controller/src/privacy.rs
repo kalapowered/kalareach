@@ -28,8 +28,9 @@
 //! * **Sessions apply the generation themselves.** Each live session's worker is told the
 //!   generation and answers with its own completion; a session's obligation ends only when its
 //!   worker says its cleanup is complete. A session whose worker has ended keeps its obligation,
-//!   reported as unavailable, because what it retained is the archive's and nothing here removes
-//!   it.
+//!   reported as unavailable, until the archive has removed what it retained
+//!   ([`crate::archive::ArchiveService::remove_retained_content`]); a removal that leaves
+//!   something is owed with its reason and tried again.
 //! * **A launch is recorded before its worker runs.** A session created while privacy mode is on
 //!   owes its cleanup from the moment its worker is asked for
 //!   ([`EnvironmentPrivacy::note_session_launching`]), and its worker is told the state in its
@@ -211,6 +212,13 @@ impl PrivacyState {
             generation: U64::new(observed.published.generation.get()),
             changing: observed.changing > 0,
         }
+    }
+
+    /// Answers whether a change of state could be made now, for this crate's own tests of what a
+    /// decision holds the state for.
+    #[cfg(test)]
+    pub(crate) fn changeable_now(&self) -> bool {
+        self.published.try_write().is_ok()
     }
 
     /// Returns the state as it stands now.
@@ -450,6 +458,17 @@ struct SessionProgress {
     reach: Reach,
     answer: Option<Answer>,
     notices: Backoff,
+    /// How the archive's removal of what an ended worker retained stands.
+    removal: Removal,
+}
+
+/// How the archive's removal of an ended worker's content stands.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Removal {
+    /// Why the last try left content behind, when it did.
+    failure: Option<String>,
+    /// When the next try is due.
+    retry: Backoff,
 }
 
 /// Whether a session's worker can be told anything.
@@ -520,7 +539,7 @@ pub enum Standing {
         reason: String,
     },
     /// Its worker ended before it said its cleanup was complete. What it retained is the
-    /// archive's, and the obligation stays until something gives evidence that it is gone.
+    /// archive's, and the obligation stays until the archive has removed it.
     WorkerEnded,
 }
 
@@ -833,6 +852,9 @@ impl EnvironmentPrivacy {
         }
         for progress in inner.sessions.values_mut() {
             progress.notices = Backoff::default();
+            // An enabling starts the removal of what an ended worker retained afresh: the last
+            // refusal, which an earlier enabling left, does not put this one off.
+            progress.removal.retry = Backoff::default();
         }
         self.apply(&mut inner, &Subsystem::ALL, now_ms);
         Ok(self.report(&inner, now_ms))
@@ -1091,6 +1113,68 @@ impl EnvironmentPrivacy {
         } else {
             inner.sessions.remove(&session_id);
         }
+    }
+
+    /// Returns the sessions whose worker has ended and whose obligation the archive is to settle by
+    /// removing what the worker retained, whose turn has come.
+    ///
+    /// A session whose removal was refused is returned again on a schedule that lengthens, as every
+    /// refused step is.
+    #[must_use]
+    pub fn awaiting_removal(&self, now_ms: TimestampMs) -> Vec<SessionId> {
+        let inner = self.inner();
+        inner
+            .obligations
+            .keys()
+            .filter(|session_id| {
+                inner.sessions.get(session_id).is_some_and(|progress| {
+                    progress.reach == Reach::Ended && progress.removal.retry.due(now_ms)
+                })
+            })
+            .copied()
+            .collect()
+    }
+
+    /// Whether a session's cleanup is still owed, so that what it retained is not served.
+    #[must_use]
+    pub fn owes_cleanup(&self, session_id: SessionId) -> bool {
+        self.inner().obligations.contains_key(&session_id)
+    }
+
+    /// Records that the archive removed what an ended worker retained, and ends its obligation,
+    /// durably.
+    ///
+    /// The obligation is deleted from the record first and the session forgotten only once that
+    /// has landed: a delete the store refuses leaves it owed, and the next removal, which finds
+    /// nothing more to take, ends it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the obligation's end cannot be
+    /// written.
+    pub fn note_removed(&self, session_id: SessionId) -> Result<()> {
+        let mut inner = self.inner();
+        let generation = inner.mode.generation();
+        if inner.obligations.contains_key(&session_id) {
+            inner.record.discharge(session_id, generation)?;
+            inner.obligations.remove(&session_id);
+        }
+        inner.unrecorded.remove(&session_id);
+        inner.sessions.remove(&session_id);
+        self.changed.notify_one();
+        Ok(())
+    }
+
+    /// Records that the archive could not remove all that an ended worker retained, and why. The
+    /// obligation stays, reported with the reason, and the removal is tried again on a schedule.
+    pub fn note_removal_refused(&self, session_id: SessionId, reason: String, now_ms: TimestampMs) {
+        let mut inner = self.inner();
+        if !inner.obligations.contains_key(&session_id) {
+            return;
+        }
+        let progress = inner.sessions.entry(session_id).or_default();
+        progress.removal.failure = Some(reason);
+        progress.removal.retry = progress.removal.retry.after_failure(now_ms);
     }
 
     /// Returns the sessions this record follows or holds an obligation for whose worker it has no
@@ -1799,7 +1883,7 @@ impl crate::service::Controller {
         sessions.dedup();
         let controller = Arc::clone(self);
         let now_ms = kr_ipc::now_ms();
-        let report = tokio::task::spawn_blocking(move || {
+        let mut report = tokio::task::spawn_blocking(move || {
             controller
                 .privacy
                 .set(params.enabled, &sessions, now_ms, &|write| {
@@ -1810,6 +1894,16 @@ impl crate::service::Controller {
         .map_err(|_| ControllerError::RegistryUnavailable {
             detail: "the privacy change stopped before it could say what it did".to_owned(),
         })??;
+        if params.enabled {
+            // A session whose worker has ended has nobody to tell, so the archive removes what it
+            // retained now, and the answer says where that stands and not where it stood.
+            self.settle_closed_sessions().await;
+            let privacy = Arc::clone(&self.privacy);
+            let now_ms = kr_ipc::now_ms();
+            if let Ok(later) = tokio::task::spawn_blocking(move || privacy.status(now_ms)).await {
+                report = later;
+            }
+        }
         kr_protocol::envelope::ParamsValue::from_typed(&self.with_viewer_copies(report))
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
     }
@@ -1820,6 +1914,13 @@ impl crate::service::Controller {
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the report could not be made.
     pub(crate) async fn privacy_status(&self) -> Result<kr_protocol::envelope::ParamsValue> {
+        let report = self.current_privacy_report().await?;
+        kr_protocol::envelope::ParamsValue::from_typed(&report)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+    }
+
+    /// Where privacy mode stands now, with the copies authorised viewers may hold.
+    async fn current_privacy_report(&self) -> Result<PrivacyReport> {
         let privacy = Arc::clone(&self.privacy);
         let now_ms = kr_ipc::now_ms();
         let report = tokio::task::spawn_blocking(move || privacy.status(now_ms))
@@ -1827,8 +1928,116 @@ impl crate::service::Controller {
             .map_err(|_| ControllerError::RegistryUnavailable {
                 detail: "privacy mode's report could not be made".to_owned(),
             })?;
-        kr_protocol::envelope::ParamsValue::from_typed(&self.with_viewer_copies(report))
-            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+        Ok(self.with_viewer_copies(report))
+    }
+
+    /// Performs `privacy.retained.delete`: asks the service that holds one copy privacy mode lists
+    /// as having left this host to delete it, and answers where that stands.
+    ///
+    /// It is the person's own action, and privacy mode neither stops it nor is stopped by it. The
+    /// host does not trust the reference: it reads the list again and acts only when exactly one
+    /// copy carries it and that copy is listed as deletable, and the store decides the deletion
+    /// again in the write that records it. Every object of the generation is written down before a
+    /// request leaves, and the carrier then sends them, under a privacy fence too. The answer waits
+    /// for the first pass of the carrier that read the written rows, and says the deletion is
+    /// confirmed only when the service has confirmed every object; a pass that met a service that
+    /// did not answer leaves the rest asked, shown as such in the list, and sent again when the
+    /// person asks again, and by the carrier once privacy mode is off. The registration the call
+    /// was admitted under is checked in the write that records the request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::InvalidArgument`] when the list holds no one copy under the
+    /// reference, [`ControllerError::PermissionDenied`] for a copy the host cannot ask the removal
+    /// of, [`ControllerError::NotConfigured`] when the host selects no storage service, and the
+    /// store's refusals.
+    pub(crate) async fn privacy_retained_delete(
+        self: &Arc<Self>,
+        mutation: &kr_protocol::envelope::MutationRequest,
+        carried: crate::authority::AdmittedMutation,
+    ) -> Result<kr_protocol::envelope::ParamsValue> {
+        let params: kr_protocol::privacy::PrivacyRetainedDeleteParams = mutation
+            .params
+            .to_typed()
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        let report = self.current_privacy_report().await?;
+        let mut named = report
+            .exported
+            .iter()
+            .filter(|copy| copy.reference == params.reference);
+        let (Some(copy), None) = (named.next(), named.next()) else {
+            return Err(ControllerError::InvalidArgument(
+                "privacy mode lists no one copy under that reference".to_owned(),
+            ));
+        };
+        let refused = |why: &str| ControllerError::PermissionDenied {
+            detail: format!("this host cannot ask for the removal of that copy: {why}"),
+        };
+        let Some((archive, generation)) = backup_generation_of(&copy.reference) else {
+            return Err(refused(if copy.deletable {
+                "it is not a backup generation"
+            } else {
+                &copy.kind
+            }));
+        };
+        if !copy.deletable {
+            // The store's own reason, when it has one, and the copy's kind otherwise.
+            let controller = Arc::clone(self);
+            let why = tokio::task::spawn_blocking(move || {
+                controller.backup().deletion_refusal(archive, generation)
+            })
+            .await
+            .ok()
+            .and_then(std::result::Result::ok)
+            .flatten();
+            return Err(refused(why.as_deref().unwrap_or(&copy.kind)));
+        }
+        let Some(runtime) = self.backup_runtime() else {
+            return Err(ControllerError::NotConfigured(format!(
+                "{} in this host's configuration document ({}) selects no storage service, so \
+                 there is nothing to ask for a deletion",
+                kr_protocol::hostinfo::configuration::STORAGE_ORIGIN.key,
+                kr_protocol::hostinfo::configuration::FILE_NAME,
+            )));
+        };
+        let controller = Arc::clone(self);
+        let now_ms = kr_ipc::now_ms();
+        // The registration is taken inside the hold of the backup store, as a privacy change takes
+        // the two: the other order would let this call and a change of privacy mode each wait for
+        // what the other holds.
+        tokio::task::spawn_blocking(move || {
+            controller
+                .backup()
+                .ask_deletion(archive, generation, now_ms, &|write| {
+                    controller.under_registration(&carried, write)?
+                })
+        })
+        .await
+        .map_err(|_| ControllerError::RegistryUnavailable {
+            detail: "the deletion stopped before it could say what it did".to_owned(),
+        })??;
+        // A service that is slow to answer, or one that asked to be left alone, leaves the rest
+        // asked and shown as such; the person is told so and the carrier goes on.
+        let _ = tokio::time::timeout(RETAINED_DELETE_WAIT, runtime.carry_now()).await;
+        let controller = Arc::clone(self);
+        let confirmed = tokio::task::spawn_blocking(move || {
+            controller
+                .backup()
+                .objects(archive, generation)
+                .map(|objects| objects.iter().all(|object| object.released_at_ms.is_some()))
+        })
+        .await
+        .map_err(|_| ControllerError::RegistryUnavailable {
+            detail: "the deletion stopped before it could say what it did".to_owned(),
+        })??;
+        let report = self.current_privacy_report().await?;
+        kr_protocol::envelope::ParamsValue::from_typed(
+            &kr_protocol::privacy::PrivacyRetainedDeleteResult {
+                deleted: confirmed,
+                report,
+            },
+        )
+        .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
     }
 
     /// Adds to a report the copies that authorised viewers may hold.
@@ -1890,6 +2099,25 @@ impl crate::service::Controller {
     }
 }
 
+/// How long a person's deletion of a kept copy waits for the carrier's pass before it answers that
+/// the rest is asked and not yet confirmed.
+const RETAINED_DELETE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The archive and the backup generation a reference of the backup service's names:
+/// `<archive> generation <number>`.
+fn backup_generation_of(
+    reference: &str,
+) -> Option<(
+    kr_protocol::ids::ArchiveId,
+    kr_protocol::ids::BackupGeneration,
+)> {
+    let (archive, number) = reference.split_once(" generation ")?;
+    Some((
+        archive.parse().ok()?,
+        kr_protocol::ids::BackupGeneration::new(number.parse().ok()?),
+    ))
+}
+
 /// Records that `subsystem` owes `work`.
 ///
 /// The same work failing again waits longer each time. Progress starts the schedule again: work
@@ -1935,7 +2163,14 @@ fn obligations(inner: &Inner) -> Vec<Obligation> {
         .map(|(session_id, owed_at)| {
             let progress = inner.sessions.get(session_id);
             let standing = match progress {
-                Some(progress) if progress.reach == Reach::Ended => Standing::WorkerEnded,
+                Some(progress) if progress.reach == Reach::Ended => {
+                    match &progress.removal.failure {
+                        Some(reason) => Standing::Unavailable {
+                            reason: reason.clone(),
+                        },
+                        None => Standing::WorkerEnded,
+                    }
+                }
                 Some(SessionProgress {
                     answer: Some(answer),
                     ..

@@ -29,7 +29,6 @@ import type {
   EnvironmentListResult,
   HostInfoResult,
   PresentationReason,
-  PrivacyReport,
   Receipt,
   SessionCreateParams,
   SessionCreateResult,
@@ -116,6 +115,7 @@ import { AGENT_DRAFT_ADD_ATTACHMENT_PARAMS, DRAFT_CREATE_PARAMS, decodeParams } 
 import { FakeDraftStore } from './fake-drafts'
 import { EVERY_RIGHT, ScriptedRecords } from './fake-state'
 import { ScriptedQuestions, type FakeQuestions } from './fake-questions'
+import { ScriptedRetained, type FakeRetained } from './fake-retained'
 import { ScriptedSharing, type FakeSharing } from './fake-sharing'
 
 const ENVIRONMENT = '3f1a2c40-11aa-4b2c-9d3e-000000000001'
@@ -436,6 +436,8 @@ export interface FakeHostControls {
   readonly questions: FakeQuestions
   /** The grants the host holds, the attempts native code keeps, and what can happen to them. */
   readonly sharing: FakeSharing
+  /** What has left the host and this computer's sync, and the person's and the service's part in deleting it. */
+  readonly retained: FakeRetained
   /** The openings screens made of sessions, and what the host says of them. */
   readonly standings: FakeStandings
   /** The drafts this device keeps, which another window can write to. */
@@ -665,9 +667,11 @@ export interface FakeHostControls {
   /** Changes what the pairing screen shows, as native code would publish it. */
   setPairing(change: Partial<PairingView>): void
   /** Changes where notifications stand, as native code would publish it. */
-  setPush(view: PushView): void
+  setPush(view: Omit<PushView, 'revision'>): void
   /** The references the person turned notifications on for, in order. */
   readonly pushEnabled: string[]
+  /** The choices the person made about the text of the notifications, in order. */
+  readonly pushPreviewChoices: { readonly reference: string; readonly on: boolean }[]
   /** How many times the page asked native code to look again at where notifications stand. */
   readonly pushLooks: { count: number }
   /** The screen the next tap on a notification will have opened the application on, or none. */
@@ -980,7 +984,8 @@ export function fakeHost(
       typeof window === 'undefined' ? null : new URLSearchParams(window.location.search).get('push')
     const row = (state: PushHostView['state'], words: string, settings = false): PushView => ({
       available: true,
-      hosts: [{ reference: 'studio-reference', state, words, settings }]
+      hosts: [{ reference: 'studio-reference', state, words, settings, previews: true }],
+      revision: 1
     })
     switch (asked) {
       case 'on':
@@ -999,16 +1004,18 @@ export function fakeHost(
           'The notification service could not be reached. Try again in a moment.'
         )
       default:
-        return { available: true, hosts: [] }
+        return { available: true, hosts: [], revision: 1 }
     }
   })()
   const pushEnabled: string[] = []
+  const pushPreviewChoices: { reference: string; on: boolean }[] = []
   const pushLooks = { count: 0 }
   const pushListeners = new Set<(view: PushView) => void>()
   let routeNext: string | null = null
   const routeAsks = { count: 0 }
-  const publishPush = (view: PushView) => {
-    push = view
+  /** Publishes where notifications stand, numbered as native code numbers the views it reads. */
+  const publishPush = (view: Omit<PushView, 'revision'>) => {
+    push = { ...view, revision: push.revision + 1 }
     for (const listener of pushListeners) listener(push)
   }
   /** While set, the pairing view's answers wait for it. */
@@ -1125,6 +1132,12 @@ export function fakeHost(
       // A session the host does not have is refused as the host refuses it.
       records.agentOf(sessionId)
     }
+  )
+  // What has left the host: the generation privacy mode stands at is the one the report says.
+  const retained = new ScriptedRetained(
+    FAKE_NOW_MS,
+    () => 3,
+    () => connected && !pairedDevice
   )
   /** The raw terminal views the page has opened, oldest first. */
   const terminalViews: FakeTerminalView[] = []
@@ -1930,13 +1943,13 @@ export function fakeHost(
       checkOpening('approvalRespond', params.target.subject.session_id, opening)
       return Promise.resolve(records.respond(params))
     },
-    pluginActionInvoke: (params) => {
+    pluginActionInvoke: (params, opening) => {
       requireConnection()
-      const actionId = (params as { action_id?: string }).action_id ?? 'unknown'
+      checkOpening('pluginActionInvoke', params.target.subject.session_id, opening)
       return Promise.resolve({
         receipt: receipt(nextActionId(), 'applied', 'plugin.action.invoke'),
         action_id: null,
-        value: { invoked: actionId }
+        value: { mutation: null, action: params.action }
       })
     },
 
@@ -2166,8 +2179,15 @@ export function fakeHost(
     privacyStatus: () =>
       reading('privacyStatus', () => {
         requireConnection()
-        return privacyReport()
+        return retained.report()
       }),
+    retainedSyncCopies: () => attempting(() => retained.syncCopies()),
+    retainedDeleteAsk: (reference) => retained.ask(reference),
+    retainedDeleteFinish: (token) => retained.finish(token),
+    retainedDeleteCancel: (token) => {
+      retained.cancel(token)
+      return Promise.resolve()
+    },
 
     // The command the page's port sends, read as native code reads it: its arguments decoded in
     // order, then the session identifier parsed and the size checked, or nothing opens.
@@ -2220,8 +2240,28 @@ export function fakeHost(
         ...push,
         hosts: [
           ...push.hosts.filter((host) => host.reference !== reference),
-          { reference, state: 'working', words: 'Asking for permission.', settings: false }
+          {
+            reference,
+            state: 'working',
+            words: 'Asking for permission.',
+            settings: false,
+            previews: true
+          }
         ]
+      })
+      return Promise.resolve(push)
+    },
+    pushPreviews: (reference, on) => {
+      const held = push.hosts.find((host) => host.reference === reference)
+      if (held === undefined) {
+        refuse('INVALID_ARGUMENT', 'This computer is not paired with that host.')
+      }
+      pushPreviewChoices.push({ reference, on })
+      publishPush({
+        ...push,
+        hosts: push.hosts.map((host) =>
+          host.reference === reference ? { ...host, previews: on, state: 'working' } : host
+        )
       })
       return Promise.resolve(push)
     },
@@ -3052,6 +3092,7 @@ export function fakeHost(
     records,
     questions,
     sharing,
+    retained,
     standings: {
       opens,
       leaves,
@@ -3408,6 +3449,7 @@ export function fakeHost(
       publishPush(view)
     },
     pushEnabled,
+    pushPreviewChoices,
     pushLooks,
     routeNextTapTo(route) {
       routeNext = route
@@ -3920,44 +3962,6 @@ function createdSession(
     state: 'live',
     worker_profile: params.worker_profile
   } as unknown as SessionSummaryOf
-}
-
-/**
- * What privacy mode reports once it has been on for three generations: an archive and a
- * notification the host sent before then, a device that may hold a copy, and a subsystem that could
- * not be listed. The host offers no way to ask for the removal of any of them.
- */
-function privacyReport(): PrivacyReport {
-  return {
-    generation: '3',
-    enabled: true,
-    changed_at_ms: String(FAKE_NOW_MS - 86_400_000),
-    completion: { state: 'complete' },
-    sessions: [],
-    disabled: [],
-    kept: [],
-    exported: [
-      {
-        kind: 'backup archive',
-        reference: 'archive 4c1f0b5e generation 12',
-        left_at_ms: String(FAKE_NOW_MS - 172_800_000),
-        deletable: false
-      },
-      {
-        kind: 'notification',
-        reference: 'a turn summary, delivered through the push service',
-        left_at_ms: String(FAKE_NOW_MS - 90_000_000),
-        deletable: false
-      },
-      {
-        kind: "possible copy held by a viewer's device",
-        reference: 'device 0d5e1a7c-31aa-4f09-9c47-5f7a7d3f6a10',
-        left_at_ms: String(FAKE_NOW_MS - 260_000_000),
-        deletable: false
-      }
-    ],
-    unlisted: [{ subsystem: 'descriptions', reason: 'the description store could not be read' }]
-  }
 }
 
 /** A fake view, and the handle the page holds for it. */

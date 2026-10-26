@@ -35,7 +35,9 @@
 use kr_attention::engine::{Announcement, Engine, Item, Text};
 use kr_protocol::attention::{AttentionLevel, AttentionRouting, AttentionRule};
 use kr_protocol::grant::SessionSelector;
-use kr_protocol::ids::{DeviceId, EnvelopeId, EnvironmentId, GrantId, NotificationId, SessionId};
+use kr_protocol::ids::{
+    DeviceId, EnvelopeId, EnvironmentId, GrantId, InvitationId, NotificationId, SessionId,
+};
 use kr_protocol::push::{PushAlert, PushDeliveryRequest, PushPlatformHints, PushUrgency};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs, Uuid};
@@ -724,6 +726,88 @@ fn refused_record(
     }
 }
 
+/// Whether `destination` is the device a pairing's event names: the one device a pairing does not
+/// tell of itself.
+fn is_the_paired_device(event: &EventKey, destination: &DestinationRecord) -> bool {
+    event
+        .paired_device()
+        .is_some_and(|device| destination.id.as_str().parse::<DeviceId>().ok() == Some(device))
+}
+
+/// The rule a notice about a completed pairing is raised under.
+pub const PAIRING_RULE: &str = "pairing.completed";
+
+/// One completed pairing, as the host's security outbox holds it, in the terms this journal needs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PairingEvent {
+    /// The row's position in the outbox, which is the cursor this journal keeps into it.
+    pub sequence: u64,
+    /// The invitation the device paired through, which names the event.
+    pub invitation_id: InvitationId,
+    /// The device the host created. It is not told of its own pairing.
+    pub device_id: DeviceId,
+    /// What the device calls itself. Display text a person chose, never authority.
+    pub device_name: String,
+    /// When the host committed the pairing, in UTC milliseconds.
+    pub committed_at_ms: u64,
+}
+
+impl PairingEvent {
+    /// The notice a completed pairing owes the owner's devices.
+    ///
+    /// It belongs to the environment, so it reaches the devices whose grant carries `host.manage`
+    /// and whose history reaches the moment the pairing committed; a device whose history starts
+    /// after that moment is not told. It is dated and expires from the moment of the pairing and
+    /// not from the moment it is produced, so a pairing read again from the start of the outbox
+    /// after a journal was lost sends nothing once it is four hours old. The device's name is the
+    /// one thing in it that a person chose, so it goes inside a push preview's seal and into no
+    /// external message.
+    #[must_use]
+    fn notice(&self) -> Notice {
+        Notice {
+            event: EventKey::pairing(self.invitation_id, self.device_id),
+            // The closed vocabulary has no sentence for a pairing, and the authority feed's notice
+            // is shown in these words too.
+            alert: PushAlert::SessionNeedsAttention,
+            urgency: PushUrgency::Attention,
+            rule: PAIRING_RULE.to_owned(),
+            summary: format!("{} was paired with this host", self.device_name),
+            session_id: None,
+            environment_id: None,
+            observed_at_ms: TimestampMs::new(self.committed_at_ms),
+            collapse_group: format!("pairing/{}", self.invitation_id),
+            expires_at_ms: TimestampMs::new(
+                self.committed_at_ms
+                    .saturating_add(DEFAULT_NOTIFICATION_LIFETIME_MS),
+            ),
+            audience: Audience::Environment {
+                at_ms: self.committed_at_ms,
+            },
+        }
+    }
+
+    /// The notice a completed pairing owes while privacy mode is on: the generic alert and
+    /// nothing of the device, grouped by the rule alone under the generation.
+    #[must_use]
+    fn alert_only(&self, generation: u64) -> Notice {
+        Notice {
+            summary: String::new(),
+            collapse_group: format!("private/{generation}/{PAIRING_RULE}"),
+            ..self.notice()
+        }
+    }
+
+    /// The lines an external message carries: the host's own sentence and nothing the device
+    /// called itself.
+    fn lines(&self) -> Vec<ContentLine> {
+        vec![ContentLine {
+            session_id: None,
+            produced_at_ms: Some(self.committed_at_ms),
+            text: "A device was paired with this host.".to_owned(),
+        }]
+    }
+}
+
 /// The delivery producer for one environment.
 #[derive(Debug)]
 pub struct Producer {
@@ -936,7 +1020,10 @@ impl Producer {
         let mut records = Vec::new();
         let mut spent = Vec::new();
         for destination in self.journal.destinations()? {
-            if !destination.enabled || destination.as_push().is_none() {
+            if !destination.enabled
+                || destination.as_push().is_none()
+                || is_the_paired_device(&notice.event, &destination)
+            {
                 continue;
             }
             match self.build_push(
@@ -975,6 +1062,112 @@ impl Producer {
             records,
             spent,
         })
+    }
+
+    /// Takes the completed pairings one outbox offers, and produces a notification of each for
+    /// the owner's devices whose grant reaches the moment it committed.
+    ///
+    /// The cursor is the outbox row's sequence, kept in this journal under a consumer of its own
+    /// (`scope`) and committed with the events, so the outbox needs to keep nothing for it and a
+    /// host that stops anywhere is handed the same pairings again, which the event keys absorb.
+    /// The device that paired is left out of what is produced, whether it is produced here or by
+    /// [`Producer::finish_pending`] after a stop, because the event's key names it.
+    ///
+    /// While privacy mode is on, the notification is the generic alert and nothing sealed, to push
+    /// destinations only, admitted in the transaction that takes the event. A pairing whose
+    /// expiry has passed is taken and produces nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::JournalUnavailable`] when this journal cannot be read or written.
+    pub fn take_from_pairings(
+        &mut self,
+        events: &[PairingEvent],
+        authority: &dyn RecipientAuthority,
+        scope: &str,
+        privacy: PrivacyView,
+        now_ms: u64,
+    ) -> Result<Taken> {
+        let consumer = EventSource::Attention.consumer(scope);
+        if !self.journal.is_registered(&consumer)? {
+            self.journal.register_consumer(&consumer, now_ms)?;
+        }
+        let standing = self.journal.standing()?;
+        if standing.generation != privacy.generation || standing.fenced != privacy.private {
+            return Ok(Taken::skipped());
+        }
+        let mut taken = Taken::default();
+        if privacy.private {
+            for event in events {
+                let notice = event.alert_only(privacy.generation);
+                let entry = if now_ms < notice.expires_at_ms.get() {
+                    self.alert(&notice, event.sequence, authority, now_ms)?
+                } else {
+                    PrivateEntry {
+                        event: observed(
+                            notice.event.clone(),
+                            event.sequence,
+                            None,
+                            notice.observed_at_ms,
+                        ),
+                        records: Vec::new(),
+                        spent: Vec::new(),
+                    }
+                };
+                let alerts = entry.records.len();
+                match self.journal.take_private(
+                    &consumer,
+                    &entry,
+                    event.sequence,
+                    privacy.generation,
+                ) {
+                    Ok(new) => {
+                        taken.taken += usize::from(new);
+                        taken.alerts += alerts;
+                        taken.dropped += usize::from(entry.records.is_empty());
+                    }
+                    Err(DeliveryError::LateResult { .. }) => {
+                        taken.skipped = true;
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            return Ok(taken);
+        }
+        let Some(cursor) = events.iter().map(|event| event.sequence).max() else {
+            return Ok(taken);
+        };
+        let mut taken_events = Vec::with_capacity(events.len());
+        for event in events {
+            taken_events.push(event.notice().taken_with(event.sequence, event.lines())?);
+        }
+        match self
+            .journal
+            .take_events_under(&consumer, &taken_events, cursor, privacy.generation)
+        {
+            Ok(new) => taken.taken += new,
+            Err(DeliveryError::Fenced | DeliveryError::LateResult { .. }) => {
+                return Ok(Taken::skipped());
+            }
+            Err(error) => return Err(error),
+        }
+        let destinations = self.journal.destinations()?;
+        for event in events {
+            let notice = event.notice();
+            if now_ms >= notice.expires_at_ms.get() {
+                continue;
+            }
+            match self.produce(&notice, &destinations, authority, &event.lines(), now_ms) {
+                Ok(_)
+                // Left to the pass that finishes what was taken: it decides each of these.
+                | Err(
+                    DeliveryError::Expiry(_) | DeliveryError::Fenced | DeliveryError::LateResult { .. },
+                ) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(taken)
     }
 
     /// The journal, for reads a caller needs.
@@ -1050,7 +1243,7 @@ impl Producer {
         let mut spent = Vec::new();
         let mut staged_objects = Vec::new();
         for destination in destinations {
-            if !destination.enabled {
+            if !destination.enabled || is_the_paired_device(&notice.event, destination) {
                 continue;
             }
             let outcome = match &destination.destination {
@@ -1641,7 +1834,7 @@ pub const MAX_NOTICE_LIFETIME_MS: u64 = MAX_EXPIRY_AHEAD_MS;
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use super::*;
     use crate::destination::{
@@ -4231,5 +4424,321 @@ mod tests {
             urgency_for(AttentionLevel::Informational),
             PushUrgency::Deferred
         );
+    }
+
+    /// What a pairing's notice is told to: devices whose grant carries `host.manage` are the owner's
+    /// own, and the rest keep only the right to see sessions.
+    #[derive(Debug)]
+    struct OwnerDevices(BTreeSet<String>);
+
+    impl OwnerDevices {
+        fn scope(&self, id: &str) -> RecipientScope {
+            let rights: CanonicalSet<ActionRight> = if self.0.contains(id) {
+                [ActionRight::SessionView, ActionRight::HostManage]
+                    .into_iter()
+                    .collect()
+            } else {
+                [ActionRight::SessionView].into_iter().collect()
+            };
+            RecipientScope {
+                viewer: ViewerScope::owner(),
+                sessions: SessionSelector::Any,
+                rights,
+                grant_id: GrantId::new(Uuid::from_bytes([9; 16])),
+                recipient: DeviceId::new(Uuid::from_bytes([10; 16])),
+                history_from_ms: 0,
+            }
+        }
+    }
+
+    impl RecipientAuthority for OwnerDevices {
+        fn scope_for(&self, rule: &DeliveryRule) -> Option<RecipientScope> {
+            Some(self.scope(&rule.name))
+        }
+
+        fn device_scope(&self, destination: &DestinationRecord) -> Option<RecipientScope> {
+            Some(self.scope(destination.id.as_str()))
+        }
+    }
+
+    /// A push destination named for a device, with an installation and a sender of its own.
+    fn phone_of(device: DeviceId) -> (DestinationRecord, NotificationPreviewKeyPair) {
+        let (mut record, keys, _) = push_destination_with_keys(&device.to_string(), true, None);
+        let byte = device.get().as_bytes()[0];
+        if let Destination::Push(push) = &mut record.destination {
+            push.installation_id = InstallationId::new(Uuid::from_bytes([byte; 16]));
+            push.sender_record_id = PushSenderRecordId::new(Uuid::from_bytes([byte; 16]));
+        }
+        (record, keys)
+    }
+
+    fn device(byte: u8) -> DeviceId {
+        DeviceId::new(Uuid::from_bytes([byte; 16]))
+    }
+
+    fn a_pairing(sequence: u64, new_device: DeviceId, committed_at_ms: u64) -> PairingEvent {
+        PairingEvent {
+            sequence,
+            invitation_id: InvitationId::new(Uuid::from_bytes([sequence as u8; 16])),
+            device_id: new_device,
+            device_name: "Ric's phone".to_owned(),
+            committed_at_ms,
+        }
+    }
+
+    const PAIRINGS: &str = "pairings";
+
+    /// KR-REQ-10.08: a completed pairing is a notification to the owner's devices that may manage
+    /// the host, in the closed vocabulary's generic words. The name the new device chose is inside
+    /// the seal of a push preview and in no message that leaves unsealed. The device that paired,
+    /// and a device that may only see sessions, are not told, and an event the outbox offers again
+    /// produces nothing more.
+    #[test]
+    fn a_completed_pairing_is_told_to_the_owners_other_devices_and_only_there() {
+        let mut producer = producer();
+        let owner = device(20);
+        let viewer = device(21);
+        let new_device = device(22);
+        let mut keys = BTreeMap::new();
+        for id in [owner, viewer, new_device] {
+            let (record, preview) = phone_of(id);
+            producer
+                .journal_mut()
+                .configure_destination(&record)
+                .expect("a destination");
+            keys.insert(id, preview);
+        }
+        producer
+            .journal_mut()
+            .configure_destination(&webhook("owner-hook"))
+            .expect("a destination");
+        let authority = OwnerDevices(
+            [
+                owner.to_string(),
+                new_device.to_string(),
+                "on failure".to_owned(),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let event = a_pairing(5, new_device, 1_000);
+
+        let taken = producer
+            .take_from_pairings(
+                std::slice::from_ref(&event),
+                &authority,
+                PAIRINGS,
+                NO_PRIVACY,
+                1_500,
+            )
+            .expect("a take");
+        assert_eq!(taken.taken, 1);
+        let told = |destination: &str| {
+            producer
+                .journal()
+                .deliveries()
+                .expect("a read")
+                .into_iter()
+                .filter(|record| record.destination_id.as_str() == destination)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            told(&owner.to_string()).len(),
+            1,
+            "the owner's other device"
+        );
+        assert!(
+            told(&viewer.to_string()).is_empty(),
+            "a device that may only see sessions"
+        );
+        assert!(
+            told(&new_device.to_string()).is_empty(),
+            "the device that paired, though its grant would admit it"
+        );
+
+        let record = told(&owner.to_string()).remove(0);
+        let request: PushDeliveryRequest =
+            serde_json::from_slice(record.content.as_ref().expect("a body")).expect("a request");
+        assert_eq!(request.hints.alert, PushAlert::SessionNeedsAttention);
+        let opened = preview::open_preview(
+            &keys[&owner],
+            producer.preview_public(),
+            request.preview.as_ref().expect("a preview"),
+            1_500,
+        )
+        .expect("the device opens its own preview");
+        assert_eq!(opened.rule, PAIRING_RULE);
+        assert!(opened.summary.contains("Ric's phone"));
+        let wire = serde_json::to_string(&request).expect("the request");
+        assert!(
+            !wire.contains("Ric's phone"),
+            "the name is not in the clear"
+        );
+
+        let hook = told("owner-hook");
+        assert_eq!(
+            hook.len(),
+            1,
+            "an external destination the owner configured"
+        );
+        let message =
+            String::from_utf8(hook[0].content.clone().expect("the message")).expect("text");
+        assert!(message.contains("A device was paired with this host."));
+        assert!(
+            !message.contains("Ric's phone"),
+            "no external message names it"
+        );
+
+        // The outbox offers the same pairing again after a restart: nothing more is produced.
+        let before = producer.journal().deliveries().expect("a read").len();
+        let again = producer
+            .take_from_pairings(&[event], &authority, PAIRINGS, NO_PRIVACY, 2_000)
+            .expect("a take");
+        assert_eq!(again.taken, 0);
+        assert_eq!(
+            producer.journal().deliveries().expect("a read").len(),
+            before
+        );
+        assert_eq!(
+            producer
+                .journal()
+                .consumer_cursor(&EventSource::Attention.consumer(PAIRINGS))
+                .expect("a read")
+                .map(|held| held.cursor),
+            Some(5),
+            "the cursor into the outbox is this journal's"
+        );
+    }
+
+    const NO_PRIVACY: PrivacyView = PrivacyView {
+        generation: 0,
+        private: false,
+    };
+
+    /// KR-REQ-10.08 and section 16: while privacy mode is on, a completed pairing is the generic
+    /// alert to push destinations, with nothing sealed in it and nothing for an external one.
+    #[test]
+    fn a_pairing_during_privacy_mode_is_the_generic_alert_and_nothing_sealed() {
+        let mut producer = producer();
+        let owner = device(20);
+        let new_device = device(22);
+        for id in [owner, new_device] {
+            let (record, _) = phone_of(id);
+            producer
+                .journal_mut()
+                .configure_destination(&record)
+                .expect("a destination");
+        }
+        producer
+            .journal_mut()
+            .configure_destination(&webhook("owner-hook"))
+            .expect("a destination");
+        producer.journal_mut().fence(1).expect("a fence");
+        let private = PrivacyView {
+            generation: 1,
+            private: true,
+        };
+        let authority = OwnerDevices(
+            [
+                owner.to_string(),
+                new_device.to_string(),
+                "on failure".to_owned(),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let taken = producer
+            .take_from_pairings(
+                &[a_pairing(5, new_device, 1_000)],
+                &authority,
+                PAIRINGS,
+                private,
+                1_500,
+            )
+            .expect("a take");
+        assert_eq!((taken.taken, taken.alerts), (1, 1));
+        let deliveries = producer.journal().deliveries().expect("a read");
+        assert_eq!(
+            deliveries.len(),
+            1,
+            "one push destination, and not the device that paired"
+        );
+        assert_eq!(deliveries[0].destination_id.as_str(), owner.to_string());
+        let request: PushDeliveryRequest =
+            serde_json::from_slice(deliveries[0].content.as_ref().expect("a body"))
+                .expect("a request");
+        assert_eq!(request.hints.alert, PushAlert::SessionNeedsAttention);
+        assert!(request.preview.0.is_none(), "nothing is sealed");
+    }
+
+    /// A pairing the outbox offers long after it committed, as it does when this journal was lost
+    /// and begins again at the start of the outbox, has expired: it is taken and sends nothing.
+    #[test]
+    fn a_pairing_read_again_after_its_expiry_sends_nothing() {
+        let mut producer = producer();
+        let owner = device(20);
+        let (record, _) = phone_of(owner);
+        producer
+            .journal_mut()
+            .configure_destination(&record)
+            .expect("a destination");
+        let authority = OwnerDevices([owner.to_string()].into_iter().collect());
+        let long_after = 1_000 + DEFAULT_NOTIFICATION_LIFETIME_MS + 1;
+
+        let taken = producer
+            .take_from_pairings(
+                &[a_pairing(5, device(22), 1_000)],
+                &authority,
+                PAIRINGS,
+                NO_PRIVACY,
+                long_after,
+            )
+            .expect("a take");
+        assert_eq!(taken.taken, 1);
+        let finished = producer
+            .finish_pending(&[record], &authority, long_after)
+            .expect("the pass that finishes what was taken");
+        assert_eq!(finished.admitted, 0);
+        assert!(producer.journal().deliveries().expect("a read").is_empty());
+        assert_eq!(producer.journal().pending_count().expect("a count"), 0);
+    }
+
+    /// KR-REQ-10.08: a pairing the host took and stopped before it produced from is finished by the
+    /// pass that finishes what was taken, and that pass leaves out the device that paired too.
+    #[test]
+    fn a_pairing_finished_after_a_stop_still_leaves_out_the_device_that_paired() {
+        let mut producer = producer();
+        let owner = device(20);
+        let new_device = device(22);
+        for id in [owner, new_device] {
+            let (record, _) = phone_of(id);
+            producer
+                .journal_mut()
+                .configure_destination(&record)
+                .expect("a destination");
+        }
+        let authority = OwnerDevices(
+            [owner.to_string(), new_device.to_string()]
+                .into_iter()
+                .collect(),
+        );
+        let event = a_pairing(5, new_device, 1_000);
+        let taken = event
+            .notice()
+            .taken_with(event.sequence, event.lines())
+            .expect("an event record");
+        producer
+            .take(EventSource::Attention, PAIRINGS, &[taken], 5, 1_000)
+            .expect("a page");
+
+        let destinations = producer.journal().destinations().expect("a read");
+        let finished = producer
+            .finish_pending(&destinations, &authority, 1_500)
+            .expect("the pass that finishes what was taken");
+        assert_eq!(finished.admitted, 1);
+        let deliveries = producer.journal().deliveries().expect("a read");
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].destination_id.as_str(), owner.to_string());
     }
 }

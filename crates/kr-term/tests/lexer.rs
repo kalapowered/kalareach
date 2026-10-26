@@ -270,6 +270,42 @@ fn raw_c1_is_classified_but_never_forwarded() {
     assert!(eight[0].eight_bit_introducer);
 }
 
+/// KR-ACC-024: whether a text run may be forwarded does not depend on where the reads end. A raw C1
+/// byte introduces what it introduces and nothing after it: text that follows a stray string
+/// terminator is forwarded, however the stream is cut around it.
+#[test]
+fn a_text_run_after_a_raw_c1_byte_is_decided_alike_wherever_the_reads_end() {
+    // A stray string terminator, "ab" and "é".
+    let input: &[u8] = b"\x9cab\xc3\xa9";
+    let by_byte = |events: &[Event]| -> Vec<(DirectDisposition, bool)> {
+        events
+            .iter()
+            .flat_map(|event| {
+                std::iter::repeat_n(
+                    (event.disposition, event.eight_bit_introducer),
+                    usize::try_from(event.span.len()).unwrap_or(0),
+                )
+            })
+            .collect()
+    };
+    let whole = by_byte(&lex(input));
+    assert_eq!(whole.len(), input.len());
+    // The stray terminator is the raw C1 byte, and does not reach a terminal.
+    assert!(whole[0].1);
+    assert_ne!(whole[0].0, DirectDisposition::Forward);
+    for decision in &whole[1..] {
+        assert_eq!(*decision, (DirectDisposition::Forward, false));
+    }
+    for cut in 1..input.len() {
+        let mut lexer = Lexer::new();
+        let mut events = Vec::new();
+        lexer.feed(&input[..cut], &mut events);
+        lexer.feed(&input[cut..], &mut events);
+        lexer.close(&mut events);
+        assert_eq!(by_byte(&events), whole, "reads cut at {cut}");
+    }
+}
+
 #[test]
 fn an_encoded_c1_scalar_is_replaced_and_never_executed() {
     // 0xC2 0x9B is a well-formed scalar whose value is the C1 CSI introducer.

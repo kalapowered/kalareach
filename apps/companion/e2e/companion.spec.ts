@@ -467,6 +467,55 @@ test.describe("a session's retained output", () => {
   })
 })
 
+// KR-REQ-13.15: over a host this device is paired with, the output starts where the device's grant
+// reaches. The reader is told that what comes before is not available to the device, and the read
+// back stops there.
+test.describe("a paired device's view of a session's retained output", () => {
+  const MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+
+  test('ends at the first output the grant reaches, and says the output before it is not available', async ({
+    page
+  }) => {
+    await page.goto('/harness.html')
+    await page.waitForSelector('.app-shell')
+    await page.evaluate((session) => {
+      const lines: string[] = []
+      for (let index = 0; index < 4000; index += 1) {
+        lines.push(`line ${String(index).padStart(4, '0')} ${'of retained output '.repeat(2)}`)
+      }
+      const host = window.krTestHost
+      host?.reachAsPairedDevice()
+      // The grant reaches the last 100 KB: more than one page, and about half of what was written.
+      host?.records.appendOutput(session, `\r\n${lines.join('\r\n')}\r\n`)
+      const end = host?.records.outputEnd(session) ?? 0n
+      host?.records.reachOutputFrom(session, end - 100_000n)
+    }, MAIN)
+    await page.getByRole('button', { name: 'Sessions' }).click()
+    await page.getByTestId('session-row-1').click()
+    await page.getByRole('tab', { name: 'Output' }).click()
+    const scroll = page.getByTestId('output-scroll')
+    await expect(scroll).toContainText('line 3999')
+
+    // Back to the top, page by page, until the read stops at the grant's reach.
+    const gap = page.getByTestId('output-gap')
+    await expect(async () => {
+      await scroll.evaluate((element) => {
+        element.scrollTop = 0
+      })
+      await expect(gap).toBeVisible({ timeout: 250 })
+    }).toPass({ timeout: 20_000 })
+    await expect(gap).toHaveText('Output before this is not available to this device.')
+    // What the grant does not reach is not on the page, and what it does is.
+    await expect(scroll).not.toContainText('line 1000')
+    await expect(scroll).toContainText('line 3999')
+    await scroll.evaluate((element) => {
+      element.scrollTop = 0
+    })
+    await expect(gap).toBeInViewport()
+    await page.screenshot({ path: shot(`output-paired-13.15-${test.info().project.name}`) })
+  })
+})
+
 test.describe('sessions', () => {
   test('a row carries the number, the directory, the attachments and the state', async ({
     page
@@ -3405,15 +3454,63 @@ test.describe('a control that commits on a completed action', () => {
 })
 
 test.describe('what has left the host', () => {
-  test('each copy is listed with whether the host can ask for its removal', async ({ page }) => {
+  test('each copy is listed with whether it can be deleted', async ({ page }) => {
     await open(page)
     await page.getByRole('button', { name: 'Change sets' }).click()
     const retained = page.getByTestId('retained-artefacts')
     await expect(retained).toBeVisible()
-    await expect(retained.getByTestId('removal')).toHaveCount(3)
-    await expect(retained.getByRole('button')).toHaveCount(0)
+    await expect(retained.getByTestId('removal')).toHaveCount(4)
+    // Two copies can be deleted from here, and the other two say nobody here can remove them.
+    await expect(retained.getByRole('button')).toHaveCount(2)
     await expect(retained.getByTestId('unlisted')).toBeVisible()
-    await page.screenshot({ path: shot('privacy-24.29'), fullPage: true })
+    await page.screenshot({
+      path: shot(`privacy-24.29-${test.info().project.name}`),
+      fullPage: true
+    })
+  })
+
+  test('a deletion waits for the person and is shown at each step', async ({ page }) => {
+    await open(page)
+    await page.getByRole('button', { name: 'Change sets' }).click()
+    const retained = page.getByTestId('retained-artefacts')
+    const archive = retained.getByTestId('left-copy').filter({ hasText: 'archive 4c1f0b5e' })
+    await archive.getByRole('button', { name: /Delete backup archive/ }).click()
+
+    // The dialog is native code's. Until the person answers it the page can only wait, and nothing
+    // has been sent.
+    await expect(archive.getByTestId('removal')).toHaveText('Waiting for your answer in the dialog.')
+    await expect(archive.getByRole('button')).toBeDisabled()
+    expect(await page.evaluate(() => window.krTestHost?.retained.finished.length)).toBe(0)
+    await page.screenshot({
+      path: shot(`privacy-24.29-waiting-${test.info().project.name}`),
+      fullPage: true
+    })
+
+    // The service does not confirm: the copy stays listed and can be asked about again.
+    await page.evaluate(() => {
+      window.krTestHost?.retained.serviceDoesNotConfirm(true)
+      window.krTestHost?.retained.answerDialog(true)
+    })
+    await expect(archive.getByTestId('removal')).toContainText('the service has not confirmed it')
+    await expect(archive.getByRole('button')).toHaveText('Ask again…')
+    await page.screenshot({
+      path: shot(`privacy-24.29-unconfirmed-${test.info().project.name}`),
+      fullPage: true
+    })
+
+    await page.evaluate(() => {
+      window.krTestHost?.retained.serviceDoesNotConfirm(false)
+    })
+    await archive.getByRole('button').click()
+    await page.evaluate(() => {
+      window.krTestHost?.retained.answerDialog(true)
+    })
+    await expect(retained.getByTestId('left-copy').filter({ hasText: 'archive 4c1f0b5e' })).toHaveCount(0)
+    await expect(page.locator('.toast-text', { hasText: 'Deleted. The service confirmed it.' })).toBeVisible()
+    await page.screenshot({
+      path: shot(`privacy-24.29-deleted-${test.info().project.name}`),
+      fullPage: true
+    })
   })
 })
 

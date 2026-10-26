@@ -31,7 +31,21 @@ struct Served {
 }
 
 impl Served {
+    /// A host whose epoch runs, so that a call into a component is stopped by its deadline when the
+    /// machine's time passes it.
     async fn start() -> Self {
+        Self::start_with(false).await
+    }
+
+    /// A host whose epoch no time advances: a call into a component is stopped by its deadline only
+    /// when the case advances the epoch ([`Served::with_the_epoch_moving`]), so a machine that is
+    /// slow to run a call cannot make a component fault. For the cases that read what a call
+    /// returns and are not about a deadline.
+    async fn start_held() -> Self {
+        Self::start_with(true).await
+    }
+
+    async fn start_with(epoch_held: bool) -> Self {
         let temp = kr_ipc::testing::TempHost::create();
         let environment = temp.environment();
         // Owner-only: it holds the payloads this host compiles, and the host refuses a packages
@@ -49,15 +63,17 @@ impl Served {
             process_start_identity: identity.process_start_identity().clone(),
             host_public_key: *identity.public_key(),
         };
+        let config = HostConfig {
+            endpoint,
+            packages_root: packages.clone(),
+            cache_root: environment.state_dir().join("plugin-cache"),
+        };
         let host = Arc::new(
-            PluginHost::new(
-                identity,
-                HostConfig {
-                    endpoint,
-                    packages_root: packages.clone(),
-                    cache_root: environment.state_dir().join("plugin-cache"),
-                },
-            )
+            if epoch_held {
+                PluginHost::new_with_epoch_held(identity, config)
+            } else {
+                PluginHost::new(identity, config)
+            }
             .expect("a plugin host"),
         );
         let endpoint_for_wait =
@@ -92,6 +108,23 @@ impl Served {
             host,
             serving,
         }
+    }
+
+    /// Awaits `call` while the host's epoch is advanced a tick at a time, which is what its
+    /// deadlines are a count of. For the cases about a deadline, on a host started held. A call
+    /// that no deadline of the component stops ends at the deadline the caller gave it, and the
+    /// case then fails on what that is.
+    async fn with_the_epoch_moving<T>(&self, call: impl core::future::Future<Output = T>) -> T {
+        let runtime = Arc::clone(self.host.runtime());
+        let moving = tokio::spawn(async move {
+            loop {
+                runtime.engine().advance_epoch();
+                tokio::time::sleep(core::time::Duration::from_millis(1)).await;
+            }
+        });
+        let outcome = call.await;
+        moving.abort();
+        outcome
     }
 
     async fn client(&self) -> PluginClient {
@@ -201,7 +234,7 @@ async fn kr_req_06_06_a_worker_registers_delivers_and_calls_over_the_protocol() 
     let Some(wasm) = components::well_behaved() else {
         return;
     };
-    let served = Served::start().await;
+    let served = Served::start_held().await;
     let mut client = served.client().await;
     let (path, digest, bytes) = served.install("well-behaved", &wasm);
 
@@ -550,7 +583,7 @@ async fn a_binding_belongs_to_the_connection_that_registered_it() {
     let Some(wasm) = components::well_behaved() else {
         return;
     };
-    let served = Served::start().await;
+    let served = Served::start_held().await;
     let first = served.client().await;
     let second = served.client().await;
     let (path, digest, bytes) = served.install("well-behaved", &wasm);
@@ -1065,7 +1098,7 @@ async fn a_worker_asks_the_component_to_prepare_an_action_and_is_given_its_plan_
     use kr_plugin_sdk::effect::EffectClass;
     use kr_plugin_service::protocol::{WireArgument, WireNamedArgument, WireOperation};
 
-    let served = Served::start().await;
+    let served = Served::start_held().await;
     let Some((client, binding_id)) = preparing(&served).await else {
         return;
     };
@@ -1155,13 +1188,22 @@ async fn a_worker_asks_the_component_to_prepare_an_action_and_is_given_its_plan_
 // component's deadline, the host refuses it by name, and the connection serves the next call.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_component_that_never_prepares_its_action_costs_its_call_and_not_the_connection() {
-    let served = Served::start().await;
+    let served = Served::start_held().await;
     let Some((client, binding_id)) = preparing(&served).await else {
         return;
     };
     let deadline = core::time::Duration::from_millis(500);
-    let stuck = client
-        .prepare_action(binding_id, invocation("cancel.loop"), Vec::new(), deadline)
+    // The caller waits far longer than the component's deadline is worth in ticks, so that what
+    // ends the call is the component's deadline and not the caller's own, whatever the machine does
+    // with the ticks.
+    let patient = core::time::Duration::from_secs(20);
+    let stuck = served
+        .with_the_epoch_moving(client.prepare_action(
+            binding_id,
+            invocation("cancel.loop"),
+            Vec::new(),
+            patient,
+        ))
         .await
         .expect_err("a call that used its whole allowance is refused by the host");
     assert!(
@@ -1316,7 +1358,7 @@ async fn account_of(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_06_07_a_native_request_is_decoded_and_a_scrape_or_an_unnamed_request_is_refused_before_a_component_runs()
  {
-    let served = Served::start().await;
+    let served = Served::start_held().await;
     let Some((client, binding_id)) = registered(&served, "hostile-decoder", 11).await else {
         return;
     };
@@ -1393,7 +1435,7 @@ async fn kr_req_06_07_a_native_request_is_decoded_and_a_scrape_or_an_unnamed_req
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_21_an_encode_returns_bytes_for_an_offered_decision_and_what_is_wrong_is_refused()
 {
-    let served = Served::start().await;
+    let served = Served::start_held().await;
     let Some((client, binding_id)) = registered(&served, "hostile-decoder", 12).await else {
         return;
     };
@@ -1556,7 +1598,7 @@ async fn kr_req_11_38_a_decode_and_an_encode_that_never_return_are_stopped_and_t
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_24_27_no_document_is_written_after_privacy_mode_is_acknowledged_and_a_fresh_one_follows_its_end()
  {
-    let served = Served::start().await;
+    let served = Served::start_held().await;
     let Some((client, binding_id)) = registered(&served, "hostile-decoder", 14).await else {
         return;
     };
@@ -1640,7 +1682,7 @@ async fn kr_req_24_27_no_document_is_written_after_privacy_mode_is_acknowledged_
 // mode stands. What the worker uses of it, the summary and the decisions, is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_24_27_a_decoded_request_carries_no_presentation_while_privacy_mode_stands() {
-    let served = Served::start().await;
+    let served = Served::start_held().await;
     let Some((client, binding_id)) = registered(&served, "hostile-decoder", 15).await else {
         return;
     };
@@ -1678,7 +1720,7 @@ async fn kr_req_24_27_a_decoded_request_carries_no_presentation_while_privacy_mo
 // reads in its next call, however many revisions came before it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_revision_of_a_bindings_facts_and_attachments_is_what_its_component_reads_next() {
-    let served = Served::start().await;
+    let served = Served::start_held().await;
     let Some((client, binding_id)) = registered(&served, "recording", 16).await else {
         return;
     };
@@ -1731,7 +1773,7 @@ async fn a_revision_of_a_bindings_facts_and_attachments_is_what_its_component_re
 // binding goes on, and nothing reached its component.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_revision_or_a_call_beyond_its_bounds_is_refused_and_the_binding_goes_on() {
-    let served = Served::start().await;
+    let served = Served::start_held().await;
     let Some((client, binding_id)) = registered(&served, "hostile-decoder", 17).await else {
         return;
     };

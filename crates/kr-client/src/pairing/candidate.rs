@@ -202,15 +202,20 @@ impl Candidate {
     /// random one the host does not use: the host assigns the record's own when it commits.
     #[must_use]
     pub fn unpaired(&self) -> LocalIdentity {
-        self.paired_identity(DeviceId::new(kr_ipc::new_uuid()))
+        self.paired_identity(DeviceId::new(kr_ipc::new_uuid()), DeviceKeyRevision::new(1))
     }
 
-    /// The identity this device connects to a host with, as the device `device_id` it became.
+    /// The identity this device connects to a host with, as the device `device_id` it became, at the
+    /// revision of its keys the host holds. A host refuses a device that offers another.
     #[must_use]
-    pub fn paired_identity(&self, device_id: DeviceId) -> LocalIdentity {
+    pub fn paired_identity(
+        &self,
+        device_id: DeviceId,
+        revision: DeviceKeyRevision,
+    ) -> LocalIdentity {
         LocalIdentity::new(
             device_id,
-            DeviceKeyRevision::new(1),
+            revision,
             self.endpoint_id(),
             self.keys.authorisation.clone(),
             self.build_id.clone(),
@@ -400,6 +405,22 @@ impl std::fmt::Debug for Pairing {
 }
 
 impl Pairing {
+    /// The identity this device connects to `host` with: the revision of its keys is the one the
+    /// records hold now, read at each connection and not taken from the copy of the host record a
+    /// caller kept, since a copy made before the host took a higher revision would offer the old
+    /// one and be refused. When the records no longer hold the pairing, the copy's is used.
+    #[must_use]
+    pub fn paired_identity_for(&self, host: &PairedHost) -> LocalIdentity {
+        let revision = self
+            .hosts
+            .by_device(host.host_device_id)
+            .ok()
+            .flatten()
+            .filter(|held| held.device_id == host.device_id)
+            .map_or(host.device_key_revision, |held| held.device_key_revision);
+        self.candidate.paired_identity(host.device_id, revision)
+    }
+
     /// What a first dial that was lost means when the managed service had no free capacity to admit
     /// this device through the relay the dial addresses, and none otherwise.
     ///
@@ -681,10 +702,12 @@ impl Pairing {
         .await
         .map_err(|error| link_failed(&error, tries))?;
         let selection = preauth.selection();
-        if selection.endpoint_id != bundle.endpoint_id || selection.device_id != bundle.device_id {
+        // The transport has refused a selection that names another endpoint than the one that
+        // answered, and kr-pairing refused a connection that is not the bundle's endpoint above.
+        if selection.device_id != bundle.device_id {
             return Err(PairingFailure::new(
                 FailureKind::HostMismatch,
-                "the host's selection names another endpoint or device than its bundle",
+                "the host's selection names another device than its bundle",
             ));
         }
         let value = attempt
@@ -732,7 +755,12 @@ impl Pairing {
             }
             // Whether the host bound the finish is unknown; asking is how to find out, on a
             // connection of its own.
-            Err(LinkError::Lost(_) | LinkError::Configuration(_) | LinkError::Membership(_)) => {
+            Err(
+                LinkError::Lost(_)
+                | LinkError::Configuration(_)
+                | LinkError::Membership(_)
+                | LinkError::Selection(_),
+            ) => {
                 drop(preauth);
                 drop(connection);
                 return self.await_approval(pending, None, progress).await;
@@ -906,7 +934,8 @@ impl Pairing {
                         Err(
                             LinkError::Lost(_)
                             | LinkError::Configuration(_)
-                            | LinkError::Membership(_),
+                            | LinkError::Membership(_)
+                            | LinkError::Selection(_),
                         ) => {
                             looked = true;
                             continue;
@@ -958,7 +987,10 @@ impl Pairing {
                     ));
                 }
                 Err(
-                    LinkError::Lost(_) | LinkError::Configuration(_) | LinkError::Membership(_),
+                    LinkError::Lost(_)
+                    | LinkError::Configuration(_)
+                    | LinkError::Membership(_)
+                    | LinkError::Selection(_),
                 ) => {
                     // The connection is gone; it is let go of before the wait, not after.
                     drop(held.take());
@@ -1151,6 +1183,7 @@ impl Pairing {
             proposed_grant: pending.proposed_grant.clone(),
             name: None,
             paired_at_ms: self.clock.wall_clock_ms(),
+            device_key_revision: DeviceKeyRevision::new(1),
         };
         // The record first: a device that stops between the two keeps both, and resuming then
         // reaches the host through the record rather than as a candidate it no longer is.
@@ -1174,7 +1207,9 @@ impl Pairing {
             stage: Stage::ReachingHost,
         });
         let device_id = host.device_id;
-        let identity = self.candidate.paired_identity(device_id);
+        let identity = self
+            .candidate
+            .paired_identity(device_id, host.device_key_revision);
         let params = PairStatusParams {
             invitation_id: pending.invitation_id,
         };
@@ -1662,6 +1697,9 @@ fn link_failed(error: &LinkError, tries: Option<u32>) -> PairingFailure {
     let kind = match error {
         LinkError::Refused(refusal) => refused_by_host(refusal.code, false),
         LinkError::Lost(_) | LinkError::Membership(_) => FailureKind::HostUnreachable,
+        // The host answered, and what it answered is not the host the bundle names: a new try gets
+        // the same answer, and costs one of this device's tries.
+        LinkError::Selection(_) => FailureKind::HostMismatch,
         LinkError::Configuration(_) => FailureKind::DidNotFinish,
     };
     PairingFailure::new(kind, error.said()).with_tries(tries)

@@ -151,6 +151,14 @@ describe('the desktop port and the published methods', () => {
     const steer = { target, text: 'Stop after the tests', turn_id: 'turn-2' }
     const cancel = { target, turn_id: 'turn-2' }
     const answer = { target, resource_id: 'resource-1', option_id: 'approve' }
+    const invocation = {
+      target,
+      plugin_id: 'openai.codex',
+      action: 'thread.refresh',
+      draft_id: null,
+      resource_id: null,
+      parameters: 'e30'
+    }
     await port.sessionAgents(SESSION)
     await port.agentCapabilities({ subject })
     await port.agentSnapshot({ subject, from_node: '5' })
@@ -161,6 +169,7 @@ describe('the desktop port and the published methods', () => {
     await port.composerSteer(steer)
     await port.composerInterrupt(cancel)
     await port.approvalRespond(answer)
+    await port.pluginActionInvoke(invocation)
     await port.historyPage({ session_id: SESSION, from_cursor: '0', max_bytes: '65536' })
     expect(shell.invoked).toEqual([
       { command: 'session_agents', args: { sessionId: SESSION } },
@@ -176,6 +185,7 @@ describe('the desktop port and the published methods', () => {
       { command: 'agent_turn_steer', args: { params: steer } },
       { command: 'agent_turn_cancel', args: { params: cancel } },
       { command: 'agent_approval_respond', args: { params: answer } },
+      { command: 'plugin_action_invoke', args: { params: invocation } },
       {
         command: 'history_page',
         args: { params: { session_id: SESSION, from_cursor: '0', max_bytes: '65536' } }
@@ -260,6 +270,10 @@ describe('the desktop port and the published methods', () => {
     await port.pluginList({ environment_id: environment })
     await port.catalogueList({ environment_id: environment })
     await port.changesetRead({ change_set_id: 'change-1', version: null })
+    await port.retainedSyncCopies()
+    await port.retainedDeleteAsk('copy-1')
+    await port.retainedDeleteFinish('token-1')
+    await port.retainedDeleteCancel('token-1')
     expect(shell.invoked.map((each) => each.command)).toEqual([
       'attention_read',
       'attention_acknowledge',
@@ -284,7 +298,11 @@ describe('the desktop port and the published methods', () => {
       'attempt_remove',
       'plugin_list',
       'catalogue_list',
-      'changeset_read'
+      'changeset_read',
+      'retained_sync_copies',
+      'retained_delete_ask',
+      'retained_delete_finish',
+      'retained_delete_cancel'
     ])
     // An acknowledgement belongs to the environment, so it names no session; an invitation names
     // the session it shares; the consequences are read for the selection alone.
@@ -307,6 +325,12 @@ describe('the desktop port and the published methods', () => {
     expect(named('attempt_set_hidden')).toEqual({ actionId: 'action-1', hidden: true })
     expect(named('grant_revoke')).toEqual({ params: { grant_id: 'grant-1' } })
     expect(named('grant_held')).toEqual({})
+    // Deleting a copy that left the host names the copy by the reference it is listed under and the
+    // confirmation by the token the person's yes returned: never a method, never a parameter of one.
+    expect(named('retained_sync_copies')).toEqual({})
+    expect(named('retained_delete_ask')).toEqual({ reference: 'copy-1' })
+    expect(named('retained_delete_finish')).toEqual({ token: 'token-1' })
+    expect(named('retained_delete_cancel')).toEqual({ token: 'token-1' })
   })
 })
 

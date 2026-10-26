@@ -131,6 +131,8 @@ $script:Line = @{
     # the first time it is wanted.
     Route            = $null
     RouteRead        = $false
+    # The words that command is given when every one of them is a plain constant, or nothing.
+    RouteWords       = $null
 }
 
 # A line of diagnostics, when the session asked for them.
@@ -667,12 +669,13 @@ function Wait-KrHandshake {
             $value = try { ConvertFrom-KrCbor $frame } catch { Write-KrTrace "the accept did not decode: $_"; $null }
             $outcome = if ($null -eq $value) { $null } else { Get-KrVariant $value }
             if ($null -eq $outcome -or $outcome.Name -ne 'handshake') {
-                Write-KrTrace "not a handshake: $($outcome.Name)"
+                # Strict mode refuses a property of nothing, so an answer that is nothing is named so.
+                Write-KrTrace "not a handshake: $(if ($null -eq $outcome) { 'an answer that is not a variant' } else { $outcome.Name })"
                 return $false
             }
             $verdict = Get-KrVariant $outcome.Payload
             if ($null -eq $verdict -or $verdict.Name -ne 'accepted') {
-                Write-KrTrace "refused: $($verdict.Name)"
+                Write-KrTrace "refused: $(if ($null -eq $verdict) { 'a verdict that is not a variant' } else { $verdict.Name })"
                 return $false
             }
             Read-KrAccept $verdict.Payload

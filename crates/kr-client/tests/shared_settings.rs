@@ -19,6 +19,7 @@
 //! | KR-REQ-20.13, a collection that holds as many drafts as it may takes another once one is removed | `a_full_collection_takes_another_draft_once_one_is_removed` |
 //! | KR-REQ-20.13, a removal never replaces what another device wrote, and keeps nothing | `a_removal_after_another_device_wrote_removes_nothing_and_keeps_no_copy` |
 //! | KR-REQ-24.28, no removal leaves while privacy mode is on | `no_removal_is_sent_while_privacy_mode_is_on` |
+//! | KR-REQ-24.27, no removal leaves while privacy mode is on: sync is off at once | `no_removal_is_sent_while_privacy_mode_is_on` |
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

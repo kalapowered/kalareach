@@ -67,32 +67,21 @@ pub fn sign_connect(
     sign::sign(key, &transcript)
 }
 
-/// Verifies both proofs and every binding the transcript depends on.
+/// Checks that a host's selection answers the offer it claims to answer.
 ///
-/// The checks, in order:
+/// This part of the connection check needs only the offer and the selection, so a client with no
+/// record of the host runs it as well as one that has: a candidate on the pairing surface holds a
+/// selection it can judge against its own offer in exactly the same way. The checks, in order:
 ///
-/// 1. the selection echoes the client nonce, so one offer is bound to one selection;
-/// 2. each side's declared key revision equals the paired record's, so a stale key is rejected;
-/// 3. the selection's endpoint identity equals the host's paired endpoint;
-/// 4. the live iroh endpoints equal the paired endpoints on both sides;
-/// 5. both signatures verify over the exact transcript.
-///
-/// Returns the transcript digest, which the caller records for the connection.
+/// 1. the selected version is one the client offered;
+/// 2. every selected capability is one the client offered;
+/// 3. no negotiated limit is above what the client offered to receive;
+/// 4. the selection echoes the client nonce, so one offer is bound to one selection.
 ///
 /// # Errors
 ///
-/// Returns [`CryptoError::BindingMismatch`] for the first binding that fails and
-/// [`CryptoError::Authentication`] when a signature does not verify.
-#[allow(clippy::too_many_arguments)]
-pub fn verify_connect(
-    offer: &ClientOffer,
-    selection: &HostSelection,
-    client: &PairedPeer,
-    host: &PairedPeer,
-    live_client_endpoint: &EndpointKey,
-    live_host_endpoint: &EndpointKey,
-    proofs: &ConnectProofs,
-) -> Result<Digest256> {
+/// Returns [`CryptoError::BindingMismatch`] for the first check that fails.
+pub fn check_selection_against_offer(offer: &ClientOffer, selection: &HostSelection) -> Result<()> {
     if !offer.offered_versions.contains(&selection.selected_version) {
         return Err(CryptoError::BindingMismatch {
             what: "the selected protocol version, which the client did not offer",
@@ -118,6 +107,37 @@ pub fn verify_connect(
             what: "the host selection's echoed client nonce",
         });
     }
+    Ok(())
+}
+
+/// Verifies both proofs and every binding the transcript depends on.
+///
+/// The checks, in order:
+///
+/// 1. the selection answers the offer ([`check_selection_against_offer`]);
+/// 2. each side's declared device identity equals the paired record's;
+/// 3. each side's declared key revision equals the paired record's, so a stale key is rejected;
+/// 4. the selection's endpoint identity equals the host's paired endpoint;
+/// 5. the live iroh endpoints equal the paired endpoints on both sides;
+/// 6. both signatures verify over the exact transcript.
+///
+/// Returns the transcript digest, which the caller records for the connection.
+///
+/// # Errors
+///
+/// Returns [`CryptoError::BindingMismatch`] for the first binding that fails and
+/// [`CryptoError::Authentication`] when a signature does not verify.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_connect(
+    offer: &ClientOffer,
+    selection: &HostSelection,
+    client: &PairedPeer,
+    host: &PairedPeer,
+    live_client_endpoint: &EndpointKey,
+    live_host_endpoint: &EndpointKey,
+    proofs: &ConnectProofs,
+) -> Result<Digest256> {
+    check_selection_against_offer(offer, selection)?;
     if offer.device_id != client.device_id {
         return Err(CryptoError::BindingMismatch {
             what: "the client device identity",

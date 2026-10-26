@@ -25,6 +25,13 @@ use kr_shell_integration::contract::qualification::ShellKind;
 
 const PWSH: ShellKind = ShellKind::PowerShell;
 
+/// KR-REQ-07.16: the cases that ask the package's host something start it with the launch
+/// environment its record holds, as a session does.
+#[test]
+fn a_case_that_asks_the_packages_host_starts_it_with_the_launch_environment_its_record_holds() {
+    shellpkg::the_packages_host_is_started_with_the_launch_environment_its_record_holds();
+}
+
 /// KR-REQ-07.40: the module holds no secret bytes once the handshake is accepted.
 #[test]
 #[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
@@ -219,6 +226,45 @@ fn a_backend_runs_the_command_through_the_launcher_it_names() {
     shellpkg::a_backend_runs_the_command_through_the_launcher_it_names(PWSH);
 }
 
+/// KR-REQ-12.07, KR-REQ-07.45
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_name_the_person_defined_runs_as_defined_and_the_worker_is_never_asked_about_it() {
+    shellpkg::a_name_the_person_has_defined_is_never_asked_about(PWSH);
+}
+
+/// KR-REQ-12.07
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_handler_the_person_runs_after_the_search_is_asked_once_and_chooses_the_command() {
+    shellpkg::a_handler_the_person_runs_after_the_search_is_asked_once_and_chooses_the_command(
+        PWSH,
+    );
+}
+
+/// KR-REQ-01.06, KR-REQ-12.07
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_program_the_worker_does_not_take_leaves_the_status_it_left() {
+    shellpkg::a_program_the_worker_does_not_take_leaves_the_status_it_left(PWSH);
+}
+
+/// KR-REQ-12.07
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_command_a_later_handler_replaces_leaves_the_status_of_what_ran() {
+    shellpkg::a_command_a_later_handler_replaces_leaves_the_status_of_what_ran(PWSH);
+}
+
+/// KR-REQ-12.07
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_launcher_that_cannot_start_runs_the_program_once_and_one_that_fails_is_not_followed() {
+    shellpkg::a_launcher_that_cannot_start_runs_the_program_once_and_one_that_fails_is_not_followed(
+        PWSH,
+    );
+}
+
 /// KR-REQ-25.05
 #[test]
 #[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
@@ -302,11 +348,7 @@ public class KrEditorNotAQueue { private static KrEditorNotAQueue _singleton = n
 #[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
 fn the_package_refuses_an_editor_whose_key_queue_it_cannot_read() {
     let package = shellpkg::Package::built(PWSH);
-    let directory = package
-        .executable
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("the package directory");
+    let directory = package.directory();
     let module = directory
         .join("modules/KalaReach.ShellBridge/KalaReach.ShellBridge.psd1")
         .display()
@@ -324,7 +366,8 @@ fn the_package_refuses_an_editor_whose_key_queue_it_cannot_read() {
              Write-Output \"kr-queue[$name]=[$($answer.Reason)] keys=[$($answer.Keys)]\" \
          }}"
     );
-    let asked = std::process::Command::new(&package.executable)
+    let asked = package
+        .command()
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .env_remove("KR_SHELL_BRIDGE")
         .env_remove("KR_SHELL_BRIDGE_SECRET")
@@ -388,11 +431,7 @@ fn the_editors_read_line_function_is_judged_against_the_editors_own_file() {
            & (Get-Module PSReadLine) { param($text) Set-Item function:script:PSConsoleHostReadLine -Value ([scriptblock]::Create($text)) } $text;
            Import-Module PSReadLine;"#;
     let package = shellpkg::Package::built(PWSH);
-    let directory = package
-        .executable
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("the package directory");
+    let directory = package.directory();
     let module = directory
         .join("modules/KalaReach.ShellBridge/KalaReach.ShellBridge.psd1")
         .display()
@@ -403,7 +442,8 @@ fn the_editors_read_line_function_is_judged_against_the_editors_own_file() {
              Import-Module '{module}'; $module = Get-Module KalaReach.ShellBridge; \
              {after}"
         );
-        let output = std::process::Command::new(&package.executable)
+        let output = package
+            .command()
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
             .env_remove("KR_SHELL_BRIDGE")
             .env_remove("KR_SHELL_BRIDGE_SECRET")
@@ -481,11 +521,7 @@ fn the_editors_read_line_function_is_judged_against_the_editors_own_file() {
 /// functions and reads the editor's own table back, which is all these cases need.
 fn in_the_package_host(script: &str) -> String {
     let package = shellpkg::Package::built(PWSH);
-    let directory = package
-        .executable
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("the package directory");
+    let directory = package.directory();
     let module = directory
         .join("modules/KalaReach.ShellBridge/KalaReach.ShellBridge.psd1")
         .display()
@@ -494,13 +530,7 @@ fn in_the_package_host(script: &str) -> String {
         "$ErrorActionPreference = 'Stop'; Import-Module '{module}'; \
          $module = Get-Module KalaReach.ShellBridge; {script}"
     );
-    let asked = std::process::Command::new(&package.executable)
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .env_remove("KR_SHELL_BRIDGE")
-        .env_remove("KR_SHELL_BRIDGE_SECRET")
-        .env_remove("KR_SESSION")
-        .output()
-        .expect("the package's host runs");
+    let asked = package.ask(&script);
     let said = String::from_utf8_lossy(&asked.stdout).into_owned();
     let told = String::from_utf8_lossy(&asked.stderr);
     assert!(
@@ -521,6 +551,100 @@ fn said(output: &str, name: &str) -> String {
         .strip_suffix(']')
         .expect("the line's shape")
         .to_owned()
+}
+
+/// KR-REQ-12.07: when the hooks go, the handler the person had before the module's still runs
+/// through a handler of the person's set after the module's.
+///
+/// The later handler calls the module's, as the person's chain of handlers does, and the module's
+/// calls the one that stood before it. Taking the hooks off cannot put the earlier handler back,
+/// since the later one holds the engine, so the module's goes on calling it and does nothing of its
+/// own. Each lookup is counted by the earlier handler: once before the hooks go, and once after.
+#[test]
+#[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_handler_the_person_set_before_the_hooks_is_still_called_through_a_later_one_after_they_go() {
+    let output = in_the_package_host(
+        r#"function kr-chain { };
+           $global:KrEarlier = 0;
+           $ExecutionContext.InvokeCommand.PostCommandLookupAction = {
+               param($n, $e) if ($n -eq 'kr-chain') { $global:KrEarlier++ } };
+           & $module { Install-KrLookupHandler };
+           $kr_ours = $ExecutionContext.InvokeCommand.PostCommandLookupAction;
+           $ExecutionContext.InvokeCommand.PostCommandLookupAction = {
+               param($n, $e) $kr_ours.Invoke($n, $e) }.GetNewClosure();
+           $null = $ExecutionContext.InvokeCommand.GetCommand('kr-chain', 'All');
+           Write-Output "kr-key[before]=[$global:KrEarlier]";
+           Remove-KalaReachHooks;
+           $null = $ExecutionContext.InvokeCommand.GetCommand('kr-chain', 'All');
+           Write-Output "kr-key[after]=[$global:KrEarlier]""#,
+    );
+    assert_eq!(said(&output, "before"), "1", "{output}");
+    assert_eq!(
+        said(&output, "after"),
+        "2",
+        "the handler that stood before the module's was dropped from the chain: {output}"
+    );
+}
+
+/// A package is published only for a host it can name: a file, called `pwsh`, at an absolute path.
+/// The refusal is by name, and the host the publish runs in is the control that is accepted.
+#[test]
+#[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_host_a_package_cannot_name_is_refused_by_name() {
+    let output = in_the_package_host(
+        r#"foreach ($case in @(@('another', '/bin/sh'), @('relative', 'pwsh'), @('missing', '/nonexistent/directory/pwsh'))) {
+               $answer = & $module { param($path) Test-KrHostCanBeStarted $path } $case[1];
+               Write-Output "kr-key[$($case[0])]=[$($answer.Reason)]"
+           }
+           $own = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName;
+           $answer = & $module { param($path) Test-KrHostCanBeStarted $path } $own;
+           Write-Output "kr-key[own]=[$($answer.Reason)]""#,
+    );
+    assert_eq!(said(&output, "another"), "powershell_host_not_pwsh");
+    assert_eq!(said(&output, "relative"), "powershell_host_unnamed");
+    assert_eq!(said(&output, "missing"), "powershell_host_missing");
+    assert_eq!(
+        said(&output, "own"),
+        "",
+        "the host this runs in can be named"
+    );
+}
+
+/// A publish that is refused for its host writes nothing: the prefix it was given is as it was.
+///
+/// The publish runs from this tree's module, as a person's does, and the host it qualifies is
+/// stood in for by one no package can name, since the one these cases run in is the one that can
+/// be named.
+#[test]
+#[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_publish_refused_for_its_host_leaves_nothing_in_the_prefix() {
+    let package = shellpkg::Package::built(PWSH);
+    let module = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../shells/psreadline/module/KalaReach.ShellBridge.psd1");
+    let prefix = tempfile::tempdir().expect("a directory on the internal disk");
+    let script = format!(
+        r#"$ErrorActionPreference = 'Stop'; Import-Module '{module}';
+           & (Get-Module KalaReach.ShellBridge) {{
+               function script:Get-KrQualifiedHost {{ [pscustomobject]@{{ executable = '/bin/sh' }} }} }};
+           try {{ Publish-KalaReachQualification -Prefix '{prefix}' | Out-Null }}
+           catch {{ Write-Output "kr-key[refused]=[$($_.Exception.Message)]" }}"#,
+        module = module.display(),
+        prefix = prefix.path().display()
+    );
+    let asked = package.ask(&script);
+    let refused = String::from_utf8_lossy(&asked.stdout).into_owned();
+    assert!(
+        said(&refused, "refused").contains("powershell_host_not_pwsh"),
+        "the publish was not refused for its host: {refused}\n{}",
+        String::from_utf8_lossy(&asked.stderr)
+    );
+    assert_eq!(
+        std::fs::read_dir(prefix.path())
+            .expect("the prefix is there")
+            .count(),
+        0,
+        "a refused publish left something in the prefix"
+    );
 }
 
 /// KR-REQ-07.73: the module binds only a chord the editor stores under the spelling it was given,
@@ -844,12 +968,12 @@ fn the_child_probe_starts_a_package_whose_path_holds_a_quote_and_a_space() {
     let directory = tempfile::tempdir().expect("a temporary directory");
     let awkward = directory.path().join("it's here");
     std::fs::create_dir_all(&awkward).expect("a directory with a quote in its name");
-    // The launcher names the host and the module by absolute paths, so a copy of it starts the
-    // same package from wherever it lies.
+    // A link to the package's host, which starts the same host from wherever it lies.
     let copy = awkward.join("pwsh");
-    std::fs::copy(&package.executable, &copy).expect("a copy of the package's launcher");
+    std::os::unix::fs::symlink(&package.executable, &copy).expect("a link to the package's host");
     let probe = shellpkg::child_probe(PWSH, &copy);
-    let asked = std::process::Command::new(&package.executable)
+    let asked = package
+        .command()
         .args([
             "-NoLogo",
             "-NoProfile",

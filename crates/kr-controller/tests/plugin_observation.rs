@@ -546,16 +546,18 @@ async fn kr_req_11_38_a_snapshot_that_never_returns_is_stopped_by_its_bound_and_
 }
 
 /// KR-REQ-11.41: a component is compiled when it is registered, outside any observation's deadline,
-/// and the first observation after it is finished inside its own, with no fault and the binding
-/// still enabled.
+/// and the first observation after it is finished with no fault and the binding still enabled.
 ///
 /// The component is one whose module is slow to compile and quick to run. The plugin host's epoch
-/// runs, so a call is stopped at its deadline if it takes past it. The registration is compiled, not
-/// loaded from the cache, and an observation after it finishes.
+/// is held, so no call is stopped by a deadline however long the machine takes over it. What this
+/// case reads is that the registration compiled the component and did not load it from the cache,
+/// that the component then observed, and that nothing faulted. That the clock of an observation's
+/// deadline starts with the call and not before the compile is held, with the epoch moved by
+/// several deadlines between the compile and the call, in the plugin runtime's own suite
+/// (`kr_req_11_41_a_cold_compile_is_not_inside_an_observation_deadline`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_11_41_a_component_compiled_at_registration_is_observed_inside_its_own_deadline() {
-    let mut options = Options::with(vec![Spec::semantic_only(1).shipping("slow-compile")]);
-    options.epoch = Epoch::Running;
+    let options = Options::with(vec![Spec::semantic_only(1).shipping("slow-compile")]);
     let Some(world) = Observing::start(options).await else {
         return;
     };

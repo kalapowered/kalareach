@@ -65,11 +65,13 @@ pub mod component;
 pub mod connectors;
 pub mod decoding;
 pub mod duplex;
+pub mod encode;
 pub mod endpoint;
 pub mod error;
 pub mod framing;
 pub mod gateway;
 pub mod host;
+pub mod host_claims;
 pub mod image;
 pub mod ledger;
 pub mod listener;
@@ -121,9 +123,10 @@ pub use crate::broker::bridge::{
 };
 pub use crate::broker::capability::{CapabilityOwner, Probe};
 pub use crate::broker::duplex::{
-    CLIENT_REPLY_DEADLINE, Carried, Closure, Delivery, Dispatch, Duplex,
-    MAX_FORWARDED_CLIENT_REQUESTS, MAX_QUEUED_BYTES, MAX_QUEUED_OBSERVATIONS, Observations,
-    Observatory, Queued, ResourceTransition, Sink, UpstreamFailure, UpstreamReply, WRITE_DEADLINE,
+    CLIENT_REPLY_DEADLINE, Carried, Closure, Delivery, Dispatch, Duplex, LateClaim, LateHandle,
+    LateVerdict, MAX_FORWARDED_CLIENT_REQUESTS, MAX_LATE_ANSWERS, MAX_QUEUED_BYTES,
+    MAX_QUEUED_OBSERVATIONS, Observations, Observatory, Queued, ResourceTransition, Sink,
+    UpstreamFailure, UpstreamReply, WRITE_DEADLINE,
 };
 pub use crate::broker::endpoint::{Accepted, BoundEndpoint, PeerIdentity, Stream};
 pub use crate::broker::error::{BrokerError, Result};
@@ -367,6 +370,17 @@ pub struct Instance {
     /// The application server this host started for the process, where it started one: a process
     /// below it is placed under this instance, as one below the process is.
     pub backend: Option<ProcessStartIdentity>,
+    /// Set from the moment a server is to be started for the instance until it is recorded as
+    /// [`Instance::backend`], or the start is given up.
+    ///
+    /// The conversations the instance holds are not free for another session while a server it
+    /// started may be running, so an instance that ends in this interval keeps them.
+    server_starting: bool,
+    /// How the retirement of the server named by [`Instance::backend`] ended, once it has: true
+    /// when nothing it started was left running, false when something was.
+    ///
+    /// The conversations the instance held are not free for another session until then.
+    server_retired: Option<bool>,
     /// The process an adoption found running this instance, where one did.
     ///
     /// It places the questions that process and the ones it starts ask, and does nothing else: it
@@ -423,6 +437,78 @@ pub struct Instance {
     host_files: Option<std::sync::Arc<HostFiles>>,
 }
 
+/// A server that is being started for an instance, and has not been recorded yet.
+///
+/// Dropping it before [`ServerStart::recorded`] gives the start up: no server exists, and the
+/// conversations the instance holds are no longer held for one.
+#[derive(Debug)]
+#[must_use = "dropping it gives the start up"]
+pub struct ServerStart<'a> {
+    broker: &'a Broker,
+    application_instance_id: ApplicationInstanceId,
+    recorded: bool,
+}
+
+impl ServerStart<'_> {
+    /// Says the server exists and is where its ending finds it, which retires it and settles the
+    /// hold on the conversations from here.
+    pub fn recorded(mut self) {
+        self.recorded = true;
+    }
+}
+
+impl Drop for ServerStart<'_> {
+    fn drop(&mut self) {
+        if !self.recorded {
+            self.broker.server_not_started(self.application_instance_id);
+        }
+    }
+}
+
+/// The host's claims of an instance that has ended while a server started for it was still to be
+/// retired.
+#[derive(Debug)]
+struct RetiringServer {
+    instance: ApplicationInstanceId,
+    /// The server, or none while it was being started and is not recorded yet.
+    server: Option<ProcessStartIdentity>,
+    claims: Vec<crate::broker::host_claims::HostClaim>,
+}
+
+impl RetiringServer {
+    fn is(&self, instance: ApplicationInstanceId, server: Option<&ProcessStartIdentity>) -> bool {
+        self.instance == instance && self.server.as_ref() == server
+    }
+}
+
+/// What an instance that is leaving has of a server that ran against its conversations.
+#[derive(Debug)]
+enum ServerOf {
+    /// None was started.
+    None,
+    /// One is being started, and is not recorded yet.
+    Starting,
+    /// One is recorded, and its retirement is not over.
+    Running(ProcessStartIdentity),
+    /// Its retirement is over: true when nothing was left running.
+    Retired(bool),
+}
+
+impl ServerOf {
+    fn of(instance: &Instance) -> Self {
+        match (
+            &instance.backend,
+            instance.server_starting,
+            instance.server_retired,
+        ) {
+            (Some(_), _, Some(clean)) => Self::Retired(clean),
+            (Some(server), _, None) => Self::Running(server.clone()),
+            (None, true, _) => Self::Starting,
+            (None, false, _) => Self::None,
+        }
+    }
+}
+
 /// One source frame the broker holds, with the package whose table recorded it.
 #[derive(Debug)]
 struct RetainedFrame {
@@ -444,6 +530,15 @@ impl Instance {
             binding_revision: self.binding_revision,
             turn_id: self.turn_id.clone(),
         }
+    }
+
+    /// Records one entry about this instance's own binding, under what it is observed under now.
+    ///
+    /// A history that has given every entry number it has takes no more: the entry is lost, and
+    /// the transition it describes is not.
+    fn note(&mut self, kind: &str, text: &str, now: TimestampMs) {
+        let under = self.observed_under();
+        let _ = self.semantic.append(kind, text, now, under);
     }
 
     /// Returns what an entry is observed under when the application reported it about `thread`
@@ -777,6 +872,16 @@ struct BrokerState {
     bindings: BTreeMap<BrokerBindingId, Binding>,
     tokens: TokenStore,
     profiles: ProfileStore,
+    /// The host's claims on the conversations of instances that have ended and whose servers are
+    /// still being retired, or still being started, by instance and server.
+    ///
+    /// A conversation is free for another session when what runs against it is gone, and an
+    /// instance's end comes first: a server that ignores the end of its input runs on for the
+    /// whole of its retirement. The claims are dropped when the retirement is over.
+    retiring: Vec<RetiringServer>,
+    /// The claims on conversations whose servers could not be ended. They are held until this
+    /// worker ends: a conversation held too long is the safe side.
+    stranded: Vec<crate::broker::host_claims::HostClaim>,
     /// The launches that hold an instance's identifier and have not finished, by their token.
     ///
     /// A launch holds its identifier from its execution until its guard commits or gives it back,
@@ -1028,6 +1133,8 @@ impl Broker {
                 bindings: BTreeMap::new(),
                 tokens: TokenStore::new(),
                 profiles,
+                retiring: Vec::new(),
+                stranded: Vec::new(),
                 launches: BTreeMap::new(),
                 next_launch: 1,
                 arbitration,
@@ -1115,9 +1222,9 @@ impl Broker {
 
     /// Registers one application instance no launch of this broker made.
     ///
-    /// Its semantic numbering resumes after whatever cursor an adapter last checkpointed, so a
-    /// restarted worker never issues a cursor an adapter has already passed, and a replay from
-    /// before the restart is a visible gap rather than a silently empty answer.
+    /// Its history starts empty and numbers its entries from one: an instance's identifier is its
+    /// own for good, so no cursor of another life of the host can be read as one of this
+    /// instance's.
     ///
     /// An identifier another path holds is refused: one already registered, and one a launch holds
     /// or an adoption has recorded. A launch registers its own instance through
@@ -1125,8 +1232,7 @@ impl Broker {
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::LedgerUnavailable`] when the checkpoint cannot be read, and
-    /// [`BrokerError::InvalidArgument`] when the identifier is already held.
+    /// Returns [`BrokerError::InvalidArgument`] when the identifier is already held.
     pub fn register_instance(
         &self,
         application_instance_id: ApplicationInstanceId,
@@ -1134,7 +1240,7 @@ impl Broker {
         profile_id: Option<LaunchProfileId>,
         process: Option<ManagedProcess>,
     ) -> Result<()> {
-        let semantic = self.resumed_semantics(application_instance_id)?;
+        let semantic = crate::broker::semantic::SemanticLog::new();
         let mut state = self.state();
         state.check_unheld(application_instance_id)?;
         state.insert_instance(application_instance_id, mode, profile_id, process, semantic);
@@ -1154,7 +1260,7 @@ impl Broker {
         profile_id: Option<LaunchProfileId>,
         process: Option<ManagedProcess>,
     ) -> Result<()> {
-        let semantic = self.resumed_semantics(application_instance_id)?;
+        let semantic = crate::broker::semantic::SemanticLog::new();
         let mut state = self.state();
         if state.launches.get(&application_instance_id) != Some(&token) {
             return Err(BrokerError::invalid(format!(
@@ -1195,8 +1301,7 @@ impl Broker {
     /// # Errors
     ///
     /// Returns [`BrokerError::InvalidArgument`] when the identifier is already held, and
-    /// [`BrokerError::LedgerUnavailable`] when the checkpoint cannot be read or the profile cannot
-    /// be recorded.
+    /// [`BrokerError::LedgerUnavailable`] when the profile cannot be recorded.
     pub fn adopt_instance(
         &self,
         profile: LaunchProfile,
@@ -1204,7 +1309,7 @@ impl Broker {
         process: ProcessStartIdentity,
         saved_conversation: Option<String>,
     ) -> Result<()> {
-        let semantic = self.resumed_semantics(application_instance_id)?;
+        let semantic = crate::broker::semantic::SemanticLog::new();
         let mut state = self.state();
         state.check_unheld(application_instance_id)?;
         state.stored(kr_ipc::now_ms(), "a launch profile", |ledger| {
@@ -1226,19 +1331,6 @@ impl Broker {
             instance.observed = Some(process);
         }
         Ok(())
-    }
-
-    /// Reads where one instance's semantic numbering resumes.
-    fn resumed_semantics(
-        &self,
-        application_instance_id: ApplicationInstanceId,
-    ) -> Result<crate::broker::semantic::SemanticLog> {
-        let consumed = self.state().ledger.checkpoint(application_instance_id)?;
-        let mut semantic = crate::broker::semantic::SemanticLog::new();
-        if let Some(consumed) = consumed {
-            semantic.resume_after(consumed);
-        }
-        Ok(semantic)
     }
 
     /// Returns one instance's binding state.
@@ -1527,11 +1619,19 @@ impl Broker {
         server: ProcessStartIdentity,
     ) -> Result<()> {
         let mut state = self.state();
-        let instance = state
-            .instances
-            .get_mut(&application_instance_id)
-            .ok_or_else(|| unknown_instance(application_instance_id))?;
+        let Some(instance) = state.instances.get_mut(&application_instance_id) else {
+            // The instance ended while its server was being started. Its claims wait for the
+            // server named from here, which the caller retires.
+            for waiting in &mut state.retiring {
+                if waiting.is(application_instance_id, None) {
+                    waiting.server = Some(server.clone());
+                }
+            }
+            return Err(unknown_instance(application_instance_id));
+        };
         instance.backend = Some(server);
+        instance.server_starting = false;
+        instance.server_retired = None;
         Ok(())
     }
 
@@ -1551,11 +1651,13 @@ impl Broker {
         let Some(ended) = state.instances.remove(&application_instance_id) else {
             return false;
         };
+        let server = ServerOf::of(&ended);
         if let Some(agent) = ended.process {
             release_agent_job(&state.instances, &agent.process);
         }
         state.tokens.withdraw(application_instance_id);
-        state.profiles.release(application_instance_id);
+        let claims = state.profiles.release(application_instance_id);
+        state.hold_until_retired(application_instance_id, server, claims);
         state.capabilities.forget(application_instance_id);
         state.forget_instance(application_instance_id, kr_ipc::now_ms());
         state.application_changed();
@@ -1584,11 +1686,13 @@ impl Broker {
         }
         state.launches.remove(&application_instance_id);
         let removed = state.instances.remove(&application_instance_id);
+        let server = removed.as_ref().map_or(ServerOf::None, ServerOf::of);
         if let Some(agent) = removed.and_then(|instance| instance.process) {
             release_agent_job(&state.instances, &agent.process);
         }
         state.tokens.withdraw(application_instance_id);
-        state.profiles.release(application_instance_id);
+        let claims = state.profiles.release(application_instance_id);
+        state.hold_until_retired(application_instance_id, server, claims);
         state.capabilities.forget(application_instance_id);
         // An instance given back must not stay bound: its bindings go from memory at once, and
         // their rows now or, where the store refuses, as soon as it takes writes again.
@@ -2671,12 +2775,16 @@ impl Broker {
         state
             .profiles
             .check_executable(intent, now, application_instance_id)?;
+        // The conversation is claimed on the host before anything is written, so a launch that
+        // another session's execution holds the conversation of leaves nothing behind, and a
+        // write that fails gives the claim back by dropping it.
+        let claim = state.profiles.claim(intent)?;
         state.stored(kr_ipc::now_ms(), "a launch profile", |ledger| {
             ledger.put_profile(&intent.profile, Some(application_instance_id))
         })?;
         let profile = state
             .profiles
-            .execute(intent, now, application_instance_id)?;
+            .execute(intent, now, application_instance_id, claim)?;
         let token = state.next_launch;
         state.next_launch = state.next_launch.saturating_add(1);
         state.launches.insert(application_instance_id, token);
@@ -2698,6 +2806,88 @@ impl Broker {
             .profiles
             .profile_of(application_instance_id)
             .cloned()
+    }
+
+    /// Has this broker claim the conversations its instances own on the host, so that no other
+    /// session of the user runs against one of them as well.
+    ///
+    /// A broker without them knows only its own session's instances. It applies to the
+    /// conversations claimed from here on, so the worker sets it before it serves anything.
+    pub fn set_host_claims(&self, claims: crate::broker::host_claims::HostClaims) {
+        self.state().profiles.set_host_claims(claims);
+    }
+
+    /// Records that a server is about to be started for one instance.
+    ///
+    /// From here until the server is recorded ([`ServerStart::recorded`] and
+    /// [`Broker::set_instance_backend`]) or the returned guard is dropped without that, an
+    /// instance that ends keeps the host's claims on its conversations, since a process may be
+    /// running against them that the broker has no record of yet. Dropping the guard gives the
+    /// start up, as a start that fails or is cancelled with its admission must.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal for an identifier no instance has: the instance ended, and no server
+    /// is started for it.
+    pub fn server_starting(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+    ) -> Result<ServerStart<'_>> {
+        let mut state = self.state();
+        let instance = state
+            .instances
+            .get_mut(&application_instance_id)
+            .ok_or_else(|| unknown_instance(application_instance_id))?;
+        instance.server_starting = true;
+        Ok(ServerStart {
+            broker: self,
+            application_instance_id,
+            recorded: false,
+        })
+    }
+
+    /// Records that no server was started after all: the start failed before a process existed.
+    fn server_not_started(&self, application_instance_id: ApplicationInstanceId) {
+        let mut state = self.state();
+        if let Some(instance) = state.instances.get_mut(&application_instance_id) {
+            instance.server_starting = false;
+        } else {
+            state
+                .retiring
+                .retain(|waiting| !waiting.is(application_instance_id, None));
+        }
+    }
+
+    /// Records that the retirement of `server`, which was started for one instance, is over, and
+    /// whether it ended everything it covered (`clean`).
+    ///
+    /// A conversation an instance owned is free for another session only when what ran against it
+    /// is gone, and that is the later of two things: the instance's end and this. Whichever comes
+    /// second lets go of the host's claims. When something survived the retirement the claims are
+    /// kept until this worker ends. A retirement is of one server: the retirement of an earlier
+    /// server of an instance that was launched again under the same identifier settles nothing
+    /// of the later one's.
+    pub fn server_retired(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+        server: &ProcessStartIdentity,
+        clean: bool,
+    ) {
+        let mut state = self.state();
+        if let Some(instance) = state.instances.get_mut(&application_instance_id)
+            && instance.backend.as_ref() == Some(server)
+        {
+            instance.server_retired = Some(clean);
+        }
+        let (done, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut state.retiring)
+            .into_iter()
+            .partition(|waiting| waiting.is(application_instance_id, Some(server)));
+        state.retiring = waiting;
+        if !clean {
+            for done in done {
+                state.stranded.extend(done.claims);
+            }
+        }
     }
 
     /// Returns which instance owns the live execution of one saved conversation.
@@ -3183,36 +3373,6 @@ impl Broker {
             recorder.refuse_writes(refuse)?;
         }
         self.state().ledger.refuse_writes(refuse)
-    }
-
-    // -- adapter checkpoints ------------------------------------------------------------------
-
-    /// Records the last semantic cursor one adapter consumed.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerError::LedgerUnavailable`] when the write fails.
-    pub fn checkpoint(
-        &self,
-        application_instance_id: ApplicationInstanceId,
-        cursor: StreamCursor,
-        now: TimestampMs,
-    ) -> Result<()> {
-        self.state().stored(now, "an adapter checkpoint", |ledger| {
-            ledger.put_checkpoint(application_instance_id, cursor, now)
-        })
-    }
-
-    /// Returns the cursor an adapter replays from after a restart.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerError::LedgerUnavailable`] when the read fails.
-    pub fn consumed_cursor(
-        &self,
-        application_instance_id: ApplicationInstanceId,
-    ) -> Result<Option<StreamCursor>> {
-        self.state().ledger.checkpoint(application_instance_id)
     }
 
     // -- the gateway --------------------------------------------------------------------------
@@ -3985,6 +4145,34 @@ impl Broker {
 }
 
 impl BrokerState {
+    /// Settles the host's claims of an instance that has left this broker: dropped at once where
+    /// no server ran against its conversations or the server is gone, kept until the server's
+    /// retirement is over otherwise, and kept for good where it left something running.
+    fn hold_until_retired(
+        &mut self,
+        application_instance_id: ApplicationInstanceId,
+        server: ServerOf,
+        claims: Vec<crate::broker::host_claims::HostClaim>,
+    ) {
+        if claims.is_empty() {
+            return;
+        }
+        match server {
+            ServerOf::None | ServerOf::Retired(true) => drop(claims),
+            ServerOf::Retired(false) => self.stranded.extend(claims),
+            ServerOf::Running(server) => self.retiring.push(RetiringServer {
+                instance: application_instance_id,
+                server: Some(server),
+                claims,
+            }),
+            ServerOf::Starting => self.retiring.push(RetiringServer {
+                instance: application_instance_id,
+                server: None,
+                claims,
+            }),
+        }
+    }
+
     /// Advances one instance's binding revision, under the lock the caller already holds.
     ///
     /// See [`Broker::advance_binding`]: this is its whole body, here so that a decision that reads
@@ -4011,6 +4199,11 @@ impl BrokerState {
             .instances
             .get_mut(&application_instance_id)
             .ok_or_else(|| unknown_instance(application_instance_id))?;
+        // A turn still running belonged to the owner the binding is leaving, so it is recorded as
+        // dropped under the revision it ran in, before that revision is left.
+        if let Some(turn) = instance.turn_id.clone() {
+            instance.note("turn.dropped", turn.as_str(), now);
+        }
         instance.binding_revision =
             AgentBindingRevision::new(instance.binding_revision.get().saturating_add(1));
         instance.thread_id = thread_id;
@@ -4457,6 +4650,8 @@ impl BrokerState {
                 application_instance_id,
                 process,
                 backend: None,
+                server_starting: false,
+                server_retired: None,
                 observed: None,
                 binding_revision: AgentBindingRevision::new(1),
                 source_generation: SourceGeneration::new(1),
@@ -4721,7 +4916,12 @@ impl BrokerState {
     /// this claim, that the decision is one the upstream actually offered, and that no answer has
     /// been admitted already. The durable marker is not written here: it goes in immediately
     /// before the bytes, in [`Broker::commit_dispatch`].
-    fn admit_dispatch_in(&mut self, claim: &Claim, option_id: &str) -> Result<DispatchAdmission> {
+    fn admit_dispatch_in(
+        &mut self,
+        claim: &Claim,
+        option_id: &str,
+        encoded: Option<&[u8]>,
+    ) -> Result<DispatchAdmission> {
         // Fenced rich work is fenced here too. Without this a claim taken before the journal
         // faulted could dispatch inside the gap, with no durable marker to stop a second answer.
         self.volatile.require_rich_work()?;
@@ -4745,12 +4945,35 @@ impl BrokerState {
         // admission and the bytes it authorises are one object. The marker is not written yet:
         // this reserves the resource's one transmission, and the marker goes in immediately
         // before the bytes, so an admission that is abandoned leaves the resource answerable.
-        let response = self.gateway.prepare_response(
-            connection,
-            &entry.upstream_request_id,
-            &entry.method,
-            option_id,
-        )?;
+        // The bytes a component encoded are adopted only if they pass the checks any response on
+        // the connection passes; without them the answer is the connection's table's.
+        let response = match encoded {
+            Some(bytes) => self
+                .gateway
+                .adopt_encoded(
+                    connection,
+                    &entry.upstream_request_id,
+                    &entry.method,
+                    option_id,
+                    bytes,
+                )
+                .inspect_err(|_| {
+                    // A person is told that the component's bytes were refused, in a fixed word
+                    // and never in the component's own.
+                    self.note_component_in(
+                        entry.binding_id,
+                        crate::broker::component::ComponentNote::Encoding(
+                            crate::broker::encode::NotEncoded::NotAnAnswer,
+                        ),
+                    );
+                })?,
+            None => self.gateway.prepare_response(
+                connection,
+                &entry.upstream_request_id,
+                &entry.method,
+                option_id,
+            )?,
+        };
         let resource = self.arbitration.commit(transition)?;
         let provenance = self
             .gateway

@@ -52,8 +52,8 @@ case "$platform" in
     *) printf 'usage: %s ios|android\n' "$0" >&2; exit 2 ;;
 esac
 web="${KR_WEB_TREE:-}"
-[ -f "$web/infra/scripts/testing/local-restore.mjs" ] \
-    || { printf 'KR_WEB_TREE names a built checkout of the web repository\n' >&2; exit 2; }
+[ -f "$web/infra/scripts/testing/local-restore.mjs" ] && [ -d "$web/apps/site/dist" ] \
+    || { printf 'KR_WEB_TREE names a built checkout of the web repository (pnpm install, then pnpm build)\n' >&2; exit 2; }
 
 # shellcheck source=scripts/lib/android-avd.sh
 . "$here/scripts/lib/android-avd.sh"
@@ -68,6 +68,7 @@ log="$artefacts/run.log"
 # The messages' outcomes are this run's alone: the judge keeps the last line of each message, and a
 # message this run never sent must not be judged on an earlier run's.
 : >"${artefacts:?}/challenge-outcomes.txt"
+: >"${artefacts:?}/delivery-outcomes.txt"
 # What the harness and the gateway hold lives on the internal disk, for this run.
 harness="$(mktemp -d "${TMPDIR:-/tmp}/kr-push-device.XXXXXX")"
 gateway_state="$harness/gateway"
@@ -154,7 +155,11 @@ start_gateway() {
     say "starting the gateway at $gateway_origin, with the provider stand-in on port $fcm_port"
     node "$web/infra/scripts/testing/local-restore.mjs" start --state "$gateway_state" --name push \
         --port "$gateway_port" --fcm-stand-in "http://127.0.0.1:$fcm_port" >"$artefacts/gateway-start.json" 2>&1 \
-        || { say "the gateway did not start: $(head -c 300 "$artefacts/gateway-start.json")"; return 2; }
+        || {
+            cp "$gateway_state/push.log" "$artefacts/gateway.log" 2>/dev/null
+            say "the gateway did not start: $(head -c 300 "$artefacts/gateway-start.json")"
+            return 2
+        }
     gateway_started=1
 }
 
@@ -307,12 +312,12 @@ for line in phone.splitlines():
 say("the key the host seals to is the key this phone holds (16.11)", own != "" and own == report.get("preview_key_id"),
     f"phone {own} host {report.get('preview_key_id')}")
 if platform == "android":
-    # The store names a file by the digest of the item's name, and the item's name is the key's
-    # identifier in hex.
+    # The store names a file by the digest of the item's name, and holds one sealed item: the set of
+    # preview keys the application handed over, whole. What is in it is sealed under the keystore.
     import hashlib
-    expected = hashlib.sha256((report.get("preview_key_id") or "").encode()).hexdigest()
+    expected = hashlib.sha256(b"preview-keys").hexdigest()
     limited = read("phone-limited.txt").split()
-    say("the limited store holds the key the host seals to, and that key only (16.11, 10.48)",
+    say("the limited store holds the one item that is the set of preview keys, and nothing else (16.11, 10.48)",
         limited == [expected], f"store {limited} expected {expected}")
 else:
     print("note=the iOS keychain cannot be listed from outside: the key's filing is shown by the write that preceded 'on' and by the Swift cases (10.48)")
@@ -334,6 +339,24 @@ else:
         shape.get("apns_alert") is True and shape.get("apns_mutable_content") == 1
         and shape.get("apns_expiration") is True and shape.get("apns_collapse_id") is True, f"{shape}")
 if platform == "android":
+    # The receiver logs why the alert it showed stands, never what the preview held. The question the
+    # worker asks carries no sentence of the host's own, so the host seals nothing to show: the real
+    # receiver opened the real host's seal, found it authentic and addressed to this phone, and had
+    # nothing to put in the alert's place.
+    outcomes = {}
+    for line in read("delivery-outcomes.txt").splitlines():
+        number, _, text = line.partition("|")
+        if number.isdigit():
+            outcomes[int(number)] = text.strip()
+    # The message the host sent with previews off carries none, and its alert stands for that reason.
+    unsealed = {report.get("previews_off_message")} - {None}
+    sealed = [text for number, text in outcomes.items() if number not in unsealed]
+    say("the receiver opened each sealed preview the host sent and found nothing to show (16.11, 16.13)",
+        len(sealed) > 0 and all(text == "delivery: shown (empty_preview)" for text in sealed), f"{sealed}")
+    say("the receiver showed the generic alert for the message the host sent with previews off, which carried no preview (16.11)",
+        report.get("previews_off_message") in outcomes
+        and outcomes[report["previews_off_message"]] == "delivery: shown (no_preview)",
+        f"{outcomes.get(report.get('previews_off_message'))}")
     cold = read("cold-start.txt")
     before_pid = cold.split("pid before the message: '")[1].split("'")[0] if "pid before the message: '" in cold else "?"
     after_pid = cold.split("pid after the message: '")[1].split("'")[0] if "pid after the message: '" in cold else ""
@@ -388,15 +411,37 @@ else:
     say("the phone's second registration ended in the host holding it again (16.16)",
         report.get("destination_back_in_service") is True)
     say("delivery resumed on the new token (16.16)", report.get("delivery_resumed_on_the_new_token") is True)
+    for choice in ("off", "on"):
+        ran = read(f"phone-previews-{choice}.txt")
+        say(f"the phone made the choice of previews {choice} through the command the page's switch uses, and the host was told (16.11)",
+            "the choice of previews was made ok=1" in ran and "done=1" in ran and report.get(f"previews_{choice}_host_told") is True,
+            ran.strip().splitlines()[-2] if ran.strip() else "no result")
+    say("the notification the host sent with previews off carried no preview, and the one with previews on carried one (16.11)",
+        report.get("previews_off_delivered") is True and report.get("previews_off_carries_a_preview") is False
+        and report.get("previews_on_delivered") is True and report.get("previews_on_carries_a_preview") is True,
+        f"off {report.get('previews_off_carries_a_preview')} on {report.get('previews_on_carries_a_preview')}")
+    say("both were put on the phone and shown",
+        report.get("previews_off_put_on_the_phone") is True and report.get("previews_on_put_on_the_phone") is True)
     asked = report.get("burst_asked")
     allowance = report.get("burst_policy_burst")
     say("the host's journal retained every one of the burst's events (16.17)",
         report.get("burst_settled") is True and report.get("burst_events_retained") == asked, f"events {report.get('burst_events_retained')} of {asked}")
-    say("each event is one delivery record, and the host accepted as many as its allowance gives and collapsed the rest (16.17)",
-        report.get("burst_deliveries_written") == asked and isinstance(allowance, int) and isinstance(asked, int)
-        and report.get("burst_accepted") == min(asked, allowance)
-        and report.get("burst_collapsed") == asked - min(asked, allowance) and report.get("burst_other") == 0,
-        f"states {report.get('burst_states')} allowance {allowance}")
+    # What the host sends is the allowance, and what the burst's own time refilled: a whole allowance
+    # every `burst_refill_ms` of its own clock, and one fewer when a notification a moment before the
+    # burst had spent one. The rest is collapsed into at most one attention update, which is an
+    # accepted delivery of its own and is counted apart.
+    span = report.get("burst_span_ms")
+    refill = report.get("burst_refill_ms")
+    sends = report.get("burst_sends")
+    updates = report.get("burst_updates")
+    ints = all(isinstance(value, int) for value in (asked, allowance, span, refill, sends, updates))
+    most = allowance + allowance * span // refill if ints else None
+    say("each event is one delivery record: the host sent as many as its allowance gives, and what the burst's own time refilled, collapsed the rest, and sent at most one attention update (16.17)",
+        report.get("burst_deliveries_written") == asked and ints
+        and min(asked, allowance) - 1 <= sends <= min(asked, most)
+        and updates <= 1
+        and report.get("burst_collapsed") == asked - sends - updates and report.get("burst_other") == 0,
+        f"states {report.get('burst_states')} sends {sends} updates {updates} allowance {allowance} span {span} ms")
     say("what reached the provider is exactly what the host's journal says the gateway accepted (16.17)",
         report.get("burst_provider_caught_up") is True and report.get("burst_at_the_provider") == report.get("burst_accepted"),
         f"provider {report.get('burst_at_the_provider')} accepted {report.get('burst_accepted')}")
@@ -458,6 +503,7 @@ pump_android() { # <adb> <serial>
         outcome="$("$adb" -s "$serial" logcat -d -s KalaReachPush:I 2>/dev/null | tail -n 1 | sed 's/^.*KalaReachPush: //')"
         say "message $n: $(python3 "$here/scripts/lib/push-inject.py" note "$file") -> $outcome"
         if python3 "$here/scripts/lib/push-inject.py" kind "$file" | grep -q '^delivery$'; then
+            printf '%s|%s\n' "$n" "$outcome" >>"$artefacts/delivery-outcomes.txt"
             check_android_notification "$adb" "$serial" "$n"
         else
             printf '%s|%s\n' "$n" "$outcome" >>"$artefacts/challenge-outcomes.txt"
@@ -558,6 +604,15 @@ steps_android() { # <adb> <serial>
             android_launch "$adb" "$serial" newtoken "{\"token\": \"$token-replaced\", \"enable\": true}"
             grep -c 'ok=1' "$artefacts/phone-newtoken.txt" >"$harness/done-newtoken" 2>/dev/null
         fi
+        for choice in off on; do
+            if [ -e "$harness/step-previews-$choice.json" ] && [ ! -e "$harness/started-previews-$choice" ]; then
+                : >"$harness/started-previews-$choice"
+                local flag=false
+                [ "$choice" = on ] && flag=true
+                android_launch "$adb" "$serial" "previews-$choice" "{\"token\": \"$token-replaced\", \"previews\": $flag}"
+                grep -c 'ok=1' "$artefacts/phone-previews-$choice.txt" >"$harness/done-previews-$choice" 2>/dev/null
+            fi
+        done
         sleep 1
     done
 }
@@ -624,14 +679,17 @@ run_android() {
     done
     steps_android "$adb" "$serial" &
     steps_pid=$!
+    "$adb" -s "$serial" logcat -G 16M >/dev/null 2>&1
     "$adb" -s "$serial" logcat -c
     android_launch "$adb" "$serial" register "$(python3 -c 'import json,sys; print(json.dumps({"invitation": open(sys.argv[1]).read().strip(), "enable": True}))' "$harness/invitation.txt")"
     wait_for_report || return 2
     "$adb" -s "$serial" shell run-as "$app_id" cat no_backup/push-pending.json >"$artefacts/phone-pending.json" 2>/dev/null
     "$adb" -s "$serial" shell run-as "$app_id" cat push/push.json >"$artefacts/phone-push.json" 2>/dev/null
     "$adb" -s "$serial" shell run-as "$app_id" ls no_backup/limited-keys 2>/dev/null | tr -d '\r' >"$artefacts/phone-limited.txt"
-    "$adb" -s "$serial" logcat -d -b all 2>/dev/null | grep -v -E 'CompositionEngine|AccessibilityNodeInfoDumper' | tail -3000 >"$artefacts/logcat.log"
+    "$adb" -s "$serial" logcat -d -b all 2>/dev/null | grep -v -E 'CompositionEngine|AccessibilityNodeInfoDumper|s_gl|HWUI|RustStdoutStderr: s_' | tail -40000 >"$artefacts/logcat.log"
     "$adb" -s "$serial" logcat -d -b crash >"$artefacts/crash.log" 2>&1
+    # A crash or a stop of the application that the run does not expect is kept with its trace.
+    "$adb" -s "$serial" shell dumpsys dropbox --print data_app_native_crash data_app_crash data_app_anr >"$artefacts/dropbox.log" 2>&1
     touch "$harness/finish"
     cat "$harness/report.json" >"$artefacts/report.json"
     local status=0 line
@@ -822,6 +880,15 @@ steps_ios() { # <udid>
             ios_launch "$udid" newtoken "{\"token\": \"$token-replaced\", \"enable\": true}"
             grep -c 'ok=1' "$artefacts/phone-newtoken.txt" >"$harness/done-newtoken" 2>/dev/null
         fi
+        for choice in off on; do
+            if [ -e "$harness/step-previews-$choice.json" ] && [ ! -e "$harness/started-previews-$choice" ]; then
+                : >"$harness/started-previews-$choice"
+                local flag=false
+                [ "$choice" = on ] && flag=true
+                ios_launch "$udid" "previews-$choice" "{\"token\": \"$token-replaced\", \"previews\": $flag}"
+                grep -c 'ok=1' "$artefacts/phone-previews-$choice.txt" >"$harness/done-previews-$choice" 2>/dev/null
+            fi
+        done
         sleep 1
     done
 }

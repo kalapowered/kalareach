@@ -177,6 +177,9 @@ impl Backend {
             .take();
         if let Some(server) = server {
             let owned = SessionOwned(self.views.as_ref().map(|(_, runtime)| Weak::clone(runtime)));
+            let broker = Arc::clone(&run.broker);
+            let instance = self.application_instance_id;
+            let identity = server.identity().clone();
             let ending = run.handle.spawn(async move {
                 let retirement = server.retire(&owned, begun).await;
                 if !retirement.survivors.is_empty() {
@@ -187,6 +190,8 @@ impl Backend {
                         retirement.ended
                     );
                 }
+                // The conversations the instance held are free for another session only now.
+                broker.server_retired(instance, &identity, retirement.survivors.is_empty());
                 retirement
             });
             ladders.push(ending);
@@ -260,7 +265,8 @@ impl Backend {
 ///
 /// Returns why the launch cannot go on: the launcher presented no environment, the server could
 /// not be started or does not run the executable that was hashed, its record is not on disk in
-/// time, or the socket could not be bound. The server, if it started, is ended.
+/// time, the socket could not be bound, or the instance has ended and no server is started for it.
+/// The server, if it started, is ended.
 pub(super) async fn start(
     backend: &Arc<Backend>,
     identity: &ExecutableIdentity,
@@ -278,6 +284,13 @@ pub(super) async fn start(
     let attempt = async {
         let presented = environment.pairs();
         drop(environment);
+        // The conversations the instance holds stay held from here, whether or not the instance
+        // ends before the server is recorded, and no server is started for an instance that has
+        // ended. A start that is given up, by an error or by being cancelled with the admission
+        // it is part of, gives the hold up with it.
+        let starting = run
+            .broker
+            .server_starting(backend.application_instance_id)?;
         let (server, unshown) = Server::spawn(
             &ServerSpec {
                 executable: std::path::Path::new(&backend.invocation.executable),
@@ -295,9 +308,17 @@ pub(super) async fn start(
         // from, and it is recorded before it is shown to run what was hashed, which takes as long
         // as the executable is large.
         let server = Arc::new(server);
-        *run.server.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&server));
-        run.broker
-            .set_instance_backend(backend.application_instance_id, server.identity().clone())?;
+        // The server is put where the ending finds it and made known to the broker in one step,
+        // so that an ending that takes it at once settles the hold on the conversations by the
+        // identity the broker has by then.
+        let recorded = {
+            let mut slot = run.server.lock().unwrap_or_else(PoisonError::into_inner);
+            *slot = Some(Arc::clone(&server));
+            starting.recorded();
+            run.broker
+                .set_instance_backend(backend.application_instance_id, server.identity().clone())
+        };
+        recorded?;
         // The record is handed over under the session's lock and waited for outside it.
         let written = {
             let runtime = backend

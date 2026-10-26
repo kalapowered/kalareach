@@ -25,6 +25,8 @@ import {
   COMPOSER_CAPABILITIES,
   composerOffers,
   foldWithheld,
+  drawnUnder,
+  invocationOf,
   liveInstance,
   targetOf,
   withheldTotal
@@ -477,5 +479,52 @@ describe('the control state, from what the worker said (KR-REQ-11.48)', () => {
     expect(
       visibilityOf(control, controlStateOf({ ...facts, bindingState: null, rights: null }))
     ).toEqual({ kind: 'hidden', because: 'this client does not know whether its condition is met' })
+  })
+})
+
+describe("a package's control asks the host for its action only when it can (KR-REQ-13.14)", () => {
+  // The call a click makes, and the input a form takes, are keyed in the conversation's own cases;
+  // what only the model decides is when it asks nothing of the host.
+  const refresh: Control = {
+    id: 'c-2',
+    revision: '1',
+    label: 'Refresh',
+    accessible_description: 'Reads the thread again.',
+    action_id: 'thread.refresh',
+    parameters: { parameters: [] }
+  }
+  const live = instance('i-1', '10')
+  const here = drawnUnder(live, binding())
+  const because = (call: ReturnType<typeof invocationOf>) =>
+    call.kind === 'cannot' ? call.because : null
+
+  it('asks nothing of the host while the agent is unread, unrecognised or its input is unknown', () => {
+    expect(because(invocationOf(refresh, SESSION, null, binding(), here, null))).toContain(
+      'no agent it can call'
+    )
+    expect(because(invocationOf(refresh, SESSION, live, null, here, null))).toContain(
+      'no agent it can call'
+    )
+    expect(because(invocationOf(refresh, SESSION, live, binding(), null, null))).toContain(
+      'before the agent was read'
+    )
+    const unrecognised = { ...live, plugin_id: null }
+    expect(
+      because(
+        invocationOf(refresh, SESSION, unrecognised, binding(), drawnUnder(unrecognised, binding()), null)
+      )
+    ).toContain('No package recognised')
+    expect(
+      because(invocationOf({ ...refresh, parameters: undefined }, SESSION, live, binding(), here, null))
+    ).toContain('cannot tell what this action takes')
+  })
+
+  it('asks nothing of the host for a control drawn under another package', () => {
+    // The page keys the other differences (another instance, a moved revision) through its view.
+    const drawn = drawnUnder({ ...live, plugin_id: 'other.package' }, binding())
+    expect(because(invocationOf(refresh, SESSION, live, binding(), drawn, null))).toContain(
+      'conversation moved'
+    )
+    expect(invocationOf(refresh, SESSION, live, binding(), here, null).kind).toBe('call')
   })
 })

@@ -22,7 +22,7 @@ import type { HeldShare, ShareOffer } from '@kalareach/protocol'
 import { readOnCadence, type Cadence } from '../app/cadence'
 import { failureCode, type AttemptView, type Held, type HostPort } from '../host/port'
 import { sessionOfShare } from './shared-with-you'
-import { roleOfRights, roleWords } from './sharing'
+import { accessWords } from './sharing'
 
 /** How often what a device holds is read while a screen that draws it is shown. */
 export const HELD_READ_CADENCE_MS = 5_000
@@ -45,7 +45,7 @@ export interface EndedShare {
   readonly grantId: string
   readonly sessionId: string | null
   readonly displayNumber: string
-  /** The role it was held as, in words. */
+  /** What it allowed, in words: the role it was held as and what it allowed beyond the role. */
   readonly role: string
   /** When this application read the list that no longer had it, by this computer's clock. */
   readonly seenEndedAtMs: number
@@ -332,7 +332,7 @@ export class HeldBook {
         grantId,
         sessionId: sessionOfShare(earlier),
         displayNumber: earlier.display_number,
-        role: roleWords(roleOfRights(earlier.grant.actions)),
+        role: accessWords(earlier.grant.actions),
         seenEndedAtMs: Date.now()
       })
     }

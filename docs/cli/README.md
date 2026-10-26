@@ -44,7 +44,7 @@ worker directly for what a session owns.
 | `kr share [invite/list/revoke/transfer]` | — | Share a session with a paired device, see who holds a share, take one back, or hand a session's control to another device |
 | `kr plugin [list/install/remove/pin/enable/disable]` | — | Plugin packages and what they may do |
 | `kr plugin repo [list/add/sync/pin/remove]` | — | The repositories plugins come from, and the trust placed in them |
-| `kr privacy [on/off/status]` | — | Turn this environment's privacy mode on or off, or show where it stands |
+| `kr privacy [on/off/status/delete]` | — | Turn this environment's privacy mode on or off, show where it stands, or ask the service to delete a copy that left this host |
 | `kr destination [list/configure/remove]` | — | The places this host sends notifications besides paired devices: a webhook, Slack, Discord, Telegram or email |
 | `kr account [sign-in/sign-out/show]` | — | Sign this host in to the managed account service, in a browser, sign it out, or show where the sign-in stands |
 | `kr host paths` | — | Show where this installation keeps its runtime files and its state |
@@ -883,6 +883,8 @@ The commands `kr question answer`, `kr question cancel`, and `kr question send` 
 
 The `kr question list`, `show`, `answer` and `cancel` commands read a worker's build from its hello before they ask it anything. If the worker is of another compatibility level than the `kr`'s own, then the command does not ask that worker about the question. When `list` skips a worker, it reports which session it did not read, the release that the session is running and the command to run with the `kr` from that release. When `list` is run with the `--json` option it also reports the same information in the `unread` key of the JSON. When `show`, `answer` or `cancel` find the question in no worker they read, and some worker was not read, they exit with exit code 8 (`UNSUPPORTED_SCHEMA` if `--json` is specified), report that they did not send anything, and give the same notes as `list`; when every worker was read, they exit with exit code 2. `kr question drafts` and `send` leave such a worker unread too: they exit with exit code 8 (`UNSUPPORTED_SCHEMA`), name the session and the command to run, and retire none of its kept answers.
 
+`show`, `answer` and `cancel` ask each worker for the question by its identifier, which fits a frame however long the session's history is. A worker that does not hold the question refuses that read, so the command then asks for the worker's pending questions, and a worker that shows them was asked and lacks the question. A worker that cannot be asked is not taken for one that lacks the question: it cannot be reached (a descriptor an ended worker left behind is such a worker), a session descriptor on this host cannot be read, it refuses to show its questions, or its read fails some other way. When no worker holds the question and one could not be asked, the command reports that failure, sends nothing and keeps nothing. With a worker that cannot be reached, or a descriptor that cannot be read, it exits with code 3 and, with `--json`, has no `kept` member; with one that refuses to show its questions it exits with code 8 and the worker's own code; with a reply it cannot read, with code 1. When a worker of another release was not read either, the exit code 8 report above names the session that could not be asked as well.
+
 An answer the worker could not take is kept rather than lost. When the connection to the worker
 fails before the answer is sent, or ends while it is being sent so that nobody can say whether it
 arrived, or the worker refuses it for the moment, `kr question answer` keeps the answer in this
@@ -1154,11 +1156,13 @@ it, and only write it if you approve.
 This does not export private sessions. All sessions are private when in privacy mode, including
 those created after privacy mode is on, and those that have not yet been cleaned up after privacy
 mode was turned off (you can list these sessions using `kr privacy status`). If the worker of one of
-these sessions ended before it could complete the cleanup, it stays on the list even after you turn
-off privacy mode, because what it kept belongs to the archive. There is no other reason why a
-session would be private. Turning privacy mode off starts new retention from that point, so a
-session that went through a private period but does not owe anything to it anymore is exported, and
-so is a session that was created when privacy mode was on but has completed its cleanup.
+these sessions ended before it could complete the cleanup, it stays on the list, even after you turn
+off privacy mode, until the daemon has removed what it kept. The daemon does that when privacy mode
+is turned on, and tries again when it cannot; `kr privacy status` gives the reason. There is no
+other reason why a session would be private. Turning privacy mode off starts new retention from that
+point, so a session that went through a private period but does not owe anything to it anymore is
+exported, and so is a session that was created when privacy mode was on but has completed its
+cleanup.
 
 This first reads whether the host is in privacy mode, then reads the sessions, and then reads
 whether the host is in privacy mode again. If the host is in privacy mode at either read, or if the
@@ -1624,9 +1628,11 @@ If the screen has changed, the document also holds the lines the host kept. It a
 command that withdraws the invitation.
 
 `kr share list` shows each share with its state (waiting to be accepted, active, ended or revoked),
-the device it goes to, its role (the widest role whose default actions the share carries, so a
-viewer share that lets the device answer questions is listed as `viewer`), whether it includes the
-live screen, its session and when it ends.
+the device it goes to, what it allows, whether it includes the live screen, its session and when it
+ends. What a share allows is the widest role whose default actions the share carries, then `plus`
+and each right that role does not cover, so a viewer share that lets the device answer questions is
+listed as `viewer plus question.respond`. A share that carries no role in full, because it has no
+`session.view`, is listed as `custom:` and its rights.
 `kr share revoke` takes a share back, or withdraws an invitation nobody has accepted. A revocation
 is complete when every affected session's worker has fenced it; until then it is pending, and the
 command names what it waits for and exits with 1. Asking again is a new revocation. What the device
@@ -1896,6 +1902,7 @@ Privacy mode is one switch for the whole environment, and only this host turns i
 kr privacy on        # stop retaining content, and clean up what this host kept
 kr privacy status    # where it stands, and what is still owed
 kr privacy off       # retention starts again, once the cleanup is complete
+kr privacy delete <reference>   # ask the service to delete a copy that left this host
 ```
 
 Turning privacy mode on records a new privacy generation before anything else happens, and then
@@ -1906,17 +1913,33 @@ far it has got: work that had already left this host and has not been answered, 
 whose worker has not yet said its own cleanup is complete. `kr privacy off` is refused while a
 service of this host or a session whose worker is running or still starting owes cleanup, and says
 what. A session whose worker has ended does not hold it back, because nothing resumes in its store;
-its obligation stays recorded and `kr privacy status` keeps reporting it. Nothing privacy mode
-removed comes back when it is turned off.
+its obligation stays recorded, and `kr privacy status` keeps reporting it, until the daemon has
+removed what the session kept. Nothing privacy mode removed comes back when it is turned off.
 
 Use `kr privacy status` to also show what data will be retained on this host while in privacy mode
 (and why), and what has left this host (backup archives and notifications, each with whether this
-host holds any way to ask for its removal). This command does not change anything. Other devices
-paired with this host that are granted `host.manage` can read the same report, but no device can
-enable or disable privacy mode. Other devices that are not granted `host.manage` will see only
-whether the host is in privacy mode, what generation it is at, and whether the host indicates it is
-changing privacy mode, as part of `host.info`. For more information on what each step does, and what
-privacy mode does not affect, see `docs/host/README.md`.
+host holds any way to ask for its removal, and for a copy it can, the command that asks). This
+command does not change anything. Other devices paired with this host that are granted `host.manage`
+can read the same report, but no device can enable or disable privacy mode. Other devices that are
+not granted `host.manage` will see only whether the host is in privacy mode, what generation it is
+at, and whether the host indicates it is changing privacy mode, as part of `host.info`. For more
+information on what each step does, and what privacy mode does not affect, see
+`docs/host/README.md`.
+
+`kr privacy delete <reference>` asks the storage service to delete one backup generation that
+`kr privacy status` lists as deletable. Write the reference as the status shows it, for example
+`kr privacy delete 7c1e2d90-0b0e-4f6e-9d6a-1f2b3c4d5e6f generation 3`. It runs outside every
+session, whose worker keeps its output and whose agent could read what it prints, and it is refused
+inside one, with or without `--yes`. It prints what is asked, including that nothing restores from
+the generation afterwards and that, if it was the newest, no restore works until this host makes its
+next backup (which it does once privacy mode is off), and then waits for you to type `delete` at the
+terminal. `--yes` skips that question and is the form for a script outside a session. The host
+reads its list again and refuses a reference that is not listed as deletable. Privacy mode does not
+stop the command. When the service confirms every object, the command prints that and exits with 0.
+When it has not, the command exits with 1 and `RESOURCE_UNAVAILABLE`: the request is written down,
+and running the same command again asks again, or this host sends it once privacy mode is off.
+`--json` prints `{ "ok": ..., "deleted": ..., "report": ... }`, the report in the shape
+`kr privacy status --json` prints.
 
 ## `kr destination`
 
@@ -2117,9 +2140,13 @@ takes the environment's singleton lock first, which a running daemon holds, and 
 daemon or another import holds it. A worker can outlive its daemon, so a journal is not opened while
 anything this host can read says its worker may still be there, or while what would say so cannot be
 read: the environment's registry is read as it is, never brought forward, repaired or written, so an
-environment whose registry is missing, is a link, is at another schema version, has lost a table or
-still holds writes in its write-ahead log imports nothing. Start this build's daemon once and stop
-it again to bring an older registry, or one whose log holds writes, up to date. What is left of a
+environment whose registry is missing, is a link, is at another schema version, has lost the table
+its workers or its closures are read from, or still holds writes in its write-ahead log imports
+nothing. A session whose closure lists a worker that never had its end confirmed is imported only
+when the kernel says that the process its launch ran has ended. The registry's reservation for the
+session records that process. If the kernel does not say so, or the reservation is missing or cannot
+be read, the journal is left as it was. Start this build's daemon once and stop it again to bring
+an older registry, or one whose log holds writes, up to date. What is left of a
 worker whose end is confirmed is removed first, its endpoint before its descriptor, and a journal is
 not opened while any of it is still there. A journal the importer cannot read is refused by name and
 left exactly as it was, and the command then exits with a failure.

@@ -20,7 +20,7 @@ fn registered(controller: &Arc<Controller>) -> (AdmittedMutation, AdmittedMutati
     let remote = ConnectionId::new(kr_ipc::new_uuid());
     let local = ConnectionId::new(kr_ipc::new_uuid());
     let actor = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
-    let mut table = controller.admitted_table();
+    let mut table = controller.admitted_write();
     table.insert(remote, AdmittedConnection::new(actor.clone(), revision));
     table.insert(
         local,
@@ -108,7 +108,7 @@ fn registered_under(controller: &Arc<Controller>, grant: Grant) -> AdmittedMutat
     let revision = controller.policy().authority_revision();
     let connection_id = ConnectionId::new(kr_ipc::new_uuid());
     let actor = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
-    controller.admitted_table().insert(
+    controller.admitted_write().insert(
         connection_id,
         AdmittedConnection::new(actor, revision).under(grant),
     );
@@ -192,4 +192,80 @@ async fn a_connection_admitted_before_the_feed_removed_the_host_is_refused_by_th
         "a personal grant rests on the feed once offline validity is bounded"
     );
     assert_eq!(asked(&controller, &local).await, [true, true]);
+}
+
+/// KR-REQ-24.15: a refusal the feed raises while a commit stands on a connection's registration
+/// rises after the commit, as a withdrawal does: the commit's check read no refusal, so the commit
+/// is the whole of what the connection did under the standing it had, and a commit that begins
+/// after the raise reads it. The commit holds the registration and not the connection table, so
+/// the case holds a commit, starts the raise, waits until it has arrived at the wait for the
+/// commit, and asks the commit what it reads. The raise does not hold the policy's lock while it
+/// waits: the commit is let go by a watchdog if the policy cannot be read meanwhile, which fails
+/// the case.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_feed_refusal_raised_while_a_commit_stands_on_a_registration_rises_after_it() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (_temp, controller) = daemon().await;
+    let (remote, _) = registered(&controller);
+    let (entered, waiting) = std::sync::mpsc::channel::<()>();
+    let (go, going) = std::sync::mpsc::channel::<()>();
+    let committing = {
+        let controller = Arc::clone(&controller);
+        tokio::task::spawn_blocking(move || {
+            controller.under_registration(&remote, || {
+                entered.send(()).expect("the case is waiting");
+                let let_go_by_the_case = going
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .is_ok();
+                (
+                    let_go_by_the_case,
+                    controller.check_registration(&remote).is_ok(),
+                )
+            })
+        })
+    };
+    tokio::task::spawn_blocking(move || waiting.recv().expect("the commit is held"))
+        .await
+        .expect("the wait ended");
+    let raise = {
+        let controller = Arc::clone(&controller);
+        tokio::spawn(async move {
+            controller.raise_the_unverified_withdrawal_refusal().await;
+        })
+    };
+    while controller.withdrawals_waiting.load(Ordering::SeqCst) == 0 && !committing.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !committing.is_finished(),
+        "the commit ended before the raise arrived at the wait for it"
+    );
+    let policy_read = Arc::new(AtomicBool::new(false));
+    let reading = {
+        let (controller, policy_read) = (Arc::clone(&controller), Arc::clone(&policy_read));
+        tokio::task::spawn_blocking(move || {
+            let _policy = controller.policy();
+            policy_read.store(true, Ordering::SeqCst);
+        })
+    };
+    while !policy_read.load(Ordering::SeqCst) && !reading.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    let _ = go.send(());
+    let (let_go_by_the_case, read_no_refusal) = committing
+        .await
+        .expect("the commit ends")
+        .expect("the commit's check read no refusal");
+    assert!(
+        let_go_by_the_case,
+        "the policy could not be read while the raise waited for the commit"
+    );
+    assert!(read_no_refusal, "the refusal rose inside the commit");
+    raise.await.expect("the raise ends");
+    reading.await.expect("the policy was read");
+    assert!(
+        controller.check_registration(&remote).is_err(),
+        "a check that begins after the raise reads it"
+    );
 }

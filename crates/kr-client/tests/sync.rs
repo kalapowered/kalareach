@@ -4068,7 +4068,7 @@ async fn a_refusal_whose_other_content_never_came_down_is_still_dropped_on_reque
 }
 
 // ---------------------------------------------------------------------------
-// KR-REQ-24.28: privacy mode reaches draft publications
+// KR-REQ-24.27 and KR-REQ-24.28: privacy mode reaches draft publications
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -4271,6 +4271,46 @@ async fn a_service_that_was_reset_leaves_a_checkpoint_only_an_explicit_step_clea
             .await
             .expect("published"),
         Published::Accepted { position: at(1) }
+    );
+}
+
+/// KR-REQ-24.29: a record the store holds and this build cannot read may account for a copy that
+/// left, so it is listed beside the kept copies as one nothing can describe or drop, and a list of
+/// the copies alone is not read as complete. The control is the store with no such record, which
+/// lists nothing.
+#[test]
+fn a_record_the_store_cannot_read_is_listed_beside_the_copies_it_keeps() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let store = SyncStore::open(directory.path().join("one")).expect("a store");
+    assert!(
+        kr_client::sync::unreadable_records(&store)
+            .expect("records")
+            .is_empty()
+    );
+
+    std::fs::write(
+        directory
+            .path()
+            .join("one")
+            .join("0b8a5a8a-0d73-4d62-9f1c-6a2f3a1c6d01.request"),
+        b"not a record",
+    )
+    .expect("a record this build cannot read");
+    assert!(
+        kr_client::sync::kept_copies(&store)
+            .expect("copies")
+            .is_empty(),
+        "it is no copy that can be dropped"
+    );
+    let unreadable = kr_client::sync::unreadable_records(&store).expect("records");
+    assert_eq!(unreadable.len(), 1);
+    assert!(!unreadable[0].deletable);
+    assert!(
+        unreadable[0]
+            .reference
+            .starts_with("a record this build cannot read"),
+        "{:?}",
+        unreadable[0].reference
     );
 }
 

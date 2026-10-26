@@ -258,8 +258,8 @@ struct Candidate {
     closed_at_ms: u64,
     retained_bytes: u64,
     /// A digest of the session's identity, when it closed, how much output it retains and whether
-    /// its journal was held back when its summary was built: what a generation keeps of it, and all
-    /// it keeps.
+    /// its summary was built from the closure alone although its journal file is there: what a
+    /// generation keeps of it, and all it keeps.
     digest: Digest256,
 }
 
@@ -372,11 +372,13 @@ impl Controller {
                     backup.holds_finished_ciphertext()?,
                     backup.privacy_status()?,
                     account.mark_at(&origin).map(|mark| mark.to_bytes()),
+                    backup.generations_being_deleted()?,
                 ))
             })
             .await
         };
-        let Ok(Ok((setup, generations, writers, finished, privacy, account))) = facts else {
+        let Ok(Ok((setup, generations, writers, finished, privacy, account, deleting))) = facts
+        else {
             return Some(failed(
                 production,
                 backoff,
@@ -441,7 +443,14 @@ impl Controller {
                     ProductionState::Producing | ProductionState::Complete
                 ) && generation.created_at_ms.get() <= now
             })
-            .max_by_key(|generation| generation.created_at_ms);
+            .max_by_key(|generation| generation.created_at_ms)
+            // The newest generation the host made, when the person has it deleted, is no backup
+            // the host has: the pass behaves as for a host with none, and makes one whatever has
+            // changed and however long ago the deleted one was made. An older generation does not
+            // stand in for it.
+            .filter(|generation| {
+                !deleting.contains(&(generation.archive_id, generation.backup_generation))
+            });
         if let Some(newest) = newest {
             let due = newest.created_at_ms.get().saturating_add(INTERVAL_MS);
             production.observed().next_due_ms = Some(due);
@@ -754,7 +763,12 @@ impl Controller {
                 summary: described.summary,
                 closed_at_ms,
                 retained_bytes: retained,
-                digest: session_digest(session_id, closed_at_ms, retained, described.held_back),
+                digest: session_digest(
+                    session_id,
+                    closed_at_ms,
+                    retained,
+                    described.journal_gave_none,
+                ),
             });
         }
         candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.closed_at_ms));
@@ -1297,25 +1311,29 @@ fn spool_bytes(directory: &std::path::Path) -> u64 {
 }
 
 /// A digest of one session as a generation keeps it: its identifier, when it closed and how much
-/// output it retains, and whether its summary was built from the closure alone because its journal
-/// was held back. The identifier goes into the digest and nowhere else; a member's name is inside
-/// the encrypted manifest and the store never writes it down.
+/// output it retains, and whether its summary was built from the closure alone although the
+/// session's journal file is there. The identifier goes into the digest and nowhere else; a member's
+/// name is inside the encrypted manifest and the store never writes it down.
 ///
-/// A session whose journal was held back digests differently from the same session once the journal
-/// can be read, so a generation made with the poorer summary is made again with the better one. A
-/// session whose journal was not held back digests as it always has.
+/// The mark follows what was packed and not why. A journal that gave no summary (it was held back,
+/// its migration failed, it holds no record of the session, or it cannot be read) leaves the same
+/// closure-only summary whichever of those it is, so the digest does not change when one becomes
+/// another; it changes when the journal gives a summary, so a generation made with the poorer one is
+/// made again with the better one. A session with no journal file, and one whose journal was read,
+/// digest as they always have.
 fn session_digest(
     session_id: SessionId,
     closed_at_ms: u64,
     retained_bytes: u64,
-    journal_held_back: bool,
+    journal_gave_none: bool,
 ) -> Digest256 {
     let mut hashed = Vec::with_capacity(64);
     hashed.extend_from_slice(b"kalareach-backup-session/1");
     hashed.extend_from_slice(session_id.get().as_bytes());
     hashed.extend_from_slice(&closed_at_ms.to_be_bytes());
     hashed.extend_from_slice(&retained_bytes.to_be_bytes());
-    if journal_held_back {
+    if journal_gave_none {
+        // The bytes a mark has always added, so that a session marked before keeps its digest.
         hashed.extend_from_slice(b"journal-held-back");
     }
     Digest256::from_bytes(kr_cbor::sha256(&hashed))

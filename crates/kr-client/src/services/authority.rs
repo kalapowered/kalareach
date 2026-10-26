@@ -638,9 +638,14 @@ impl AuthorityFeedClient {
 
 /// The furthest ahead of its own clock the service lets an announcement expire.
 ///
-/// An announcement is a nudge rather than a record: the service refuses a change whose
-/// announcement lives longer than an hour by its own clock, because the revocation itself is in the
-/// feed and stays there until the host is finished with it. The refusal is of the whole change.
+/// An announcement is a nudge rather than a record: the service declines one that lives longer
+/// than an hour by its own clock, because the revocation itself is in the feed and stays there
+/// until the host is finished with it. The change the announcement came with is committed either
+/// way, and the answer reports the announcement as declined.
+///
+/// The service holds the same figure in its own contract. Neither side reads the other's, so each
+/// holds it to the hour with a case of its own: a change to one side fails there, and is made on
+/// the other side too.
 pub const ANNOUNCEMENT_LIFETIME_MS: u64 = 60 * 60 * 1000;
 
 /// How long an announcement sealed now lives: the service's bound less the freshness of a signed
@@ -648,7 +653,7 @@ pub const ANNOUNCEMENT_LIFETIME_MS: u64 = 60 * 60 * 1000;
 ///
 /// The service admits a request signed up to [`SERVICE_REQUEST_FRESHNESS_MS`] ahead of its own
 /// clock, and an announcement sealed on such a sender's clock would otherwise expire later than the
-/// service's bound and cost the sender the whole change, a revocation among them.
+/// service's bound and be declined, which leaves the host to read the feed at its next poll.
 pub const ANNOUNCEMENT_SEALED_LIFETIME_MS: u64 =
     ANNOUNCEMENT_LIFETIME_MS - SERVICE_REQUEST_FRESHNESS_MS;
 
@@ -1066,6 +1071,24 @@ mod tests {
 
         assert_eq!(http.requests(), 0, "nothing was sent");
         assert_eq!(host_http.requests(), 0, "nothing was sent");
+    }
+
+    /// The service declines an announcement that expires more than an hour after its own clock,
+    /// and admits a request signed up to the freshness window ahead of it. An announcement sealed
+    /// on a clock that far ahead must still expire within the hour: the figure here is the
+    /// service's own, held to the hour by a case on its side too.
+    #[test]
+    fn an_announcement_sealed_on_a_clock_ahead_of_the_services_expires_within_its_hour() {
+        const THE_SERVICES_HOUR_MS: u64 = 3_600_000;
+        let services_clock = 1_800_000_000_000;
+        let senders_clock = services_clock + SERVICE_REQUEST_FRESHNESS_MS;
+
+        assert_eq!(ANNOUNCEMENT_LIFETIME_MS, THE_SERVICES_HOUR_MS);
+        assert_eq!(
+            announcement_expiry(senders_clock).get() - services_clock,
+            THE_SERVICES_HOUR_MS,
+            "a sender at the edge of the freshness window expires at the service's bound and no later"
+        );
     }
 
     #[tokio::test]

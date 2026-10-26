@@ -8,7 +8,8 @@
 //  no keychain synchronisation, no transfer to a new phone.
 //
 //  The application writes; the extension only reads. That asymmetry is the whole point of the
-//  shared access group: one limited key crosses the boundary and nothing else does.
+//  shared access group: the keys that open a notification preview cross the boundary and nothing
+//  else does.
 //
 
 import Foundation
@@ -16,8 +17,10 @@ import Security
 
 /// What a stored key is for.
 enum StoredKeyPurpose: String {
-    /// The limited key the notification extension reads.
+    /// The limited key the notification extension reads: this device's preview seed.
     case notificationPreview = "to.kala.reach.notification-preview"
+    /// The public key of a host that may seal a preview to this device, which the extension reads.
+    case notificationPreviewSender = "to.kala.reach.notification-preview-sender"
     /// This device's own authorisation key, which the extension is not entitled to.
     case deviceAuthorisation = "to.kala.reach.device-authorisation"
 }
@@ -43,7 +46,10 @@ struct SecureKeys {
     /// entitlement happens to list first, which is a decision about who can read a key being made
     /// by the order of two lines in a build description.
     func group(for purpose: StoredKeyPurpose) -> String? {
-        purpose == .notificationPreview ? sharedGroup : privateGroup
+        switch purpose {
+        case .notificationPreview, .notificationPreviewSender: return sharedGroup
+        case .deviceAuthorisation: return privateGroup
+        }
     }
 
     /// Stores one key, replacing whatever was filed under the same account.
@@ -69,6 +75,42 @@ struct SecureKeys {
         item[kSecAttrAccessGroup as String] = group
         SecItemDelete(item as CFDictionary)
         return SecItemAdd(item as CFDictionary, nil)
+    }
+
+    /// The accounts one purpose has keys under, or nil when the keychain refused to say.
+    func accounts(purpose: StoredKeyPurpose) -> [String]? {
+        guard let group = group(for: purpose) else { return nil }
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: purpose.rawValue,
+            kSecAttrAccessGroup as String: group,
+            kSecReturnAttributes as String: true,
+            kSecMatchLimit as String: kSecMatchLimitAll,
+        ]
+        var result: CFTypeRef?
+        switch SecItemCopyMatching(query as CFDictionary, &result) {
+        case errSecSuccess:
+            let items = result as? [[String: Any]] ?? []
+            return items.compactMap { $0[kSecAttrAccount as String] as? String }
+        case errSecItemNotFound:
+            return []
+        default:
+            return nil
+        }
+    }
+
+    /// Removes the key of one purpose filed under `account`. A key that is not there is removed.
+    @discardableResult
+    func remove(purpose: StoredKeyPurpose, account: String) -> OSStatus {
+        guard let group = group(for: purpose) else { return errSecMissingEntitlement }
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: purpose.rawValue,
+            kSecAttrAccount as String: account,
+            kSecAttrAccessGroup as String: group,
+        ]
+        let status = SecItemDelete(query as CFDictionary)
+        return status == errSecItemNotFound ? errSecSuccess : status
     }
 
     /// Removes every key of one purpose, which is what signing out does.

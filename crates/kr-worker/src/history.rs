@@ -92,6 +92,20 @@ struct ResidentMark {
     last_at_ms: u64,
 }
 
+/// How much of a session's retained output a reader may be served.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reach {
+    /// All of it, whether or not the time it was produced at is known.
+    Whole,
+    /// The output from this cursor on, and none before it.
+    From(u64),
+    /// None of the output that exists: the reader reaches only what is produced after `end`.
+    Nothing {
+        /// The cursor after the last byte of output when the reader's reach was worked out.
+        end: u64,
+    },
+}
+
 /// What discarding a session's retained output took, and what it could not.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Discarded {
@@ -1095,6 +1109,78 @@ impl OutputHistory {
             oldest_retained_cursor: U64::new(oldest),
             gap: Nullable(gap),
         })
+    }
+
+    /// Reads one page of retained output for a reader that reaches `reach` of it.
+    ///
+    /// A reader of the whole range is served as [`Self::page`] serves it. One that reaches the
+    /// output from a cursor on is served from there and never before it: the oldest retained
+    /// cursor it is told is the later of the two, and a request that begins before its reach is
+    /// answered with a gap from where it began to where its reach does. That gap carries the cause
+    /// this host recorded only where the range it reports reaches into the reader's reach, as when
+    /// retention, a hole or a boundary this host cannot read took some of it, and none when the
+    /// reader's reach is what ends it, since nothing took the range before and what a reader may
+    /// not see is not a fact about the output. One that reaches none of the output that exists is
+    /// told the output ends where it does, and is served nothing; the output that follows is
+    /// served once a reach begins within it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a spool segment cannot be read.
+    pub fn page_within(
+        &self,
+        from_cursor: u64,
+        max_bytes: u64,
+        reach: Reach,
+    ) -> Result<HistoryPageResult> {
+        let floor = match reach {
+            Reach::Whole => return self.page(from_cursor, max_bytes),
+            Reach::From(floor) => floor,
+            Reach::Nothing { end } => {
+                let end = end.min(self.next_cursor);
+                return Ok(HistoryPageResult {
+                    from_cursor: U64::new(end),
+                    next_cursor: U64::new(end),
+                    bytes: Bytes::new(Vec::new()),
+                    oldest_retained_cursor: U64::new(end),
+                    gap: Nullable((from_cursor < end).then(|| HistoryGap {
+                        from_cursor: U64::new(from_cursor),
+                        to_cursor: U64::new(end),
+                        cause: None,
+                    })),
+                });
+            }
+        };
+        let mut page = self.page(from_cursor.max(floor), max_bytes)?;
+        let oldest = page.oldest_retained_cursor.get();
+        page.oldest_retained_cursor = U64::new(oldest.max(floor));
+        // What the page's own gap says about output before the reach is not the reader's to be
+        // told: it begins no earlier than the reach, and a gap wholly before it says nothing.
+        if let Some(gap) = page.gap.0.as_mut() {
+            gap.from_cursor = U64::new(gap.from_cursor.get().max(floor));
+        }
+        page.gap = Nullable(
+            page.gap
+                .0
+                .filter(|gap| gap.from_cursor.get() < gap.to_cursor.get()),
+        );
+        if from_cursor < floor {
+            // The reader began before its reach, so nothing of what it asked for first is served:
+            // the page begins at the reach, or later where retention or a hole took more, and the
+            // gap runs from where the reader began to where the page does. It names a cause only
+            // when what this host recorded took some of what the reach covers.
+            let cause = page
+                .gap
+                .0
+                .as_ref()
+                .and_then(|gap| gap.cause.filter(|_| gap.to_cursor.get() > floor));
+            page.gap = Nullable(Some(HistoryGap {
+                from_cursor: U64::new(from_cursor),
+                to_cursor: page.from_cursor,
+                cause,
+            }));
+        }
+        Ok(page)
     }
 
     /// Reads what this history holds from `start`, up to `limit` bytes.
@@ -3109,6 +3195,175 @@ mod tests {
             cursor = page.next_cursor.get();
         }
         (gap, bytes)
+    }
+
+    #[test]
+    fn a_reader_with_a_reach_is_served_from_it_and_told_of_nothing_before_it() {
+        let mut history = OutputHistory::in_memory(64);
+        history.append(b"aaaa");
+        history.append(b"bbbb");
+        history.append(b"cccc");
+
+        // Asking from before the reach: the page begins at the reach, and the gap says only that
+        // what came before is not served, with no cause since none took it.
+        for from in [0, 2] {
+            let page = history
+                .page_within(from, 64, Reach::From(4))
+                .expect("a page");
+            assert_eq!(page.bytes.as_slice(), b"bbbbcccc");
+            assert_eq!(page.from_cursor.get(), 4);
+            assert_eq!(page.oldest_retained_cursor.get(), 4);
+            let gap = page.gap.0.expect("the page says what it left out");
+            assert_eq!((gap.from_cursor.get(), gap.to_cursor.get()), (from, 4));
+            assert_eq!(gap.cause, None);
+        }
+
+        // From the reach on, a page is whole.
+        for from in [4, 6] {
+            let page = history
+                .page_within(from, 64, Reach::From(4))
+                .expect("a page");
+            assert_eq!(page.bytes.as_slice(), &b"bbbbcccc"[(from - 4) as usize..]);
+            assert_eq!(page.from_cursor.get(), from);
+            assert!(page.gap.0.is_none());
+        }
+
+        // A reader of the whole range is served what the page serves.
+        assert_eq!(
+            history.page_within(0, 64, Reach::Whole).expect("a page"),
+            history.page(0, 64).expect("a page")
+        );
+    }
+
+    #[test]
+    fn a_reader_that_reaches_none_of_the_output_is_told_where_it_ends() {
+        let mut history = OutputHistory::in_memory(64);
+        history.append(b"aaaabbbb");
+        let page = history
+            .page_within(0, 64, Reach::Nothing { end: 8 })
+            .expect("a page");
+        assert!(page.bytes.as_slice().is_empty());
+        assert_eq!(
+            (page.from_cursor.get(), page.next_cursor.get()),
+            (8, 8),
+            "the next request is from the end"
+        );
+        assert_eq!(page.oldest_retained_cursor.get(), 8);
+        let gap = page.gap.0.expect("what came before is not served");
+        assert_eq!(
+            (gap.from_cursor.get(), gap.to_cursor.get(), gap.cause),
+            (0, 8, None)
+        );
+
+        // Asked from the end, or from past it, there is nothing to say.
+        for from in [8, 20] {
+            let page = history
+                .page_within(from, 64, Reach::Nothing { end: 8 })
+                .expect("a page");
+            assert!(page.bytes.as_slice().is_empty() && page.gap.0.is_none());
+        }
+
+        // Once a reach begins at the old end, as one does when a later interval starts there, the
+        // output written after it is served.
+        history.append(b"cccc");
+        let page = history.page_within(8, 64, Reach::From(8)).expect("a page");
+        assert_eq!(page.bytes.as_slice(), b"cccc");
+    }
+
+    #[test]
+    fn the_gap_of_a_reader_with_a_reach_names_a_cause_only_where_retention_took_the_reach_too() {
+        let directory = spool_directory("reach-cause");
+        let mut history = OutputHistory::with_spool(4, directory.clone(), SpoolLayout::new(8, 16))
+            .expect("a spool");
+        for _ in 0..8 {
+            history.append(&[b'z'; 8]);
+        }
+        let oldest = history.oldest_retained_cursor();
+        assert!(oldest > 8, "retention took the first segments: {oldest}");
+
+        // The reach is inside what retention took: the reader is told as any reader is.
+        let page = history.page_within(0, 64, Reach::From(8)).expect("a page");
+        let ordinary = history.page(0, 64).expect("a page");
+        assert_eq!(page, ordinary);
+        assert!(
+            ordinary
+                .gap
+                .0
+                .as_ref()
+                .is_some_and(|gap| gap.cause.is_some())
+        );
+
+        // The reach is inside what is retained: the reader's own reach is the gap's end.
+        let reach = oldest + 8;
+        let page = history
+            .page_within(0, 64, Reach::From(reach))
+            .expect("a page");
+        assert_eq!(page.from_cursor.get(), reach);
+        assert_eq!(page.oldest_retained_cursor.get(), reach);
+        let gap = page.gap.0.expect("a gap");
+        assert_eq!((gap.from_cursor.get(), gap.to_cursor.get()), (0, reach));
+        assert_eq!(gap.cause, None, "nothing took what the reach leaves out");
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn a_hole_inside_the_readers_reach_is_named_in_the_gap_that_runs_to_the_page() {
+        let directory = spool_directory("reach-hole");
+        let mut history =
+            OutputHistory::with_spool(4, directory.clone(), SpoolLayout::new(8, 1 << 20))
+                .expect("a spool");
+        for _ in 0..8 {
+            history.append(&[b'z'; 8]);
+        }
+        // The file of the third segment goes from under the index, so nothing holds [16, 24).
+        std::fs::remove_file(directory.join(format!("{:020}.out", 16)))
+            .expect("takes the segment's file away");
+
+        // The reach begins inside the hole: the gap runs to the end of it, and the hole is named.
+        let page = history.page_within(0, 64, Reach::From(20)).expect("a page");
+        assert_eq!(page.from_cursor.get(), 24);
+        let gap = page.gap.0.expect("a gap");
+        assert_eq!((gap.from_cursor.get(), gap.to_cursor.get()), (0, 24));
+        assert!(
+            gap.cause.is_some(),
+            "the hole is part of what the reach covers"
+        );
+
+        // The reach begins after the hole: nothing the reader's reach covers was lost.
+        let page = history.page_within(0, 64, Reach::From(24)).expect("a page");
+        assert_eq!(page.from_cursor.get(), 24);
+        let gap = page.gap.0.expect("a gap");
+        assert_eq!((gap.from_cursor.get(), gap.to_cursor.get()), (0, 24));
+        assert_eq!(gap.cause, None);
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn a_range_this_host_cannot_account_for_is_named_only_where_it_reaches_into_the_readers_reach()
+    {
+        let directory = spool_directory("reach-unaccounted");
+        let mut history =
+            OutputHistory::with_spool(4, directory.clone(), SpoolLayout::new(8, 1 << 20))
+                .expect("a spool");
+        history.append(&[b'z'; 64]);
+        history.spool.as_mut().expect("a spool").unreadable_boundary = true;
+
+        // The host cannot say what lies before its oldest cursor, which is before the reach: the
+        // reader is told what its own reach leaves out and nothing of the range it could not read.
+        let page = history.page_within(0, 64, Reach::From(16)).expect("a page");
+        let gap = page
+            .gap
+            .0
+            .expect("the reader's reach begins after the start");
+        assert_eq!((gap.from_cursor.get(), gap.to_cursor.get()), (0, 16));
+        assert_eq!(gap.cause, None);
+        // Asked from inside its reach, the same host has nothing to say of what lies before it.
+        let page = history
+            .page_within(20, 64, Reach::From(16))
+            .expect("a page");
+        assert!(page.gap.0.is_none(), "{:?}", page.gap);
+        assert_eq!(page.from_cursor.get(), 20);
+        std::fs::remove_dir_all(&directory).ok();
     }
 
     #[test]

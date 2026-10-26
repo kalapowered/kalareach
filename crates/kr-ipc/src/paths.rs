@@ -116,6 +116,30 @@ impl HostPaths {
         self.state_root.join("environment-id")
     }
 
+    /// Returns the directory holding the locks that keep two launches of one saved conversation
+    /// apart, across every session of every environment this user runs.
+    ///
+    /// A saved conversation lives in the application's own store, which belongs to the operating
+    /// system user and not to an environment, so the locks sit in the state root they share. It is
+    /// not the runtime root: a claim is held for as long as an execution lives, which can be days,
+    /// and the system's cleaner of temporary files empties a runtime root that is under a
+    /// temporary directory, file by file, whatever holds the lock. The files are empty, and the
+    /// `-1` in the name is the form their names take, which workers of different builds that run
+    /// side by side must agree on.
+    #[must_use]
+    pub fn conversation_claims_dir(&self) -> PathBuf {
+        self.state_root.join("conversation-claims-1")
+    }
+
+    /// Returns the lock file named `file_name` in [`HostPaths::conversation_claims_dir`].
+    ///
+    /// The name is the caller's: a conversation is named by typed text, so the caller derives a
+    /// name that is safe in a path from it.
+    #[must_use]
+    pub fn conversation_claim_path(&self, file_name: &str) -> PathBuf {
+        self.conversation_claims_dir().join(file_name)
+    }
+
     /// Reads this installation's environment identity, allocating one on first use.
     ///
     /// The identity binds one installation and one OS user. It is a random identifier, never a

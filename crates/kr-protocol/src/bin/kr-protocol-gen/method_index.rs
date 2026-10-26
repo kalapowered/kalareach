@@ -127,7 +127,9 @@ pub(crate) const fn described_in(method: Method) -> Section {
         | Method::DeliveryDestinationRemove
         | Method::DeliveryDestinationList => at(DELIVERY, "Configuring and removing a destination"),
         Method::DeliveryDestinationSecretSet => at(DELIVERY, "Credentials"),
-        Method::PrivacySet | Method::PrivacyStatus => at(HOST, "Privacy mode"),
+        Method::PrivacySet | Method::PrivacyStatus | Method::PrivacyRetainedDelete => {
+            at(HOST, "Privacy mode")
+        }
         Method::BackupRead | Method::BackupBundleWrite => {
             at(HOST, "Reading a backup for a restore")
         }

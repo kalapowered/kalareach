@@ -202,7 +202,7 @@ impl InboxDesk {
         }
         // The answer waits for the slowest host, so an account may have left since the pass that
         // read a host ended. What was read for it is not handed on.
-        found
+        let read: Vec<HostInbox> = found
             .into_iter()
             .filter(|each| {
                 each.read_over
@@ -210,6 +210,28 @@ impl InboxDesk {
                     .is_none_or(|connection| connection.ended_by_this_device().is_none())
             })
             .map(|each| each.inbox)
+            .collect();
+        Self::settled(device, read)
+    }
+
+    /// The answers of a pass that are still for one of the other hosts when the pass ends.
+    ///
+    /// Each visit asked about its own host when it ended, and a slower visit has run since: a host
+    /// this device forgot, or began to use, in the meantime is not reported either. A list that
+    /// cannot be read now decides nothing, and the answers stand as each visit left them.
+    fn settled(device: &Device, found: Vec<HostInbox>) -> Vec<HostInbox> {
+        let Ok(listed) = device.pairing().hosts.list() else {
+            return found;
+        };
+        let in_use = device.host_in_use().map(|host| host.host_device_id);
+        let others: BTreeSet<String> = listed
+            .iter()
+            .filter(|host| Some(host.host_device_id) != in_use)
+            .map(reference_of)
+            .collect();
+        found
+            .into_iter()
+            .filter(|each| others.contains(&each.reference))
             .collect()
     }
 
@@ -384,7 +406,7 @@ async fn present(
     presentation: Presentation,
 ) -> Result<(), Missed> {
     let pairing = device.pairing();
-    let identity = pairing.candidate.paired_identity(host.device_id);
+    let identity = pairing.paired_identity_for(host);
     pairing
         .link
         .present_membership(&connection.session(), host, &identity, presentation)
@@ -393,7 +415,9 @@ async fn present(
             LinkError::Refused(refusal) | LinkError::Membership(refusal) => {
                 Missed::Refused(CommandError::from(refusal))
             }
-            LinkError::Lost(_) | LinkError::Configuration(_) => Missed::Unreached,
+            LinkError::Lost(_) | LinkError::Configuration(_) | LinkError::Selection(_) => {
+                Missed::Unreached
+            }
         })
 }
 

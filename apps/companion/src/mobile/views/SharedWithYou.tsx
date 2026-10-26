@@ -16,6 +16,7 @@ import {
   sentenceCase,
   sessionOfShare,
   sessionWords,
+  shareBeyond,
   shareEnds,
   shareRole
 } from '../../model/shared-with-you'
@@ -56,7 +57,9 @@ export function SharedWithYou({
                 <span className="m-row-kind">{shareRole(share)}</span>
               </span>
               <span className="m-row-title">{title(share.display_number)}</span>
-              <span className="m-row-detail">{shareEnds(share, view.readAtMs)}</span>
+              <span className="m-row-detail">
+                {[shareBeyond(share), shareEnds(share, view.readAtMs)].filter((part) => part !== '').join(' · ')}
+              </span>
             </>
           )
           return (

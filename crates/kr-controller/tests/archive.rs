@@ -1151,19 +1151,38 @@ async fn a_server_the_worker_recorded_is_asked_to_end_without_a_hang_up() {
 /// A record this pass may not act on stops nothing, and the closure says why. The processes are
 /// real and carry their true identities, so the only reason they are left alone is the record.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_record_from_another_boot_or_none_at_all_stops_nothing_and_says_why() {
-    for what in ["another boot", "a record that names no boot", "no record"] {
+async fn a_record_of_a_boot_that_cannot_be_compared_or_none_at_all_stops_nothing_and_says_why() {
+    for what in [
+        "another kind of boot",
+        "a boot of another length",
+        "a record that names no boot",
+        "no record",
+    ] {
         let (_temp, archive) = host();
         let session_id = session();
         let leftover = leftover();
         {
             let mut journal = journal_for(&archive, session_id);
             let mut record = owned_record(vec![leftover.identity.clone()]);
+            let now = kr_ipc::identity::boot_identity().expect("this boot");
             match what {
-                "another boot" => {
+                "another kind of boot" => {
                     record.boot = Some(kr_protocol::identity::BootIdentity {
-                        source: kr_protocol::identity::BootIdentitySource::BootTime,
+                        source: if now.source == kr_protocol::identity::BootIdentitySource::BootTime
+                        {
+                            kr_protocol::identity::BootIdentitySource::LinuxBootId
+                        } else {
+                            kr_protocol::identity::BootIdentitySource::BootTime
+                        },
                         value: kr_protocol::scalars::Bytes::new(b"not this boot".to_vec()),
+                    });
+                }
+                "a boot of another length" => {
+                    let mut value = now.value.as_slice().to_vec();
+                    value.push(0);
+                    record.boot = Some(kr_protocol::identity::BootIdentity {
+                        source: now.source,
+                        value: kr_protocol::scalars::Bytes::new(value),
                     });
                 }
                 "a record that names no boot" => record.boot = None,
@@ -1186,8 +1205,50 @@ async fn a_record_from_another_boot_or_none_at_all_stops_nothing_and_says_why() 
                 .any(|resource| resource.kind == "unestablished"),
             "{what}: the closure says why: {fenced:?}"
         );
+        assert!(
+            !fenced.earlier_boot,
+            "{what}: such a record does not say the worker went with an earlier boot"
+        );
         assert_eq!(fenced.coverage, OwnershipCoverage::Incomplete, "{what}");
     }
+}
+
+/// KR-REQ-24.18: a record that names an earlier boot of this boot's own kind says the worker went with that boot:
+/// nothing is stopped, since no process of one boot runs in another, and nothing is listed as
+/// surviving, since nothing outlives a boot. The pass says so, and the closure can give the host's
+/// restart as the reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_record_of_an_earlier_boot_of_this_boots_kind_stops_nothing_and_lists_nothing() {
+    let (_temp, archive) = host();
+    let session_id = session();
+    let leftover = leftover();
+    {
+        let mut journal = journal_for(&archive, session_id);
+        let mut record = owned_record(vec![leftover.identity.clone()]);
+        let now = kr_ipc::identity::boot_identity().expect("this boot");
+        let mut value = now.value.as_slice().to_vec();
+        value[0] ^= 0xff;
+        record.boot = Some(kr_protocol::identity::BootIdentity {
+            source: now.source,
+            value: kr_protocol::scalars::Bytes::new(value),
+        });
+        journal
+            .record_owned(session_id, &record)
+            .expect("records what the session owned");
+    }
+    let ownership = take(&archive, session_id);
+    let fenced = archive.fence_owned(&ownership, None).await;
+    assert!(leftover.running(), "nothing was stopped");
+    assert!(fenced.ended.is_empty(), "nothing is reported ended");
+    assert!(
+        fenced.surviving.is_empty(),
+        "a worker of an earlier boot owned nothing that outlived the boot: {fenced:?}"
+    );
+    assert!(
+        fenced.earlier_boot,
+        "and the pass says the worker went with its boot"
+    );
+    assert_eq!(fenced.coverage, OwnershipCoverage::Incomplete);
 }
 
 /// A process the platform will not let this host stop is named in the closure, by identifier and
@@ -2154,6 +2215,152 @@ fn a_journal_a_worker_may_still_own_is_not_imported() {
             "a journal a worker may still own is left alone"
         );
     }
+}
+
+/// A session whose version 1 journal is on disk and whose registry closure lists a worker whose end
+/// was never confirmed, with a reservation that records `launcher` as the process the launch ran
+/// (`None` records none), as an environment is left by a daemon that closed it over a worker it
+/// could not see end.
+fn unconfirmed_session(
+    archive: &ArchiveService,
+    launcher: Option<&kr_protocol::identity::ProcessStartIdentity>,
+) -> (SessionId, DisplayNumber) {
+    let mut registry = registry(archive);
+    let reservation = registry
+        .reserve(
+            &ActorId::new("local:501").expect("a principal"),
+            kr_ipc::new_uuid(),
+            kr_protocol::scalars::Digest256::from_bytes([3; 32]),
+            &[0xa0],
+            TimestampMs::new(1),
+        )
+        .expect("a reservation")
+        .reservation;
+    if let Some(launcher) = launcher {
+        registry
+            .record_launch(reservation.reservation_id, launcher)
+            .expect("records the process the launch ran");
+    }
+    let session_id = reservation.session_id;
+    write_version_one_journal(archive, session_id);
+    let mut record = closure(session_id, ClosureReason::WorkerCrash);
+    record.surviving = vec![SurvivingResource {
+        kind: "unaccounted_worker".to_owned(),
+        detail: "its end was never confirmed".to_owned(),
+    }];
+    registry
+        .record_closure(&record)
+        .expect("records the closure");
+    (session_id, reservation.display_number)
+}
+
+#[test]
+fn a_closures_unconfirmed_worker_no_longer_blocks_the_import_once_the_process_its_launch_ran_has_ended()
+ {
+    // KR-REQ-24.30. A closure that lists a worker whose end was never confirmed is a claim made when
+    // the session closed. The kernel's later answer about the process the session's launch ran, read
+    // from its reservation, lifts it; the same proof lifts the daemon's. What is left of the worker
+    // is fenced before the journal is opened. Anything short of that answer keeps the refusal.
+    use kr_controller::archive::ImportOutcome;
+    let (_temp, archive) = host();
+    let ended = kr_ipc::identity::ended_process_identity(5);
+    let running = kr_ipc::identity::current_process_start_identity().expect("an identity");
+
+    let (lifted, _) = unconfirmed_session(&archive, Some(&ended));
+    publish_descriptor(&archive, lifted, &ended);
+    let (still_running, _) = unconfirmed_session(&archive, Some(&running));
+    let (no_launch, _) = unconfirmed_session(&archive, None);
+
+    let imported = archive.import_journals().expect("imports");
+    assert_eq!(
+        outcome_of(&imported, lifted),
+        ImportOutcome::Imported {
+            from: 1,
+            to: kr_worker::persistence::migration::CURRENT,
+            receipts: 1,
+        },
+        "the launch's process ended, so nothing says a worker may remain"
+    );
+    assert!(
+        !archive.paths().descriptor_file(lifted).exists(),
+        "and what was left of its worker was fenced before the journal was opened"
+    );
+    // A launch whose process runs, and a reservation that records no launch.
+    for session_id in [still_running, no_launch] {
+        refused_as_owned(
+            &archive,
+            &outcome_of(&imported, session_id),
+            session_id,
+            "never confirmed",
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn what_a_lifted_closure_left_of_its_worker_is_fenced_by_the_display_number_of_its_reservation() {
+    // KR-REQ-24.30. With no worker row and no descriptor, the reservation is what says which
+    // endpoint the worker published: the one at its display number is removed before the journal is
+    // opened, and an endpoint at another number is not the session's and stays.
+    use kr_controller::archive::ImportOutcome;
+    let (_temp, archive) = host();
+    let ended = kr_ipc::identity::ended_process_identity(7);
+    let (session_id, display_number) = unconfirmed_session(&archive, Some(&ended));
+    let own = PublishedEndpoint::of(&archive, display_number);
+    let other = PublishedEndpoint::of(&archive, DisplayNumber::new(display_number.get() + 1));
+
+    let imported = archive.import_journals().expect("imports");
+    assert!(
+        matches!(
+            outcome_of(&imported, session_id),
+            ImportOutcome::Imported { from: 1, .. }
+        ),
+        "{:?}",
+        outcome_of(&imported, session_id)
+    );
+    assert!(
+        !own.exists(),
+        "the endpoint at the reservation's display number was fenced"
+    );
+    assert!(
+        other.exists(),
+        "and another worker's endpoint was not touched"
+    );
+}
+
+#[test]
+fn a_reservation_that_cannot_be_read_only_keeps_the_refusal_it_was_read_to_lift() {
+    // The reservation is evidence to lift a closure's claim, never a blocker of its own: a registry
+    // without its reservations keeps the refusal for a closure that lists an unconfirmed worker and
+    // imports the journal of one that lists none.
+    use kr_controller::archive::ImportOutcome;
+    let (_temp, archive) = host();
+    let ended = kr_ipc::identity::ended_process_identity(6);
+    let (unconfirmed, _) = unconfirmed_session(&archive, Some(&ended));
+    let plain = session();
+    write_version_one_journal(&archive, plain);
+    registry(&archive)
+        .record_closure(&closure(plain, ClosureReason::RootExit))
+        .expect("records the closure");
+    rusqlite::Connection::open(archive.paths().registry_database())
+        .expect("a second connection")
+        .execute_batch("DROP TABLE reservations;")
+        .expect("the table goes");
+
+    let imported = archive.import_journals().expect("imports");
+    refused_as_owned(
+        &archive,
+        &outcome_of(&imported, unconfirmed),
+        unconfirmed,
+        "reservation could not be read",
+    );
+    assert!(
+        matches!(
+            outcome_of(&imported, plain),
+            ImportOutcome::Imported { from: 1, .. }
+        ),
+        "a closure that lists no such worker needs no reservation"
+    );
 }
 
 /// What the import did with one session's journal.

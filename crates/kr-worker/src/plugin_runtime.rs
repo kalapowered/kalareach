@@ -187,6 +187,7 @@ async fn privacy_sync(broker: Weak<Broker>) {
         match calls.client() {
             None => {
                 told = None;
+                #[cfg(feature = "testing")]
                 lane.runtime_was_told(None);
             }
             Some(client) => {
@@ -196,11 +197,13 @@ async fn privacy_sync(broker: Weak<Broker>) {
                 if !current {
                     if client.privacy(private).await.is_ok() {
                         told = Some((Arc::downgrade(&client), private));
+                        #[cfg(feature = "testing")]
                         lane.runtime_was_told(Some(private));
                         // Either may have moved while the request was out.
                         continue;
                     }
                     told = None;
+                    #[cfg(feature = "testing")]
                     lane.runtime_was_told(None);
                     retry = Some(PRIVACY_RETRY);
                 }

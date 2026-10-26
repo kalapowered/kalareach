@@ -586,12 +586,20 @@ impl Broker {
         now: TimestampMs,
     ) -> std::result::Result<PendingResource, NotDecoded> {
         let projection = project(decoded, &job.upstream_id, &job.table)?;
-        self.interpret(job.binding_id, job.resource_id, projection, None, now)
+        let mut state = self.state();
+        let interpreted = state
+            .interpret_in(job.binding_id, job.resource_id, projection, None, now)
             .map_err(|error| match error {
                 BrokerError::Trust(TrustError::NoDecisions) => NotDecoded::NoDecisions,
                 BrokerError::Trust(TrustError::SummaryTooLong { .. }) => NotDecoded::SummaryTooLong,
                 _ => NotDecoded::Refused,
-            })
+            })?;
+        // What the component is handed of this request again, to write its answer, is made in
+        // privacy mode if the request was.
+        state
+            .arbitration
+            .set_made_in_privacy(job.resource_id, job.private);
+        Ok(interpreted)
     }
 
     /// Records that a request was not decoded by its component, in the words a person reads in the

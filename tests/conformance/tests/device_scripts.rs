@@ -216,8 +216,9 @@ fn run(
     fs::create_dir_all(package.parent().expect("a parent")).expect("a directory");
     fs::write(package, "").expect("a package");
     fs::write(tree.join("application.apk"), "").expect("a package");
-    // What the receiver's script builds with and installs from, and the web checkout the push
-    // script starts its gateway from.
+    // What the receiver's script builds with and installs from, and the built web checkout the push
+    // script starts its gateway from (it refuses a tree that lacks the driver or the built site
+    // before it starts anything or builds, which is why the stand-in has both).
     let android = companion.join("src-tauri/gen/android");
     let outputs = android.join("app/build/outputs/apk");
     for package in [
@@ -231,6 +232,7 @@ fn run(
     let driver = tree.join("web/infra/scripts/testing/local-restore.mjs");
     fs::create_dir_all(driver.parent().expect("a parent")).expect("a directory");
     fs::write(driver, "").expect("a driver");
+    fs::create_dir_all(tree.join("web/apps/site/dist")).expect("a built site");
 
     fs::write(root.join("avds.txt"), format!("{}\n", listed.join("\n"))).expect("a list");
     if let Some((serial, name)) = running {

@@ -731,6 +731,21 @@ fn windows() -> Vec<Step> {
                 ],
             )
         },
+        Step {
+            reading: Reading::Build,
+            ..Step::cargo(
+                Group::Rust,
+                "the description process the update suite assembles into releases",
+                &[
+                    "build",
+                    "--locked",
+                    "-p",
+                    "kr-describe-model",
+                    "--bin",
+                    "kr-describe-inference",
+                ],
+            )
+        },
         Step::cargo(
             Group::Rust,
             "the terminal engine, the repository boundary, the attach client and pairing",
@@ -1373,6 +1388,18 @@ fn windows() -> Vec<Step> {
                 "pwsh_windows",
             ],
         ),
+        Step::cargo(
+            Group::Rust,
+            "the PowerShell package a Windows host publishes",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-shell-integration",
+                "--test",
+                "pwsh_windows_package",
+            ],
+        ),
         qualified_only(
             "the reference bridge over a real endpoint",
             &[
@@ -1567,6 +1594,74 @@ fn windows() -> Vec<Step> {
                 "kr-controller",
                 "--test",
                 "descriptions",
+            ],
+        ),
+        Step::cargo(
+            Group::Rust,
+            "how a session's closure reaches its attachments",
+            &["test", "--locked", "-p", "kr-worker", "--test", "closure"],
+        ),
+        Step::cargo(
+            Group::Rust,
+            "the daemon ended during output",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-worker",
+                "--test",
+                "controller_kill",
+            ],
+        ),
+        Step::cargo(
+            Group::Rust,
+            "the decisions a membership lease gives",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-controller",
+                "--test",
+                "grants",
+                "--test",
+                "organisation",
+            ],
+        ),
+        Step::cargo(
+            Group::Rust,
+            "an expired membership on a live connection",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-controller",
+                "--test",
+                "network",
+                "--",
+                "--ignored",
+                "--exact",
+                "a_members_running_subscription_ends_with_its_lease_and_a_new_lease_serves_the_device_again",
+                "a_members_read_and_mutation_are_refused_on_a_connection_that_stays_up_once_its_lease_ends",
+                "an_exclusive_host_holds_its_local_owner_to_a_lease_at_the_worker_and_at_the_daemon",
+                "ending_exclusive_management_serves_the_local_owner_without_a_lease_and_turning_it_on_closes_it_again",
+                "a_shorter_renewal_ends_the_local_owners_access_at_the_worker_when_the_new_lease_does",
+            ],
+        ),
+        Step::cargo(
+            Group::Rust,
+            "the recovery bundle store and its write record",
+            &["test", "--locked", "-p", "kr-client", "--test", "recovery"],
+        ),
+        Step::cargo(
+            Group::Rust,
+            "the host's events reaching a real window",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "companion-tauri",
+                "--test",
+                "host_events",
             ],
         ),
         Step::cargo(
@@ -1883,6 +1978,18 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         },
     },
     IgnoredRun {
+        package: "kr-cli",
+        target: "--test shell_windows",
+        cases: &[
+            "a_default_session_is_refused_without_the_entry_and_managed_with_it",
+            "a_program_whose_package_ships_a_component_starts_the_plugin_host_on_windows",
+            "the_bundled_agents_typed_at_the_managed_prompt_are_launched_through_the_forwarder",
+        ],
+        runs: Runs::ByHand {
+            why: "they write the account's PowerShell profiles and put them back, so they run on the Windows test machine under a run that records and restores the profiles",
+        },
+    },
+    IgnoredRun {
         package: "kr-conformance",
         target: "--test applications",
         cases: &[],
@@ -1921,7 +2028,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         cases: &[],
         runs: Runs::Command {
             file: "scripts/real-package-cases.sh",
-            line: "step cargo test -p kr-worker --test fence -- --ignored --exact a_real_qualified_package_registers_and_qualifies_on_this_hosts_endpoint a_startup_prompt_takes_its_answer_through_the_worker_and_the_session_is_ready_after_the_profile a_startup_prompt_nobody_answers_leaves_the_session_not_ready_and_it_still_closes a_real_package_asks_the_real_worker_before_each_command_and_runs_a_bypass_as_typed a_real_shell_that_ran_cd_is_described_by_its_new_directory_at_the_next_prompt a_real_shell_names_the_program_it_resolved_and_not_a_word_it_found_no_file_for a_real_readers_fence_is_invalidated_by_the_hosts_answer_and_proven_again",
+            line: "step cargo test -p kr-worker --test fence -- --ignored --exact a_real_qualified_package_registers_and_qualifies_on_this_hosts_endpoint a_startup_prompt_takes_its_answer_through_the_worker_and_the_session_is_ready_after_the_profile a_startup_prompt_nobody_answers_leaves_the_session_not_ready_and_it_still_closes a_real_package_asks_the_real_worker_before_each_command_and_runs_a_bypass_as_typed a_real_shell_that_ran_cd_is_described_by_its_new_directory_at_the_next_prompt a_real_shell_names_the_program_it_resolved_and_not_a_word_it_found_no_file_for a_real_readers_fence_is_invalidated_by_the_hosts_answer_and_proven_again a_moved_powershell_package_qualifies_with_its_own_module_over_a_competing_one",
         },
     },
     IgnoredRun {
@@ -2089,14 +2196,6 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         cases: &[],
         runs: Runs::ByHand {
             why: "it needs the real description process and weights that KR_DESCRIBE_INFERENCE names, which no step of this repository has",
-        },
-    },
-    IgnoredRun {
-        package: "kr-controller",
-        target: "--test native_bridge",
-        cases: &[],
-        runs: Runs::Nowhere {
-            why: "a parked case: the recipe format has no removal step that waits until nothing else is left",
         },
     },
 ];

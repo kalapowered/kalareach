@@ -352,6 +352,17 @@ fn nt_path(path: &Path) -> io::Result<Vec<u16>> {
 /// Returns the operating system's error when the directory cannot be made or the junction cannot
 /// be set on it, and then leaves no directory behind.
 pub(super) fn create_junction(link: &Path, target: &Path) -> io::Result<()> {
+    let data = junction_data(target)?;
+    std::fs::create_dir(link)?;
+    let set = set_junction(link, &data);
+    if set.is_err() {
+        let _ = std::fs::remove_dir(link);
+    }
+    set
+}
+
+/// The reparse data of a junction that names the directory `target`.
+fn junction_data(target: &Path) -> io::Result<Vec<u8>> {
     let substitute = nt_path(target)?;
     // The print name is the target as a person reads it, without the NT prefix.
     let print = substitute[4..].to_vec();
@@ -377,38 +388,46 @@ pub(super) fn create_junction(link: &Path, target: &Path) -> io::Result<()> {
     for unit in substitute.iter().chain(&[0]).chain(&print).chain(&[0]) {
         buffer.extend_from_slice(&unit.to_le_bytes());
     }
+    Ok(buffer)
+}
 
-    std::fs::create_dir(link)?;
-    let set = (|| {
-        let directory = OpenOptions::new()
-            .write(true)
-            .share_mode(SHARE_ALL)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(link)?;
-        let mut returned = 0_u32;
-        // SAFETY: the handle is the open directory's own, `buffer` holds the reparse data it is
-        // told, and no output buffer is asked for.
-        let done = unsafe {
-            DeviceIoControl(
-                directory.as_raw_handle(),
-                FSCTL_SET_REPARSE_POINT,
-                buffer.as_ptr().cast(),
-                u32::try_from(buffer.len()).unwrap_or(0),
-                std::ptr::null_mut(),
-                0,
-                &raw mut returned,
-                std::ptr::null_mut(),
-            )
-        };
-        if done == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    })();
-    if set.is_err() {
-        let _ = std::fs::remove_dir(link);
+/// Makes the empty directory `link` a junction with the reparse data `data`.
+fn set_junction(link: &Path, data: &[u8]) -> io::Result<()> {
+    let directory = OpenOptions::new()
+        .write(true)
+        .share_mode(SHARE_ALL)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(link)?;
+    let mut returned = 0_u32;
+    // SAFETY: the handle is the open directory's own, `data` holds the reparse data it is told,
+    // and no output buffer is asked for.
+    let done = unsafe {
+        DeviceIoControl(
+            directory.as_raw_handle(),
+            FSCTL_SET_REPARSE_POINT,
+            data.as_ptr().cast(),
+            u32::try_from(data.len()).unwrap_or(0),
+            std::ptr::null_mut(),
+            0,
+            &raw mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if done == 0 {
+        return Err(io::Error::last_os_error());
     }
-    set
+    Ok(())
+}
+
+/// Makes the existing empty directory `directory` a junction that names `target`, as another
+/// process of the account can while a removal has the directory open.
+///
+/// # Errors
+///
+/// Returns the operating system's error when the junction cannot be set.
+#[cfg(feature = "testing")]
+pub(super) fn make_junction_in_place(directory: &Path, target: &Path) -> io::Result<()> {
+    set_junction(directory, &junction_data(target)?)
 }
 
 /// Renames the directory or junction `from` to `to`, replacing a directory or junction that is
@@ -637,6 +656,26 @@ impl Left {
     }
 }
 
+/// What a test runs at the one moment a removal can be raced: right after a directory was pinned
+/// and checked, before its names are read.
+#[cfg(feature = "testing")]
+pub(super) static AFTER_PIN: std::sync::Mutex<Option<std::sync::Arc<dyn Fn(&Path) + Send + Sync>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(feature = "testing")]
+fn after_pin(directory: &Path) {
+    let hook = AFTER_PIN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(hook) = hook {
+        hook(directory);
+    }
+}
+
+#[cfg(not(feature = "testing"))]
+fn after_pin(_directory: &Path) {}
+
 /// A failure that is not a program's hold: the operating system's code is left out of it, so that
 /// nothing takes it for one.
 fn refused(what: &str, path: &Path, error: &io::Error) -> io::Error {
@@ -710,6 +749,7 @@ fn remove_directory(directory: &Path, left: &mut Left) -> bool {
         left.add(refused("cannot give back", directory, &error));
         return false;
     }
+    after_pin(directory);
     let entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) => {

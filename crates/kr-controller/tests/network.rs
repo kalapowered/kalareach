@@ -14,11 +14,11 @@
 //! a test suite must never do that, so every create checks what the kernel actually gave the
 //! process it started.
 //!
-//! The session this drives is a POSIX shell in a Unix pseudo-terminal, signalled by process group
-//! and read from the process table, so the suite is a Unix suite. The Windows equivalents of the
-//! same paths are qualified against a Windows console in the worker's Windows module.
-
-#![cfg(unix)]
+//! The session this drives is a POSIX shell in a pseudo-terminal, signalled by process group and
+//! read from the process table on Unix. On Windows the daemon starts each worker through the
+//! environment's scheduled task, as the shipping daemon does, and the shell is the POSIX shell Git
+//! for Windows installs; the cases that read a process's working directory or signal a group are
+//! Unix cases.
 
 #[allow(dead_code)]
 #[path = "net_support/pairing.rs"]
@@ -38,6 +38,7 @@ use kr_controller::registry::Registry;
 use kr_controller::service::net::devices::DeviceRecord;
 use kr_controller::service::net::{self, Network, NetworkSetup};
 use kr_controller::service::{Clocks, Controller, ControllerSetup, WallClock};
+#[cfg(not(windows))]
 use kr_controller::supervision::DetachedSupervisor;
 use kr_crypto::connect::PairedPeer;
 use kr_crypto::keys::DeviceKeys;
@@ -123,11 +124,24 @@ const THIRD_MARKER: &str = "kalareach-lastly";
 /// The command that produces it.
 const THIRD_MARKER_COMMAND: &str = "printf 'kala%s-lastly\n' reach\n";
 
+/// Output the session writes before a device is paired, and what is typed to write it. Its marker
+/// never appears in the command's own echo.
+const BEFORE_MARKER: &str = "kalareach-before";
+const BEFORE_COMMAND: &str = "printf 'kala%s-before\n' reach\n";
+
+/// Output the session writes after the pairing, and what is typed to write it.
+const AFTER_MARKER: &str = "kalareach-after";
+const AFTER_COMMAND: &str = "printf 'kala%s-after\n' reach\n";
+
 /// A host tree on the internal disk, with the worker beside it.
 struct Host {
     /// The host tree, which ends every worker its daemon started before it goes, and is kept
     /// instead when one of them cannot be established as ended.
     temp: teardown::Tree,
+    /// The environment's scheduled task, through which a Windows daemon here starts each worker.
+    /// Declared after the tree, so it is removed once the tree has ended what was started.
+    #[cfg(windows)]
+    task: kr_controller::supervision::windows::testing::TestTask,
     worker: PathBuf,
     environment_id: EnvironmentId,
 }
@@ -146,10 +160,35 @@ impl Host {
         // Started once here, where nothing is timed, so the operating system's check of a new
         // executable is not paid inside a create's rendezvous.
         kr_ipc::testing::place_and_start_once(&worker_build, &worker, &["--version"]);
+        #[cfg(windows)]
+        let task = kr_controller::supervision::windows::testing::TestTask::register(
+            &temp.environment(),
+            &kr_controller::supervision::windows::testing::built_binary("kr-controller")
+                .unwrap_or_else(|missing| panic!("{missing}")),
+        )
+        .unwrap_or_else(|failure| panic!("the environment's task: {failure}"));
         Self {
             temp,
+            #[cfg(windows)]
+            task,
             worker,
             environment_id,
+        }
+    }
+
+    /// The supervisor this host's daemon starts workers through.
+    ///
+    /// On Windows, the one the shipping daemon chooses: the environment's scheduled task, whose
+    /// starter creates each worker outside the jobs a test run holds its daemon in. Elsewhere, a
+    /// detached process of the daemon's own.
+    fn platform_supervisor(&self) -> Box<dyn kr_controller::supervision::WorkerSupervisor> {
+        #[cfg(windows)]
+        {
+            self.task.product_supervisor(&self.paths())
+        }
+        #[cfg(not(windows))]
+        {
+            Box::new(DetachedSupervisor::new())
         }
     }
 
@@ -199,7 +238,7 @@ impl Host {
             }),
             secret_store: StoreSelection::File,
             boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-            supervisor: self.temp.supervisor(Box::new(DetachedSupervisor::new())),
+            supervisor: self.temp.supervisor(self.platform_supervisor()),
             worker_program: self.worker.clone(),
             build_id: build(),
             release: "0".to_owned(),
@@ -337,7 +376,7 @@ fn create_params(environment_id: EnvironmentId, cwd: &Path) -> SessionCreatePara
     SessionCreateParams {
         environment_id,
         presentation: Presentation::Attach,
-        shell: Nullable::some("/bin/sh".to_owned()),
+        shell: Nullable::some(kr_worker::testing::posix_shell()),
         shell_mode: ShellMode::NativeCompat,
         cwd: Nullable::some(cwd.display().to_string()),
         dimensions: Nullable::null(),
@@ -379,8 +418,9 @@ async fn create(client: &mut LocalClient, host: &Host) -> SessionCreateResult {
 /// Read from the process table rather than from anything this test arranged: what is being checked
 /// is what the process actually got, and a launch that quietly inherited a directory looks exactly
 /// like one that was given the right one until the kernel is asked. Linux and macOS answer that for
-/// another process, and a refusal to answer fails here. So does a platform this suite knows no way
-/// to ask, because a comparison that could not be made is not one that passed.
+/// another process, and a refusal to answer fails here. Windows is not asked: the check is about a
+/// removable volume a worker must not hold open, which the Windows hosts do not have.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn working_directory_of(pid: u32) -> PathBuf {
     #[cfg(target_os = "linux")]
     {
@@ -400,13 +440,6 @@ fn working_directory_of(pid: u32) -> PathBuf {
             .unwrap_or_else(|| {
                 panic!("the process table named no working directory for process {pid}")
             })
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        panic!(
-            "this suite knows no way to ask this platform for the working directory of process \
-             {pid}, so the check that the host put its worker there cannot run here"
-        )
     }
 }
 
@@ -442,12 +475,17 @@ fn runs_where_the_host_put_it(host: &Host, session_id: SessionId) {
         "and the binary it started is not inside it either: {}",
         host.worker.display()
     );
-    let actual = working_directory_of(pid);
-    assert_eq!(
-        std::fs::canonicalize(&actual).unwrap_or(actual),
-        expected,
-        "the worker runs in the directory the host configured"
-    );
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let actual = working_directory_of(pid);
+        assert_eq!(
+            std::fs::canonicalize(&actual).unwrap_or(actual),
+            expected,
+            "the worker runs in the directory the host configured"
+        );
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let _ = pid;
 }
 
 /// Returns the workspace this test was built from.
@@ -954,6 +992,123 @@ async fn type_and_wait_for(
         "the bytes reached the application"
     );
     observe(session, &mut events, wanted).await
+}
+
+/// Types `text` into the session as the person at this machine does, on the worker's own socket,
+/// and returns the cursor after the output that carries `wanted`, as the owner reads it.
+///
+/// The connection that typed stays open until the output has come back: a worker discards the
+/// input a closed connection has not delivered.
+async fn the_owner_types_until(
+    endpoint: &kr_ipc::paths::Endpoint,
+    environment_id: EnvironmentId,
+    session_id: SessionId,
+    text: &str,
+    wanted: &str,
+) -> u64 {
+    let mut client = LocalClient::connect(endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("the local client reaches the worker");
+    let target = ActionTarget {
+        environment_id,
+        session_id: Nullable::some(session_id),
+        session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+        application_instance_id: Nullable::null(),
+        agent_binding_revision: Nullable::null(),
+    };
+    let attached: SessionAttachResult = client
+        .mutate(
+            Method::SessionAttach,
+            ActionId::new(kr_ipc::new_uuid()),
+            target.clone(),
+            &SessionAttachParams {
+                session_id,
+                mode: AttachMode::Terminal,
+                claim_geometry: false,
+                dimensions: Nullable::some(kr_protocol::session::Dimensions {
+                    rows: U64::new(24),
+                    columns: U64::new(80),
+                }),
+                terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                requested: [
+                    AttachmentCapability::ObserveTerminal,
+                    AttachmentCapability::Input,
+                ]
+                .into_iter()
+                .collect(),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the attachment is admitted")
+        .to_typed()
+        .expect("an attachment");
+    let attachment_id = attached.attachment.attachment_id;
+    let acquired: InputAcquireResult = client
+        .mutate(
+            Method::InputAcquire,
+            ActionId::new(kr_ipc::new_uuid()),
+            target,
+            &InputAcquireParams {
+                session_id,
+                attachment_id,
+                expected_epoch: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the lease is acquired")
+        .to_typed()
+        .expect("a lease");
+    client
+        .request(
+            Method::InputWrite,
+            &InputWriteParams {
+                session_id,
+                attachment_id,
+                epoch: acquired.lease.epoch,
+                sequence: kr_protocol::ids::InputSequence::new(0),
+                bytes: kr_protocol::scalars::Bytes::new(text.as_bytes().to_vec()),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the owner's input reaches the terminal");
+    // Each read is a round trip to the worker, which is what spaces them: the loop waits for the
+    // output and for nothing else, and ends at a deadline if it never comes.
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    loop {
+        let page = the_owners_page(&mut client, session_id).await;
+        if String::from_utf8_lossy(page.bytes.as_slice()).contains(wanted) {
+            return page.next_cursor.get();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the session's retained output never carried {wanted:?}"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
+/// The session's retained output from the start, as the owner reads it on the worker's own socket.
+async fn the_owners_page(
+    client: &mut LocalClient,
+    session_id: SessionId,
+) -> kr_protocol::recovery::HistoryPageResult {
+    client
+        .request(
+            Method::HistoryPage,
+            &kr_protocol::recovery::HistoryPageParams {
+                session_id,
+                from_cursor: U64::ZERO,
+                max_bytes: U64::new(64 * 1024),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the owner is served the page")
+        .to_typed()
+        .expect("decodes")
 }
 
 /// Closes a session and waits for the daemon to record that its worker has gone.
@@ -2091,9 +2246,9 @@ impl Membership {
 /// Printed through format strings, so the echo of the command itself matches neither.
 fn flag_loop(flag: &Path) -> String {
     format!(
-        "while :; do printf 'kala%s-tick\\n' reach; if [ -f '{path}' ]; then \
-         printf 'kala%s-flag-%s\\n' reach \"$(cat '{path}')\"; fi; sleep 0.2; done\n",
-        path = flag.display()
+        "while :; do printf 'kala%s-tick\\n' reach; if [ -f {path} ]; then \
+         printf 'kala%s-flag-%s\\n' reach \"$(cat {path})\"; fi; sleep 0.2; done\n",
+        path = kr_worker::testing::shell_quoted(flag)
     )
 }
 
@@ -3603,6 +3758,16 @@ async fn a_devices_grant_bounds_what_it_can_reach() {
         .to_typed()
         .expect("an attachment");
 
+    // The session writes before the device is paired, and the owner reads that.
+    let before_ends = the_owner_types_until(
+        &worker_endpoint,
+        host.environment_id,
+        session_id,
+        BEFORE_COMMAND,
+        BEFORE_MARKER,
+    )
+    .await;
+
     let device = Device::create(&loopback()).await;
     let record = pair_with(
         &daemon,
@@ -3649,17 +3814,46 @@ async fn a_devices_grant_bounds_what_it_can_reach() {
         .expect_err("a grant with no geometry right claims no geometry");
     assert_eq!(claimed.code(), ErrorCode::PermissionDenied);
 
-    // Retained history is not something this host can narrow to a grant's lower bound, so it is
-    // refused rather than served in full.
+    // Retained output is served to the grant, narrowed to its lower bound, which this grant leaves
+    // at its pairing. What the session wrote before then is not in the page, whatever the page
+    // begins at; and where the page begins at or before the output written after the pairing, it
+    // carries it.
+    let after_starts = the_owners_page(&mut attached_locally, session_id)
+        .await
+        .next_cursor
+        .get();
+    the_owner_types_until(
+        &worker_endpoint,
+        host.environment_id,
+        session_id,
+        AFTER_COMMAND,
+        AFTER_MARKER,
+    )
+    .await;
     let history = session
         .history_page(&kr_protocol::recovery::HistoryPageParams {
             session_id,
             from_cursor: U64::ZERO,
-            max_bytes: U64::new(4_096),
+            max_bytes: U64::new(64 * 1024),
         })
         .await
-        .expect_err("retained history is refused");
-    assert_eq!(history.code(), ErrorCode::PermissionDenied);
+        .expect("the grant reaches the output written after its pairing");
+    let served = String::from_utf8_lossy(history.bytes.as_slice()).into_owned();
+    assert!(
+        !served.contains(BEFORE_MARKER),
+        "what the session wrote before the pairing is not served: {served:?}"
+    );
+    assert!(
+        history.from_cursor.get() >= before_ends,
+        "the page begins no earlier than the pairing: {} before {before_ends}",
+        history.from_cursor.get()
+    );
+    if history.from_cursor.get() <= after_starts {
+        assert!(
+            served.contains(AFTER_MARKER),
+            "what the session wrote after the pairing is served: {served:?}"
+        );
+    }
 
     // An attachment identifier is not permission: the device may detach its own and nothing else.
     let attached = attach(&session, host.environment_id, session_id).await;

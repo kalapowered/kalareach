@@ -62,14 +62,19 @@ pub const START_LIMIT: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// How long this host waits for the answer to one mutation.
 ///
-/// A create waits for its worker for up to thirty seconds inside the destination's daemon, which
-/// says nothing until it has the answer. This is the bound the network door puts on the same wait.
-pub const MUTATION_LIMIT: std::time::Duration = std::time::Duration::from_secs(45);
+/// A create waits for its worker inside the destination's daemon, which says nothing until it has
+/// the answer: up to a managed create's rendezvous and its shell's qualification. This is the bound
+/// the network door puts on the same wait.
+pub const MUTATION_LIMIT: std::time::Duration = crate::service::CREATE_WAIT;
 
-/// How long an attached stream may go without any frame at all, a keepalive included.
+/// How long an attached stream may go without any frame at all, a keepalive included, while nothing
+/// has been asked of it.
 ///
 /// The destination's daemon and workers send a keepalive every few seconds, so a stream that says
-/// nothing for this long is not an idle session but a frozen bridge, and it ends.
+/// nothing for this long is not an idle session but a frozen bridge, and it ends. A wait for the
+/// answer to a request is held to the bound its caller gave it instead: while the destination's
+/// daemon performs a mutation it sends no keepalive, and a create that waits for its worker says
+/// nothing until it has the answer.
 pub const STREAM_SILENCE_LIMIT: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// What a helper of a release before the opening's `start` member says when it refuses an opening it
@@ -929,8 +934,10 @@ impl Shared {
 ///   that drops it in a `select!` loses nothing.
 /// * **The connection's own traffic is not the caller's.** A renewed action window replaces the
 ///   one the stream quotes, and a keepalive is not returned; both count as the destination being
-///   heard from, and a stream that is not heard from for [`STREAM_SILENCE_LIMIT`] ends with
-///   [`Refusal::Silent`].
+///   heard from, and a stream that is not heard from for [`STREAM_SILENCE_LIMIT`] while its caller
+///   waits for nothing in particular ends with [`Refusal::Silent`]. A caller that waits for the
+///   answer to a request ([`Self::response`]) gives the wait a bound of its own, which is then the
+///   only bound on it.
 /// * **What the helper writes to its standard error is kept, not shown.** It is read from the same
 ///   place as the rest of a helper's diagnostics, and [`Self::diagnostics`] says how much there was.
 #[derive(Debug)]
@@ -1254,9 +1261,13 @@ impl BridgeStream {
 
     /// Takes the answer to one request, leaving everything else for [`Self::recv`], in order.
     ///
+    /// The wait is held to `limit` and to nothing else, since the destination may say nothing at
+    /// all while it makes the answer.
+    ///
     /// # Errors
     ///
-    /// As [`Self::recv`], and [`Refusal::Silent`] when no answer came within `limit`.
+    /// As [`Self::recv`], except that it is `limit` and not [`STREAM_SILENCE_LIMIT`] that ends the
+    /// wait: [`Refusal::Silent`] when no answer came within `limit`.
     pub async fn response(
         &mut self,
         request_id: RequestId,
@@ -1299,26 +1310,26 @@ impl BridgeStream {
                 if let Some(ended) = pending.ended.clone() {
                     return Err(ended);
                 }
-                let heard = pending.last_heard + self.shared.silence;
-                match limit {
-                    Some(limit) => heard.min(asked + limit),
-                    None => heard,
+                // A wait with a bound of its own is held to that bound and to nothing else: the
+                // caller chose how long the answer may take, and a destination that is making a
+                // session says nothing until it has made it. A wait without one is held to the
+                // stream's silence.
+                let (deadline, waited) = match limit {
+                    Some(limit) => (asked + limit, limit),
+                    None => (
+                        pending.last_heard + self.shared.silence,
+                        self.shared.silence,
+                    ),
+                };
+                // Judged here, under the lock the reader updates what it heard under, so that a
+                // keepalive that has arrived is never missed, and frames arriving one after another
+                // cannot keep a wait that is already due going.
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(Refusal::Silent { waited });
                 }
+                deadline
             };
-            if tokio::time::timeout_at(deadline, arrived).await.is_err() {
-                let pending = self.shared.lock();
-                let silent_since = pending.last_heard + self.shared.silence;
-                if tokio::time::Instant::now() >= silent_since {
-                    return Err(Refusal::Silent {
-                        waited: self.shared.silence,
-                    });
-                }
-                if let Some(limit) = limit
-                    && tokio::time::Instant::now() >= asked + limit
-                {
-                    return Err(Refusal::Silent { waited: limit });
-                }
-            }
+            let _ = tokio::time::timeout_at(deadline, arrived).await;
         }
     }
 
@@ -2329,6 +2340,94 @@ mod tests {
             .await;
     }
 
+    /// A mutation that makes a session is answered when the session is made, and the destination
+    /// says nothing in between: not even a keepalive, since the loop that serves the connection is
+    /// busy with the mutation. The caller that asked for the answer chose how long it may take, and
+    /// that is the only bound on the wait; the stream's silence bound is for a stream nobody has
+    /// asked anything of.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_answer_asked_for_with_a_bound_of_its_own_outlasts_the_streams_silence() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let encode = |frame: &BridgeFrame| {
+            FrameCodec::new(StreamKind::Control)
+                .encode_message(frame)
+                .expect("the frame encodes")
+        };
+        let first = directory.path().join("first");
+        let late = directory.path().join("late");
+        std::fs::write(
+            &first,
+            encode(&BridgeFrame::HelloAck(Box::new(acknowledgement()))),
+        )
+        .expect("written");
+        std::fs::write(&late, encode(&answer_to(7))).expect("written");
+        // The helper answers the hello, says nothing for a second, which is several times the
+        // silence bound the stream is given, and then answers the request.
+        let opening = Opening {
+            command: BridgeCommand {
+                program: "/bin/sh".to_owned(),
+                arguments: vec![
+                    "-c".to_owned(),
+                    "head -c 4 >/dev/null; cat \"$1\"; sleep 1; cat \"$2\"; exec sleep 600"
+                        .to_owned(),
+                    "sh".to_owned(),
+                    first.to_str().expect("text").to_owned(),
+                    late.to_str().expect("text").to_owned(),
+                ],
+            },
+            environment_id: here(),
+            hello: hello(),
+        };
+        let silence = std::time::Duration::from_millis(200);
+        let mut stream = opening
+            .launch()
+            .await
+            .expect("the helper answered as the enrolled environment")
+            .into_stream_within(silence, kr_protocol::limits::MAX_SEND_QUEUE_BYTES);
+        let answered = tokio::time::timeout(
+            READER_LIVENESS,
+            stream.response(RequestId::new(7), READER_LIVENESS),
+        )
+        .await
+        .expect("the wait ends")
+        .expect("the stream outlasts its silence bound while an answer is awaited");
+        assert_eq!(answered.request_id, RequestId::new(7));
+        let _ = stream
+            .close_within(std::time::Duration::from_millis(100), KILL_LIMIT)
+            .await;
+    }
+
+    /// The bound a caller gives an answer is still a bound: a destination that never answers ends
+    /// the wait at it, with the time the caller allowed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_answer_that_does_not_come_within_its_own_bound_ends_the_wait_at_the_bound() {
+        let (_directory, opening) = writing(
+            &[BridgeFrame::HelloAck(Box::new(acknowledgement()))],
+            "exec sleep 600",
+        );
+        let bound = std::time::Duration::from_millis(300);
+        let mut stream = opening
+            .launch()
+            .await
+            .expect("the helper answered as the enrolled environment")
+            .into_stream_within(
+                std::time::Duration::from_secs(600),
+                kr_protocol::limits::MAX_SEND_QUEUE_BYTES,
+            );
+        assert_eq!(
+            tokio::time::timeout(READER_LIVENESS, stream.response(RequestId::new(7), bound))
+                .await
+                .expect("the wait ends")
+                .expect_err("nothing answers"),
+            Refusal::Silent { waited: bound }
+        );
+        let _ = stream
+            .close_within(std::time::Duration::from_millis(100), KILL_LIMIT)
+            .await;
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn a_keepalive_counts_as_the_destination_being_heard_from() {
@@ -2962,6 +3061,11 @@ mod tests {
         // daemon, and a mutation waits for the destination's own bound on a create.
         assert!(START_LIMIT > SILENCE_LIMIT);
         assert!(MUTATION_LIMIT > SILENCE_LIMIT);
+        assert!(
+            MUTATION_LIMIT
+                > crate::service::RENDEZVOUS_TIMEOUT + kr_worker::runtime::QUALIFICATION_DEADLINE,
+            "a mutation that is a managed create outlasts what its worker takes"
+        );
         let opening = open_for_person(
             &enrolment(),
             here(),

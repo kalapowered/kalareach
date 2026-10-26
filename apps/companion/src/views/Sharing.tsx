@@ -55,6 +55,7 @@ import { ask } from '../mobile/model/call'
 import {
   HISTORY_CHOICES,
   ROLES,
+  accessWords,
   actionWords,
   attemptWords,
   defaultLasting,
@@ -67,8 +68,6 @@ import {
   nameWords,
   pairingEnd,
   platformWords,
-  roleOfRights,
-  roleWords,
   spanWords,
   stateWords,
   visibly,
@@ -652,7 +651,7 @@ function SharingTab({
               {grantRows.map((summary) => {
                 const rights: readonly ActionRight[] = summary.grant.actions
                 const name = nameWords(nameOf(summary.grant.recipient_device_id))
-                const role_ = roleWords(roleOfRights(rights))
+                const access = accessWords(rights)
                 return (
                   <div
                     className="divided-row access-row"
@@ -665,7 +664,7 @@ function SharingTab({
                     <span className="spacer access-who">
                       <span className="access-name">{name}</span>
                       <span className="small faint">
-                        {role_}
+                        {access}
                         {summary.ends_at_ms !== null
                           ? ` · until ${momentWords(Number(summary.ends_at_ms), now)}`
                           : ''}

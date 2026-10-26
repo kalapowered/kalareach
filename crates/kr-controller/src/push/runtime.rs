@@ -57,6 +57,12 @@ use super::{Clock, DeliveryModule, SystemClock};
 /// The scope the attention store's announcements are taken under: one store, so one cursor.
 pub const ATTENTION_SCOPE: &str = "environment";
 
+/// The scope the host's pairing outbox is taken under: a store of its own, so a cursor of its own.
+pub const PAIRING_SCOPE: &str = "pairings";
+
+/// The completed pairings one pass reads from the outbox.
+const PAIRINGS_PER_PASS: usize = 64;
+
 /// How often the runtime works, and how often each loop may ask a gateway what became of a
 /// notification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,6 +94,48 @@ pub const CONFIRMATIONS_PER_DEVICE: StatusAllowance = StatusAllowance {
     burst: 3,
     per_hour: 6,
 };
+
+/// How many times an hour one paired device may have a credential confirmed that only changes its
+/// choice of previews: a burst of three, then six an hour.
+///
+/// Every change of the choice reaches the host as a registration with a new bearer, since the
+/// device asks the gateway to issue first, and every bearer is confirmed. The changes are counted
+/// apart from [`CONFIRMATIONS_PER_DEVICE`], so that a person who changes the choice does not spend
+/// what the device's next token refresh needs. The host-wide allowance for the nonce
+/// ([`CONFIRMATIONS_PER_HOST`]) is shared by both.
+pub const PREVIEW_CHANGES_PER_DEVICE: StatusAllowance = StatusAllowance {
+    burst: 3,
+    per_hour: 6,
+};
+
+/// What a registration is, for the allowance of the device that makes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Registering {
+    /// Every registration that is not a change of the choice of previews: a first registration, a
+    /// token refresh, a new authorisation, a destination that was out of service.
+    NewCredential,
+    /// A credential for the authorisation and installation the destination in service already
+    /// names, with the other choice of previews.
+    PreviewsChoice,
+}
+
+impl Registering {
+    fn allowance(self) -> StatusAllowance {
+        match self {
+            Self::NewCredential => CONFIRMATIONS_PER_DEVICE,
+            Self::PreviewsChoice => PREVIEW_CHANGES_PER_DEVICE,
+        }
+    }
+
+    fn refusal(self) -> &'static str {
+        match self {
+            Self::NewCredential => "this device has registered too often; try again later",
+            Self::PreviewsChoice => {
+                "this device has changed its choice of previews too often; try again later"
+            }
+        }
+    }
+}
 
 /// How many nonces for a renewal this host asks the gateway for, to confirm credentials, whichever
 /// devices hand them over: a burst of six, then six an hour.
@@ -170,12 +218,16 @@ pub struct DeliveryRuntime {
     signer: Arc<dyn ServiceSigner>,
     adapters: OnceLock<Adapters>,
     attention: OnceLock<Arc<crate::attention::AttentionModule>>,
+    /// The host's pairing outbox, which every pass takes the completed pairings of.
+    pairings: OnceLock<crate::service::net::invitations::InvitationRows>,
     /// The mailbox service this host places the objects of its previews in, when its configuration
     /// document selects one.
     mailbox: OnceLock<kr_protocol::service::GatewayOrigin>,
     recovered: AtomicBool,
-    /// What each paired device may still ask the gateway about a credential it hands over.
-    confirmations: Mutex<std::collections::BTreeMap<kr_protocol::ids::DeviceId, StatusBudget>>,
+    /// What each paired device may still ask the gateway about a credential it hands over, for
+    /// each kind of registration.
+    confirmations:
+        Mutex<std::collections::BTreeMap<(kr_protocol::ids::DeviceId, Registering), StatusBudget>>,
     /// What all devices together may still spend of the gateway's allowance for renewing and
     /// revoking, on nonces that confirm a credential.
     nonces: StatusBudget,
@@ -214,6 +266,7 @@ impl DeliveryRuntime {
             signer,
             adapters: OnceLock::new(),
             attention: OnceLock::new(),
+            pairings: OnceLock::new(),
             mailbox: OnceLock::new(),
             recovered: AtomicBool::new(false),
             confirmations: Mutex::new(std::collections::BTreeMap::new()),
@@ -354,6 +407,14 @@ impl DeliveryRuntime {
         self.attention.set(attention).is_ok()
     }
 
+    /// Hands the runtime the host's pairing outbox, whose completed pairings every pass takes and
+    /// tells the owner's devices of.
+    ///
+    /// Once, like the attention store. Returns false when one was already attached.
+    pub fn attach_pairings(&self, rows: crate::service::net::invitations::InvitationRows) -> bool {
+        self.pairings.set(rows).is_ok()
+    }
+
     /// Returns true once recovery has succeeded.
     #[must_use]
     pub fn is_recovered(&self) -> bool {
@@ -477,8 +538,67 @@ impl DeliveryRuntime {
                 eprintln!("kr-controller: the attention store could not be taken from: {refusal}");
             }
         }
+        self.take_pairings(view, now_ms);
         if let Err(error) = self.module.finish_pending(self.authority.as_ref(), now_ms) {
             eprintln!("kr-controller: taken announcements were not produced from: {error}");
+        }
+    }
+
+    /// Takes the completed pairings the outbox holds past this journal's cursor into it.
+    ///
+    /// The outbox keeps every row, so the cursor is the one this journal holds under its own
+    /// consumer: a row is read again after a stop until the journal has committed it with its
+    /// cursor, and the event key absorbs a repeat.
+    fn take_pairings(&self, view: kr_delivery::producer::PrivacyView, now_ms: u64) {
+        let Some(rows) = self.pairings.get() else {
+            return;
+        };
+        let consumer = kr_delivery::journal::EventSource::Attention.consumer(PAIRING_SCOPE);
+        let cursor = match self.module.with(|producer| {
+            producer
+                .journal()
+                .consumer_cursor(&consumer)
+                .map_err(storage)
+        }) {
+            Ok(held) => held.map_or(0, |held| held.cursor),
+            Err(error) => {
+                eprintln!("kr-controller: the pairing cursor could not be read: {error}");
+                return;
+            }
+        };
+        let events = match rows.events_after(
+            Some(kr_protocol::ids::PairingEventSequence::new(cursor)),
+            PAIRINGS_PER_PASS,
+        ) {
+            Ok(events) if events.is_empty() => return,
+            Ok(events) => events,
+            Err(error) => {
+                eprintln!("kr-controller: completed pairings could not be read: {error}");
+                return;
+            }
+        };
+        let pairings: Vec<kr_delivery::producer::PairingEvent> = events
+            .iter()
+            .map(|event| kr_delivery::producer::PairingEvent {
+                sequence: event.sequence.get(),
+                invitation_id: event.invitation_id,
+                device_id: event.device_id,
+                device_name: event.device_name.as_str().to_owned(),
+                committed_at_ms: event.committed_at_ms.get(),
+            })
+            .collect();
+        if let Err(error) = self.module.with(|producer| {
+            producer
+                .take_from_pairings(
+                    &pairings,
+                    self.authority.as_ref(),
+                    PAIRING_SCOPE,
+                    view,
+                    now_ms,
+                )
+                .map_err(storage)
+        }) {
+            eprintln!("kr-controller: completed pairings were not taken: {error}");
         }
     }
 
@@ -572,9 +692,12 @@ impl DeliveryRuntime {
     ///
     /// A device may ask a few times an hour, whatever it hands over, and all devices together a few
     /// more: the questions come out of the gateway's allowances for this host, and a device that
-    /// registers over and over would spend the renewals and revocations of every other. The
-    /// nonce is the dearer question, so it is asked only for a bearer the first question took, and
-    /// the host-wide allowance for it ([`CONFIRMATIONS_PER_HOST`]) is spent only then.
+    /// registers over and over would spend the renewals and revocations of every other. A device's
+    /// changes of its choice of previews have an allowance of their own
+    /// ([`PREVIEW_CHANGES_PER_DEVICE`]), so that they do not spend the one new credentials need;
+    /// both are counted before the gateway is asked, and every bearer is asked about all the same.
+    /// The nonce is the dearer question, so it is asked only for a bearer the first question took,
+    /// and the host-wide allowance for it ([`CONFIRMATIONS_PER_HOST`]) is spent only then.
     ///
     /// # Errors
     ///
@@ -589,6 +712,7 @@ impl DeliveryRuntime {
         &self,
         device_id: kr_protocol::ids::DeviceId,
         credential: &kr_protocol::push::PushDeliveryCredential,
+        registering: Registering,
     ) -> Result<(), super::Confirmation> {
         use super::Confirmation::{Limited, NotAsked};
 
@@ -601,13 +725,11 @@ impl DeliveryRuntime {
             .confirmations
             .lock()
             .map_err(|_| NotAsked("an earlier registration failed part way".to_owned()))?
-            .entry(device_id)
-            .or_insert_with(|| StatusBudget::new(CONFIRMATIONS_PER_DEVICE))
+            .entry((device_id, registering))
+            .or_insert_with(|| StatusBudget::new(registering.allowance()))
             .take(SystemClock.steady_ms());
         if !allowed {
-            return Err(Limited(
-                "this device has registered too often; try again later".to_owned(),
-            ));
+            return Err(Limited(registering.refusal().to_owned()));
         }
         // From the sweep's share, so a device that registers over and over cannot spend the
         // pass's, which notifications a person is waiting on depend on.

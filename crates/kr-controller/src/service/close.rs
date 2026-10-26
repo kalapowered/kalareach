@@ -567,7 +567,7 @@ impl Controller {
         let Some(record) = record else {
             return Ok(None);
         };
-        let reason = self.why_a_worker_is_gone(session_id, record.profile, desktop.as_ref());
+        let reason = Self::why_a_worker_is_gone(record.profile, desktop.as_ref());
         self.crash_flight(
             session_id,
             record.display_number,
@@ -599,6 +599,12 @@ impl Controller {
     /// wrote its own closure before it went has stopped what it owned, and its account stands,
     /// except where its endpoint cannot be removed: the closure is then this host's, and the
     /// worker's journal is not read for it.
+    ///
+    /// The reason is the host's restart for a worker that went with an earlier boot, whoever asks
+    /// and whatever reason they give: a session this daemon's start could not close yet is
+    /// remembered as one, and a daemon that started again finds the same fact in the worker's own
+    /// record of its processes, which names the boot the worker ran in. Where neither says so, the
+    /// reason given stands.
     ///
     /// One flight per session at a time: the second caller waits, and finds the closure.
     pub(super) async fn crash_flight(
@@ -649,6 +655,13 @@ impl Controller {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(&session_id);
+        // A worker of a session this daemon's start found in an earlier boot and could not close
+        // yet went with that boot, whatever its profile and whoever asks for its closure.
+        let reason = if from_an_earlier_boot {
+            ClosureReason::HostShutdown
+        } else {
+            reason
+        };
         let ownership = match archive.take_ownership(session_id, display_number, identity) {
             Ok(ownership) => ownership,
             // The kernel confirmed the worker is gone, and the endpoint it published could not be
@@ -722,6 +735,15 @@ impl Controller {
                 .map(|reservation| crate::supervision::worker_label(reservation.reservation_id));
             archive.fence_owned(&ownership, unit.as_deref()).await
         };
+        // The worker's own record of its processes may name an earlier boot than this one: a
+        // daemon that started again in this boot has forgotten that it left the session, but the
+        // worker has not forgotten which boot it ran in, and a worker confirmed gone that ran in
+        // another boot went with it.
+        let reason = if fenced.earlier_boot {
+            ClosureReason::HostShutdown
+        } else {
+            reason
+        };
         let closure = self
             .record_final(session_id, reason, identity, &fenced, Death::Confirmed)
             .await?;
@@ -729,10 +751,7 @@ impl Controller {
     }
 
     /// Returns the reason a worker that is confirmed gone ended, where this host can establish
-    /// one.
-    ///
-    /// A worker of a session this daemon's start found in an earlier boot and could not close yet
-    /// went with that boot, whatever its profile.
+    /// one, apart from the host's restart, which [`Self::crash_flight_alone`] decides.
     ///
     /// A desktop-bound worker whose desktop has gone went with it: the platform ended the job with
     /// the login session it was in, which is what a logout does, and the worker had no chance to
@@ -746,19 +765,9 @@ impl Controller {
     /// Everything else is a worker that ended for reasons this host does not know, including a
     /// desktop it could not read: an unreadable platform is not a logout.
     fn why_a_worker_is_gone(
-        &self,
-        session_id: SessionId,
         profile: WorkerProfile,
         desktop: Option<&kr_protocol::identity::DesktopBinding>,
     ) -> ClosureReason {
-        if self
-            .left_by_an_earlier_boot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(&session_id)
-        {
-            return ClosureReason::HostShutdown;
-        }
         if profile != WorkerProfile::DesktopBound {
             return ClosureReason::WorkerCrash;
         }

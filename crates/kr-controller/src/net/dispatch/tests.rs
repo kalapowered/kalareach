@@ -1455,6 +1455,267 @@ async fn a_device_reads_an_agents_history_and_an_approval_record_under_its_grant
     world.serving.abort();
 }
 
+/// A control stream that keeps every frame it is handed, inside the admission that handed it over,
+/// and says whether privacy mode could have been changed at that moment.
+#[derive(Debug)]
+struct Kept {
+    frames: std::sync::Mutex<Vec<kr_protocol::envelope::ControlFrame>>,
+    /// For each frame handed over, whether the privacy state `watching` could have been changed
+    /// while the frame was being handed over.
+    changeable: std::sync::Mutex<Vec<bool>>,
+    watching: crate::privacy::PrivacyState,
+}
+
+impl Kept {
+    fn watching(state: crate::privacy::PrivacyState) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            frames: std::sync::Mutex::default(),
+            changeable: std::sync::Mutex::default(),
+            watching: state,
+        })
+    }
+
+    fn frames(&self) -> Vec<kr_protocol::envelope::ControlFrame> {
+        self.frames
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn changeable_while_handed_over(&self) -> Vec<bool> {
+        self.changeable
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl super::output::FrameSink for std::sync::Arc<Kept> {
+    fn send_while<'a>(
+        &'a self,
+        frame: &'a kr_protocol::envelope::ControlFrame,
+        admits: kr_transport::codec::Admission<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = kr_transport::Result<bool>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            Ok(admits(&mut || {
+                self.changeable
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(self.watching.changeable_now());
+                self.frames
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(frame.clone());
+            }))
+        })
+    }
+
+    fn close(&self) {}
+}
+
+/// A daemon whose one worker answers every `history.page` a device forwards with `page`, which it
+/// does whatever the privacy mode of the daemon says: it is never told of a change of mode, as a
+/// worker the daemon has not reached yet is not.
+async fn worker_answering_pages_with(
+    page: &kr_protocol::recovery::HistoryPageResult,
+) -> crate::service::a_close_a_worker_never_answers::Silent {
+    use std::sync::Arc;
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+
+    let recorded: fake::Recorded = Arc::default();
+    let world = answering_worker(
+        {
+            let page = page.clone();
+            Arc::new(move |request: &kr_protocol::envelope::Request| {
+                match request.method.method()? {
+                    Method::HistoryPage => ParamsValue::from_typed(&page).ok(),
+                    _ => None,
+                }
+            })
+        },
+        recorded,
+        reads_scopes(),
+    )
+    .await;
+    fake::acknowledged(&world.controller, world.session_id);
+    world
+}
+
+/// Turns privacy mode on at the daemon as its record does, and returns once it is published.
+async fn privacy_mode_is_turned_on(controller: &crate::service::Controller) {
+    let privacy = std::sync::Arc::clone(&controller.privacy);
+    tokio::task::spawn_blocking(move || {
+        let admitted = |write: &mut dyn FnMut() -> crate::error::Result<()>| write();
+        privacy
+            .enable(&[], kr_ipc::now_ms(), &admitted)
+            .expect("privacy mode is turned on");
+    })
+    .await
+    .expect("privacy mode's change ran");
+}
+
+fn history_page_of(session_id: SessionId, request_id: u64) -> kr_protocol::envelope::Request {
+    use kr_protocol::recovery::HistoryPageParams;
+    use kr_protocol::scalars::U64;
+
+    device_request(
+        request_id,
+        Method::HistoryPage,
+        &HistoryPageParams {
+            session_id,
+            from_cursor: U64::ZERO,
+            max_bytes: U64::new(4096),
+        },
+    )
+}
+
+fn a_page_of_retained_output() -> kr_protocol::recovery::HistoryPageResult {
+    use kr_protocol::scalars::{Bytes, U64};
+
+    kr_protocol::recovery::HistoryPageResult {
+        from_cursor: U64::new(0),
+        next_cursor: U64::new(16),
+        bytes: Bytes::new(b"retained output!".to_vec()),
+        oldest_retained_cursor: U64::new(0),
+        gap: Nullable::null(),
+    }
+}
+
+/// A device paired with a grant that reaches retained output from a moment, and a connection of
+/// its own that keeps what it is written.
+fn viewing_connection(
+    controller: &std::sync::Arc<crate::service::Controller>,
+    byte: u8,
+) -> (super::RemoteConnection, std::sync::Arc<Kept>) {
+    let viewer = paired(controller, byte, |grant| {
+        grant.history.lower_bound_ms =
+            Nullable::some(kr_protocol::scalars::TimestampMs::new(2_000));
+        grant.history.include_live_screen = true;
+    });
+    let kept = Kept::watching(controller.privacy.state().clone());
+    let connection = super::RemoteConnection::for_test_writing_to(
+        controller,
+        viewer,
+        Box::new(std::sync::Arc::clone(&kept)),
+    );
+    (connection, kept)
+}
+
+/// A page of retained output goes to a device whole when no change of privacy mode falls between the
+/// worker's answer and the write, and the write holds the privacy state while the bytes are handed
+/// over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_page_is_written_whole_under_the_privacy_state_it_was_read_in_and_holds_it_while_it_goes()
+{
+    use kr_protocol::envelope::ControlFrame;
+    use kr_protocol::recovery::HistoryPageResult;
+
+    let page = a_page_of_retained_output();
+    let world = worker_answering_pages_with(&page).await;
+    let controller = &world.controller;
+    let (connection, kept) = viewing_connection(controller, 61);
+
+    let answer = connection
+        .answer_now(ControlFrame::Request(history_page_of(world.session_id, 1)))
+        .await
+        .expect("an answer");
+    assert!(
+        connection.write_answer(answer).await,
+        "the connection stands"
+    );
+    let written: HistoryPageResult = answered(kept.frames()[0].clone());
+    assert_eq!(written, page);
+    assert_eq!(
+        kept.changeable_while_handed_over(),
+        [false],
+        "privacy mode could not be changed while the page was handed over"
+    );
+    assert!(
+        kept.watching.changeable_now(),
+        "and can be once it has been"
+    );
+    world.serving.abort();
+}
+
+/// A page the worker answered while privacy mode was off is withheld when privacy mode is turned on
+/// before the page is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_page_a_worker_answered_is_withheld_when_privacy_mode_starts_before_it_is_sent() {
+    use kr_protocol::envelope::ControlFrame;
+    use kr_protocol::recovery::HistoryPageResult;
+
+    let page = a_page_of_retained_output();
+    let world = worker_answering_pages_with(&page).await;
+    let controller = &world.controller;
+    let (connection, kept) = viewing_connection(controller, 62);
+
+    // Read under the state it will be written after, then held at the writer while the mode starts.
+    let answer = connection
+        .answer_now(ControlFrame::Request(history_page_of(world.session_id, 1)))
+        .await
+        .expect("an answer");
+    let turn = connection.output.hold_the_turn().await;
+    let (stands, ()) = tokio::join!(connection.write_answer(answer), async {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while connection.output.writes_queued() < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the answer is waiting for the writer");
+        privacy_mode_is_turned_on(controller).await;
+        drop(turn);
+    });
+    assert!(stands, "the connection stands");
+    let withheld: HistoryPageResult = answered(kept.frames()[0].clone());
+    assert!(
+        withheld.bytes.as_slice().is_empty(),
+        "none of the output goes once privacy mode has started: {withheld:?}"
+    );
+    let gap = withheld
+        .gap
+        .0
+        .expect("the range the page covered is said to be gone");
+    assert_eq!(
+        (gap.from_cursor.get(), gap.to_cursor.get()),
+        (0, 16),
+        "{gap:?}"
+    );
+    world.serving.abort();
+}
+
+/// A page a worker answers after the daemon published privacy mode and before the worker was told,
+/// which still holds the output that privacy mode removes, is withheld.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_page_read_before_the_worker_is_told_of_privacy_mode_is_withheld() {
+    use kr_protocol::envelope::ControlFrame;
+    use kr_protocol::recovery::HistoryPageResult;
+
+    let page = a_page_of_retained_output();
+    let world = worker_answering_pages_with(&page).await;
+    let controller = &world.controller;
+    let (connection, kept) = viewing_connection(controller, 63);
+
+    privacy_mode_is_turned_on(controller).await;
+    let answer = connection
+        .answer_now(ControlFrame::Request(history_page_of(world.session_id, 1)))
+        .await
+        .expect("an answer");
+    assert!(
+        connection.write_answer(answer).await,
+        "the connection stands"
+    );
+    let written: HistoryPageResult = answered(kept.frames()[0].clone());
+    assert!(
+        written.bytes.as_slice().is_empty(),
+        "the worker's output goes to nobody while privacy mode is on: {written:?}"
+    );
+    assert!(written.gap.0.is_some(), "and the range is said to be gone");
+    world.serving.abort();
+}
+
 /// A device whose grant lets it close and read every session.
 fn closing_and_viewing(
     controller: &crate::service::Controller,
@@ -1734,10 +1995,74 @@ async fn a_devices_close_whose_connection_ends_while_it_waits_for_the_workers_li
     }
 }
 
+/// KR-REQ-24.15: the lookup of a receipt that a retried close may have kept, which waits for the
+/// link to the session's worker, is refused when the link opens if the authority feed has raised a
+/// refusal on remote grants meanwhile, also when the device's connection has ended in between, and
+/// no worker is asked for the receipt. The close's route is on record, so the lookup is what waits
+/// at the link. The control: with no refusal raised, the lookup reaches the worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_receipt_lookup_waiting_for_the_workers_link_is_refused_once_a_feed_refusal_rises() {
+    use std::sync::Arc;
+
+    use kr_protocol::envelope::ControlFrame;
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+
+    for (refused, ended) in [(false, false), (true, false), (true, true)] {
+        let recorded: fake::Recorded = Arc::default();
+        let world = answering_worker(
+            Arc::new(|_: &kr_protocol::envelope::Request| None),
+            Arc::clone(&recorded),
+            reads_scopes(),
+        )
+        .await;
+        let controller = &world.controller;
+        let connection =
+            super::RemoteConnection::for_test(controller, closing_and_viewing(controller, 31));
+        let close = fake::close_request(world.environment_id, world.session_id);
+        assert!(
+            connection
+                .claim_route(&close, Some(world.session_id))
+                .is_ok(),
+            "the route of the close is on record"
+        );
+        let (arrived, go) = controller.before_a_proxy_is_opened.arm();
+
+        let (_answered, ()) = tokio::join!(
+            connection.answer_now(ControlFrame::Mutation(Box::new(close))),
+            async {
+                arrived.await.expect("the lookup reaches the worker's door");
+                if ended {
+                    // As a revocation does: the registration goes before the connection is fenced.
+                    controller.deregister(connection.connection_id);
+                }
+                if refused {
+                    controller.raise_the_unverified_withdrawal_refusal().await;
+                }
+                go.send(()).expect("the lookup is waiting");
+            }
+        );
+        if refused {
+            assert!(
+                forwarded_reads(&recorded).is_empty(),
+                "a lookup refused at the link reaches no worker"
+            );
+        } else {
+            assert_eq!(
+                forwarded_reads(&recorded).len(),
+                1,
+                "the control: the lookup reaches the worker"
+            );
+        }
+        world.serving.abort();
+    }
+}
+
 /// KR-REQ-24.15: a device's read, and with it raw input, that had been admitted and waits for the
 /// link to the session's worker is refused when the link opens if the authority feed has raised a
-/// refusal on remote grants meanwhile, and no worker is asked. The control: with no refusal raised,
-/// the read reaches the worker.
+/// refusal on remote grants meanwhile, also when the device's connection has ended in between, as
+/// a revocation ends it: it takes the standing it was admitted under with it, and no worker is
+/// asked. The control: with no refusal raised, the read reaches the worker.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_devices_read_waiting_for_the_workers_link_is_refused_once_a_feed_refusal_rises() {
     use std::sync::Arc;
@@ -1747,7 +2072,7 @@ async fn a_devices_read_waiting_for_the_workers_link_is_refused_once_a_feed_refu
 
     use crate::service::a_close_a_worker_never_answers as fake;
 
-    for refused in [false, true] {
+    for (refused, ended) in [(false, false), (true, false), (true, true)] {
         let recorded: fake::Recorded = Arc::default();
         let world = answering_worker(
             Arc::new(move |request: &kr_protocol::envelope::Request| {
@@ -1778,6 +2103,10 @@ async fn a_devices_read_waiting_for_the_workers_link_is_refused_once_a_feed_refu
 
         let (answer, ()) = tokio::join!(connection.read(&read), async {
             arrived.await.expect("the read reaches the worker's door");
+            if ended {
+                // As a revocation does: the registration goes before the connection is fenced.
+                controller.deregister(connection.connection_id);
+            }
             if refused {
                 controller.raise_the_unverified_withdrawal_refusal().await;
             }
@@ -2768,6 +3097,49 @@ fn a_draft_holding_an_attachment(
     bound_to_a_draft(controller, actor, &draft, &handle).draft_id
 }
 
+/// A new draft written for `application_instance_id` that holds one published attachment.
+fn a_draft_written_for(
+    controller: &crate::service::Controller,
+    environment_id: kr_protocol::ids::EnvironmentId,
+    actor: &kr_protocol::ids::ActorId,
+    application_instance_id: kr_protocol::ids::ApplicationInstanceId,
+    name: &str,
+) -> kr_protocol::ids::DraftId {
+    let handle = a_published_attachment(controller, environment_id, actor, name);
+    let draft = controller
+        .transfer()
+        .service()
+        .draft_create(
+            actor,
+            &kr_protocol::transfer::DraftCreateParams {
+                environment_id,
+                device_id: Nullable::null(),
+                session_id: Nullable::null(),
+                application_instance_id: Nullable::some(application_instance_id),
+                text: "look at this".to_owned(),
+            },
+            None,
+        )
+        .expect("creates the draft")
+        .draft;
+    bound_to_a_draft(controller, actor, &draft, &handle).draft_id
+}
+
+/// `prompt`, made for `application_instance_id` instead of the application it was built for.
+fn made_for_application(
+    mut prompt: MutationRequest,
+    application_instance_id: kr_protocol::ids::ApplicationInstanceId,
+) -> MutationRequest {
+    let mut params: kr_protocol::agent::AgentPromptParams =
+        prompt.params.to_typed().expect("a prompt's parameters");
+    params.target.subject.application_instance_id = application_instance_id;
+    prompt.params = ParamsValue::from_typed(&params).expect("encodes");
+    if prompt.target.application_instance_id.is_present() {
+        prompt.target.application_instance_id = Nullable::some(application_instance_id);
+    }
+    prompt
+}
+
 /// A prompt a device makes to the scripted session, naming `draft_id`.
 fn a_prompt_naming(
     world: &crate::service::a_close_a_worker_never_answers::Silent,
@@ -3089,6 +3461,127 @@ async fn a_local_prompt_naming_a_draft_is_recorded_before_the_worker_is_asked() 
         sent[0].actor.ingress,
         kr_protocol::actor::ActorIngress::LocalIpc
     );
+    world.serving.abort();
+}
+
+/// KR-REQ-12.06: a draft written for one application is not sent by a prompt for another, whether
+/// the prompt comes from a paired device or from a caller at this machine. It is refused as a
+/// conflict before the draft is recorded as sent and before the worker is asked, and the draft is
+/// left as it was; the prompt for the application the draft was written for goes through.
+///
+/// The paired device's refused prompt is a queued one and the local caller's is a submitted one:
+/// both are the same record, and each method reaches it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_06_a_draft_written_for_another_application_is_a_conflict_on_either_prompt_route()
+{
+    use kr_protocol::envelope::ControlFrame;
+    use kr_protocol::error::ErrorCode;
+    use kr_protocol::ids::ApplicationInstanceId;
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    let script = Scripted::new();
+    script.accepts_prompts(true);
+    let world = scripted::scripted(&script).await;
+    let controller = &world.controller;
+    let written_for = ApplicationInstanceId::new(kr_ipc::new_uuid());
+    let elsewhere = ApplicationInstanceId::new(kr_ipc::new_uuid());
+    let answered_ok = |frame: &ControlFrame| {
+        matches!(
+            frame,
+            ControlFrame::Response(kr_protocol::envelope::Response {
+                outcome: kr_protocol::envelope::Outcome::Ok(_),
+                ..
+            })
+        )
+    };
+
+    // A paired device.
+    let connection =
+        super::RemoteConnection::for_test(controller, prompting_and_viewing(controller, 61));
+    let actor = connection.device.principal();
+    let draft_id = a_draft_written_for(
+        controller,
+        world.environment_id,
+        &actor,
+        written_for,
+        "paired.bin",
+    );
+    let answer = connection
+        .answer_now(ControlFrame::Mutation(Box::new(made_for_application(
+            a_prompt_naming(&world, &connection, Method::AgentPromptQueue, 1, draft_id),
+            elsewhere,
+        ))))
+        .await
+        .expect("the prompt is answered");
+    assert_eq!(
+        error_of(answer.frame()).code,
+        ErrorCode::DraftConflict,
+        "{:?}",
+        answer.frame()
+    );
+    assert!(
+        prompts_the_worker_was_asked_to_take(&script).is_empty(),
+        "nothing was sent"
+    );
+    assert!(
+        !is_submitted(controller, &actor, draft_id),
+        "and the draft was not recorded as sent"
+    );
+    let answer = connection
+        .answer_now(ControlFrame::Mutation(Box::new(made_for_application(
+            a_prompt_naming(&world, &connection, Method::AgentPromptQueue, 2, draft_id),
+            written_for,
+        ))))
+        .await
+        .expect("the prompt is answered");
+    assert!(answered_ok(answer.frame()), "{:?}", answer.frame());
+    assert!(is_submitted(controller, &actor, draft_id));
+    assert_eq!(prompts_the_worker_was_asked_to_take(&script).len(), 1);
+
+    // A caller at this machine.
+    let admission = fake::admission(controller, world.accepted).await;
+    let local = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
+    let draft_id = a_draft_written_for(
+        controller,
+        world.environment_id,
+        &local,
+        written_for,
+        "local.bin",
+    );
+    let prompt = |application| {
+        made_for_application(
+            a_local_prompt(
+                &world,
+                &admission,
+                ActionId::new(kr_ipc::new_uuid()),
+                Nullable::some(draft_id),
+                Nullable::null(),
+            ),
+            application,
+        )
+    };
+    let answer = controller
+        .perform(&local, admission.connection_id, None, prompt(elsewhere))
+        .await;
+    assert_eq!(
+        error_of(&answer).code,
+        ErrorCode::DraftConflict,
+        "{answer:?}"
+    );
+    assert_eq!(
+        prompts_the_worker_was_asked_to_take(&script).len(),
+        1,
+        "nothing more was sent"
+    );
+    assert!(!is_submitted(controller, &local, draft_id));
+    let answer = controller
+        .perform(&local, admission.connection_id, None, prompt(written_for))
+        .await;
+    assert!(answered_ok(&answer), "{answer:?}");
+    assert!(is_submitted(controller, &local, draft_id));
+    assert_eq!(prompts_the_worker_was_asked_to_take(&script).len(), 2);
     world.serving.abort();
 }
 
@@ -3927,7 +4420,12 @@ async fn record_directly(
         .transfer()
         .record_submission(
             actor,
-            draft_id,
+            crate::transfer::PromptedDraft {
+                draft_id,
+                application_instance_id: kr_protocol::ids::ApplicationInstanceId::new(
+                    kr_ipc::new_uuid(),
+                ),
+            },
             session_id,
             crate::transfer::TransferAdmission::new(
                 std::sync::Arc::clone(&world.controller),
@@ -3992,7 +4490,7 @@ async fn a_local_prompt_whose_admission_lapses_before_its_draft_is_recorded_reco
     lapsing_before_the_record(
         controller,
         || {
-            controller.admitted_table().remove(&admission.connection_id);
+            controller.admitted_write().remove(&admission.connection_id);
         },
         async {
             answered = Some(
@@ -4047,7 +4545,7 @@ async fn a_paired_prompt_whose_admission_lapses_before_its_draft_is_recorded_rec
         controller,
         || {
             controller
-                .admitted_table()
+                .admitted_write()
                 .remove(&connection.connection_id());
         },
         async {

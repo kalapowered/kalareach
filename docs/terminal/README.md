@@ -538,6 +538,33 @@ stand-in for the write, which would prove nothing about the write.
 Nothing on the lane is history. `reset` drops everything pending, and a reconnecting client is never
 sent a reply or a probe answer from before it arrived.
 
+#### Where a reply is attributed to nothing
+
+A reply has its own kind of batch in the worker's queue for the terminal. It carries no lease epoch,
+no paste transition and no authority deadline, holds no lease and is counted apart from the person's
+bytes, so nothing that is about a person or a grant is decided by it. The worker's queue gives the
+replies a share of 64 KiB inside the session's 1 MiB budget. The share is what the replies hold: the
+bytes queued for the terminal that are neither written nor dropped. It is not the queue less the
+current lease's count. A takeover ends the lease's count and leaves the previous holder's stale
+keystrokes in the queue until the writer reaches them, and charging those to the replies refused
+answers the application had asked for.
+
+Each place the worker attributes input says what a reply does there:
+
+| Place | A reply | Shown by |
+| --- | --- | --- |
+| Lease holder and epoch | Seizes nothing and takes no lease | `input_lease.rs`, KR-REQ-08.65 |
+| An open paste | Waits for it and takes no lease | `terminal.rs`, `reply_lane.rs` |
+| The replies' share of the queue | Is charged what the replies hold and nothing a takeover left | `input_domain.rs`, `the_keystrokes_a_takeover_left_behind_do_not_spend_the_answers_share` |
+| The lease's byte count and the count a takeover discards | Is in neither, and is not discarded | `reply_lane.rs`, `a_takeover_counts_the_holders_keystrokes_and_leaves_the_hosts_answer_alone` |
+| The receipt of `input.write` | Is in neither `forwarded_bytes` nor `held_prefix_bytes`: they count what the recogniser returned for that write | None; no state shows a reply in a receipt |
+| The writer's check of a lease epoch and an authority deadline | Has none to be checked against, so it is written | The batch has no such field |
+| Input held for a reader transition, and the `editor_busy` event's `released_input_bytes` | Revokes a reserved launch and releases the person's held keys; the count is those keys, under the holder's attachment and epoch | `fence.rs`, `the_client_is_told_the_editor_was_busy_after_the_hosts_answer_released_its_keys` |
+| The root editor's launch and fence | Revokes the launch and invalidates the fence | `fence.rs`, KR-REQ-08.49 |
+| The origin of an accepted line | A line accepted on a fence the answer took away is unverifiable; one accepted on a fence proved again after the answer is judged on that fence | `fence/driver.rs`, `a_line_accepted_after_an_answer_is_attributed_only_on_a_fence_proved_after_it` |
+| The process-activity mark | Is a hint to process supervision, set once for each look, and not a record of a person's activity, so there is nothing to attribute | None |
+| The journal | Is not journalled: the host keeps no record of input | `input_lease.rs`, KR-REQ-08.66 |
+
 ## Side effects
 
 A side effect leaves the terminal, so it goes to exactly one place: the attachment that currently
@@ -1185,9 +1212,9 @@ support either.
 ### The compiled file
 
 `terminfo::compiled` writes the same data as the binary file that a terminfo library loads.
-`kr-term-fixtures --terminfo <directory>` writes it into a directory in the layout a terminfo
-library expects. The fixture file carries the bytes, so a change to any capability changes the
-fixture in the same commit.
+`terminfo::write_database` writes it into a directory in the layout a terminfo library expects, and
+`kr-release terminal` calls it to put the database in a release tree as `share/terminfo/`. The fixture
+file carries the bytes, so a change to any capability changes the fixture in the same commit.
 
 The file is the legacy format, meaning that it has a header, a names line, and tables for the
 predefined boolean, number and string capabilities, followed by an extended section for the
@@ -1551,6 +1578,20 @@ saves it, and then sets the margins. Written where it was before, after the scro
 the cursor home, the sequence replaced the saved cursor with the home position and the session's
 current rendition, and an `ESC 8` brought that back.
 
+Origin mode is set for the save and put back after it. A cursor saved in origin mode is saved with
+`?6h` in force, and once the margins, the rendition and the link are back the restoration writes
+`?6l`. Origin mode comes on again only where the session has it on, when the cursor is placed. A
+terminal left in origin mode by the save read every absolute address after the restoration relative
+to the scroll region, and the cursor and the next lines landed in the wrong rows. The restore
+corpus `saved-origin` holds the case: a cursor saved in origin mode inside a scroll region and left
+and right margins, origin mode left afterwards, and a second save made with origin mode off. The
+harness attaches a terminal at every byte of it and compares the terminal with the session.
+
+The keyboard protocol flags of the buffer that is not showing are not installed. No sequence sets
+one buffer's flags or stack without switching to it, so the restoration counts them as state it
+carried and did not reproduce. An attachment that has such a count is projected and is not handed
+the stream.
+
 tmux 3.7c and 3.6, GNU screen 5.0.2 and 4.09.01 and the terminal library of Alacritty 0.17.0 were
 each sent both orders for four screens (a cursor saved in the primary buffer, one saved in the
 alternate buffer, one saved inside a scroll region in origin mode, and a screen with no saved cursor
@@ -1577,9 +1618,10 @@ the restoration erases and redraws every line of the buffer that is showing.
 
 ## Fixtures
 
-`fixtures/terminal/` holds eight files, generated from the corpus in
-`crates/kr-term/src/conformance.rs`, and the records of physical terminals measured with
-`kr-term-probe`.
+`fixtures/terminal/` holds nine files generated from the corpus in
+`crates/kr-term/src/conformance.rs`, the manifest that lists every fixture, two files written by
+hand (the client renderer's and the client encoder's) and the records of physical terminals measured
+with `kr-term-probe`.
 
 | File | What it pins | Requirements |
 | --- | --- | --- |
@@ -1591,12 +1633,94 @@ the restoration erases and redraws every line of the buffer that is showing.
 | `admission.json` | The geometries the budget admits and refuses, and the footprint each one reserves, the same on every supported host | KR-REQ-08.71, KR-REQ-08.79 |
 | `profile.json` | What kr-vt/1 advertises, what it refuses, the identity bytes, and the library record | KR-REQ-08.10, KR-REQ-04.02, KR-REQ-04.24 |
 | `terminfo-xterm-256color.json` | The pinned database and the class of every advertised capability | KR-REQ-08.11, KR-REQ-08.35 |
+| `input-encodings.json` | The console's key records and the bytes the win32 input mode encodes each as, written by hand; `tests/win32_input.rs` checks the encoder against them | KR-REQ-08.52, KR-REQ-08.56 |
+| `client-encodings.json` | The bytes the client's input encoder spells a key as under the ordinary encoding, `modifyOtherKeys` and the Kitty protocol, written by hand from xterm's documentation and the protocol's specification. `crates/kr-client/tests/encoder_vectors.rs` checks the encoder against them; a vector made from the encoder's own output would compare it with itself | KR-REQ-08.59 |
+| `projection.json` | What the client renders from a projection, written by hand | KR-REQ-08.40, KR-ACC-023 |
 | `physical/*.json` | One physical terminal build's cursor answers to the probe corpus, beside the grid's | KR-REQ-08.03 |
+| `capabilities.json` | The manifest: the six things the specification gives it, each with the fixtures that pin it and their digests | KR-REQ-08.11 |
 
 Every case records the classes, the dispositions, the spans, the forwarded byte ranges, the replies,
 the side effects and the diagnostics. Three assertions hold across the whole corpus: the grid
 library never writes a byte, it never fails to recognise a sequence the engine approved, and no
 consumed sequence contributes a forwarded byte.
+
+### The capability manifest
+
+The specification gives the signed capability manifest six things to own: sequence classes,
+terminfo, worker responses, width, wrap and geometry, input encodings and renderer fixtures.
+`crates/kr-term/src/capability.rs` lists them, each with the fixture files that pin it, and
+`capabilities.json` names those files by digest. A fixture may be under more than one category: the
+profile lists both the identity bytes the worker answers with and the input protocols it advertises.
+
+`kr-term-fixtures --check`, the step that holds the committed fixtures to the engine in continuous
+integration, fails when `capabilities.json` is not what the fixtures are now, so a change to any
+fixture, one the engine does not generate included, moves the manifest in the same commit. It also
+fails for a fixture file that no category owns. `--root <directory>` names the directory to write or
+check in place of the workspace's. A release tree carries the manifest as
+`share/terminal-capabilities.json`, beside the terminfo database (see
+[the release manifest](../releases/manifest.md#the-terminals-capability-manifest-and-database)).
+
+### Generated streams
+
+The corpus is the streams someone thought of. `crates/kr-term/tests/generated/` holds a generator of
+streams nobody did, and the invariants every one of them is held to (KR-ACC-024). A stream is a
+seed: a seeded xorshift64\* picks up to 40 atoms from these:
+
+- printable runs, valid scalars (CJK, joined emoji, combining marks, U+FFFD and encoded C1
+  scalars), thirteen malformed forms, every raw C1 byte and every C0 byte;
+- control sequences with private markers, up to six parameters joined by `;` and `:`, intermediates,
+  embedded C0 bytes, parameters of 300 digits, and 7-bit and 8-bit introducers;
+- OSC (with 52, 8 and 133 among the selectors), DCS, APC, PM and SOS strings ended by BEL, ST, CAN,
+  SUB, a raw 0x9C, ESC and another byte, or nothing;
+- tmux envelopes with doubled escapes nested to depth seven, where the bound is four (a small share of the envelopes reach past it);
+- queries, side effects (OSC 52, 9, 99 and 777, and BEL) and graphics strings, each tagged by the
+  generator with what it is, from its own tables and not from the class table.
+
+Each stream is read whole, a byte at a time (under 128 KiB), in reads of 1 to 97 bytes and in reads
+of 1 to 4,096 bytes, on an 80 by 24 grid or a 7 by 4 one. Separate tests build control strings of
+each family just inside and just past their bounds (64 KiB, and 1 MiB for OSC 52), ended and not,
+with queries in the tail, and a flood of 70,000 queries.
+
+| Invariant | Safety claim |
+| --- | --- |
+| 1. The forwarded bytes lie only in events the lexer calls display or mode with the disposition forward | Yes |
+| 2. The forwarded stream, lexed again, gives only forwardable events, and a new engine forwards all of it and asks and does nothing | Yes |
+| 3. The forwarded bytes are valid UTF-8, hold no C1 scalar, hold no ENQ, BEL or `ESC Z` outside a string and none of the questions the class table's query rows list that a control sequence can ask (a device or status report, a mode report, `CSI > q`, `CSI ? u`, `CSI ? m`, a window report, and the parameter, checksum, colour and graphics reports), and a forwarded control string is an operating system command that neither acts (OSC 9, 52, 99, 777) nor asks (a bare `?` part of a palette, colour or key query; a title or link may carry one as text) and holds no control byte but its terminator, by a scan that reads neither the lexer nor the class table | Yes |
+| 4. A tagged atom the lexer frames as one event is never forwarded, a query is answered where it stood, a side effect happens or is refused, and graphics produce nothing | Yes |
+| 5. Where a read is cut changes nothing: the screen, the forwarded bytes, the side effects, the replies and the first projection | No |
+| 6. The events cover the stream once, an event of the outer stream counted as it is and a tmux envelope's inner events counted once; only an empty envelope, which makes no event, leaves bytes unclaimed | No |
+| 7. The engine is on ground after `close`, the grid library wrote nothing, the lane holds its bound, and a flood is reported, forwards no query and forwards its text | No |
+| 8. Nothing in a control string past its bound acts, and exactly the queries outside the string are answered | Yes |
+
+The checks for a safety claim are shown to fail: a test hands them a forwarded set the engine did
+not produce, with a query, a clipboard write, a raw C1 control, an encoded C1 scalar or a control
+string with a control byte in it, and each is named. `KR_FUZZ_STREAMS` sets how many seeds a run
+takes (1,000 by default, from zero). A failing stream is its seed, and the failure prints its bytes.
+
+The generator found two defects, both fixed. A text run read after a raw C1 byte carried the byte's
+flag when a read ended before the next scalar, so whether the text was forwarded depended on where
+reads ended, and a flood of queries that followed an 8-bit one lost its text; the flag now belongs to
+the sequence that was pending and is cleared when it is read. Reading a cell through the grid
+library's accessor by position converted a line held in its compact form into one cell per column,
+and the two forms keep a blank past the end of the text differently, so the screen differed with the
+read; the cell is now read from the line as it is. A blank printed past the end of a compact line is
+implicit there, and a combining mark that follows it joins the blank all the same. The other
+invariants held for every stream.
+
+What the generator reaches: bytes into one engine on an 80 by 24 or a 7 by 4 grid, at one reading of
+the clock, with no resize, no change of lease and no second client. That covers the lexer, the
+policy, the grid adapter, the broker and the lane. It does not reach the worker's pseudo-terminal,
+the timing of a writer, a physical terminal, or the hyperlink and resident-state bounds: a link is
+admitted by reading the state once for each read, so near a bound a refusal can change with the read.
+A stream of 40 atoms is short, and the flood and the oversized strings are the long ones. Randomness
+stops at the seeds a run takes.
+
+The class table approves some sequences that the grid library does not implement: character-set
+designations with finals the library lacks (`ESC ( j`, `ESC ( w`) and control sequences with extra
+parameters (`CSI 99;0; A`). The engine consumes them as unclassified sequences and none is
+forwarded, so no invariant breaks, and the corpus fixtures' check that nothing is unrecognised holds
+for the corpus only. In the first 1,000 streams 90 events are such sequences; the test prints the
+count.
 
 ## Building and checking
 

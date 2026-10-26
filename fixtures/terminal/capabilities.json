@@ -1,0 +1,98 @@
+{
+  "categories": [
+    {
+      "fixtures": [
+        {
+          "path": "classes.json",
+          "sha256": "95770283b180042a31bc362c11f6b426c1340d045393895dc56b9ec6f2761581"
+        },
+        {
+          "path": "byte-policy.json",
+          "sha256": "a34a21d6293eec88684396c92382de92f21c6460d4872c5da80b1eedbe3ca439"
+        }
+      ],
+      "name": "sequence-classes",
+      "owns": "The class of every sequence, and what the byte policy does with raw C1 bytes, malformed UTF-8, nested passthrough and oversized strings."
+    },
+    {
+      "fixtures": [
+        {
+          "path": "terminfo-xterm-256color.json",
+          "sha256": "22b238bce4bf69c802b398b0cf1df167861769860f7aeecde840027fa559c39c"
+        }
+      ],
+      "name": "terminfo",
+      "owns": "The pinned xterm-256color database, its compiled bytes, and the class every advertised output capability lands in."
+    },
+    {
+      "fixtures": [
+        {
+          "path": "broker.json",
+          "sha256": "f02b0aa7a58a264934cb4c58b8486320ea65a6f50649271dd49fa40dfc946f53"
+        },
+        {
+          "path": "profile.json",
+          "sha256": "e3793dc2c8ac6d1609c6b7e958b63f82fc9b2afe8666b333860dc45c9d36199d"
+        }
+      ],
+      "name": "worker-responses",
+      "owns": "Every query and the exact bytes the worker answers with, and the identity and limits the profile states."
+    },
+    {
+      "fixtures": [
+        {
+          "path": "width.json",
+          "sha256": "cc95a1ae3aea46e8e3905f1edc6572cb3b64698a7f48df2ccbc8a89b3933bd2e"
+        },
+        {
+          "path": "admission.json",
+          "sha256": "d69f8f7c96113a4319dcf3b24e456965d2f2973babf5ca3e976a946c44b9def8"
+        }
+      ],
+      "name": "width-wrap-geometry",
+      "owns": "The width model, delayed wrap, scrolling at the margins and the geometries a session is admitted at."
+    },
+    {
+      "fixtures": [
+        {
+          "path": "profile.json",
+          "sha256": "e3793dc2c8ac6d1609c6b7e958b63f82fc9b2afe8666b333860dc45c9d36199d"
+        },
+        {
+          "path": "input-encodings.json",
+          "sha256": "c0c8acd815649a6aec54cacf9c0d526d2f9dc1157ea098dccba980e76edd3da1"
+        },
+        {
+          "path": "client-encodings.json",
+          "sha256": "5dfacf27ffd8475d378ed47470c455d26ca9ea10d0e8dbd90e7125d6f2c77ab6"
+        }
+      ],
+      "name": "input-encodings",
+      "owns": "The input protocols the profile advertises and the bytes each encodes a key as: the console's key records, and the client's ordinary, modifyOtherKeys and Kitty encodings."
+    },
+    {
+      "fixtures": [
+        {
+          "path": "snapshot.json",
+          "sha256": "8042a494899d916854fc7dd7020b7b320921eb2803a6471a40d32414d63742d3"
+        },
+        {
+          "path": "projection.json",
+          "sha256": "aa6b4e0abb136232c85f3e5bf97fe167c6317e5f83787fa69b0af27ac212196d"
+        },
+        {
+          "path": "physical/iterm2-3.7.1.json",
+          "sha256": "d8a058aec28c6182cf058c36791a922a6f600838a59bb10c91b49564aa7bf2d6"
+        },
+        {
+          "path": "physical/terminal-app-2.15.json",
+          "sha256": "e53f57a37eebf1f7710e249ce0870cc81a4525354efc9f9bc3268b76dffd3116"
+        }
+      ],
+      "name": "renderer-fixtures",
+      "owns": "The snapshots a reconnection restores, what the client renders from a projection, and what physical terminals measured."
+    }
+  ],
+  "format": "kalareach.terminal-capabilities/1",
+  "profile": "kr-vt/1"
+}

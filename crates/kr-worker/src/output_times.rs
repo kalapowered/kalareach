@@ -309,6 +309,41 @@ impl TimeIndex {
         }
     }
 
+    /// Returns the first cursor from which every byte of the output is proved to have been
+    /// produced at or after `moment_ms`, when the index proves any.
+    ///
+    /// It is the start of the first interval, in the order of the cursors, that has a proven
+    /// reading of `moment_ms` or later. Cursors only grow, and every byte of an interval was written
+    /// at or after the interval's first reading, so everything from that cursor on is no earlier
+    /// than the moment, bytes that no interval times included. Bytes before it are not: an
+    /// interval that began earlier is a lower bound on the time of its first byte and says nothing
+    /// of its last, so none of its bytes is claimed. An interval whose reading was not proven, as
+    /// every one is after the wall clock stepped forward, is not one to start from.
+    ///
+    /// The intervals not yet written are read from memory and the rest from the file. A write in
+    /// progress is waited for, so that an interval it is moving from one to the other is in one of
+    /// them. A file that is missing or cannot be read contributes nothing, which can only start the
+    /// answer later than the truth.
+    #[must_use]
+    pub fn first_cursor_from(&self, moment_ms: u64) -> Option<u64> {
+        let _writing = locked(&self.inner.writing);
+        let held = {
+            let state = locked(&self.inner.state);
+            state
+                .closed
+                .iter()
+                .chain(state.open.as_ref().map(|open| &open.mark))
+                .filter(|mark| mark.proven && mark.at_ms >= moment_ms)
+                .map(|mark| mark.start)
+                .min()
+        };
+        let written = first_proven_in_file(&self.inner.path, moment_ms);
+        match (held, written) {
+            (Some(held), Some(written)) => Some(held.min(written)),
+            (held, written) => held.or(written),
+        }
+    }
+
     /// Returns why the last write failed, when it did and none has succeeded since.
     #[must_use]
     pub fn failure(&self) -> Option<String> {
@@ -637,16 +672,11 @@ impl Unavailable {
     }
 }
 
-/// Reads the intervals of the output between the cursors `from` and `to`, at most `limit` of them.
+/// Opens the index file at `path` for reading, and checks it holds the version this release reads.
 ///
 /// The file is opened for reading and nothing is created. A reader of a session whose worker has
 /// gone reads what the worker left, including the log a crash left in it.
-///
-/// # Errors
-///
-/// Returns why the index could not be read.
-pub fn read(path: &Path, from: u64, to: u64, limit: usize) -> Result<Times, Unavailable> {
-    let limit = limit.clamp(1, MAX_ANSWER_ROWS);
+fn reader(path: &Path) -> Result<rusqlite::Connection, Unavailable> {
     match path.try_exists() {
         Ok(true) => {}
         Ok(false) => return Err(Unavailable::Missing),
@@ -666,14 +696,42 @@ pub fn read(path: &Path, from: u64, to: u64, limit: usize) -> Result<Times, Unav
         .optional()
         .map_err(unreadable)?;
     match version {
-        Some(VERSION) => {}
-        Some(other) => return Err(Unavailable::Version(other)),
-        None => {
-            return Err(Unavailable::Unreadable(
-                "the file holds no schema".to_owned(),
-            ));
-        }
+        Some(VERSION) => Ok(connection),
+        Some(other) => Err(Unavailable::Version(other)),
+        None => Err(Unavailable::Unreadable(
+            "the file holds no schema".to_owned(),
+        )),
     }
+}
+
+/// The start of the first interval in the file at `path`, in the order of the cursors, whose
+/// reading was proven and is `moment_ms` or later.
+fn first_proven_in_file(path: &Path, moment_ms: u64) -> Option<u64> {
+    let connection = reader(path).ok()?;
+    let moment = cursor(moment_ms).ok()?;
+    let start: Option<i64> = connection
+        .query_row(
+            "SELECT start FROM marks WHERE proven = 1 AND at_ms >= ?1 ORDER BY start LIMIT 1",
+            [moment],
+            |row| row.get(0),
+        )
+        .optional()
+        .ok()?;
+    start.and_then(|start| u64::try_from(start).ok())
+}
+
+/// Reads the intervals of the output between the cursors `from` and `to`, at most `limit` of them.
+///
+/// The file is opened for reading and nothing is created. A reader of a session whose worker has
+/// gone reads what the worker left, including the log a crash left in it.
+///
+/// # Errors
+///
+/// Returns why the index could not be read.
+pub fn read(path: &Path, from: u64, to: u64, limit: usize) -> Result<Times, Unavailable> {
+    let limit = limit.clamp(1, MAX_ANSWER_ROWS);
+    let unreadable = |error: rusqlite::Error| Unavailable::Unreadable(describe(&error));
+    let connection = reader(path)?;
     if from >= to {
         return Ok(Times {
             marks: Vec::new(),
@@ -1069,6 +1127,56 @@ mod tests {
             locked(&index.inner.state).open.is_none(),
             "the rows in flight leave no room"
         );
+    }
+
+    #[test]
+    fn output_is_reached_from_the_first_proven_interval_at_or_after_a_moment() {
+        let (index, path, _kept) = index("reach");
+        // Four intervals with gaps between them, so each is a row of its own.
+        index.note_at(0, 4, 1_000, true, 5_000);
+        index.note_at(100, 4, 2_000, true, 5_000);
+        index.note_at(200, 4, 3_000, true, 5_000);
+        index.note_at(300, 4, 4_000, false, 5_000);
+        assert_eq!(index.first_cursor_from(0), Some(0));
+        assert_eq!(index.first_cursor_from(1_001), Some(100));
+        assert_eq!(
+            index.first_cursor_from(2_000),
+            Some(100),
+            "a reading at the moment is at the moment"
+        );
+        assert_eq!(index.first_cursor_from(2_001), Some(200));
+        assert_eq!(
+            index.first_cursor_from(3_001),
+            None,
+            "an interval whose reading was not proven is not one to start from"
+        );
+
+        // The first three are written; later ones, held in memory, are read with them.
+        index.flush().expect("writes");
+        assert_eq!(read(&path, 0, 400, 16).expect("reads").marks.len(), 4);
+        index.note_at(400, 4, 5_000, true, 5_000);
+        assert_eq!(index.first_cursor_from(1_500), Some(100), "from the file");
+        assert_eq!(index.first_cursor_from(4_000), Some(400), "from memory");
+        assert_eq!(index.first_cursor_from(5_001), None);
+    }
+
+    #[test]
+    fn an_interval_after_the_wall_clock_stepped_forward_is_not_one_to_start_from() {
+        let (index, _, _kept) = index("stepped");
+        index.note_at(0, 4, 1_000, true, 5_000);
+        // A minute on the wall clock against a millisecond on the continuous one.
+        index.note_at(100, 4, 61_000, true, 5_001);
+        assert_eq!(index.first_cursor_from(1_001), None);
+        assert_eq!(index.first_cursor_from(1_000), Some(0));
+    }
+
+    #[test]
+    fn a_session_with_no_index_file_is_reached_from_memory_alone() {
+        let (index, path, _kept) = index("memory");
+        assert_eq!(index.first_cursor_from(0), None, "nothing is noted");
+        index.note_at(8, 4, 1_000, true, 5_000);
+        assert!(!path.exists(), "nothing has been written");
+        assert_eq!(index.first_cursor_from(1_000), Some(8));
     }
 
     #[test]

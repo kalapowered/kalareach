@@ -1972,4 +1972,71 @@ mod tests {
             "a writer that kept the frame through the launch's hold is given up now"
         );
     }
+
+    /// KR-REQ-08.48: a line accepted after the host's answer invalidated the fence it stood on is
+    /// not attributed to anyone; a line accepted on a fence the reader proved again after the answer
+    /// is judged on that fence, and is attributed to the holder whose keys it was.
+    #[test]
+    fn a_line_accepted_after_an_answer_is_attributed_only_on_a_fence_proved_after_it() {
+        let clock = Arc::new(ManualClock::new());
+        let mut driver = qualified(&clock);
+        let _ = acknowledged(&mut driver);
+        let holder = lease().holder.expect("a holder");
+        let first = driver.fence().map(|fence| fence.fence_id).expect("a fence");
+        let accepted = |fence_id| {
+            BridgeEvent::CommandAccepted(RootCommandAcceptedParams {
+                session_id: session(),
+                fence_id: Nullable::some(fence_id),
+                prompt_generation: PromptGeneration::new(1),
+                origin: AcceptedOrigin::Fenced {
+                    attachment_id: holder,
+                    input_epoch: InputLeaseEpoch::new(1),
+                },
+            })
+        };
+
+        let _ = driver.host_reply_queued(b"\x1b[?62;22c".len() as u64);
+        assert!(driver.fence().is_none(), "the answer invalidated the fence");
+        let after_the_answer = driver.bridge_event(RequestId::new(5), &accepted(first));
+        assert_eq!(
+            after_the_answer.acceptance,
+            Some(AcceptedOrigin::Unverifiable),
+            "the reader's claim stands on a fence the answer took away"
+        );
+
+        // The reader idles, is asked again, and proves its queues from its own snapshot.
+        let asked = driver.bridge_event(RequestId::new(6), &idled(1, 1));
+        let second = asked
+            .steps
+            .iter()
+            .find_map(|step| match step {
+                Step::Send(Outbound::Request(request)) => match request.as_ref() {
+                    WorkerRequest::Fence(params) => Some(params.fence_id),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("the reader was asked for a fence again");
+        let _ = driver.bridge_answer(&BridgeAnswer::Fence(
+            kr_protocol::root::RootEditorFenceResult::Acknowledged(FenceAcknowledgement {
+                fence_id: second,
+                reader_context: ReaderContext::Primary,
+                prompt_generation: PromptGeneration::new(1),
+                reader_revision: ReaderRevision::new(1),
+                queues: kr_protocol::root::QueueDrainReport::CLEAR,
+                snapshot: KeyQueueSnapshot::drained(),
+                editor: editor(),
+                cwd_revision: CwdRevision::new(1),
+            }),
+        ));
+        assert!(driver.fence().is_some(), "the fence is proved again");
+        let on_the_new_fence = driver.bridge_event(RequestId::new(7), &accepted(second));
+        assert_eq!(
+            on_the_new_fence.acceptance,
+            Some(AcceptedOrigin::Fenced {
+                attachment_id: holder,
+                input_epoch: InputLeaseEpoch::new(1),
+            })
+        );
+    }
 }

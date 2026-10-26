@@ -72,16 +72,27 @@ pub struct Platform<R: Runtime> {
 
 #[cfg(mobile)]
 impl<R: Runtime> Platform<R> {
-    /// Calls one of the native methods and reads its answer.
-    async fn call<T: serde::de::DeserializeOwned>(
+    /// Calls one of the native methods and reads its answer. The call runs to its end whatever the
+    /// caller does ([`to_its_end`]).
+    async fn call<T: serde::de::DeserializeOwned + Send + 'static>(
         &self,
         method: &str,
         arguments: impl serde::Serialize,
     ) -> Result<T, PlatformError> {
-        self.handle
-            .run_mobile_plugin_async(method, arguments)
-            .await
-            .map_err(|error| PlatformError::new(format!("the platform's {method} failed: {error}")))
+        let arguments = serde_json::to_value(arguments).map_err(|error| {
+            PlatformError::new(format!("the platform's {method} failed: {error}"))
+        })?;
+        let handle = self.handle.clone();
+        let named = method.to_owned();
+        to_its_end(async move {
+            handle
+                .run_mobile_plugin_async::<T>(&named, arguments)
+                .await
+                .map_err(|error| {
+                    PlatformError::new(format!("the platform's {named} failed: {error}"))
+                })
+        })
+        .await?
     }
 
     /// Calls one of the native methods from a thread that may wait for it. The thread the platform
@@ -97,6 +108,38 @@ impl<R: Runtime> Platform<R> {
             .run_mobile_plugin(method, arguments)
             .map_err(|error| PlatformError::new(format!("the platform's {method} failed: {error}")))
     }
+}
+
+/// Runs `call` to its end even when the caller stops waiting for it.
+///
+/// Tauri hands the answer of a native command to a callback that unwraps the send on the channel
+/// the caller waits on. A caller that is dropped (a timeout, a run that was cancelled) takes the
+/// channel with it, and the native answer, when it comes, panics in a callback the native side
+/// called into, which ends the process. So the call is moved to a task of its own, which keeps the
+/// channel until the answer comes; a caller that left finds its answer discarded.
+///
+/// The caller makes the first poll, which is the one that sends the command: commands reach the
+/// platform in the order callers ask, whatever the task below is doing, so a set of keys asked for
+/// later is never sent before one asked for earlier.
+///
+/// # Errors
+///
+/// Returns an error when the task itself is lost.
+#[cfg(any(mobile, test))]
+async fn to_its_end<T: Send + 'static>(
+    call: impl std::future::Future<Output = T> + Send + 'static,
+) -> Result<T, PlatformError> {
+    use std::task::Poll;
+
+    let mut call = Box::pin(call);
+    if let Poll::Ready(answer) =
+        std::future::poll_fn(|context| Poll::Ready(call.as_mut().poll(context))).await
+    {
+        return Ok(answer);
+    }
+    tauri::async_runtime::spawn(call)
+        .await
+        .map_err(|error| PlatformError::new(format!("the platform's call was lost: {error}")))
 }
 
 #[cfg(target_os = "ios")]
@@ -122,4 +165,85 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             Ok(())
         })
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::to_its_end;
+
+    /// Says, when it is dropped, whether the call it belonged to had answered.
+    struct Report {
+        answered: bool,
+        to: Option<tokio::sync::oneshot::Sender<bool>>,
+    }
+
+    impl Drop for Report {
+        fn drop(&mut self) {
+            if let Some(to) = self.to.take() {
+                let _ = to.send(self.answered);
+            }
+        }
+    }
+
+    /// A native call that is dropped before it answers makes Tauri's callback panic when the answer
+    /// comes, so a caller that stops waiting (a timeout, a cancelled run) must leave the call to its
+    /// end: it is not dropped before it answers, and a caller that stays gets the answer.
+    #[tokio::test]
+    async fn a_call_whose_caller_stops_waiting_runs_to_its_answer() {
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let (report, reported) = tokio::sync::oneshot::channel::<bool>();
+        let call = async move {
+            let mut guard = Report {
+                answered: false,
+                to: Some(report),
+            };
+            let _ = gate.await;
+            guard.answered = true;
+            7_u8
+        };
+        let mut waiting = Box::pin(to_its_end(call));
+        // The caller polls once, which starts the call, and then stops waiting.
+        tokio::select! {
+            biased;
+            _ = &mut waiting => unreachable!("the call cannot have answered"),
+            () = std::future::ready(()) => {}
+        }
+        drop(waiting);
+
+        release.send(()).expect("the call is still waiting");
+        assert!(
+            reported.await.expect("the call ended"),
+            "the call was dropped before it answered"
+        );
+        assert_eq!(to_its_end(async { 7_u8 }).await.expect("an answer"), 7);
+    }
+
+    /// Commands must reach the platform in the order callers ask, so the poll that sends a command is
+    /// the caller's own: a task started for it could be run after a command asked for later.
+    #[tokio::test]
+    async fn a_call_is_first_polled_in_the_turn_of_its_caller() {
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let polled_on = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen = std::sync::Arc::clone(&polled_on);
+        let call = async move {
+            seen.lock()
+                .expect("the thread of the first poll")
+                .get_or_insert(std::thread::current().id());
+            let _ = gate.await;
+        };
+        let mut waiting = Box::pin(to_its_end(call));
+        tokio::select! {
+            biased;
+            _ = &mut waiting => unreachable!("the call cannot have answered"),
+            () = std::future::ready(()) => {}
+        }
+
+        assert_eq!(
+            *polled_on.lock().expect("the thread of the first poll"),
+            Some(std::thread::current().id()),
+            "the command was not sent in the caller's turn"
+        );
+        drop(waiting);
+        let _ = release.send(());
+    }
 }

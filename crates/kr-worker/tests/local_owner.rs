@@ -1516,16 +1516,15 @@ async fn the_local_owner_is_drawn_the_whole_screen_and_a_device_the_live_screen(
 // KR-REQ-10.49: who is served the session's retained output
 // ---------------------------------------------------------------------------------------------
 
-/// KR-REQ-10.49: a caller the daemon heard on its local socket, acting under a grant, is refused the
-/// session's retained output, and so is a paired device.
+/// KR-REQ-10.49: a caller acting under a grant that forwarded no history scope with its read is
+/// refused the session's retained output, a paired device the daemon forwarded anyway included.
 ///
-/// A history page is a byte range and a grant's history scope is a moment in time, so nothing on
-/// this path can narrow one to the other, and a host that cannot narrow content to a grant refuses
-/// it rather than serving more than the grant allows. The daemon already refuses a paired device
-/// this read; the worker holds every caller but the local owner to the same rule, whichever socket
-/// it came in on.
+/// A history page is a byte range and a grant's history scope is a moment in time, so a page is
+/// narrowed through the scope that comes with the read. Without one there is nothing to narrow
+/// by, and the worker refuses rather than serve more than the grant allows, whichever socket the
+/// read came in on; only the local owner, who holds no grant, reads without one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_local_caller_under_a_grant_is_refused_the_retained_history() {
+async fn a_caller_under_a_grant_that_sent_no_history_scope_is_refused_the_retained_history() {
     let wired = wired(TWO_BUFFERS).await;
     common::produced(&wired.runtime, SCREEN_DRAWN).await;
 
@@ -1540,7 +1539,7 @@ async fn a_local_caller_under_a_grant_is_refused_the_retained_history() {
         "the refusal says what it withheld: {refused:?}"
     );
 
-    // A paired device the daemon forwarded anyway is refused here in the same words.
+    // A paired device the daemon forwarded with no scope is refused here in the same words.
     let mut phone = wired.daemon(ControllerConnectionRole::Proxy).await;
     let refused = wired
         .page_for(&mut phone, &device(1))
@@ -1943,6 +1942,9 @@ async fn a_local_caller_under_a_grant_detaches_only_what_its_own_connection_made
 
 /// KR-REQ-10.41: the local owner detaches another window's attachment on either socket, and a
 /// paired device does not, as each always did.
+///
+/// KR-REQ-07.52, the part about detaching: a detach removes only the attachment it names, and the
+/// session and its shell go on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_local_owner_detaches_another_windows_attachment_and_a_device_does_not() {
     let wired = wired("sleep 120").await;
@@ -1986,6 +1988,15 @@ async fn the_local_owner_detaches_another_windows_attachment_and_a_device_does_n
         .await
         .expect("the owner the daemon forwards detaches another window's attachment");
     assert!(!wired.attached(first));
+    assert!(
+        wired.attached(second),
+        "the other attachment stays when one is detached"
+    );
+    assert_eq!(
+        wired.runtime.state(),
+        kr_protocol::session::SessionState::Live,
+        "and so does the session"
+    );
 
     // And so does the owner in another of its own windows.
     let mut other_window = wired.window().await;

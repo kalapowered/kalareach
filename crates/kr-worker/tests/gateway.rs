@@ -1769,13 +1769,6 @@ fn kr_req_12_10_gateway_request_state_survives_reopening_the_workers_own_journal
             .1
             .expect("it expects a response");
         let interpreted = approval(&broker, "2", 3).expect("interpreted");
-        broker
-            .checkpoint(
-                instance(2),
-                kr_protocol::ids::StreamCursor::new(40),
-                TimestampMs::new(5),
-            )
-            .expect("the adapter's cursor is recorded");
         (opaque.resource_id, interpreted.resource_id)
     };
 
@@ -1800,12 +1793,6 @@ fn kr_req_12_10_gateway_request_state_survives_reopening_the_workers_own_journal
             .expect("the read succeeds")
             .is_some(),
         "and so did the record of whose interpretation it was"
-    );
-    assert_eq!(
-        restarted
-            .consumed_cursor(instance(2))
-            .expect("the read succeeds"),
-        Some(kr_protocol::ids::StreamCursor::new(40))
     );
     let _ = std::fs::remove_dir_all(path.parent().expect("a directory"));
 }
@@ -2601,8 +2588,8 @@ async fn kr_req_11_35_native_work_goes_on_while_a_recovery_is_held_at_its_write(
 /// KR-REQ-11.35, KR-REQ-11.36 and KR-REQ-11.37: while the fence is up nothing that needs its
 /// record is taken, and nothing that holds the broker's lock writes to the store.
 ///
-/// A component bound, a grant changed, an adapter's checkpoint and an ordinary reconciliation all
-/// need their record, and the store is what failed. Each is refused before the store is reached,
+/// A component bound, a grant changed and an ordinary reconciliation all need their record, and
+/// the store is what failed. Each is refused before the store is reached,
 /// and each is taken again once the recovery is complete.
 #[tokio::test]
 async fn kr_req_11_37_nothing_that_needs_its_record_is_taken_while_the_fence_is_up() {
@@ -2655,14 +2642,6 @@ async fn kr_req_11_37_nothing_that_needs_its_record_is_taken_while_the_fence_is_
             .holds(BrokerGrant::ApprovalInterpreter),
         "and the grant is as it was"
     );
-    fenced(
-        broker.checkpoint(
-            instance(2),
-            kr_protocol::ids::StreamCursor::new(1),
-            TimestampMs::new(3),
-        ),
-        "an adapter checkpoint",
-    );
     assert_eq!(
         broker.pending(held.resource_id).expect("still held").state,
         PendingState::Pending,
@@ -2678,13 +2657,6 @@ async fn kr_req_11_37_nothing_that_needs_its_record_is_taken_while_the_fence_is_
         "the open connection is reconciled from the host's record"
     );
     bind(6).expect("a component is bound once the recovery is complete");
-    broker
-        .checkpoint(
-            instance(2),
-            kr_protocol::ids::StreamCursor::new(1),
-            TimestampMs::new(6),
-        )
-        .expect("and an adapter's checkpoint is written");
 }
 
 /// KR-REQ-11.35 and KR-REQ-11.37: a recovery finishes without waiting for a store another

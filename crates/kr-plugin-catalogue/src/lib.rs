@@ -77,6 +77,7 @@ pub mod trust;
 /// The generation compiled into the host.
 #[rustfmt::skip]
 mod bundled_files;
+mod publisher;
 /// The trust a build commits.
 #[rustfmt::skip]
 mod seed_trust;
@@ -1387,6 +1388,26 @@ impl Catalogue {
         // which is what stays if it goes no further; generations it is not on make room for the
         // second first. A sync that cannot fit either way is refused here, with the accepted
         // checkpoint and the generation in use as they were.
+        // A publisher's name is held by one root. What this generation lists is held to that
+        // before anything of it is kept, against the root the repository was on and the one the
+        // load ended on, which the client verified a chain between.
+        let publishers: BTreeSet<String> = verified
+            .index
+            .entries
+            .iter()
+            .map(|entry| entry.publisher_id.to_string())
+            .collect();
+        self.db.read(|records| {
+            publisher::check(
+                records,
+                &self.root,
+                &enrolled.key,
+                &[&enrolled.enrolment.root, &verified.root],
+                &publishers,
+                publisher::Doing::Synchronising,
+            )
+        })?;
+
         let checkpoint = store.publication_peak(&working)?;
         self.retain_before_publication(&store, &enrolled.key, id, checkpoint, arriving, authority)?;
 
@@ -1463,6 +1484,8 @@ impl Catalogue {
         let entries = verified.index.entries.len() as u64;
         let versions = verified.versions;
         let key = enrolled.key.clone();
+        let home = self.root.clone();
+        let began_on = enrolled.enrolment.root.clone();
         let accepted_targets = verified.accepted_targets(&enrolled.enrolment.targets_url)?;
         // The index is written whole and flushed before the row that names it commits, in a
         // commit of its own: a document nothing names yet is what a later failure leaves behind,
@@ -1471,66 +1494,91 @@ impl Catalogue {
             store.write_index(permit, rendered)
         })?;
         let checkpoint = store.checkpoint_bytes()?;
-        let synced = committing(&mut self.db, &*self.broker, change, |changes| {
-            // Read again: the repository may have been removed, enrolled again or moved to
-            // another generation while this sync fetched. Only the enrolment this sync
-            // verified is changed, and only forward from the generation it holds now.
-            let current =
-                changes
-                    .enrolment_by_key(&key)?
-                    .ok_or_else(|| CatalogueError::NotFound {
-                        detail: format!("{id} was removed while it synchronised"),
+        let synced =
+            committing_checked(
+                &mut self.db,
+                &*self.broker,
+                change,
+                // Decided again where the generation becomes the active one: another process can
+                // have synchronised a repository under another root since the check above.
+                |records| {
+                    // The admission is asked first, so a sync whose admission lapsed is refused for
+                    // that and not for what the check finds.
+                    authority.check()?;
+                    let current = records.enrolment_by_key(&key)?.ok_or_else(|| {
+                        CatalogueError::NotFound {
+                            detail: format!("{id} was removed while it synchronised"),
+                        }
                     })?;
-            trust::check_generation(
-                verified.generation,
-                digest,
-                accepted_of(current.active),
-                current.enrolment.pinned_generation,
-            )?;
-            let active = ActiveGeneration {
-                generation: verified.generation.get(),
-                index_digest: digest,
-                index_bytes: bytes,
-                entries,
-                versions,
-            };
-            if let Via::Bundle(bundle) = via {
-                require_seeded_in(changes, &key)?;
-                // Where the bundled generation came from is kept with the commit that activates it,
-                // so the record names the last bundle this store took a generation from; a later
-                // synchronisation from the repository itself leaves it, and the doctor shows both
-                // generation numbers.
-                changes.put_setting(
-                    &format!("{}{key}", seed::PROVENANCE),
-                    &seed::provenance_of(bundle),
-                )?;
-            }
-            changes.activate(&key, &active, &accepted_targets)?;
-            // The generations it no longer keeps go in the same commit that moves it on, the
-            // oldest first, decided from the records and the budgets as they are now.
-            let forgotten = BudgetLedger::new(current.enrolment.budgets).plan_retention(
-                checkpoint,
-                &retained(&changes.kept_generations(&key)?),
-                Some(Retained {
-                    generation: active.generation,
-                    index_bytes: active.index_bytes,
-                }),
-            )?;
-            for generation in forgotten {
-                changes.forget_generation(&key, generation)?;
-            }
-            let repository = RepositoryView {
-                enrolment: current.enrolment,
-                active: Some(active),
-            };
-            Ok((
-                outcome.clone(),
-                Transition::Synced {
-                    repository,
-                    outcome,
+                    publisher::check(
+                        records,
+                        &home,
+                        &key,
+                        &[&began_on, &current.enrolment.root, &verified.root],
+                        &publishers,
+                        publisher::Doing::Synchronising,
+                    )
                 },
-            ))
-        })?;
+                |changes| {
+                    // Read again: the repository may have been removed, enrolled again or moved to
+                    // another generation while this sync fetched. Only the enrolment this sync
+                    // verified is changed, and only forward from the generation it holds now.
+                    let current = changes.enrolment_by_key(&key)?.ok_or_else(|| {
+                        CatalogueError::NotFound {
+                            detail: format!("{id} was removed while it synchronised"),
+                        }
+                    })?;
+                    trust::check_generation(
+                        verified.generation,
+                        digest,
+                        accepted_of(current.active),
+                        current.enrolment.pinned_generation,
+                    )?;
+                    let active = ActiveGeneration {
+                        generation: verified.generation.get(),
+                        index_digest: digest,
+                        index_bytes: bytes,
+                        entries,
+                        versions,
+                    };
+                    if let Via::Bundle(bundle) = via {
+                        require_seeded_in(changes, &key)?;
+                        // Where the bundled generation came from is kept with the commit that
+                        // activates it, so the record names the last bundle this store took a
+                        // generation from; a later synchronisation from the repository itself
+                        // leaves it, and the doctor shows both generation numbers.
+                        changes.put_setting(
+                            &format!("{}{key}", seed::PROVENANCE),
+                            &seed::provenance_of(bundle),
+                        )?;
+                    }
+                    changes.activate(&key, &active, &accepted_targets)?;
+                    // The generations it no longer keeps go in the same commit that moves it on,
+                    // the oldest first, decided from the records and the budgets as they are now.
+                    let forgotten = BudgetLedger::new(current.enrolment.budgets).plan_retention(
+                        checkpoint,
+                        &retained(&changes.kept_generations(&key)?),
+                        Some(Retained {
+                            generation: active.generation,
+                            index_bytes: active.index_bytes,
+                        }),
+                    )?;
+                    for generation in forgotten {
+                        changes.forget_generation(&key, generation)?;
+                    }
+                    let repository = RepositoryView {
+                        enrolment: current.enrolment,
+                        active: Some(active),
+                    };
+                    Ok((
+                        outcome.clone(),
+                        Transition::Synced {
+                            repository,
+                            outcome,
+                        },
+                    ))
+                },
+            )?;
         // Best effort: the sync has happened whatever this does. A document it cannot remove is
         // removed by the next sync before it keeps anything, or stops that sync.
         let _ = self.remove_unnamed_indexes(&store, &enrolled.key, id, authority);
@@ -2463,6 +2511,19 @@ impl Catalogue {
                 ),
             });
         }
+        // The name this package lists is held by one root, and nothing is fetched for a package
+        // under a name another root holds.
+        let publishers = BTreeSet::from([entry.publisher_id.to_string()]);
+        self.db.read(|records| {
+            publisher::check(
+                records,
+                &self.root,
+                &enrolled.key,
+                &[&enrolled.enrolment.root],
+                &publishers,
+                publisher::Doing::Installing,
+            )
+        })?;
         let previous = self.installation(environment_id, plugin_id)?;
         let confirmed = authority.owner_confirmed();
         check_installation(
@@ -2495,61 +2556,87 @@ impl Catalogue {
 
         let root = self.root.clone();
         let key = enrolled.key.clone();
-        committing(&mut self.db, &*self.broker, change, |changes| {
-            // Read again, inside the commit. The enrolment may have changed while the package
-            // was fetched, and the installation it replaces may have been pinned or granted
-            // in the meantime: the decision is made against what is there now.
-            let current =
-                changes
-                    .enrolment_by_key(&key)?
-                    .ok_or_else(|| CatalogueError::NotFound {
-                        detail: format!("{id} was removed while {plugin_id} was installed"),
-                    })?;
-            check_decided_under(id, &current.enrolment.ceiling, decided_under)?;
-            let previous = changes.installation(environment_id, plugin_id)?;
-            check_installation(
-                &entry,
-                &current.enrolment.ceiling,
-                &grant,
-                previous.as_ref(),
-                confirmed,
-            )?;
-            // The ceiling travels with the installation. What this package may do was decided
-            // against the repository's ceiling as it stood now, and that answer must not move
-            // when the repository's enrolment changes or is removed.
-            let mut installation = Installation::from_package(
-                &package,
-                key.clone(),
-                id.clone(),
-                environment_id,
-                grant.clone(),
-                current.enrolment.ceiling.clone(),
-            );
-            if let Some(previous) = &previous {
-                installation.enabled = previous.enabled;
-                installation.pinned =
-                    previous.pinned && previous.package_digest == entry.manifest_digest;
-                // The release the installation leaves may still be bound somewhere, and keeps
-                // what it held then as the most a binding on it may use.
-                let left = ReleaseOrigin::of(previous);
-                if previous.package_digest != installation.package_digest
-                    || left != ReleaseOrigin::of(&installation)
-                {
-                    changes.retire_release(&retired_from(previous))?;
+        committing_checked(
+            &mut self.db,
+            &*self.broker,
+            change,
+            // Decided again where the installation commits: another process can have synchronised
+            // a repository under another root while the package was fetched.
+            |records| {
+                // The admission is asked first, so an installation whose admission lapsed is
+                // refused for that and not for what the check finds.
+                authority.check()?;
+                let current =
+                    records
+                        .enrolment_by_key(&key)?
+                        .ok_or_else(|| CatalogueError::NotFound {
+                            detail: format!("{id} was removed while {plugin_id} was installed"),
+                        })?;
+                publisher::check(
+                    records,
+                    &root,
+                    &key,
+                    &[&current.enrolment.root],
+                    &publishers,
+                    publisher::Doing::Installing,
+                )
+            },
+            |changes| {
+                // Read again, inside the commit. The enrolment may have changed while the package
+                // was fetched, and the installation it replaces may have been pinned or granted
+                // in the meantime: the decision is made against what is there now.
+                let current =
+                    changes
+                        .enrolment_by_key(&key)?
+                        .ok_or_else(|| CatalogueError::NotFound {
+                            detail: format!("{id} was removed while {plugin_id} was installed"),
+                        })?;
+                check_decided_under(id, &current.enrolment.ceiling, decided_under)?;
+                let previous = changes.installation(environment_id, plugin_id)?;
+                check_installation(
+                    &entry,
+                    &current.enrolment.ceiling,
+                    &grant,
+                    previous.as_ref(),
+                    confirmed,
+                )?;
+                // The ceiling travels with the installation. What this package may do was decided
+                // against the repository's ceiling as it stood now, and that answer must not move
+                // when the repository's enrolment changes or is removed.
+                let mut installation = Installation::from_package(
+                    &package,
+                    key.clone(),
+                    id.clone(),
+                    environment_id,
+                    grant.clone(),
+                    current.enrolment.ceiling.clone(),
+                );
+                if let Some(previous) = &previous {
+                    installation.enabled = previous.enabled;
+                    installation.pinned =
+                        previous.pinned && previous.package_digest == entry.manifest_digest;
+                    // The release the installation leaves may still be bound somewhere, and keeps
+                    // what it held then as the most a binding on it may use.
+                    let left = ReleaseOrigin::of(previous);
+                    if previous.package_digest != installation.package_digest
+                        || left != ReleaseOrigin::of(&installation)
+                    {
+                        changes.retire_release(&retired_from(previous))?;
+                    }
                 }
-            }
-            // A release installed again is described by its installation, whose grants the owner
-            // confirmed, and no longer by what it held when it was left.
-            changes.forget_retired(
-                environment_id,
-                plugin_id,
-                installation.package_digest,
-                &ReleaseOrigin::of(&installation),
-            )?;
-            changes.install(&installation)?;
-            let view = installation_view(&root, changes, installation)?;
-            Ok((view.clone(), Transition::Installed(view)))
-        })
+                // A release installed again is described by its installation, whose grants the
+                // owner confirmed, and no longer by what it held when it was left.
+                changes.forget_retired(
+                    environment_id,
+                    plugin_id,
+                    installation.package_digest,
+                    &ReleaseOrigin::of(&installation),
+                )?;
+                changes.install(&installation)?;
+                let view = installation_view(&root, changes, installation)?;
+                Ok((view.clone(), Transition::Installed(view)))
+            },
+        )
     }
 
     /// Enables or disables an installed package, as the owner acting directly.
@@ -2918,11 +3005,28 @@ fn committing<T>(
     change: &mut Change<'_>,
     apply: impl FnOnce(&Changes<'_>) -> CatalogueResult<(T, Transition)>,
 ) -> CatalogueResult<T> {
+    committing_checked(db, broker, change, |_| Ok(()), apply)
+}
+
+/// As [`committing`], with `check` run first: under the write lock the change holds, so what it
+/// reads is what the change then writes over, and before the admitting authority is asked.
+///
+/// The admitting authority holds the daemon's registration of the caller for as long as the commit
+/// runs. A decision that reads files and scans records, as the publisher's name does, is made here,
+/// outside that hold, and the commit only writes.
+fn committing_checked<T>(
+    db: &mut Db,
+    broker: &dyn BrokerBridge,
+    change: &mut Change<'_>,
+    check: impl FnOnce(&Records<'_>) -> CatalogueResult<()>,
+    apply: impl FnOnce(&Changes<'_>) -> CatalogueResult<(T, Transition)>,
+) -> CatalogueResult<T> {
     let authority = change.authority;
     let settlement = &mut change.settlement;
     // The write lock first. Whatever wait there is for another writer happens here, before the
     // authority is asked for the last time, so no wait comes between its answer and the change.
     let pending = db.begin()?;
+    pending.read(check)?;
     committed(authority, &Effect::Records, move |permit| {
         pending.run(permit, |changes| {
             let (value, transition) = apply(changes)?;

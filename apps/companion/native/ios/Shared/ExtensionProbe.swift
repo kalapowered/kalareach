@@ -69,7 +69,7 @@ struct ExtensionProbe {
         var added: [String: Any] = ["kr_ext_reason": reason]
 
         do {
-            let value = try keys.key(forRecipient: ProbeFixture.recipientKeyID(nonce: nonce))
+            let value = try keys.recipientSeed(forRecipient: ProbeFixture.recipientKeyID(nonce: nonce))
             added["kr_ext_shared_match"] = value == ProbeFixture.value(nonce: nonce)
         } catch {
             added["kr_ext_shared_match"] = false

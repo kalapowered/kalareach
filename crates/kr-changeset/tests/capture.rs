@@ -16,11 +16,18 @@
 
 mod support;
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use kr_changeset::service::VersionHead;
 use kr_protocol::changeset::{
     ContentOrigin, ExclusionReason, FileGrant, PathClass, SourceConsistency,
 };
 use kr_protocol::error::ErrorCode;
+use kr_protocol::ids::SessionId;
 use kr_protocol::project::{ContentClass, InclusionChoice, InclusionPolicy};
+use kr_protocol::scalars::Uuid;
 
 use support::{
     Fixture, change, exclusion, git_raw, include_everything, ordinary_repository, write,
@@ -3406,5 +3413,88 @@ fn requiring_the_quiesced_class_refuses_a_capture_whose_file_was_written_under_i
         2,
         "the file was read once, written, and read whole once more; the capture then refused \
          rather than reading the whole tree again"
+    );
+}
+
+/// A reader that follows the change-set store is told each time a version is recorded, and reads
+/// the newest version of each change set past what it has seen, with the session it was recorded
+/// for and the moment it was recorded.
+#[test]
+fn the_newest_version_of_each_change_set_is_read_with_its_session_and_the_host_is_told() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "heads");
+    write(&path, "README.md", "changed after the commit\n");
+    let workspace = fixture.workspace("heads");
+    let told = Arc::new(AtomicUsize::new(0));
+    fixture.service().on_version_recorded({
+        let told = Arc::clone(&told);
+        move || {
+            told.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    let nothing_seen = BTreeMap::new();
+    assert!(
+        fixture
+            .service()
+            .newest_versions_after(&nothing_seen)
+            .expect("the store reads")
+            .is_empty(),
+        "a store with no version has no head"
+    );
+    let first_session = SessionId::new(Uuid::from_bytes([1; 16]));
+    let second_session = SessionId::new(Uuid::from_bytes([2; 16]));
+
+    let first = fixture.capture_for(workspace, None, Some(first_session));
+    assert_eq!(told.load(Ordering::SeqCst), 1, "told of the capture");
+    assert_eq!(
+        fixture
+            .service()
+            .newest_versions_after(&nothing_seen)
+            .expect("the store reads"),
+        vec![VersionHead {
+            change_set_id: first.change_set_id,
+            version: first.version,
+            captured_at_ms: first.captured_at_ms,
+            session_id: Some(first_session),
+        }]
+    );
+    let seen = BTreeMap::from([(first.change_set_id, first.version)]);
+    assert!(
+        fixture
+            .service()
+            .newest_versions_after(&seen)
+            .expect("the store reads")
+            .is_empty(),
+        "a version the reader has seen is not read again"
+    );
+
+    // Two more versions of the first change set, the last for another session, and a change set
+    // recorded for none: the reader is given the newest of each and nothing in between.
+    let _ = fixture.capture_for(workspace, Some(first.change_set_id), Some(first_session));
+    let newest = fixture.capture_for(workspace, Some(first.change_set_id), Some(second_session));
+    let unattended = fixture.capture_for(workspace, None, None);
+    assert_eq!(told.load(Ordering::SeqCst), 4, "told of each capture");
+    let mut heads = fixture
+        .service()
+        .newest_versions_after(&seen)
+        .expect("the store reads");
+    heads.sort_by_key(|head| head.captured_at_ms);
+    assert_eq!(
+        heads,
+        vec![
+            VersionHead {
+                change_set_id: newest.change_set_id,
+                version: newest.version,
+                captured_at_ms: newest.captured_at_ms,
+                session_id: Some(second_session),
+            },
+            VersionHead {
+                change_set_id: unattended.change_set_id,
+                version: unattended.version,
+                captured_at_ms: unattended.captured_at_ms,
+                session_id: None,
+            },
+        ],
+        "the newest version of each, and the one recorded for no session names none"
     );
 }

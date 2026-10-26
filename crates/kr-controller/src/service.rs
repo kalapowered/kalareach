@@ -90,11 +90,12 @@ pub use backup_production::{Held as ProductionHeld, ProducerBounds, StopBackupPr
 pub use barrier::DEBT_PASS_INTERVAL;
 pub use capabilities::{CAPABILITY_REVISION_FILE, DESKTOP_REREAD_INTERVAL};
 pub use close::{CLOSE_EXCHANGE, CLOSURE_WATCH_TIMEOUT};
-pub use create::RENDEZVOUS_TIMEOUT;
+pub use create::{CREATE_WAIT, RENDEZVOUS_TIMEOUT};
 pub use inhibition::{DEMAND_BUDGET, DEMAND_PATIENCE, POWER_REVIEW_INTERVAL};
 pub use local::{
     LOCAL_KEEPALIVE, RETAINED_AUTHORITY_ANSWERS, RETAINED_MACHINE_ANSWERS, WINDOW_RENEWAL,
 };
+pub(crate) use reads::withheld_page;
 pub use rendezvous::LAUNCH_IDENTITY_TIMEOUT;
 pub use revocation::Audience;
 pub use routes::local_actor;
@@ -351,7 +352,25 @@ pub struct Controller {
     /// This is the daemon's authority store for live connections. A registration is written in the
     /// same critical section as the caller's final record validation, and withdrawn when the
     /// authority it was made under is revoked or the connection ends.
-    admitted: std::sync::Mutex<BTreeMap<ConnectionId, AdmittedConnection>>,
+    admitted: std::sync::RwLock<BTreeMap<ConnectionId, AdmittedConnection>>,
+    /// Held for reading by every commit that stands on a connection's registration, from the
+    /// check of it to the end of the commit, and for writing by every withdrawal or replacement of
+    /// a registration, which therefore lands wholly before the check or wholly after the commit.
+    /// The connection table is not held for the length of a commit, so what only reads it, and a
+    /// registration that is added, never waits for one.
+    commit_hold: std::sync::RwLock<()>,
+    /// The connections that ended while the registrations were held, whose registrations go when
+    /// whoever holds them lets go ([`Self::deregister`]).
+    ended: std::sync::Mutex<Vec<ConnectionId>>,
+    /// Where this host's own tests stop a withdrawal once it has taken the registrations of the
+    /// connections that ended and still holds them, so that a connection can end behind it.
+    /// Compiled away in every shipped build.
+    #[cfg(test)]
+    after_the_ended_are_taken: BlockingPause,
+    /// How many withdrawals have begun to wait for the commits that stand on a registration, for
+    /// a suite that holds a commit and waits for one to arrive.
+    #[cfg(test)]
+    withdrawals_waiting: std::sync::atomic::AtomicUsize,
     identity: ControllerIdentity,
     /// Which store this daemon keeps its keys in.
     secret_store: kr_crypto::store::StoreSelection,
@@ -720,6 +739,11 @@ pub struct Controller {
     /// The wait for the pairing records' write lock that a refusal which rose is in, while it has
     /// gone on past the database's busy timeout ([`Controller::stuck_drain`]).
     feed_drain: std::sync::Mutex<Option<remote_revocation::StuckDrain>>,
+    /// The ask this crate's own unit tests substitute for the wait's ask of the pairing records'
+    /// write lock, so that a case can drive the wait of a refusal that rises with a connection it
+    /// has set up. Compiled only into the crate's unit-test build.
+    #[cfg(test)]
+    lock_ask: std::sync::Mutex<Option<std::sync::Arc<remote_revocation::LockAsk>>>,
     /// What a withdrawal the feed shows complete and this host cannot verify names, while one
     /// stands: the devices, and the keys they hold, that keep no standing over the feed.
     feed_withheld: std::sync::Mutex<remote_revocation::Withheld>,
@@ -800,6 +824,14 @@ pub struct Controller {
     /// reconciliation this daemon does on its own both reach that point for the same session, so
     /// the two steps are one transaction.
     finalising: Mutex<()>,
+    /// Held while the archive removes what the sessions that have ended retained for privacy mode.
+    ///
+    /// A change to privacy mode removes it before it answers, and the privacy tick removes it on
+    /// its own schedule, so two removals can reach the same session together. Each takes the
+    /// session's recovery lock without waiting, so the second would find the session held and
+    /// leave it owed, and the change would answer that it was. The second waits for the first
+    /// and then asks what is still owed.
+    removing_closed: Mutex<()>,
     /// The sessions whose crashed worker is being cleaned up, each under a lock of its own.
     ///
     /// A worker's death is noticed by a read, a list, the closure watcher, the barrier and the
@@ -1222,6 +1254,9 @@ mod a_create_that_launches_nothing;
 mod a_close_a_worker_never_answers;
 
 #[cfg(test)]
+mod a_closed_session_read_held_while_privacy_mode_is_enabled;
+
+#[cfg(test)]
 mod a_description_read_held_while_privacy_mode_is_enabled;
 
 #[cfg(test)]
@@ -1235,6 +1270,9 @@ mod a_feed_request_written_down_before_it_takes_effect;
 
 #[cfg(test)]
 mod a_completed_request_carried_out_again;
+
+#[cfg(test)]
+mod a_connection_that_ends_behind_a_withdrawal;
 
 #[cfg(test)]
 mod a_refusal_the_feed_raises_after_admission;
@@ -1334,6 +1372,10 @@ mod a_crash_whose_endpoint_cannot_be_removed;
 /// A migration and a recovery of one session's journal, which its recovery lock keeps apart.
 #[cfg(test)]
 mod a_migration_and_a_recovery_of_one_session;
+
+/// A closed session whose journal is of an earlier schema and whose migration fails.
+#[cfg(all(test, unix))]
+mod a_migration_that_fails;
 
 /// A closed session whose worker has not yet exited.
 #[cfg(test)]

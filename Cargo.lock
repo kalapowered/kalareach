@@ -1261,6 +1261,7 @@ version = "0.1.0"
 dependencies = [
  "apple-native-keyring-store",
  "base64 0.23.1",
+ "companion-preview",
  "jni 0.22.4",
  "keyring-core",
  "kr-client",
@@ -1274,6 +1275,20 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "companion-preview"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "kr-cbor",
+ "kr-crypto",
+ "kr-delivery",
+ "kr-protocol",
+ "serde",
+ "serde_json",
  "zeroize",
 ]
 
@@ -5118,6 +5133,7 @@ dependencies = [
  "kr-plugin-sdk",
  "kr-protocol",
  "kr-shell-integration",
+ "kr-term",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -5189,6 +5205,8 @@ dependencies = [
  "kr-width",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
  "thiserror 2.0.20",
  "vtparse",
  "wezterm-escape-parser",

@@ -716,6 +716,76 @@ async fn kr_req_14_11_a_prompt_naming_a_draft_is_refused_on_the_workers_own_sock
     assert_eq!(error.code, ErrorCode::UnsupportedCapability);
 }
 
+/// KR-REQ-12.06: a prompt that names a draft is held to the instance's binding as one that carries
+/// its text is. A binding that moved after the prompt was prepared is `STALE_SESSION`, an instance
+/// whose rich mutations are suspended is `DRAFT_CONFLICT`, and neither reaches the upstream; the
+/// same prompt at the binding's revision is carried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_06_a_prompt_naming_a_draft_is_held_to_the_instances_binding() {
+    for (cause, expected) in [
+        ("a moved binding", Some(ErrorCode::StaleSession)),
+        ("a suspended instance", Some(ErrorCode::DraftConflict)),
+        ("neither", None),
+    ] {
+        let host = host().await;
+        let upstream = Arc::new(CountingUpstream::default());
+        register(
+            &host,
+            Some(Arc::clone(&upstream) as Arc<dyn UpstreamDispatch>),
+        );
+        let client = cli(&host).await;
+        let mut daemon = daemon(&host).await;
+        let mut mutation = prompt_mutation(&client, &host, 31);
+        mutation.params = ParamsValue::from_typed(&AgentPromptParams {
+            target: AgentMutationTarget {
+                subject: subject(host.session_id, instance()),
+                binding_revision: AgentBindingRevision::new(1),
+            },
+            draft_id: Nullable::some(DraftId::new(kr_ipc::new_uuid())),
+            text: Nullable::null(),
+        })
+        .expect("encodes");
+        match cause {
+            "a moved binding" => {
+                host.service
+                    .broker()
+                    .advance_binding(
+                        instance(),
+                        Some(kr_protocol::ids::AgentThreadId::new("thread-2").expect("a thread")),
+                        TimestampMs::new(5),
+                    )
+                    .expect("the binding moves");
+            }
+            "a suspended instance" => host
+                .service
+                .broker()
+                .suspend_rich_mutations(instance(), "a frame the table does not classify arrived")
+                .expect("the instance is held"),
+            _ => {}
+        }
+        let answer = forward_as_device(&mut daemon, &mutation, &[]).await;
+        match expected {
+            Some(code) => {
+                let error = answer.expect_err(cause);
+                assert_eq!(error.code, code, "{cause}");
+                assert_eq!(
+                    upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+                    0,
+                    "{cause}: nothing reached the upstream"
+                );
+            }
+            None => {
+                answer.expect("a prompt at the binding's revision is carried");
+                assert_eq!(
+                    upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+                    1,
+                    "and reaches the upstream"
+                );
+            }
+        }
+    }
+}
+
 /// KR-REQ-14.11: a prompt the control daemon forwards for a local caller with no lifetime left is
 /// answered only from a receipt the worker holds, which is how the daemon learns whether a draft
 /// the prompt names was recorded for an earlier attempt: the receipt as it stands for the same
@@ -2033,6 +2103,20 @@ fn upstream_rich() -> kr_protocol::gateway::RichMethodTable {
     }
 }
 
+/// The closed rich table that names the methods a prompt and a cancellation of the running turn go
+/// out as.
+fn upstream_rich_cancelling() -> kr_protocol::gateway::RichMethodTable {
+    let mut table = upstream_rich();
+    table.entries.push(kr_protocol::gateway::RichMethodEntry {
+        method: kr_protocol::ids::UpstreamMethod::new("turn/interrupt").expect("valid"),
+        class: kr_protocol::gateway::NativeMethodClass::Mutation,
+        required_right: kr_protocol::rights::ActionRight::AgentCancel,
+        operation: Nullable::some(kr_protocol::gateway::RichOperation::TurnCancel),
+        provenance: kr_protocol::broker::ActionProvenance::UpstreamTypedRpc,
+    });
+    table
+}
+
 /// One end of a connected pair of local sockets: a Unix socket pair where the platform has one,
 /// and otherwise a loopback connection. This suite needs two connected streams and nothing of the
 /// endpoint they stand in for: a launched agent's endpoint on Windows is a named pipe, and the
@@ -2070,26 +2154,46 @@ fn socket_pair() -> (SocketStream, SocketStream) {
     (ready(here), ready(there))
 }
 
-/// Section 9 and KR-REQ-11.33: a request that went in full and was never answered leaves a receipt
-/// nobody can read as applied.
-///
-/// The transport here is the real one, over a real socket pair. The upstream reads the whole frame
-/// and says nothing, which is the case a queue-shaped transport cannot tell from success: the
-/// bytes went, so nothing failed, and the upstream never acted, so nothing succeeded. What the
-/// caller is told and what the receipt says is that nobody can establish it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kr_req_09_a_request_that_went_and_was_never_answered_leaves_an_unknown_receipt() {
-    let host = host().await;
-    register(&host, None);
+/// The real transport of a session's one gateway connection, over a socket pair, to an upstream
+/// the test plays: it reads everything the connection writes to it, and says only what the test has
+/// the connection's owner read.
+struct RealTransport {
+    owner: Arc<kr_worker::broker::Duplex>,
+    /// Everything the upstream has read, in the lines it was written in.
+    read: Arc<std::sync::Mutex<String>>,
+    driving: tokio::task::JoinHandle<()>,
+    reading: tokio::task::JoinHandle<()>,
+    /// The terminal's end, kept open.
+    _client: SocketStream,
+}
+
+impl Drop for RealTransport {
+    fn drop(&mut self) {
+        self.reading.abort();
+        self.driving.abort();
+    }
+}
+
+/// Opens the connection and binds its transport to the session's instance.
+async fn real_transport(host: &Host) -> RealTransport {
+    real_transport_with(host, upstream_rich()).await
+}
+
+/// Opens the connection and binds its transport to the session's instance, over a rich table that
+/// lists the operations `rich` does.
+async fn real_transport_with(
+    host: &Host,
+    rich: kr_protocol::gateway::RichMethodTable,
+) -> RealTransport {
     let broker = host.service.broker();
     broker
-        .pin_table(instance(), installed(), upstream_table(), upstream_rich())
+        .pin_table(instance(), installed(), upstream_table(), rich.clone())
         .expect("the installed tables are pinned");
     broker
         .pin_reading(
             instance(),
             &PluginId::new("kalareach.codex").expect("valid"),
-            kr_worker::broker::reading::Reading::spelling(&upstream_rich()),
+            kr_worker::broker::reading::Reading::spelling(&rich),
         )
         .expect("what the connector spells is pinned");
     broker
@@ -2102,7 +2206,7 @@ async fn kr_req_09_a_request_that_went_and_was_never_answered_leaves_an_unknown_
         )
         .expect("the native connection is authenticated");
     let (upstream_here, upstream_there) = socket_pair();
-    let (client_here, _client_there) = socket_pair();
+    let (client_here, client_there) = socket_pair();
     let (owner, writes) = kr_worker::broker::Duplex::new(
         Arc::clone(broker),
         kr_protocol::ids::GatewayConnectionId::new(1),
@@ -2136,7 +2240,61 @@ async fn kr_req_09_a_request_that_went_and_was_never_answered_leaves_an_unknown_
             }
         })
     };
+    RealTransport {
+        owner,
+        read,
+        driving,
+        reading,
+        _client: client_there,
+    }
+}
 
+impl RealTransport {
+    /// The identifier the host sent its `number`th request under, as the upstream read it, once
+    /// the upstream has read that many.
+    async fn identifier_of(&self, number: usize) -> String {
+        let started = std::time::Instant::now();
+        loop {
+            let line = self
+                .read
+                .lock()
+                .expect("the record is not poisoned")
+                .lines()
+                .nth(number - 1)
+                .map(str::to_owned);
+            if let Some(line) = line {
+                let frame: serde_json::Value = serde_json::from_str(&line).expect("a frame");
+                return frame["id"].to_string();
+            }
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "the upstream read {number} requests by now"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// The upstream says something to the connection's owner, as its reader would hand it over.
+    async fn says(&self, frame: &str) -> Result<kr_worker::broker::Carried, BrokerError> {
+        self.owner
+            .from_upstream(frame.as_bytes(), TimestampMs::new(5))
+            .await
+    }
+}
+
+/// Section 9 and KR-REQ-11.33: a request that went in full and was never answered leaves a receipt
+/// nobody can read as applied.
+///
+/// The transport here is the real one, over a real socket pair. The upstream reads the whole frame
+/// and says nothing, which is the case a queue-shaped transport cannot tell from success: the
+/// bytes went, so nothing failed, and the upstream never acted, so nothing succeeded. What the
+/// caller is told and what the receipt says is that nobody can establish it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_09_a_request_that_went_and_was_never_answered_leaves_an_unknown_receipt() {
+    let host = host().await;
+    register(&host, None);
+    let transport = real_transport(&host).await;
+    let read = Arc::clone(&transport.read);
     let mut client = cli(&host).await;
     let mutation = prompt_mutation(&client, &host, 31);
     let action_id = mutation.action_id;
@@ -2201,8 +2359,355 @@ async fn kr_req_09_a_request_that_went_and_was_never_answered_leaves_an_unknown_
         "its receipt still says what it said"
     );
 
-    reading.abort();
-    driving.abort();
+    drop(transport);
+}
+
+/// What the journal holds of the observations made about one action.
+fn observations_of(
+    host: &Host,
+    receipt: &kr_protocol::receipt::Receipt,
+) -> Vec<kr_protocol::action::ActionObservation> {
+    host.service
+        .runtime()
+        .session()
+        .journal_mut()
+        .expect("the session journals")
+        .observations(&receipt.actor_id, receipt.action_id)
+        .expect("the observations are read")
+}
+
+/// Waits until the journal holds an observation about the action, and returns what it holds.
+async fn until_observed(
+    host: &Host,
+    receipt: &kr_protocol::receipt::Receipt,
+) -> Vec<kr_protocol::action::ActionObservation> {
+    let started = std::time::Instant::now();
+    loop {
+        let seen = observations_of(host, receipt);
+        if !seen.is_empty() {
+            return seen;
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "the journal holds no observation of the action by now"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+/// Waits until the action's receipt says `state`.
+async fn until_receipt(
+    client: &mut Client<impl Codec>,
+    action_id: ActionId,
+    state: ReceiptState,
+) -> kr_protocol::receipt::Receipt {
+    let started = std::time::Instant::now();
+    loop {
+        let read = receipt(client, action_id).await;
+        if read.state == state {
+            return read;
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "the receipt says {} and not {state} by now",
+            read.state
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+/// Sends a prompt the upstream does not answer within the shortened deadline, and returns the
+/// action whose receipt says nobody can establish what became of it.
+async fn unanswered_prompt(
+    client: &mut LocalClient,
+    host: &Host,
+    request_id: u64,
+) -> kr_protocol::receipt::Receipt {
+    let mutation = prompt_mutation(client, host, request_id);
+    let action_id = mutation.action_id;
+    let Outcome::Error(failure) = send(client, mutation).await else {
+        panic!("an operation nobody acknowledged is not a success");
+    };
+    assert_eq!(failure.code, ErrorCode::OutcomeUnknown);
+    let unknown = receipt(client, action_id).await;
+    assert_eq!(unknown.state, ReceiptState::Unknown);
+    unknown
+}
+
+/// Section 9 and KR-REQ-09.05: an upstream that answers an operation after the host stopped
+/// waiting has said, by the identifier the host sent the operation under, what became of it. That
+/// is correlation evidence the receipt contract lets settle an unknown outcome: a success reply
+/// makes it applied, an error that proves the operation was not acted on makes it refused, and any
+/// other error is recorded and settles nothing. Whatever the evidence says, the receipt stays what
+/// it was when it is not unknown, and a screen the host parsed never settles it (section 9).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_09_05_a_reply_after_the_deadline_is_correlation_evidence_that_settles_an_unknown_receipt()
+ {
+    use kr_protocol::action::{ActionObservation, ObservationProvenance, ObservedResult};
+
+    let host = host().await;
+    register(&host, None);
+    let transport = real_transport(&host).await;
+    transport
+        .owner
+        .set_acknowledgement_deadline(std::time::Duration::from_millis(20));
+    let mut client = cli(&host).await;
+
+    // A success reply, late: the operation was acted on.
+    let unknown = unanswered_prompt(&mut client, &host, 31).await;
+    let id = transport.identifier_of(1).await;
+    transport
+        .says(&format!(r#"{{"id":{id},"result":{{}}}}"#))
+        .await
+        .expect("the reply is carried");
+    let applied = until_receipt(&mut client, unknown.action_id, ReceiptState::Applied).await;
+    assert!(
+        !applied.error.is_present(),
+        "an applied receipt does not keep the failure of the wait: {:?}",
+        applied.error
+    );
+    let seen = observations_of(&host, &applied);
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        seen[0].provenance,
+        ObservationProvenance::UpstreamCorrelation
+    );
+    assert_eq!(seen[0].claimed_result, ObservedResult::Applied);
+    // The same reply again settles nothing and records nothing more.
+    let _ = transport
+        .says(&format!(r#"{{"id":{id},"result":{{}}}}"#))
+        .await;
+    assert_eq!(observations_of(&host, &applied).len(), 1);
+    // The receipt a retry is answered with is the settled one, and the result the retry returns is
+    // the one a mutation answered on time has: it names the identifier the prompt was sent under.
+    assert_eq!(
+        receipt(&mut client, unknown.action_id).await.state,
+        ReceiptState::Applied
+    );
+    let mut retry = prompt_mutation(&client, &host, 34);
+    retry.action_id = unknown.action_id;
+    let Outcome::Ok(replayed) = send(&mut client, retry).await else {
+        panic!("a retry of a settled prompt is answered with its result");
+    };
+    let result: kr_protocol::agent::AgentMutationResult = replayed
+        .to_typed()
+        .expect("the result is the one a mutation has");
+    assert_eq!(
+        result.provenance,
+        kr_protocol::broker::ActionProvenance::UpstreamTypedRpc
+    );
+    assert_eq!(
+        result.upstream_request_id.as_ref().map(ToString::to_string),
+        Some(id.clone())
+    );
+
+    // An error that says the frame was never a call the upstream could make: the operation was
+    // not acted on.
+    let unknown = unanswered_prompt(&mut client, &host, 32).await;
+    let id = transport.identifier_of(2).await;
+    transport
+        .says(&format!(
+            r#"{{"id":{id},"error":{{"code":-32602,"message":"no such parameter"}}}}"#
+        ))
+        .await
+        .expect("the reply is carried");
+    let refused = until_receipt(&mut client, unknown.action_id, ReceiptState::Refused).await;
+    assert!(
+        refused.error.is_present(),
+        "a refused receipt says what the upstream refused"
+    );
+    assert_eq!(
+        observations_of(&host, &refused)[0].claimed_result,
+        ObservedResult::Refused
+    );
+
+    // An error that says the operation failed and not that it did not happen: recorded, and the
+    // receipt stays unknown.
+    let unknown = unanswered_prompt(&mut client, &host, 33).await;
+    let id = transport.identifier_of(3).await;
+    transport
+        .says(&format!(
+            r#"{{"id":{id},"error":{{"code":-32603,"message":"internal error"}}}}"#
+        ))
+        .await
+        .expect("the reply is carried");
+    let seen = until_observed(&host, &unknown).await;
+    assert_eq!(seen.len(), 1, "the evidence is recorded");
+    assert_eq!(seen[0].claimed_result, ObservedResult::Indeterminate);
+    assert_eq!(
+        receipt(&mut client, unknown.action_id).await.state,
+        ReceiptState::Unknown
+    );
+
+    // Control: a screen the host parsed that claims the same operation was applied is recorded and
+    // changes nothing, however clearly it reads.
+    let screen = ActionObservation {
+        action_id: unknown.action_id,
+        provenance: ObservationProvenance::InferredScreen,
+        subject: "agent.prompt:screen".to_owned(),
+        subject_revision: Nullable::null(),
+        source_cursor: Nullable::null(),
+        claimed_result: ObservedResult::Applied,
+        observed_at_ms: TimestampMs::new(9),
+    };
+    let after = host
+        .service
+        .runtime()
+        .session()
+        .journal_mut()
+        .expect("the session journals")
+        .record_observation(&unknown.actor_id, &screen)
+        .expect("the observation is recorded");
+    assert_eq!(after.state, ReceiptState::Unknown);
+    assert_eq!(observations_of(&host, &unknown).len(), 2);
+}
+
+/// KR-REQ-09.05: the host's own deadline for an operation can pass before the transport's wait for
+/// the upstream's answer has ended. The receipt then says unknown, and the reply that comes later
+/// still settles it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_09_05_a_reply_after_the_workers_own_deadline_still_settles_the_receipt() {
+    let host = host().await;
+    register(&host, None);
+    let transport = real_transport(&host).await;
+    transport
+        .owner
+        .set_acknowledgement_deadline(std::time::Duration::from_secs(3_600));
+    host.service
+        .set_upstream_deadline_for_tests(std::time::Duration::from_millis(20));
+    let mut client = cli(&host).await;
+    let unknown = unanswered_prompt(&mut client, &host, 31).await;
+    let id = transport.identifier_of(1).await;
+    transport
+        .says(&format!(r#"{{"id":{id},"result":{{}}}}"#))
+        .await
+        .expect("the reply is carried");
+    until_receipt(&mut client, unknown.action_id, ReceiptState::Applied).await;
+}
+
+/// KR-REQ-09.05: the reply that comes after the deadline to an action of a package settles its
+/// receipt with the result that action has. A retry of the call is answered with the result of an
+/// action, which names the action, the identifier it was sent under and the turn it acted on, as
+/// the result of a cancellation answered on time does, and not with the result of a plain mutation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_09_05_a_reply_after_the_deadline_to_a_package_action_is_kept_as_that_actions_result()
+ {
+    let host = host().await;
+    register(&host, None);
+    record_evidence(
+        &host,
+        "agent.cancel",
+        CapabilityRevision::new(1),
+        kr_protocol::broker::InstanceCapabilityState::QualifiedAvailable,
+    );
+    let refused = host
+        .service
+        .broker()
+        .register_actions(binding(), &[cancel_declaration()])
+        .expect("the action is registered");
+    assert!(refused.is_empty(), "{refused:?}");
+    let transport = real_transport_with(&host, upstream_rich_cancelling()).await;
+    transport
+        .owner
+        .set_acknowledgement_deadline(std::time::Duration::from_millis(20));
+    host.service
+        .broker()
+        .set_turn(
+            instance(),
+            Some(kr_protocol::ids::AgentTurnId::new("turn-1").expect("valid")),
+        )
+        .expect("a turn is running");
+    let mut client = cli(&host).await;
+    let window_id = client.action_window().action_window_id.clone();
+    let mutation = plugin_invocation(&host, 40, window_id, "turn.cancel", Nullable::null(), b"{}");
+    let action_id = mutation.action_id;
+    let mut retry = mutation.clone();
+    retry.request_id = RequestId::new(41);
+
+    let Outcome::Error(failure) = send(&mut client, mutation).await else {
+        panic!("a cancellation nobody acknowledged is not a success");
+    };
+    assert_eq!(failure.code, ErrorCode::OutcomeUnknown);
+    assert_eq!(
+        receipt(&mut client, action_id).await.state,
+        ReceiptState::Unknown
+    );
+    // Waits until the upstream has read the request, whose record the reader task keeps.
+    let id = transport.identifier_of(1).await;
+    assert!(
+        transport
+            .read
+            .lock()
+            .expect("the record is not poisoned")
+            .contains("turn/interrupt"),
+        "the cancellation reached the upstream"
+    );
+    transport
+        .says(&format!(r#"{{"id":{id},"result":{{}}}}"#))
+        .await
+        .expect("the reply is carried");
+    until_receipt(&mut client, action_id, ReceiptState::Applied).await;
+
+    let Outcome::Ok(replayed) = send(&mut client, retry).await else {
+        panic!("a retry of a settled action is answered with its result");
+    };
+    let result: kr_protocol::agent::PluginActionInvokeResult = replayed
+        .to_typed()
+        .expect("the result is the one an action has");
+    assert_eq!(result.action.as_str(), "turn.cancel");
+    let mutation = result
+        .mutation
+        .as_ref()
+        .expect("the cancellation went upstream");
+    assert_eq!(
+        mutation.provenance,
+        kr_protocol::broker::ActionProvenance::UpstreamTypedRpc
+    );
+    assert_eq!(
+        mutation
+            .upstream_request_id
+            .as_ref()
+            .map(ToString::to_string),
+        Some(id),
+        "it names the identifier the cancellation was sent under"
+    );
+    assert_eq!(
+        mutation
+            .turn_id
+            .as_ref()
+            .map(kr_protocol::ids::AgentTurnId::as_str),
+        Some("turn-1"),
+        "and the turn it cancelled"
+    );
+}
+
+/// KR-REQ-09.05: a connection that has ended carries no evidence: a reply the upstream wrote
+/// before the connection went is not read afterwards, and the receipt stays unknown.
+///
+/// The reply is refused where the connection reads, so it never reaches a claim. That the end of a
+/// connection lets go of the claims and the answers it kept is the connection's own unit case in
+/// the library.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_09_05_a_connection_that_ended_settles_nothing() {
+    let host = host().await;
+    register(&host, None);
+    let transport = real_transport(&host).await;
+    transport
+        .owner
+        .set_acknowledgement_deadline(std::time::Duration::from_millis(20));
+    let mut client = cli(&host).await;
+    let unknown = unanswered_prompt(&mut client, &host, 31).await;
+    let id = transport.identifier_of(1).await;
+    transport.owner.shutdown();
+    transport
+        .says(&format!(r#"{{"id":{id},"result":{{}}}}"#))
+        .await
+        .expect_err("a connection that ended reads nothing");
+    assert_eq!(
+        receipt(&mut client, unknown.action_id).await.state,
+        ReceiptState::Unknown
+    );
+    assert!(observations_of(&host, &unknown).is_empty());
 }
 
 /// KR-REQ-11.35 and KR-REQ-11.37: the receipt journal and the broker's ledger are behind one
@@ -2268,9 +2773,14 @@ async fn kr_req_11_37_one_fence_covers_the_receipt_journal_and_the_ledger_and_ma
         .refuse_ledger_writes(true)
         .expect("the ledger's store is put in query-only mode");
     let failed = broker
-        .checkpoint(
+        .bind_descriptor(
+            BrokerBindingId::new(Uuid::from_bytes([77; 16])),
             instance(),
-            kr_protocol::ids::StreamCursor::new(1),
+            PluginId::new("kalareach.other").expect("valid"),
+            PublisherId::new("kalareach").expect("valid"),
+            Digest256::from_bytes([6; 32]),
+            BrokerGrants::granted([BrokerGrant::Observation]),
+            None,
             TimestampMs::new(40),
         )
         .expect_err("the ledger's store refuses the write");
@@ -3423,6 +3933,20 @@ async fn kr_req_11_47_a_forwarded_action_needs_the_rights_of_its_class() {
     );
 }
 
+/// The action a package declares to cancel the running turn, which the host carries out itself.
+fn cancel_declaration() -> kr_plugin_sdk::effect::ActionDeclaration {
+    serde_json::from_value(serde_json::json!({
+        "id": "turn.cancel",
+        "label": "Cancel the turn",
+        "effect": "upstream.cancel",
+        "implementation": { "type": "upstream_cancel" },
+        "parameters": { "parameters": [] },
+        "description": "Stop the turn that is running",
+        "confirmation_required": false,
+    }))
+    .expect("a declaration the manifest format reads")
+}
+
 /// KR-REQ-12.08 and KR-REQ-11.28: an action the package declares as a cancellation of the running
 /// turn is held, before anything is admitted, to the right to cancel: a device whose grant holds
 /// the rights to prompt and to answer an approval, and to view, is refused `PERMISSION_DENIED`,
@@ -3436,21 +3960,10 @@ async fn kr_req_12_08_a_declared_cancellation_needs_the_right_to_cancel() {
         &host,
         Some(Arc::clone(&upstream) as Arc<dyn UpstreamDispatch>),
     );
-    let cancel =
-        serde_json::from_value::<kr_plugin_sdk::effect::ActionDeclaration>(serde_json::json!({
-            "id": "turn.cancel",
-            "label": "Cancel the turn",
-            "effect": "upstream.cancel",
-            "implementation": { "type": "upstream_cancel" },
-            "parameters": { "parameters": [] },
-            "description": "Stop the turn that is running",
-            "confirmation_required": false,
-        }))
-        .expect("a declaration the manifest format reads");
     let refused = host
         .service
         .broker()
-        .register_actions(binding(), &[cancel])
+        .register_actions(binding(), &[cancel_declaration()])
         .expect("the action is registered");
     assert!(refused.is_empty(), "{refused:?}");
     let mut daemon = daemon(&host).await;

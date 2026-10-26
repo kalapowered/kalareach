@@ -359,9 +359,11 @@ impl ControlSender {
     /// Sends one control frame for as long as `admits` holds, and says whether it went.
     ///
     /// The writer is taken first, and then `admits` decides at every attempt to hand bytes to the
-    /// stream: a frame that waited behind the keepalive, behind a window renewal or behind a peer
-    /// that stopped reading is never written under authority that went while it waited. `admits`
-    /// is evaluated inside a poll, so it must not block and must not wait on this stream.
+    /// stream, and holds what it decided on until the attempt has ended
+    /// ([`kr_transport::codec::Admission`](crate::codec::Admission)): a frame that waited behind
+    /// the keepalive, behind a window renewal or behind a peer that stopped reading is never
+    /// written under authority that went while it waited. `admits` is evaluated inside a poll, so
+    /// it must not block and must not wait on this stream.
     ///
     /// Returns `Ok(false)` when it refused. Nothing more can be written on the stream after that:
     /// a frame abandoned part way through leaves it in pieces, and it is reset.
@@ -372,10 +374,11 @@ impl ControlSender {
     pub async fn send_while(
         &self,
         frame: &ControlFrame,
-        admits: &(dyn Fn() -> bool + Send + Sync),
+        admits: crate::codec::Admission<'_>,
     ) -> Result<bool> {
         let mut writer = self.writer.lock().await;
-        if !admits() {
+        // Asked before anything is written, so that a frame refused at once leaves the stream whole.
+        if !admits(&mut || {}) {
             return Ok(false);
         }
         let outcome = writer.write_message_while(frame, admits).await;

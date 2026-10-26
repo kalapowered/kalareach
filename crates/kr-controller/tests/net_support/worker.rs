@@ -33,8 +33,9 @@ use kr_protocol::ids::{
 use kr_protocol::method::Method;
 use kr_protocol::question::{Question, QuestionCreateParams, QuestionKind};
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, Uuid};
-use kr_protocol::session::{Dimensions, DisplayNumber, SessionState, ShellMode};
+use kr_protocol::session::{ClosureReason, Dimensions, DisplayNumber, SessionState, ShellMode};
 use kr_protocol::worker::WorkerDescriptor;
+use kr_worker::action::time::TimeSources;
 use kr_worker::broker::{
     BrokerError, BrokerTransport, Credential, ManagedProcess, PendingTransmission, TransportHandle,
     UpstreamBody, UpstreamDispatch, UpstreamOutcome, UpstreamRequest,
@@ -73,7 +74,9 @@ impl HeldBoundary {
 pub struct Worker {
     pub service: Arc<WorkerService>,
     pub session_id: SessionId,
+    endpoint: kr_ipc::paths::Endpoint,
     _runtime: Arc<SessionRuntime>,
+    serving: tokio::task::JoinHandle<()>,
 }
 
 impl Worker {
@@ -101,11 +104,47 @@ impl Worker {
         Self::start_as(tree, display, true, "exec cat").await
     }
 
+    /// As [`Self::start_running`], for a worker whose time service keeps its clock, so that the
+    /// time each part of its output is written at is recorded as proven. A host with no such
+    /// service to read, as a runner may be, would record none of it as proven.
+    pub async fn start_running_on_a_kept_clock(
+        tree: &kr_ipc::testing::TempHost,
+        display: u64,
+        script: &str,
+    ) -> Self {
+        let kept = kr_worker::action::adapter::classify_unix(
+            "macos",
+            "ntp_adjtime(2)",
+            kr_worker::action::adapter::UnixTimex {
+                time_state: kr_worker::action::adapter::unix_model::TIME_OK,
+                status: kr_worker::action::adapter::unix_model::STA_PLL,
+                maxerror_us: 62_192,
+                esterror_us: 500,
+            },
+            now(),
+        );
+        let time = TimeSources {
+            adapter: Arc::new(kr_worker::action::adapter::RecordedTimeAdapter::new(kept)),
+            ..TimeSources::system()
+        };
+        Self::start_with(tree, display, true, script, time).await
+    }
+
     async fn start_as(
         tree: &kr_ipc::testing::TempHost,
         display: u64,
         reserved: bool,
         script: &str,
+    ) -> Self {
+        Self::start_with(tree, display, reserved, script, TimeSources::system()).await
+    }
+
+    async fn start_with(
+        tree: &kr_ipc::testing::TempHost,
+        display: u64,
+        reserved: bool,
+        script: &str,
+        time: TimeSources,
     ) -> Self {
         let environment = tree.environment();
         let environment_id = tree.environment_id();
@@ -177,7 +216,7 @@ impl Worker {
             worker_endpoint: None,
             send_queue_bytes: 1024 * 1024,
             resident_bytes: 64 * 1024,
-            time: kr_worker::action::time::TimeSources::system(),
+            time,
             launch_profile: kr_protocol::session::LaunchProfile::default(),
         };
         let mut session = Session::open(config).expect("opens the session");
@@ -207,7 +246,12 @@ impl Worker {
             )
             .expect("a worker service"),
         );
-        tokio::spawn(Arc::clone(&service).serve(listener));
+        let serving = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move {
+                let _ = service.serve(listener).await;
+            }
+        });
         let mut registry =
             Registry::open(environment.registry_database(), environment_id).expect("the registry");
         registry
@@ -247,8 +291,45 @@ impl Worker {
         Self {
             service,
             session_id,
+            endpoint,
             _runtime: runtime,
+            serving,
         }
+    }
+
+    /// The owner's own client on this worker's socket, as a terminal on this machine reaches it.
+    pub async fn client(&self) -> kr_ipc::client::LocalClient {
+        kr_ipc::client::LocalClient::connect(
+            &self.endpoint,
+            kr_protocol::local::LocalClientKind::Cli,
+            build(),
+        )
+        .await
+        .expect("connects to the worker")
+    }
+
+    /// Ends the worker: it takes no more connections and its session closes, which ends the shell
+    /// it runs and the supervision of the session, and waits until the closure is recorded. For a
+    /// case that makes a worker again and must not leave the earlier ones running beside it.
+    ///
+    /// What the service started stays until the test's runtime ends, as it does for a worker that
+    /// is dropped: the host's maintenance ends at its next pass, the task that expires recoveries
+    /// never ends, and a connection task ends when the daemon closes its link. They only wait.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the closure is not recorded within a minute, so that a case does not go on to
+    /// remove the tree of a session that is still closing.
+    pub async fn stop(self) {
+        self.serving.abort();
+        let (_, gate) = self._runtime.close(ClosureReason::CloseRequested);
+        gate.release();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            self._runtime.wait_closed(),
+        )
+        .await
+        .expect("the worker's session closed");
     }
 
     /// The session's runtime, for a suite that stops the journal's next commit.

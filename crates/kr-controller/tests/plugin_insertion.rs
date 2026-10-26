@@ -59,7 +59,19 @@ async fn until_binding(
 
 /// A world with a draft that holds one published image, and the image.
 async fn offering() -> Option<(Acting, DraftRecord, AttachmentHandle)> {
-    let acting = Acting::start().await?;
+    Some(offering_in(Acting::start().await?))
+}
+
+/// As [`offering`], with the worker's deadlines measured on a clock that stays where it is: an
+/// offer that is held in its preparation for as long as the machine takes to do what the case does
+/// meanwhile does not run out its accepted deadline.
+async fn offering_held() -> Option<(Acting, DraftRecord, AttachmentHandle)> {
+    Some(offering_in(
+        Acting::start_on(Arc::new(kr_transport::clock::ManualClock::new())).await?,
+    ))
+}
+
+fn offering_in(acting: Acting) -> (Acting, DraftRecord, AttachmentHandle) {
     // The receiver of the offer reads the file the frame names before it acknowledges it.
     *acting.upstream.lock().expect("not poisoned") = Upstream::Reads;
     let handle = acting.publish(
@@ -67,7 +79,7 @@ async fn offering() -> Option<(Acting, DraftRecord, AttachmentHandle)> {
         "a name with spaces and \"quotes\" and ünïcode.png",
     );
     let draft = acting.bind(&acting.new_draft(), &handle);
-    Some((acting, draft, handle))
+    (acting, draft, handle)
 }
 
 /// KR-REQ-23.30 and KR-REQ-24.09: the plan a component prepares for an attachment is validated and
@@ -1118,7 +1130,7 @@ async fn kr_req_23_30_an_offer_cancelled_by_a_client_that_then_went_is_not_dispa
 }
 
 async fn an_offer_while_its_client(how: Client) {
-    let Some((acting, draft, handle)) = offering().await else {
+    let Some((acting, draft, handle)) = offering_held().await else {
         return;
     };
     let service = Arc::clone(&acting.hosted._service);
@@ -1293,7 +1305,7 @@ async fn kr_req_23_30_an_offer_that_loses_its_ground_while_prepared_settles_what
             kr_protocol::receipt::RejectionReason::StalePreconditions,
         ),
     ] {
-        let Some((acting, draft, handle)) = offering().await else {
+        let Some((acting, draft, handle)) = offering_held().await else {
             return;
         };
         let mut watcher = acting.client().await;
@@ -1335,7 +1347,7 @@ async fn kr_req_23_30_an_offer_that_loses_its_ground_while_prepared_settles_what
 /// nothing; the offer is claimed, written and reported once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_23_30_a_repeat_of_an_offer_claims_nothing_again_and_a_changed_one_conflicts() {
-    let Some((acting, draft, first)) = offering().await else {
+    let Some((acting, draft, first)) = offering_held().await else {
         return;
     };
     let second = acting.publish(&[12; 64], "second.png");

@@ -324,6 +324,17 @@ impl Rig {
         kind: MailboxPayloadType,
         number: u8,
     ) -> SealedEnvelope {
+        self.sealed_until(from, kind, number, announcement_expiry(self.now()))
+    }
+
+    /// The same, expiring at `expires_at`.
+    fn sealed_until(
+        &self,
+        from: &StoredEnvelopeKeyPair,
+        kind: MailboxPayloadType,
+        number: u8,
+        expires_at: TimestampMs,
+    ) -> SealedEnvelope {
         let now = self.now();
         seal_envelope(
             from,
@@ -335,7 +346,7 @@ impl Rig {
                 recipient_key_id: key_id(KeyPurpose::StoredEnvelope, self.host_key().as_bytes()),
                 payload_type: kind,
                 created_at_ms: TimestampMs::new(now),
-                expires_at_ms: announcement_expiry(now),
+                expires_at_ms: expires_at,
                 grant_id: Nullable::null(),
                 environment_id: Nullable::null(),
                 session_id: Nullable::null(),
@@ -510,6 +521,48 @@ async fn an_announcement_in_the_hosts_mailbox_has_the_feed_read_at_once() {
         rig.items_held(),
         0,
         "the host told the service it has the item"
+    );
+}
+
+/// An announcement is a nudge beside a change that is the record: one the service will not place
+/// because it outlives the service's hour is declined and reported, and the change it came with
+/// stands in the host's feed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_announcement_the_service_will_not_place_costs_the_change_nothing() {
+    let rig = Rig::start().await;
+    let request = rig.request(0xa4, devices(DeviceId::new(Uuid::from_bytes([0xa4; 16]))));
+    let outliving = FeedAnnouncement {
+        recipient_key: *rig.host_key(),
+        envelope: rig.sealed_until(
+            &rig.owner.stored_envelope,
+            MailboxPayloadType::AuthorityFeedChange,
+            0xa4,
+            TimestampMs::new(rig.now() + 2 * 60 * 60 * 1000),
+        ),
+    };
+
+    let state = rig
+        .feed
+        .publish(rig.feed_key(), &request, Some(&outliving))
+        .await
+        .expect("the change stands though its announcement is declined");
+
+    let announced = state
+        .announced
+        .as_ref()
+        .expect("the feed says what became of the announcement");
+    assert_eq!(
+        announced.mailbox,
+        kr_client::services::authority::AnnouncementPlacement::Declined
+    );
+    assert!(
+        state.record(request.request_id).is_some(),
+        "the request is in the host's feed"
+    );
+    assert_eq!(
+        rig.items_held(),
+        0,
+        "nothing was placed in the host's mailbox"
     );
 }
 

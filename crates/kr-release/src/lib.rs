@@ -26,6 +26,7 @@ pub mod record;
 mod refusal;
 mod shells;
 mod signing;
+pub mod terminal;
 mod tree;
 
 pub use refusal::{Refusal, Result};

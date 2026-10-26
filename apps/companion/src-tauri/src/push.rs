@@ -8,6 +8,10 @@
 //! This module is the application's half: it sequences those steps for one host, remembers where
 //! each stands, and says so in words.
 //!
+//! The host is reached before the gateway issues its credential: an issue stops the credential the
+//! host holds at once, so a host that cannot be reached keeps the one it has and the person is
+//! told so.
+//!
 //! # What the person sees
 //!
 //! One action per host, "turn on notifications", and where it stands: off, working, on, or needing
@@ -15,12 +19,19 @@
 //! could not be reached). Stopping notifications is the system's setting: a host ends a destination
 //! when it unpairs the device, and only the host can revoke the authorisation it holds.
 //!
+//! Once a host has been asked, one more choice: whether its notifications show what needs the
+//! person or only that something does. The choice takes effect on this phone at once, since the
+//! receivers hold a host's preview key only while previews are on for it, and the host is told
+//! next. A host that cannot be told leaves the row needing the person with the choice kept, and
+//! trying again tells it.
+//!
 //! # What is kept, and what is not
 //!
 //! `push/push.json` under the application's data directory holds, per paired host, whether the
 //! person asked, the authorisation identifier this phone issued for that host (so asking again
 //! issues under the same identifier and the host keeps one authorisation), the digest of the token
-//! the registration that last turned the host on proposed, and the last outcome in words. It holds no token, no key and no
+//! the registration that last turned the host on proposed, the choice of previews and the choice the
+//! host was last told, and the last outcome in words. It holds no token, no key and no
 //! credential. The credential exists in memory between the gateway's issue and the host's answer
 //! and is never kept: a registration whose answer was lost is made again under a new action with a
 //! fresh credential, which is what the host expects.
@@ -53,7 +64,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use companion_platform::notify::Permission;
+use companion_platform::notify::{Permission, PreviewKeys, RecipientKey, SenderKey};
 use companion_platform::push::{PendingRegistration, PendingState};
 use kr_client::pairing::paired::PairedHost;
 use kr_client::services::push::{InstallationSigner, PushGateway, Registration};
@@ -106,6 +117,21 @@ const TOKEN_WITHIN: Duration = Duration::from_secs(20);
 /// gives the challenge and a margin, so that one native call that never returns cannot keep every
 /// other host from registering.
 const CHALLENGE_WAIT: Duration = Duration::from_millis(CHALLENGE_WITHIN_MS + 30_000);
+
+/// How long the receivers are given to take a set of preview keys. A native call that never
+/// answers must not hold every choice of previews and every filing for every host for ever.
+const KEYS_WITHIN: Duration = Duration::from_secs(10);
+
+/// The change a run makes over the line to a host that stopped it.
+#[derive(Clone, Copy)]
+enum Step {
+    /// Reaching the host.
+    Connect,
+    /// The registration, which carries the credential and the choice of previews.
+    Register,
+    /// Telling the host which preview key this phone holds.
+    PreviewKey,
+}
 
 /// The soonest the same host is tried again after a try that needed the person: asking the system
 /// or the gateway again at every foreground would be a loop with a person in it.
@@ -160,6 +186,67 @@ struct HostPush {
     /// look leaves such a host alone: only the person turning it on again starts it over.
     #[serde(default)]
     lost: bool,
+    /// What the person chose for the text of the notification: whether the host seals a preview to
+    /// this phone. A record written before the choice existed reads as on, as every registration
+    /// made until then asked for previews.
+    #[serde(default = "previews_on")]
+    previews: bool,
+    /// The choice the host was last told. None reads as on, for the same reason.
+    #[serde(default)]
+    told_previews: Option<bool>,
+}
+
+impl HostPush {
+    /// A host this phone has just taken up: nothing issued, registered or told yet, and previews on.
+    fn new(phase: Phase, now_ms: u64) -> Self {
+        Self {
+            sender_record_id: None,
+            phase,
+            words: String::new(),
+            settings: false,
+            updated_ms: now_ms,
+            registered: None,
+            lost: false,
+            previews: true,
+            told_previews: None,
+        }
+    }
+}
+
+impl HostPush {
+    /// Whether the host was last told another choice of previews than the one that stands.
+    fn told_differs(&self) -> bool {
+        self.told_previews.unwrap_or(true) != self.previews
+    }
+}
+
+/// What a host that is on is shown while it is told again.
+const TELLING_THE_HOST: &str = "Telling the host.";
+
+/// What a host that is on is shown when a look could not read the notification token, so that this
+/// phone cannot say whether the host still has the one it holds: nothing is changed, and the next
+/// look that reads a token settles it.
+const TOKEN_UNREADABLE: &str = "This phone could not check its notification token. It will check \
+                                again the next time you open the app.";
+
+/// What follows the words for a filing of the preview keys that failed.
+const KEYS_RETRY: &str = "It will try again the next time you open the app.";
+
+/// What a token the gateway does not take is shown as.
+const TOKEN_REFUSED: &str =
+    "The notification token this phone was given is not one the gateway takes.";
+
+/// The most names a record that cannot be read is tried under before it is left where it is.
+const ASIDE_NAMES: u32 = 1_000;
+
+/// What a host that a look cannot reach without cutting off the host in use is shown as.
+const BESIDE_THE_HOST_IN_USE: &str = "This host is reached through the same relay as the host you \
+                                      are using. Choose Try again to turn notifications on for it; \
+                                      the host in use reconnects afterwards.";
+
+/// The choice a record that holds none reads as.
+const fn previews_on() -> bool {
+    true
 }
 
 /// What is kept on disk.
@@ -192,6 +279,9 @@ pub struct HostPushView {
     pub words: String,
     /// Whether what stopped it is the system's notification setting.
     pub settings: bool,
+    /// What the person chose for the text of the notification: true shows what needs them, false
+    /// only that something does. The choice as recorded, whether or not the host has been told.
+    pub previews: bool,
 }
 
 /// Where one host's notifications stand, as the page tells them.
@@ -215,6 +305,11 @@ pub struct PushView {
     pub available: bool,
     /// Each paired host.
     pub hosts: Vec<HostPushView>,
+    /// The place of this view among the views the desk has read, counted from one: a view read
+    /// later has a higher number. The page may be handed views by several routes (an event, an
+    /// answer to a command) and they do not arrive in the order they were read, so it keeps the
+    /// view with the highest number it has seen and drops any older one.
+    pub revision: u64,
 }
 
 /// Why a sequence stopped, in words for the person.
@@ -239,6 +334,20 @@ impl From<String> for Stop {
 pub type PushFuture<'a, T> =
     Pin<Box<dyn Future<Output = std::result::Result<T, String>> + Send + 'a>>;
 
+/// A boxed future for a question the answer to which is yes or no.
+pub type AskFuture<'a> = Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+
+/// Why a change made over the line to a host did not happen, in words.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LineStop {
+    /// This phone stopped itself before it asked the host, or after it was answered: the words are
+    /// its own, and the host refused nothing.
+    Phone(String),
+    /// The host refused the change, did not answer it, or answered with what this phone does not
+    /// read.
+    Host(String),
+}
+
 /// What only the platform can say or do about notifications.
 ///
 /// The product's is the plugin ([`companion_platform::notify`]); a test gives its own.
@@ -253,14 +362,30 @@ pub trait Native: Send + Sync {
     fn pending_set<'a>(&'a self, record: &'a PendingRegistration) -> PushFuture<'a, ()>;
     /// The record of the registration being waited for, as it stands now.
     fn pending_get(&self) -> PushFuture<'_, Option<PendingRegistration>>;
-    /// Files the notification-preview key in the limited store a receiver reads.
-    fn limited_key<'a>(
-        &'a self,
-        recipient_key_id: &'a [u8; 32],
-        seed: &'a [u8],
-    ) -> PushFuture<'a, ()>;
+    /// Makes the limited store a receiver reads hold exactly these keys.
+    fn preview_keys<'a>(&'a self, keys: &'a PreviewKeys) -> PushFuture<'a, ()>;
     /// The screen a tap on a notification opened the application on, once.
     fn route(&self) -> PushFuture<'_, Option<String>>;
+}
+
+/// What a run does for its host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Job {
+    /// The whole sequence: permission, token, proposal, challenge, and then the host.
+    Full,
+    /// The host is told again under the registration it already has, which was made for the token
+    /// whose digest this holds: the person's choice of previews changed, and nothing the provider
+    /// or the gateway holds did.
+    Delivery(Digest256),
+}
+
+/// What a run does once the host has been told.
+#[derive(Debug, PartialEq, Eq)]
+enum Next {
+    /// The run is over: the host is on, or the run stopped.
+    Done,
+    /// What the host was told is not what stands now, and this is what is done about it.
+    Again(Job),
 }
 
 /// How a run reaches its host.
@@ -285,7 +410,19 @@ pub trait Registrar: Send + Sync {
         host: &'a PairedHost,
         reach: Reach,
     ) -> PushFuture<'a, Box<dyn HostLine + 'a>>;
+
+    /// Whether reaching `host` as a visit would be refused now because that would cut off the host
+    /// in use, asked before anything is done for the host and with nothing held. The answer is as
+    /// of now: the connection is the authority when it is made. A registrar that cannot tell says
+    /// no.
+    fn beside_the_host_in_use<'a>(&'a self, _host: &'a PairedHost) -> AskFuture<'a> {
+        Box::pin(async { false })
+    }
 }
+
+/// A boxed future for a change made over the line.
+pub type LineFuture<'a, T> =
+    Pin<Box<dyn Future<Output = std::result::Result<T, LineStop>> + Send + 'a>>;
 
 /// An open connection to a host, and the two changes the phone makes there. The desk asks whether
 /// its run is still wanted before it makes the connection and before each change, so a host the
@@ -295,12 +432,19 @@ pub trait HostLine: Send {
     fn register(
         &mut self,
         params: DevicePushRegisterParams,
-    ) -> PushFuture<'_, DevicePushRegisterResult>;
-    /// Sends `device.preview_key.update`, which says which preview key this phone holds.
+    ) -> LineFuture<'_, DevicePushRegisterResult>;
+    /// Sends `device.preview_key.update`, which says which preview key this phone holds and at
+    /// which revision. When the host answers, the line records the revision, since a connection
+    /// offers the revision the host holds and is refused at another.
+    ///
+    /// The host commits a revision before it answers, so a phone that does not record the answer
+    /// offers the old revision and is refused at every connection. Nothing in the desk sends a
+    /// revision above the one it holds; a caller that does has to add a retry on that refusal.
     fn update_preview_key(
         &mut self,
         preview_key: kr_protocol::scalars::NotificationPreviewKey,
-    ) -> PushFuture<'_, ()>;
+        revision: DeviceKeyRevision,
+    ) -> LineFuture<'_, ()>;
 }
 
 /// How the gateway at an origin is reached.
@@ -313,6 +457,8 @@ pub struct Wiring {
     pub http: Arc<HttpFor>,
     /// The time, in UTC milliseconds.
     pub clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// How long the receivers are given to take a set of preview keys.
+    pub keys_within: Duration,
 }
 
 impl Wiring {
@@ -330,6 +476,7 @@ impl Wiring {
                 .map_err(|error| error.to_string())
             }),
             clock: Arc::new(|| kr_ipc::now_ms().get()),
+            keys_within: KEYS_WITHIN,
         }
     }
 }
@@ -354,7 +501,21 @@ pub struct PushDesk {
     /// second host's registration would replace the first's: they go one at a time. Never awaited
     /// while `state` is held.
     registering: tokio::sync::Mutex<()>,
-    changed: Box<dyn Fn() + Send + Sync>,
+    /// The keys last filed for the receivers, and the hold that keeps filings in order: a set is
+    /// built and handed over under it, so an older set is never filed after a newer one.
+    filed: tokio::sync::Mutex<Option<PreviewKeys>>,
+    /// Held for the whole of a choice of previews: its record, its filing for the receivers, what
+    /// it puts back when the filing fails, and the claim of the run that tells the host. Choices go
+    /// one after another, each from the state the one before left, so a choice let go puts back
+    /// what it found and never undoes a choice made after it began. Nothing else waits for it.
+    choosing: tokio::sync::Mutex<()>,
+    /// Tells the page where notifications stand, with the view as read when it is told.
+    changed: Box<dyn Fn(PushView) + Send + Sync>,
+    /// Held from the read of the view to the end of the call that hands it to the page, so that
+    /// pages are told in the order the views were read: a view read earlier is never handed over
+    /// after one read later, which would leave the page with a state the desk has left. Taken with
+    /// no other hold held.
+    telling: Mutex<()>,
     /// Whether the record on disk is one that could not be read and could not be moved aside, so
     /// that writing would replace it. Nothing is written then, and the page shows what the desk
     /// holds in memory until a start can read the record.
@@ -384,6 +545,17 @@ struct State {
     /// its comparison, so what is here when it compares is something a look saw while the run's own
     /// answer was on its way.
     observed: BTreeMap<DeviceId, BTreeSet<Digest256>>,
+    /// The hosts that are on and that a look could not confirm, because it could not read the
+    /// token, each with the words that say so. Kept in memory only: the record still says on, and
+    /// the next look that reads a token takes the mark away, as does a run that ends.
+    unconfirmed: BTreeMap<DeviceId, &'static str>,
+    /// Why the receivers may not hold the keys the record asks for, in words, while the last
+    /// filing failed. It belongs to the phone and not to a host, and to the receivers' store and not
+    /// to any registration: a host that is on stays registered, and the next filing that succeeds
+    /// takes the mark away. Kept in memory only, since a start files again.
+    keys_unfiled: Option<String>,
+    /// How many views have been read: the number of the newest.
+    views: u64,
     /// The number the next claim is given.
     next_run: u64,
 }
@@ -448,8 +620,8 @@ const fn this_platform() -> PushPlatform {
 }
 
 impl PushDesk {
-    /// Opens the desk over the record under `data`. `changed` is called when what the page is
-    /// shown changes.
+    /// Opens the desk over the record under `data`. `changed` is called, one call at a time and in
+    /// the order the views were read, with what the page is shown, when that changes.
     ///
     /// # Errors
     ///
@@ -460,7 +632,7 @@ impl PushDesk {
         native: Arc<dyn Native>,
         registrar: Arc<dyn Registrar>,
         wiring: Wiring,
-        changed: impl Fn() + Send + Sync + 'static,
+        changed: impl Fn(PushView) + Send + Sync + 'static,
     ) -> Result<Arc<Self>> {
         let origin =
             GatewayOrigin::new(kr_client::services::account::ACCOUNT_ORIGIN).map_err(|error| {
@@ -468,8 +640,24 @@ impl PushDesk {
             })?;
         let file = data.join(DIRECTORY).join(RECORD);
         let now = (wiring.clock)();
+        let mut pruned = false;
         let (record, write_blocked, lost) = match read_record(&file) {
-            Loaded::Record(record) => (after_a_restart(record, now), false, false),
+            Loaded::Record(record) => {
+                let mut record = after_a_restart(record, now);
+                // A host this phone stopped being paired with while the application was not
+                // running, or whose forgetting did not reach the record, keeps nothing here. A list
+                // that cannot be read is not an empty one, and prunes nothing.
+                if let Ok(hosts) = device.pairing().hosts.list() {
+                    let paired: BTreeSet<String> = hosts
+                        .iter()
+                        .map(|host| host.host_device_id.to_string())
+                        .collect();
+                    let before = record.hosts.len();
+                    record.hosts.retain(|host, _| paired.contains(host));
+                    pruned = record.hosts.len() != before;
+                }
+                (record, false, false)
+            }
             loss => {
                 // What the record said of each host is gone, and the hosts paired now are marked.
                 // The paired hosts are read first: a list that cannot be read is not an empty one,
@@ -518,14 +706,21 @@ impl PushDesk {
                 cancels: BTreeMap::new(),
                 asking: BTreeSet::new(),
                 observed: BTreeMap::new(),
+                unconfirmed: BTreeMap::new(),
+                keys_unfiled: None,
+                views: 0,
                 next_run: 0,
             }),
             registering: tokio::sync::Mutex::new(()),
+            filed: tokio::sync::Mutex::new(None),
+            choosing: tokio::sync::Mutex::new(()),
             changed: Box::new(changed),
+            telling: Mutex::new(()),
             write_blocked,
         });
-        if lost {
-            // The marks that say which hosts were lost are kept, so that they outlast this start.
+        if lost || pruned {
+            // The marks that say which hosts were lost are kept, so that they outlast this start,
+            // and so is the record without the hosts that are no longer paired.
             let state = lock(&desk.state);
             desk.keep(&state.record);
         }
@@ -535,7 +730,10 @@ impl PushDesk {
     /// What the page is shown: each paired host and where its notifications stand.
     #[must_use]
     pub fn view(&self) -> PushView {
-        let state = lock(&self.state);
+        let mut state = lock(&self.state);
+        // Numbered under the hold that reads the state, so a higher number is a later reading.
+        state.views += 1;
+        let revision = state.views;
         let hosts = self
             .device
             .pairing()
@@ -546,23 +744,53 @@ impl PushDesk {
             .rev()
             .map(|host| {
                 let kept = state.record.hosts.get(&host.host_device_id.to_string());
+                // What keeps a host that is on from being shown as on: a token a look could not
+                // confirm, or keys the receivers could not be handed.
+                let unsettled = state
+                    .unconfirmed
+                    .get(&host.host_device_id)
+                    .map(|why| (*why).to_owned())
+                    .or_else(|| state.keys_unfiled.clone());
+                let (shown, words) = match (kept, unsettled) {
+                    // A record that could not be written knows no host the list now has, and a host
+                    // turned on would be one this phone could not remember.
+                    (None, _) if self.write_blocked => {
+                        (PushState::NeedsAttention, RECORD_KEPT.to_owned())
+                    }
+                    (None, _) => (PushState::Off, String::new()),
+                    (Some(kept), Some(why)) if kept.phase == Phase::On => {
+                        (PushState::NeedsAttention, why)
+                    }
+                    (Some(kept), _) => (
+                        match kept.phase {
+                            Phase::Working => PushState::Working,
+                            Phase::On => PushState::On,
+                            Phase::Attention => PushState::NeedsAttention,
+                        },
+                        kept.words.clone(),
+                    ),
+                };
                 HostPushView {
                     reference: reference_of(host),
-                    state: match kept.map(|kept| kept.phase) {
-                        None => PushState::Off,
-                        Some(Phase::Working) => PushState::Working,
-                        Some(Phase::On) => PushState::On,
-                        Some(Phase::Attention) => PushState::NeedsAttention,
-                    },
-                    words: kept.map_or_else(String::new, |kept| kept.words.clone()),
+                    state: shown,
+                    words,
                     settings: kept.is_some_and(|kept| kept.settings),
+                    previews: kept.is_none_or(|kept| kept.previews),
                 }
             })
             .collect();
         PushView {
             available: cfg!(mobile),
             hosts,
+            revision,
         }
+    }
+
+    /// Tells the page where notifications stand. The view is read and handed over under one hold,
+    /// so two tellings from two tasks reach the page in the order their views were read.
+    fn tell_page(&self) {
+        let _one_at_a_time = lock(&self.telling);
+        (self.changed)(self.view());
     }
 
     /// Turns notifications on for the host the page named, and starts the sequence.
@@ -580,6 +808,25 @@ impl PushDesk {
             .ok_or_else(crate::hosts::unknown_host)?;
         if self.write_blocked {
             // A host started now would be one this phone could not remember.
+            return Ok(self.view());
+        }
+        // A host that is on, and is shown as needing the person only because the receivers could not
+        // be handed the keys, has nothing to register again: a sequence would spend the gateway's
+        // issues and retire the credential the host holds, and the store would refuse the keys
+        // again. Try again files the keys, alone.
+        let only_the_keys = {
+            let state = lock(&self.state);
+            state.keys_unfiled.is_some()
+                && !state.unconfirmed.contains_key(&host.host_device_id)
+                && state
+                    .record
+                    .hosts
+                    .get(&host.host_device_id.to_string())
+                    .is_some_and(|kept| kept.phase == Phase::On && !kept.lost)
+        };
+        if only_the_keys {
+            let desk = Arc::clone(self);
+            tauri::async_runtime::spawn(async move { desk.file_keys_logged().await });
             return Ok(self.view());
         }
         let now = (self.wiring.clock)();
@@ -603,9 +850,117 @@ impl PushDesk {
             run
         };
         if let Some(run) = run {
-            (self.changed)();
-            self.spawn_run(host, run, Reach::Asked);
+            // The run starts before the page is told: a host marked working has a run behind it
+            // even when the page's callback fails.
+            self.spawn_run(host, run, Reach::Asked, Job::Full);
+            self.tell_page();
         }
+        Ok(self.view())
+    }
+
+    /// Chooses whether the notifications of the host the page named show what needs the person or
+    /// only that something does.
+    ///
+    /// The choice is recorded and applied on this phone at once: the receivers hold the host's
+    /// preview key only while previews are on for it, so turning them off takes the key out before
+    /// the host is told, and turning them on files it first. A choice that cannot be kept in the
+    /// record, or whose key cannot be filed, is not made: it is let go, the person is told so, and
+    /// nothing is left half done. A host that is on is then told, over a run that makes no proposal
+    /// to the gateway and asks the person nothing. A host that a run holds is told by that run,
+    /// which reads the choice when it gets to the host and goes round again if the choice changed
+    /// after. A host that is not on keeps the choice for the run that turns it on, so trying again
+    /// sends it. Choices are made one after another: a second waits until the first is made or let
+    /// go, so the one let go puts back what it found and the last the person made stands.
+    ///
+    /// # Errors
+    ///
+    /// Returns a refusal when this phone is not paired with that host, and a local failure when the
+    /// choice could not be kept or its key not filed.
+    pub async fn set_previews(self: &Arc<Self>, reference: &str, on: bool) -> Result<PushView> {
+        let host = self
+            .device
+            .host_by_reference(reference)
+            .ok_or_else(crate::hosts::unknown_host)?;
+        if self.write_blocked {
+            // A choice made now would be one this phone could not remember.
+            return Ok(self.view());
+        }
+        let key = host.host_device_id.to_string();
+        let _choice = self.choosing.lock().await;
+        let before = {
+            let mut state = lock(&self.state);
+            let Some(kept) = state.record.hosts.get_mut(&key) else {
+                // A host nobody asked for notifications has no row to choose on.
+                drop(state);
+                return Ok(self.view());
+            };
+            let before = std::mem::replace(&mut kept.previews, on);
+            if before != on && !self.keep_checked(&state.record) {
+                if let Some(kept) = state.record.hosts.get_mut(&key) {
+                    kept.previews = before;
+                }
+                // A write that failed may have reached the disk (a rename that went through and a
+                // directory that did not sync): the earlier choice is written again, so that what
+                // a restart reads is what the person is told.
+                let undone = self.keep_checked(&state.record);
+                return Err(CommandError::local_failure(if undone {
+                    "This phone could not keep your choice of previews. Try again."
+                } else {
+                    "This phone could not keep your choice of previews, or put back the one it \
+                     had. The one it had may return when the application next starts."
+                }));
+            }
+            before
+        };
+        if let (Err(words), _) = self.file_keys_quietly().await {
+            // The choice is let go with the record: Off that left the host's key with the receivers
+            // would be Off in name only.
+            let undone = {
+                let mut state = lock(&self.state);
+                if let Some(kept) = state.record.hosts.get_mut(&key) {
+                    kept.previews = before;
+                }
+                self.keep_checked(&state.record)
+            };
+            // A filing that failed part way may have left the receivers holding some of the new
+            // set: the set the record says now is filed again at once, and the next look files it
+            // again if this fails too.
+            let restored = self.file_keys_quietly().await.0.is_ok();
+            // The page is told once, with the choice as it stands again: neither filing reported
+            // while the choice was in the record, which the page would have kept.
+            self.tell_page();
+            return Err(CommandError::local_failure(if undone && restored {
+                format!("{words} Your choice of previews was not made. Try again.")
+            } else {
+                format!(
+                    "{words} Your choice of previews was not made, and this phone could not put \
+                     back everything it held before. It tries again shortly."
+                )
+            }));
+        }
+        let now = (self.wiring.clock)();
+        let claimed = {
+            let mut state = lock(&self.state);
+            let id = host.host_device_id;
+            let due = state
+                .record
+                .hosts
+                .get(&key)
+                .filter(|kept| kept.phase == Phase::On && !kept.lost)
+                .and_then(|kept| kept.told_differs().then_some(kept.registered).flatten());
+            match due {
+                Some(registered) => state.claim(id).map(|run| {
+                    Self::mark(&mut state, id, Phase::Working, TELLING_THE_HOST, false, now);
+                    self.keep(&state.record);
+                    (run, Job::Delivery(registered))
+                }),
+                None => None,
+            }
+        };
+        if let Some((run, job)) = claimed {
+            self.spawn_run(host, run, Reach::Asked, job);
+        }
+        self.tell_page();
         Ok(self.view())
     }
 
@@ -631,12 +986,33 @@ impl PushDesk {
             tracing::warn!(%error, "the paired hosts could not be read for a look at notifications");
             CommandError::local_failure("the paired hosts could not be read")
         })?;
-        let current = self.current_digest().await;
+        let checked = self.checked_token().await;
+        let current = checked.ok();
         let now = (self.wiring.clock)();
-        let claimed: Vec<(PairedHost, u64)> = {
+        let mut shown = false;
+        let claimed: Vec<(PairedHost, u64, Job)> = {
             let mut state = lock(&self.state);
             let mut claimed = Vec::new();
             let mut marked = false;
+            // A look that read a token settles every host it could not confirm before; one that
+            // could not read one leaves the hosts that are on unconfirmed, since nothing says they
+            // still have the token they were registered with.
+            match checked {
+                Ok(_) => shown = !std::mem::take(&mut state.unconfirmed).is_empty(),
+                Err(why) => {
+                    for host in &hosts {
+                        let id = host.host_device_id;
+                        let on = state
+                            .record
+                            .hosts
+                            .get(&id.to_string())
+                            .is_some_and(|kept| kept.phase == Phase::On);
+                        if on && state.unconfirmed.insert(id, why) != Some(why) {
+                            shown = true;
+                        }
+                    }
+                }
+            }
             for host in hosts {
                 let id = host.host_device_id;
                 if let Some(digest) = current
@@ -650,47 +1026,51 @@ impl PushDesk {
                 let Some(kept) = state.record.hosts.get(&id.to_string()) else {
                     continue;
                 };
-                let (due, was_on) = match kept.phase {
-                    Phase::On => (
-                        current.is_some_and(|digest| kept.registered != Some(digest)),
-                        true,
-                    ),
-                    Phase::Working => (false, false),
-                    Phase::Attention => (
-                        !kept.lost && now >= kept.updated_ms.saturating_add(RETRY_AFTER_MS),
-                        false,
-                    ),
+                let after_a_minute = now >= kept.updated_ms.saturating_add(RETRY_AFTER_MS);
+                let (due, words) = match kept.phase {
+                    Phase::On => {
+                        if current.is_some_and(|digest| kept.registered != Some(digest)) {
+                            (Some(Job::Full), Some("Registering this phone again."))
+                        } else if after_a_minute && kept.told_differs() {
+                            // The choice of previews is not the one the host was told, and the
+                            // run that would have told it did not finish.
+                            (kept.registered.map(Job::Delivery), Some(TELLING_THE_HOST))
+                        } else {
+                            (None, None)
+                        }
+                    }
+                    Phase::Working => (None, None),
+                    Phase::Attention => ((!kept.lost && after_a_minute).then_some(Job::Full), None),
                 };
-                if !due {
+                let Some(job) = due else {
                     continue;
-                }
+                };
                 let Some(run) = state.claim(id) else {
                     continue;
                 };
-                if was_on {
-                    Self::mark(
-                        &mut state,
-                        id,
-                        Phase::Working,
-                        "Registering this phone again.",
-                        false,
-                        now,
-                    );
+                if let Some(words) = words {
+                    Self::mark(&mut state, id, Phase::Working, words, false, now);
                     marked = true;
                 }
-                claimed.push((host, run));
+                claimed.push((host, run, job));
             }
             if marked {
                 self.keep(&state.record);
             }
             claimed
         };
-        if !claimed.is_empty() {
-            (self.changed)();
+        let changed = !claimed.is_empty() || shown;
+        // The runs start before the page is told: a host marked working has a run behind it even
+        // when the page's callback fails.
+        for (host, run, job) in claimed {
+            self.spawn_run(host, run, Reach::Visit, job);
         }
-        for (host, run) in claimed {
-            self.spawn_run(host, run, Reach::Visit);
+        if changed {
+            self.tell_page();
         }
+        // What the receivers hold follows the record and the paired hosts, so a look mends a filing
+        // that failed or a host that was unpaired meanwhile.
+        self.file_keys_logged().await;
         Ok(self.view())
     }
 
@@ -702,7 +1082,7 @@ impl PushDesk {
     /// Forgets what is kept of `host`, as the person forgetting the host does. A run that is
     /// taking the host up loses its claim with it, writes nothing more, and is ended where it
     /// waits.
-    pub fn forgotten(&self, host: DeviceId) {
+    pub fn forgotten(self: &Arc<Self>, host: DeviceId) {
         {
             let mut state = lock(&self.state);
             state.running.remove(&host);
@@ -713,17 +1093,22 @@ impl PushDesk {
             }
             state.asking.remove(&host);
             state.observed.remove(&host);
+            state.unconfirmed.remove(&host);
             if state.record.hosts.remove(&host.to_string()).is_some() {
                 self.keep(&state.record);
             }
         }
-        (self.changed)();
+        self.tell_page();
+        // The host's key is not the receivers' to open its previews with any more.
+        let desk = Arc::clone(self);
+        tauri::async_runtime::spawn(async move { desk.file_keys_logged().await });
     }
 
-    /// Runs the sequence for `host`, which `run` holds, and runs it again for as long as the token
-    /// the provider holds is not the one the registration just made proposed. The host is reached
+    /// Runs `job` for `host`, which `run` holds, and runs the sequence again for as long as the token
+    /// the provider holds is not the one the registration just made proposed, and a delivery again
+    /// for as long as the choice of previews is not the one the host was told. The host is reached
     /// as `reach` says.
-    fn spawn_run(self: &Arc<Self>, host: PairedHost, run: u64, reach: Reach) {
+    fn spawn_run(self: &Arc<Self>, host: PairedHost, run: u64, reach: Reach, first: Job) {
         let cancel = Arc::new(tokio::sync::Notify::new());
         {
             let mut state = lock(&self.state);
@@ -744,13 +1129,15 @@ impl PushDesk {
                 armed: true,
             };
             let work = async {
+                let mut job = first;
                 loop {
-                    match desk.sequence(&host, run, reach).await {
+                    match desk.sequence(&host, run, reach, job).await {
                         Ok(registered) => {
                             desk.about_to_compare(host.host_device_id, run);
                             let current = desk.current_digest().await;
-                            if !desk.registered(host.host_device_id, run, registered, current) {
-                                break;
+                            match desk.registered(host.host_device_id, run, registered, current) {
+                                Next::Done => break,
+                                Next::Again(next) => job = next,
                             }
                         }
                         Err(stop) => {
@@ -792,22 +1179,23 @@ impl PushDesk {
     }
 
     /// What a run does when its registration is made: the host is on when the token it proposed is
-    /// the one the provider holds, and the run goes round again when it is not, whether its own
-    /// last read or a look made while that read was on its way says so. A run that cannot say what
-    /// the provider holds has no evidence, and stops for a retry. Returns whether it goes round
-    /// again. A run that no longer holds its host writes nothing.
+    /// the one the provider holds and the host was told the choice of previews that stands, and the
+    /// run goes round again when it is not, whether its own last read or a look made while that
+    /// read was on its way says so, or the person chose again while the host was told. A run that
+    /// cannot say what the provider holds has no evidence, and stops for a retry. A run that no
+    /// longer holds its host writes nothing.
     fn registered(
         &self,
         host: DeviceId,
         run: u64,
         registered: Digest256,
         current: Option<Digest256>,
-    ) -> bool {
+    ) -> Next {
         let now = (self.wiring.clock)();
         {
             let mut state = lock(&self.state);
             if !state.holds(host, run) {
-                return false;
+                return Next::Done;
             }
             state.asking.remove(&host);
             let observed = state.observed.remove(&host).unwrap_or_default();
@@ -817,7 +1205,7 @@ impl PushDesk {
                 .any(|digest| digest != registered)
             {
                 // The record already says working, and the repeat reads the token as it stands.
-                return true;
+                return Next::Again(Job::Full);
             }
             if current.is_none() && observed.is_empty() {
                 drop(state);
@@ -828,21 +1216,30 @@ impl PushDesk {
                         .to_owned()
                         .into(),
                 );
-                return false;
+                return Next::Done;
+            }
+            let Some(kept) = state.record.hosts.get(&host.to_string()) else {
+                state.running.remove(&host);
+                return Next::Done;
+            };
+            if kept.told_differs() {
+                // The person chose again while the host was being told.
+                return Next::Again(Job::Delivery(registered));
             }
             state.running.remove(&host);
+            state.unconfirmed.remove(&host);
             let Some(kept) = state.record.hosts.get_mut(&host.to_string()) else {
-                return false;
+                return Next::Done;
             };
             kept.phase = Phase::On;
-            "Notifications are on for this host.".clone_into(&mut kept.words);
+            "This host took this phone for notifications.".clone_into(&mut kept.words);
             kept.settings = false;
             kept.updated_ms = now;
             kept.registered = Some(registered);
             self.keep(&state.record);
         }
-        (self.changed)();
-        false
+        self.tell_page();
+        Next::Done
     }
 
     /// What a run does when its sequence stopped: the host needs the person, for the reason it
@@ -857,6 +1254,7 @@ impl PushDesk {
             state.running.remove(&host);
             state.asking.remove(&host);
             state.observed.remove(&host);
+            state.unconfirmed.remove(&host);
             let Some(kept) = state.record.hosts.get_mut(&host.to_string()) else {
                 return;
             };
@@ -866,7 +1264,7 @@ impl PushDesk {
             kept.updated_ms = now;
             self.keep(&state.record);
         }
-        (self.changed)();
+        self.tell_page();
     }
 
     /// Records where a host stands, without writing it.
@@ -878,19 +1276,13 @@ impl PushDesk {
         settings: bool,
         now: u64,
     ) {
+        // What a run says of the host replaces the mark of a look that could not confirm it.
+        state.unconfirmed.remove(&host);
         let entry = state
             .record
             .hosts
             .entry(host.to_string())
-            .or_insert_with(|| HostPush {
-                sender_record_id: None,
-                phase,
-                words: String::new(),
-                settings: false,
-                updated_ms: now,
-                registered: None,
-                lost: false,
-            });
+            .or_insert_with(|| HostPush::new(phase, now));
         entry.lost = false;
         entry.phase = phase;
         entry.words = words.to_owned();
@@ -918,21 +1310,30 @@ impl PushDesk {
             Self::mark(&mut state, host, Phase::Working, words, false, now);
             self.keep(&state.record);
         }
-        (self.changed)();
+        self.tell_page();
         true
+    }
+
+    /// The digest of the token the provider holds now, or the words for why a look cannot say: it
+    /// holds none, it could not be read, or the gateway would not take it.
+    async fn checked_token(&self) -> std::result::Result<Digest256, &'static str> {
+        match self.token().await {
+            Ok(Some(token)) => RegistrationToken::new(token)
+                .map(|token| token_digest(&token))
+                .map_err(|_| TOKEN_REFUSED),
+            Ok(None) | Err(_) => Err(TOKEN_UNREADABLE),
+        }
     }
 
     /// The digest of the token the provider holds now, when it holds one.
     async fn current_digest(&self) -> Option<Digest256> {
-        let token = self.token().await.ok().flatten()?;
-        RegistrationToken::new(token)
-            .ok()
-            .map(|token| token_digest(&token))
+        self.checked_token().await.ok()
     }
 
-    /// The whole sequence for one host, for the run that holds it: permission, token, proposal, the
-    /// challenge, the authorisation, the host. Every failure is words for the person. When it
-    /// succeeds it says which token it proposed, by its digest.
+    /// What `job` does for one host, for the run that holds it. The full sequence is permission,
+    /// token, proposal, the challenge, the host; a delivery tells the host again, under the
+    /// registration it already has. Every failure is words for the person. When it succeeds it says
+    /// which token the registration was made for, by its digest.
     ///
     /// # Errors
     ///
@@ -942,7 +1343,48 @@ impl PushDesk {
         host: &PairedHost,
         run: u64,
         reach: Reach,
+        job: Job,
     ) -> std::result::Result<Digest256, Stop> {
+        // A look never cuts off the host in use, so a host it cannot reach without that is not
+        // asked or told anything, and the words say why.
+        if reach == Reach::Visit && self.registrar.beside_the_host_in_use(host).await {
+            return Err(BESIDE_THE_HOST_IN_USE.to_owned().into());
+        }
+        match job {
+            Job::Full => {
+                let (gateway, proposed) = self.propose(host, run).await?;
+                self.tell_host(host, run, reach, &gateway, true).await?;
+                Ok(proposed)
+            }
+            Job::Delivery(registered) => {
+                let (_, gateway) = self.gateway()?;
+                self.tell_host(host, run, reach, &gateway, false).await?;
+                Ok(registered)
+            }
+        }
+    }
+
+    /// The gateway this phone's requests go to, and the origin it is at.
+    fn gateway(&self) -> std::result::Result<(GatewayOrigin, PushGateway), String> {
+        let origin = self.gateway_origin();
+        let signer = Arc::new(InstallationSigner::new(
+            self.device.identity().keys.authorisation.clone(),
+        ));
+        let http = (self.wiring.http)(&origin).map_err(|_| unreachable_gateway())?;
+        Ok((origin.clone(), PushGateway::new(origin, http, signer)))
+    }
+
+    /// The first half of the sequence: the system's permission, the token, and the gateway's
+    /// challenge for it, answered. Returns the gateway and the digest of the token it was proposed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the words for whatever stopped it.
+    async fn propose(
+        &self,
+        host: &PairedHost,
+        run: u64,
+    ) -> std::result::Result<(PushGateway, Digest256), Stop> {
         let native = &self.native;
         let mut permission = native
             .permission()
@@ -1004,12 +1446,7 @@ impl PushDesk {
                     .into(),
             );
         };
-        let origin = self.gateway_origin();
-        let signer = Arc::new(InstallationSigner::new(
-            self.device.identity().keys.authorisation.clone(),
-        ));
-        let http = (self.wiring.http)(&origin).map_err(|_| unreachable_gateway())?;
-        let gateway = PushGateway::new(origin.clone(), http, signer.clone());
+        let (origin, gateway) = self.gateway()?;
 
         // The turn and the token may have taken a while, and the person may have forgotten the host
         // meanwhile: a run that is not wanted must not write a pending registration and propose a
@@ -1019,9 +1456,8 @@ impl PushDesk {
         }
         // The record is written before the token is proposed, so a challenge that arrives before the
         // gateway's answer to the proposal is the challenge of a registration the receiver knows.
-        let registration_token = RegistrationToken::new(token).map_err(|_| {
-            "The notification token this phone was given is not one the gateway takes.".to_owned()
-        })?;
+        let registration_token =
+            RegistrationToken::new(token).map_err(|_| TOKEN_REFUSED.to_owned())?;
         let registration_id = PushRegistrationId::new(kr_ipc::new_uuid());
         let now = (self.wiring.clock)();
         let pending = PendingRegistration {
@@ -1071,36 +1507,81 @@ impl PushDesk {
             }
         }
         drop(one_at_a_time);
+        Ok((gateway, pending.token_digest))
+    }
 
+    /// The second half: the host is told. The receivers hold the host's key first (the keys are
+    /// filed before any hold on the host's endpoint is taken: filing is the platform's, and no other
+    /// host waits behind it), then the host is reached, then the gateway issues the credential, and
+    /// the registration carries it with the person's choice of previews. The full sequence also
+    /// tells the host which preview key this phone holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns the words for whatever stopped it.
+    async fn tell_host(
+        &self,
+        host: &PairedHost,
+        run: u64,
+        reach: Reach,
+        gateway: &PushGateway,
+        full: bool,
+    ) -> std::result::Result<(), Stop> {
         // The host is the one the person chose. A phone that was unpaired or forgot the host
-        // while the challenge was awaited stops here, before the host is asked anything.
+        // meanwhile stops here, before the host is asked anything.
         if !self.wanted(host.host_device_id, run) {
             return Err(forgotten_host());
         }
-        if !self.working(host.host_device_id, run, "Telling the host.") {
+        if !self.working(host.host_device_id, run, TELLING_THE_HOST) {
             return Err(forgotten_host());
         }
         let Some(sender_record_id) = self.sender_record_for(host, Some(run)) else {
             return Err(forgotten_host());
         };
-        let issued = gateway
-            .issue(PushSenderIssueRequest {
-                host_endpoint_key: host.host_endpoint_id,
-                host_signing_key: host.host_keys.authorisation,
-                sender_record_id,
-            })
-            .await
-            .map_err(|error| gateway_words(&error))?;
-        let keys = &self.device.identity().keys;
+        // The choice the host is told is read once, before the keys are filed, so what the receivers
+        // hold is never older than it: a choice made after this is told by a run that goes round
+        // again, and one that turns previews off is told after the receivers were asked to let the
+        // key go, whether or not they did.
+        let Some(previews) = self.previews_wanted(host.host_device_id, run) else {
+            return Err(forgotten_host());
+        };
+        // A filing that fails does not stop the run. The registration does not depend on the
+        // receivers' store: a preview sealed to a key they do not hold shows the generic alert, and
+        // one turned off is no longer sealed once the host is told. The rows say what is wrong until
+        // a look files the keys again, which retries the filing alone.
+        self.file_keys_logged().await;
         // The person can forget the host during any of the waits that follow, so the host is
         // sent nothing until the run is asked about again: before the connection, after it, and
-        // before each of the two changes.
+        // before each of the changes.
         let wanted = || self.wanted(host.host_device_id, run);
-        let not_taken = |words: String| -> Stop {
-            if wanted() {
-                format!("The host did not take this phone as a destination: {words}").into()
-            } else {
-                forgotten_host()
+        let not_taken = |stop: LineStop, step: Step| -> Stop {
+            if !wanted() {
+                return forgotten_host();
+            }
+            match (stop, step) {
+                (LineStop::Phone(words), _) => words.into(),
+                // The host took the registration, and it is the preview key that it refused or did
+                // not answer: it holds this phone as a destination, and the key may be there too.
+                (LineStop::Host(words), Step::PreviewKey) => format!(
+                    "The host took this phone as a destination, but did not confirm its preview \
+                     key: {words}"
+                )
+                .into(),
+                // The gateway issued before the host was asked, and an issue retires the credential
+                // the host holds: a host that refuses what follows, or whose answer is lost, may
+                // hold one the gateway no longer takes, and may not be able to notify this phone
+                // until a registration is taken.
+                (LineStop::Host(words), Step::Register) if !full => format!(
+                    "The host did not take this choice of previews, and it may not be able to \
+                     notify this phone until it takes a registration: {words}"
+                )
+                .into(),
+                (LineStop::Host(words), _) if !full => {
+                    format!("The host did not take this choice of previews: {words}").into()
+                }
+                (LineStop::Host(words), _) => {
+                    format!("The host did not take this phone as a destination: {words}").into()
+                }
             }
         };
         if !wanted() {
@@ -1110,45 +1591,202 @@ impl PushDesk {
             .registrar
             .connect(host, reach)
             .await
-            .map_err(not_taken)?;
+            .map_err(|words| not_taken(LineStop::Host(words), Step::Connect))?;
+        if !wanted() {
+            return Err(forgotten_host());
+        }
+        // The gateway issues once the host is reached: an issue replaces the credential the host
+        // holds at once, so a host that cannot be reached keeps the one it has.
+        let issued = gateway
+            .issue(PushSenderIssueRequest {
+                host_endpoint_key: host.host_endpoint_id,
+                host_signing_key: host.host_keys.authorisation,
+                sender_record_id,
+            })
+            .await
+            .map_err(|error| gateway_words(&error))?;
         if !wanted() {
             return Err(forgotten_host());
         }
         line.register(DevicePushRegisterParams {
             credential: issued.credential,
-            // The host seals a preview to the key it holds for this phone. The phone shows the
-            // generic alert; the key is filed so a later opener needs no registration.
-            previews_enabled: true,
+            // The host seals a preview to the key it holds for this phone when this is true, and
+            // the receivers open it with the keys filed before the host was reached.
+            previews_enabled: previews,
         })
         .await
-        .map_err(not_taken)?;
+        .map_err(|stop| not_taken(stop, Step::Register))?;
         if !wanted() {
             return Err(forgotten_host());
         }
-        line.update_preview_key(*keys.notification_preview.public())
+        self.told(host.host_device_id, run, previews);
+        if full {
+            // The revision the host holds, read now: the record may have moved since this run began.
+            let revision = self
+                .device
+                .pairing()
+                .hosts
+                .by_device(host.host_device_id)
+                .ok()
+                .flatten()
+                .map_or(host.device_key_revision, |held| held.device_key_revision);
+            line.update_preview_key(
+                *self.device.identity().keys.notification_preview.public(),
+                revision,
+            )
             .await
-            .map_err(not_taken)?;
-        // The line is not needed any more, and the hold on the host's endpoint goes with it: the
-        // filing of the key below does not use the connection.
+            .map_err(|stop| not_taken(stop, Step::PreviewKey))?;
+        }
+        // The line is not needed any more, and the hold on the host's endpoint goes with it.
         drop(line);
+        Ok(())
+    }
 
+    /// The choice of previews the host is to be told, while `run` holds it.
+    fn previews_wanted(&self, host: DeviceId, run: u64) -> Option<bool> {
+        let state = lock(&self.state);
+        if !state.holds(host, run) {
+            return None;
+        }
+        state
+            .record
+            .hosts
+            .get(&host.to_string())
+            .map(|kept| kept.previews)
+    }
+
+    /// Records that the host was told `previews`, while `run` holds it.
+    fn told(&self, host: DeviceId, run: u64, previews: bool) {
+        let mut state = lock(&self.state);
+        if !state.holds(host, run) {
+            return;
+        }
+        if let Some(kept) = state.record.hosts.get_mut(&host.to_string()) {
+            kept.told_previews = Some(previews);
+        }
+        self.keep(&state.record);
+    }
+
+    /// The keys the receivers are to open previews with, from the record and the paired hosts: the
+    /// preview key of each paired host whose record is not lost and whose previews are on, and this
+    /// phone's own seed when at least one is. Nothing when what it is built from cannot be read: a list that cannot be read
+    /// is not an empty one, and a set built from it would take every host's previews away.
+    fn wanted_keys(&self) -> std::result::Result<PreviewKeys, String> {
+        let hosts = self.device.pairing().hosts.list().map_err(|error| {
+            tracing::warn!(%error, "the paired hosts could not be read to file the preview keys");
+            "This phone could not read its paired hosts.".to_owned()
+        })?;
+        let senders: BTreeMap<[u8; 32], SenderKey> = {
+            let state = lock(&self.state);
+            hosts
+                .iter()
+                .filter(|host| {
+                    state
+                        .record
+                        .hosts
+                        .get(&host.host_device_id.to_string())
+                        .is_some_and(|kept| !kept.lost && kept.previews)
+                })
+                .map(|host| {
+                    let key = host.host_keys.notification_preview;
+                    let id = *kr_protocol::pairing::key_id(
+                        kr_protocol::pairing::KeyPurpose::NotificationPreview,
+                        key.as_bytes(),
+                    )
+                    .as_bytes();
+                    // Two records that name one key name it once: the receivers refuse a set that
+                    // names an identifier twice, and one refusal would stop every filing.
+                    (
+                        id,
+                        SenderKey {
+                            id,
+                            key: *key.as_bytes(),
+                        },
+                    )
+                })
+                .collect()
+        };
+        if senders.is_empty() {
+            return Ok(PreviewKeys::default());
+        }
+        let identity = self.device.identity();
         let name = kr_crypto::store::SecretName::device_key(
             crate::device::identity::SCOPE,
             kr_protocol::pairing::KeyPurpose::NotificationPreview,
         )
         .map_err(|_| "This phone could not find its preview key.".to_owned())?;
-        let seed = self
-            .device
-            .identity()
+        let seed = identity
             .secrets
             .get(&name)
             .map_err(|_| "This phone could not read its preview key.".to_owned())?
             .ok_or_else(|| "This phone has no preview key.".to_owned())?;
-        native
-            .limited_key(keys.notification_preview.key_id().as_bytes(), seed.expose())
+        Ok(PreviewKeys {
+            recipients: vec![RecipientKey {
+                id: *identity.keys.notification_preview.key_id().as_bytes(),
+                seed: zeroize::Zeroizing::new(seed.expose().to_vec()),
+            }],
+            senders: senders.into_values().collect(),
+        })
+    }
+
+    /// Makes the receivers hold the keys the record and the paired hosts say, and nothing else.
+    ///
+    /// The set is built and handed over under one hold, so a set built before a newer one is never
+    /// filed after it. A set the receivers already hold is not filed again. A filing that fails
+    /// leaves a mark, which every row that is on shows until a filing succeeds; no registration is
+    /// touched by it. Says nothing to the page: the answer's second member is whether the mark
+    /// moved, for the caller to report when it has settled what the page is to be shown.
+    ///
+    /// # Errors
+    ///
+    /// The first member holds the words for what stopped it.
+    async fn file_keys_quietly(&self) -> (std::result::Result<(), String>, bool) {
+        let mut filed = self.filed.lock().await;
+        let outcome = self.hand_over_keys(&mut filed).await;
+        // The mark follows the last filing, and is made under the hold that orders them.
+        let unfiled = outcome
+            .as_ref()
+            .err()
+            .map(|words| format!("{words} {KEYS_RETRY}"));
+        let mut state = lock(&self.state);
+        let moved = state.keys_unfiled != unfiled;
+        state.keys_unfiled = unfiled;
+        (outcome, moved)
+    }
+
+    /// The filing itself, over the hold of [`Self::file_keys_quietly`]: the keys the record asks
+    /// for, unless the receivers already hold them.
+    async fn hand_over_keys(
+        &self,
+        filed: &mut Option<PreviewKeys>,
+    ) -> std::result::Result<(), String> {
+        let keys = self.wanted_keys()?;
+        if filed.as_ref() == Some(&keys) {
+            return Ok(());
+        }
+        // Whatever the receivers hold is not known until this filing is known to have been made,
+        // and a filing that was not answered in time leaves it unknown: it may still be made, so
+        // the next filing is made whatever it holds.
+        *filed = None;
+        tokio::time::timeout(self.wiring.keys_within, self.native.preview_keys(&keys))
             .await
+            .map_err(|_| "This phone's preview key was not filed in time.".to_owned())?
             .map_err(|_| "This phone could not file its preview key.".to_owned())?;
-        Ok(pending.token_digest)
+        *filed = Some(keys);
+        Ok(())
+    }
+
+    /// [`Self::file_keys_quietly`], for the callers that have nobody to tell: a failure is logged
+    /// and left as the mark the rows show, the page is told when the mark moved, and the next look
+    /// files again.
+    async fn file_keys_logged(&self) {
+        let (outcome, moved) = self.file_keys_quietly().await;
+        if moved {
+            self.tell_page();
+        }
+        if let Err(words) = outcome {
+            tracing::warn!(%words, "the preview keys could not be filed for the receivers");
+        }
     }
 
     /// The gateway's origin: the managed service's, and in a debug build the one a device run named.
@@ -1173,17 +1811,7 @@ impl PushDesk {
     /// person agrees and the system has given the application its own token, which is after the
     /// permission step has said yes.
     async fn token_within(&self, within: Duration) -> std::result::Result<Option<String>, String> {
-        let mut waited = Duration::ZERO;
-        loop {
-            if let Some(token) = self.token().await? {
-                return Ok(Some(token));
-            }
-            if waited >= within {
-                return Ok(None);
-            }
-            tokio::time::sleep(LOOK_EVERY).await;
-            waited += LOOK_EVERY;
-        }
+        read_until(|| self.token(), within, LOOK_EVERY).await
     }
 
     /// Waits for the receiver to answer the challenge, reading the record it writes.
@@ -1230,12 +1858,7 @@ impl PushDesk {
     /// Returns the words for what stopped it.
     #[cfg(debug_assertions)]
     pub async fn reissue_unannounced(&self, host: &PairedHost) -> std::result::Result<u64, String> {
-        let origin = self.gateway_origin();
-        let signer = Arc::new(InstallationSigner::new(
-            self.device.identity().keys.authorisation.clone(),
-        ));
-        let http = (self.wiring.http)(&origin).map_err(|_| unreachable_gateway())?;
-        let gateway = PushGateway::new(origin, http, signer);
+        let (_, gateway) = self.gateway()?;
         let issued = gateway
             .issue(PushSenderIssueRequest {
                 host_endpoint_key: host.host_endpoint_id,
@@ -1268,15 +1891,11 @@ impl PushDesk {
         let sender = held.unwrap_or_else(|| PushSenderRecordId::new(kr_ipc::new_uuid()));
         if held.is_none() {
             let now = (self.wiring.clock)();
-            let entry = state.record.hosts.entry(key).or_insert_with(|| HostPush {
-                sender_record_id: None,
-                phase: Phase::Working,
-                words: String::new(),
-                settings: false,
-                updated_ms: now,
-                registered: None,
-                lost: false,
-            });
+            let entry = state
+                .record
+                .hosts
+                .entry(key)
+                .or_insert_with(|| HostPush::new(Phase::Working, now));
             entry.sender_record_id = Some(sender);
             self.keep(&state.record);
         }
@@ -1287,23 +1906,34 @@ impl PushDesk {
     /// still in place. A failure is logged and not raised: what the person sees is the memory, and
     /// the next change writes it again.
     fn keep(&self, record: &Record) {
+        self.keep_checked(record);
+    }
+
+    /// [`Self::keep`], saying whether the record is on disk as `record` has it: a choice the person
+    /// must be told did not take effect is made only after this answers yes.
+    fn keep_checked(&self, record: &Record) -> bool {
         if self.write_blocked {
-            return;
+            return false;
         }
         let Some(directory) = self.file.parent() else {
-            return;
+            return false;
         };
         if let Err(error) = kr_ipc::paths::create_private_directory(directory) {
             tracing::warn!(%error, "the notifications record's directory could not be made");
-            return;
+            return false;
         }
         match serde_json::to_vec(&Versioned { record }) {
-            Ok(bytes) => {
-                if let Err(error) = write_owner_only_file(&self.file, &bytes) {
+            Ok(bytes) => match write_owner_only_file(&self.file, &bytes) {
+                Ok(()) => true,
+                Err(error) => {
                     tracing::warn!(%error, "the notifications record could not be written");
+                    false
                 }
+            },
+            Err(error) => {
+                tracing::warn!(%error, "the notifications record could not be encoded");
+                false
             }
-            Err(error) => tracing::warn!(%error, "the notifications record could not be encoded"),
         }
     }
 }
@@ -1389,7 +2019,7 @@ fn has_a_record_set_aside(file: &Path) -> bool {
 /// in the log. It holds each host's authorisation identifier, so it is kept as it was found.
 /// Returns whether it was moved.
 fn set_aside(file: &Path, why: &Shown, now_ms: u64) -> bool {
-    let aside = (0_u32..)
+    let free = (0_u32..ASIDE_NAMES)
         .map(|attempt| {
             let name = match attempt {
                 0 => format!("{ASIDE_PREFIX}{now_ms}.json"),
@@ -1397,8 +2027,16 @@ fn set_aside(file: &Path, why: &Shown, now_ms: u64) -> bool {
             };
             file.with_file_name(name)
         })
-        .find(|each| is_absent(each))
-        .expect("a name is free");
+        .find(|each| is_absent(each));
+    let Some(aside) = free else {
+        // Names that are all taken, or that cannot be inspected, are not tried for ever: the record
+        // stays where it is and nothing is written over it.
+        tracing::error!(
+            why = %why,
+            "the notifications record could not be set aside under any name it was tried under"
+        );
+        return false;
+    };
     match std::fs::rename(file, &aside) {
         Ok(()) => {
             tracing::error!(
@@ -1427,13 +2065,9 @@ fn record_after_a_loss(hosts: &[PairedHost], now_ms: u64, words: &str) -> Record
         record.hosts.insert(
             host.host_device_id.to_string(),
             HostPush {
-                sender_record_id: None,
-                phase: Phase::Attention,
                 words: words.to_owned(),
-                settings: false,
-                updated_ms: now_ms,
-                registered: None,
                 lost: true,
+                ..HostPush::new(Phase::Attention, now_ms)
             },
         );
     }
@@ -1443,16 +2077,45 @@ fn record_after_a_loss(hosts: &[PairedHost], now_ms: u64, words: &str) -> Record
 /// What a record says when the application starts. A run that was under way then ended with the
 /// process, and nothing is running it now, so it is a stop the person can mend and not a state that
 /// says it is working for ever. A run that reached an end stays as it was.
+///
+/// The stop keeps the time the run was last heard of, so a start a minute or more after it retries
+/// at its first look and one sooner waits out the rest of the minute, as a stop that happened while
+/// the application ran would. A time later than now is a clock set back, and counts as now.
 fn after_a_restart(mut record: Record, now_ms: u64) -> Record {
     for kept in record.hosts.values_mut() {
         if kept.phase == Phase::Working {
             kept.phase = Phase::Attention;
             "Turning on notifications was interrupted. Try again.".clone_into(&mut kept.words);
             kept.settings = false;
-            kept.updated_ms = now_ms;
+            kept.updated_ms = kept.updated_ms.min(now_ms);
         }
     }
     record
+}
+
+/// Reads with `read` every `every` until it gives a value, for no longer than `within` in all.
+///
+/// One deadline covers the reads and the waits between them: a read can itself wait for the
+/// provider, or never answer, and the registration slot a run holds is not held longer than
+/// `within`. `Ok(None)` when the time ran out.
+async fn read_until<F, Fut, T>(
+    mut read: F,
+    within: Duration,
+    every: Duration,
+) -> std::result::Result<Option<T>, String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<Option<T>, String>>,
+{
+    let wait = async {
+        loop {
+            if let Some(value) = read().await? {
+                return Ok(Some(value));
+            }
+            tokio::time::sleep(every).await;
+        }
+    };
+    tokio::time::timeout(within, wait).await.unwrap_or(Ok(None))
 }
 
 fn forgotten_host() -> Stop {
@@ -1536,13 +2199,9 @@ impl<R: tauri::Runtime> Native for PluginNative<R> {
         })
     }
 
-    fn limited_key<'a>(
-        &'a self,
-        recipient_key_id: &'a [u8; 32],
-        seed: &'a [u8],
-    ) -> PushFuture<'a, ()> {
+    fn preview_keys<'a>(&'a self, keys: &'a PreviewKeys) -> PushFuture<'a, ()> {
         Box::pin(async move {
-            companion_platform::notify::limited_key(&self.0, recipient_key_id, seed)
+            companion_platform::notify::preview_keys(&self.0, keys)
                 .await
                 .map_err(said)
         })
@@ -1576,6 +2235,17 @@ async fn within_the_answer<T>(
 pub struct ConnectionRegistrar(pub Arc<Device>);
 
 impl Registrar for ConnectionRegistrar {
+    fn beside_the_host_in_use<'a>(&'a self, host: &'a PairedHost) -> AskFuture<'a> {
+        Box::pin(async move {
+            let in_use = || self.0.host_in_use().map(|using| using.network_config);
+            self.0
+                .pairing()
+                .link
+                .would_refuse_visit(&host.network_config, &in_use)
+                .await
+        })
+    }
+
     fn connect<'a>(
         &'a self,
         host: &'a PairedHost,
@@ -1616,6 +2286,8 @@ impl Registrar for ConnectionRegistrar {
             .map_err(|error| error.message)?;
             Ok(Box::new(ConnectionLine {
                 connection,
+                device: Arc::clone(&self.0),
+                host_device_id: host.host_device_id,
                 device_id: host.device_id,
                 _held: held,
             }) as Box<dyn HostLine + 'a>)
@@ -1626,6 +2298,9 @@ impl Registrar for ConnectionRegistrar {
 /// The paired connection to one host.
 struct ConnectionLine {
     connection: crate::connection::Connection,
+    /// This phone, which keeps the revision of its keys the host takes.
+    device: Arc<Device>,
+    host_device_id: DeviceId,
     /// The host's identifier for this phone.
     device_id: DeviceId,
     /// The hold on the host's endpoint, kept until the line is dropped.
@@ -1636,9 +2311,9 @@ impl ConnectionLine {
     /// Fails, in the words of why, when the account the connection was opened under has signed out
     /// or been replaced: a change made to a host under the lease of an account that has left is
     /// made for no one.
-    fn still_the_account(&self) -> std::result::Result<(), String> {
+    fn still_the_account(&self) -> std::result::Result<(), LineStop> {
         match self.connection.ended_by_this_device() {
-            Some(refusal) => Err(refusal.message),
+            Some(refusal) => Err(LineStop::Phone(refusal.message)),
             None => Ok(()),
         }
     }
@@ -1648,7 +2323,7 @@ impl HostLine for ConnectionLine {
     fn register(
         &mut self,
         params: DevicePushRegisterParams,
-    ) -> PushFuture<'_, DevicePushRegisterResult> {
+    ) -> LineFuture<'_, DevicePushRegisterResult> {
         Box::pin(async move {
             use kr_protocol::envelope::ActionTarget;
             use kr_protocol::method::Method;
@@ -1668,14 +2343,15 @@ impl HostLine for ConnectionLine {
                     .await
                     .map_err(|error| CommandError::from(error).message)
             })
-            .await?;
+            .await
+            .map_err(LineStop::Host)?;
             match settled {
-                kr_client::Settled::Result(value) => value
-                    .to_typed()
-                    .map_err(|_| "its answer was not one this phone reads".to_owned()),
-                kr_client::Settled::Receipt(_) => {
-                    Err("it did not say it had taken the registration".to_owned())
-                }
+                kr_client::Settled::Result(value) => value.to_typed().map_err(|_| {
+                    LineStop::Host("its answer was not one this phone reads".to_owned())
+                }),
+                kr_client::Settled::Receipt(_) => Err(LineStop::Host(
+                    "it did not say it had taken the registration".to_owned(),
+                )),
             }
         })
     }
@@ -1683,7 +2359,8 @@ impl HostLine for ConnectionLine {
     fn update_preview_key(
         &mut self,
         preview_key: kr_protocol::scalars::NotificationPreviewKey,
-    ) -> PushFuture<'_, ()> {
+        revision: DeviceKeyRevision,
+    ) -> LineFuture<'_, ()> {
         Box::pin(async move {
             use kr_protocol::envelope::ActionTarget;
             use kr_protocol::method::Method;
@@ -1692,9 +2369,9 @@ impl HostLine for ConnectionLine {
             // The registration that came before may have been made under an account that has since
             // left: the key goes to the host only for the account that is signed in now.
             self.still_the_account()?;
-            // The key the host seals previews to is the one it recorded when this phone paired. The
-            // call says the phone holds it and at which revision: the same key at the same revision
-            // is answered as already recorded, and any other is refused rather than taken.
+            // The call says which key the phone holds and at which revision: the same key at the
+            // same revision is answered as already recorded, a higher revision is recorded, and a
+            // revision behind the host's is refused.
             within_the_answer(async {
                 self.connection
                     .session()
@@ -1706,7 +2383,7 @@ impl HostLine for ConnectionLine {
                         &DevicePreviewKeyUpdateParams {
                             device_id: self.device_id,
                             notification_preview: preview_key,
-                            revision: DeviceKeyRevision::new(1),
+                            revision,
                         },
                         crate::commands::MUTATION_TTL,
                     )
@@ -1715,6 +2392,17 @@ impl HostLine for ConnectionLine {
                     .map_err(|error| CommandError::from(error).message)
             })
             .await
+            .map_err(LineStop::Host)?;
+            // The host holds the revision now, and the next connection has to offer it.
+            self.device
+                .pairing()
+                .hosts
+                .raise_revision(self.host_device_id, self.device_id, revision)
+                .map_err(|_| {
+                    LineStop::Phone(
+                        "this phone could not keep the revision the host took".to_owned(),
+                    )
+                })
         })
     }
 }
@@ -1757,6 +2445,8 @@ mod tests {
             updated_ms: 7,
             registered: None,
             lost: false,
+            previews: true,
+            told_previews: None,
         }
     }
 
@@ -1783,7 +2473,10 @@ mod tests {
         let working = &started.hosts["working"];
         assert_eq!(working.phase, Phase::Attention);
         assert!(!working.settings, "nothing the system's setting can mend");
-        assert_eq!(working.updated_ms, 99);
+        assert_eq!(
+            working.updated_ms, 7,
+            "the stop is from when the run was last heard of"
+        );
         assert_eq!(
             working.sender_record_id,
             Some(kept_id),
@@ -1791,6 +2484,21 @@ mod tests {
         );
         assert_eq!(started.hosts["on"], on);
         assert_eq!(started.hosts["stopped"], stopped);
+    }
+
+    /// A time later than the start's own is a clock set back: the retry is not delayed by it.
+    #[test]
+    fn a_run_last_heard_of_in_the_future_is_taken_to_have_stopped_now() {
+        let mut working = host(Phase::Working, false);
+        working.updated_ms = 500;
+        let record = Record {
+            version: VERSION,
+            hosts: BTreeMap::from([("working".to_owned(), working)]),
+        };
+
+        let started = after_a_restart(record, 99);
+
+        assert_eq!(started.hosts["working"].updated_ms, 99);
     }
 
     /// A record is set aside under a name no earlier one has: one left from an earlier loss, a link
@@ -1819,6 +2527,55 @@ mod tests {
             b"the record"
         );
         assert!(!file.exists(), "the record is out of the way");
+    }
+
+    /// A record is not set aside for ever under names that are all taken or cannot be inspected: it
+    /// is tried under a bounded number of names and left where it is, whole.
+    #[test]
+    fn a_record_is_left_in_place_when_no_name_is_free_to_set_it_aside_under() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let file = directory.path().join(RECORD);
+        std::fs::write(&file, b"the record").expect("a record");
+        for attempt in 0..ASIDE_NAMES {
+            let name = match attempt {
+                0 => format!("{ASIDE_PREFIX}7.json"),
+                _ => format!("{ASIDE_PREFIX}7-{attempt}.json"),
+            };
+            std::fs::write(directory.path().join(name), b"earlier").expect("an earlier record");
+        }
+
+        assert!(!set_aside(&file, &Shown::said("a test"), 7));
+
+        assert_eq!(
+            std::fs::read(&file).expect("the record"),
+            b"the record",
+            "the record is where it was"
+        );
+    }
+
+    /// A read that never answers does not keep the registration slot past the time given: the wait
+    /// ends with no value, and a value that comes in time is the value.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_that_never_answers_does_not_outlast_its_time() {
+        let never = read_until(
+            std::future::pending::<std::result::Result<Option<u8>, String>>,
+            Duration::from_secs(20),
+            Duration::from_millis(500),
+        );
+        let ended = tokio::time::timeout(Duration::from_secs(21), never).await;
+        assert_eq!(ended, Ok(Ok(None)), "the wait ended at its time");
+
+        let mut reads = 0;
+        let late = read_until(
+            || {
+                reads += 1;
+                let answer = (reads == 3).then_some(7_u8);
+                async move { Ok(answer) }
+            },
+            Duration::from_secs(20),
+            Duration::from_millis(500),
+        );
+        assert_eq!(late.await, Ok(Some(7)), "a value in time is the value");
     }
 
     /// A host that keeps its connection and never answers a change does not keep the line for ever:

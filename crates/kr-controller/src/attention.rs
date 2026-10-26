@@ -93,6 +93,8 @@ use kr_worker::history_filter::{HistoryFilter, Surface, ViewerScope};
 use crate::directory::KnownWorker;
 use crate::error::{ControllerError, Result};
 
+mod change_sets;
+
 /// What one answer of a method in this group is.
 pub type Answer<T> = std::result::Result<T, ProtocolError>;
 
@@ -136,8 +138,18 @@ fn held_back_wait(holds: u32) -> Duration {
 #[derive(Clone, Copy, Debug)]
 struct Held {
     holds: u32,
+    /// How many of the tries found the migration of the journal failing. A try that found the
+    /// journal held back for another reason does not count, and does not reset the count.
+    failures: u32,
     not_before_ms: u64,
 }
+
+/// How many tries that find a closed session's journal failing to migrate the store makes before it
+/// finishes the session with gaps, as it does for a journal it cannot read. With the waits that
+/// grow from [`CLOSURE_RETRY`] to [`CLOSURE_RETRY_MAX`] that is about twenty minutes. The count is
+/// kept in memory and starts again with the daemon. If the store cannot take the gaps that end the
+/// session, the count is kept, and the next look that finds the migration failing ends it.
+const FAILED_MIGRATION_TRIES: u32 = 10;
 
 /// How often the records of expired actions are let go of.
 const FORGET_EVERY_MS: u64 = 60 * 60 * 1_000;
@@ -307,6 +319,14 @@ pub trait Reach: Send + Sync {
         session_id: SessionId,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
 
+    /// Answers whether privacy mode's cleanup of a closed session is still owed: until the archive
+    /// has recorded the privacy state in its journal and removed what it retained, the text the
+    /// journal holds is not served. A record that cannot be read is answered as owed.
+    fn cleanup_owed<'a>(
+        &'a self,
+        session_id: SessionId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
+
     /// Returns the journal of a closed session, brought to the schema this build reads, when it
     /// can be opened, and says when it is held back for now instead.
     fn closed_journal(&self, session_id: SessionId) -> ClosedJournal;
@@ -316,6 +336,16 @@ pub trait Reach: Send + Sync {
     fn output_floor(&self, session_id: SessionId) -> Option<u64>;
 }
 
+/// Which sessions this host holds.
+pub trait HeldSessions: Send + Sync {
+    /// Answers whether this host holds the session: a worker is known for it, or its closure is
+    /// recorded.
+    fn holds<'a>(
+        &'a self,
+        session_id: SessionId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
+}
+
 /// What a closed session's journal can be asked for.
 pub enum ClosedJournal {
     /// The journal, at the schema this build reads.
@@ -323,6 +353,10 @@ pub enum ClosedJournal {
     /// The journal is of an earlier schema and cannot be brought forward yet, because a worker of
     /// the session may still own it or another recovery holds it. A later look may open it.
     HeldBack,
+    /// The journal is of an earlier schema, and bringing it forward was tried and failed. A later
+    /// look may succeed; after ten looks that found it failing the store finishes the session with
+    /// gaps. A look that finds the journal held back is not one of the ten.
+    Failing,
     /// The journal is not there or cannot be read.
     Unreadable,
 }
@@ -333,7 +367,7 @@ impl ClosedJournal {
     pub fn open(self) -> Option<kr_worker::journal::Journal> {
         match self {
             Self::Open(journal) => Some(*journal),
-            Self::HeldBack | Self::Unreadable => None,
+            Self::HeldBack | Self::Failing | Self::Unreadable => None,
         }
     }
 }
@@ -378,6 +412,9 @@ struct Origins {
     unfinished: BTreeSet<SessionId>,
     /// The closed sessions among those whose journal is held back for now, with how long they wait.
     held_back: BTreeMap<SessionId, Held>,
+    /// Closing sessions whose journal a read has opened since their last try began, so that the
+    /// hold on them has lifted and the try in progress must not put a wait back.
+    lifted: BTreeSet<SessionId>,
 }
 
 /// How far the store has read each origin, as a timer pass is told it: the moment up to which it
@@ -424,20 +461,26 @@ struct SessionFence {
 /// What must still hold for a response's session text to be released.
 ///
 /// One entry for each live answer the response holds text from. Text read from a finished
-/// session's journal needs none: no transition can follow the closure. A response that carries
-/// text a model wrote also holds the privacy state that text was decided under.
+/// session's journal has no entry: it is held to the privacy state it was read under, as text a
+/// model wrote is, and none is read while privacy mode is on or its cleanup of the session is
+/// owed. A response that carries either also holds the privacy state that text was decided
+/// under.
 #[derive(Clone, Debug, Default)]
 pub struct Ticket {
     entries: Vec<TicketEntry>,
-    generated: Option<Generated>,
+    /// The privacy states the daemon's own readings of text were decided under: text a model wrote
+    /// and text read from a closed session's journal.
+    generated: Vec<Generated>,
 }
 
-/// Text a model wrote that a response carries, and the privacy state it was read under.
+/// Text the daemon read itself that a response carries, and the privacy state it was read under:
+/// text a model wrote, or text read from a closed session's journal.
 ///
-/// Privacy mode removes what a model wrote of a session at the moment it is enabled, so the text is
-/// released only while the state is the one it was read under: not private, and in the same
-/// generation. The worker's own fence says nothing of it, since the daemon holds this text and
-/// the worker did not answer it.
+/// Privacy mode removes what a model wrote of a session at the moment it is enabled, and a closed
+/// session's journal serves none of its text once the archive has written the state into it, so
+/// the text is released only while the state is the one it was read under: not private, and in the
+/// same generation. The worker's own fence says nothing of it, since the daemon holds this text
+/// and the worker did not answer it.
 #[derive(Clone, Debug)]
 pub(crate) struct Generated {
     state: crate::privacy::PrivacyState,
@@ -457,7 +500,7 @@ impl Generated {
 /// The privacy state a response's generated text is released under, held for as long as a write
 /// of it is made: privacy mode cannot be published in between.
 struct Standing<'a> {
-    _reading: Option<crate::privacy::Reading<'a>>,
+    _readings: Vec<crate::privacy::Reading<'a>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -496,28 +539,30 @@ impl Ticket {
     pub(crate) fn of_generated(generated: Generated) -> Self {
         Self {
             entries: Vec::new(),
-            generated: Some(generated),
+            generated: vec![generated],
         }
     }
 
     /// Returns true when the ticket names no text that needs a check.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.generated.is_none()
+        self.entries.is_empty() && self.generated.is_empty()
     }
 
-    /// Takes the privacy state the generated text was read under, and none when it has moved or is
-    /// moving. It waits for nothing. A ticket with no generated text stands on nothing.
+    /// Takes the privacy states the daemon's own readings were decided under, and none when any
+    /// has moved or is moving. It waits for nothing. A ticket with no such text stands on nothing.
     fn standing(&self) -> Option<Standing<'_>> {
-        let Some(generated) = &self.generated else {
-            return Some(Standing { _reading: None });
-        };
-        generated
-            .state
-            .try_reading()
-            .filter(|reading| reading.published() == generated.decided)
-            .map(|reading| Standing {
-                _reading: Some(reading),
+        self.generated
+            .iter()
+            .map(|generated| {
+                generated
+                    .state
+                    .try_reading()
+                    .filter(|reading| reading.published() == generated.decided)
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(|readings| Standing {
+                _readings: readings,
             })
     }
 
@@ -719,6 +764,24 @@ pub struct AttentionModule {
     automation_failing: AtomicBool,
     /// The task that reads the workflow journal when it changes, ended with the module.
     automation_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// What the pass over the change-set store has settled.
+    change_sets: std::sync::Mutex<change_sets::ChangeSetPass>,
+    /// Set once the change-set store is being read, so it is read by one loop.
+    change_sets_started: std::sync::OnceLock<()>,
+    /// Held for the whole of one pass over the change-set store, so passes do not overlap.
+    change_sets_pass: tokio::sync::Mutex<()>,
+    /// Whether a version waits for a session this daemon does not hold yet.
+    change_sets_waiting: AtomicBool,
+    /// Woken when the change-set service records a version.
+    change_sets_wake: Arc<tokio::sync::Notify>,
+    /// Whether the last pass over the change-set store stopped short, so a failure that persists is
+    /// reported once rather than at every pass.
+    change_sets_failing: AtomicBool,
+    /// The task that reads the change-set store, ended with the module.
+    change_sets_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// How many passes over the change-set store have finished.
+    #[cfg(any(test, feature = "testing"))]
+    change_sets_passes: tokio::sync::watch::Sender<u64>,
     /// How many passes over the workflow journal have finished, which a test reads to see that an
     /// idle journal costs none.
     #[cfg(test)]
@@ -753,6 +816,14 @@ impl Drop for AttentionModule {
     fn drop(&mut self) {
         let task = self
             .automation_task
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(task) = task {
+            task.abort();
+        }
+        let task = self
+            .change_sets_task
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
@@ -847,6 +918,15 @@ impl AttentionModule {
             descriptions: std::sync::OnceLock::new(),
             automation_failing: AtomicBool::new(false),
             automation_task: std::sync::Mutex::new(None),
+            change_sets: std::sync::Mutex::new(change_sets::ChangeSetPass::default()),
+            change_sets_started: std::sync::OnceLock::new(),
+            change_sets_pass: tokio::sync::Mutex::new(()),
+            change_sets_waiting: AtomicBool::new(false),
+            change_sets_wake: Arc::new(tokio::sync::Notify::new()),
+            change_sets_failing: AtomicBool::new(false),
+            change_sets_task: std::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "testing"))]
+            change_sets_passes: tokio::sync::watch::channel(0).0,
             #[cfg(test)]
             automation_passes: AtomicU64::new(0),
             #[cfg(feature = "testing")]
@@ -1315,7 +1395,11 @@ impl AttentionModule {
         records: &[EventCursor],
     ) -> (Vec<Option<String>>, Ticket) {
         let indexed: Vec<(usize, EventCursor)> = records.iter().copied().enumerate().collect();
-        let (texts, ticket, _) = self.texts(reach, &indexed).await;
+        let Texts {
+            served: texts,
+            ticket,
+            ..
+        } = self.texts(reach, &indexed, &BTreeSet::new()).await;
         let mut ordered = vec![None; records.len()];
         for (index, text) in texts {
             if let Some(slot) = ordered.get_mut(index) {
@@ -1370,7 +1454,11 @@ impl AttentionModule {
                 .map_err(refusal)?;
                 let mut result = page.result;
                 let withheld = encode(&result)?;
-                let (texts, ticket, _) = self.texts(reach, &page.texts).await;
+                let Texts {
+                    served: texts,
+                    ticket,
+                    ..
+                } = self.texts(reach, &page.texts, &BTreeSet::new()).await;
                 for (index, text) in texts {
                     if let Some(item) = result.items.get_mut(index) {
                         item.summary = Nullable(text);
@@ -1455,7 +1543,12 @@ impl AttentionModule {
                 self.after_page.wait();
                 let mut result = page.result;
                 let withheld = encode(&result)?;
-                let (texts, mut ticket, _) = self.texts(reach, &page.texts).await;
+                let Texts {
+                    served: texts,
+                    mut ticket,
+                    silent,
+                    ..
+                } = self.texts(reach, &page.texts, &BTreeSet::new()).await;
                 for (index, text) in texts {
                     if let Some(change) = result.changes.get_mut(index) {
                         change.summary = Nullable(text);
@@ -1465,11 +1558,12 @@ impl AttentionModule {
                 // text carries no summary: one is generated text, written from it. It is released
                 // only while the privacy state it was read under holds.
                 if let Some(source) = &source
-                    && let Some((summary, generated)) =
-                        self.summary(reach, caller, params.session_id, source).await
+                    && let Some((summary, generated)) = self
+                        .summary(reach, caller, params.session_id, source, &silent)
+                        .await
                 {
                     result.summary = Nullable::some(summary);
-                    ticket.generated = Some(generated);
+                    ticket.generated.push(generated);
                 }
                 Ok(Read::with(encode(&result)?, withheld, ticket))
             }
@@ -1497,6 +1591,7 @@ impl AttentionModule {
         caller: &Caller,
         session_id: SessionId,
         source: &kr_attention::visit::SummarySource,
+        silent: &BTreeSet<SessionId>,
     ) -> Option<(ChangeSummary, Generated)> {
         let (Some(descriptions), Some(privacy)) = (
             self.descriptions.get().map(Arc::clone),
@@ -1528,7 +1623,7 @@ impl AttentionModule {
             }
         };
         if reading.wanted {
-            self.ask_for_summary(reach, &descriptions, session_id, source)
+            self.ask_for_summary(reach, &descriptions, session_id, source, silent)
                 .await;
         }
         reading.served.map(|record| {
@@ -1552,16 +1647,18 @@ impl AttentionModule {
     /// carried to the host is the generation that text was decided under: a host that finds
     /// privacy mode has moved since refuses the request. Nothing here is released to anybody.
     ///
-    /// Nothing is asked while the text of a closed session's change is held back for now (see
-    /// [`Self::texts`]): text that no owner will ever serve leaves the change without it, but text
-    /// that a later look can read is waited for. A live worker that does not answer in time is not
-    /// held back.
+    /// Nothing is asked while the text of a change is absent for now (see [`Self::texts`]): text
+    /// that no owner will ever serve leaves the change without it, but text that a later look can
+    /// read is waited for. `silent` names the sessions whose live worker gave no usable answer to
+    /// the read this belongs to (no answer, a link that ended, or a refusal the next request may
+    /// cure), which are not asked again.
     async fn ask_for_summary(
         &self,
         reach: &dyn Reach,
         descriptions: &crate::describe::DescribeModule,
         session_id: SessionId,
         source: &kr_attention::visit::SummarySource,
+        silent: &BTreeSet<SessionId>,
     ) {
         let newest = newest_changes(source);
         let records: Vec<(usize, EventCursor)> = newest
@@ -1569,9 +1666,14 @@ impl AttentionModule {
             .enumerate()
             .filter_map(|(index, change)| change.text.record().map(|record| (index, record)))
             .collect();
-        let (texts, ticket, held_back) = self.texts(reach, &records).await;
-        // A summary written without text that is only held back for now would reach the head and
-        // be served as that interval's summary from then on. The next read asks again.
+        let Texts {
+            served: texts,
+            ticket,
+            held_back,
+            ..
+        } = self.texts(reach, &records, silent).await;
+        // A summary written without text that is only absent for now would reach the head and be
+        // served as that interval's summary from then on. The next read asks again.
         if held_back {
             return;
         }
@@ -1623,13 +1725,25 @@ impl AttentionModule {
     /// Reads the text of each record a page names, from the record's owner, as it serves now.
     ///
     /// A live session's worker answers over its link and a closed session's journal is read; a
-    /// session that is neither, or whose owner does not answer in time, serves none. Each request
-    /// names at most as many records as a text request carries.
+    /// session that is neither, or whose owner does not answer in time, serves none. So does a
+    /// closed session while privacy mode is on or its cleanup of the session is owed. Each request
+    /// names at most as many records as a text request carries. A worker `silent` in the read this
+    /// belongs to is not asked again.
     ///
-    /// The last of the three answers says whether the text of a closed session is held back for
-    /// now rather than absent: its journal cannot be brought forward yet. A session closed over a
-    /// worker this host could not account for, a journal that cannot be read, a session that serves
-    /// no text and a live worker that does not answer are not held back.
+    /// A closed session whose journal fails to migrate is absent for now only while the store still
+    /// tries it ([`Self::finish`]); once the session is finished with gaps it reads as a journal that
+    /// cannot be read.
+    ///
+    /// The result says whether any text is absent for now rather than for good, which is when a
+    /// summary written without it would stand for the interval from then on. Text is absent for now
+    /// when a closed session's journal cannot be brought forward yet; when privacy mode is on or its
+    /// cleanup of a closed session is owed; when a live worker gives no answer in time, its link
+    /// ends first, or it refuses in a way the next request may cure (its own journal could not be
+    /// read); when a link no longer speaks for its session; and when a session the store follows (a
+    /// worker it keeps a link for, or a closure it has begun) has no owner at this moment. It is
+    /// not absent for now when the session was closed over a worker this host could not account for,
+    /// when a journal cannot be read, when a worker refuses in a way that repeats, and when the store
+    /// follows no worker or closure of the session.
     ///
     /// What was read is looked at again once every owner has answered, under the same lock a
     /// closure is recorded under: a session found closed over a worker this host could not account
@@ -1638,12 +1752,13 @@ impl AttentionModule {
     ///
     /// Each live answer that carries text adds its generation and lease end to the ticket its
     /// release is bound by, and keeps it after its session closes; text read from a finished
-    /// session's journal needs none.
+    /// session's journal carries a stamp of the privacy state it was read under instead.
     async fn texts(
         &self,
         reach: &dyn Reach,
         records: &[(usize, EventCursor)],
-    ) -> (Vec<(usize, Option<String>)>, Ticket, bool) {
+        silent: &BTreeSet<SessionId>,
+    ) -> Texts {
         let mut by_session: BTreeMap<SessionId, Vec<(usize, EventCursor)>> = BTreeMap::new();
         for (index, record) in records {
             // What an approval asks is the application's to show: a broker transition has no text
@@ -1659,16 +1774,47 @@ impl AttentionModule {
             }
         }
         let batch = usize::try_from(MAX_ATTENTION_TEXT_RECORDS).unwrap_or(usize::MAX);
+        // The privacy state a closed session's journal is read under, taken before any of them is
+        // read and without waiting, since this runs on the runtime: a change of privacy mode that
+        // is being made, or is private already, leaves none of them read. A journal carries the
+        // state only once the archive has written it there.
+        let journals = self.privacy.get().map(|state| {
+            let decided = state.try_reading().map(|reading| reading.published());
+            (state.clone(), decided)
+        });
+        let journals_open = journals
+            .as_ref()
+            .is_none_or(|(_, decided)| decided.is_some_and(|decided| !decided.private));
         // Every live session is asked at once, so a read waits for the slowest worker rather than
         // for each in turn.
         let mut read = Vec::new();
         let mut journals_held_back = BTreeSet::new();
         for (session_id, wanted) in by_session {
-            let owner = self.text_owner(session_id);
+            let mut owner = self.text_owner(session_id);
+            // A closed session's text is served only while privacy mode is off and the cleanup it
+            // owed, which writes that state into its journal, is done. It is held back for now and
+            // not absent: a summary is not written from it until it can be read.
+            if matches!(owner, TextOwner::Journal)
+                && (!journals_open || reach.cleanup_owed(session_id).await)
+            {
+                owner = TextOwner::Nobody;
+                journals_held_back.insert(session_id);
+            }
             let journal = if matches!(owner, TextOwner::Journal) {
                 let closed = reach.closed_journal(session_id);
-                if matches!(closed, ClosedJournal::HeldBack) {
-                    journals_held_back.insert(session_id);
+                match &closed {
+                    ClosedJournal::HeldBack => {
+                        journals_held_back.insert(session_id);
+                    }
+                    // Only while the store is still trying it: a session finished with gaps
+                    // because its migration kept failing no longer holds a summary back.
+                    ClosedJournal::Failing => {
+                        if self.origins().closing.contains(&session_id) {
+                            journals_held_back.insert(session_id);
+                        }
+                    }
+                    ClosedJournal::Open(_) => self.lift_the_wait(session_id),
+                    ClosedJournal::Unreadable => {}
                 }
                 closed.open()
             } else {
@@ -1691,6 +1837,11 @@ impl AttentionModule {
                     recorded_generation: Nullable(recorded.map(U64::new)),
                 };
                 let answer = match &owner {
+                    // A worker already found silent in this read is not made to be waited for
+                    // again.
+                    TextOwner::Link(_) if silent.contains(&session_id) => {
+                        TextAnswer::Live(Live::Unanswered)
+                    }
                     TextOwner::Link(link) => {
                         let link = Arc::clone(link);
                         TextAnswer::Asked(tokio::spawn(async move {
@@ -1699,16 +1850,27 @@ impl AttentionModule {
                                 .ask(ControlFrame::AttentionText(request), request_id, TEXT_WAIT)
                                 .await
                             {
-                                Some(ControlFrame::AttentionTextAnswer(answer)) => Some(Leased {
-                                    generation: answer.privacy_generation.0.map(U64::get),
-                                    release_until: answer.release_until_boot_ms.get(),
-                                    texts: answer
-                                        .texts
-                                        .into_iter()
-                                        .map(|text| text.text.0)
-                                        .collect(),
-                                }),
-                                _ => None,
+                                Some(ControlFrame::AttentionTextAnswer(answer)) => {
+                                    Live::Text(Leased {
+                                        generation: answer.privacy_generation.0.map(U64::get),
+                                        release_until: answer.release_until_boot_ms.get(),
+                                        texts: answer
+                                            .texts
+                                            .into_iter()
+                                            .map(|text| text.text.0)
+                                            .collect(),
+                                    })
+                                }
+                                // The worker could not read its journal: the next request may.
+                                Some(ControlFrame::Response(Response {
+                                    outcome: Outcome::Error(error),
+                                    ..
+                                })) if error.code == ErrorCode::StorageUnavailable => {
+                                    Live::Unanswered
+                                }
+                                // Any other refusal repeats, and the text will not come.
+                                Some(_) => Live::Refused,
+                                None => Live::Unanswered,
                             }
                         }))
                     }
@@ -1726,17 +1888,20 @@ impl AttentionModule {
         }
         let mut answered = Vec::with_capacity(read.len());
         for (session_id, owner, wanted, answer) in read {
-            let (texts, lease) = match answer {
-                TextAnswer::Asked(asking) => match asking.await.ok().flatten() {
-                    Some(leased) => (
-                        Some(leased.texts),
-                        Some((leased.generation, leased.release_until)),
-                    ),
-                    None => (None, None),
+            let Settled {
+                texts,
+                lease,
+                unanswered,
+            } = match answer {
+                TextAnswer::Asked(asking) => asking.await.unwrap_or(Live::Unanswered).settle(),
+                TextAnswer::Live(live) => live.settle(),
+                TextAnswer::Read(texts) => Settled {
+                    texts,
+                    lease: None,
+                    unanswered: false,
                 },
-                TextAnswer::Read(texts) => (texts, None),
             };
-            answered.push((session_id, owner, wanted, texts, lease));
+            answered.push((session_id, owner, wanted, texts, lease, unanswered));
         }
         let finalised: BTreeSet<SessionId> = self
             .store()
@@ -1755,7 +1920,8 @@ impl AttentionModule {
         let mut served = Vec::new();
         let mut ticket = Ticket::default();
         let mut held_back = false;
-        for (session_id, owner, wanted, texts, lease) in answered {
+        let mut silent = BTreeSet::new();
+        for (session_id, owner, wanted, texts, lease, unanswered) in answered {
             let unaccounted = origins.unaccounted.contains(&session_id);
             let still = !unaccounted
                 && match &owner {
@@ -1771,7 +1937,36 @@ impl AttentionModule {
                     TextOwner::Nobody => false,
                 };
             let texts = texts.filter(|_| still);
-            held_back |= !unaccounted && journals_held_back.contains(&session_id);
+            // Text read from a journal is held to the state it was read under, as a model's is.
+            if matches!(owner, TextOwner::Journal)
+                && texts
+                    .as_ref()
+                    .is_some_and(|texts| texts.iter().any(Option::is_some))
+                && let Some((state, Some(decided))) = &journals
+            {
+                ticket
+                    .generated
+                    .push(Generated::read_under(state.clone(), *decided));
+            }
+            if unanswered {
+                silent.insert(session_id);
+            }
+            // The text is absent for now where a later look may serve it: the journal is held
+            // back or privacy mode holds its text, the worker did not answer, the link no longer
+            // speaks for the session, or the store follows a worker or a closure of the session
+            // and none owns it at this moment.
+            // A session closed over an unaccounted worker is never served, and one the store
+            // follows nothing of has no owner to wait for.
+            let replaced = matches!(owner, TextOwner::Link(_)) && !still;
+            let between_owners = matches!(owner, TextOwner::Nobody)
+                && (origins.ended.contains(&session_id)
+                    || origins.watched.contains(&session_id)
+                    || origins.workers.contains_key(&session_id));
+            held_back |= !unaccounted
+                && (journals_held_back.contains(&session_id)
+                    || unanswered
+                    || replaced
+                    || between_owners);
             if let (Some(texts), Some((generation, release_until))) = (&texts, lease)
                 && texts.iter().any(Option::is_some)
             {
@@ -1783,7 +1978,12 @@ impl AttentionModule {
             }
             served.extend(serve(&wanted, texts));
         }
-        (served, ticket, held_back)
+        Texts {
+            served,
+            ticket,
+            held_back,
+            silent,
+        }
     }
 
     /// Returns the privacy generation this daemon has recorded for a session.
@@ -2621,7 +2821,9 @@ impl AttentionModule {
     /// Finishes a closed session as far as the store can now, and keeps it for the next pass when
     /// it cannot. A session whose journal is held back waits longer after each try that finds it
     /// so, up to [`CLOSURE_RETRY_MAX`]; while it waits its items are held back as they are while
-    /// its closure is under way.
+    /// its closure is under way. One whose journal fails to migrate waits the same way, and is
+    /// finished with gaps, as for a journal that cannot be read, when [`FAILED_MIGRATION_TRIES`]
+    /// tries have found it so.
     fn finish(&self, reach: &dyn Reach, session_id: SessionId, unaccounted: bool, now_ms: u64) {
         if self.finalised(session_id) {
             let mut origins = self.origins();
@@ -2629,11 +2831,17 @@ impl AttentionModule {
             origins.ended.remove(&session_id);
             origins.unfinished.remove(&session_id);
             origins.held_back.remove(&session_id);
+            origins.lifted.remove(&session_id);
             return;
         }
         // Taken out here and put back only by a try that finds the journal held back again, so a
-        // session whose hold has lifted keeps no wait.
-        let earlier = self.origins().held_back.remove(&session_id);
+        // session whose hold has lifted keeps no wait. A read that opens the journal after this
+        // point lifts the hold too, and is told of by `lifted`.
+        let earlier = {
+            let mut origins = self.origins();
+            origins.lifted.remove(&session_id);
+            origins.held_back.remove(&session_id)
+        };
         let finished = if unaccounted {
             // Marked first, so no text is served for the session from here on.
             self.origins().unaccounted.insert(session_id);
@@ -2645,6 +2853,7 @@ impl AttentionModule {
             let read = match reach.closed_journal(session_id) {
                 ClosedJournal::Open(journal) => self.read_to_the_end(session_id, &journal),
                 ClosedJournal::HeldBack => Err(Unfinished::HeldBack),
+                ClosedJournal::Failing => Err(Unfinished::Failing),
                 ClosedJournal::Unreadable => Err(Unfinished::Journal),
             };
             match read {
@@ -2653,21 +2862,62 @@ impl AttentionModule {
                     .gaps_without_end(session_id)
                     .and_then(|()| self.finalise(session_id)),
                 Err(Unfinished::Store(error)) => Err(error),
-                Err(Unfinished::HeldBack) => {
+                Err(waiting @ (Unfinished::HeldBack | Unfinished::Failing)) => {
+                    let failed = matches!(waiting, Unfinished::Failing);
+                    let failures = earlier
+                        .map_or(0, |held| held.failures)
+                        .saturating_add(u32::from(failed));
                     let mut origins = self.origins();
-                    let holds = earlier.map_or(0, |held| held.holds).saturating_add(1);
-                    let wait = u64::try_from(held_back_wait(holds).as_millis()).unwrap_or(u64::MAX);
-                    origins.held_back.insert(
-                        session_id,
-                        Held {
-                            holds,
-                            not_before_ms: now_ms.saturating_add(wait),
-                        },
-                    );
-                    Err(ProtocolError::new(
-                        ErrorCode::StorageUnavailable,
-                        "a closed session's journal cannot be brought forward yet",
-                    ))
+                    let lifted = origins.lifted.remove(&session_id);
+                    if !lifted && failed && failures >= FAILED_MIGRATION_TRIES {
+                        // The migration failed on every try the store makes, so the journal is
+                        // taken for one that cannot be read.
+                        drop(origins);
+                        let finished = self
+                            .gaps_without_end(session_id)
+                            .and_then(|()| self.finalise(session_id));
+                        if finished.is_err() {
+                            // The store could not take the gaps: the tries are used up all the
+                            // same, and the next look ends it as soon as it finds the migration
+                            // failing, with no new set of tries.
+                            let holds = earlier.map_or(0, |held| held.holds).saturating_add(1);
+                            self.origins().held_back.insert(
+                                session_id,
+                                Held {
+                                    holds,
+                                    failures,
+                                    not_before_ms: now_ms.saturating_add(
+                                        u64::try_from(CLOSURE_RETRY.as_millis())
+                                            .unwrap_or(u64::MAX),
+                                    ),
+                                },
+                            );
+                        }
+                        finished
+                    } else {
+                        if lifted {
+                            // A read opened the journal while this try was finding it held back:
+                            // the hold is over, and a wait put back now would outlast it. The
+                            // session is due at once, and the loop is woken for it.
+                            self.wake.notify_one();
+                        } else {
+                            let holds = earlier.map_or(0, |held| held.holds).saturating_add(1);
+                            let wait = u64::try_from(held_back_wait(holds).as_millis())
+                                .unwrap_or(u64::MAX);
+                            origins.held_back.insert(
+                                session_id,
+                                Held {
+                                    holds,
+                                    failures,
+                                    not_before_ms: now_ms.saturating_add(wait),
+                                },
+                            );
+                        }
+                        Err(ProtocolError::new(
+                            ErrorCode::StorageUnavailable,
+                            "a closed session's journal cannot be brought forward yet",
+                        ))
+                    }
                 }
             }
         };
@@ -2677,6 +2927,7 @@ impl AttentionModule {
                 origins.unfinished.remove(&session_id);
                 origins.closing.remove(&session_id);
                 origins.ended.remove(&session_id);
+                origins.lifted.remove(&session_id);
                 true
             } else {
                 // A session newly left unfinished wakes the loop that retries it. One that failed
@@ -2686,6 +2937,25 @@ impl AttentionModule {
             }
         };
         if changed {
+            self.wake.notify_one();
+        }
+    }
+
+    /// Ends the wait of a closing session whose journal a read has just opened, and wakes the
+    /// loop that tries it again, so the session is finished by the next pass and not at the end of
+    /// a wait that outlasted its hold. A session that is not closing has no wait.
+    fn lift_the_wait(&self, session_id: SessionId) {
+        let lifted = {
+            let mut origins = self.origins();
+            if origins.closing.contains(&session_id) {
+                origins.held_back.remove(&session_id);
+                origins.lifted.insert(session_id);
+                true
+            } else {
+                false
+            }
+        };
+        if lifted {
             self.wake.notify_one();
         }
     }
@@ -3274,6 +3544,9 @@ enum Unfinished {
     /// The journal is of an earlier schema and cannot be brought forward yet: the session is tried
     /// again after a wait that grows with each try.
     HeldBack,
+    /// The journal is of an earlier schema and bringing it forward failed: the session is tried
+    /// again in the same way, a bounded number of times.
+    Failing,
 }
 
 // ----- The link --------------------------------------------------------------------------------
@@ -3292,9 +3565,68 @@ enum TextOwner {
 /// One text request's answer, as it is being read.
 enum TextAnswer {
     /// Asked of a live worker, on a task of its own.
-    Asked(tokio::task::JoinHandle<Option<Leased>>),
+    Asked(tokio::task::JoinHandle<Live>),
+    /// What a live worker's answer already is, without asking.
+    Live(Live),
     /// Read already, from a finished session's journal.
     Read(Option<Vec<Option<String>>>),
+}
+
+/// What a live worker answered to a request for text.
+enum Live {
+    /// Its text, with what the release of it is bound by.
+    Text(Leased),
+    /// A refusal that repeats: the text will not come from this worker.
+    Refused,
+    /// No answer in time, the link ending first, or a refusal the next request may cure: the text
+    /// may come.
+    Unanswered,
+}
+
+/// What a live worker's answer comes to for the text it is read for.
+struct Settled {
+    /// The texts it served.
+    texts: Option<Vec<Option<String>>>,
+    /// The generation and lease end of the answer, where it carried text.
+    lease: Option<(Option<u64>, u64)>,
+    /// Whether the worker left the request unanswered.
+    unanswered: bool,
+}
+
+impl Live {
+    fn settle(self) -> Settled {
+        match self {
+            Self::Text(leased) => Settled {
+                texts: Some(leased.texts),
+                lease: Some((leased.generation, leased.release_until)),
+                unanswered: false,
+            },
+            Self::Refused => Settled {
+                texts: None,
+                lease: None,
+                unanswered: false,
+            },
+            Self::Unanswered => Settled {
+                texts: None,
+                lease: None,
+                unanswered: true,
+            },
+        }
+    }
+}
+
+/// What reading the text of some records came to.
+struct Texts {
+    /// Each record's text, where its owner served one.
+    served: Vec<(usize, Option<String>)>,
+    /// What the release of the live answers is bound by.
+    ticket: Ticket,
+    /// Whether some text is absent for now rather than for good, so that a summary written
+    /// without it would stand for its interval from then on.
+    held_back: bool,
+    /// The sessions whose live worker gave no usable answer: none in time, the link ending first,
+    /// or a refusal the next request may cure.
+    silent: BTreeSet<SessionId>,
 }
 
 /// A live worker's text answer: the texts, and what their release is bound by.
@@ -4277,7 +4609,7 @@ pub(crate) mod tests {
         };
         let ticket = |entries: Vec<TicketEntry>| Ticket {
             entries,
-            generated: None,
+            generated: Vec::new(),
         };
         let named = |generation: u64| Some(kr_worker::privacy::PrivacyGeneration::new(generation));
         assert_eq!(ticket(Vec::new()).generation_of(session), Ok(None));
@@ -4328,6 +4660,13 @@ pub(crate) mod tests {
             Box::pin(async move { unaccounted })
         }
 
+        fn cleanup_owed<'a>(
+            &'a self,
+            _session_id: SessionId,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+            Box::pin(async { false })
+        }
+
         fn closed_journal(&self, _session_id: SessionId) -> ClosedJournal {
             ClosedJournal::Unreadable
         }
@@ -4359,6 +4698,13 @@ pub(crate) mod tests {
         }
 
         fn unaccounted<'a>(
+            &'a self,
+            _session_id: SessionId,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+            Box::pin(async { false })
+        }
+
+        fn cleanup_owed<'a>(
             &'a self,
             _session_id: SessionId,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
@@ -4458,6 +4804,7 @@ pub(crate) mod tests {
         let held = HeldBack::default();
         let readable = Readable {
             path: temp.environment().state_dir().join("closed.sqlite3"),
+            owed: false,
         };
         let session_id = SessionId::new(kr_ipc::new_uuid());
         let seconds = |seconds: u64| seconds * 1_000;
@@ -4489,6 +4836,415 @@ pub(crate) mod tests {
             module.closure_retry_wait(seconds(115)),
             MAINTENANCE,
             "so the loop has nothing of it to wake for"
+        );
+    }
+
+    /// A text read that opens the journal of a closing session whose journal was held back ends
+    /// the session's wait and wakes the loop that tries it again, so the next pass finishes the
+    /// session and its items are no longer held for the rest of a wait that outlasted the hold.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_text_read_that_opens_a_held_journal_ends_the_sessions_wait() {
+        let world = Summarised::start();
+        world.record_commands(&[1_000, 1_010], true);
+        let held = HeldBack::default();
+        let readable = Readable {
+            path: world.temp.environment().state_dir().join("closed.sqlite3"),
+            owed: false,
+        };
+        let seconds = |seconds: u64| seconds * 1_000;
+
+        world
+            .module
+            .session_closed_at(&held, world.session_id, seconds(100))
+            .await;
+        world.module.finish_again_at(&held, seconds(105)).await;
+        assert!(
+            world
+                .module
+                .origins()
+                .held_back
+                .contains_key(&world.session_id),
+            "two tries found it held back, so the next is due ten seconds on"
+        );
+        // Whatever woke the loop before is not the wake the read gives.
+        let _ = tokio::time::timeout(Duration::ZERO, world.module.wake.notified()).await;
+
+        world
+            .changed_through(&readable, &owner(), &Caller::Owner)
+            .await;
+        assert!(
+            world.module.origins().held_back.is_empty(),
+            "the read found the journal open, so the session waits no longer"
+        );
+        assert!(
+            tokio::time::timeout(Duration::ZERO, world.module.wake.notified())
+                .await
+                .is_ok(),
+            "and the loop that tries it again was woken"
+        );
+
+        world.module.finish_again_at(&readable, seconds(106)).await;
+        assert!(
+            world.module.finalised(world.session_id),
+            "so the next pass finishes it, before the wait it had would have ended"
+        );
+    }
+
+    /// A reach whose closed journal is held back for the try that is looking at it, and which a
+    /// text read opens in that moment.
+    struct OpenedByAReadMeanwhile {
+        module: Arc<AttentionModule>,
+    }
+
+    impl Reach for OpenedByAReadMeanwhile {
+        fn connect<'a>(
+            &'a self,
+            _worker: &'a KnownWorker,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<BoundLink>> + Send + 'a>>
+        {
+            Box::pin(async { Err(ControllerError::supervision("this test connects nothing")) })
+        }
+
+        fn unaccounted<'a>(
+            &'a self,
+            _session_id: SessionId,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+            Box::pin(async { false })
+        }
+
+        fn cleanup_owed<'a>(
+            &'a self,
+            _session_id: SessionId,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+            Box::pin(async { false })
+        }
+
+        fn closed_journal(&self, session_id: SessionId) -> ClosedJournal {
+            self.module.lift_the_wait(session_id);
+            ClosedJournal::HeldBack
+        }
+
+        fn output_floor(&self, _session_id: SessionId) -> Option<u64> {
+            None
+        }
+    }
+
+    /// A try that has found a journal held back does not put a wait back when a read opened the
+    /// journal while it was looking: the hold it found is over.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_try_does_not_put_back_a_wait_a_read_has_ended() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = module(&temp);
+        let reach = OpenedByAReadMeanwhile {
+            module: Arc::clone(&module),
+        };
+        let readable = Readable {
+            path: temp.environment().state_dir().join("closed.sqlite3"),
+            owed: false,
+        };
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let seconds = |seconds: u64| seconds * 1_000;
+
+        module
+            .session_closed_at(&reach, session_id, seconds(100))
+            .await;
+        assert!(
+            module.origins().held_back.is_empty(),
+            "the try found the journal held back and a read opened it meanwhile: no wait"
+        );
+        assert!(
+            module.origins().unfinished.contains(&session_id),
+            "the session is still to be finished"
+        );
+
+        module.finish_again_at(&readable, seconds(100)).await;
+        assert!(
+            module.finalised(session_id),
+            "and it is due at once, not after a wait"
+        );
+    }
+
+    /// How a scripted reach answers one look at a closed session's journal.
+    #[derive(Clone, Copy)]
+    enum Look {
+        /// A worker may still own it.
+        Held,
+        /// Its migration was made and failed.
+        Fails,
+        /// It can be read, from the journal the reach was given.
+        Reads,
+    }
+
+    /// A reach whose closed journal answers each look as the script says, and then as its last
+    /// answer said, and which counts the looks.
+    struct Scripted {
+        script: std::sync::Mutex<std::collections::VecDeque<Look>>,
+        last: std::sync::Mutex<Look>,
+        looks: std::sync::atomic::AtomicUsize,
+        journal: Option<std::path::PathBuf>,
+    }
+
+    impl Scripted {
+        fn new(script: impl IntoIterator<Item = Look>) -> Self {
+            let script: std::collections::VecDeque<Look> = script.into_iter().collect();
+            let last = script.back().copied().unwrap_or(Look::Held);
+            Self {
+                script: std::sync::Mutex::new(script),
+                last: std::sync::Mutex::new(last),
+                looks: std::sync::atomic::AtomicUsize::new(0),
+                journal: None,
+            }
+        }
+
+        /// The journal a look that finds it readable opens.
+        fn reading(mut self, journal: std::path::PathBuf) -> Self {
+            self.journal = Some(journal);
+            self
+        }
+
+        fn looks(&self) -> usize {
+            self.looks.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Reach for Scripted {
+        fn connect<'a>(
+            &'a self,
+            _worker: &'a KnownWorker,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<BoundLink>> + Send + 'a>>
+        {
+            Box::pin(async { Err(ControllerError::supervision("this test connects nothing")) })
+        }
+
+        fn unaccounted<'a>(
+            &'a self,
+            _session_id: SessionId,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+            Box::pin(async { false })
+        }
+
+        fn cleanup_owed<'a>(
+            &'a self,
+            _session_id: SessionId,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+            Box::pin(async { false })
+        }
+
+        fn closed_journal(&self, _session_id: SessionId) -> ClosedJournal {
+            self.looks.fetch_add(1, Ordering::SeqCst);
+            let next = self
+                .script
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front();
+            let look = next.unwrap_or_else(|| {
+                *self
+                    .last
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            });
+            match look {
+                Look::Held => ClosedJournal::HeldBack,
+                Look::Fails => ClosedJournal::Failing,
+                Look::Reads => ClosedJournal::Open(Box::new(
+                    kr_worker::journal::Journal::open(
+                        self.journal.as_ref().expect("a journal to read"),
+                    )
+                    .expect("the journal opens"),
+                )),
+            }
+        }
+
+        fn output_floor(&self, _session_id: SessionId) -> Option<u64> {
+            None
+        }
+    }
+
+    /// Looks at `session_id` through `reach` each time it is due, on the clock `now` the case
+    /// keeps, until it is finished or `looks` have been made through `reach` in all.
+    async fn tried_until(
+        module: &AttentionModule,
+        reach: &Scripted,
+        session_id: SessionId,
+        now: &mut u64,
+        looks: usize,
+    ) {
+        while reach.looks() < looks && !module.finalised(session_id) {
+            *now += u64::try_from(module.closure_retry_wait(*now).as_millis()).unwrap_or(u64::MAX);
+            module.finish_again_at(reach, *now).await;
+        }
+    }
+
+    /// A journal whose migration keeps failing is tried again, the session staying closing and its
+    /// items held, and after the tries the store makes it is finished with gaps, as a journal that
+    /// cannot be read is. A try that finds it held back for another reason is not one of them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_journal_whose_migration_keeps_failing_is_tried_a_bounded_number_of_times() {
+        let tries = usize::try_from(FAILED_MIGRATION_TRIES).expect("a small count");
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = module(&temp);
+        let reach = Scripted::new([Look::Fails]);
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let mut now = 100_000_u64;
+
+        module.session_closed_at(&reach, session_id, now).await;
+        tried_until(&module, &reach, session_id, &mut now, tries - 1).await;
+        assert_eq!(reach.looks(), tries - 1);
+        assert!(
+            !module.finalised(session_id) && module.origins().closing.contains(&session_id),
+            "a journal that failed to migrate is tried again, not finished with gaps"
+        );
+        tried_until(&module, &reach, session_id, &mut now, tries).await;
+        assert_eq!(reach.looks(), tries, "the last try the store makes");
+        assert!(
+            module.finalised(session_id) && !module.origins().closing.contains(&session_id),
+            "and a migration that failed every time is taken for a journal that cannot be read"
+        );
+
+        // Held back for a worker, again and again, and then failing: only the failures count.
+        let held_then_failing = Scripted::new(
+            std::iter::repeat_n(Look::Held, 3 * tries)
+                .chain(std::iter::repeat_n(Look::Fails, tries)),
+        );
+        let other = SessionId::new(kr_ipc::new_uuid());
+        module
+            .session_closed_at(&held_then_failing, other, now)
+            .await;
+        tried_until(&module, &held_then_failing, other, &mut now, 4 * tries - 1).await;
+        assert_eq!(held_then_failing.looks(), 4 * tries - 1);
+        assert!(
+            !module.finalised(other),
+            "holds for a worker do not use up the tries a failing migration has"
+        );
+        tried_until(&module, &held_then_failing, other, &mut now, 4 * tries).await;
+        assert!(module.finalised(other), "and the tenth failure ends it");
+    }
+
+    /// How many gaps with no known end the store holds for a session.
+    fn gaps_of(module: &AttentionModule, session_id: SessionId) -> usize {
+        module
+            .store()
+            .expect("the store")
+            .engine()
+            .expect("the engine")
+            .gaps()
+            .iter()
+            .filter(|gap| gap.session_id.0 == Some(session_id) && gap.to_sequence.0.is_none())
+            .count()
+    }
+
+    /// The migration that failed nine times and then can be made is a journal that is read, not one
+    /// that is given up: the session is finished from its journal and no gap is recorded. One that
+    /// fails the tenth time too is finished with gaps. The tries are the same for both.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_migration_that_succeeds_on_the_last_try_is_read_and_not_given_up() {
+        let tries = usize::try_from(FAILED_MIGRATION_TRIES).expect("a small count");
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = module(&temp);
+        let journal = temp.environment().state_dir().join("closed.sqlite3");
+        let reach = Scripted::new(std::iter::repeat_n(Look::Fails, tries - 1).chain([Look::Reads]))
+            .reading(journal);
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let mut now = 100_000_u64;
+
+        module.session_closed_at(&reach, session_id, now).await;
+        tried_until(&module, &reach, session_id, &mut now, tries).await;
+        assert_eq!(
+            reach.looks(),
+            tries,
+            "the tenth try is the one that can read it"
+        );
+        assert!(module.finalised(session_id));
+        assert_eq!(
+            gaps_of(&module, session_id),
+            0,
+            "it was read to its end, and not given up with gaps"
+        );
+    }
+
+    /// The tries are used up when the migration has failed the tenth time even if the store cannot
+    /// take the gaps that end the session just then: the next look that finds it failing ends it
+    /// with gaps, with no new set of tries.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_store_that_cannot_take_the_gaps_does_not_give_the_session_new_tries() {
+        let tries = usize::try_from(FAILED_MIGRATION_TRIES).expect("a small count");
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = module(&temp);
+        let reach = Scripted::new([Look::Fails]);
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let mut now = 100_000_u64;
+
+        module.session_closed_at(&reach, session_id, now).await;
+        tried_until(&module, &reach, session_id, &mut now, tries - 1).await;
+        assert_eq!(reach.looks(), tries - 1);
+
+        // The store fails for the tenth try: a thread that held its lock panicked.
+        let poisoning = Arc::clone(&module);
+        let _ = std::thread::spawn(move || {
+            let _held = poisoning.store.lock().expect("the store");
+            panic!("the store's holder failed");
+        })
+        .join();
+        now += u64::try_from(module.closure_retry_wait(now).as_millis()).unwrap_or(u64::MAX);
+        module.finish_again_at(&reach, now).await;
+        assert_eq!(reach.looks(), tries);
+        assert!(
+            module.origins().unfinished.contains(&session_id),
+            "the store could not take the gaps, so the session is still to be finished"
+        );
+
+        module.store.clear_poison();
+        now += u64::try_from(module.closure_retry_wait(now).as_millis()).unwrap_or(u64::MAX);
+        module.finish_again_at(&reach, now).await;
+        assert_eq!(reach.looks(), tries + 1);
+        assert!(
+            module.finalised(session_id),
+            "the next look ends it, and does not begin the tries again"
+        );
+        assert!(gaps_of(&module, session_id) > 0);
+    }
+
+    /// KR-REQ-18.02: a summary is not asked for while the store still tries a journal that fails to
+    /// migrate, and is once the session has been finished with gaps: the bound bounds the wait for
+    /// the text too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failing_migration_holds_a_summary_back_only_while_the_store_tries_it() {
+        let tries = usize::try_from(FAILED_MIGRATION_TRIES).expect("a small count");
+        let mut world = Summarised::start();
+        world.record_commands(&[1_000, 1_010], true);
+        let reach = Scripted::new([Look::Fails]);
+        let mut now = 100_000_u64;
+
+        world
+            .module
+            .session_closed_at(&reach, world.session_id, now)
+            .await;
+        world
+            .changed_through(&reach, &owner(), &Caller::Owner)
+            .await;
+        assert_eq!(
+            world.asked(),
+            Vec::new(),
+            "the store still tries the journal, so no summary is asked for"
+        );
+
+        tried_until(
+            &world.module,
+            &reach,
+            world.session_id,
+            &mut now,
+            usize::MAX,
+        )
+        .await;
+        assert!(world.module.finalised(world.session_id));
+        assert!(reach.looks() >= tries);
+        world
+            .changed_through(&reach, &owner(), &Caller::Owner)
+            .await;
+        assert_eq!(
+            world.asked().len(),
+            1,
+            "once the session is finished with gaps the text is not waited for"
         );
     }
 
@@ -4854,6 +5610,8 @@ pub(crate) mod tests {
     /// A reach whose closed journal can be read, as it can once nothing holds it back.
     struct Readable {
         path: std::path::PathBuf,
+        /// Whether privacy mode's cleanup of the session is owed.
+        owed: bool,
     }
 
     impl Reach for Readable {
@@ -4870,6 +5628,14 @@ pub(crate) mod tests {
             _session_id: SessionId,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
             Box::pin(async { false })
+        }
+
+        fn cleanup_owed<'a>(
+            &'a self,
+            _session_id: SessionId,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+            let owed = self.owed;
+            Box::pin(async move { owed })
         }
 
         fn closed_journal(&self, _session_id: SessionId) -> ClosedJournal {
@@ -4912,6 +5678,7 @@ pub(crate) mod tests {
 
         let readable = Readable {
             path: world.temp.environment().state_dir().join("closed.sqlite3"),
+            owed: false,
         };
         world
             .changed_through(&readable, &owner(), &Caller::Owner)
@@ -4932,6 +5699,193 @@ pub(crate) mod tests {
             1,
             "control: text that cannot be read at all does not hold a summary back"
         );
+    }
+
+    /// KR-REQ-18.02: a finished session's text is not served while privacy mode's cleanup of the
+    /// session is owed, and that is a hold for now: a summary written without the text would
+    /// reach the head and be served for the interval from then on, so none is asked for until the
+    /// cleanup is done. Nothing follows a worker or a closure of a finished session, so only the
+    /// cleanup holds its text back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_summary_is_not_asked_for_while_privacy_modes_cleanup_of_a_finished_session_is_owed()
+    {
+        let mut world = Summarised::start();
+        world.record_commands(&[1_000, 1_010], true);
+        let path = world.temp.environment().state_dir().join("closed.sqlite3");
+        let readable = |owed: bool| Readable {
+            path: path.clone(),
+            owed,
+        };
+
+        world
+            .module
+            .session_closed(&readable(false), world.session_id)
+            .await;
+        assert!(
+            world.module.finalised(world.session_id),
+            "the session is finished"
+        );
+        {
+            let origins = world.module.origins();
+            assert!(
+                !origins.ended.contains(&world.session_id)
+                    && !origins.watched.contains(&world.session_id)
+                    && !origins.workers.contains_key(&world.session_id),
+                "and the store follows no worker or closure of it"
+            );
+        }
+
+        world
+            .changed_through(&readable(true), &owner(), &Caller::Owner)
+            .await;
+        assert_eq!(
+            world.asked(),
+            Vec::new(),
+            "the cleanup is owed, so the text is held back and no summary is asked for"
+        );
+
+        world
+            .changed_through(&readable(false), &owner(), &Caller::Owner)
+            .await;
+        assert_eq!(
+            world.asked().len(),
+            1,
+            "once the cleanup is done, the text is read and a summary is asked for"
+        );
+    }
+
+    /// How the worker at the far end of a session's link treats the requests for text.
+    #[derive(Clone, Copy, Debug)]
+    enum Worker {
+        /// Answers each with the text of every record.
+        Answers,
+        /// Refuses each in a way the next request may cure: its own journal could not be read.
+        CannotReadItsJournal,
+        /// Refuses each in a way that repeats.
+        RefusesTheRequest,
+        /// Ends the link when the first request arrives, without answering it.
+        EndsTheLink,
+        /// Answers the first request, and is replaced as the session's worker while the second is
+        /// asked, which it answers too.
+        IsReplacedMeanwhile,
+    }
+
+    /// How many summaries are asked for the changes of a session with a live link, and how many
+    /// requests for text its worker is sent, when the worker treats the requests as `worker` says.
+    /// A read of what changed asks for the text of the page first and of the summary's interval
+    /// after it.
+    async fn summary_asked_of(worker: Worker) -> (usize, usize) {
+        let mut world = Summarised::start();
+        world.record_commands(&[1_000, 1_010], true);
+        let (_link, mut reader, mut writer) =
+            linked(&world.temp, 1, &world.module, world.session_id).await;
+        let module = Arc::clone(&world.module);
+        let session_id = world.session_id;
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&requests);
+        let playing = tokio::spawn(async move {
+            while let Ok(ControlFrame::AttentionText(request)) =
+                reader.read_message::<ControlFrame>().await
+            {
+                let asked = counted.fetch_add(1, Ordering::SeqCst) + 1;
+                let frame = match worker {
+                    Worker::EndsTheLink => return,
+                    Worker::CannotReadItsJournal => ControlFrame::Response(Response {
+                        request_id: request.request_id,
+                        outcome: Outcome::Error(ProtocolError::new(
+                            ErrorCode::StorageUnavailable,
+                            "the journal could not be read",
+                        )),
+                    }),
+                    Worker::RefusesTheRequest => ControlFrame::Response(Response {
+                        request_id: request.request_id,
+                        outcome: Outcome::Error(ProtocolError::new(
+                            ErrorCode::InvalidArgument,
+                            "ask for fewer records",
+                        )),
+                    }),
+                    Worker::Answers | Worker::IsReplacedMeanwhile => {
+                        if matches!(worker, Worker::IsReplacedMeanwhile) && asked == 2 {
+                            // What closing the session does to its link, as the answer is given.
+                            let mut origins = module.origins();
+                            origins.links.remove(&session_id);
+                            origins.ended.insert(session_id);
+                        }
+                        ControlFrame::AttentionTextAnswer(Box::new(AttentionTextAnswer {
+                            request_id: request.request_id,
+                            privacy_generation: Nullable::some(U64::ZERO),
+                            release_until_boot_ms: lease_from_now(),
+                            texts: request
+                                .records
+                                .iter()
+                                .map(|record| AttentionRecordText {
+                                    source: record.source,
+                                    sequence: record.sequence,
+                                    text: Nullable::some(format!(
+                                        "record {}",
+                                        record.sequence.get()
+                                    )),
+                                })
+                                .collect(),
+                        }))
+                    }
+                };
+                if writer.write_message(&frame).await.is_err() {
+                    return;
+                }
+            }
+        });
+        world
+            .changed_through(&Stub { unaccounted: false }, &owner(), &Caller::Owner)
+            .await;
+        playing.abort();
+        (world.asked().len(), requests.load(Ordering::SeqCst))
+    }
+
+    /// KR-REQ-18.02: a summary is written from the text of the changes it covers, and one written
+    /// without text that is only absent for now would reach the head and be served for the interval
+    /// from then on. So none is asked for while a live worker gives no answer, its link ends first,
+    /// it cannot read its journal, or it is replaced as the answer is given; the next read asks
+    /// again. A worker that answers, and one that refuses in a way that repeats, do not hold it back.
+    /// A worker that gave no answer to the page of changes is not asked again for the summary, so a
+    /// silent worker costs the read one wait.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_summary_is_not_asked_for_while_a_live_workers_text_is_missing_for_now() {
+        for (worker, summaries, requests) in [
+            (Worker::EndsTheLink, 0, 1),
+            (Worker::CannotReadItsJournal, 0, 1),
+            (Worker::IsReplacedMeanwhile, 0, 2),
+            (Worker::Answers, 1, 2),
+            (Worker::RefusesTheRequest, 1, 2),
+        ] {
+            assert_eq!(
+                summary_asked_of(worker).await,
+                (summaries, requests),
+                "a worker that {worker:?}"
+            );
+        }
+    }
+
+    /// KR-REQ-18.02: a session whose closure the store has begun and whose journal it has not yet
+    /// read has no owner for its text for a moment, and a summary written then would stand. A
+    /// session the store follows nothing of has no owner to wait for, so it holds nothing back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_summary_is_not_asked_for_while_a_closing_session_has_no_owner_for_its_text() {
+        for (followed, asked) in [(true, 0), (false, 1)] {
+            let mut world = Summarised::start();
+            world.record_commands(&[1_000, 1_010], true);
+            if followed {
+                world.module.origins().ended.insert(world.session_id);
+            }
+            world
+                .changed_through(&Stub { unaccounted: false }, &owner(), &Caller::Owner)
+                .await;
+            assert_eq!(
+                world.asked().len(),
+                asked,
+                "a session the store follows: {followed}"
+            );
+        }
     }
 
     /// The summary an answer to a read of what changed carries, when it carries one.
@@ -5402,7 +6356,11 @@ pub(crate) mod tests {
             .collect();
         let asking = {
             let module = Arc::clone(&module);
-            tokio::spawn(async move { module.texts(&Stub { unaccounted: false }, &records).await })
+            tokio::spawn(async move {
+                module
+                    .texts(&Stub { unaccounted: false }, &records, &BTreeSet::new())
+                    .await
+            })
         };
         let mut sizes = Vec::new();
         for _ in 0..2 {
@@ -5436,7 +6394,9 @@ pub(crate) mod tests {
         }
         sizes.sort_unstable();
         assert_eq!(sizes, vec![44, 256]);
-        let (mut served, ticket, _) = asking.await.expect("the texts are read");
+        let Texts {
+            mut served, ticket, ..
+        } = asking.await.expect("the texts are read");
         assert_eq!(
             ticket.entries.len(),
             2,
@@ -5486,7 +6446,7 @@ pub(crate) mod tests {
                     release_until: until,
                 })
                 .collect(),
-            generated: None,
+            generated: Vec::new(),
         }
     }
 
@@ -6431,6 +7391,13 @@ pub(crate) mod tests {
             _session_id: SessionId,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
             self.asked.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { false })
+        }
+
+        fn cleanup_owed<'a>(
+            &'a self,
+            _session_id: SessionId,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
             Box::pin(async { false })
         }
 
@@ -7816,6 +8783,13 @@ pub(crate) mod tests {
                 gate.notified().await;
                 false
             })
+        }
+
+        fn cleanup_owed<'a>(
+            &'a self,
+            _session_id: SessionId,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+            Box::pin(async { false })
         }
 
         fn closed_journal(&self, _session_id: SessionId) -> ClosedJournal {

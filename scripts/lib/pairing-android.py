@@ -747,6 +747,11 @@ def paired_host_used(phone: Phone, directory: Path) -> None:
     phone.shot("draft-host-back")
     phone.press("Send")
     touch(directory, "go-sent")
+    wait_for_file(directory, "sent-first.txt", 90)
+    # The phone itself says the send is applied once the host has answered it, and sends nothing more
+    # for it: the host is asked how many times it was sent after that, and not after a time.
+    phone.wait_screen(lambda nodes: any(each["label"] == "Applied" for each in nodes), "the phone to say the send is applied", 60)
+    touch(directory, "go-counted")
     wait_for_file(directory, "sent-result.txt", 90)
     if read(directory, "sent-result.txt") != f"prompts=1 text={DRAFT}":
         raise SystemExit(f"the agent was not sent the draft once: {read(directory, 'sent-result.txt')}")

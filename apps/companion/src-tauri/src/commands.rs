@@ -118,6 +118,7 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("agent_turn_steer", Some(Method::AgentTurnSteer)),
     ("agent_turn_cancel", Some(Method::AgentTurnCancel)),
     ("agent_approval_respond", Some(Method::AgentApprovalRespond)),
+    ("plugin_action_invoke", Some(Method::PluginActionInvoke)),
     ("session_agents", None),
     // Attention and review.
     ("attention_read", Some(Method::AttentionRead)),
@@ -132,8 +133,15 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     // and the hand-over of control asks an owner device first.
     ("device_list", Some(Method::DeviceList)),
     // What privacy mode reports: whether it is on, and the copies that have left the host and are
-    // shown rather than erased. The page lists them and offers no action on them.
+    // shown rather than erased. The page lists them; deleting one is the commands below.
     ("privacy_status", Some(Method::PrivacyStatus)),
+    // Deleting a copy privacy mode lists as having left the host. The page names the copy by the
+    // reference the host lists it under and cannot confirm: this process asks in a native dialog,
+    // and sends the deletion once, with the token that answer minted.
+    ("retained_delete_ask", None),
+    ("retained_delete_finish", None),
+    ("retained_delete_cancel", None),
+    ("retained_sync_copies", None),
     ("grant_notices", None),
     ("session_screen_preview", Some(Method::SessionScreenPreview)),
     ("grant_create", Some(Method::GrantCreate)),
@@ -182,6 +190,7 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     // screen a tap on a notification opened.
     ("push_view", None),
     ("push_enable", None),
+    ("push_previews", None),
     ("push_refresh", None),
     ("notification_route", None),
     // Voice. The start names its method for the table, and this process refuses it before sending.
@@ -271,6 +280,7 @@ pub const SESSION_BOUND_COMMANDS: &[&str] = &[
     "agent_turn_steer",
     "agent_turn_cancel",
     "agent_approval_respond",
+    "plugin_action_invoke",
     "question_read",
     "question_answer",
     "question_settle",
@@ -335,6 +345,10 @@ pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
     // key the host seals previews to. The page names a host and nothing else.
     (
         "push_enable",
+        &[Method::DevicePushRegister, Method::DevicePreviewKeyUpdate],
+    ),
+    (
+        "push_previews",
         &[Method::DevicePushRegister, Method::DevicePreviewKeyUpdate],
     ),
     (
@@ -492,6 +506,13 @@ pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
         "transfer_finish",
         &[Method::OwnerConfirmationPending, Method::GrantTransfer],
     ),
+    // Deleting a copy that left the host: the host's list is read before the person is asked and
+    // again before the deletion is sent, which only the command that holds the person's yes does.
+    ("retained_delete_ask", &[Method::PrivacyStatus]),
+    (
+        "retained_delete_finish",
+        &[Method::PrivacyStatus, Method::PrivacyRetainedDelete],
+    ),
     // What was left unfinished. Asking the host again is an exact repeat of the request that was
     // sent, and a state check reads what the host shows; neither is an action of its own.
     ("attempts_list", &[Method::GrantList, Method::GrantHeld]),
@@ -589,6 +610,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         agent_turn_steer,
         agent_turn_cancel,
         agent_approval_respond,
+        plugin_action_invoke,
         session_agents,
         attention_read,
         attention_acknowledge,
@@ -598,6 +620,10 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         device_list,
         privacy_status,
         grant_notices,
+        retained_delete_ask,
+        retained_delete_finish,
+        retained_delete_cancel,
+        retained_sync_copies,
         session_screen_preview,
         grant_create,
         grant_list,
@@ -634,6 +660,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         inbox_hosts,
         push_view,
         push_enable,
+        push_previews,
         push_refresh,
         notification_route,
         voice_prepare,
@@ -1448,23 +1475,33 @@ pub async fn action_read(
 /// A live session's output is its worker's, so the page is read on the session's own worker link;
 /// the control daemon serves the archive of a session whose worker has ended, and refuses a live
 /// one. Which it is follows from whether the session's worker has a descriptor on this machine.
+///
+/// Over a host this device is paired with, the page is read on the link of the opening the screen
+/// names, or the session's ambient link when it names none. That host narrows the page to the
+/// output the grant reaches: it begins at the first output the grant's history reaches, and says
+/// what it left out before that. A closed session's output is not served to a device.
 #[tauri::command]
 pub async fn history_page(
     state: State<'_, AppState>,
     links: State<'_, crate::agent::WorkerLinks>,
     params: Value,
+    opening: Option<String>,
 ) -> Result<Value> {
     let typed: kr_protocol::recovery::HistoryPageParams = decode(params)?;
-    // A host does not serve retained output to a paired device: a byte range cannot be narrowed to
-    // the time a grant reaches back to. The page is told so and nothing is asked.
-    not_on_a_paired_host(&state, "a session's retained output")?;
-    let page: kr_protocol::recovery::HistoryPageResult = if links.serves(typed.session_id)? {
-        links
-            .read(&state, typed.session_id, None, Method::HistoryPage, &typed)
-            .await?
-    } else {
-        state.session()?.read(Method::HistoryPage, &typed).await?
-    };
+    let page: kr_protocol::recovery::HistoryPageResult =
+        if state.paired_context().is_some() || links.serves(typed.session_id)? {
+            links
+                .read(
+                    &state,
+                    typed.session_id,
+                    opening.as_deref(),
+                    Method::HistoryPage,
+                    &typed,
+                )
+                .await?
+        } else {
+            state.session()?.read(Method::HistoryPage, &typed).await?
+        };
     encode(&page)
 }
 read_command!(
@@ -1618,6 +1655,12 @@ agent_mutate_command!(
     agent_approval_respond, Method::AgentApprovalRespond,
     kr_protocol::agent::AgentApprovalRespondParams, |_| Ok(())
 );
+agent_mutate_command!(
+    /// Invokes one action a package registered for the bound agent, on the session's own worker,
+    /// which checks the action's rights against this device's grant itself.
+    plugin_action_invoke, Method::PluginActionInvoke,
+    kr_protocol::agent::PluginActionInvokeParams, |_| Ok(())
+);
 
 /// Reads a session's live agent instances and every request its broker is still arbitrating.
 ///
@@ -1721,6 +1764,71 @@ pub async fn grant_redeem(
 #[tauri::command]
 pub async fn grant_held(state: State<'_, AppState>) -> Result<crate::sharing::Held> {
     crate::sharing::held(&state).await
+}
+
+/// Asks the person, in a native dialog, whether to delete a copy that left this computer: one the
+/// host lists, or one this application's own sync lists.
+///
+/// The page names the copy by the reference it is listed under and cannot answer for the person. A
+/// yes returns a token that finishes the deletion once.
+#[tauri::command]
+pub async fn retained_delete_ask<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, AppState>,
+    reference: String,
+) -> Result<crate::retained::Asked> {
+    let connection = state.connection().ok();
+    let settings = state.settings()?;
+    state
+        .retained()
+        .ask(
+            connection.as_ref(),
+            &settings,
+            &crate::retained::NativeConfirm::new(app),
+            &reference,
+        )
+        .await
+}
+
+/// Asks for the deletion of the copy the person said yes to, once, and says whether the service
+/// confirmed it.
+#[tauri::command]
+pub async fn retained_delete_finish(
+    state: State<'_, AppState>,
+    token: String,
+) -> Result<crate::retained::Finished> {
+    let connection = state.connection().ok();
+    let settings = state.settings()?;
+    state
+        .retained()
+        .finish(connection.as_ref(), &settings, &token)
+        .await
+}
+
+/// Drops a confirmation without using it.
+#[tauri::command]
+pub fn retained_delete_cancel(state: State<'_, AppState>, token: String) -> Result<()> {
+    state.retained().cancel(&token);
+    Ok(())
+}
+
+/// The copies the sync service kept of writes it refused this computer, listed as the host lists
+/// what it sent. Nothing is sent.
+#[tauri::command]
+pub fn retained_sync_copies(
+    state: State<'_, AppState>,
+) -> Result<Vec<kr_protocol::privacy::PrivacyExported>> {
+    Ok(state
+        .settings()?
+        .sync_copies()?
+        .into_iter()
+        .map(|copy| kr_protocol::privacy::PrivacyExported {
+            kind: copy.kind,
+            reference: copy.reference,
+            left_at_ms: copy.left_at_ms,
+            deletable: copy.deletable,
+        })
+        .collect())
 }
 
 /// Asks the owner devices to confirm handing a session's control to another device. Nothing that
@@ -2585,6 +2693,24 @@ pub fn push_enable(state: State<'_, AppState>, reference: String) -> Result<crat
         .enable(&reference)
 }
 
+/// Chooses whether the notifications of the host the page named show what needs the person, or only
+/// that something does.
+///
+/// The choice is recorded and applied on this phone at once; a host that is on is told next, and
+/// the page is told where it stands on `kr://push`.
+#[tauri::command]
+pub async fn push_previews(
+    state: State<'_, AppState>,
+    reference: String,
+    on: bool,
+) -> Result<crate::push::PushView> {
+    state
+        .push()
+        .ok_or_else(|| CommandError::unsupported("notifications are a phone's"))?
+        .set_previews(&reference, on)
+        .await
+}
+
 /// Looks again at where notifications stand, and mends what a change since the last look needs.
 #[tauri::command]
 pub async fn push_refresh(state: State<'_, AppState>) -> Result<crate::push::PushView> {
@@ -2607,6 +2733,7 @@ fn unavailable_push_view() -> crate::push::PushView {
     crate::push::PushView {
         available: false,
         hosts: Vec::new(),
+        revision: 0,
     }
 }
 
@@ -3619,6 +3746,7 @@ mod tests {
         "inbox_hosts",
         "push_view",
         "push_enable",
+        "push_previews",
         "push_refresh",
         "notification_route",
         "host_info",
@@ -3653,6 +3781,10 @@ mod tests {
         "changeset_read",
         "device_list",
         "privacy_status",
+        "retained_delete_ask",
+        "retained_delete_finish",
+        "retained_delete_cancel",
+        "retained_sync_copies",
         "grant_notices",
         "grant_create",
         "grant_list",
@@ -3849,6 +3981,7 @@ mod tests {
                 // own receiver, and hands the host the credential; the page names a host.
                 "push_view",
                 "push_enable",
+                "push_previews",
                 "push_refresh",
                 "notification_route",
                 // Setup's own two. Neither performs a protocol operation: one reads this
@@ -3928,6 +4061,15 @@ mod tests {
                 // What an invitation would carry, from the protocol's own table. It reaches
                 // nothing.
                 "grant_notices",
+                // Deleting a copy that left the host: native code asks the person in a dialog and
+                // sends the deletion with the token their yes minted. The page names the copy by the
+                // reference the host lists it under, never a method.
+                "retained_delete_ask",
+                "retained_delete_finish",
+                "retained_delete_cancel",
+                // What the sync service kept of this computer's refused writes, read from this
+                // computer's own records.
+                "retained_sync_copies",
                 // A hand-over of control: the host describes the plan and asks the owner devices,
                 // native code reads whether one answered, and only then sends the transfer. The
                 // page names a session, a grant, a device and a reference, never a method.
@@ -4029,6 +4171,11 @@ mod tests {
         assert_eq!(
             performing(Method::PairRedeem),
             BTreeSet::from(["pairing_start_read"])
+        );
+        // A copy that left the host is deleted only by the command that holds the person's yes.
+        assert_eq!(
+            performing(Method::PrivacyRetainedDelete),
+            BTreeSet::from(["retained_delete_finish"])
         );
         // A terminal view's calls are the view's own, on its own link: no page method attaches,
         // subscribes, reports a window, resizes, configures, takes or gives back the input lease,
@@ -4176,6 +4323,7 @@ mod tests {
             agent_turn_steer,
             agent_turn_cancel,
             agent_approval_respond,
+            plugin_action_invoke,
             attention_read,
             attention_acknowledge,
             review_read,

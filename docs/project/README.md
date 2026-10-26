@@ -872,6 +872,11 @@ nothing ever changes what an earlier test or review was about.
 
 A paired device reaches `changeset.read`, `changeset.materialize` and `diff.read` of a recorded version, for a version inside its grant, and is never told the path of a materialisation's directory. It is refused `changeset.capture`, `diff.apply`, `diff.revert` and `diff.read` of a working copy, which run the Git program on a working tree. `docs/host/README.md` gives the rule that decides whether a version is inside a grant.
 
+A version whose provenance names a session is review work for that session, whether a capture
+recorded it or it was derived from a modified materialisation. The control daemon reads the newest
+version of each change set and records it in the attention store; a version that names no session
+is not review work. `docs/host/README.md` gives what that guarantees and where it stops.
+
 ### The base is the commit, and the index is not it
 
 A version is against a **revision**. What the captured tree is compared with is the commit `HEAD`

@@ -552,8 +552,8 @@ impl DescribeModule {
     /// The store, held: everything that reads or writes it on this module's connection takes this
     /// first.
     ///
-    /// A rename writes to it under an admission while holding the connection table, so a write
-    /// that waits on the file's own lock waits with every other admission behind it. The
+    /// A rename writes to it under an admission while holding the registration standing, so a
+    /// write that waits on the file's own lock waits with every withdrawal behind it. The
     /// description host writes through a connection of its own to the same file, under privacy
     /// mode's admission at the generation of what it publishes, and the store's removals take the
     /// write lock before they read, so a writer waits on the file's lock rather than failing and

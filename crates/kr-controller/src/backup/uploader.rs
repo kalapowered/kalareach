@@ -562,7 +562,8 @@ impl Disk {
 /// not at each place that makes one: [`QuietStorage`] and [`QuietManifest`] refuse to send while a
 /// delay is owed, with a refusal that carries what is left of it, and record every delay an answer
 /// names as it arrives. Cleanup under a privacy fence is the one exception, because ending work in
-/// flight must not wait out a delay.
+/// flight must not wait out a delay. A deletion the person asked for is not cleanup, and waits out a
+/// delay under a fence as it does without one.
 #[derive(Clone)]
 struct Gate {
     quiet: Arc<Quiet>,
@@ -570,15 +571,17 @@ struct Gate {
 }
 
 impl Gate {
-    /// Whether a request may leave now.
-    async fn open(&self) -> kr_client::Result<()> {
+    /// Whether a request may leave now. A request that ends work in flight (`ending_work`) may
+    /// under a privacy fence, whatever the service asked; no other request does.
+    async fn open(&self, ending_work: bool) -> kr_client::Result<()> {
         let Some(left) = self.quiet.left() else {
             return Ok(());
         };
-        let fenced = self
-            .disk
-            .run(|backup| backup.privacy_status())
-            .is_ok_and(|privacy| privacy.inhibited_at().is_some());
+        let fenced = ending_work
+            && self
+                .disk
+                .run(|backup| backup.privacy_status())
+                .is_ok_and(|privacy| privacy.inhibited_at().is_some());
         if fenced {
             return Ok(());
         }
@@ -602,12 +605,30 @@ impl Gate {
         }
     }
 
-    /// Sends `request` if a request may leave, and remembers what the service answers.
+    /// Sends `request` if a request may leave, and remembers what the service answers. Under a
+    /// privacy fence it leaves whatever delay the service asked for.
     async fn through<'a, T>(
         &self,
         request: impl FnOnce() -> ServiceFuture<'a, T>,
     ) -> kr_client::Result<T> {
-        self.open().await?;
+        self.sent(true, request).await
+    }
+
+    /// As [`Self::through`], for a request that does not end work in flight: it waits out the
+    /// service's delay under a privacy fence too.
+    async fn through_waiting_out_the_delay<'a, T>(
+        &self,
+        request: impl FnOnce() -> ServiceFuture<'a, T>,
+    ) -> kr_client::Result<T> {
+        self.sent(false, request).await
+    }
+
+    async fn sent<'a, T>(
+        &self,
+        ending_work: bool,
+        request: impl FnOnce() -> ServiceFuture<'a, T>,
+    ) -> kr_client::Result<T> {
+        self.open(ending_work).await?;
         let answer = request().await;
         if let Err(error) = &answer {
             self.note(error);
@@ -699,8 +720,9 @@ impl StorageService for QuietStorage {
         object_id: BackupObjectId,
     ) -> ServiceFuture<'_, kr_client::services::ObjectDeleted> {
         Box::pin(
-            self.gate
-                .through(move || self.inner.delete_object(archive_id, object_id)),
+            self.gate.through_waiting_out_the_delay(move || {
+                self.inner.delete_object(archive_id, object_id)
+            }),
         )
     }
 }
@@ -734,7 +756,7 @@ impl BackupManifestService for QuietManifest {
         Box::pin(async move {
             // A request that was not sent is not a request that may have left: it is not a
             // publication to ask the service about afterwards.
-            if let Err(error) = self.gate.open().await {
+            if let Err(error) = self.gate.open(true).await {
                 return Ok(Dispatched::NotSent(error));
             }
             let answer = self.inner.publish_dispatched(publication).await;
@@ -865,8 +887,8 @@ impl Uploader {
             };
             // A service that asked to be left alone is not asked about the next publication either,
             // and not by the first pass: the delay is recorded where the answer arrived. The gate
-            // sends nothing while it is owed, except under a privacy fence, which opens it for
-            // every request, so the loop stops here instead.
+            // sends nothing while it is owed, except under a privacy fence, which opens it for the
+            // requests that end work in flight, so the loop stops here instead.
             if !matches!(self.held(&generation).await, Ok(true)) {
                 if self.quiet.left().is_some() {
                     break;
@@ -1938,13 +1960,19 @@ impl Uploader {
             let generation = match work {
                 Reclaim::Delete(generation, object) => {
                     return self
-                        .release(&generation, &object, None, now, turn)
+                        .release(&generation, &object, Basis::Unnamed, now, turn)
                         .await
                         .map(Some);
                 }
                 Reclaim::Retire(generation, object, kept) => {
                     return self
-                        .release(&generation, &object, Some(kept), now, turn)
+                        .release(&generation, &object, Basis::Retention(kept), now, turn)
+                        .await
+                        .map(Some);
+                }
+                Reclaim::Asked(generation, object) => {
+                    return self
+                        .release(&generation, &object, Basis::Person, now, turn)
                         .await
                         .map(Some);
                 }
@@ -1989,10 +2017,11 @@ impl Uploader {
         privacy: &PrivacyStatus,
         kept: Option<u64>,
     ) -> Result<Vec<Reclaim>> {
-        if privacy.inhibited_at().is_some() {
-            return Ok(Vec::new());
-        }
         let generations = self.disk.run(|backup| backup.generations())?;
+        let mut work = self.asked_by_a_person(&generations, privacy.inhibited_at().is_some())?;
+        if privacy.inhibited_at().is_some() {
+            return Ok(work);
+        }
         let uploads = self.disk.run(|backup| backup.store().uploads())?;
         let mut behind: Vec<(GenerationRecord, Vec<ObjectRecord>, bool)> = Vec::new();
         for record in &generations {
@@ -2006,7 +2035,6 @@ impl Uploader {
                 || objects.iter().any(|object| object.released_at_ms.is_some());
             behind.push((record.clone(), objects, unheld));
         }
-        let mut work = Vec::new();
         if let Some(kept) = kept {
             work.extend(self.retired(&generations, &uploads, outbox, privacy, kept)?);
         }
@@ -2053,6 +2081,82 @@ impl Uploader {
                     work.push(Reclaim::Delete(record.clone(), object.clone()));
                 }
             }
+        }
+        Ok(work)
+    }
+
+    /// The objects of the generations the host is deleting whole that it wrote down it would ask
+    /// the service to delete and has had no answer about, which are the person's to have sent.
+    ///
+    /// The person's request writes down every object of a generation at once, and a deletion the
+    /// host decides for itself is written down one object a step, the next only after the one
+    /// before is answered. A generation with an object not written down is therefore one the
+    /// host's own rules are deleting, and the objects of it that were written down and not
+    /// answered are not the person's: they are asked again by the rule that wrote them down, as
+    /// that rule stands now ([`Self::retired`] and the generations no publication can name), so a
+    /// deletion of the person's since made does not send what it has made a kept generation.
+    ///
+    /// The one object the store cannot tell apart is the last: the host's own rule writes down
+    /// the last object of a generation, every other object of which it has already had deleted,
+    /// and then the generation has a row for every object, as the person's request leaves it.
+    /// That object is sent as the person's. The generation holds nothing a restore could read
+    /// by then, and a request that restart cut short would otherwise leave its last object at
+    /// the service for good.
+    ///
+    /// Without a fence every object of such a generation is sent, once the standing the store
+    /// judges a deletion by holds again: a request that was not answered, or that a restart cut
+    /// short, is asked again and not forgotten. Under a fence only the objects the person has just
+    /// asked for are, because the fence's rule stands for every deletion the host decides for
+    /// itself: the copies privacy mode listed go by the person's own action and no other.
+    fn asked_by_a_person(
+        &self,
+        generations: &[GenerationRecord],
+        fenced: bool,
+    ) -> Result<Vec<Reclaim>> {
+        let authorised = self.disk.run(|backup| backup.authorised_deletions());
+        let mut work = Vec::new();
+        for record in generations {
+            let objects = self
+                .disk
+                .run(|backup| backup.objects(record.archive_id, record.backup_generation))?;
+            // The generation is being deleted whole (see `generations_being_deleted`).
+            if !objects
+                .iter()
+                .all(|object| object.deletion_asked_at_ms.is_some())
+            {
+                continue;
+            }
+            let asked = objects
+                .into_iter()
+                .filter(|object| object.released_at_ms.is_none())
+                .filter(|object| {
+                    !fenced
+                        || authorised.contains(&(
+                            record.archive_id,
+                            record.backup_generation,
+                            object.object_id,
+                        ))
+                })
+                .collect::<Vec<_>>();
+            if asked.is_empty() {
+                continue;
+            }
+            // A generation the store would not delete from now is left as it stands: the list
+            // shows its deletion as asked and not confirmed, and the pass does not spend itself on
+            // a request that cannot leave.
+            let standing = self.disk.run(|backup| {
+                backup
+                    .store()
+                    .deletion_refusal(record.archive_id, record.backup_generation)
+            })?;
+            if standing.is_some() {
+                continue;
+            }
+            work.extend(
+                asked
+                    .into_iter()
+                    .map(|object| Reclaim::Asked(record.clone(), object)),
+            );
         }
         Ok(work)
     }
@@ -2109,23 +2213,28 @@ impl Uploader {
         &mut self,
         generation: &GenerationRecord,
         object: &ObjectRecord,
-        retiring: Option<u64>,
+        basis: Basis,
         now: TimestampMs,
         turn: &mut Turn,
     ) -> Result<Stepped> {
-        let asked = self.disk.run(|backup| match retiring {
-            Some(kept) => backup.store().note_retained_deletion_asked(
+        let asked = self.disk.run(|backup| match basis {
+            Basis::Retention(kept) => backup.store().note_retained_deletion_asked(
                 generation.archive_id,
                 generation.backup_generation,
                 object.object_id,
                 kept,
                 now,
             ),
-            None => backup.store().note_deletion_asked(
+            Basis::Unnamed => backup.store().note_deletion_asked(
                 generation.archive_id,
                 generation.backup_generation,
                 object.object_id,
                 now,
+            ),
+            Basis::Person => backup.confirm_asked_deletion(
+                generation.archive_id,
+                generation.backup_generation,
+                object.object_id,
             ),
         });
         if let Err(error) = asked {
@@ -2202,12 +2311,16 @@ impl Uploader {
             return Ok(Vec::new());
         };
         let archive_id = setup.record.archive_id;
+        // A generation the host is deleting whole is no backup it keeps, so it takes no place among
+        // the newest `kept`: after the person deletes the newest, the two before it stay.
+        let deleting = self.disk.run(|backup| backup.generations_being_deleted())?;
         let mut published: Vec<&GenerationRecord> = generations
             .iter()
             .filter(|record| {
                 record.archive_id == archive_id
                     && record.remote == Remote::Published
                     && record.production.is_over()
+                    && !deleting.contains(&generation_key(record))
             })
             .collect();
         published.sort_by_key(|record| std::cmp::Reverse(record.backup_generation));
@@ -2309,16 +2422,31 @@ impl Uploader {
 enum Reclaim {
     /// Ask the service whether it holds the generation.
     Ask(GenerationRecord),
+    /// Delete one object this host wrote down it would ask the service to delete, because the
+    /// person asked for exactly that.
+    Asked(GenerationRecord, ObjectRecord),
     /// Delete one object of a published generation that is older than the newest this host keeps.
     Retire(GenerationRecord, ObjectRecord, u64),
     /// Delete one object of a generation the service does not hold.
     Delete(GenerationRecord, ObjectRecord),
 }
 
+/// What a deletion is written down on, which decides the rules the store judges it by.
+#[derive(Clone, Copy)]
+enum Basis {
+    /// An object of a generation no publication can name any more.
+    Unnamed,
+    /// An object of a published generation older than the newest this host keeps.
+    Retention(u64),
+    /// An object the person asked to have deleted.
+    Person,
+}
+
 impl Reclaim {
     fn generation_key(&self) -> (ArchiveId, BackupGeneration) {
         match self {
             Self::Ask(generation)
+            | Self::Asked(generation, _)
             | Self::Delete(generation, _)
             | Self::Retire(generation, _, _) => generation_key(generation),
         }

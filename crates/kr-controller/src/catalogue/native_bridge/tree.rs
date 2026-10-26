@@ -366,6 +366,18 @@ mod platform {
             rustix::fs::unlinkat(self.handle.as_fd(), name, AtFlags::REMOVEDIR).map_err(Into::into)
         }
 
+        /// Lists the names in this directory, through the handle it was opened by.
+        pub(in crate::catalogue::native_bridge) fn names(&self) -> std::io::Result<Vec<String>> {
+            let mut names = Vec::new();
+            for entry in rustix::fs::Dir::read_from(&self.handle)? {
+                let name = entry?.file_name().to_string_lossy().into_owned();
+                if name != "." && name != ".." {
+                    names.push(name);
+                }
+            }
+            Ok(names)
+        }
+
         /// Makes this directory's own entries durable.
         pub(in crate::catalogue::native_bridge) fn flush(&self) -> std::io::Result<()> {
             rustix::fs::fsync(self.handle.as_fd()).map_err(Into::into)
@@ -580,6 +592,10 @@ mod platform {
             &self,
             _name: &str,
         ) -> std::io::Result<()> {
+            Err(unsupported())
+        }
+
+        pub(in crate::catalogue::native_bridge) fn names(&self) -> std::io::Result<Vec<String>> {
             Err(unsupported())
         }
 

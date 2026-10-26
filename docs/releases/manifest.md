@@ -1,7 +1,8 @@
 # The release manifest and the release record
 
 A release is a tree of regular files: `bin/` with the host's programs, `shells/` with the qualified
-shell packages, `share/` with the update channel's root and the release record, and `release.json`.
+shell packages, `share/` with the update channel's root, the release record, the terminal's
+capability manifest and its terminfo database, and `release.json`.
 `release.json` is the release's manifest in the signed envelope of
 [the update documents](../host/updates.md#what-a-release-is-and-how-it-is-checked). This page says
 what each member of the manifest states, where its value is read from, and what stops a release
@@ -164,9 +165,31 @@ build yet, and the pipeline of the plugins repository does not yet write the res
 entry, so the first build it names would stop the release record of that build's platform until it
 does.
 
+## The terminal's capability manifest and database
+
+A release for every target carries two things about the terminal it ships, both written by
+`kr-release terminal` and listed in the manifest like any other file, so the signature covers them.
+
+| Path | What it is |
+| --- | --- |
+| `share/terminal-capabilities.json` | The manifest of the terminal fixtures: for each of the six things the specification gives it (sequence classes, terminfo, worker responses, width, wrap and geometry, input encodings, and renderer fixtures), the fixture files that pin it and the SHA-256 digest of each. It is the checkout's `fixtures/terminal/capabilities.json` |
+| `share/terminfo/x/xterm-256color` and `share/terminfo/78/xterm-256color` | The compiled `xterm-256color` database the worker supplies to a managed session, under both names a terminfo library looks for it by |
+
+They are the statement of what the release ships. The worker still writes its own copy of the
+database at the start of a session, from its own engine, and nothing reads the tree's copy. The
+tree layout is the same for every target: a Windows release carries the database too, as evidence.
+
+`kr-release manifest`, `check` and `sign` refuse a tree that lacks any of the three files or whose
+copy is not what the checkout makes: the manifest is made from the checkout's fixtures, and the
+database is compiled by the engine in the build. They also refuse a checkout whose own
+`capabilities.json` is not what its fixtures make, or in which a fixture belongs to no category.
+Releases published before these files existed do not carry them, so the check is on a tree being
+built and not on a release being installed.
+
 ## Building and signing a release
 
 ```sh
+kr-release terminal --tree T --checkout C
 kr-release record   --tree T --checkout C --target TRIPLE [--plugins DIR] [--web DIR] [--development]
 kr-release manifest --tree T --checkout C --release R --sequence N --commit SHA --target TRIPLE --floor macos=14.0
 kr-release check    --tree T --checkout C [--plugins DIR] [--web DIR] [--development]

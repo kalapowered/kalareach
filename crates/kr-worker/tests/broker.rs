@@ -28,7 +28,7 @@ use kr_protocol::ids::{
     ActorId, AgentBindingRevision, AgentThreadId, ApplicationInstanceId, BrokerBindingId,
     CapabilityId, CapabilityRevision, EnvironmentId, GatewayConnectionId, GrantId, LaunchProfileId,
     MethodTableVersion, PendingResourceId, PluginId, PublisherId, SessionId, SourceEventHandle,
-    StreamCursor, UpstreamMethod, UpstreamRequestId,
+    UpstreamMethod, UpstreamRequestId,
 };
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Bytes, CanonicalSet, Digest256, Nullable, TimestampMs, U64, Uuid};
@@ -1718,7 +1718,9 @@ fn no_arguments() -> Digest256 {
 /// A component package's channel with one relayed approval that the package's decoder
 /// interpreted as its component does, against the component's own projection schema, with the
 /// package's actions registered and a transport bound to carry an answer.
-fn component_decoded(connector: &InstalledConnector) -> (Broker, PendingResourceId) {
+fn component_decoded(
+    connector: &InstalledConnector,
+) -> (Broker, PendingResourceId, std::sync::Arc<RecordingUpstream>) {
     let package = connector.package().clone();
     let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
     broker
@@ -1760,11 +1762,9 @@ fn component_decoded(connector: &InstalledConnector) -> (Broker, PendingResource
             TimestampMs::new(3),
         )
         .expect("the component's interpretation is accepted");
-    broker.bind_connection_dispatch(
-        connection,
-        std::sync::Arc::new(RecordingUpstream::default()) as _,
-    );
-    (broker, relayed.resource_id)
+    let upstream = std::sync::Arc::new(RecordingUpstream::default());
+    broker.bind_connection_dispatch(connection, std::sync::Arc::clone(&upstream) as _);
+    (broker, relayed.resource_id, upstream)
 }
 
 /// KR-REQ-11.47: an action's effect class is the class it declares, and a label cannot change it.
@@ -1967,7 +1967,7 @@ fn kr_req_11_47_an_answer_to_a_component_decoded_request_needs_its_decoder_to_en
     for narrowing in ["approval.respond", "approval.decode"] {
         let root = package_store();
         let connector = claude_code(&root, true, &[]);
-        let (broker, relayed) = component_decoded(&connector);
+        let (broker, relayed, _) = component_decoded(&connector);
         let admitted = broker
             .admit_approval(
                 &caller("device-1"),
@@ -2024,6 +2024,38 @@ fn kr_req_11_47_an_answer_to_a_component_decoded_request_needs_its_decoder_to_en
         );
         let _ = std::fs::remove_dir_all(&root);
     }
+}
+
+/// KR-REQ-11.21: the answer to a request a bridge channel relayed is written by the host from the
+/// validated decision, whoever read the request. A component that read it is not asked to write
+/// the answer, and the host does not refuse the answer for want of a component's bytes.
+#[tokio::test]
+async fn kr_req_11_21_a_bridge_channels_answer_is_written_by_the_host_though_a_component_read_it() {
+    let root = package_store();
+    let connector = claude_code(&root, true, &[]);
+    let (broker, relayed, upstream) = component_decoded(&connector);
+    let (answered, _) = broker
+        .agent_approval_respond(
+            &caller("device-1"),
+            &respond(relayed, "allow"),
+            TimestampMs::new(4),
+        )
+        .await
+        .expect("the host writes the channel's answer from the decision");
+    assert_eq!(answered.state, PendingState::Resolved);
+    let submitted = upstream.submitted();
+    let [request] = submitted.as_slice() else {
+        panic!("one answer was carried: {submitted:?}");
+    };
+    let UpstreamBody::Approval { response, .. } = &request.body else {
+        panic!("the answer is an approval: {:?}", request.body);
+    };
+    let frame = String::from_utf8_lossy(response.frame());
+    assert!(
+        frame.contains("abcde") && frame.contains("allow"),
+        "the channel's own verdict for the request: {frame}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// KR-REQ-11.47: a binding's actions are registered from its package's declarations and from
@@ -2387,7 +2419,8 @@ fn kr_req_12_03_a_stale_launch_is_refused_and_starts_nothing() {
 }
 
 /// KR-REQ-12.05 and KR-REQ-02.10: no second agent process runs against one saved conversation,
-/// and selecting another conversation moves the reservation rather than leaving both taken.
+/// and once the stream has named the conversation a launch asked for, selecting another one moves
+/// the reservation rather than leaving both taken.
 #[test]
 fn kr_req_12_05_no_second_process_runs_against_one_saved_conversation() {
     let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
@@ -2423,13 +2456,20 @@ fn kr_req_12_05_no_second_process_runs_against_one_saved_conversation() {
         }) if application_instance_id == instance(2)
     ));
 
-    // The running instance selects another conversation. The one it left is free; the one it took
-    // is not, and neither is stale.
+    // The stream names the conversation the launch asked for, and the running instance then
+    // selects another one. The one it left is free; the one it took is not, and neither is stale.
+    broker
+        .advance_binding(
+            instance(2),
+            Some(AgentThreadId::new("thread-7").expect("valid")),
+            TimestampMs::new(5),
+        )
+        .expect("the stream names the conversation the launch asked for");
     broker
         .advance_binding(
             instance(2),
             Some(AgentThreadId::new("thread-8").expect("valid")),
-            TimestampMs::new(5),
+            TimestampMs::new(6),
         )
         .expect("the selection changes");
     assert_eq!(broker.conversation_owner("thread-7"), None);
@@ -2437,6 +2477,414 @@ fn kr_req_12_05_no_second_process_runs_against_one_saved_conversation() {
     let _second = broker
         .execute_launch(&second, &ForegroundMark::idle(4), instance(3))
         .expect("the conversation it left is free for another execution");
+}
+
+/// Two brokers over one directory of claims, as two session workers of one user have: each knows
+/// only the instances of its own session, and the claims are what they share.
+fn two_sessions() -> (tempfile::TempDir, Broker, Broker) {
+    let directory = tempfile::tempdir().expect("a directory");
+    let paths =
+        kr_ipc::paths::HostPaths::new(directory.path().join("run"), directory.path().join("state"))
+            .expect("the roots");
+    let open = || {
+        let broker =
+            Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
+        broker.set_host_claims(kr_worker::broker::host_claims::HostClaims::new(&paths));
+        broker
+    };
+    let (first, second) = (open(), open());
+    (directory, first, second)
+}
+
+/// Launches `word` as `id` in `broker` and keeps the instance, as a committed launch does.
+fn launched_on(broker: &Broker, word: &str, id: ApplicationInstanceId) -> Result<(), BrokerError> {
+    let intent = broker.prepare_launch(
+        profile(IntegrationMode::Gateway, [3; 32], "0.9.1"),
+        ForegroundMark::idle(4),
+        Some(word.to_owned()),
+    )?;
+    broker
+        .execute_launch(&intent, &ForegroundMark::idle(4), id)?
+        .register(IntegrationMode::Gateway, Some(managed(id)))
+        .map_err(|refused| refused.error)?
+        .commit();
+    Ok(())
+}
+
+/// KR-REQ-12.05 and KR-REQ-02.10: a saved conversation another session's execution holds is not
+/// launched against, and the claim lasts until what runs against it is gone: the instance's end
+/// is not that, the end of its server's retirement is. Nothing of a refused launch is left, and
+/// another conversation is served.
+#[test]
+fn kr_req_12_05_a_conversation_another_session_holds_is_not_launched_against() {
+    let (_directory, first, second) = two_sessions();
+    launched_on(&first, "thread-7", instance(2)).expect("the first session launches it");
+    let server = process_identity(77, 1_000);
+    first
+        .set_instance_backend(instance(2), server.clone())
+        .expect("the instance has a server");
+
+    let refusal = launched_on(&second, "thread-7", instance(3))
+        .expect_err("a second session's execution of the same conversation is refused");
+    assert!(
+        matches!(refusal, BrokerError::ConversationHeldElsewhere),
+        "{refusal:?}"
+    );
+    assert!(
+        second.profile_of(instance(3)).is_none() && second.binding_state(instance(3)).is_err(),
+        "a refused launch leaves no instance behind"
+    );
+    launched_on(&second, "thread-8", instance(4)).expect("another conversation is served");
+
+    // The program ends, and its server is still being retired: the conversation is still held.
+    assert!(first.end(instance(2)));
+    assert!(matches!(
+        launched_on(&second, "thread-7", instance(3)),
+        Err(BrokerError::ConversationHeldElsewhere)
+    ));
+    // The retirement is over with nothing left running: the conversation is free.
+    first.server_retired(instance(2), &server, true);
+    launched_on(&second, "thread-7", instance(3)).expect("the conversation is free once it is");
+}
+
+/// KR-REQ-12.05: a server whose retirement left something running keeps its conversation held for
+/// as long as the worker lives, and one that ended cleanly before its instance did frees it at the
+/// instance's end.
+#[test]
+fn kr_req_12_05_a_server_that_left_a_process_running_keeps_its_conversation_held() {
+    let (_directory, first, second) = two_sessions();
+    launched_on(&first, "thread-7", instance(2)).expect("launched");
+    let server = process_identity(77, 1_000);
+    first
+        .set_instance_backend(instance(2), server.clone())
+        .expect("the instance has a server");
+    first.server_retired(instance(2), &server, false);
+    assert!(first.end(instance(2)));
+    assert!(matches!(
+        launched_on(&second, "thread-7", instance(3)),
+        Err(BrokerError::ConversationHeldElsewhere)
+    ));
+    drop(first);
+    launched_on(&second, "thread-7", instance(3)).expect("a worker that has ended holds nothing");
+
+    // The retirement ended before the instance did: nothing waits for it.
+    let (_directory, first, second) = two_sessions();
+    launched_on(&first, "thread-7", instance(2)).expect("launched");
+    first
+        .set_instance_backend(instance(2), server.clone())
+        .expect("the instance has a server");
+    first.server_retired(instance(2), &server, true);
+    assert!(first.end(instance(2)));
+    launched_on(&second, "thread-7", instance(3)).expect("free at once");
+}
+
+/// KR-REQ-12.05: the retirement of one server settles that server's conversations and no other's.
+/// An instance launched again under the identifier of one that ended has a server of its own,
+/// and the earlier server's retirement, which can arrive after the second launch, frees what the
+/// earlier instance held and leaves what the later one holds.
+#[test]
+fn kr_req_12_05_the_retirement_of_an_earlier_server_frees_only_the_conversations_it_ran_against() {
+    let (_directory, first, second) = two_sessions();
+    let (earlier, later) = (process_identity(77, 1_000), process_identity(78, 1_001));
+    launched_on(&first, "earlier", instance(2)).expect("launched");
+    first
+        .set_instance_backend(instance(2), earlier.clone())
+        .expect("a server");
+    assert!(first.end(instance(2)));
+    launched_on(&first, "later", instance(2)).expect("launched again under the identifier");
+    first
+        .set_instance_backend(instance(2), later.clone())
+        .expect("a server");
+
+    // The earlier retirement arrives after the second launch.
+    first.server_retired(instance(2), &earlier, true);
+    launched_on(&second, "earlier", instance(3))
+        .expect("what the earlier server ran against is free");
+    assert!(first.end(instance(2)));
+    assert!(
+        matches!(
+            launched_on(&second, "later", instance(4)),
+            Err(BrokerError::ConversationHeldElsewhere)
+        ),
+        "what the later server runs against is held until its own retirement"
+    );
+    first.server_retired(instance(2), &later, true);
+    launched_on(&second, "later", instance(4)).expect("free once the later server is retired");
+}
+
+/// KR-REQ-12.05: an instance that ends while its server is still being started keeps its
+/// conversations, whether the server is then recorded (and its retirement frees them) or never
+/// started (and giving the start up, as a start that fails or is cancelled with its admission
+/// does by being dropped, frees them), and no server is started for an instance that has ended.
+#[test]
+fn kr_req_12_05_an_instance_that_ends_while_its_server_starts_keeps_its_conversation_held() {
+    let (_directory, first, second) = two_sessions();
+    let server = process_identity(77, 1_000);
+    launched_on(&first, "recorded", instance(2)).expect("launched");
+    let starting = first
+        .server_starting(instance(2))
+        .expect("a server is to be started");
+    assert!(first.end(instance(2)));
+    assert!(matches!(
+        launched_on(&second, "recorded", instance(3)),
+        Err(BrokerError::ConversationHeldElsewhere)
+    ));
+    starting.recorded();
+    first
+        .set_instance_backend(instance(2), server.clone())
+        .expect_err("the instance has ended, and the server is the caller's to retire");
+    assert!(matches!(
+        launched_on(&second, "recorded", instance(3)),
+        Err(BrokerError::ConversationHeldElsewhere)
+    ));
+    first.server_retired(instance(2), &server, true);
+    launched_on(&second, "recorded", instance(3)).expect("free once the server is retired");
+
+    launched_on(&first, "unstarted", instance(4)).expect("launched");
+    let starting = first
+        .server_starting(instance(4))
+        .expect("a server is to be started");
+    assert!(first.end(instance(4)));
+    assert!(matches!(
+        launched_on(&second, "unstarted", instance(5)),
+        Err(BrokerError::ConversationHeldElsewhere)
+    ));
+    drop(starting);
+    launched_on(&second, "unstarted", instance(5)).expect("free once the start is given up");
+
+    first
+        .server_starting(instance(4))
+        .expect_err("no server is started for an instance that has ended");
+}
+
+/// A hook the instance's application started, as the kernel recorded it starting at `kernel`.
+fn hook(kernel: u64) -> BridgeProcess {
+    BridgeProcess {
+        identity: process_identity(4_000 + kernel, kernel),
+        starter: Some(process_identity(41, 900)),
+        started: Some(kernel),
+    }
+}
+
+/// What the application's hook reports when it starts `thread`.
+fn selects(thread: &str) -> kr_worker::broker::bridge::Observation {
+    kr_worker::broker::bridge::Observation::from_frame(
+        format!(r#"{{"kr_observation":{{"event":"thread_started","thread":"{thread}"}}}}"#)
+            .as_bytes(),
+    )
+    .expect("an observation")
+}
+
+/// Registers an instance of a native bridge in `broker`, whose application the hooks name.
+fn bridged(broker: &Broker, id: ApplicationInstanceId) {
+    broker
+        .register_instance(id, IntegrationMode::NativeBridge, None, Some(managed(id)))
+        .expect("the instance is registered");
+}
+
+fn selected_by(
+    broker: &Broker,
+    id: ApplicationInstanceId,
+    kernel: u64,
+    thread: &str,
+) -> kr_worker::broker::bridge::ThreadChange {
+    broker
+        .observe_bridge(id, &hook(kernel), &selects(thread), TimestampMs::new(1))
+        .expect("the observation is applied")
+        .0
+}
+
+/// KR-REQ-11.62 and KR-REQ-12.05: a thread another session's execution has selected is not
+/// selected. The thread the binding had is left and no thread is vouched for. The thread an
+/// execution leaves is free for the other session, and so is the one it ends in, a repeated
+/// selection keeps the thread held, and an adopted program that cannot have its conversation owns
+/// none.
+#[test]
+fn kr_req_11_62_a_thread_another_session_owns_leaves_no_thread_vouched_for() {
+    use kr_worker::broker::bridge::ThreadChange;
+
+    let (_directory, first, second) = two_sessions();
+    bridged(&first, instance(2));
+    bridged(&second, instance(3));
+    assert!(matches!(
+        selected_by(&first, instance(2), 10, "shared"),
+        ThreadChange::Selected(_)
+    ));
+    assert!(matches!(
+        selected_by(&second, instance(3), 10, "own"),
+        ThreadChange::Selected(_)
+    ));
+
+    let change = selected_by(&second, instance(3), 11, "shared");
+    assert!(matches!(change, ThreadChange::Refused(_)), "{change:?}");
+    assert_eq!(
+        second.binding_state(instance(3)).expect("known").thread_id,
+        Nullable::null(),
+        "the thread it had is left"
+    );
+    assert!(second.verified_selection(instance(3)).is_none());
+    assert!(
+        second
+            .binding_state(instance(3))
+            .expect("known")
+            .rich_mutations_suspended
+    );
+
+    // A selection repeated keeps the thread held, with no moment another session could take it.
+    assert!(matches!(
+        selected_by(&first, instance(2), 12, "shared"),
+        ThreadChange::Selected(_)
+    ));
+    assert!(matches!(
+        selected_by(&second, instance(3), 12, "shared"),
+        ThreadChange::Refused(_)
+    ));
+
+    // The execution leaves the thread: the other session can have it.
+    assert!(matches!(
+        selected_by(&first, instance(2), 13, "other"),
+        ThreadChange::Selected(_)
+    ));
+    assert!(matches!(
+        selected_by(&second, instance(3), 13, "shared"),
+        ThreadChange::Selected(_)
+    ));
+
+    // An adopted program that is running against a conversation the other session holds owns
+    // none, and its stream selecting it is refused.
+    second
+        .adopt_instance(
+            profile(IntegrationMode::NativeTerminal, [4; 32], "1.0.0"),
+            instance(5),
+            process_identity(44, 903),
+            Some("other".to_owned()),
+        )
+        .expect("a program that runs is adopted");
+    assert_eq!(second.conversation_owner("other"), None);
+    assert!(matches!(
+        second.advance_binding(
+            instance(5),
+            Some(AgentThreadId::new("other").expect("valid")),
+            TimestampMs::new(2),
+        ),
+        Err(BrokerError::ConversationHeldElsewhere)
+    ));
+
+    // The execution ends: the thread it was in is free.
+    assert!(first.end(instance(2)));
+    second
+        .advance_binding(
+            instance(5),
+            Some(AgentThreadId::new("other").expect("valid")),
+            TimestampMs::new(3),
+        )
+        .expect("the thread is free once its execution has ended");
+}
+
+/// KR-REQ-12.05: a launch resumed by a word is held under that word across sessions, and the
+/// thread the stream names for it is held too, as the thread's identifier, while the execution is
+/// in it.
+#[test]
+fn kr_req_12_05_the_word_a_launch_resumed_by_is_held_across_sessions_until_the_stream_leaves_it() {
+    let (_directory, first, second) = two_sessions();
+    launched_on(&first, "thread-7", instance(2)).expect("launched");
+    first
+        .advance_binding(
+            instance(2),
+            Some(AgentThreadId::new("thread-7").expect("valid")),
+            TimestampMs::new(2),
+        )
+        .expect("the stream names the conversation the launch asked for");
+    assert!(matches!(
+        launched_on(&second, "thread-7", instance(3)),
+        Err(BrokerError::ConversationHeldElsewhere)
+    ));
+    first
+        .advance_binding(
+            instance(2),
+            Some(AgentThreadId::new("thread-8").expect("valid")),
+            TimestampMs::new(3),
+        )
+        .expect("the execution moves to another conversation");
+    launched_on(&second, "thread-7", instance(3)).expect("the conversation it left is free");
+    assert!(matches!(
+        launched_on(&second, "thread-8", instance(4)),
+        Err(BrokerError::ConversationHeldElsewhere)
+    ));
+}
+
+/// KR-REQ-12.05: a directory of claims that cannot be used refuses the launch of a saved
+/// conversation and a stream's selection of a thread, because nothing then says that no one holds
+/// it. The launch leaves no instance behind, and a launch that names no conversation needs no
+/// claim.
+#[test]
+fn kr_req_12_05_a_claims_directory_that_cannot_be_used_refuses_the_launch_and_the_selection() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let paths =
+        kr_ipc::paths::HostPaths::new(directory.path().join("run"), directory.path().join("state"))
+            .expect("the roots");
+    kr_ipc::paths::create_private_tree(paths.state_root(), paths.state_root())
+        .expect("a state root that is as it should be");
+    std::fs::write(paths.conversation_claims_dir(), b"").expect("a file where the directory is");
+    let ledger = directory.path().join("ledger.sqlite");
+    let broker =
+        Broker::open(Some(&ledger), session(), JournalHealth::shared()).expect("the broker opens");
+    broker.set_host_claims(kr_worker::broker::host_claims::HostClaims::new(&paths));
+    let launched_instances = || -> i64 {
+        rusqlite::Connection::open(&ledger)
+            .expect("the ledger opens")
+            .query_row(
+                "SELECT COUNT(*) FROM broker_profiles WHERE application_instance_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the profiles are counted")
+    };
+
+    let refusal = launched_on(&broker, "thread-7", instance(2)).expect_err("refused");
+    assert!(
+        matches!(refusal, BrokerError::ResourceUnavailable { .. }),
+        "{refusal:?}"
+    );
+    assert!(broker.profile_of(instance(2)).is_none() && broker.binding_state(instance(2)).is_err());
+    assert_eq!(broker.conversation_owner("thread-7"), None);
+    assert_eq!(
+        launched_instances(),
+        0,
+        "and no profile is recorded for an instance"
+    );
+
+    // A launch that names no conversation claims nothing, and its stream's selection is refused.
+    let intent = broker
+        .prepare_launch(
+            profile(IntegrationMode::Gateway, [3; 32], "0.9.1"),
+            ForegroundMark::idle(4),
+            None,
+        )
+        .expect("prepared");
+    broker
+        .execute_launch(&intent, &ForegroundMark::idle(4), instance(3))
+        .expect("a launch that names no conversation is served")
+        .register(IntegrationMode::Gateway, Some(managed(instance(3))))
+        .expect("registered")
+        .commit();
+    assert_eq!(
+        launched_instances(),
+        1,
+        "the one that named no conversation is recorded"
+    );
+    assert!(matches!(
+        broker.advance_binding(
+            instance(3),
+            Some(AgentThreadId::new("thread-7").expect("valid")),
+            TimestampMs::new(2),
+        ),
+        Err(BrokerError::ResourceUnavailable { .. })
+    ));
+    assert_eq!(
+        broker.binding_state(instance(3)).expect("known").thread_id,
+        Nullable::null()
+    );
 }
 
 /// One identifier names one instance, and the path that holds it owns it: an executed launch's
@@ -2993,44 +3441,6 @@ fn kr_req_19_05_upstream_content_is_data_and_never_authority() {
     );
     let grants = broker.grants(binding(9)).expect("the binding is there");
     assert!(grants.is_display_only(), "and it did not change on the way");
-}
-
-/// KR-REQ-24.24: an adapter's consumed cursor survives a restart, which is what a replay starts
-/// from.
-///
-/// The replay itself, and the visible history gap an evicted range produces, are the gateway's
-/// and are established by its own suite.
-#[test]
-fn kr_req_24_24_a_consumed_cursor_survives_a_restart() {
-    let directory = std::env::temp_dir().join(format!("kr-broker-{}", kr_ipc::new_uuid()));
-    std::fs::create_dir_all(&directory).expect("the directory is created");
-    let path = directory.join("session.sqlite");
-    {
-        let broker = Broker::open(Some(&path), session(), JournalHealth::shared())
-            .expect("the broker opens");
-        broker
-            .register_instance(instance(2), IntegrationMode::Gateway, None, None)
-            .expect("the instance is registered");
-        assert_eq!(
-            broker
-                .consumed_cursor(instance(2))
-                .expect("the read succeeds"),
-            None,
-            "an adapter that has consumed nothing replays from the beginning"
-        );
-        broker
-            .checkpoint(instance(2), StreamCursor::new(40), TimestampMs::new(2))
-            .expect("the checkpoint is written");
-    }
-    let restarted =
-        Broker::open(Some(&path), session(), JournalHealth::shared()).expect("the broker reopens");
-    assert_eq!(
-        restarted
-            .consumed_cursor(instance(2))
-            .expect("the read succeeds"),
-        Some(StreamCursor::new(40))
-    );
-    let _ = std::fs::remove_dir_all(&directory);
 }
 
 /// KR-REQ-11.37: a gap commits everything that happened inside it, including endings, and normal

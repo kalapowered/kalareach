@@ -471,11 +471,11 @@ is in force and its key is recorded. It makes one when the acknowledgement tells
 new: the first acknowledgement, or a change in how many of the host's sessions have confirmed the
 revocation. A request left pending is therefore not announced on every pass. A refusal carries no
 announcement, because the service takes none on one, and the owner learns of a refusal from the
-feed. The service places an announcement after the change has committed, so one it declines leaves
-the acknowledgement as it was. A service that reads an announcement as invalid refuses the whole
-acknowledgement instead: the carrier stops that pass at the record and seals a new announcement
-when it acknowledges the record again. The host and the companion open what they find in their own
-mailboxes by the same rules, which live in the client library.
+feed. The service places an announcement after the change has committed, so one it declines, for
+whatever reason, leaves the acknowledgement as it was and is reported beside it. When the service
+refuses the whole acknowledgement, the carrier stops that pass at the record and seals a new
+announcement when it acknowledges the record again. The host and the companion open what they find
+in their own mailboxes by the same rules, which live in the client library.
 
 The daemon reads the mailbox when it starts and every ten seconds after that. It takes an item only
 if the item opens against the stored-envelope key of a device the host has paired and whose pairing
@@ -1082,7 +1082,9 @@ so a recycled identifier reads as a different process. Neither carries a boot. O
 value counts clock ticks since boot, so a process of a later boot that repeats a recorded worker's
 identifier and tick reads as that worker for as long as it runs: a start that finds the sessions of
 an earlier boot leaves such a session open, and it closes later with the reason a worker found
-gone has, not as the host's restart. A query the operating system refuses is reported as unknown, never as death: a recovery path that treated a failed query as a death would
+gone has, not as the host's restart. The exception is a worker whose own record of its processes
+names the earlier boot: that session closes as the host's restart once the process that repeated
+the identifier has ended. A query the operating system refuses is reported as unknown, never as death: a recovery path that treated a failed query as a death would
 release a session identity while its worker was still running.
 
 A process query answers one of three things: the process and its start identity, gone, or cannot
@@ -1342,10 +1344,28 @@ the old enrolment installed stays with the old enrolment.
 Both method groups arrive through the ordinary path. A read is checked against current authority; a
 mutation carries an action window and is checked against the method registry and its envelope. That
 admission travels into the catalogue and is asked again where the change becomes durable: the
-catalogue's transaction, and every file it publishes or reclaims, runs while the daemon holds its
-table of admitted connections, so a revocation or a withdrawn connection is ordered wholly before
+catalogue's transaction, and every file it publishes or reclaims, runs while the daemon holds the
+change's registration standing, so a revocation or a withdrawn connection is ordered wholly before
 the change or wholly after it, and a request whose deadline or authority ran out while it waited
-behind a sync or a download changes nothing. A mutation is claimed durably before it is performed,
+behind a sync or a download changes nothing. The daemon's table of admitted connections is held
+only for the check, not for the commit: a request, a typed key, an output batch and a connection
+that is registered never wait for a commit, and a connection that ends is withdrawn once no commit
+or withdrawal holds the registrations, without anything waiting for it. A revocation, or a refusal
+the authority feed raises, that lands during a commit does wait for it. It holds the registry
+meanwhile, so the requests that need the registry wait with it, and one runtime thread; a commit
+that begins behind it waits too.
+A connection whose control stream was lost keeps its registration, and so its lease renewal, until
+no commit or withdrawal holds the registrations.
+
+The catalogue's work that grows with a catalogue (a mutation, a read, the seed, a change of the
+adapters an organisation allows, and the plan of an installation a person confirms) runs on a
+thread the runtime has handed its other tasks away from, because a sync of a catalogue of ten
+thousand entries flushes files, commits records and parses an index of that size without awaiting.
+A session's input is therefore answered while a synchronisation or an installation runs; the
+change holds that one thread for as long as it runs, a sync's waits for the network included. On a
+current-thread runtime there is no thread to hand them to, and the work runs where it is. The
+receipt of an action and the budgets and the disable policy in force are single records, and are
+read and written where they are asked for. A mutation is claimed durably before it is performed,
 under the caller and the action identifier, and the transaction that makes its change also records
 the answer it gave. A retry of an applied action is answered with that answer and a refused one
 with its refusal, without performing anything again. An action a stopped daemon left mid-way is
@@ -1479,7 +1499,7 @@ The create token is the request's action identifier. A retry with the same paylo
 same reservation; the same token with a different payload is refused rather than becoming a second
 session. A lost reply never causes a second launch.
 
-A reservation records the create request without the environment variables its creator sent. The list in a recorded request is always empty and says nothing about what the creator sent. The environment is kept in memory in the daemon in the entry corresponding to a create request waiting for a worker to claim it. When a worker claims the create request, the environment is "moved" (once) from the waiting create request to the specification of what needs to be launched by the worker. A create that stops waiting takes back whatever the claim has not taken, whether its launch could not start or the 30 seconds it waits for its worker ran out, so a claim that arrives afterwards finds none.
+A reservation records the create request without the environment variables its creator sent. The list in a recorded request is always empty and says nothing about what the creator sent. The environment is kept in memory in the daemon in the entry corresponding to a create request waiting for a worker to claim it. When a worker claims the create request, the environment is "moved" (once) from the waiting create request to the specification of what needs to be launched by the worker. A create that stops waiting takes back whatever the claim has not taken, whether its launch could not start or the time it waits for its worker ran out (30 seconds, and 30 more for a managed create, whose worker reports itself once its shell has qualified), so a claim that arrives afterwards finds none.
 
 When a worker claims a create request, if there is no more environment, the claim is refused. A reservation that is still `spawned` becomes `failed` without any key, and nothing is launched with an environment its creator did not send. Another case where this can happen is when the daemon is restarted in between a reservation and the claim of a worker created by the previous daemon. A second claim on a reservation that was already claimed still fences it. A repeat under the same token is answered from the record: with the session once it exists, or with an error that names the reservation's phase. A `claimed` reservation can still become a session. A `spawned` one can only while its create is waiting or a claim has already taken the variables; otherwise it becomes `failed` when its worker's claim is refused or, once its worker has ended, at a later start. A `failed` one cannot. Note that if a worker claimed the create request in time but is not answering anymore, the answer to the create request will be `OUTCOME_UNKNOWN`. In that case, the create request can be sent again under the same token, but a new session should only be created if the answer is `failed`.
 
@@ -2504,7 +2524,12 @@ page carries at most 1,000 rows and 1 MiB.
 
 Semantic snapshots are held to section 8's three limits, which `kr_protocol::semantic` states: 16
 MiB across the parts, sixteen levels of depth and twenty thousand nodes. `agent.snapshot` reads an
-agent's retained history, a flat list of at most 4,096 entries, so its depth is one. A part travels
+agent's retained history, a flat list of at most 4,096 entries, so its depth is one. An entry keeps
+at most 64 KiB of text, cut at a character boundary; what it left out is counted in the entry's
+`omitted_text_bytes`, so a cut text is not read as the whole of what was said. Together with the
+4,096 entries that makes 256 MiB of text for one instance at the most, which no producer of entries
+reaches: a gateway frame records an identifier, and a bridge report is cut at 4,096 bytes first.
+A part travels
 in one control frame, so it is cut to what the reader's connection said it receives once the rest
 of the answer is in it, and an entry larger than that on its own is carried with its text cut,
 saying how many bytes it left out. The 16 MiB and the node count are spent by one snapshot's parts
@@ -2713,9 +2738,12 @@ does not record when a worker was made, so a worker made after those revisions p
 same way while a fence is owed to another worker. Once the start is done, a task of its own asks
 each recorded worker for the first page of each of the eight revisions at or below the one the
 registry holds it as having acknowledged, and the pass that collects owed names asks for the pages
-that follow. That is one exchange for each revision and none asked again, so a worker takes eight at
-most. The daemon keeps a report for eight revisions of a worker in all, so a worker that was eight
-or more revisions behind has the older of these reports go first. A repeat of one of those
+that follow. That is one exchange for each revision. A worker that answers that its dispatch boundary
+is held for the moment is asked again, at most three times for its walk, after pauses of 20, 40
+and 80 milliseconds, so a worker takes eight answered exchanges at most and three retries of a
+refusal for now; its fourth refusal ends its own walk and no other. The daemon keeps a report for eight
+revisions of a worker in all, so a worker that was eight or more revisions behind has the older of
+these reports go first. A repeat of one of those
 revocations then names what the worker still holds. A revocation older than that answers as it was
 first given.
 
@@ -2912,9 +2940,9 @@ transaction. A daemon that starts cancels every invitation it left unfinished be
 anything; the consumed state and the failed-confirmation count stay.
 
 **The security outbox.** `pairing_events` holds one immutable row per completed pairing, ordered by
-a stable sequence. A row is removed only after every registered consumer has read past it, and none
-is removed while no consumer is registered. The environment's attention store is the consumer that
-delivers the event to the owner's devices.
+a stable sequence. No row is removed, and the outbox registers no reader: a reader keeps its own
+cursor. The delivery journal reads it that way, under a consumer of its own, and tells the owner's
+devices (see *Notification delivery*).
 
 Its own network device keys are a separate key set from the environment's controller identity. The
 controller identity signs generation tokens to this host's workers; these are the keys a *device*
@@ -3024,14 +3052,36 @@ What the grant decides, for every request:
 * **Capabilities.** What an attachment is granted is what it asked for intersected with the rights
   this request was decided with, made where the attachment is admitted. See "What an attachment
   may do".
-* **History.** Retained history is not served to a device at all: its scope is the grant's lower
-  bound, that bound is a moment in time and a history page is a byte range, and a host that does
-  not narrow a page to a grant refuses it rather than serving more than the grant allows. The host
-  records when each part of a closed session's output was written (see "When output was
-  produced"), which is what a page narrowed to a grant would be cut by. It serves no page cut that
-  way: bytes with no recorded time, or timed on a clock the worker could not prove, are never
-  served to a bound, and the daemon does not read a live session's record. The
-  session's live screen and the stream that follows it are served when the grant includes them,
+* **History.** A device is served a live session's retained output cut to its grant. A history
+  page is a byte range and the grant's scope is a moment in time, so the session's worker cuts the
+  range by its record of when each part of the output was written (see "When output was
+  produced"), using the history scope of the grant the daemon decided the read under, which the
+  daemon forwards with it. A grant with no history bound, once its own start is filled in where it
+  names no cursor, reaches no retained output, and the daemon refuses its page by name. Otherwise
+  the worker serves the output from the start of the first interval whose proven reading is at or
+  after the grant's first moment, and none before it. Cursors only grow, so everything from that
+  cursor on was recorded no earlier than that interval's first byte, whether or not an interval
+  times it. An interval read on a clock the
+  worker could not prove is not one to start from, as none is after the wall clock stepped
+  forward. A page asked for from before that cursor begins at it, reports it as the oldest
+  retained cursor, and says what it left out as a gap with no cause, because retention took none
+  of it; where retention or a hole took some of what the grant reaches, the gap names its cause, as
+  for any reader. A grant that reaches no interval yet is served an empty page at the end of the
+  output, and reads on from there as intervals begin. Output is dated when the worker records it,
+  which can be later than when the application wrote it, and output that continues an interval
+  begun before the grant's start is served from the next interval, which starts with the first
+  output written after that interval's time limits pass (see "When output was produced" for the
+  limits and for a full index). A grant that reaches every moment
+  is served what the owner is. The page comes from the same retained window as the owner's, so
+  what privacy mode removes is gone from both. The daemon publishes privacy mode before it tells a
+  worker to remove what it retained, so a page is sent only while privacy mode is off and stays off
+  in the generation the page was read in, and the state is held while the bytes are handed to the
+  stream. A page read with privacy mode on, or one for which the state moved before the first byte
+  went, is sent with none of its output and says the range it covered is gone; one for which it
+  moved after the first byte went ends the connection. A closed session has no worker to cut its
+  output, and a paired device is refused it, with that reason; a worker that still answers while its
+  closure is delivered refuses the page to every caller but the owner. The session's live screen and
+  the stream that follows it are served when the grant includes them,
   and "the live screen" means the screen that is showing: a device's attachment is drawn the active
   buffer alone, and the rows of the buffer that is not showing are counted among what its
   restoration did not carry. The exception section 10 names is the visible screen, and never the
@@ -3345,10 +3395,13 @@ never saw rotate is applied.
 After the organisation rotates its key, a host that has followed the new chain keeps the policy it
 holds and accepts the next one only under the new key. A policy the organisation signed under the
 old key is refused until the organisation signs it again. The managed service signs the policy it
-holds again under the new key, as the next revision with the same settings, at the rotation, and
-again on a read that finds the policy under a key that no longer signs. It serves the stored policy
-when it cannot, so a policy it serves can still be one that a host which followed the new chain
-refuses. A host that has not followed the rotation needs the chain beside the policy:
+holds again under the new key, with the same settings and at a revision above every one it has
+signed, at the rotation, and again on a read that finds the policy under a key that no longer
+signs. When its authority object has noted the revision its database held and the database was
+restored to an earlier one, it signs nothing: the policy then stays under the old key until an
+administrator sets it again. It serves the stored
+policy when it cannot, so a policy it serves can still be one that a host which followed the new
+chain refuses. A host that has not followed the rotation needs the chain beside the policy:
 `kr organisation policy <policy-file> --chain <chain-file>`.
 
 The host keeps the policy's revision and its adapter allowlist in a store of its own,
@@ -3701,7 +3754,8 @@ shortens that. A record from an earlier boot needs no such guard, because the wi
 live in its memory and a host that has restarted can admit nothing through them.
 
 An observation is evidence, not an execution state. Only an authoritative answer about an uncertain
-outcome moves a receipt, and an inferred screen never does: a screen is what the host parsed, not
+outcome moves a receipt, such as the upstream's reply to the request this host sent, matched by the
+identifier it was sent under, and an inferred screen never does: a screen is what the host parsed, not
 what the interface that owns the subject said. "Observed" in a user interface means evidence was
 observed.
 
@@ -3848,7 +3902,14 @@ transaction, while the environment's daemon is stopped and no worker can hold it
 registry's worker rows and closures, with the registry read as it is (`Registry::open_to_read`,
 which reads the file alone as immutable, writes nothing, not even beside it, and refuses a registry
 whose write-ahead log still holds writes or that is reached through a link), and from the
-descriptor; a source it cannot read, the registry included, refuses the journal. It checks the
+descriptor; a source it cannot read, the registry included, refuses the journal. A closure that
+lists a worker whose end was never confirmed refuses it too. The refusal is lifted when the
+registry's reservation for the session records the process its launch ran and the kernel says that
+process has ended. The reservation is read only to lift that refusal, and its display number then
+names the endpoint to fence before the journal is opened. A reservation that is missing, records no
+launch, names a process that runs or cannot be established, or cannot be read keeps the refusal.
+Before the daemon collects or migrates a closed session's stores, it asks the same question and
+takes the same proof. The importer checks the
 version and every object against the statement one of those builds ran to make it, reads every row
 as the running host reads it, names anything it cannot read, and leaves a refused journal exactly as
 it was; a failure after it has begun changing the journal goes back with its transaction.
@@ -4001,8 +4062,9 @@ knows the file. Until then the file holds instants and no content.
 `history.times` reads the intervals between two cursors of a closed session through the control
 daemon, at most 2,048 to an answer, with the cursor to ask from next. A session with no index, or
 one that cannot be read, is answered with no intervals and the reason, and what reads it says its
-output carries no time. It refuses a session whose worker the daemon has not seen end, as
-`history.page` does, and a paired device cannot ask it.
+output carries no time. It refuses a session whose worker the daemon has not seen end, as the
+daemon's own `history.page` does (a live session's page is its worker's), and a paired device
+cannot ask it.
 
 ## The archive service
 
@@ -4057,6 +4119,9 @@ whose registry row has no closure, or whose launch is still under way, is a reco
 collection's. A worker hands its closure over before it exits, and the closure erases its row and
 retires its descriptor, so the launch's process is what says the worker is still there: until the
 kernel says it has ended, the worker may still write what a collection or a migration would open.
+A closure the daemon wrote without confirming that the worker ended says so in its surviving list,
+and keeps the session shut for the same reason. The kernel's later word that the launch's process
+has ended clears that claim; a launch that names no process leaves it standing.
 
 A read of a closed session asks the same question first. A session this daemon has verified is
 refused with the endpoint to ask; so is one whose registry record names a process the kernel still
@@ -4072,10 +4137,22 @@ It looks again after five seconds, then after ten, and so on, doubling up to fiv
 looks for as long as the hold lasts. Until the store reads the journal the session stays closing,
 so the announcements about its pending questions and approvals are held back from delivery, as
 they are while any closure is under way. While the hold lasts none of the session's text is
-served; a read that finds the journal can be brought forward serves it at once. On Linux a
-process of a later boot that repeats the launch process's identifier and start tick reads as the
-worker for as long as it runs, because an identity carries no boot; the reads and the collection
-leave the session alone until it ends.
+served; a read that finds the journal can be brought forward serves it at once. Such a read also
+ends the wait the session had: the store finishes the session on its next pass and delivers its
+items then, not at the end of that wait. On Linux a process of a later boot that repeats the launch
+process's identifier and start tick reads as the worker for as long as it runs, because an identity
+carries no boot; the reads and the collection leave the session alone until it ends.
+
+A migration that was made and failed (the journal's database was busy or full, or damaged) is not
+a hold for a worker, and the journal is not unreadable either. The store tries the session the same
+way, with its items held back and no text served, but only so often. After ten tries that found
+the migration failing, the store finishes the session with gaps, as it does for a journal it cannot
+read, and a migration made later does not repair them. The daemon keeps the count in memory, so it
+starts again when the daemon does. A try that finds the journal held back (for a worker, a busy
+registry or another recovery) is not one of the ten. If the store cannot write the gaps at the
+tenth failure, the next look that finds the migration failing ends the session with them, and the
+ten tries do not begin again. A summary of the session's changes is not asked for while the store
+still tries the session.
 
 **A reader cannot create a worker.** Every read the archive serves is a read of what is already on
 disk. A history request never starts an execution, and a retried create is answered from the
@@ -4105,8 +4182,12 @@ fact that puts it in the session's tree (its parent, its session, its terminal, 
 session's job), so an identifier the kernel gave to a stranger after the process it listed ended is
 not recorded. A process stays in the record until the kernel says it has ended, so one that left
 the tree after it was seen is still stopped, unless it left for a control daemon's own scope.
-The record belongs to one boot: one from another boot, one from an earlier build that names no boot,
-and a missing one are not acted on, and the closure says why. A recorded process is stopped only
+The record belongs to one boot. A record that names an earlier boot, of the same kind and length as
+this host's own, says the worker went with that boot. Nothing is stopped, since no process of one
+boot runs in another, and nothing is listed as surviving. The closure gives the host's restart as
+its reason, whatever this daemon remembers of the session. A record that names a boot this host
+cannot compare with its own (another kind of identity or another length), a record from an earlier
+build that names no boot, and a missing record are not acted on, and the closure says why. A recorded process is stopped only
 through the platform's hold on it: a process descriptor on Linux, the kernel's own version of the
 process on macOS (which the kernel checks again as it signals), an open handle on Windows. A
 platform that offers none of these does not signal the process by its number. On Unix the cleanup
@@ -4426,7 +4507,7 @@ The call is held to the account that was signed in when it began. A sign-in as a
 
 Once the owner has used `kr backup setup` to set backups up, a task on the daemon's reactor runs each day and makes one full backup when what it would pack has changed. A backup is a generation of the archive, and each generation holds every member in full, so nothing is incremental. The daemon holds no seed. From the kit it keeps only the public half of the recovery key and a fingerprint of it, and every generation wraps its keys for that public half.
 
-Each generation holds `sessions/<session uuid>.json` for each closed session, with the most recently closed session first, and, if the daemon accepts it, the host's configuration document as `host/configuration.json`. Each session document is the one `kr export` writes. A session is packed when its closure is recorded, its worker is confirmed ended, it owes privacy mode no cleanup, and the archive holds output for it. A session that is still open is in no backup until it closes, and `kr doctor` counts the sessions that have not closed. A session whose output cannot be read is left out and counted by `kr doctor`, and the daemon tries it again once a day. A session whose journal an earlier build wrote, and which could not be brought forward when a pass read it because the registry was busy or unreadable or another recovery held the session, is packed with a summary built from its closure alone. It counts as changed once its journal can be read, so a later pass makes the generation again with the session's own record. A generation made by an earlier release, or from a journal that failed to migrate, is not made again for this. The members follow the restore's limits: a session at most 192 MiB, the configuration at most 1 MiB, all members together at most 1.5 GiB, and at most 4,096 members. A session that would take the total past its limit is left out of that generation whole, a smaller one after it may still fit, and `kr doctor` counts what was left out. With nothing to pack, there is no generation.
+Each generation holds `sessions/<session uuid>.json` for each closed session, with the most recently closed session first, and, if the daemon accepts it, the host's configuration document as `host/configuration.json`. Each session document is the one `kr export` writes. A session is packed when its closure is recorded, its worker is confirmed ended, it owes privacy mode no cleanup, and the archive holds output for it. A session that is still open is in no backup until it closes, and `kr doctor` counts the sessions that have not closed. A session whose output cannot be read is left out and counted by `kr doctor`, and the daemon tries it again once a day. A session whose journal file is there but gave no summary when a pass read it is packed with a summary built from its closure alone. That summary has no shell path or directory, takes the closing time for the creation time, and has default dimensions. A journal gives no summary when an earlier build wrote it and it could not be brought forward (the registry was busy or unreadable, another recovery held the session, the migration failed, or the journal is older than the migration ladder and waits for `kr host import-journals`), when it holds no record of the session, and when it cannot be read. Such a session counts as changed once its journal gives a summary, so a later pass makes the generation again with the session's own record. It does not count as changed when one of those reasons gives way to another, because the summary packed is the same. After an upgrade to this release, a session that was not marked before and whose journal gives no summary counts as changed once, so the next pass makes one more generation. A session marked before keeps its digest while its journal still gives no summary. A session whose journal is read, or is not there, digests as it always has. A generation an earlier release made for such a session is not made again for this alone; the next generation that anything else causes holds the session as it then reads. The members follow the restore's limits: a session at most 192 MiB, the configuration at most 1 MiB, all members together at most 1.5 GiB, and at most 4,096 members. A session that would take the total past its limit is left out of that generation whole, a smaller one after it may still fit, and `kr doctor` counts what was left out. With nothing to pack, there is no generation.
 
 A pass makes a generation only when all of these hold:
 
@@ -4566,22 +4647,24 @@ The carrier waits between passes as the service and the cause allow:
 | A privacy fence was raised | At once, whatever else it waits for and whatever token the host holds, because the cleanup a fence owes ends work in flight |
 | Nothing is owed | When something changes |
 
-A delay the service names binds every question to it, and the daemon never waits longer than an
-hour for one, whatever the service writes. The daemon records the delay where the answer arrives,
-and its clients send nothing while a delay is owed: not the question about an earlier publication,
-not the first question about backup storage, not the status read `kr doctor` makes, and not the
-next request of a pass that was running when the delay arrived. That pass ends and says where it
-stopped. A fence that arrives meanwhile does its cleanup and leaves the rest of the delay owed. A
-host under a fence is not held back by a delay at all, because its clients cannot tell cleanup from
-other work; only the question about an earlier publication and the status read `kr doctor` makes
-still stop at a delay, as they do outside a fence. The clients do not send a request again on
-their own after a short delay: the carrier waits it out and asks again. A
-refusal only a person can clear that names a delay is waited for as long as the longer of the delay
-and five minutes, and new work still waits out the delay. A refusal that names a delay and one that needs a
-person can come in the same pass, for example when a publication is refused because the writer is
-not enrolled and the question that follows is turned back with a delay. The pass ends at the delay
-and the daemon keeps the person's refusal for `kr doctor`. A refusal that names no delay may be about
-one attempt alone, an object the service already holds for example, and the pass goes on to the next.
+A delay the service names binds every question to it, and the daemon never waits longer than an hour
+for one, whatever the service writes. The daemon records the delay where the answer arrives, and its
+clients send nothing while a delay is owed: not the question about an earlier publication, not the
+first question about backup storage, not the status read `kr doctor` makes, and not the next request
+of a pass that was running when the delay arrived. That pass ends and says where it stopped. A fence
+that arrives meanwhile does its cleanup and leaves the rest of the delay owed. Under a fence, the
+requests that end work in flight are not held back by a delay, because the cleanup a fence owes must
+not wait. A deletion the person asked for is not such a request: it waits out the delay under a
+fence as it does outside one, and the carrier sends it once the delay has passed. The question about
+an earlier publication and the status read `kr doctor` makes still stop at a delay, as they do
+outside a fence. The clients do not send a request again on their own after a short delay: the
+carrier waits it out and asks again. A refusal only a person can clear that names a delay is waited
+for as long as the longer of the delay and five minutes, and new work still waits out the delay. A
+refusal that names a delay and one that needs a person can come in the same pass, for example when a
+publication is refused because the writer is not enrolled and the question that follows is turned
+back with a delay. The pass ends at the delay and the daemon keeps the person's refusal for `kr
+doctor`. A refusal that names no delay may be about one attempt alone, an object the service already
+holds for example, and the pass goes on to the next.
 
 A part is 8 MiB and its answer begins only after the whole part has been sent, so storage exchanges
 get 60 seconds to start answering and 90 in all. That is the time the slowest supported uplink needs
@@ -4658,9 +4741,26 @@ Each session is told the generation by the daemon, on a tick once a second, over
 daemon holds to its worker. The worker raises its attention transition, applies the generation to
 the session and answers where its own cleanup stands. The tick tells it again, waiting longer each
 time, until it answers that its cleanup is complete, and only that answer ends its obligation. A
-session whose worker ended first keeps its obligation, reported as unavailable with the archive
-named as what holds its output, because an ended worker is no evidence that what it retained is
-gone.
+session whose worker ended first has nobody to tell, so the archive does what the worker would
+have, under the session's recovery ownership. It writes the privacy state in force into the
+session's journal, as a worker does, so that the questions and notices the session recorded stay
+out of what the attention store serves. It removes the retained output and its time index, through
+the removal a worker makes, which publishes where the output had reached, and the content of the
+receipts that have settled, which keep their identity, state and digests. A receipt that has not settled is
+settled first, as a collection pass settles it (a dispatch with no outcome becomes unknown, and an
+accepted intent that was never dispatched is rejected), and then loses its content too, because no
+worker is left to retry it. The obligation ends only when nothing is left. A removal that leaves
+something is reported as unavailable with the reason, and is tried again on a schedule that
+lengthens, across a restart. So is a removal that could not start: another recovery holds the
+session, or a worker may still own its stores. Removals run one at a time, so a change that answers
+while the tick is removing waits for it and reports what is left after it. While the obligation
+stands, `history.page`, `history.times` and `action.read` of that session are refused with
+`RESOURCE_UNAVAILABLE`, and the attention store serves no text from its journal. Once the output is
+removed they answer a gap with no bytes, and the journal's record keeps its text out of the store
+whether privacy mode is on or has been turned off again. A page that was
+read before privacy mode was turned on, and has not yet been written to the reader when it is, is
+written without its bytes, as a range that is gone. `privacy.set` runs the removal before it
+answers, so the answer says where it stands.
 
 Creating a new session in privacy mode doesn't wait for a tick. The daemon records the new session's
 obligation before it asks for the worker. That write waits for whatever holds the record, a change
@@ -4683,7 +4783,8 @@ A record it cannot read stops the start rather than leaving the daemon to guess.
 
 Turning it off is refused while a daemon subsystem, or a session whose worker is running or may
 still start, owes cleanup, and the refusal names what is owed. A session whose worker has ended does
-not hold it back, because nothing resumes in its store, and its obligation stays recorded. A session
+not hold it back, because nothing resumes in its store, and its obligation stays recorded until the
+archive has removed what the session retained. A session
 counts as ended only when the registry shows its launch is over: it has no reservation, or one whose
 launch failed after a worker claimed it, or whose session has closed. A session whose worker has not
 reported yet is one this host has not reached, and it holds turning privacy mode off back until its
@@ -4721,8 +4822,8 @@ host's own maintenance takes its content then.
 
 Privacy mode does not reach two stores. The canonical grid keeps its own scrollback, which a client
 can still page through, and the worker keeps a bounded log of the semantic entries that a bound
-agent's bridge observed (up to 4,096 for each instance, the text of notifications and details
-included), which `agent.snapshot` serves and the privacy cleanup does not clear. Neither is
+agent's bridge or gateway observed (up to 4,096 for each instance, the text of notifications and
+details included, at most 64 KiB for each entry), which `agent.snapshot` serves and the privacy cleanup does not clear. Neither is
 described here as though it were done.
 
 A cleanup that could not finish is not a cleanup that finished. A redaction the store refused and
@@ -4854,16 +4955,58 @@ What has already left the host is shown rather than erased. An uploaded archive 
 archive and generation; so is one whose outcome this host could not establish, because a copy it
 cannot account for is still a copy; and so is object ciphertext a service acknowledged for a
 generation whose descriptor was never published, because those bytes are there whether or not an
-archive was ever completed from them. The backup service marks them **not** deletable, and that
-mark is the plain truth about what the host can do: it holds no route through which it could ask a
-service to remove a copy, so it offers no deletion action for one and says so instead of offering
-an action nothing here can perform. A person who wants such a copy removed asks the service that
-holds it. A notification or another artifact this host does hold a reference to is listed with an
-action; backup does not silently delete unrelated collections and does not claim a copy somebody
-else holds can be recalled. Local deletion is logical cleanup of this host's own records rather
-than a
-claim of physical secure erase: the files are unlinked and the rows are cleared, and nothing here
-says the bytes are unrecoverable from the device they were on.
+archive was ever completed from them. The backup service marks an archive deletable when the
+person's own deletion of it would be accepted now (below), and not deletable when it would not. The
+ciphertext of a generation whose descriptor was never published is not deletable: its store records
+no deletion of such objects, the entry's kind says so, and a person who wants that copy removed asks
+the service that holds it. A notification a provider queued is listed and is not deletable, because
+this host holds no way to ask the provider to forget it. Backup does not silently delete unrelated
+collections and does not claim a copy somebody else holds can be recalled. Local deletion is logical
+cleanup of this host's own records rather than a claim of physical secure erase: the files are
+unlinked and the rows are cleared, and nothing here says the bytes are unrecoverable from the device
+they were on.
+
+`privacy.retained.delete` is the separately authorised action that asks the service to delete one of
+those copies. It is its own call, apart from turning privacy mode on. It is served on the owner's
+socket at the host only, so no paired device can make it, and it needs `host.manage`. Privacy mode
+does not stop it: privacy mode is why the copy is listed. The call names the copy by the `reference`
+the `exported` list of `privacy.status` shows for it, and the host does not trust the text. It reads
+the list again and acts only when exactly one entry has that reference and the entry is marked
+deletable. A reference the list does not hold is refused as `INVALID_ARGUMENT`, and a copy marked
+non-deletable as `PERMISSION_DENIED`.
+
+For a backup generation the host's store decides, in the write that records the request. The
+generation belongs to the archive of this host's setup, and the writer that signed it is still
+enrolled. It is published, or its production ended with the outcome unknown while a newer generation
+of the archive is published, because a publication of it landing later would otherwise name objects
+that are gone. No attempt or upload of it is open, and no other generation names one of its objects.
+The line privacy mode draws under a generation, and the fence while it stands, are not reasons to
+refuse. The store writes down a deletion of every object of the generation in one transaction before
+any request leaves, and the carrier then sends the requests, under a fence too. While a fence stands
+the carrier sends nothing else: a deletion the host decided on for itself before privacy mode came
+on waits until privacy mode is off, and is then asked again by the rule that wrote it down, as that
+rule stands. Retention's request for an object of a generation it was deleting object by object is
+sent only while retention would still delete that generation. A generation the person's own deletion
+has since made one of the newest the host keeps stays until a newer one is published, and one behind
+the line privacy mode drew stays until the person deletes it. The exception is the last object of a
+generation whose other objects retention had already deleted: it has a row for every object, as a
+person's request leaves it, so it is sent as the person's, and nothing a restore could read is left
+of that generation.
+
+The answer is `deleted` and the report. `deleted` is true once the service has confirmed every
+object, and false while some are asked and not confirmed. The call waits for the first pass of the
+carrier that begins after the request is written down, and no longer than thirty seconds. A copy in
+the second state is listed as deletion asked and not yet confirmed, and stays deletable: asking
+again sends what is unanswered. Without a second ask the carrier sends it once privacy mode is off,
+also after a restart, because the written-down request is what survives. The call keeps no record of
+its action, so asking again for the same copy asks the service again, which is safe.
+
+A generation whose deletion is written down is no backup the host has. Retention keeps the newest
+generations that are not being deleted, so deleting the newest does not let the one before it go.
+When the newest generation is the one deleted, the producer makes the next one at its first pass
+after privacy mode is off, whatever has changed and however recently the deleted one was made, and
+until then no restore works: the restore takes the newest publication, and the service prunes
+nothing.
 
 Copies held by authorised viewers are listed with the rest of what has left the host, because a device
 that was let see a session may hold what it was shown, on a screen or in its own scrollback, and this
@@ -4905,9 +5048,14 @@ what it removes is exactly the thing a person cannot check for themselves.
 
 * **A worker that claims its reservation and then fails keeps its obligation.** A worker that
   reports it could not start after it claimed its reservation, or that ended before it said its
-  cleanup was complete, is taken for ended. Its obligation is preserved, and the report names the
-  archive as what holds whatever it kept. Differently, a launch that fails before any claim is
-  forgotten, since it ran no shell.
+  cleanup was complete, is taken for ended. Its obligation is preserved until the archive has
+  removed whatever it kept, or found nothing of it on the disk, and the report names the archive
+  as what holds it until then. Differently, a launch that fails before any claim is forgotten,
+  since it ran no shell.
+* **Change sets are not stopped.** A change set is the person's own capture of repository work
+  under file grants, and stopping it would stop the completion, test and review workflow under
+  privacy mode; the "outboxes and captures" privacy mode fences are session content: output,
+  descriptions and the queues that carry them off this host.
 * **Transfer previews and sync are not driven.** The transfer service keeps no preview store for
   privacy mode to reach, and sync is the clients' own record; neither is one of the subsystems the
   daemon takes through the steps.
@@ -5039,11 +5187,12 @@ thread, a lock or a transaction. The check is the one every service asks from in
 whether this host owes a fence it could not raise, then whether the connection's registration still
 stands under the revision the mutation was admitted at, then whether its accepted deadline has
 passed. The service asks it under its own lock at each place a mutation starts a new effect, and
-every commit that makes such an effect durable runs while the daemon's connection table is held,
-from the check to the end of the commit. This way any withdrawal of the connection will either be
-committed before the check or after the commit of the mutation. If the check fails, nothing the
-action began becomes durable or visible, and the refusal is not kept as its answer: the same action
-sent again under an admission that stands is decided as a first admission. Finishing an effect that
+every commit that makes such an effect durable runs while the connection's registration is held
+standing against a withdrawal, from the check to the end of the commit. This way any withdrawal of
+the connection will either be committed before the check or after the commit of the mutation. If
+the check fails, nothing the action began becomes durable or visible, and the refusal is not kept
+as its answer: the same action sent again under an admission that stands is decided as a first
+admission. Finishing an effect that
 is already begun, such as completing a publication or a cancellation whose claim is committed, and
 the recovery at startup are not new effects, and the service does not ask again for them. A request
 whose envelope names a different session from the object its parameters name is refused, because the
@@ -5449,7 +5598,9 @@ reading of the host time contract from the daemon.
 
 ### Where its events come from
 
-Three sources in each session's journal reach it: the question ledger, whose events carry the moment
+Three sources in each session's journal reach it. The environment has sources of its own beside
+them: the workflow journal's alerts and the change-set store's versions, which come below, and its
+notices about its authority feed. The three of a session are: the question ledger, whose events carry the moment
 a request became pending; the transitions the session's broker records for the requests an
 application makes of a person, which is how an approval an application raises comes to be
 pending; and the journal's host events, which are the terminal side effects that had no
@@ -5566,6 +5717,35 @@ the owner's alone. A record announces nothing by itself: once a pass has read to
 journal's records, the timer pass decides what an item it raised is owed, as it does for a session
 after a page that reached the head of both its sources. `workflow.read` shows as alerts the
 attention records the journal does not yet record the store as having taken.
+
+### The change-set store's versions
+
+The change-set service is a source of review work. A change set's version numbers only go up, and
+each version's record names the session it was recorded for and the moment it was recorded. The
+daemon reads the newest version of each change set past what it has already read: at its start,
+before it serves anything; each time the service records a version; and two seconds after a pass
+that could not finish. A version a capture recorded, a version derived from a modified
+materialisation and a version whose pin then failed are read the same way, and nothing that
+captures has anything to announce.
+
+A version that is review work is recorded as a captured change set at that version, and as one
+change in its session's log. The change is dated by the moment the version was recorded and not
+the moment it was read, and its text is the host's own words: the identifiers of the version and
+of its change set, so a paired device is served it. Reading a version raises no inbox item; only a
+completed turn does. The records are numbered from the environment's own semantic source, in one
+transaction for each page, and the review state only goes forward, so a version read again after a
+restart is recorded once. A write the attention store refused is not counted as read, and the next
+pass offers the version again.
+
+After a pass, every change set whose newest version names a session this daemon holds has review
+work at that version. A session is held while a worker is known for it and after a closure is
+recorded for it. A version recorded for a session the daemon does not hold waits, and is read again
+at each pass and every minute, until the session is held. A version that names no session raises
+nothing, because a review subject belongs to a session: a capture that names none, and the
+versions a proposal apply derives into its destination's change set, are not review work. The pass
+cannot recover a version that was deleted, an older version of a change set that was captured into
+again afterwards, or the order the captures were made in. A workflow's capture node names a session
+only when its grant selects that session.
 
 ### The rule set
 
@@ -5839,9 +6019,11 @@ after it.
 Section 10 narrows retained content to the grant that asked for it, and this host cannot narrow a
 moment in time to an item's text: an item carries a sequence in its own source's records, which is
 not a cursor of any session's output, so the record of when output was produced gives it no time.
-That, and the absence of a page cut by a grant's bound, is why it refuses a retained history page to
-a paired device outright. An attention item is not a history page, so it is narrowed rather than
-refused: a caller that did not arrive over the local socket is served the host's own record of a condition (which
+That is why it serves a device no item's text. A history page is different: it is a byte range of
+one session's output, and the session's worker holds the record of when each part was written, so
+the worker cuts a live session's page to the grant (see "When output was produced"). An attention
+item has no such record, so it is narrowed rather than refused: a caller that did not arrive
+over the local socket is served the host's own record of a condition (which
 rule, at what level, how often and when) with the text left out and said to be left out, and no
 model summary either. The changed-since-last-visit view holds only the changes the host recorded
 at or after the moment the caller's history reaches back to. Its cursors end after the last change
@@ -5926,8 +6108,10 @@ same way: each transport write of session text is made through the daemon's rele
 it once the check fails, and a consumer whose transport would send held bytes later on its own
 cannot carry session text. No sender of this host meets that contract, so none carries any, and a
 request already handed to a transport can still leave within that sender's own deadline. Text read
-from a finished session's journal needs no lease, because no transition can follow a closure the
-host confirmed.
+from a finished session's journal carries no lease: it is held to the privacy state it was read under,
+as text a model wrote is, and a transition before the write withholds it. None is served while
+privacy mode is on or its cleanup of the session is owed, and once the archive has written the
+privacy state into the journal none from before it is.
 
 Privacy mode reports complete only once the daemon has recorded the new generation, which a request
 on the current attention connection says when it names that generation. Until then the worker's
@@ -5966,6 +6150,19 @@ state the daemon publishes says: a fence the journal has not reached, or has not
 nothing, and the store offers the same announcements again. Notifications are then built from the
 notices the journal holds, one for each destination whose recipient's grant reaches what the notice
 is about.
+
+The host's pairing outbox is the journal's other source. Every completed pairing is a notification
+to the owner's devices: the devices whose grant carries `host.manage` and whose history reaches the
+moment the pairing committed. The device that paired is left out by name: the event's key holds its
+identifier, so a pass that finishes a pairing after a stop leaves it out too. Each pass reads the
+outbox past the cursor the journal holds for it under a consumer of its own, commits the events and
+that cursor in one transaction, and the outbox keeps nothing for the journal. A pairing is dated and
+expires from the moment it committed, so one more than four hours old, read again from the start of
+the outbox after the journal was lost, has expired and sends nothing; a younger one is sent again,
+because the journal that remembered it is gone. The alert is the generic one for a session that
+needs attention, because the fixed vocabulary has no sentence for a pairing. The name the new device
+chose is a display text a person typed, so it travels only inside a push preview's seal and is in
+no external message.
 
 What travels to a device is an opaque identifier, a preview sealed to that device's own
 notification-preview key, an expiry, and a collapse identifier that is a keyed digest. The alert a
@@ -6012,7 +6209,8 @@ under the old one, and removing the destination deletes the credential with it.
 Privacy mode fences the delivery outbox at once, takes back what was never dispatched, removes the
 queued content, and does not report complete while a send of content from before the boundary is
 still on the wire. A pending question or approval still alerts a paired device, with no preview and
-none of its words, and nothing else decided while privacy mode is on is ever sent. Notifications
+none of its words, and so does a completed pairing; nothing else decided while privacy mode is on is
+ever sent. Notifications
 that already reached a provider are shown as retained artifacts, each saying that this host holds no
 way to recall it: there is no deletion action for a copy that is on somebody else's device or in
 somebody else's service, and the listing says so rather than offering one that would do nothing.
@@ -6090,6 +6288,17 @@ worker holds the public half and rotation is a procedure that closes them all.
 A grant is the authority a request is decided against. It names its issuer and its recipient, the
 authority revision it was issued under, the environments and sessions it covers, the actions it
 permits, how far back it may see, when it stops and which organisation membership it requires.
+
+A grant's history reaches back to the cursor it names. A pairing that names none reaches from its
+own start, the moment the host committed it, and a share that names none is given the moment it was
+issued. Both are readings of the host's wall clock, and unlike expiry they are not held against a
+clock that cannot go backwards. Each reader compares that number with the moments it holds for its
+own content: the times recorded for a session's output, when an attention item was first seen, when
+a session's last command ran. If the wall clock is stepped backwards after content was recorded, a
+grant begun within the size of the step has a start earlier than the readings of that content, and
+can reach what was recorded before the grant began. The host marks no row as written before such a
+step, so the history check does not withhold that content. Every reader that decides by the grant's
+first moment has this limit.
 
 Two stores hold grants. A pairing writes its grant into the device record.
 `crates/kr-controller/src/grants/` holds the grants this daemon issues through the sharing method
@@ -6249,9 +6458,14 @@ carries no notice, a viewer invited to answer the agent's questions carries `age
 the notices follow the actions and not the label. The role the host names beside a grant (in a
 `grant.held` offer, in `kr share list` and in the role line of `kr share invite`) is the widest role
 whose default actions the grant carries, a label for a person to read that the host never decides
-from. A viewer invited to answer is therefore named a viewer there, and the role line of
-`kr share invite` says what a viewer sees, so only the notices say what the grant lets the
-recipient do.
+from. A viewer invited to answer is named a viewer in an offer's role, since that is the widest
+role the grant carries in full, and the role line of `kr share invite` says what a viewer sees; the
+rights line after it names the rest. The lists that show a share put each right its role does not
+cover beside the role: `kr share list` prints `viewer plus question.respond`, and the companion's
+"Who has access", "Invitations" and "Shared with you" lists say that the viewer also answers the
+agent's questions. A grant that carries no role in full, because it has no `session.view`, is
+listed as custom with its rights. The lists leave out the notices, which the invitation form and
+the recipient's invitation card show.
 
 Restricted typed collaboration would be offered only where the upstream and the broker both enforce
 the boundary it states, and this host offers none today. A question always keeps its free-text
@@ -6640,7 +6854,9 @@ nothing of the refusal and reads no feed, so the refusal ends and a device the w
 confirms again. The owner pairs a new owner device, revokes the devices and grants the withdrawal
 names, sets `authority.origin` back and starts the daemon again. The cost is that the host serves the
 named devices until the owner has revoked them, and learns no remote revocation while it reads no
-feed. A feed that shows a revocation complete that no owner made cannot revive a device. It keeps
+feed. A host that bounds offline validity needs the route finished inside the bound: it synchronises
+with no feed meanwhile, and once the bound ends it refuses every remote request under a personal
+grant, a named owner device's among them. A feed that shows a revocation complete that no owner made cannot revive a device. It keeps
 remote access refused until the owner at the machine revokes what the request names or takes this
 route. While
 the refusal stands, the devices the request names keep no standing over the feed, and neither does a
@@ -6690,7 +6906,8 @@ the device, and the next scan then refuses the request, because the registry hol
 revoked; what the request named is not withdrawn. `kr doctor` names each such device and says so.
 Establishing the clock does not end the wait, because an owner device's confirmation is refused while
 the refusal stands. A reboot of the machine ends a lost continuity, and the host then judges the
-request at its place and carries it out.
+request again with the authority its issuer holds then. It can still refuse the request: the issuer's
+grant may have run out while the request waited.
 When the host has read the feed through it raises the registry to the feed's revision in one barrier
 that fences the workers and withdraws every connection admitted under the earlier state. The next
 revision it issues is then above everything it issued, and it decides again. A pass that stops
@@ -6736,14 +6953,16 @@ a standing the refusal took away. The wait asks for the pairing records' write l
 for as long as a write holds it. It ends when it has the lock and at no other point, so a refusal
 that has risen has returned only when every write to the pairing records that began before it has
 ended. A spend holds the lock for a few milliseconds; the wait goes on past that only for a write
-that does not end, or a registry that cannot take a write at all. The refusal stands meanwhile, the
+that does not end, a registry that cannot take a write at all, or an ask that the database does not
+answer. It asks on a connection of its own, so no other user of the daemon's handle on the pairing
+records waits for it. The refusal stands meanwhile, the
 carrier reads no more of the feed, and `kr doctor` shows the check as a warning that says the
 refusal waits for the registry to take a write, since when, and why; the log says it when the
 wait is first found stuck and when its reason changes. The
 wait asks again by itself and goes on when the registry takes a write. The feed's removal
-of the host does not wait: no owner confirmation reads it, so the carrier raises it and ends the
-links it reaches at once, and a start that restores it waits for nothing, since no endpoint is bound
-yet and no confirmation can be under way. What
+of the host does not wait: the carrier raises it and ends the links it reaches at once, and a start
+that restores it waits for nothing, since no endpoint is bound yet and no confirmation can be under
+way. A spend that read the removal clear before it rose commits after it. What
 a spend that had committed before the refusal rose goes on
 to do, such as trusting a catalogue or installing a plugin, commits under that spend. The terminal is left as it is: it confirms the pairing of a first
 owner and the end of exclusive organisation management, and on a host that has an owner it confirms
@@ -6764,6 +6983,21 @@ commits. The host does not end the link to the worker of a connection it newly r
 that checked the standing just before the change can commit under it, so input that a worker already
 holds for such a connection can still reach the terminal. The owner at the machine
 is never refused, and can stop any session locally.
+
+An owner confirmation that a remote owner device signed is spent under the standing of that
+device's pairing grant, so the removal refuses it, with `PERMISSION_DENIED` and the words of the
+removal, when that grant rests on the feed, and leaves it alone when it does not. The removal is read
+where the confirmation is spent, as it is at admission, and a spend that read it clear before it
+rose commits. A host can be left with no way to confirm: every owner device it has rests on the
+removed feed, and the terminal does not open. The terminal confirms the pairing of a first owner and
+the host's clock only while the host has no owner, and the end of exclusive organisation management
+only while the host is exclusive and no device that could confirm for it is left, which it counts
+without asking the removal. The owner then points `authority.origin` at another feed or at none and
+starts the daemon again, which ends the removal. A host that bounds offline validity adds a condition:
+the host reads no feed after the removal, so the bound runs from its last synchronisation, and once it
+ends the host refuses every remote request under a personal grant, an owner device's included. The
+owner then points `authority.origin` at a feed the host can synchronise with, or finishes the route
+inside the bound.
 
 The host also tells the feed which keys may remove it. These are the paired devices that may manage
 the host by the decision above, the eight oldest pairings if there are more, and `kr doctor` says
@@ -6881,8 +7115,9 @@ after any of its sources. A device whose grant reaches every moment, as an owner
 crosses no bound and is served a summary as the owner is.
 What a model wrote of a session is shown to a device whose history reaches the session's start,
 decided as a summary derived from the interval that is that moment, and a session whose start is
-not known is shown none of it. A retained history page and an export are not served to a paired
-device at all.
+not known is shown none of it. A live session's retained history page is served to a paired device
+cut to what its grant reaches, as the History paragraph above describes. A closed session's page
+and an export are not served to one.
 
 A live-only invitation reaches the currently visible screen and nothing else. Snapshot installation
 goes through the filtered projection rather than the worker's unrestricted state, so the buffer that
@@ -7074,19 +7309,79 @@ terminal.
 
 Within a session, one live instance at a time holds a saved conversation. A launch intent that
 names a saved conversation is refused, and names the instance that owns it, while that live
-instance holds the conversation; an instance in another session is not seen. A native thread
-selection moves the reservation with it, so the conversation an instance left is free and the one it
-took is not. An instance holds a conversation when its bridge reports that it selected one, and a
-program the host adopted from the terminal holds none.
+instance holds the conversation. A native thread selection moves the reservation with it, so the
+conversation an instance left is free and the one it took is not. An instance holds a conversation
+when its bridge or its gateway's stream reports that it selected one, and when the command that
+launched it named one.
 
-Nothing in the host replaces a running agent with a second run of its saved conversation. An agent
-process starts only from the managed shell: from a command the person typed, or from one a client
-installed at the empty prompt with `shell.launch`. The broker records no saved conversation for
-either, even when the command resumes one, so the guard above covers a launch intent that names a
-conversation and a bridge's selection, and not a command line that resumes a conversation by
-itself. If a bridge reports that an instance selected a conversation another live instance of the
-same session holds, the host refuses the selection: the instance is left with no thread vouched for,
-and rich mutations stay suspended until the binding is verified again.
+An agent process starts only from the managed shell: from a command the person typed, or from one a
+client installed at the empty prompt with `shell.launch`. When the command is one a package's
+backend declaration applies to, the saved conversation the launch works on is the first bare word
+after the command's launching word, whatever follows it: the identifier, or the name the
+application resumes the conversation by. The rule is the same for every launching word, `fork`
+included, because the package declares which words launch and the host does not know what an
+application's word means. A launch that types no such word, or an option in its place, names none.
+The word is held for as long as the execution lives, beside the identifier the stream names once
+the application has resolved it, since a name and the identifier it resolves to are one
+conversation that the host cannot tell apart. The exception is a word that the stream itself names
+as the execution's conversation, as it does an identifier: that word is held only while the
+execution is in that conversation, and is free once the execution selects another or none.
+
+The claim is host-wide. Every worker of the user takes an operating-system lock on a file that
+names the conversation, in the directory `conversation-claims-1` of the state root, and keeps it
+for as long as it holds the conversation. The file is empty and is named by the SHA-256 of the
+word, in lower-case hexadecimal, and `.lock`. The control daemon plays no part: a worker that
+cannot take the lock refuses the launch before it starts anything, and the kernel lets go of the
+locks of a worker that ends, whichever way it ends. A second launch of a held conversation, in this
+session or another, is not served a second server: its program runs as typed and nothing of the
+launch is left published. The launcher prints its own reason for the refusal. The host keeps a
+reason of its own for diagnostics: it names the instance when one of this session's instances
+holds the conversation, and says only that an execution of this session or another, or the server
+it started, still holds it when the claim refused the launch.
+
+A claim lasts until what runs against the conversation is gone. When the program ends, its
+instance ends with it and its server is retired: the input is closed, the server is asked to
+terminate and, after the grace period, ended by force. The conversation is free for another session
+once that retirement is over, and not before. A retirement that leaves a process running keeps the
+claim until the worker ends. A person who quits the agent and starts the same conversation again
+within the retirement, in this session or another, has the second launch run as typed.
+
+A directory of claims that cannot be made or used refuses the launch of a saved conversation and
+the selection of a thread by a stream, because nothing then says that no one holds it. The launch
+runs as typed and the instance has no thread vouched for, so rich mutations stay suspended. A launch
+that names no conversation needs no claim and is served, but its stream's selection of a thread is
+refused in the same way. The worker writes the reason to its log.
+
+What the claim does not do:
+
+* It holds between workers of builds that carry it. A worker of an earlier build, such as a session
+  that was running when the host was updated, takes no claim and sees none, so between it and a new
+  session neither refuses the other. The window is the age of the oldest such session.
+* A worker killed with no goodbye lets go of its claims at once, and a server that ignores the end
+  of its input can run on until the daemon ends it.
+* A program the host adopted from the terminal, or one started outside the managed shell, holds no
+  claim until a stream or a bridge names its conversation; the selection is then checked across
+  sessions. If it is refused, the instance has no thread vouched for and rich mutations stay
+  suspended until the binding is verified again.
+* A name and the identifier it resolves to are one conversation that the host cannot tell apart
+  until the stream names the thread. Until then a second session can launch by the identifier and
+  be served. The first execution to claim the identifier, by a launch or by a stream's selection,
+  keeps it, and the other's selection is refused: its instance has no thread vouched for.
+* The key is the word alone. Two applications that give one name to different conversations, a
+  `fork` of a held conversation, two directories that use one name, and different data directories
+  for one identifier are refused: the program runs as typed and loses the integration, nothing else.
+* It reaches the operating-system user and the state root. Environments with different state roots
+  and other users do not see each other.
+* The files are never removed, so there is one empty file for each distinct word the user has
+  claimed.
+* The directory, the file name and the lock are what workers of different builds must agree on. A
+  later build that changes any of them takes both forms for as long as the workers of an earlier
+  build can run.
+
+If a bridge or a stream reports that an instance selected a conversation that another live
+instance of this session or another session holds, or that the server of an instance that has
+ended still runs against, the host refuses the selection: the instance is left with no thread
+vouched for, and rich mutations stay suspended until the binding is verified again.
 
 ### What a launch reads of its application's mode
 
@@ -7268,6 +7563,17 @@ notification that says a request was answered or cleared. Each names a routed me
 its message, from the root of the message, inside the member the table names for that kind of
 message. The core reads those places itself; nothing a component says is read, and a conversation is
 never taken from matching prompt text and timestamps.
+
+What the stream says of the conversation and the turn is also history of the instance, which
+`agent.snapshot` serves: a `thread.started` entry when the binding takes a thread, a `thread.ended`
+entry when it ends up with none (the terminal leaves the thread, or the server closes it), a
+`turn.started` entry when a turn starts in the bound conversation, a `turn.ended` entry when that
+turn ends and a `turn.dropped` entry when the binding moves while a turn runs, on any route that
+moves a binding. The text of each is the identifier it
+names. Each entry names the binding revision and the turn it was observed under, so what one owner
+said is never read as the words of the owner that followed it. A message about a conversation the
+terminal is not in records nothing. When the instance's history has used every entry number it has,
+an entry is lost and the transition it describes still happens.
 
 A success reply to a selecting request names a thread, and the binding takes it. The revision
 advances only when the thread changed, and the unread thread's reason ends. A conversation another
@@ -7904,7 +8210,31 @@ transport's own call that takes the operation runs on a thread of its own, and t
 it and for the upstream's answer for ten seconds at most, so a transport that blocks cannot hold the
 caller past them. At that bound an answer's resource is settled as uncertain first, the receipt then
 records an outcome nobody can establish, and only then is the caller told `UPSTREAM_UNAVAILABLE`.
-What the transport does afterwards settles nothing.
+What the transport does afterwards settles nothing for an answer.
+
+An operation this host sent as its own request is different, because the host minted the identifier
+it was sent under and the upstream's reply names it. When the receipt says unknown and a reply to
+that identifier comes later, the reply is correlation evidence: a result makes the receipt applied
+and clears the failure of the wait, an error that says the frame was never a call the upstream could
+make (the reserved parse, request, method and parameter codes) makes it refused with that error,
+and any other error is recorded and settles nothing. The evidence is an observation with the
+upstream-correlation provenance, written in the same commit as the new state. The result the
+receipt then keeps is the one the operation has when its reply comes in time. It names the
+identifier the operation was sent under and the turn it was admitted against (a prompt learns its
+turn from its reply, which is not read late, so a late prompt names none), and the result of a
+package's action names the action as well. The evidence never moves a receipt that is not unknown,
+a second reply to one identifier is recorded once, and a connection that ended before the reply
+keeps nothing, so a reply that reaches a later connection under the same text of identifier is not
+read, and an operation that gives up after the connection ended claims nothing.
+
+Two limits keep the evidence bounded, and past either an operation stays unknown, as it did before
+the reply was kept. A connection keeps the sixteen newest replies that no operation has claimed,
+and that includes a reply an operation's wait took in time, since the wait can end in the moment
+the reply comes: sixteen later replies of any kind push an older one out before its operation
+claims it. A connection also holds at most sixteen claims, and a claim stays until its reply comes
+or the connection ends, so after sixteen operations that get no reply, a further operation's claim
+is refused, and a reply that comes after that operation gave up settles nothing unless it was
+kept before the claim.
 
 A binding's actions are registered from its package's declarations and from nothing else. The
 grant, the effect, the capability, the operation and the rights of each follow from its declared
@@ -7962,10 +8292,13 @@ name the resource it answers. The action must be registered for this binding wit
 `approval.respond` effect, and the binding must still hold that action's grant. This binding must be
 the resource's decoder, because the answer carries the decoder's meaning, and the decision, read
 from the parameter the action names for it, must be one the interpretation offered. No action token
-is issued and no component is asked: the answer is written from the connection's own table under
-the approval's claim, and the method answers with its own result, the mutation and the action.
+is issued. Who writes the answer depends on who read the request: a request the connector's table
+read is answered from the connection's own table under the approval's claim, and a request a
+component read is answered by that component, as `agent.approval.respond` does. The method answers
+with its own result, the mutation and the action.
 
-An adapter checkpoints the cursor it consumed, and the cursor survives a restart. A restart resumes
-the numbering after it, so a new entry never takes a cursor an adapter has already passed and a
-replay from before the restart is a visible gap rather than a silently empty answer. A range that
-was evicted rebuilds from what is verifiably retained and says there is a gap.
+A history belongs to one instance and ends with it. An instance's identifier is its own for good, so
+no cursor of another life of the host is read as one of this instance's, and no number is given
+twice within it. A cursor is the reader's: `agent.snapshot` takes the node a reader wants next, the
+last one it consumed plus one, and the host keeps no cursor for a reader. A range that was evicted
+rebuilds from what is verifiably retained and says there is a gap.

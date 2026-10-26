@@ -1623,6 +1623,149 @@ async fn a_refused_read_keeps_its_code_and_the_answer() {
     assert_eq!(host.answers_received(), 1);
 }
 
+/// Runs `kr question answer` for the host's question and returns its status and document.
+fn answer_it(host: &Host) -> (Option<i32>, Value) {
+    host.json(&["question", "answer", &host.question(), "--choice", "left"])
+}
+
+/// KR-REQ-11.63: a worker that cannot be asked at the first read is not taken for a session that
+/// lacks the question. There is no question to answer then, so nothing is kept and nothing is
+/// sent, and the command reports why the worker could not be asked: it could not be reached, it
+/// refused the read (as a worker whose membership lease ended does), or its read failed another
+/// way. The search goes on past a worker that was asked and lists no question. The control is a
+/// worker that was asked and lists no question, which is what makes a question unknown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_that_cannot_be_asked_is_not_taken_for_one_that_lacks_the_question() {
+    let mut host = Host::start(Behaviour::Serves).await;
+    host.stop_worker().await;
+    let (status, document) = answer_it(&host);
+    assert_eq!(status, Some(3), "{document}");
+    assert!(document.get("kept").is_none(), "{document}");
+    let message = document["message"].as_str().expect("a message");
+    assert!(message.contains("could not reach session"), "{message}");
+    assert!(
+        !host.kept().exists(),
+        "a question that was not shown keeps nothing"
+    );
+    assert_eq!(host.answers_received(), 0);
+
+    // The worker refuses to show its questions.
+    let host = Host::start(Behaviour::RefusesReads).await;
+    let (status, document) = answer_it(&host);
+    assert_eq!(status, Some(8), "{document}");
+    assert_eq!(document["code"], "PERMISSION_DENIED", "{document}");
+    assert!(document.get("kept").is_none(), "{document}");
+    assert!(!host.kept().exists());
+    assert_eq!(host.answers_received(), 0);
+
+    // The worker is reached and its read fails.
+    let host = Host::start(Behaviour::DisownsItsSession).await;
+    let (status, document) = answer_it(&host);
+    assert_eq!(status, Some(8), "{document}");
+    assert_eq!(document["code"], "UNKNOWN_SESSION", "{document}");
+    assert!(!host.kept().exists());
+    assert_eq!(host.answers_received(), 0);
+
+    // A worker that was asked and lists nothing does not end the search: the session after it
+    // could not be reached, and the question may be there.
+    let host = Host::start(Behaviour::ListsNoQuestions).await;
+    leave_a_descriptor_behind(&host);
+    let (status, document) = answer_it(&host);
+    assert_eq!(status, Some(3), "{document}");
+    let message = document["message"].as_str().expect("a message");
+    assert!(message.contains("could not reach session"), "{message}");
+    assert!(!host.kept().exists());
+    assert_eq!(host.answers_received(), 0);
+
+    // The control: every worker was asked, and none lists the question.
+    let host = Host::start(Behaviour::ListsNoQuestions).await;
+    let (status, document) = answer_it(&host);
+    assert_eq!(status, Some(2), "{document}");
+    assert_eq!(document["code"], "INVALID_ARGUMENT", "{document}");
+    assert!(!host.kept().exists());
+    assert_eq!(host.answers_received(), 0);
+}
+
+/// Publishes the descriptor of a second session whose worker is not there, as an ended worker
+/// leaves one behind.
+fn leave_a_descriptor_behind(host: &Host) {
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let display = DisplayNumber::new(2);
+    let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+    let process = kr_ipc::identity::current_process_start_identity().expect("a process identity");
+    let identity = WorkerIdentity::generate(
+        session_id,
+        SessionEpoch::V1,
+        boot.clone(),
+        process.clone(),
+        PROTOCOL_VERSION,
+    )
+    .expect("a worker identity");
+    let descriptor = WorkerDescriptor {
+        session_id,
+        session_epoch: SessionEpoch::V1,
+        environment_id: host.environment.environment_id(),
+        display_number: display,
+        boot_identity: boot,
+        process_start_identity: process,
+        protocol_version: PROTOCOL_VERSION,
+        endpoint: host
+            .environment
+            .worker_endpoint(display)
+            .expect("an endpoint")
+            .as_text(),
+        worker_public_key: *identity.public_key(),
+        worker_profile: WorkerProfile::HeadlessUser,
+        published_at_ms: TimestampMs::new(kr_ipc::now_ms().get()),
+    };
+    kr_ipc::descriptor::publish(&host.environment, &descriptor).expect("publishes the descriptor");
+}
+
+/// KR-REQ-11.63: when a worker of an earlier build was not read and another worker could not be
+/// reached, the refusal names both, so the person is not told the question is in the first alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_that_cannot_be_reached_is_named_beside_one_of_an_earlier_build() {
+    let host = Host::start(Behaviour::IsOfAnEarlierBuild).await;
+    leave_a_descriptor_behind(&host);
+    let question = host.question();
+    let (status, document) = host.json(&["question", "answer", &question, "--choice", "left"]);
+    assert_eq!(status, Some(8), "{document}");
+    assert_eq!(document["code"], "UNSUPPORTED_SCHEMA", "{document}");
+    let message = document["message"].as_str().expect("a message");
+    assert!(message.contains("earlier build"), "{message}");
+    assert!(
+        message.contains("Session 2 could not be asked either"),
+        "{message}"
+    );
+    assert!(message.contains("could not reach session"), "{message}");
+    assert!(!host.kept().exists());
+    assert_eq!(host.answers_received(), 0);
+}
+
+/// KR-REQ-11.63: a session whose descriptor cannot be read cannot be asked, so a question no other
+/// session lists is not unknown: the worker behind the descriptor may hold it. The control is the
+/// same host without the unreadable descriptor, where every session was asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_descriptor_that_cannot_be_read_is_not_taken_for_a_session_without_the_question() {
+    let host = Host::start(Behaviour::ListsNoQuestions).await;
+    let (status, document) = answer_it(&host);
+    assert_eq!(status, Some(2), "{document}");
+
+    let unreadable = host
+        .environment
+        .descriptor_file(SessionId::new(kr_ipc::new_uuid()));
+    std::fs::write(&unreadable, b"not a descriptor").expect("a file that is not a descriptor");
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o600))
+        .expect("readable by its owner alone, as a descriptor is");
+    let (status, document) = answer_it(&host);
+    assert_eq!(status, Some(3), "{document}");
+    assert!(document.get("kept").is_none(), "{document}");
+    let message = document["message"].as_str().expect("a message");
+    assert!(message.contains("cannot be read"), "{message}");
+    assert!(!host.kept().exists());
+    assert_eq!(host.answers_received(), 0);
+}
+
 /// KR-REQ-11.63: a reply that is not a message is the worker's own answer, not a lost connection,
 /// so the answer is shown as refused and not kept, as the drafts library rules.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

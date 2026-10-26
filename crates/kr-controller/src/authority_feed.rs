@@ -78,7 +78,7 @@ use crate::grants::Refusal;
 use crate::grants::feed::{FEED_POLL_INTERVAL_MS, RetainedRevocation};
 use crate::quiet::{Quiet, Timer};
 use crate::service::Controller;
-use crate::service::remote_revocation::{DrainWhy, Judged, Replay, Unverified};
+use crate::service::remote_revocation::{DrainWhy, Judged, Replay, StuckDrain, Unverified};
 
 /// The deadlines the feed's exchanges are made under. A request and its answer are small.
 pub const FEED_DEADLINES: HttpDeadlines = HttpDeadlines {
@@ -563,31 +563,7 @@ impl FeedRuntime {
             detail
         };
         let detail = match stuck {
-            Some(stuck) => {
-                let waited = now.saturating_sub(stuck.since_ms) / 1000;
-                let detail = detail.stated(
-                    "; a refusal this host raised on remote grants waits for the registry to take \
-                     a write, so this host reads no more of the feed until it has: ",
-                );
-                match stuck.why {
-                    DrainWhy::Held => detail
-                        .stated(
-                            "a write to the pairing records has held the registry's write lock \
-                             for at least ",
-                        )
-                        .number(waited)
-                        .stated(" seconds"),
-                    DrainWhy::Unanswered => detail
-                        .stated("the ask for the registry's write lock has not been answered for at least ")
-                        .number(waited)
-                        .stated(" seconds"),
-                    DrainWhy::Failed(kind) => detail
-                        .stated("the registry could not take the write for at least ")
-                        .number(waited)
-                        .stated(" seconds, because ")
-                        .stated(kind),
-                }
-            }
+            Some(stuck) => the_wait_for_the_registry(detail, &stuck, now),
             None => detail,
         };
         let detail = if observed.unnamed_owners > 0 {
@@ -669,9 +645,11 @@ macro_rules! unverified_remedy {
          request names every owner device, remove `authority.origin` from the configuration \
          document and start the daemon again, which ends the refusal because the host keeps none \
          of it. Then pair a new owner device, revoke what the request names, set \
-         `authority.origin` back and start the daemon again. Until you revoke them, this host \
-         serves the devices the request names, and while it reads no feed it learns no remote \
-         revocation."
+         `authority.origin` back and start the daemon again. If this host bounds offline \
+         validity, finish this inside the bound: once it ends, the host refuses every remote \
+         request under a personal grant, an owner device's included. Until you revoke them, this \
+         host serves the devices the request names, and while it reads no feed it learns no \
+         remote revocation."
     };
 }
 
@@ -705,6 +683,38 @@ const STUCK_DRAIN_REMEDY: &str = "This host asks again by itself and goes on onc
 
 /// How many of each of the issuers, devices and grants a withdrawal names a check says by name.
 const MOST_NAMED: usize = 8;
+
+/// What `kr doctor` says of a refusal that waits for the registry to take a write: how long the
+/// wait has gone on in all, and why it has not ended, with the time of the reason that stands now.
+/// A reason can have replaced another, so the two times differ.
+fn the_wait_for_the_registry(detail: Sentence, stuck: &StuckDrain, now_ms: u64) -> Sentence {
+    let in_all = now_ms.saturating_sub(stuck.since_ms) / 1000;
+    let this_long = now_ms.saturating_sub(stuck.why_since_ms) / 1000;
+    let detail = detail
+        .stated(
+            "; a refusal this host raised on remote grants waits for the registry to take a \
+             write, as it has for at least ",
+        )
+        .number(in_all)
+        .stated(" seconds, so this host reads no more of the feed until it has: ");
+    match stuck.why {
+        DrainWhy::Held => detail
+            .stated(
+                "a write to the pairing records has held the registry's write lock for at least ",
+            )
+            .number(this_long)
+            .stated(" seconds"),
+        DrainWhy::Unanswered => detail
+            .stated("the ask for the registry's write lock has not been answered for at least ")
+            .number(this_long)
+            .stated(" seconds"),
+        DrainWhy::Failed(kind) => detail
+            .stated("the registry could not take the write for at least ")
+            .number(this_long)
+            .stated(" seconds, because ")
+            .stated(kind),
+    }
+}
 
 /// Names `grant` in a sentence. A grant is identified by a UUID this host generated, as a device is,
 /// and the identifiers a sentence may name in full are a closed list that does not hold the
@@ -946,12 +956,13 @@ async fn pass(
             // after it. That record waits as well, and so does anything that would revoke its issuer,
             // while the scan goes on reading, to settle the refusals and catch up.
             if let Some(waiting) = undecided.as_mut() {
-                let held = !shown_complete(record)
+                let waits = !shown_complete(record);
+                let held = waits
                     || controller
-                        .would_revoke_one_of(&record.request, &waiting.issuers)
+                        .would_revoke_one_of(&record.request, &waiting.issuers())
                         .map_err(Stopped::local)?;
                 if held {
-                    waiting.issuers.insert(record.request.issuer_device_id);
+                    waiting.hold(record.request.issuer_device_id, waits);
                     contiguous = false;
                     continue;
                 }
@@ -967,21 +978,37 @@ async fn pass(
                     // this machine has dealt with what it names.
                     contiguous = false;
                     found.extend(&these);
-                    controller
-                        .note_unverified_withdrawal(&found)
-                        .await
-                        .map_err(Stopped::local)?;
+                    let (wait_owed, keys) =
+                        controller.refuse_for_an_unverified_withdrawal(&found).await;
+                    if let Err(error) = keys {
+                        // The refusal stands, and a later scan owes no wait for it.
+                        if wait_owed {
+                            controller.wait_for_the_confirmations_being_spent().await;
+                        }
+                        return Err(Stopped::local(error));
+                    }
                     shared.observed().unverified = true;
                     // The feed takes a removal from the keys it lists, so the keys of the devices
                     // this names are taken out of the list now, not when the scan has read the
-                    // feed through: a scan that stops half way leaves the list as it is. A change
-                    // the feed turns back stops the pass like any other request it turns back,
-                    // with the delay it asked for.
-                    if withhold_from_the_feed(shared, controller, &mut now).await?
-                        == Delegation::Removed
-                    {
-                        return removed(shared, controller).await;
+                    // feed through, and before the wait for the registry: a write that is held
+                    // keeps the wait from ending, and the list must not wait with it. A scan that
+                    // stops half way leaves the list as it is. A change the feed turns back stops
+                    // the pass like any other request it turns back, with the delay it asked for.
+                    let delegation = withhold_from_the_feed(shared, controller, &mut now).await;
+                    if matches!(delegation, Ok(Delegation::Removed)) {
+                        // The removal is recorded first: a registry that cannot take a write must
+                        // not keep it from being recorded and shown. The wait this raise owes
+                        // follows.
+                        let ended = removed(shared, controller).await;
+                        if wait_owed {
+                            controller.wait_for_the_confirmations_being_spent().await;
+                        }
+                        return ended;
                     }
+                    if wait_owed {
+                        controller.wait_for_the_confirmations_being_spent().await;
+                    }
+                    delegation?;
                 }
                 Settled::Waiting => {
                     contiguous = false;
@@ -998,7 +1025,8 @@ async fn pass(
                     contiguous = false;
                     undecided.get_or_insert_with(|| Undecided {
                         refusal,
-                        issuers: [record.request.issuer_device_id].into_iter().collect(),
+                        requesters: [record.request.issuer_device_id].into_iter().collect(),
+                        held: std::collections::BTreeSet::new(),
                     });
                 }
                 Settled::Removed => return removed(shared, controller).await,
@@ -1132,7 +1160,7 @@ fn waiting_issuers_the_withdrawal_names(
         .filter(|waiting| matches!(waiting.refusal, Refusal::ClockUnproven))
         .map(|waiting| {
             waiting
-                .issuers
+                .requesters
                 .iter()
                 .filter(|issuer| found.devices.contains_key(issuer))
                 .copied()
@@ -1262,9 +1290,31 @@ enum Settled {
 #[derive(Clone, Debug)]
 struct Undecided {
     refusal: Refusal,
-    /// The devices that made the requests that wait for it, those behind it that are not complete
-    /// and the complete records held because they would revoke one of these.
-    issuers: std::collections::BTreeSet<DeviceId>,
+    /// The devices that made the requests that wait: the one that cannot be decided and those behind
+    /// it that are not complete. Revoking one of them refuses its request.
+    requesters: std::collections::BTreeSet<DeviceId>,
+    /// The devices that made the complete records held because they would revoke one of the
+    /// others. Revoking one of them dismisses its record, which carries out nothing, and what it
+    /// names stays served.
+    held: std::collections::BTreeSet<DeviceId>,
+}
+
+impl Undecided {
+    /// Notes the issuer of a record that waits behind the undecided request. A request that is not
+    /// complete waits for the one before it, and revoking its issuer refuses it. A complete record
+    /// waits only to keep its order, and is dismissed if its issuer is revoked.
+    fn hold(&mut self, issuer: DeviceId, waits: bool) {
+        if waits {
+            self.requesters.insert(issuer);
+        } else {
+            self.held.insert(issuer);
+        }
+    }
+
+    /// Every device whose record or request waits.
+    fn issuers(&self) -> std::collections::BTreeSet<DeviceId> {
+        self.requesters.union(&self.held).copied().collect()
+    }
 }
 
 /// Whether the feed shows the record's request completed by this host, and not refused.
@@ -1527,6 +1577,67 @@ fn revision_record(
 mod tests {
     use super::*;
     use futures_util::FutureExt as _;
+
+    /// KR-REQ-24.15: `kr doctor` says that revoking a device refuses its request only for a device
+    /// that made a request that waits. A device that made a complete record held behind it is not
+    /// named: revoking it dismisses the record, which carries out nothing, and refuses nothing. A
+    /// device that made both is named.
+    #[test]
+    fn the_doctor_names_only_the_devices_whose_waiting_request_a_revocation_would_refuse() {
+        let device = |byte: u8| DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([byte; 16]));
+        let (requester, held_only, both) = (device(1), device(2), device(3));
+        // The undecided request is the first requester's. The records behind it are sorted as the
+        // scan sorts them: a request that is not complete waits, and a complete record is held.
+        let mut waiting = Undecided {
+            refusal: Refusal::ClockUnproven,
+            requesters: [requester].into_iter().collect(),
+            held: std::collections::BTreeSet::new(),
+        };
+        waiting.hold(held_only, false);
+        waiting.hold(both, false);
+        waiting.hold(both, true);
+        let found = Unverified {
+            devices: [(requester, 1), (held_only, 1), (both, 1)]
+                .into_iter()
+                .collect(),
+            ..Unverified::default()
+        };
+        let mut named = waiting_issuers_the_withdrawal_names(Some(&waiting), &found);
+        named.sort();
+        assert_eq!(
+            named,
+            vec![requester, both],
+            "the devices whose waiting request a revocation refuses, and not the held record's"
+        );
+    }
+
+    /// KR-REQ-24.15: `kr doctor` gives a refusal that waits for the registry the time the wait has
+    /// gone on in all, and gives the reason that stands now its own time: a reason that replaced
+    /// another has not stood for as long as the wait has gone on.
+    #[test]
+    fn the_doctor_gives_a_later_reason_its_own_time_beside_the_waits() {
+        let stuck = StuckDrain {
+            since_ms: 0,
+            why_since_ms: 600_000,
+            why: DrainWhy::Failed("the disk is full"),
+        };
+        let check = DoctorCheck::new(
+            "authority-feed",
+            "This host reads its remote revocations from its authority feed",
+            DoctorStatus::Warning,
+            the_wait_for_the_registry(Sentence::new(), &stuck, 605_000),
+            None,
+        );
+        let said = check.detail();
+        assert!(
+            said.contains("as it has for at least 605 seconds"),
+            "the wait's time in all: {said}"
+        );
+        assert!(
+            said.contains("for at least 5 seconds, because the disk is full"),
+            "the reason's own time, and not the wait's: {said}"
+        );
+    }
 
     /// A request a host acknowledges again on every pass while some of its sessions have yet to
     /// confirm it announces once, and again when how much is confirmed changes. The daemon's

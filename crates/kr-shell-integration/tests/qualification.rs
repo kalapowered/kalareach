@@ -2686,13 +2686,53 @@ fn change_name(change: &str) -> &str {
     change.split([',', ';']).next().unwrap_or(change).trim()
 }
 
+/// The identifiers of the change a triage row names: the words of its name that carry a digit and
+/// a hyphen or a dot inside them, such as `CVE-2026-69806`, `GHSA-r9hj-j2rw-4q3m`, `zsh-5.9.3` or
+/// `v7.4.21`. A name with none of them is its own identifier.
+fn change_identifiers(change: &str) -> Vec<String> {
+    let name = change_name(change);
+    let found: Vec<String> = name
+        .split_whitespace()
+        .map(|word| word.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|word| {
+            word.chars().any(|c| c.is_ascii_digit()) && word.chars().any(|c| c == '-' || c == '.')
+        })
+        .map(str::to_owned)
+        .collect();
+    if found.is_empty() {
+        vec![name.to_owned()]
+    } else {
+        found
+    }
+}
+
+/// Whether `text` names `identifier` as a whole: not as part of a longer word or number, which is
+/// what the daily check reads a row for.
+fn mentions(text: &str, identifier: &str) -> bool {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    text.match_indices(identifier).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let mut after = text[at + identifier.len()..].chars();
+        let next = after.next();
+        let behind_ok = before.is_none_or(|c| !(word(c) || c == '.' || c == '-'));
+        let ahead_ok = match next {
+            None => true,
+            Some(c) if word(c) || c == '-' => false,
+            Some('.') => !after.next().is_some_and(|d| d.is_ascii_digit()),
+            Some(_) => true,
+        };
+        behind_ok && ahead_ok
+    })
+}
+
 /// The rows that are still `scheduled` past their target release and are the newest assessment of
-/// their change, as lines to print.
+/// their change for a package, as lines to print.
 ///
-/// The newest row about a change is the assessment that stands, and the rows before it are the
-/// record of what was thought earlier, so a `scheduled` row that a later row about the same
-/// change and package replaces is history and not a missed deadline. A later row is one of the
-/// same day or after, further down the table.
+/// One rule picks the assessment that stands, here and in the daily check of the upstreams: rows
+/// are ordered by their date and, within one day, by their place in the table, and of the rows
+/// that name a package and mention an identifier of a change the last is the assessment, while the
+/// rows before it are the record of what was thought earlier. A row that names several packages
+/// stands for each of them apart, so a later row for one package leaves the others waiting.
 fn scheduled_past_their_target(triage: &[Vec<String>], now: (i64, u32, u32)) -> Vec<String> {
     let mut late = Vec::new();
     for (index, row) in triage.iter().enumerate() {
@@ -2702,20 +2742,27 @@ fn scheduled_past_their_target(triage: &[Vec<String>], now: (i64, u32, u32)) -> 
         if status != "scheduled" || as_date(target_release) >= now {
             continue;
         }
-        let replaced = triage[index + 1..].iter().any(|later| {
-            let [later_date, later_change, later_packages, ..] = later.as_slice() else {
-                return false;
-            };
-            as_date(later_date) >= as_date(date)
-                && change_name(later_change) == change_name(change)
-                && later_packages
-                    .split(", ")
-                    .any(|package| packages.split(", ").any(|own| own == package))
-        });
-        if !replaced {
+        let identifiers = change_identifiers(change);
+        let waiting: Vec<&str> = packages
+            .split(", ")
+            .filter(|package| {
+                !triage.iter().enumerate().any(|(other, later)| {
+                    let [later_date, later_change, later_packages, ..] = later.as_slice() else {
+                        return false;
+                    };
+                    (as_date(later_date), other) > (as_date(date), index)
+                        && later_packages.split(", ").any(|own| own == *package)
+                        && identifiers
+                            .iter()
+                            .any(|identifier| mentions(later_change, identifier))
+                })
+            })
+            .collect();
+        if !waiting.is_empty() {
             late.push(format!(
-                "{date}: {} (target {target_release})",
-                change_name(change)
+                "{date}: {} (target {target_release}) for {}",
+                change_name(change),
+                waiting.join(", ")
             ));
         }
     }
@@ -2723,11 +2770,14 @@ fn scheduled_past_their_target(triage: &[Vec<String>], now: (i64, u32, u32)) -> 
 }
 
 /// KR-REQ-07.88: a row that is still scheduled after its target stands as a missed deadline only
-/// when it is the newest assessment of its change.
+/// when it is the newest assessment of its change for a package.
 ///
-/// A replacement appended beneath a scheduled row makes that row history, and a row about another
-/// change, another package or an earlier day replaces nothing. The deadline is read from the
-/// table's own rows with a date as the caller's, so the case does not depend on the day it runs.
+/// The newest assessment is the last row, by date and then by place in the table, that names the
+/// package and mentions an identifier of the change, wherever it stands in the table and however
+/// it is worded. A replacement replaces a row for the packages it names alone, and a row about
+/// another change, another package or an earlier day replaces nothing. The deadline is read from
+/// the table's own rows with a date as the caller's, so the case does not depend on the day it
+/// runs.
 #[test]
 fn a_scheduled_row_past_its_target_is_a_missed_deadline_only_when_it_is_the_newest_for_its_change()
 {
@@ -2778,6 +2828,16 @@ fn a_scheduled_row_past_its_target_is_a_missed_deadline_only_when_it_is_the_newe
             ),
         ),
         (
+            "a longer version number",
+            row(
+                "2026-10-24",
+                "PowerShell v7.4.211; released 2026-10-13",
+                "psreadline",
+                "2026-10-27",
+                "not-affected",
+            ),
+        ),
+        (
             "another package",
             row(
                 "2026-10-24",
@@ -2805,6 +2865,74 @@ fn a_scheduled_row_past_its_target_is_a_missed_deadline_only_when_it_is_the_newe
             "a row about {name} replaced the scheduled one"
         );
     }
+
+    // One rule for "the newest row" here and in the daily check: wording and place in the table do
+    // not matter, the date and then the order do.
+    let worded_otherwise = row(
+        "2026-10-25",
+        "The 7.4 series' release (v7.4.21), assessed again; released 2026-10-13",
+        "psreadline",
+        "2026-10-27",
+        "not-affected",
+    );
+    assert!(
+        scheduled_past_their_target(&[scheduled.clone(), worded_otherwise.clone()], now).is_empty(),
+        "a row that mentions the identifier in other words replaces the scheduled one"
+    );
+    assert!(
+        scheduled_past_their_target(&[worded_otherwise, scheduled.clone()], now).is_empty(),
+        "a row of a later day replaces the scheduled one from above it in the table"
+    );
+    let same_day_above = row(
+        "2026-10-24",
+        "PowerShell v7.4.21, read again; released 2026-10-13",
+        "psreadline",
+        "2026-10-27",
+        "not-affected",
+    );
+    assert_eq!(
+        scheduled_past_their_target(&[same_day_above, scheduled.clone()], now).len(),
+        1,
+        "of two rows of one day the lower one stands, so a row above does not replace it"
+    );
+
+    // A row stands for each package it names apart.
+    let two_packages = row(
+        "2026-10-24",
+        "PowerShell v7.4.21, a release of the 7.4 series; released 2026-10-13",
+        "psreadline, zsh",
+        "2026-10-27",
+        "scheduled",
+    );
+    let for_psreadline = row(
+        "2026-10-25",
+        "PowerShell v7.4.21, read again; released 2026-10-13",
+        "psreadline",
+        "2026-10-27",
+        "not-affected",
+    );
+    let late = scheduled_past_their_target(&[two_packages.clone(), for_psreadline.clone()], now);
+    assert_eq!(
+        late.len(),
+        1,
+        "a later row for one package leaves the other waiting"
+    );
+    assert!(
+        late[0].ends_with("for zsh"),
+        "the line names the package still waiting: {late:?}"
+    );
+    let for_zsh = row(
+        "2026-10-25",
+        "PowerShell v7.4.21, read again; released 2026-10-13",
+        "zsh",
+        "2026-10-27",
+        "not-affected",
+    );
+    assert!(
+        scheduled_past_their_target(&[two_packages, for_psreadline, for_zsh], now).is_empty(),
+        "a row for each package replaces a row that names both"
+    );
+
     let mut table = vec![scheduled.clone()];
     table.push(row(
         "2026-10-25",
@@ -3247,11 +3375,7 @@ fn a_live_session_keeps_the_package_it_started_with() {
     let shell = root.path().join(ShellKind::Zsh.as_str());
     std::fs::create_dir_all(&shell).expect("an installation directory");
     for build in [&installed, &older] {
-        let directory = build
-            .executable
-            .parent()
-            .and_then(std::path::Path::parent)
-            .expect("the package directory");
+        let directory = build.directory();
         std::os::unix::fs::symlink(directory, shell.join(&build.identity))
             .expect("an installed build");
     }
@@ -3334,11 +3458,7 @@ fn a_live_session_keeps_the_package_it_started_with() {
     // belongs to and leaves the packages beside it alone. The Bash package is put into this same
     // installation to check that, rather than to say it.
     let beside = Package::built(ShellKind::Bash);
-    let directory = beside
-        .executable
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("the package directory");
+    let directory = beside.directory();
     let bash = root.path().join(ShellKind::Bash.as_str());
     std::fs::create_dir_all(&bash).expect("an installation directory");
     std::os::unix::fs::symlink(directory, bash.join(&beside.identity)).expect("an installed build");
@@ -3368,12 +3488,7 @@ fn a_live_session_keeps_the_package_it_started_with() {
 #[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
 fn the_package_binds_into_the_editor_it_was_qualified_against() {
     let package = Package::built(ShellKind::PowerShell);
-    let directory = package
-        .executable
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("the package directory")
-        .to_owned();
+    let directory = package.directory().to_owned();
 
     // A copy of the package, because what is driven here is its own record and the installed one
     // is what every other case in this run qualifies against.
@@ -3562,12 +3677,7 @@ fn the_package_binds_into_the_editor_it_was_qualified_against() {
 #[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
 fn a_powershell_release_an_advisory_affects_is_named_and_refused() {
     let package = Package::built(ShellKind::PowerShell);
-    let directory = package
-        .executable
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("the package directory")
-        .to_owned();
+    let directory = package.directory().to_owned();
 
     // Release, then the advisory and the first fixed release it names, or nothing.
     let table: [(&str, Option<(&str, &str)>); 13] = [
@@ -3601,10 +3711,7 @@ fn a_powershell_release_an_advisory_affects_is_named_and_refused() {
            if ($r) {{ Write-Output \"kr-release=[$v|$($r.Id)|$($r.FirstFixed)]\" }} \
            else {{ Write-Output \"kr-release=[$v||]\" }} }} }}"
     );
-    let asked = std::process::Command::new(&package.executable)
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output()
-        .expect("the package's host runs");
+    let asked = package.ask(&script);
     let said = String::from_utf8_lossy(&asked.stdout).into_owned();
     for (version, expected) in table {
         let prefix = format!("kr-release=[{version}|");
@@ -3684,12 +3791,15 @@ fn a_powershell_release_an_advisory_affects_is_named_and_refused() {
              if ($r) {{ Write-Output \"kr-runtime=[$($p[0])|$($p[1])|$($r.Id)|$($r.FirstFixed)]\" }} \
              else {{ Write-Output \"kr-runtime=[$($p[0])|$($p[1])||]\" }} }}; \
            foreach ($t in @({texts})) {{ \
-             Write-Output \"kr-described=[$t|$(ConvertFrom-KrFrameworkDescription $t)]\" }} }}"
+             Write-Output \"kr-described=[$t|$(ConvertFrom-KrFrameworkDescription $t)]\" }}; \
+           Write-Output \"kr-judged=[$((Test-KrQualifiedEditor).Reason)]\"; \
+           function Read-KrFrame {{ [byte[]](255,255,255) }}; \
+           try {{ Write-Output \"kr-handshake=[$(Wait-KrHandshake)]\" }} \
+           catch {{ Write-Output \"kr-handshake=[error: $($_.Exception.Message)]\" }}; \
+           function Get-KrFrameworkDescription {{ '.NET Framework 4.8' }}; \
+           Write-Output \"kr-unreadable=[$((Test-KrQualifiedEditor).Reason)]\" }}"
     );
-    let asked = std::process::Command::new(&package.executable)
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output()
-        .expect("the package's host runs");
+    let asked = package.ask(&script);
     let said = String::from_utf8_lossy(&asked.stdout).into_owned();
     for (runtime, platform, expected) in runtimes {
         let prefix = format!("kr-runtime=[{runtime}|{platform}|");
@@ -3719,6 +3829,37 @@ fn a_powershell_release_an_advisory_affects_is_named_and_refused() {
             "the module read {text:?} as something other than {version:?}:\n{said}"
         );
     }
+
+    // A runtime that describes itself in words the module cannot read is refused on the platforms an
+    // advisory lists, and this run's own runtime, read, is not refused for it.
+    let reason = |label: &str| -> String {
+        let prefix = format!("{label}=[");
+        said.lines()
+            .find_map(|line| {
+                line.strip_prefix(&prefix)
+                    .and_then(|rest| rest.strip_suffix(']'))
+            })
+            .unwrap_or_else(|| panic!("the module said nothing for {label}:\n{said}"))
+            .to_owned()
+    };
+    assert_eq!(
+        reason("kr-unreadable"),
+        "powershell_runtime_unreadable",
+        "a runtime the module cannot read passed on a platform an advisory lists"
+    );
+    assert_ne!(
+        reason("kr-judged"),
+        "powershell_runtime_unreadable",
+        "the runtime this run has was refused as unreadable"
+    );
+
+    // An answer that does not decode ends the handshake with a plain no, not with an error that the
+    // host would show the person.
+    assert_eq!(
+        reason("kr-handshake"),
+        "False",
+        "the handshake over an answer that does not decode"
+    );
 
     // The list the package publishes is the one the manifest pins.
     let record: serde_json::Value = serde_json::from_str(
@@ -3798,10 +3939,11 @@ fn refusal(package: &Package, package_root: &std::path::Path) -> String {
          $answer = & (Get-Module KalaReach.ShellBridge) {{ Test-KrQualifiedEditor }}; \
          Write-Output \"kr-editor=[$($answer.Reason)]\""
     );
-    // The package's own launcher, which is how a session starts this host: the runtime location
-    // the host needs is the launcher's to pass, not this test's to guess. Nothing of a session's
-    // is in this environment, so the module answers the question and attempts no handshake.
-    let asked = std::process::Command::new(&package.executable)
+    // The package's own launch, which is how a session starts this host: the runtime location the
+    // host needs is the record's to give, not this test's to guess. Nothing of a session's is in
+    // this environment, so the module answers the question and attempts no handshake.
+    let asked = package
+        .command()
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .env_remove("KR_SHELL_BRIDGE")
         .env_remove("KR_SHELL_BRIDGE_SECRET")
@@ -3844,11 +3986,7 @@ fn resolved_executable(root: &std::path::Path) -> std::path::PathBuf {
 /// different inputs has two real builds of it. A host with one build has one, and the test that
 /// uses this says so rather than copying the same bytes twice and calling them two packages.
 fn another_build(current: &Package) -> Option<Package> {
-    let root = current
-        .executable
-        .parent()
-        .and_then(std::path::Path::parent)
-        .and_then(std::path::Path::parent)?;
+    let root = current.directory().parent()?;
     let mut others: Vec<std::path::PathBuf> = std::fs::read_dir(root)
         .ok()?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
@@ -5224,17 +5362,30 @@ fn an_installation_holding_every_package_still_resolves_each_of_them() {
             package.kind.as_str(),
             executable.display()
         );
-        // Every path a package records is its own, so the one the host would launch is inside the
-        // package it came from rather than in somebody else's installation.
         let directory = shellpkg::package_root()
             .join(package.kind.as_str())
             .join(&package.identity);
-        assert!(
-            executable.starts_with(&directory),
-            "the {} package would launch {}, which is outside {}",
-            package.kind.as_str(),
-            executable.display(),
-            directory.display()
-        );
+        if package.kind == ShellKind::PowerShell {
+            // This package builds no shell: it names the PowerShell it qualified, by an absolute
+            // path to a `pwsh`, and every other path it records is its own.
+            assert!(
+                executable.is_absolute()
+                    && executable
+                        .file_stem()
+                        .is_some_and(|name| name.eq_ignore_ascii_case("pwsh")),
+                "the powershell package would launch {}, which is not an absolute path to pwsh",
+                executable.display()
+            );
+        } else {
+            // Every path a package records is its own, so the one the host would launch is inside
+            // the package it came from rather than in somebody else's installation.
+            assert!(
+                executable.starts_with(&directory),
+                "the {} package would launch {}, which is outside {}",
+                package.kind.as_str(),
+                executable.display(),
+                directory.display()
+            );
+        }
     }
 }

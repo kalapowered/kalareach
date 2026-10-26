@@ -134,9 +134,13 @@ def numbers(text):
     return tuple(int(part) for part in re.findall(r"\d+", text))
 
 
+KEY_NUMBERS = 8
+
+
 def padded(version):
-    """The numbers of a version as four, so that `7.7` and `7.7.0` are the same version."""
-    return tuple(version) + (0,) * max(0, 4 - len(version))
+    """The numbers of a version as eight, so that `7.7` and `7.7.0` are the same version and every
+    key has one shape, whatever the number of parts a version is written with."""
+    return (tuple(version) + (0,) * KEY_NUMBERS)[:KEY_NUMBERS]
 
 
 def version_key(text):
@@ -157,18 +161,12 @@ def version_key(text):
     return release + (0, tuple((0, int(each)) if each.isdigit() else (1, each.lower()) for each in label.split(".")))
 
 
-def numeric_key(text):
-    """Where a version sorts when only its numbers count, as in a comparison of four-part versions
-    that has no pre-release: `2.3.4-beta1` is `2.3.4`."""
-    match = re.match(r"\s*v?(\d+(?:\.\d+)*)", text)
-    if not match:
-        return None
-    return padded(tuple(int(part) for part in match.group(1).split("."))) + (1, ())
-
-
 def after(key):
-    """The smallest key above `key`: what a bound of `>` or `<=` stands for."""
-    return key[:-1] + (key[-1] + ((2, 0),),)
+    """The smallest key above `key`: what a bound of `>` or `<=` stands for. Above a pre-release it
+    is the same pre-release with one more identifier, the smallest there is (`rc` and then `rc.0`);
+    above a release it is past anything that shares the release's numbers."""
+    marker = (0, 0) if key[-2] == 0 else (2, 0)
+    return key[:-1] + (key[-1] + (marker,),)
 
 
 def series_start(version):
@@ -179,16 +177,16 @@ def series_start(version):
 def in_range(range_text, version):
     """Whether a version is inside a range such as '>= 10.32, <= 10.47' or '3.1.0-3.3.1'. A range
     that cannot be read in full counts as inside it, because the safe mistake is a row too many."""
-    wanted = numbers(version)
+    wanted = padded(numbers(version))
     span = re.match(r"\s*([0-9][0-9.]*)\s*-\s*([0-9][0-9.]*)\s*$", range_text)
     if span:
-        return numbers(span.group(1)) <= wanted <= numbers(span.group(2))
+        return padded(numbers(span.group(1))) <= wanted <= padded(numbers(span.group(2)))
     tests = []
     for comparator in range_text.split(","):
         match = re.match(r"\s*(<=|>=|<|>|=)?\s*([0-9][0-9.]*)\s*$", comparator)
         if not match:
             return True
-        tests.append((match.group(1) or "=", numbers(match.group(2))))
+        tests.append((match.group(1) or "=", padded(numbers(match.group(2)))))
     for operator, bound in tests:
         held = {
             "<=": wanted <= bound,
@@ -202,17 +200,17 @@ def in_range(range_text, version):
     return True
 
 
-def range_intervals(range_text, key=version_key):
+def range_intervals(range_text):
     """The versions a range covers, as half-open intervals of version keys: `low` is inside, `high`
     is not, and None is no bound. Comparators separated by a comma all hold, alternatives separated
     by `||` are each their own interval, and `a-b` is the span from a to b. Versions are ordered as
-    `key` orders them. None when the range cannot be read in full."""
+    `version_key` orders them. None when the range cannot be read in full."""
     intervals = []
     for alternative in range_text.split("||"):
         low, high = None, None
         span = re.match(r"\s*([0-9][0-9A-Za-z.+]*)\s*-\s*([0-9][0-9A-Za-z.+]*)\s*$", alternative)
         if span:
-            first, last = key(span.group(1)), key(span.group(2))
+            first, last = version_key(span.group(1)), version_key(span.group(2))
             if first is None or last is None:
                 return None
             intervals.append((first, after(last)))
@@ -221,7 +219,7 @@ def range_intervals(range_text, key=version_key):
             match = re.match(r"\s*(<=|>=|<|>|=)?\s*([0-9][0-9A-Za-z.\-+]*)\s*$", comparator)
             if not match:
                 return None
-            operator, version = match.group(1) or "=", key(match.group(2))
+            operator, version = match.group(1) or "=", version_key(match.group(2))
             if version is None:
                 return None
             if operator in (">=", "="):
@@ -243,11 +241,10 @@ def overlap(first, second):
 
 
 def reaches(range_text, accepted):
-    """Whether a range covers any version inside the accepted intervals, which are ordered by the
-    accepted set's own `key`. A range that cannot be read in full counts as reaching, because the
-    safe mistake is a row too many."""
-    intervals = range_intervals(range_text, accepted["key"])
-    return intervals is None or any(overlap(each, other) for each in intervals for other in accepted["intervals"])
+    """Whether a range covers any version inside the accepted intervals. A range that cannot be read
+    in full counts as reaching, because the safe mistake is a row too many."""
+    intervals = range_intervals(range_text)
+    return intervals is None or any(overlap(each, other) for each in intervals for other in accepted)
 
 
 def finding(source, package, identifier, aliases, published, updated=None, ranges=(), needs_row=True,
@@ -271,9 +268,9 @@ def finding(source, package, identifier, aliases, published, updated=None, range
 def repository_advisories(api, token, repository, package, pinned, may_be_empty=False, accepted=None):
     """The security advisories of one repository. `pinned` is the version of what the package
     pins from it, or None where only the date decides. `accepted` is, for a package that pins no
-    version, the intervals of the versions its module accepts and the order it compares versions
-    in: an advisory revised since the register started whose ranges now reach one of them needs a
-    row, whenever it was first published. A repository that has published none is the one case of a source that may answer
+    version, the intervals of the versions its module accepts: an advisory revised since the
+    register started whose ranges now reach one of them needs a row, whenever it was first
+    published. A repository that has published none is the one case of a source that may answer
     with nothing."""
     source = "%s security advisories" % repository
     items = fetch_pages(
@@ -325,6 +322,12 @@ def revised_day(body, created):
         month = MONTHS.get(match.group(1))
         if month:
             days.append(datetime.date(int(match.group(3)), month, int(match.group(2))))
+    # The .NET team writes the day as month, day and year in numbers: `V1.1 (10/15/2026)`.
+    for match in re.finditer(r"V\d+\.\d+ \((\d{1,2})/(\d{1,2})/(\d{4})\)", body or ""):
+        try:
+            days.append(datetime.date(int(match.group(3)), int(match.group(1)), int(match.group(2))))
+        except ValueError:
+            pass
     for match in re.finditer(r"Last Updated\s*(\d{4}-\d{2}-\d{2})", body or ""):
         days.append(datetime.date.fromisoformat(match.group(1)))
     return max(days + [created]) if created else (max(days) if days else None)
@@ -366,20 +369,57 @@ def announcements(api, token):
     return found
 
 
+def dotnet_announcements(api, token, labels):
+    """The security advisories the .NET team publishes in dotnet/announcements for the runtime series
+    the module judges (`labels`, such as `.NET 8.0`), under the rules of the PowerShell ones: an
+    advisory needs a row when it was first published on or after the start day or its body dates a
+    revision on or after it, and a comment revises nothing. A runtime advisory reaches PowerShell
+    through the runtime a host finds, so the register assesses each one, and the module's runtime
+    bound is the assessment of the two that reach the bridge's host."""
+    url = "%s/repos/dotnet/announcements/issues?state=all&labels=Security&since=%sT00:00:00Z" % (
+        api,
+        STARTED.isoformat(),
+    )
+    found = []
+    for item in fetch_pages(url, token):
+        names = [label if isinstance(label, str) else (label or {}).get("name") for label in item.get("labels") or []]
+        if "pull_request" in item or "Security" not in names or not set(labels) & set(names):
+            continue
+        cves = re.findall(r"CVE-\d{4}-\d{4,}", item.get("title") or "")
+        identifier = cves[0] if cves else "dotnet/announcements#%d" % item["number"]
+        created = day(item.get("created_at"))
+        revised = revised_day(item.get("body"), created)
+        recent = (created is not None and created >= STARTED) or (revised is not None and revised >= STARTED)
+        found.append(
+            finding(
+                "dotnet/announcements",
+                "psreadline",
+                identifier,
+                ["github.com/dotnet/announcements/issues/%d" % item["number"]],
+                created,
+                revised,
+                needs_row=recent,
+            )
+        )
+    return found
+
+
 def powershell_releases(api, token, floors):
     """Stable PowerShell releases above the first fixed release of their series, and every stable
-    release of a series above the newest series the register's advisories list."""
+    release of a series above the newest series the register's advisories list. `floors` holds a
+    version key for each series (see `version_key`), so a first fixed release written as a
+    pre-release sorts below the final one."""
     found = []
     newest = max(floors) if floors else (0, 0)
     for item in fetch_pages("%s/repos/PowerShell/PowerShell/releases" % api, token):
         if item.get("prerelease") or item.get("draft"):
             continue
         tag = item["tag_name"]
-        version = numbers(tag)
-        if len(version) < 3:
+        version, key = numbers(tag), version_key(tag)
+        if len(version) < 3 or key is None:
             continue
         series = version[:2]
-        newer = (series in floors and version > floors[series]) or series > newest
+        newer = (series in floors and key > floors[series]) or series > newest
         if newer:
             found.append(
                 finding(
@@ -653,11 +693,12 @@ def pinned_versions(root):
         with open(os.path.join(root, "shells", name, "manifest.json")) as handle:
             return json.load(handle)
 
-    floors, host_floors = {}, {}
+    floors, host_floors, runtime_labels = {}, {}, set()
     for advisory in manifest("psreadline")["qualified"]["powershell_advisories"]:
+        runtime_labels.update(".NET " + series for series in advisory.get("runtime_first_fixed", {}))
         for series, fixed in advisory["first_fixed"].items():
             key = numbers(series)
-            floors[key] = max(floors.get(key, ()), numbers(fixed))
+            floors[key] = max(floors.get(key, ()), version_key(fixed))
             # An advisory against the .NET runtime is judged by the runtime the host reports, on its
             # platforms, and the module does not hold the PowerShell version to it, so only the
             # advisories against PowerShell itself bound the versions the module accepts.
@@ -667,8 +708,10 @@ def pinned_versions(root):
     # fixed release of each series that an advisory against PowerShell itself lists to the next
     # series, and every series above the newest. A pre-release of a fixed release is refused. What
     # it accepts of PSReadLine, which it compares as a four-part version that has no pre-release,
-    # is the range it was qualified against: the pre-releases of the lower bound are in it and
-    # those of the upper bound are not.
+    # is the range it was qualified against, and in the order advisories use that is the span from
+    # below the pre-releases of the lower bound to below those of the upper bound: a pre-release
+    # of the lower bound reads as the bound, and one of the upper bound reads as the bound, which
+    # is refused.
     newest = max(host_floors) if host_floors else (0, 0)
     powershell = [
         (floor, series_start((series[0], series[1] + 1))) for series, floor in sorted(host_floors.items())
@@ -676,17 +719,15 @@ def pinned_versions(root):
     powershell.append((series_start((newest[0], newest[1] + 1)), None))
     qualified = manifest("psreadline")["qualified"]
     psreadline = [
-        (numeric_key(qualified["psreadline_from"]), numeric_key(qualified["psreadline_before"]))
+        (series_start(numbers(qualified["psreadline_from"])), series_start(numbers(qualified["psreadline_before"])))
     ]
     return {
-        "accepted": {
-            "powershell": {"intervals": powershell, "key": version_key},
-            "psreadline": {"intervals": psreadline, "key": numeric_key},
-        },
+        "accepted": {"powershell": powershell, "psreadline": psreadline},
         "fish": manifest("fish")["upstream"]["version"],
         "zsh": manifest("zsh")["upstream"]["version"],
         "bash": manifest("bash")["upstream"]["version"],
         "floors": floors,
+        "runtime_labels": sorted(runtime_labels),
     }
 
 
@@ -709,6 +750,7 @@ def collect(root, api, ftp, token, facts, audit, register_text):
         accepted=pins["accepted"]["psreadline"],
     )
     found += announcements(api, token)
+    found += dotnet_announcements(api, token, pins["runtime_labels"])
     found += powershell_releases(api, token, pins["floors"])
     found += fish_releases(api, token, pins["fish"])
     found += zsh_tags(api, token, pins["zsh"])
@@ -827,6 +869,7 @@ def routes():
     ):
         table["/repos/%s/security-advisories" % repository] = fixture("github-%s-security-advisories.json" % name)
     table["/repos/PowerShell/Announcements/issues"] = fixture("github-announcements-issues.json")
+    table["/repos/dotnet/announcements/issues"] = fixture("github-dotnet-announcements-issues.json")
     table["/repos/fish-shell/fish-shell/releases"] = fixture("github-fish-releases.json")
     table["/repos/PowerShell/PowerShell/releases"] = fixture("github-powershell-releases.json")
     table["/repos/zsh-users/zsh/tags"] = fixture("github-zsh-tags.json")
@@ -961,6 +1004,21 @@ def run_self_test():
             and in_range("3.1.0-3.3.1", "3.2")
             and in_range(">= 10.44, < 10.48 || <= 10.43", "10.43"),
         )
+        # Versions of two parts and of three are one version, and a version of many parts has a key of
+        # the same shape as any other, so comparing them raises nothing.
+        expect(
+            "two numbers are three in a pinned version's range",
+            in_range(">= 10.43.0, < 10.44", "10.43") and not in_range(">= 10.43.1, < 10.44", "10.43"),
+        )
+        expect(
+            "a version of five numbers has a key of the same shape",
+            version_key("1.2.3.4") < version_key("1.2.3.4.1") < version_key("1.2.3.4.2-rc.1") < version_key("1.2.3.4.2")
+            and reaches(">= 1.2.3.4.5, < 1.2.3.4.6", [(version_key("1.2.3.4.0"), None)]),
+        )
+        # A first fixed release written as a pre-release does not hide the final release.
+        with Server(routes()) as base:
+            found = powershell_releases(base, None, {(7, 6): version_key("7.6.8-rc.1")})
+        expect("a floor written as a pre-release", "v7.6.8" in [item["id"] for item in found], str(found))
         expect("the start day is the register's", date_after(register, "published from ") == STARTED)
 
         # The control: the committed register covers every change the recorded sources hold.
@@ -978,6 +1036,44 @@ def run_self_test():
             expect("the control reads nothing of the pin " + identifier, identifier not in read, str(read))
         # The releases at the module's bound are the ones it accepts, and only a release above one needs a row.
         expect("a release at the bound needs no row", not {"v7.4.21", "v7.5.12", "v7.6.7"} & set(needing), str(needing))
+
+        # The .NET team's advisories for the runtime series the module judges are read under the same
+        # rules: the recorded servicing of 2026-10-13 holds 46, and the control above covers each.
+        dotnet = "/repos/dotnet/announcements/issues"
+        expect("the control reads the .NET advisories", "CVE-2026-96225" in needing and "CVE-2026-70194" in needing, str(needing))
+        outcome = attempt(routes(), now="2026-11-02", text=without("CVE-2026-70194"))
+        expect("without the row of a .NET advisory", says(outcome, "CVE-2026-70194", "no triage row"), str(outcome))
+        def dotnet_issue(number, cve, labels, created, body="### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"):
+            def add(items):
+                return items + [{
+                    "number": number, "title": "Microsoft Security Advisory %s | .NET Denial of Service Vulnerability" % cve,
+                    "state": "open", "labels": [{"name": name} for name in labels], "created_at": created,
+                    "updated_at": created, "author_association": "NONE", "body": body,
+                }]
+            return add
+        september = "### Revisions\n\nV1.0 (09/01/2026): Advisory published.\n"
+        november = "### Revisions\n\nV1.0 (11/03/2026): Advisory published.\n"
+        for labels, created, body, needs, name in (
+            (["Security", ".NET 10.0"], "2026-11-03T10:00:00Z", november, True, "a new advisory for a series the module judges"),
+            (["Security", ".NET 7.0"], "2026-11-03T10:00:00Z", november, False, "a new advisory for a series the module does not judge"),
+            (["Security", ".NET 10.0"], "2026-09-01T10:00:00Z", september, False, "an advisory from before the start day"),
+            ([".NET 10.0"], "2026-11-03T10:00:00Z", november, False, "an issue without the Security label"),
+        ):
+            outcome = attempt(edited(routes(), dotnet, dotnet_issue(900, "CVE-2026-99001", labels, created, body)), now="2026-11-20")
+            expect(
+                name,
+                not isinstance(outcome, SourceError) and says(outcome, "CVE-2026-99001", "no triage row") == needs,
+                str(outcome),
+            )
+        def revised_dotnet(items):
+            for item in items:
+                if item["number"] == 476:
+                    item["body"] += "\nV1.1 (10/30/2026): The affected platforms were corrected.\n"
+            return items
+        outcome = attempt(edited(routes(), dotnet, revised_dotnet), now="2026-11-10")
+        expect("a .NET advisory revised after its row", says(outcome, "CVE-2026-96225", "revised"), str(outcome))
+        outcome = attempt(edited(routes(), dotnet, revised_dotnet), now="2026-10-30")
+        expect("a .NET advisory revised inside its allowance", not isinstance(outcome, SourceError) and not says(outcome, "CVE-2026-96225"), str(outcome))
 
         # Each mutation takes away a row the recorded data needs, and the check names the change. It is read
         # on a day after every triage allowance has passed, since v7.6.8 (2026-10-22) is still inside its own on the day the recorded sources were taken.
@@ -1126,6 +1222,7 @@ def run_self_test():
             (">= 7.6.8-rc.1, < 7.6.8", "2026-10-20T10:00:00Z", True, "a revised range of release candidates of an accepted release"),
             (">= 7.7.0-preview.5, < 7.7.0-rc.1", "2026-10-20T10:00:00Z", True, "a revised range of previews between two labels"),
             (">= 7.7, <= 7.7.0", "2026-10-20T10:00:00Z", True, "a revised range written with two numbers"),
+            ("> 7.7.0-preview, < 7.7.0-preview.2", "2026-10-20T10:00:00Z", True, "a revised range that excludes a label and includes the previews numbered after it"),
             (">= 7.6.0-rc.1, < 7.6.6-rc.1", "2026-10-20T10:00:00Z", False, "a revised range that ends before the first fixed release"),
         ):
             outcome = attempt(
@@ -1141,7 +1238,7 @@ def run_self_test():
         table[reader_route] = json.dumps(old_advisory("GHSA-old2-aaaa-bbbb", ">= 2.3.5, < 2.3.7", "2026-10-20T10:00:00Z")([])).encode()
         outcome = attempt(table, now="2026-11-10")
         expect("a revised PSReadLine range inside the qualified one", says(outcome, "GHSA-old2-aaaa-bbbb", "no triage row"), str(outcome))
-        table[reader_route] = json.dumps(old_advisory("GHSA-old2-aaaa-bbbb", "< 2.3.4", "2026-10-20T10:00:00Z")([])).encode()
+        table[reader_route] = json.dumps(old_advisory("GHSA-old2-aaaa-bbbb", "<= 2.3.3", "2026-10-20T10:00:00Z")([])).encode()
         outcome = attempt(table, now="2026-11-10")
         expect("a revised PSReadLine range below it", not isinstance(outcome, SourceError) and not says(outcome, "GHSA-old2"), str(outcome))
         # The module compares PSReadLine as a four-part version that has no pre-release, so a
@@ -1150,6 +1247,7 @@ def run_self_test():
         for text, needs, name in (
             ("= 2.3.4-beta1", True, "a revised range of a pre-release of the lowest PSReadLine version"),
             ("= 3.0.0-beta1", False, "a revised range of a pre-release of the version the range stops before"),
+            (">= 2.3.5-beta1, < 2.3.5", True, "a revised range of previews that ends at a version the module accepts"),
         ):
             table[reader_route] = json.dumps(old_advisory("GHSA-old2-aaaa-bbbb", text, "2026-10-20T10:00:00Z")([])).encode()
             outcome = attempt(table, now="2026-11-10")
@@ -1174,6 +1272,33 @@ def run_self_test():
         expect("a zsh tag past the pin", says(outcome, "zsh-5.9.3", "no triage row"), str(outcome))
         outcome = attempt(table, now="2026-10-02")
         expect("a zsh tag inside its allowance", not isinstance(outcome, SourceError) and not says(outcome, "zsh-5.9.3"), str(outcome))
+
+        # The assessment that stands for a package is the last row, by date and then by place in the
+        # table, that names the package and mentions the change's identifier; a row that names two
+        # packages stands for each apart. The qualification suite applies the same rule to a row that
+        # is still scheduled past its target.
+        def with_rows(*rows):
+            marker = "<!-- /kr:triage -->"
+            return register.replace(marker, "\n".join(rows) + "\n" + marker)
+        table = zsh_tag(routes(), "zsh-5.9.3", "2026-10-01T10:00:00Z")
+        both = "| 2026-10-24 | zsh-5.9.3, the release after 5.9.2; released 2026-10-01 | zsh, bash | A first reading of the release by both packages. | 2026-10-15 | scheduled |"
+        for_bash = "| 2026-10-25 | zsh-5.9.3, read again; released 2026-10-01 | bash | The release was read again for this package. | 2026-10-15 | not-affected |"
+        for_zsh = "| 2026-10-25 | The release after 5.9.2 (zsh-5.9.3), assessed again; released 2026-10-01 | zsh | The release was read again for this package. | 2026-10-15 | not-affected |"
+        same_day = "| 2026-10-24 | zsh-5.9.3, read again; released 2026-10-01 | zsh | The release was read again for this package. | 2026-10-15 | not-affected |"
+        for name, rows, stands in (
+            ("a scheduled row past its target and alone", (both,), True),
+            ("a later row for the other package only", (both, for_bash), True),
+            ("a later row for the package, worded otherwise", (both, for_zsh), False),
+            ("a later row of the same day below it", (both, same_day), False),
+            ("a row of a later day above it", (for_zsh, both), False),
+            ("a row of the same day above it", (same_day, both), True),
+        ):
+            outcome = attempt(table, now="2026-11-02", text=with_rows(*rows))
+            expect(
+                "the assessment that stands: " + name,
+                not isinstance(outcome, SourceError) and says(outcome, "zsh-5.9.3", "still scheduled") == stands,
+                str(outcome),
+            )
         five_three = "/gnu/bash/bash-5.3-patches/"
         row = lambda text: b'<tr><td><a href="%s">%s</a></td><td align="right">%s  </td></tr>\n' % tuple(
             part.encode() for part in text

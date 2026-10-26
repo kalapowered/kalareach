@@ -2185,6 +2185,98 @@ async fn a_helper_whose_input_closes_leaves_its_question_to_end_as_expired() {
     );
 }
 
+/// KR-REQ-11.63: a question is found by its identifier in a session whose history has grown past
+/// what one frame holds. A session keeps every question it was asked, and the worker refuses a
+/// list of all of them that does not fit the frame the command declared, so a command that looked
+/// for its question in that list would fail for every question of the session. The question is
+/// read by name, and a question the session does not hold is unknown, not a failure to ask.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_question_is_found_in_a_history_past_what_one_frame_holds() {
+    let hosted = hosted().await;
+    let context = "c".repeat(kr_protocol::question::MAX_CONTEXT_BYTES);
+    let text = "q".repeat(kr_protocol::question::MAX_QUESTION_BYTES);
+    // Questions of the largest size, all cancelled, in number enough that the list of them is past
+    // a frame.
+    for number in 0..100 {
+        let (created, failed) = hosted
+            .call(
+                "ask_user",
+                json!({
+                    "request_id": format!("ended-{number}"),
+                    "context": context,
+                    "question": text,
+                    "type": "confirm"
+                }),
+            )
+            .await;
+        assert!(!failed, "{created}");
+        let (cancelled, failed) = hosted
+            .call(
+                "cancel_question",
+                json!({
+                    "question_id": created["question_id"],
+                    "caller_token": created["caller_token"]
+                }),
+            )
+            .await;
+        assert!(!failed, "{cancelled}");
+    }
+    let (open, failed) = hosted
+        .call(
+            "ask_user",
+            json!({
+                "request_id": "still-open",
+                "context": "",
+                "question": "which one?",
+                "type": "confirm"
+            }),
+        )
+        .await;
+    assert!(!failed, "{open}");
+    let open_id = open["question_id"]
+        .as_str()
+        .expect("an identifier")
+        .to_owned();
+
+    // The premise: the worker refuses the list of every question, since it does not fit.
+    let mut client = hosted.worker().await;
+    let listed = client
+        .request(
+            kr_protocol::method::Method::QuestionRead,
+            &kr_protocol::question::QuestionReadParams {
+                session_id: hosted.session_id,
+                question_id: kr_protocol::scalars::Nullable::null(),
+                include_resolved: true,
+            },
+        )
+        .await
+        .expect("reaches the worker");
+    let Err(refusal) = listed else {
+        panic!("the history of the session fits a frame, so this case shows nothing");
+    };
+    assert_eq!(refusal.code, kr_protocol::error::ErrorCode::InvalidArgument);
+
+    let shown = hosted.kr(&["question", "show", &open_id]);
+    assert!(
+        shown.status.success(),
+        "the question is found by name: {}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    // A question the session does not hold is unknown, and is not a failure to ask.
+    let unknown = hosted.kr(&[
+        "question",
+        "show",
+        &kr_protocol::ids::QuestionId::new(kr_ipc::new_uuid()).to_string(),
+    ]);
+    assert_eq!(unknown.status.code(), Some(2));
+    let answered = hosted.kr(&["question", "answer", &open_id, "--yes"]);
+    assert!(
+        answered.status.success(),
+        "the question is answered: {}",
+        String::from_utf8_lossy(&answered.stderr)
+    );
+}
+
 /// KR-REQ-11.62: a helper whose agent the worker's broker launched asks for that agent, while a
 /// question asked before the broker described it stays the helper's own. The broker proves which
 /// agent the helper serves and not which thread a request came from, so a thread switch it reports

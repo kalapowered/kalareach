@@ -1182,6 +1182,7 @@ impl Lexer {
             self.pending_len = 0;
             self.pending_truncated = false;
             self.pending_controls.clear();
+            self.eight_bit = false;
             self.state = State::Ground;
             let decoded = undouble_escapes(&payload[4..]);
             let mut inner = Lexer::nested(self.limits, self.depth + 1);
@@ -1300,7 +1301,14 @@ impl Lexer {
         self.pending_truncated = false;
         self.state = State::Ground;
         let direct_safe = !truncated && kind.payload_is_direct_safe();
-        let mut event = self.build_with(span, bytes, kind, true, direct_safe, embedded);
+        // The flag belongs to the sequence that was pending: it is read here and cleared, so that
+        // nothing built later, a text run above all, takes it from a sequence that came before.
+        let eight_bit = core::mem::take(&mut self.eight_bit);
+        let origin = Origin {
+            eight_bit,
+            embedded,
+        };
+        let mut event = self.build_with(span, bytes, kind, true, direct_safe, origin);
         // A prelude the parser could not keep whole is not a shorter sequence: the bytes it dropped
         // could have carried anything. That holds however the sequence ended, including the ones
         // that go on to collect a string body before they finish here.
@@ -1370,6 +1378,7 @@ impl Lexer {
         self.pending_len = 0;
         self.pending_truncated = false;
         self.pending_controls.clear();
+        self.eight_bit = false;
         self.text.clear();
         self.text_scalars = 0;
         self.text_cluster = 0;
@@ -1391,9 +1400,17 @@ impl Lexer {
         ground_after: bool,
         direct_safe: bool,
     ) -> Event {
-        self.build_with(span, bytes, kind, ground_after, direct_safe, Vec::new())
+        let origin = Origin {
+            eight_bit: false,
+            embedded: Vec::new(),
+        };
+        self.build_with(span, bytes, kind, ground_after, direct_safe, origin)
     }
 
+    /// Builds the event for a sequence, with how it began.
+    ///
+    /// A text run and an encoded C1 scalar are built by [`Self::build`], which says that no raw
+    /// 8-bit C1 byte introduced them: where a read ends must not decide whether they are projected.
     fn build_with(
         &self,
         span: ByteSpan,
@@ -1401,10 +1418,14 @@ impl Lexer {
         kind: EventKind,
         ground_after: bool,
         direct_safe: bool,
-        embedded: Vec<u8>,
+        origin: Origin,
     ) -> Event {
+        let Origin {
+            eight_bit,
+            embedded,
+        } = origin;
         let class = crate::classify::classify(&kind);
-        let needs_projection = self.eight_bit || !direct_safe || !embedded.is_empty();
+        let needs_projection = eight_bit || !direct_safe || !embedded.is_empty();
         let disposition = crate::classify::disposition(&kind, class, needs_projection);
         Event {
             span,
@@ -1414,10 +1435,18 @@ impl Lexer {
             disposition,
             ground_after,
             passthrough_depth: self.depth,
-            eight_bit_introducer: self.eight_bit,
+            eight_bit_introducer: eight_bit,
             embedded,
         }
     }
+}
+
+/// How the sequence an event describes began, which its disposition depends on.
+struct Origin {
+    /// Whether a raw 8-bit C1 byte introduced it rather than its 7-bit `ESC` form.
+    eight_bit: bool,
+    /// Control bytes that arrived inside it.
+    embedded: Vec<u8>,
 }
 
 impl Default for Lexer {

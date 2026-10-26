@@ -262,7 +262,7 @@ export function tauriPort(): HostPort {
     composerSteer: (params, opening) => call('agent_turn_steer', { params, opening }),
     composerInterrupt: (params, opening) => call('agent_turn_cancel', { params, opening }),
     approvalRespond: (params, opening) => call('agent_approval_respond', { params, opening }),
-    pluginActionInvoke: () => noAgreedShape("invoking a package's action"),
+    pluginActionInvoke: (params, opening) => call('plugin_action_invoke', { params, opening }),
 
     deviceDrafts: () => call('device_drafts', {}),
     deviceDraftSave: (request) => read('device_draft_save', request),
@@ -326,6 +326,11 @@ export function tauriPort(): HostPort {
 
     privacyStatus: () => read('privacy_status', {}),
 
+    retainedSyncCopies: () => call('retained_sync_copies', {}),
+    retainedDeleteAsk: (reference) => call('retained_delete_ask', { reference }),
+    retainedDeleteFinish: (token) => call('retained_delete_finish', { token }),
+    retainedDeleteCancel: (token) => call<undefined>('retained_delete_cancel', { token }),
+
     // Each view has a channel of its own, which native code publishes that view's states on and
     // nothing else: no protocol event and no other view's state ever reaches its listener.
     openTerminalView: async (sessionId, grid, listener, opening): Promise<TerminalView> => {
@@ -377,6 +382,7 @@ export function tauriPort(): HostPort {
     inboxHosts: () => call<readonly HostInbox[]>('inbox_hosts', {}),
     pushView: () => call<PushView>('push_view', {}),
     pushEnable: (reference) => call<PushView>('push_enable', { reference }),
+    pushPreviews: (reference, on) => call<PushView>('push_previews', { reference, on }),
     pushRefresh: () => call<PushView>('push_refresh', {}),
     notificationRoute: () => call<string | null>('notification_route', {}),
     onPush: (listener) => listening<PushView>(PUSH_EVENT, listener),

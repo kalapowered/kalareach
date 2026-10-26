@@ -192,6 +192,24 @@ impl Gateway {
         shape: &fixture::Shape,
         table: Option<String>,
     ) -> Self {
+        Self::assembled(qualified, runtime_name, ledger, shape, table, None)
+    }
+
+    /// A session of the shape given that claims the saved conversations it runs against in
+    /// `claims`, a directory every session built on it shares, as the sessions of one user share
+    /// the state root their workers claim in.
+    pub fn claiming(shape: &fixture::Shape, claims: &Path) -> Self {
+        Self::assembled(true, "", Ledger::Memory, shape, None, Some(claims))
+    }
+
+    fn assembled(
+        qualified: bool,
+        runtime_name: &str,
+        ledger: Ledger,
+        shape: &fixture::Shape,
+        table: Option<String>,
+        claims: Option<&Path>,
+    ) -> Self {
         let placed = Placed::new();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -248,6 +266,11 @@ impl Gateway {
                 None,
             ),
         };
+        if let Some(claims) = claims {
+            let roots = kr_ipc::paths::HostPaths::new(claims.join("run"), claims.join("state"))
+                .expect("the roots the sessions share");
+            broker.set_host_claims(kr_worker::broker::host_claims::HostClaims::new(&roots));
+        }
         let sources = Arc::new(ConnectorSources::new());
         let admissions = kr_worker::broker::catalogue::Admissions::new();
         let _ = kr_worker::broker::catalogue::testing::admit(
@@ -342,6 +365,13 @@ impl Gateway {
         })
     }
 
+    /// Why the last launch this session's newest backend took did not go, where one did not.
+    pub fn last_launch_failure(&self) -> Option<String> {
+        let newest = self.generation.load(std::sync::atomic::Ordering::SeqCst) - 1;
+        self.backends
+            .launch_failure_of(PromptGeneration::new(newest))
+    }
+
     /// Starts the launcher for an answer, the way the shell does: its child, with the answer's
     /// variable and the person's own variables, in the group every launch of this test runs in.
     /// Standard output goes to a file the test reads, for it is what the terminal prints.
@@ -360,17 +390,46 @@ impl Gateway {
         name: &str,
         own: &[(&std::ffi::OsStr, &std::ffi::OsStr)],
     ) -> Launched {
+        self.launch_typing(answer, name, own, &[])
+    }
+
+    /// Starts the launcher for an answer to a launch that typed `words` after the command, as the
+    /// shell does: the answer's variable and the person's own variables, with the words after the
+    /// flags the integration added.
+    pub fn launch_typed(
+        &self,
+        answer: &CommandBackend,
+        name: &str,
+        own: &[(&str, &str)],
+        words: &[&str],
+    ) -> Launched {
+        let own: Vec<(&std::ffi::OsStr, &std::ffi::OsStr)> = own
+            .iter()
+            .map(|(variable, value)| (variable.as_ref(), value.as_ref()))
+            .collect();
+        self.launch_typing(answer, name, &own, words)
+    }
+
+    fn launch_typing(
+        &self,
+        answer: &CommandBackend,
+        name: &str,
+        own: &[(&std::ffi::OsStr, &std::ffi::OsStr)],
+        words: &[&str],
+    ) -> Launched {
         use std::os::unix::process::CommandExt as _;
 
         let printed = self.outputs.join(name);
-        let mut command = self.placed.command(&[
+        let mut arguments = vec![
             "launch",
             "--",
             self.executable.to_str().expect("a text path"),
             "codex",
             "--remote",
             "{gateway}",
-        ]);
+        ];
+        arguments.extend_from_slice(words);
+        let mut command = self.placed.command(&arguments);
         for variable in &answer.environment {
             command.env(&variable.name, &variable.value);
         }

@@ -53,6 +53,7 @@ pub struct AppState {
     drafts: Arc<crate::drafts::DraftDesk>,
     questions: crate::questions::QuestionDesk,
     shares: Arc<crate::sharing::ShareDesk>,
+    retained: crate::retained::Deletions,
     paired_links: Arc<crate::standing::PairedLinks>,
     export_destinations: Mutex<Vec<std::path::PathBuf>>,
     dropped_files: Mutex<Vec<std::path::PathBuf>>,
@@ -97,6 +98,7 @@ impl AppState {
             drafts: Arc::new(crate::drafts::DraftDesk::default()),
             questions: crate::questions::QuestionDesk::default(),
             shares: Arc::new(crate::sharing::ShareDesk::default()),
+            retained: crate::retained::Deletions::default(),
             paired_links: Arc::new(crate::standing::PairedLinks::default()),
             export_destinations: Mutex::new(Vec::new()),
             dropped_files: Mutex::new(Vec::new()),
@@ -719,6 +721,12 @@ impl AppState {
     #[must_use]
     pub fn shares(&self) -> Arc<crate::sharing::ShareDesk> {
         Arc::clone(&self.shares)
+    }
+
+    /// The confirmations of deleting a copy that left the host, which wait for their deletion.
+    #[must_use]
+    pub const fn retained(&self) -> &crate::retained::Deletions {
+        &self.retained
     }
 
     /// The questions this application has read, and the answers it keeps.

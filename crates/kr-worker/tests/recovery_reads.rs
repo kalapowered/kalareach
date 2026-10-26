@@ -1065,10 +1065,12 @@ async fn kr_req_23_48_a_receipt_answers_only_the_actor_whose_action_it_is() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kr_req_23_48_retained_history_is_served_to_the_owner_and_not_to_a_paired_device() {
-    // A history page is a byte range and a grant's history scope is a moment in time, so nothing
-    // narrows one to the other: the local owner is served the page, and a paired device, whose
-    // read the daemon forwards, is refused it rather than served more than its grant allows.
+async fn kr_req_23_48_retained_history_is_served_to_the_owner_and_a_device_within_its_grant() {
+    // A history page is a byte range and a grant's history scope is a moment in time, so the
+    // worker narrows one to the other by when the output was written. The local owner is served
+    // the page. A paired device, whose read the daemon forwards with its grant's scope, is served
+    // what that scope reaches: all of it from the beginning of time, none of it from a moment that
+    // has not come, and nothing when its read comes with no scope.
     let host = host().await;
     {
         let mut session = host.runtime.session();
@@ -1089,6 +1091,74 @@ async fn kr_req_23_48_retained_history_is_served_to_the_owner_and_not_to_a_paire
             .expect("decodes");
     assert!(!page.bytes.is_empty());
     let mut daemon = daemon(&host).await;
+    let whole: kr_protocol::recovery::HistoryPageResult = forwarded(
+        &mut daemon,
+        Some(reaching_back_to(0)),
+        Method::HistoryPage,
+        &params,
+    )
+    .await
+    .expect("a grant that reaches every moment is served the page")
+    .to_typed()
+    .expect("decodes");
+    assert_eq!(whole.bytes, page.bytes);
+    let later: kr_protocol::recovery::HistoryPageResult = forwarded(
+        &mut daemon,
+        Some(reaching_back_to(kr_ipc::now_ms().get() + 3_600_000)),
+        Method::HistoryPage,
+        &params,
+    )
+    .await
+    .expect("a grant that reaches a later moment is served a page of nothing")
+    .to_typed()
+    .expect("decodes");
+    assert!(later.bytes.is_empty(), "{later:?}");
+    let refused = forwarded(&mut daemon, None, Method::HistoryPage, &params)
+        .await
+        .expect_err("a read with no scope is not a paired device's to make");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::PermissionDenied,
+        "{refused:?}"
+    );
+}
+
+/// A worker goes on answering for a while after its session is closed, while its closure is
+/// delivered. The daemon serves a device nothing of a closed session, and a read that reaches the
+/// worker in that interval is refused by the worker in the same way, while the owner reads on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_23_48_a_device_is_not_served_the_output_of_a_closed_session_its_worker_still_answers_for()
+ {
+    let host = host().await;
+    {
+        let mut session = host.runtime.session();
+        session.ingest_output(b"kr-retained-output");
+    }
+    let params = kr_protocol::recovery::HistoryPageParams {
+        session_id: host.session_id,
+        from_cursor: U64::new(0),
+        max_bytes: U64::new(4096),
+    };
+    let mut daemon = daemon(&host).await;
+    forwarded(
+        &mut daemon,
+        Some(reaching_back_to(0)),
+        Method::HistoryPage,
+        &params,
+    )
+    .await
+    .expect("a device is served the page while the session is live");
+
+    {
+        let mut session = host.runtime.session();
+        session.begin_close(kr_protocol::session::ClosureReason::CloseRequested);
+        session.finish_close();
+        assert_eq!(
+            session.state(),
+            kr_protocol::session::SessionState::Closed,
+            "the session is closed and its worker is still serving"
+        );
+    }
     let refused = forwarded(
         &mut daemon,
         Some(reaching_back_to(0)),
@@ -1096,12 +1166,22 @@ async fn kr_req_23_48_retained_history_is_served_to_the_owner_and_not_to_a_paire
         &params,
     )
     .await
-    .expect_err("a paired device is not served retained history");
+    .expect_err("a device is not served the page of a closed session");
     assert_eq!(
         refused.code,
-        kr_protocol::error::ErrorCode::PermissionDenied,
+        kr_protocol::error::ErrorCode::SessionClosed,
         "{refused:?}"
     );
+
+    let mut window = owner(&host, ReceiveLimits::default()).await;
+    let page: kr_protocol::recovery::HistoryPageResult =
+        within("the page", window.request(Method::HistoryPage, &params))
+            .await
+            .expect("the call reaches the worker")
+            .expect("the owner is served the page of the closed session")
+            .to_typed()
+            .expect("decodes");
+    assert!(!page.bytes.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

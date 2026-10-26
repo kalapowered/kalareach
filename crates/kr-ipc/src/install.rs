@@ -100,6 +100,31 @@ mod windows;
 #[cfg(windows)]
 pub use windows::{free_space, seal_directory, seal_file, unseal_directory, windows_version};
 
+/// What a test needs to meet a removal at the moment another process of the account changes the
+/// directory it works in.
+#[cfg(all(windows, feature = "testing"))]
+pub mod removal_race {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    /// Sets what runs, with the directory's path, when a removal has pinned a directory and checked
+    /// that it is a plain one, before it reads the names in it; `None` takes it away.
+    pub fn after_pin(hook: Option<Arc<dyn Fn(&Path) + Send + Sync>>) {
+        *super::windows::AFTER_PIN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
+    }
+
+    /// Makes the existing empty directory `directory` a junction that names `target`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating system's error when the junction cannot be set.
+    pub fn make_junction_in_place(directory: &Path, target: &Path) -> std::io::Result<()> {
+        super::windows::make_junction_in_place(directory, target)
+    }
+}
+
 /// The store's record, whose presence is what makes a directory a store.
 pub const STORE_RECORD: &str = "install.json";
 

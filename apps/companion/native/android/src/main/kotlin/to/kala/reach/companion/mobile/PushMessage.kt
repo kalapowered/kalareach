@@ -78,3 +78,82 @@ fun planNotification(delivery: PushMessage.Delivery, decision: PreviewDecision):
         is PreviewDecision.Generic ->
             NotificationPlan(delivery.collapseId, delivery.alert, decision.reason.wireName)
     }
+
+/** The data key that carries the sealed preview. */
+const val PREVIEW_KEY = "preview"
+
+/**
+ * The reason a delivery ends with when its preview opened and the alert it was to replace was gone:
+ * the person tapped or dismissed the alert while the preview was being opened, so nothing was
+ * posted over it.
+ */
+const val ALERT_GONE = "alert_gone"
+
+/**
+ * The reason a delivery ends with when its alert could not be posted at all (notifications are off
+ * for the application): there is no alert for a preview to replace, so none is opened.
+ */
+const val NOT_POSTED = "not_posted"
+
+/** How a notification is posted. */
+enum class Posting {
+    /** The first post of a delivery: it may sound. */
+    NEW,
+
+    /** A post that an earlier try of the same delivery may have made already: it does not sound again. */
+    REPEAT,
+
+    /**
+     * The opened preview, over the alert already up: it does not sound, and it is not posted when
+     * that alert has gone, as the person tapped or dismissed it.
+     */
+    REPLACEMENT
+}
+
+/**
+ * Shows one delivery, with the alert the message carries up before anything is opened.
+ *
+ * Opening a sealed preview runs native code in a process the system may end in the middle of it (a
+ * library that aborts, the memory limit, a kill), and a notification posted only after that returns
+ * would then never be posted: the person would get nothing, not even the generic alert. So the
+ * alert goes up first, and a preview that opens replaces it in place, under the same tag and
+ * without a second sound. A message with no sealed preview has nothing to open and is shown once.
+ *
+ * The decision about a sealed preview, from the first read of the keys to the post of the preview,
+ * is made under [PreviewKeyGate]: the person turning previews off waits for it to finish, and a
+ * decision that starts after reads the keys as the person left them. So no preview is posted from
+ * keys that the person had already taken away.
+ *
+ * `decide` is the decision about the preview. `show` posts a plan the way it is told, and says
+ * whether it posted. `repeated` says an earlier try of this delivery may already have posted its
+ * alert, so that this try's first post does not sound again. Returns the plan the delivery ended
+ * with: [ALERT_GONE] is its reason when a preview opened and was not posted, and [NOT_POSTED] when
+ * the alert could not be posted and nothing was opened.
+ */
+fun showDelivery(
+    delivery: PushMessage.Delivery,
+    repeated: Boolean = false,
+    decide: () -> PreviewDecision,
+    show: (plan: NotificationPlan, posting: Posting) -> Boolean
+): NotificationPlan {
+    val first = if (repeated) Posting.REPEAT else Posting.NEW
+    if (PREVIEW_KEY !in delivery.data) {
+        // Nothing to open: the keys are not read, and the one post is the whole of it.
+        val plan = planNotification(delivery, decide())
+        show(plan, first)
+        return plan
+    }
+    if (!show(NotificationPlan(delivery.collapseId, delivery.alert, reason = "opening"), first)) {
+        return NotificationPlan(delivery.collapseId, delivery.alert, reason = NOT_POSTED)
+    }
+    return PreviewKeyGate.deciding {
+        val decision = decide()
+        val plan = planNotification(delivery, decision)
+        // The alert is already up, and a preview that stayed closed says nothing more.
+        if (decision is PreviewDecision.Reveal && !show(plan, Posting.REPLACEMENT)) {
+            plan.copy(reason = ALERT_GONE)
+        } else {
+            plan
+        }
+    }
+}

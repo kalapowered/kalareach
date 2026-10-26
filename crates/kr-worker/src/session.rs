@@ -1213,6 +1213,12 @@ impl Session {
         self.config.session_id
     }
 
+    /// Returns the program the session started as its root shell.
+    #[must_use]
+    pub fn shell_program(&self) -> &str {
+        &self.config.shell.program
+    }
+
     /// Returns what this session was created as.
     #[must_use]
     pub const fn config(&self) -> &SessionConfig {
@@ -3996,6 +4002,20 @@ impl Session {
         self.history.page(from_cursor, max_bytes)
     }
 
+    /// Reads one page of retained output for a reader that reaches `reach` of it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the spool cannot be read.
+    pub fn history_page_within(
+        &self,
+        from_cursor: u64,
+        max_bytes: u64,
+        reach: crate::history::Reach,
+    ) -> Result<HistoryPageResult> {
+        self.history.page_within(from_cursor, max_bytes, reach)
+    }
+
     /// Returns why a cursor is no longer retained, when this host recorded a reason.
     ///
     /// The gap a page carries says what is gone; this says which of section 20's bounds took it,
@@ -4070,7 +4090,8 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// Returns [`WorkerError::SessionClosed`] once the session has begun closing.
+    /// Returns [`WorkerError::SessionClosed`] once the session is closed. A session that has begun
+    /// closing is still running and is not refused here.
     pub fn require_live(&self) -> Result<()> {
         self.require_running()
     }

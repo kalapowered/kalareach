@@ -93,12 +93,14 @@ private enum SharedKeyReading {
 
     private struct Found: PreviewKeyReading {
         let value: Data
-        func key(forRecipient recipientKeyID: Data) throws -> Data { value }
+        func recipientSeed(forRecipient recipientKeyID: Data) throws -> Data { value }
+        func senderKey(forSender senderKeyID: Data) throws -> Data { value }
     }
 
     private struct Failing: PreviewKeyReading {
         let failure: PreviewKeyUnavailable
-        func key(forRecipient recipientKeyID: Data) throws -> Data { throw failure }
+        func recipientSeed(forRecipient recipientKeyID: Data) throws -> Data { throw failure }
+        func senderKey(forSender senderKeyID: Data) throws -> Data { throw failure }
     }
 }
 

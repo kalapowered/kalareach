@@ -664,8 +664,10 @@ struct TailCell {
     /// Once it has, every later mark is dropped too. Keeping some of a group and none of the next
     /// would make the answer depend on how many marks arrived in each read.
     full: bool,
-    /// What the cell holds, which a designated character set can make different from the scalars.
-    stored: String,
+    /// What the cell held when a mark was last written into it, which a designated character set
+    /// can make different from the scalars. Nothing until then: a cell is read when a mark reaches
+    /// it and not when it is printed, which would walk the row once for each cell of a line.
+    stored: Option<String>,
     /// Cells it occupies.
     width: usize,
     /// Column of its first cell.
@@ -1006,22 +1008,48 @@ impl CanonicalGrid {
         } else {
             (before.col, before.row)
         };
-        let stored = self.cell_text(col, row)?;
         Some(TailCell {
             full: false,
-            stored,
+            stored: None,
             width,
             col,
             row,
         })
     }
 
+    /// The attributes and text of one cell of the active buffer.
+    ///
+    /// The library's accessor for a cell by position takes the screen mutably, and through the
+    /// line's `cells_mut` turns a line held in its compact form into one cell per column. The two
+    /// forms keep a blank past the end of the text differently, so reading a cell changed what the
+    /// line holds, and which lines had been read depended on where the reads of output ended. This
+    /// borrows the line as it is and reads it.
+    ///
+    /// A blank printed past the end of a compact line is not stored: the line reads as blank
+    /// there, which is the cell a person sees and the cell a combining mark that follows joins.
+    /// Such a cell is reported as the plain blank it is, so a mark reaches it whether or not a
+    /// read happened to store it.
+    fn read_cell(&mut self, col: usize, row: i64) -> Option<(CellAttributes, String)> {
+        if col >= usize::try_from(self.size().cols).unwrap_or(usize::MAX) {
+            return None;
+        }
+        let screen = self.terminal.screen_mut();
+        let physical = screen.phys_row(row);
+        if physical >= screen.scrollback_rows() {
+            return None;
+        }
+        let line = screen.line_mut(physical);
+        match line.get_cell(col) {
+            Some(cell) => Some((cell.attrs().clone(), cell.str().to_owned())),
+            // The second half of a wide character is covered, and reads as a plain blank. Nothing
+            // reads it: a cell is read where a print put its first column.
+            None => Some((CellAttributes::blank(), " ".to_owned())),
+        }
+    }
+
     /// The text of one cell of the active buffer.
     fn cell_text(&mut self, col: usize, row: i64) -> Option<String> {
-        self.terminal
-            .screen_mut()
-            .get_cell(col, row)
-            .map(|cell| cell.str().to_owned())
+        self.read_cell(col, row).map(|(_, text)| text)
     }
 
     /// Adds combining marks to the cell the previous text run ended on.
@@ -1045,7 +1073,20 @@ impl CanonicalGrid {
             self.tail = Some(tail);
             return;
         }
-        let room = self.config.cell_bytes.saturating_sub(tail.stored.len());
+        // The cell is read now, where the mark reaches it. Nothing changes it between the print and
+        // here: a resize and every other kind of event end the tail, and a later print replaces it.
+        let Some((attributes, found)) = self.read_cell(tail.col, tail.row) else {
+            self.dropped_marks = self.dropped_marks.saturating_add(1);
+            return;
+        };
+        // After a mark has been written the cell has to still be the one that was drawn. A resize
+        // reflows the rows and eviction moves them, so the remembered position can hold someone
+        // else's text, and writing into it would overwrite that instead of adding a mark to this.
+        if tail.stored.as_ref().is_some_and(|stored| *stored != found) {
+            self.dropped_marks = self.dropped_marks.saturating_add(1);
+            return;
+        }
+        let room = self.config.cell_bytes.saturating_sub(found.len());
         let keep = marks
             .char_indices()
             .take_while(|(index, scalar)| index + scalar.len_utf8() <= room)
@@ -1061,26 +1102,10 @@ impl CanonicalGrid {
             return;
         }
         let marks = &marks[..keep];
-        let Some((attributes, found)) = self
-            .terminal
-            .screen_mut()
-            .get_cell(tail.col, tail.row)
-            .map(|cell| (cell.attrs().clone(), cell.str().to_owned()))
-        else {
-            self.dropped_marks = self.dropped_marks.saturating_add(1);
-            return;
-        };
-        // The cell has to still be the one that was drawn. A resize reflows the rows and eviction
-        // moves them, so the remembered position can now hold someone else's text, and writing into
-        // it would overwrite that instead of adding a mark to this.
-        if found != tail.stored {
-            self.dropped_marks = self.dropped_marks.saturating_add(1);
-            return;
-        }
         // The marks go on what the cell holds, not on the scalars that were printed into it. A
         // designated character set makes those different, and rebuilding the cell from the printed
         // scalars would undo the mapping the reducer applied.
-        let mut text = tail.stored;
+        let mut text = found;
         text.push_str(marks);
         // The write is a change like any other, so it takes a sequence number of its own. Without
         // one the row does not count as changed, and the mark never reaches a client reading
@@ -1095,7 +1120,7 @@ impl CanonicalGrid {
             .unwrap_or_else(|| text.clone());
         self.tail = Some(TailCell {
             full,
-            stored,
+            stored: Some(stored),
             width: tail.width,
             col: tail.col,
             row: tail.row,

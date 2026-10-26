@@ -63,7 +63,7 @@ use kr_ipc::IpcError;
 use kr_protocol::error::ProtocolError;
 use kr_protocol::frame::FrameError;
 use kr_transport::TransportError;
-use kr_transport::error::RelayRefusalKind;
+use kr_transport::error::{RelayRefusalKind, SelectionRefusal};
 
 /// Text a diagnostic may show.
 ///
@@ -398,6 +398,7 @@ impl Shown {
             TransportError::Crypto(error) => {
                 crate::shown!("the connection proof failed: {}", Self::crypto(error))
             }
+            TransportError::Selection(refusal) => Self::selection(refusal),
             TransportError::Inactive => {
                 Self::said("the peer was silent for longer than the inactivity threshold")
             }
@@ -408,6 +409,24 @@ impl Shown {
                 Self::said("the control stream ended, revoking every associated data stream")
             }
             _ => Self::said("the connection failed"),
+        }
+    }
+
+    /// What a refused host selection says.
+    ///
+    /// The host's selection is not quoted: what it names is said as the check that refused it, in
+    /// this program's own words.
+    #[must_use]
+    pub fn selection(refusal: &SelectionRefusal) -> Self {
+        match refusal {
+            SelectionRefusal::OtherEndpoint => {
+                Self::said("the host's selection names another endpoint than the one that answered")
+            }
+            SelectionRefusal::NotTheOffer { what } => crate::shown!(
+                "the host's selection does not answer this device's offer: {}",
+                *what
+            ),
+            _ => Self::said("the host's selection was refused"),
         }
     }
 

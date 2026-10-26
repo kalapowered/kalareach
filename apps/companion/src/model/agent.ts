@@ -18,8 +18,11 @@ import type {
   AgentSnapshotResult,
   AgentSubject,
   InstanceCapabilityRecord,
-  PendingResource
+  PendingResource,
+  PluginActionInvokeParams
 } from '@kalareach/protocol'
+
+import type { Control } from './controls'
 
 /** One entry of an instance's semantic history, as the conversation holds it. */
 export interface AgentEntry {
@@ -63,6 +66,108 @@ export function targetOf(
   binding: AgentBindingState
 ): AgentMutationTarget {
   return { subject: subjectOf(sessionId, instance), binding_revision: binding.binding_revision }
+}
+
+/** The arguments of an action that takes none: the empty object, as the host hashes it. */
+export const NO_ARGUMENTS = 'e30'
+
+/** What pressing a package's control asks of the host, or why this view cannot ask it. */
+export type Invocation =
+  | { readonly kind: 'call'; readonly params: PluginActionInvokeParams }
+  | { readonly kind: 'cannot'; readonly because: string }
+
+/**
+ * The conversation a control was drawn under: the instance, the package that recognised it and the
+ * binding revision. A package draws its controls for one conversation, and its document does not
+ * say which; the view records it when the node arrives.
+ */
+export interface DrawnUnder {
+  readonly instance: string
+  readonly plugin_id: string | null
+  readonly revision: string
+}
+
+/** The conversation the session's agent is in now, or null while this view has not read it. */
+export function drawnUnder(
+  instance: AgentInstanceSummary | null,
+  binding: AgentBindingState | null
+): DrawnUnder | null {
+  if (instance === null || binding === null) return null
+  return {
+    instance: instance.application_instance_id,
+    plugin_id: instance.plugin_id,
+    revision: binding.binding_revision
+  }
+}
+
+/**
+ * Builds the call a control makes, from what this view has read of the session's agent.
+ *
+ * The call names the package that recognised the agent, the control's registered action, and the
+ * instance at the binding revision the person saw. A control is called only under the conversation
+ * it was drawn under: after the agent moved, the revision this view holds now is not the one the
+ * control was drawn for, and sending it would hide the move from the host. A control drawn before
+ * this view had read the agent has no conversation to be called under until it is drawn again.
+ *
+ * Only a control that declares no parameters, on a surface that collects none, is called: this view
+ * has no way yet to collect an argument, and sending an action what it needs would be the host's
+ * refusal after a press the person had no way to complete. An action that answers a pending
+ * request names the request, which a control does not, and the host refuses it for that.
+ *
+ * `input` is the reason the surface around the control takes something the call does not carry, a
+ * form's fields for one, or null when it takes nothing.
+ */
+export function invocationOf(
+  control: Control,
+  sessionId: string,
+  instance: AgentInstanceSummary | null,
+  binding: AgentBindingState | null,
+  drawn: DrawnUnder | null,
+  input: string | null
+): Invocation {
+  const now = drawnUnder(instance, binding)
+  if (instance === null || binding === null || now === null) {
+    return { kind: 'cannot', because: 'This view has no agent it can call.' }
+  }
+  if (drawn === null) {
+    return {
+      kind: 'cannot',
+      because: 'This was shown before the agent was read. It works when the package draws it again.'
+    }
+  }
+  if (
+    drawn.instance !== now.instance ||
+    drawn.plugin_id !== now.plugin_id ||
+    drawn.revision !== now.revision
+  ) {
+    return {
+      kind: 'cannot',
+      because: 'The conversation moved since this was shown. It works when the package draws it again.'
+    }
+  }
+  if (instance.plugin_id === null) {
+    return { kind: 'cannot', because: 'No package recognised this agent.' }
+  }
+  if (input !== null) {
+    return { kind: 'cannot', because: input }
+  }
+  if (control.parameters === undefined) {
+    return { kind: 'cannot', because: 'This view cannot tell what this action takes.' }
+  }
+  if (control.parameters.parameters.length > 0) {
+    return { kind: 'cannot', because: 'This action asks for input this view cannot take yet.' }
+  }
+  return {
+    kind: 'call',
+    params: {
+      target: targetOf(sessionId, instance.application_instance_id, binding),
+      plugin_id: instance.plugin_id,
+      action: control.action_id,
+      draft_id: null,
+      resource_id: null,
+      parameters: NO_ARGUMENTS
+    }
+  }
 }
 
 /** One entry of `instance`'s history, as the conversation holds it. */

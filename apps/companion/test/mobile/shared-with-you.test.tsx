@@ -114,6 +114,17 @@ describe('an invitation at the head of the inbox (KR-REQ-18.13)', () => {
     expect(within(ends).getByText(/\. Used once\.$/)).toBeInTheDocument()
   })
 
+  // KR-REQ-10.42, the part about labels: the row names what the invitation allows beside the role,
+  // so a viewer who may answer the agent is not read as a viewer who only watches.
+  it('names beside the role what an invitation allows beyond it', async () => {
+    start({
+      before: (c) => c.sharing.offer({ role: 'viewer', actions: ['question.respond', 'session.view'] })
+    })
+    const row = await screen.findByRole('button', { name: new RegExp(INVITATION) })
+    expect(row).toHaveTextContent('Viewer')
+    expect(row).toHaveTextContent('answers the agent’s questions')
+  })
+
   it('names the control that closes the card by the card, and closing it leaves the invitation offered', async () => {
     start({ before: (c) => c.sharing.offer() })
     await userEvent.click(await screen.findByRole('button', { name: new RegExp(INVITATION) }))
@@ -564,7 +575,41 @@ describe('the shares held, at the head of the sessions (KR-REQ-18.13)', () => {
     expect(within(shared).getByRole('heading', { name: 'Shared with you' })).toBeInTheDocument()
     expect(within(shared).getByText('Session 3 · Studio')).toBeInTheDocument()
     expect(within(shared).getByText('Controller')).toBeInTheDocument()
+    // A controller carries every right its role names: nothing is said beside the role.
+    expect(shared).not.toHaveTextContent(/also/i)
     expect(within(shared).getByText(/^Until /)).toBeInTheDocument()
+  })
+
+  // KR-REQ-10.42, the part about labels: a share is shown by what it allows, so a viewer who may
+  // answer the agent is named with the answer.
+  it('names beside the role what a share allows beyond it', async () => {
+    start({
+      before: (c) => {
+        c.sharing.hold({ role: 'viewer', actions: ['question.respond', 'session.view'], session: '3' })
+      }
+    })
+    await openTab('Sessions')
+    const shared = await screen.findByTestId('shared-with-you')
+    const viewer = within(shared).getByRole('button', { name: /Session 3 · Studio/ })
+    expect(viewer).toHaveTextContent('Viewer')
+    expect(viewer).toHaveTextContent('answers the agent’s questions')
+  })
+
+  // KR-REQ-10.42, the part about labels: a share with no view of the session is no viewer. It is
+  // custom access, and each right it carries is named.
+  it('calls a share with no view of the session custom access and names its rights', async () => {
+    start({
+      before: (c) => {
+        c.sharing.hold({ actions: ['agent.approval.respond', 'agent.prompt'], session: '4' })
+      }
+    })
+    await openTab('Sessions')
+    const shared = await screen.findByTestId('shared-with-you')
+    const custom = within(shared).getByRole('button', { name: /Session 4 · Studio/ })
+    expect(custom).toHaveTextContent('Custom access')
+    expect(custom).not.toHaveTextContent('Viewer')
+    expect(custom).toHaveTextContent(/sends the agent prompts/)
+    expect(custom).toHaveTextContent(/answers the agent’s approval requests/i)
   })
 
   it('opens the session under the share when the row is pressed', async () => {

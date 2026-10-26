@@ -925,7 +925,12 @@ impl InputDomain {
         let mut queued_bytes = 0_u64;
         for reply in replies {
             let queued = self.writer.queued_input_bytes.load(Ordering::Acquire);
-            let held = queued.saturating_sub(self.writer.queued_lease_bytes.load());
+            // What the replies themselves hold: queued and neither written nor dropped. The queue
+            // holds more than that. The keystrokes a takeover made stale stay in it until the
+            // writer reaches them, and the count of the lease they were accepted under went with
+            // the takeover, so taking the lease's share off the queue would charge them to the
+            // replies.
+            let held = self.writer.unwritten_replies.load(Ordering::Acquire);
             // Two bounds, both of them this reply's: its own share, so an application that asks
             // questions without reading the answers cannot fill the terminal by itself, and the
             // whole budget, so its share cannot be spent on top of a full queue. What the root
@@ -1531,6 +1536,62 @@ mod tests {
             order,
             ["remove", "write", "interrupt"],
             "the session carries out the rest in the machine's order"
+        );
+    }
+
+    /// KR-REQ-08.48: the share of the queue the host's own answers may fill is what the answers
+    /// themselves hold. The keystrokes a takeover made stale wait in the queue until the writer
+    /// reaches them, and they are no answer's: they count against the whole budget, which they
+    /// still hold, and not against the answers' share.
+    #[test]
+    fn the_keystrokes_a_takeover_left_behind_do_not_spend_the_answers_share() {
+        let mut input = domain();
+        input.queue_input(InputBatch::Lease {
+            epoch: 0,
+            bytes: vec![b'x'; MAX_PENDING_REPLY_BYTES],
+            paste: PasteTransition::default(),
+            authority_deadline_boot_ms: None,
+            authority_utc_deadline_ms: None,
+        });
+        // The lease changes hands. Its own count goes with the takeover, and the bytes stay in the
+        // queue until a writer reaches them and sees they are stale; no writer runs here.
+        let ended = input.end_lease();
+        assert_eq!(ended.left, MAX_PENDING_REPLY_BYTES as u64);
+
+        let answer = b"\x1b[0n".to_vec();
+        let _ = input.queue_replies(vec![crate::projection::LaneReply {
+            bytes: answer.clone(),
+            expires_at_ms: None,
+        }]);
+
+        let queued: Vec<InputBatch> = input
+            .take_pending()
+            .into_iter()
+            .filter(|batch| matches!(batch, InputBatch::Reply { .. }))
+            .collect();
+        assert_eq!(
+            queued,
+            vec![InputBatch::Reply {
+                bytes: answer,
+                expires_at_ms: None
+            }],
+            "the answer is queued, with the whole budget still far from spent"
+        );
+
+        // The share is still a share: the replies themselves fill it, to the byte, and the next
+        // reply past it is refused.
+        let room = MAX_PENDING_REPLY_BYTES - b"\x1b[0n".len();
+        let reply = |len: usize| crate::projection::LaneReply {
+            bytes: vec![b'r'; len],
+            expires_at_ms: None,
+        };
+        let _ = input.queue_replies(vec![reply(room)]);
+        let _ = input.queue_replies(vec![reply(1)]);
+        let lengths: Vec<usize> = input.take_pending().iter().map(InputBatch::len).collect();
+        assert_eq!(
+            lengths,
+            vec![room],
+            "a reply that fills the share is queued and the one past it is not"
         );
     }
 

@@ -121,7 +121,7 @@ between the two would let another writer put a batch in front of one the machine
 grouping the actions by kind would tell the bridge a detach had happened before the attachment was
 gone, or interrupt an application before the launch that interrupt revoked had been called off.
 
-The driver tells the machine about every byte the host puts into the terminal, not only a person's. The host's answer to a question the application asked holds no lease and is never held behind an exchange, so it can reach the reader after the reader has proved its queues clear. The driver tells the machine about those bytes by giving them to it as a `host_reply_queued` stimulus when they are queued, before anything the machine publishes because of them. If those bytes arrive while an exchange is in progress, the driver withholds the corresponding fence from publication. If they arrive after the fence has been published, the driver invalidates the fence, and a launch reserved on that fence is revoked as queued prior input. Either way, the reader's next idle callback asks again, and its own snapshot accounts for the bytes.
+The driver tells the machine about every byte the host puts into the terminal, not only a person's. The host's answer to a question the application asked holds no lease and is never held behind an exchange, so it can reach the reader after the reader has proved its queues clear. The driver tells the machine about those bytes by giving them to it as a `host_reply_queued` stimulus when they are queued, before anything the machine publishes because of them. If those bytes arrive while an exchange is in progress, the driver withholds the corresponding fence from publication. If they arrive after the fence has been published, the driver invalidates the fence, and a launch reserved on that fence is revoked as queued prior input. Either way, the reader's next idle callback asks again, and its own snapshot accounts for the bytes. The Zsh, Bash and Fish readers count the unread bytes of the terminal in that snapshot. The PowerShell reader counts only the keys its editor has queued, so bytes still in the terminal's queue or in .NET's input buffer are in none of its counts, and a fence over it does not wait for them.
 
 An answer the writer has not written when an exchange begins is reported again as that exchange's own. The session raises a count of such bytes when it queues an answer. The writer lowers it by the answer's bytes in each piece it writes to the terminal, and by the rest of an answer it drops. A person's own bytes never change it. The writer lowers the count after the write returns, so an exchange that begins between the two steps is withheld for bytes the reader already has. The reader asks again at its next idle report, and a reader that reports idle only once until the next key asks at that key. The writer lowers the count in that order on purpose, and the order stays. The writer drops an answer whose response lane deadline passed while it waited for a terminal that would not take it, before its first byte and never part way through.
 
@@ -217,7 +217,8 @@ single-quote rule.
 ## Launching the root shell
 
 Managed mode launches a KalaReach-qualified package: the exact binary its reader patch was built
-into and the module tree it will load. Nothing is substituted. A shell no package qualifies is
+into and the module tree it will load. A package's own files are inside it, and a package that builds
+no shell names the host it qualified. Nothing is substituted. A shell no package qualifies is
 refused with `SHELL_INTEGRATION_UNSUPPORTED`, by name, before a reservation is recorded and before
 anything is spawned. A command line rather than an executable is refused the same way: a
 non-interactive script request never becomes an interactive shell.
@@ -237,18 +238,51 @@ the record's own shape is stated; these are the parts a session depends on.
 | Field | What it is |
 | --- | --- |
 | `shell.kind` | `zsh`, `bash`, `fish` or `powershell` |
-| `shell.executable` | The shell binary, as the build installed it |
+| `shell.executable` | The shell binary, as the build installed it; for a package that builds no shell, the absolute path of the host it qualified |
 | `shell.upstream_version` | The upstream release it was built from |
 | `shell.editor_abi` | The editor ABI revision the reader patch was built against |
 | `shell.integration_version` | The package's own integration version |
 | `shell.patches` | Every published reader patch, with the upstream revision each applies to |
 | `shell.modules` | The module tree, with each module's search path and ABI |
 | `startup_entry.file` | The file the guarded startup entry sources |
+| `launch` | What a start adds to the shell's environment (see below) |
 
 The Zsh, Bash and Fish packages rebuild their shell with a reader patch, so each record names its
 patches. The PSReadLine package rebuilds nothing and patches nothing: its reader bridge is its own
 `KalaReach.ShellBridge` module, so its record names no patch and names that module in
 `shell.modules`, at the editor ABI it was qualified against.
+
+That package also holds no shell. PowerShell and PSReadLine are the person's, and the record names
+the host it qualified, by an absolute path to a program called `pwsh`, as `shell.executable`. A
+session starts that program by that path, never by a search, and the module reports the process it
+runs in as the executable, so the two strings agree because the worker started what the record
+names. Every other file the record names (the module tree, the startup entry) is the package's own
+and has to be inside it; a record that names anything else outside its package, or a host that is
+not an absolute path to a `pwsh`, is refused for that shell alone. A Microsoft Store build of
+PowerShell is installed under `WindowsApps`, whose programs an account does not start by their path,
+so publishing a package for one is refused by name and sessions use `--shell-mode native_compat`.
+
+`launch` is the one place a record reaches the environment of the shell a session starts, and it is
+held to two things. `launch.environment` sets the .NET runtime's location (`DOTNET_ROOT` and its
+forms for one architecture) to the value the qualification found it at, because the host cannot
+start without it. `launch.search_paths.PSModulePath` lists the package's module directories, which
+the worker puts first on the list of module directories, once each, with every other entry kept in
+the order it had: the module a startup entry imports by name is then the package's own, and a
+module of the same name that the person listed first is behind it. PowerShell puts its own user,
+shared and `$PSHOME` module folders before a list it inherits, so a module of the same name in one
+of those is found first; the handshake then names the module it was given, which is not the
+package's, and refuses the session. A record that names any other
+variable, a variable the host owns, a value with a NUL in it or a directory outside the package is
+refused when it is read. The worker applies the block before it adds the two bootstrap values, and
+the shells that ask a question of the host (where a profile is, whether an entry sits among whole
+statements) are started with it too.
+
+A package states its record as it was published, as a compiled package states the build it came
+from, and a session reads the files it opens from where the package is. A package that has been
+moved starts its own module and reports the module tree it was published with, which the worker
+expects. PowerShell or PSReadLine updated after a publish is a host or an editor the package did not
+qualify: the module declines it, and the answer to the create says to run
+`Publish-KalaReachQualification` again.
 
 A hello is checked against the package's editor ABI and integration version, and the rest of the
 identity it carries (the executable, the upstream revision, the patches and the module tree) is
@@ -311,7 +345,13 @@ does is inside a test for Bash that is not in its POSIX mode, which is what `/bi
 platforms where that file is Bash.
 
 Whether the integration actually loaded is established at run time by the handshake, never by
-reading a file back.
+reading a file back. One read comes before the shell starts, to refuse early: a managed create reads
+the record described below and, when no file the record names for the shell holds the entry that
+opens the bridge, is refused at once under `SHELL_INTEGRATION_UNSUPPORTED` with the words "run
+`kr shell install`", instead of waiting out the qualification bound for a hello that cannot come. A
+managed create whose shell starts and never opens the bridge ends under the same code, with the
+worker's own reason. A record that cannot be read refuses nothing, and an entry put in a file by
+hand has no record until `kr shell install` runs.
 
 `kr shell install` records each startup file it puts an entry in, by the file's exact name, before
 it writes any of them, in `shell-entries.json` in the installation's state directory. `kr shell

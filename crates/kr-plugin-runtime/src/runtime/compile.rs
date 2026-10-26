@@ -50,6 +50,8 @@
 
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "testing")]
+use std::sync::{Condvar, PoisonError};
 
 use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_service::vocabulary::COMPILE_DEADLINE_MS;
@@ -138,6 +140,52 @@ pub struct CompilePool {
     sender: mpsc::SyncSender<Job>,
     priority: Arc<Mutex<Option<BackgroundPriority>>>,
     threads: usize,
+    #[cfg(feature = "testing")]
+    hold: Arc<HoldState>,
+}
+
+/// Whether a test holds the pool's jobs, and what a held job waits on.
+#[cfg(feature = "testing")]
+#[derive(Debug, Default)]
+struct HoldState {
+    held: Mutex<bool>,
+    released: Condvar,
+}
+
+#[cfg(feature = "testing")]
+impl HoldState {
+    fn set(&self, held: bool) {
+        *self.held.lock().unwrap_or_else(PoisonError::into_inner) = held;
+        self.released.notify_all();
+    }
+
+    fn wait_until_released(&self) {
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        while *held {
+            held = self
+                .released
+                .wait(held)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
+/// A test's hold on the compilation pool, taken with [`CompilePool::hold`].
+///
+/// Every job the pool takes while the hold stands waits before it compiles anything, so a caller
+/// that was told its compile was queued can be shown a compile that is not done and cannot be done.
+/// Dropping the hold lets the jobs go.
+#[cfg(feature = "testing")]
+#[derive(Debug)]
+pub struct CompileHold {
+    state: Arc<HoldState>,
+}
+
+#[cfg(feature = "testing")]
+impl Drop for CompileHold {
+    fn drop(&mut self) {
+        self.state.set(false);
+    }
 }
 
 type JobWork = Box<dyn FnOnce() + Send + 'static>;
@@ -158,6 +206,8 @@ impl CompilePool {
         let (sender, receiver) = mpsc::sync_channel::<Job>(queue);
         let receiver = Arc::new(Mutex::new(receiver));
         let priority = Arc::new(Mutex::new(None));
+        #[cfg(feature = "testing")]
+        let hold = Arc::new(HoldState::default());
         for index in 0..threads {
             let receiver = Arc::clone(&receiver);
             let priority = Arc::clone(&priority);
@@ -190,6 +240,18 @@ impl CompilePool {
             sender,
             priority,
             threads,
+            #[cfg(feature = "testing")]
+            hold,
+        }
+    }
+
+    /// Holds every job the pool takes until the returned hold is dropped. One hold at a time.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn hold(&self) -> CompileHold {
+        self.hold.set(true);
+        CompileHold {
+            state: Arc::clone(&self.hold),
         }
     }
 
@@ -242,7 +304,11 @@ impl CompilePool {
         // A channel a caller can await rather than block on, so nothing that is waiting for a
         // compile is holding a thread while it waits.
         let (answer, wait) = tokio::sync::oneshot::channel();
+        #[cfg(feature = "testing")]
+        let hold = Arc::clone(&self.hold);
         let job = Job(Box::new(move || {
+            #[cfg(feature = "testing")]
+            hold.wait_until_released();
             // A compiler that panics on a component refuses that component. It does not end the
             // pool thread it ran on, which would be lost for good and take a share of the pool
             // with it, and it does not leave the caller told that the pool is gone.

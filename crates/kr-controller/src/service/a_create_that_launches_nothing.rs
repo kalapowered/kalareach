@@ -113,7 +113,7 @@ impl HeldConnections {
         let (held, confirmed) = std::sync::mpsc::channel::<()>();
         let controller = Arc::clone(controller);
         let task = tokio::task::spawn_blocking(move || {
-            let _table = controller.admitted_table();
+            let _table = controller.admitted_write();
             held.send(()).expect("the test is waiting");
             // Held until the test releases it. The receiver ends when the sender is dropped,
             // so a test that panics does not leave the table locked for the rest of the suite.
@@ -514,7 +514,7 @@ async fn a_create_admitted_before_a_revision_is_refused_though_its_connection_st
         let revision = registry
             .authority_revision()
             .expect("the revision in force");
-        let mut admitted = controller.admitted_table();
+        let mut admitted = controller.admitted_write();
         for connection in admitted.values_mut() {
             connection.admitted_revision = revision;
         }
@@ -1945,7 +1945,7 @@ async fn the_admission_a_service_checks_again_answers_both_revocations() {
         let revision = registry
             .authority_revision()
             .expect("the revision in force");
-        let mut admitted = controller.admitted_table();
+        let mut admitted = controller.admitted_write();
         for connection in admitted.values_mut() {
             connection.admitted_revision = revision;
         }
@@ -2656,7 +2656,7 @@ async fn an_installation_admitted_before_a_revocation_is_refused_at_its_marker()
         let revision = registry
             .authority_revision()
             .expect("the revision in force");
-        let mut registrations = controller.admitted_table();
+        let mut registrations = controller.admitted_write();
         for connection in registrations.values_mut() {
             connection.admitted_revision = revision;
         }
@@ -2794,7 +2794,7 @@ async fn a_create_a_paired_device_makes_with_variables_of_its_own_is_refused() {
     let connection_id = ConnectionId::new(kr_ipc::new_uuid());
     let actor_id = kr_protocol::ids::ActorId::new("device:test").expect("a principal");
     let revision = controller.leases.authority_revision();
-    controller.admitted_table().insert(
+    controller.admitted_write().insert(
         connection_id,
         super::AdmittedConnection::new(actor_id.clone(), revision),
     );

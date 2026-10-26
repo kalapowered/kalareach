@@ -1,6 +1,6 @@
 {
   "description": "One exhaustive authority entry per method. Anything not listed is denied. Generated from crates/kr-protocol; do not edit by hand.",
-  "method_count": 188,
+  "method_count": 189,
   "methods": [
     {
       "capability": "none",
@@ -400,6 +400,39 @@
         "environment"
       ],
       "summary": "Where privacy mode stands: its generation, whether its last change has taken effect, what each session still owes, what is kept and what had already left this host.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "host_and_environment",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "keyed": {
+          "key": "the reference of the copy"
+        }
+      },
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "privacy.retained.delete",
+      "name": "privacy.retained.delete",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "host.manage"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "environment"
+      ],
+      "summary": "Ask the service that holds a copy privacy mode listed as having left this host to delete it, at the host itself: the copy is named by the reference `privacy.status` shows for it, and the call is its own action, apart from turning privacy mode on. Privacy mode does not stop it. A copy the host holds no way to ask the removal of is refused. The answer says whether the service confirmed the deletion, and where privacy mode stands; the call keeps no record of its action, and asked again for the same copy it asks again.",
       "version": 1
     },
     {

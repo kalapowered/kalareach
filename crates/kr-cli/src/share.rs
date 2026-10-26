@@ -1329,10 +1329,34 @@ const fn state_words(state: GrantState) -> &'static str {
     }
 }
 
+/// What a share allows, as a list prints it: the widest role whose rights the share carries in
+/// full, and every right the role does not cover named beside it. A viewer who may answer the
+/// agent's questions is `viewer plus question.respond`, never a plain viewer; a share that carries
+/// no role in full, because every role includes `session.view` and it has none, is `custom` with
+/// each right named. The role is a label for the person reading the line: the host decides from
+/// the rights.
+fn access_words(actions: &CanonicalSet<ActionRight>) -> Shown {
+    let role = kr_controller::sharing::roles::describes(actions);
+    let beyond: Vec<Shown> = actions
+        .iter()
+        .filter(|right| role.is_none_or(|role| !role.default_actions().contains(right)))
+        .map(|right| Shown::said(right.as_str()))
+        .collect();
+    match (role, beyond.is_empty()) {
+        (Some(role), true) => Shown::said(role.as_str()),
+        (Some(role), false) => shown!(
+            "{} plus {}",
+            Shown::said(role.as_str()),
+            Shown::joined(beyond, ", ")
+        ),
+        (None, true) => Shown::said("custom"),
+        (None, false) => shown!("custom: {}", Shown::joined(beyond, ", ")),
+    }
+}
+
 /// One share as a line.
 fn list_line(summary: &GrantSummary, devices: &DeviceListResult) -> Line {
-    let role = kr_controller::sharing::roles::describes(&summary.grant.actions)
-        .map_or("custom", SessionRole::as_str);
+    let access = access_words(&summary.grant.actions);
     let session = match &summary.grant.session_selector {
         kr_protocol::grant::SessionSelector::These { session_ids } => session_ids.iter().next(),
         _ => None,
@@ -1350,7 +1374,7 @@ fn list_line(summary: &GrantSummary, devices: &DeviceListResult) -> Line {
         summary.grant.recipient_device_id,
         device.unwrap_or_else(|| Asked::text(Request::Devices, "")),
         session.map_or_else(|| Shown::said("none"), |session| shown!("{}", *session)),
-        Shown::said(role),
+        access,
         Shown::said(if summary.grant.history.include_live_screen {
             " with the live screen"
         } else {
@@ -2060,6 +2084,105 @@ mod tests {
             "ok\\u{001b}[31m red \\u{202e}gnp.exe\\u{0007}\\u{200b}"
         );
         assert_eq!(visibly("plain text ünï"), "plain text ünï");
+    }
+
+    /// A share to a device, as the host lists it, carrying exactly these rights.
+    fn share_with(seed: u8, rights: &[ActionRight]) -> GrantSummary {
+        use kr_protocol::grant::{
+            EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector,
+        };
+        use kr_protocol::ids::AuthorityRevision;
+
+        GrantSummary {
+            grant: Grant {
+                grant_id: GrantId::new(Uuid::from_bytes([seed; 16])),
+                parent_grant_id: Nullable::null(),
+                issuer_device_id: DeviceId::new(Uuid::from_bytes([200; 16])),
+                recipient_device_id: DeviceId::new(Uuid::from_bytes([seed; 16])),
+                authority_revision: AuthorityRevision::new(1),
+                environment_selector: EnvironmentSelector::Any,
+                session_selector: SessionSelector::None,
+                actions: rights.iter().copied().collect(),
+                history: HistoryScope {
+                    lower_bound_ms: Nullable::null(),
+                    include_live_screen: false,
+                    named_questions: CanonicalSet::new(),
+                    named_approvals: CanonicalSet::new(),
+                },
+                expiry: GrantExpiry::At {
+                    expires_at_ms: TimestampMs::new(NOW),
+                },
+                organisation: Nullable::null(),
+            },
+            state: GrantState::Active,
+            revoked_at_ms: Nullable::null(),
+            revoked_by_parent: Nullable::null(),
+            ends_at_ms: Nullable::some(TimestampMs::new(NOW)),
+        }
+    }
+
+    /// The text of the line `kr share list` prints for a share.
+    fn listed(rights: &[ActionRight]) -> String {
+        let devices = DeviceListResult {
+            devices: Vec::new(),
+            authority_revision: kr_protocol::ids::AuthorityRevision::new(1),
+            feed_synchronised_at_ms: Nullable::null(),
+            feed_stale: false,
+            feed_removed: false,
+        };
+        list_line(&share_with(1, rights), &devices)
+            .text()
+            .to_owned()
+    }
+
+    /// KR-REQ-10.42: a viewer who may answer the agent's questions is not listed as a plain
+    /// viewer. The role is the widest one whose rights the share carries in full, and each right
+    /// beyond it is named beside it.
+    #[test]
+    fn a_viewer_who_may_answer_is_listed_with_the_answer() {
+        let answering = listed(&[ActionRight::SessionView, ActionRight::QuestionRespond]);
+        assert!(answering.contains("viewer"), "{answering}");
+        assert!(answering.contains("question.respond"), "{answering}");
+    }
+
+    /// KR-REQ-10.42: the grant of a voice call in the default scope, with prompt submission added,
+    /// carries `session.view`, `agent.prompt` and `voice.use`, so it is a viewer with the other two
+    /// rights named, not a plain viewer.
+    #[test]
+    fn a_voice_calls_grant_is_listed_with_its_rights() {
+        let call = listed(&[
+            ActionRight::SessionView,
+            ActionRight::AgentPrompt,
+            ActionRight::VoiceUse,
+        ]);
+        assert!(call.contains("viewer"), "{call}");
+        for right in ["agent.prompt", "voice.use"] {
+            assert!(call.contains(right), "{call}");
+        }
+    }
+
+    /// KR-REQ-10.42: every role includes the view of the session, so a share without it has no
+    /// role. It is not called a viewer; each right it carries is named.
+    #[test]
+    fn a_share_with_no_view_of_the_session_is_listed_with_its_rights() {
+        let blind = listed(&[ActionRight::AgentApprovalRespond, ActionRight::AgentPrompt]);
+        assert!(!blind.contains("viewer"), "{blind}");
+        for right in ["agent.approval.respond", "agent.prompt"] {
+            assert!(blind.contains(right), "{blind}");
+        }
+    }
+
+    /// A share that carries exactly a role's rights says the role and no right: nothing is left
+    /// unnamed, and nothing is said twice.
+    #[test]
+    fn a_share_that_carries_exactly_a_role_is_listed_by_the_role_alone() {
+        for role in SessionRole::ALL {
+            let line = listed(role.default_actions());
+            assert!(line.contains(role.as_str()), "{line}");
+            for right in role.default_actions() {
+                assert!(!line.contains(right.as_str()), "{role}: {line}");
+            }
+        }
     }
 
     /// The list document carries the device's own name only as asked-for text, and every other leaf

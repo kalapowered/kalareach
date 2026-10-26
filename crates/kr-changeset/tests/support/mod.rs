@@ -299,6 +299,44 @@ impl Fixture {
         self.changesets.capture(&order).map(|(record, _)| record)
     }
 
+    /// Captures one version recorded for a session, or for none, into a change set or a new one.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the capture fails.
+    #[must_use]
+    pub fn capture_for(
+        &self,
+        workspace_id: WorkspaceId,
+        change_set_id: Option<kr_protocol::ids::ChangeSetId>,
+        session_id: Option<kr_protocol::ids::SessionId>,
+    ) -> ChangeSetVersionRecord {
+        let policy = include_everything();
+        let grant = FileGrant::default();
+        let order = CaptureOrder {
+            workspace_id,
+            change_set_id,
+            label: "the work",
+            request: CaptureRequest {
+                policy: &policy,
+                grant: &grant,
+                quiescence_declared: false,
+                required_consistency: None,
+                quiescence: None,
+            },
+            pin: false,
+            provenance: Provenance {
+                session_id: Nullable(session_id),
+                ..provenance()
+            },
+            admitted: None,
+        };
+        self.changesets
+            .capture(&order)
+            .map(|(record, _)| record)
+            .expect("the capture succeeds")
+    }
+
     /// Captures one version under an admission the daemon can withdraw while it runs.
     ///
     /// # Errors

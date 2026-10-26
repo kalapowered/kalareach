@@ -276,6 +276,40 @@ describe('who has access', () => {
     expect(controls.sharing.grants().map((each) => each.state)).toEqual(['revoked'])
   })
 
+  // KR-REQ-10.42, the part about labels: a viewer who may answer the agent's questions is not
+  // listed as a plain viewer. An answer is input the agent acts on under its own permissions, so
+  // the row says what the share allows beside the role; a viewer who may not answer says nothing more.
+  it('names what a viewer who may answer the agent’s questions is allowed, beside the role', async () => {
+    const { controls, person } = await openSharing()
+    await person.click(screen.getByRole('radio', { name: PHONE }))
+    await person.click(screen.getByRole('switch', { name: 'Let a viewer answer questions' }))
+    await person.click(await screen.findByRole('checkbox', { name: /I understand this lets Sam/ }))
+    await person.click(screen.getByTestId('invite'))
+    await waitFor(() => {
+      expect(controls.sharing.grants()).toHaveLength(1)
+    })
+    expect(controls.sharing.grants()[0]?.grant.actions).toContain('question.respond')
+    const answering = await waitFor(() => {
+      const found = screen.getByTestId('access').querySelector('[data-state="pending"]')
+      expect(found).not.toBeNull()
+      return found as HTMLElement
+    })
+    expect(answering.textContent).toContain('Viewer')
+    expect(answering.textContent).toContain('answers the agent’s questions')
+
+    // The same viewer without the option has nothing beyond the role to name.
+    await person.click(within(answering).getByTestId('withdraw'))
+    await person.click(screen.getByRole('switch', { name: 'Let a viewer answer questions' }))
+    await person.click(screen.getByTestId('invite'))
+    const plain = await waitFor(() => {
+      const found = screen.getByTestId('access').querySelector('[data-state="pending"]')
+      expect(found).not.toBeNull()
+      return found as HTMLElement
+    })
+    expect(plain.textContent).toContain('Viewer')
+    expect(plain.textContent).not.toContain('answers')
+  })
+
   // KR-REQ-18.14: a revocation a session worker has not confirmed is not called done. The line the
   // page keeps for it states the authority revision the host issued and how many session workers
   // have not confirmed, and offers to check again until none is left.

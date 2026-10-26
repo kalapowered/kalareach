@@ -252,20 +252,16 @@ pub(crate) fn sync(
         Ok(built) => built,
         Err(answer) => return answer,
     };
-    // Read before the feed is asked, as the Worker's route reads it: a change that carries an
-    // announcement the service will not carry is refused whole.
-    let announcement = match read_announcement(operation, member, now_ms) {
-        Ok(announcement) => announcement,
-        Err(answer) => return answer,
-    };
+    // Read before the feed is asked, as the Worker's route reads it. The announcement is a nudge
+    // beside a change that is the record, so what is wrong with one never refuses the change.
+    let announcing = read_announcement(operation, member, now_ms);
     let feed = feeds.entry(host_key_id.clone()).or_default();
     match feed.run(&host_key_id, &call, &caller) {
         Ok(mut state) => {
             // The change has committed, so the announcement is placed after it and what becomes
             // of it is reported beside the change.
-            if let Some((recipient, envelope)) = announcement {
-                state["announced"] =
-                    crate::mailbox::announce(mailboxes, signature, recipient, envelope, now_ms);
+            if let Some(announced) = announced(announcing, mailboxes, signature, now_ms) {
+                state["announced"] = announced;
             }
             answered(state)
         }
@@ -273,46 +269,74 @@ pub(crate) fn sync(
     }
 }
 
+/// What a change says about the announcement it carries.
+#[derive(Debug)]
+enum Announcing<'a> {
+    /// The change carries none.
+    None,
+    /// A sealed item for a recipient that says the feed changed and expires within an hour.
+    Place(&'a str, SealedEnvelope),
+    /// An item the service will not place, and the fixed reason it reports. The reason repeats
+    /// nothing the caller sent, which may be a secret in a place a reader refuses.
+    Declined(&'static str),
+}
+
+/// What became of the announcement, once the change has committed: where it ended up, or why the
+/// service declined it.
+fn announced(
+    announcing: Announcing<'_>,
+    mailboxes: &mut BTreeMap<String, crate::mailbox::Mailbox>,
+    signature: &ServiceRequestSignature,
+    now_ms: u64,
+) -> Option<Value> {
+    match announcing {
+        Announcing::None => None,
+        Announcing::Declined(reason) => {
+            Some(json!({ "mailbox": "declined", "declined_reason": reason }))
+        }
+        Announcing::Place(recipient, envelope) => Some(crate::mailbox::announce(
+            mailboxes, signature, recipient, envelope, now_ms,
+        )),
+    }
+}
+
 /// The announcement a publication, a revision or an acknowledgement carries, when it carries one
 /// this service will place: a sealed item for a recipient that says the feed changed and expires
-/// within an hour. Any other member carries none.
+/// within an hour. One it will not place is declined, and the change it came with stands. Any
+/// other member carries none.
 fn read_announcement<'a>(
     operation: &str,
     member: Option<&'a Value>,
     now_ms: u64,
-) -> Result<Option<(&'a str, SealedEnvelope)>, ServiceHttpAnswer> {
+) -> Announcing<'a> {
     if !matches!(operation, "publish" | "revise" | "acknowledge") {
-        return Ok(None);
+        return Announcing::None;
     }
     let Some(announce) = member
         .map(|member| &member["announce"])
         .filter(|announce| !announce.is_null())
     else {
-        return Ok(None);
+        return Announcing::None;
     };
-    let sealed = "An announcement is a sealed item for a recipient.";
     // The route reads the recipient as text and no more: whether it is a key is found when the
     // item is placed, and reported beside the change, which has committed by then.
     let Some(recipient) = announce["recipient_key"].as_str() else {
-        return Err(invalid(sealed));
+        return Announcing::Declined("An announcement is a sealed item for a recipient.");
     };
-    let envelope = match crate::mailbox::read_envelope(&announce["envelope"]) {
-        Ok(envelope) => envelope,
-        Err(message) => {
-            return Err(invalid(
-                &message.unwrap_or_else(|| "An announcement is a sealed item.".to_owned()),
-            ));
-        }
+    let Ok(envelope) = crate::mailbox::read_envelope(&announce["envelope"]) else {
+        return Announcing::Declined(
+            "An announcement is a sealed item: its fields are exactly the ones the contract names, each in the form it states.",
+        );
     };
     if envelope.routing.payload_type != MailboxPayloadType::AuthorityFeedChange {
-        return Err(invalid(
+        return Announcing::Declined(
             "An announcement carries that the feed changed and nothing about what changed.",
-        ));
+        );
     }
     if envelope.routing.expires_at_ms.get() > now_ms + ANNOUNCEMENT_LIFETIME_MS {
-        return Err(invalid("An announcement expires within 60 minutes."));
+        return Announcing::Declined("An announcement expires within 60 minutes.");
     }
-    Ok(Some((recipient, envelope)))
+    Announcing::Place(recipient, envelope)
 }
 
 /// What the route checks before the feed decides, and the call it makes of the feed.
@@ -890,6 +914,18 @@ mod tests {
     use crate::mailbox::tests::{NOW, envelope_for};
     use kr_crypto::keys::StoredEnvelopeKeyPair;
 
+    /// How long after its own clock the Worker lets an announcement expire: an hour, as the
+    /// client's announcements are sealed to stay within.
+    const THE_WORKERS_HOUR_MS: u64 = 3_600_000;
+
+    /// An announcement from a fresh key to itself that expires at `expires_at_ms`, as a request
+    /// member carries it.
+    fn carrying(expires_at_ms: u64) -> Value {
+        let recipient = StoredEnvelopeKeyPair::generate().expect("a key");
+        let envelope = envelope_for(recipient.public(), recipient.public(), expires_at_ms);
+        json!({ "announce": { "recipient_key": recipient.public(), "envelope": envelope } })
+    }
+
     /// The route reads the recipient of an announcement as text and no more, so a change that
     /// names one that is no key commits and the announcement is declined beside it.
     #[test]
@@ -899,33 +935,67 @@ mod tests {
         let member = json!({ "announce": { "recipient_key": "not a key", "envelope": envelope } });
         let read = read_announcement("publish", Some(&member), NOW);
         assert!(
-            matches!(&read, Ok(Some(("not a key", _)))),
+            matches!(&read, Announcing::Place("not a key", _)),
             "the announcement is read and left for the mailbox to decline: {read:?}"
         );
     }
 
+    /// The announcement is a nudge beside a change that is the record: whatever is wrong with
+    /// it, the Worker declines it with a fixed reason and the change stands.
     #[test]
-    fn a_recipient_that_is_not_text_refuses_the_change() {
-        let recipient = StoredEnvelopeKeyPair::generate().expect("a key");
-        let envelope = envelope_for(recipient.public(), recipient.public(), NOW + 60_000);
-        let member = json!({ "announce": { "recipient_key": 7, "envelope": envelope } });
-        let refused = read_announcement("publish", Some(&member), NOW).expect_err("a refusal");
-        assert_eq!(refused.status, 400);
-        assert!(
-            String::from_utf8_lossy(&refused.body)
-                .contains("An announcement is a sealed item for a recipient."),
-            "{refused:?}"
-        );
+    fn an_announcement_the_service_will_not_place_is_declined_and_the_change_stands() {
+        let mut wrong_kind = carrying(NOW + 60_000);
+        wrong_kind["announce"]["envelope"]["routing"]["payload_type"] =
+            json!("signed_authority_object");
+        let mut unreadable = carrying(NOW + 60_000);
+        unreadable["announce"]["envelope"]["routing"]["planted-secret"] = json!(1);
+
+        for (what, member) in [
+            (
+                "a recipient that is not text",
+                json!({ "announce": { "recipient_key": 7, "envelope": null } }),
+            ),
+            (
+                "an envelope that is not one",
+                json!({ "announce": { "recipient_key": "x", "envelope": null } }),
+            ),
+            ("an envelope with a field beside the record", unreadable),
+            ("an item of another kind", wrong_kind),
+            (
+                "an item that outlives the hour",
+                carrying(NOW + THE_WORKERS_HOUR_MS + 1),
+            ),
+        ] {
+            let read = read_announcement("publish", Some(&member), NOW);
+            let Announcing::Declined(reason) = read else {
+                panic!("{what} is declined: {read:?}");
+            };
+            assert!(
+                !reason.contains("planted-secret"),
+                "the reason repeats nothing the caller sent ({what}): {reason}"
+            );
+        }
     }
 
+    /// The hour the Worker allows is counted from its own clock, so an item that expires exactly
+    /// then is placed and one a millisecond later is declined.
     #[test]
-    fn an_envelope_that_is_not_one_refuses_the_change_in_the_contracts_words() {
-        let member = json!({ "announce": { "recipient_key": "x", "envelope": null } });
-        let refused = read_announcement("publish", Some(&member), NOW).expect_err("a refusal");
-        assert_eq!(refused.status, 400);
+    fn an_announcement_may_expire_an_hour_after_the_services_clock_and_no_later() {
+        let at_the_hour = carrying(NOW + THE_WORKERS_HOUR_MS);
         assert!(
-            String::from_utf8_lossy(&refused.body).contains("a sealed envelope is an object"),
-            "{refused:?}"
+            matches!(
+                read_announcement("publish", Some(&at_the_hour), NOW),
+                Announcing::Place(..)
+            ),
+            "an item that expires within the hour is placed"
+        );
+        let past_it = carrying(NOW + THE_WORKERS_HOUR_MS + 1);
+        assert!(
+            matches!(
+                read_announcement("publish", Some(&past_it), NOW),
+                Announcing::Declined(_)
+            ),
+            "an item that expires after the hour is declined"
         );
     }
 }

@@ -305,11 +305,19 @@ and a draft publication is accounted for and settled there by the same rules as 
   say so. The note is written in the draft store before the record that ends the request, so a stop
   between the two leaves the request counted and the next pass writes the same note again.
 - A refusal names the copy the service kept of this device's write on the copy that comes down
-  beside the draft, as `Draft::retained`. `DraftSync::resolve` records the person's choice about that
-  copy: it takes the copy out of the draft store and drops the one copy on the service that answers
-  it. The choice is recorded before the service is asked, so a service that cannot be told hears of
-  it from `SyncClient::finish_resolutions` later. A refusal whose other content never came down is
-  listed in `exported` as deletable, and `SyncClient::drop_kept_copy` drops it.
+  beside the draft, as `Draft::retained`. `DraftSync::resolve` records the person's choice about
+  that copy: it takes the copy out of the draft store and drops the one copy on the service that
+  answers it. The choice is recorded before the service is asked, so a service that cannot be told
+  hears of it from `SyncClient::finish_resolutions` later. A refusal whose other content never came
+  down is listed in `exported` as deletable, and `SyncClient::drop_kept_copy` drops it. An
+  application that holds no client for a store at the moment, as a desktop companion does between
+  its passes, lists the same copies from the store with `sync::kept_copies`, which pairs each entry
+  with the `SyncConflictId` that `drop_kept_copy` takes and asks the service nothing, and
+  `sync::unreadable_records` lists beside them the records the store holds that this build cannot
+  read, which may account for a copy that left and which nothing can describe or drop. A copy whose
+  drop was chosen and not yet confirmed stays in that list until the service says it is gone;
+  `finish_resolutions` is what asks again, since `drop_kept_copy` of a copy already chosen records
+  nothing and returns none.
 - While privacy mode is on, no draft is published and none is fetched. An answer that comes back for
   work from an earlier generation is `drafts::Published::Discarded`, or a late result for a fetch.
   The account of what left stays, and no note moves and no copy comes down.
@@ -831,13 +839,22 @@ If the first dial attempt of a route fails with `host_unreachable`, and the rela
 Each host is reached through the relay and discovery services its own configuration names, with one
 dialling endpoint for each set of services. A key holds one endpoint on a relay at a time, so two
 configurations that share a relay are never open together, and binding one closes the other. An
-attempt holds its host's endpoint from its first dial to its end, and an owner's review holds its
-host's while it runs. Nothing else the device does closes a held endpoint, and a connection that
+attempt holds its host's endpoint from its first dial to its end, an owner's review holds its
+host's while it runs, and a push registration that the person asked for holds its host's while its
+connection is open. Nothing else the device does closes a held endpoint, and a connection that
 would have to is refused until the hold ends. A visit, a look in the background at a host that is
 not the one in use (`HostLink::visit_paired`), leaves the host in use's relay to it: a visit to a
 host whose services (its relays and address lookups) differ from the host in use's and share a relay
 with them is refused as a connection lost, whether or not the host in use's endpoint is open at that
-moment. Which host is in use is asked when the visit's turn at the pool comes.
+moment. Which host is in use is asked when the visit's turn at the pool comes. A visit's refusal can
+be asked for beforehand (`HostLink::would_refuse_visit`), which binds and holds nothing; the hold
+decides when the visit connects.
+
+A visit that needs its endpoint to stay open holds it as a visit (`HostLink::visit_hold`), as a
+push registration that a look started does while its connection is open. That hold stops other
+visits and nothing the person does: choosing a host on the same relay, an owner's review and a
+pairing attempt close the endpoint, the visit's connection ends, and the background work that made
+it starts again at its next look. A hold that is not a visit's stops every request, visits included.
 
 The verification value is computed here, from the transcript, and grouped `f3c1 46fd` by the
 function the host and the command line use. The device shows it only once the host's answer to
@@ -1027,11 +1044,12 @@ reader keeps its own storage, transport and wait, and honours the delay a servic
 
 `services::authority` also seals the announcement a caller places beside a feed change
 (`FeedAnnouncement::sealed_for`). Its payload is empty, and it expires 55 minutes after it is sealed.
-The service refuses the whole change when an announcement expires more than an hour after the
-service's own clock, and it admits a signed request whose time is up to five minutes ahead of that
-clock. An expiry of 55 minutes therefore stays within the service's bound for any sender whose
-request the service admits, as long as the sender seals the announcement on the clock that signs
-the request, no later than it signs it.
+The service declines an announcement that expires more than an hour after the service's own clock:
+it commits the change, places no announcement, and reports the announcement as declined beside the
+change. It admits a signed request whose time is up to five minutes ahead of that clock. An expiry
+of 55 minutes therefore stays within the service's bound for any sender whose request the service
+admits, as long as the sender seals the announcement on the clock that signs the request, no later
+than it signs it.
 
 `services::http` is the exchange underneath them: `HttpService` addresses one gateway origin, which
 it compares as a parsed scheme, host and port before it makes contact, and refuses an address that
@@ -1379,8 +1397,12 @@ again with `Presentation::IfDue`, which sends nothing until the lease the host h
 replaced and then asks the service for a new one, because nothing refreshes the lease of a host that
 is not in use and the host refuses a connection once the lease it holds has ended; a presentation is
 an action the host records and never removes, so one at each use would write a row on the host for
-each. A renewal that cannot be had while the lease the host holds still lasts is no failure of the
-connection. A host that refuses a read on such a connection as not permitted may have lost the lease
+each. A renewal that does not come off is no failure of the connection while the lease the host
+holds still lasts: the service did not answer or named a delay, the chain of keys could not be
+read, or the host refused the new lease for a cause the keeper waits out (for example
+`not_yet_valid`, `clock_untrusted` or `issued_before_activation`). The keeper keeps the lease the
+host took until the host takes the new one, and sends nothing, to the service or to the host, until
+what the failure held against the service is over. A host that refuses a read on such a connection as not permitted may have lost the lease
 before this device's clock said it was due, and the inbox presents the lease the device holds
 (`Presentation::First`, which asks for a new one if the host refuses it) and reads once more, when
 the refusal says the host holds no lease it will answer under (`organisation::lease_is_refused`), and
@@ -1406,7 +1428,8 @@ all connections of that kind, and each ends at once when the account signs out, 
 signs in, or the same account signs in again; none is opened while no account is signed in (an account store that cannot be read is told as `Unreachable`, whose words name the organisation's service though the cause is on the device). The
 end is decided from the status the account publishes, asked at every send and at every frame read,
 so a call made after a sign-out has returned reaches nothing and a frame read after it is not
-handed on. The reason (`SignIn` or `AccountChanged`) is kept before the connection is closed, and
+handed on. The reason is kept before the connection is closed: `SignIn` or `AccountChanged` for the
+account, and for a connection that presents no lease of its own, the keeper's stop (below).
 `ControlTransport::ended_by_this_device` gives it to whoever finds the connection closed: the
 application's connection state, a link's `reconnecting`, a terminal view's ending, the inbox's
 refusal and the push run's stop. A pass of the inbox asks once, at its end, whether its connection
@@ -1417,10 +1440,13 @@ own refusal of the list does that. A connection that presents no lease of its ow
 serves the person only while the keeper of its sign-in holds a lease the host took
 (`LeaseKeeper::took_a_lease`): the host binds a device to the first account that presents a lease,
 so a link opened after a switch to an account whose lease the host refuses is ended with the
-keeper's held stop and not served on the lease of the account before. A link opened before the
+keeper's held stop and not served on the lease of the account before. Such a link ends with the
+stop the keeper holds against the service for as long as it holds one (`NotAMember`, `Refused`,
+`TokenRefused`, `Unusable`, `Unreachable` or `Later`). With none held it ends with
+`LeaseStop::Presenting`, whose words say the device is still presenting its lease: before the
 application's connection has had the host take the lease of a new sign-in (after a start, a sign-in
-or a switch) is ended with `LeaseStop::Presenting`, whose words say the device is still presenting
-its lease, and opens again once the host has taken it. The binding hears what the account object
+or a switch), and once a held stop's time has run out, though the host may still refuse the lease.
+It opens again once the host has taken the lease. The binding hears what the account object
 publishes. A change another process of the application makes in the shared store of a desktop, and
 one whose status could not be read when it was published, are not heard: the old account's sessions
 then end at the keeper's next request, and at the latest when the lease ends, up to fifteen minutes.
@@ -1446,8 +1472,10 @@ request that replaces a token the service turned back, which the keeper makes af
 the hold again. A request already sent is not recalled, so the hold covers what is asked after the
 caller gave up, and not the answer to a request that was already on its way or one whose token was
 being refreshed when the hold began. The hold is against the service only: a connection
-presents the lease the keeper holds whatever is held, and one that has none is told the stop. A chain the host does not accept is tried
-three times before the keeper stops, because nothing says whether time mends it. The keeper stops,
+presents the lease the keeper holds whatever is held, and one that has none is told the stop, except
+that a kept connection whose renewal did not come off (`Presentation::IfDue`) sends the host nothing
+either while the hold lasts and the lease the host holds does. A chain the host does not accept is
+tried three times before the keeper stops, because nothing says whether time mends it. The keeper stops,
 and says why (`LeaseStop`), when no account is signed in (`SignIn`), when the service no longer takes
 the sign-in (`TokenRefused`), when the account is not a member, or when the host refuses the lease
 for a reason only an administrator can change. A visit that stops this way shows the reason in the

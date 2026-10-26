@@ -12,11 +12,12 @@ use kr_ipc::paths::HostPaths;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::method::Method;
 use kr_protocol::privacy::{
-    PrivacyCompletion, PrivacyDisabled, PrivacyOutstanding, PrivacyReport, PrivacySession,
+    PrivacyCompletion, PrivacyDisabled, PrivacyExported, PrivacyOutstanding, PrivacyReport,
+    PrivacyRetainedDeleteParams, PrivacyRetainedDeleteResult, PrivacySession,
     PrivacySessionStanding, PrivacySetParams, PrivacyStatusParams, PrivacyUnavailable,
 };
 
-use crate::cli::{EnvironmentSelector, PrivacyCommand};
+use crate::cli::{EnvironmentSelector, PrivacyCommand, PrivacyDeleteArguments};
 use crate::daemon::Daemon;
 use crate::error::{CliError, Result};
 use crate::output::{self, Asked, Document, Line, Request, closed};
@@ -35,7 +36,130 @@ pub async fn run(paths: &HostPaths, command: PrivacyCommand, json: bool) -> Resu
         PrivacyCommand::Status(arguments) => status(paths, &arguments.selector, json)
             .await
             .map(|()| Completion::Done),
+        PrivacyCommand::Delete(arguments) => delete(paths, &arguments, json).await,
     }
+}
+
+/// The word typed to confirm `kr privacy delete`.
+const DELETE_WORD: &str = "delete";
+
+/// `kr privacy delete`: asks the service that holds one copy privacy mode lists as having left this
+/// host to delete it.
+///
+/// It is the person's own action. It runs outside every session, whose worker keeps its output and
+/// whose agent could read what it prints or type the confirmation, and unless `--yes` is given the
+/// person types `delete` at the terminal after reading what is asked. The host reads its list again
+/// and acts only on a copy it lists as deletable.
+async fn delete(
+    paths: &HostPaths,
+    arguments: &PrivacyDeleteArguments,
+    json: bool,
+) -> Result<Completion> {
+    let reference = arguments.reference.join(" ");
+    let build_id = crate::build_id();
+    let because = "a copy that left this host is deleted at a terminal outside every session, whose \
+                   output its worker keeps and an agent in it can read";
+    if arguments.yes {
+        crate::bind::require_outside(&build_id, because).await?;
+    } else {
+        crate::pair::guard(&build_id, because).await?;
+    }
+    let mut daemon = Daemon::open(paths, &arguments.selector).await?;
+    let report: PrivacyReport = daemon
+        .read(Method::PrivacyStatus, &PrivacyStatusParams {})
+        .await?;
+    let Some(copy) = report
+        .exported
+        .iter()
+        .find(|copy| copy.reference == reference)
+    else {
+        return Err(CliError::Usage(shown!(
+            "privacy mode lists no copy under that reference; kr privacy status lists them"
+        )));
+    };
+    if !copy.deletable {
+        return Err(CliError::Usage(shown!(
+            "this host has no way to ask for the removal of that copy; kr privacy status says \
+             which it can"
+        )));
+    }
+    let summary = delete_summary(copy);
+    if arguments.yes {
+        // Standard error carries nothing but this program's own words, so the summary is read on
+        // standard output, and not at all when that is a document.
+        if !json {
+            output::lines(&summary);
+        }
+    } else {
+        let mut terminal = crate::pair::Terminal::open()?;
+        for line in &summary {
+            terminal.say(line)?;
+        }
+        let typed = terminal.ask(&stdout_line!(
+            "Type {} to ask the service to delete it: ",
+            DELETE_WORD
+        ))?;
+        if typed.trim() != DELETE_WORD {
+            return Err(CliError::refused_in_its_own_words(
+                ErrorCode::OwnerConfirmationRequired,
+                Shown::said("that is not what the question asked for, so nothing was deleted"),
+            ));
+        }
+    }
+    let result: PrivacyRetainedDeleteResult = daemon
+        .mutate(
+            Method::PrivacyRetainedDelete,
+            &PrivacyRetainedDeleteParams {
+                reference: reference.clone(),
+            },
+        )
+        .await?;
+    let unconfirmed = (!result.deleted).then(|| CliError::Unfinished {
+        code: ErrorCode::ResourceUnavailable,
+        message: shown!(
+            "the deletion is written down and asked of the service, and the service has not \
+             confirmed it; run the same command again to ask again, or this host sends it once \
+             privacy mode is off"
+        ),
+    });
+    let outcome = Document::new()
+        .with("deleted", result.deleted)
+        .with("report", document(&result.report))
+        .with("ok", result.deleted);
+    match (&unconfirmed, json) {
+        (None, true) => output::document(&outcome),
+        (Some(error), true) => output::document(&report::with_failure(outcome, error)),
+        (None, false) => output::lines(&[
+            stdout_line!("The service has confirmed that it holds that copy no longer."),
+            stdout_line!(
+                "It keeps what it deleted for its recovery window, and the list shows the copy \
+                 until then."
+            ),
+        ]),
+        (Some(error), false) => report::failed(error),
+    }
+    Ok(unconfirmed.map_or(Completion::Done, Completion::Reported))
+}
+
+/// What a deletion asks, as lines for a person to read before they type the word.
+fn delete_summary(copy: &PrivacyExported) -> Vec<Line> {
+    vec![
+        stdout_line!(
+            "Delete {} {}, which left this host at {} ms.",
+            Asked::text(Request::Privacy, &copy.kind),
+            Asked::text(Request::Privacy, &copy.reference),
+            copy.left_at_ms.get()
+        ),
+        stdout_line!(
+            "This asks the storage service to delete every object of that backup generation. \
+             Privacy mode stays as it is."
+        ),
+        stdout_line!(
+            "Nothing restores from the generation afterwards. If it is the newest this host made, \
+             no restore works until this host makes its next backup, which it does once privacy \
+             mode is off."
+        ),
+    ]
 }
 
 /// `kr privacy on` and `kr privacy off`.
@@ -160,7 +284,7 @@ fn lines(report: &PrivacyReport) -> Vec<Line> {
                 Asked::text(Request::Privacy, &exported.reference),
                 exported.left_at_ms.get(),
                 if exported.deletable {
-                    "this host can ask for its removal"
+                    "this host can ask for its removal: kr privacy delete <reference>"
                 } else {
                     "this host has no way to ask for its removal"
                 }

@@ -22218,6 +22218,11 @@
           "type": "string"
         },
         {
+          "const": "privacy.retained.delete",
+          "description": "Ask the service that holds a copy privacy mode listed as having left this host to delete it, at the host itself: the copy is named by the reference `privacy.status` shows for it, and the call is its own action, apart from turning privacy mode on. Privacy mode does not stop it. A copy the host holds no way to ask the removal of is refused. The answer says whether the service confirmed the deletion, and where privacy mode stands; the call keeps no record of its action, and asked again for the same copy it asks again.",
+          "type": "string"
+        },
+        {
           "const": "account.sign_in",
           "description": "Start this host's own sign-in to the managed account service: listen on the loopback address the desktop client is registered with, and keep the grant that comes back from the person's browser in this host's secret store. The address the person opens is read with account.status. Nothing in the answer is a token.",
           "type": "string"
@@ -28732,6 +28737,39 @@
         "kept",
         "exported",
         "unlisted"
+      ],
+      "type": "object"
+    },
+    "PrivacyRetainedDeleteParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `privacy.retained.delete`.",
+      "properties": {
+        "reference": {
+          "description": "The reference of the copy to delete, exactly as the `exported` list of `privacy.status`\nshows it. The host acts only on a copy that list shows now with a way to ask for its\nremoval, and only when exactly one copy has this reference.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "reference"
+      ],
+      "type": "object"
+    },
+    "PrivacyRetainedDeleteResult": {
+      "additionalProperties": false,
+      "description": "The result of `privacy.retained.delete`.",
+      "properties": {
+        "deleted": {
+          "description": "True when the service holding the copy has said it no longer holds it. False while the\nrequest has been made and the service has not answered: the host asks again when it is asked\nto delete the same copy again, and the report shows the copy as one whose deletion was asked.",
+          "type": "boolean"
+        },
+        "report": {
+          "$ref": "#/$defs/PrivacyReport",
+          "description": "Where privacy mode stands after the request."
+        }
+      },
+      "required": [
+        "deleted",
+        "report"
       ],
       "type": "object"
     },
@@ -44433,6 +44471,12 @@
     },
     "privacy_report": {
       "$ref": "#/$defs/PrivacyReport"
+    },
+    "privacy_retained_delete_params": {
+      "$ref": "#/$defs/PrivacyRetainedDeleteParams"
+    },
+    "privacy_retained_delete_result": {
+      "$ref": "#/$defs/PrivacyRetainedDeleteResult"
     },
     "privacy_session": {
       "$ref": "#/$defs/PrivacySession"

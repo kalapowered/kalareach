@@ -10,7 +10,7 @@
 
 import type { DocumentNode } from '@kalareach/plugin-sdk'
 
-import type { AgentEntry } from './agent'
+import type { AgentEntry, DrawnUnder } from './agent'
 
 /** What the conversation holds: something with a stable identity and a revision. */
 export interface Identified {
@@ -25,11 +25,22 @@ export interface Identified {
  */
 export type ConversationItem =
   | ({ readonly source: 'entry' } & AgentEntry)
-  | { readonly source: 'node'; readonly id: string; readonly revision: string; readonly node: DocumentNode }
+  | {
+      readonly source: 'node'
+      readonly id: string
+      readonly revision: string
+      readonly node: DocumentNode
+      /**
+       * The conversation the view knew when this revision arrived, or null when it had not read
+       * the agent. It lives with the revision it belongs to: a revision that is not kept takes
+       * its record with it, and a view that is left and opened again finds it where it was.
+       */
+      readonly under: DrawnUnder | null
+    }
 
-/** A presentation node, as the conversation holds it. */
-export function nodeItem(node: DocumentNode): ConversationItem {
-  return { source: 'node', id: node.id, revision: node.revision, node }
+/** A presentation node, as the conversation holds it, drawn under `under`. */
+export function nodeItem(node: DocumentNode, under: DrawnUnder | null): ConversationItem {
+  return { source: 'node', id: node.id, revision: node.revision, node, under }
 }
 
 /** How many nodes are rendered at once. */

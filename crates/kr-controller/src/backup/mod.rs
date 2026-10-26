@@ -14,9 +14,9 @@
 //!   `kr_worker::privacy::PrivacySubsystem`: it fences the outbox at the generation, takes back
 //!   what has not been dispatched, removes the staged ciphertext it holds, reports what is still in
 //!   flight, names what it keeps, and shows already-uploaded archives as retained artifacts. Each
-//!   step answers with the reason the store gave when it could not be taken. It marks the archives
-//!   **not** deletable, because this host holds no route through which it could ask a service to
-//!   remove one; the separately authorised deletion action section 24 asks for is not built here.
+//!   step answers with the reason the store gave when it could not be taken. It marks an archive
+//!   deletable when the person's own deletion of it would be accepted ([`BackupService::ask_deletion`]),
+//!   and not deletable, with the reason, when it would not.
 //!
 //! # What this host never writes down
 //!
@@ -35,7 +35,7 @@ pub mod uploader;
 
 pub use lease::{ProductionLease, StagedFile, Staging};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -278,6 +278,11 @@ pub struct BackupService {
     /// The production passes that hold the staging directory. Always taken after the store, and
     /// never while waiting for it.
     leases: Arc<Mutex<lease::Leases>>,
+    /// The objects whose deletion the person has just asked for, which the carrier sends under a
+    /// privacy fence, where it sends no deletion the host decides for itself. A restart forgets
+    /// them and keeps the rows they are written down in: the person asks again under a fence, and
+    /// without one the carrier sends every row that was asked and not answered.
+    authorised: Mutex<BTreeSet<(ArchiveId, BackupGeneration, BackupObjectId)>>,
     /// Where a test stops the thread that commits a setup, before it commits.
     #[cfg(feature = "testing")]
     commit_pause: Mutex<Option<CommitPause>>,
@@ -319,6 +324,11 @@ pub struct BackupSignals {
     /// Something that can change what the producer does happened: a setup was committed, a fence
     /// was released, a generation finished or ciphertext left the disk.
     pub produce: Notify,
+    /// A person asked for a deletion to be sent now, or the fence it waited under came down. It
+    /// ends every wait the carrier makes except the delay the service itself asked for, the wait
+    /// after a failure too: asking again is how a person tries again, and a backoff is not theirs
+    /// to sit out.
+    pub person: Notify,
 }
 
 impl BackupService {
@@ -341,6 +351,7 @@ impl BackupService {
             binding,
             kit,
             leases: Arc::default(),
+            authorised: Mutex::default(),
             #[cfg(feature = "testing")]
             commit_pause: Mutex::new(None),
         })
@@ -364,6 +375,7 @@ impl BackupService {
             binding,
             kit,
             leases: Arc::default(),
+            authorised: Mutex::default(),
             #[cfg(feature = "testing")]
             commit_pause: Mutex::new(None),
         })
@@ -984,6 +996,7 @@ impl BackupService {
             self.store()
                 .release_fence(fence_generation.get(), resumed_generation.get(), now_ms)?;
         self.signals.work.notify_one();
+        self.signals.person.notify_one();
         self.signals.produce.notify_one();
         Ok(released)
     }
@@ -1030,6 +1043,143 @@ impl BackupService {
         backup_generation: BackupGeneration,
     ) -> Result<Option<MadeFrom>> {
         self.store().made_from(archive_id, backup_generation)
+    }
+
+    /// Writes down that the person asked the service to delete every object of a generation, and
+    /// lets the carrier send the requests even under a privacy fence. It does not wake the carrier:
+    /// the caller does, once the rows are written ([`runtime::BackupRuntime::carry_now`]).
+    ///
+    /// The store decides in the one write whether the person may ask
+    /// ([`BackupStore::ask_generation_deletion`]); this is the person's own action, so privacy mode
+    /// is not one of its reasons. The rows are written before any request leaves, every object or
+    /// none. An object already written down is left as it is, so asking again after an unanswered
+    /// request writes nothing new. Returns how many objects of the generation the service has not
+    /// yet confirmed deleted.
+    ///
+    /// `admitted` holds the caller's registration standing for the write. It is taken inside the
+    /// hold of the store, the order a privacy change takes the two in, so that neither can wait
+    /// for the other: a caller never holds the registration while it waits for the store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::Refused`] when the store refuses the deletion, `admitted`'s own
+    /// refusal when the registration does not stand, and [`ControllerError::RegistryUnavailable`]
+    /// when the store cannot be read or written.
+    pub fn ask_deletion(
+        &self,
+        archive_id: ArchiveId,
+        backup_generation: BackupGeneration,
+        now_ms: TimestampMs,
+        admitted: crate::privacy::Admitted<'_>,
+    ) -> Result<u64> {
+        let mut store = self.store();
+        let mut unconfirmed = 0;
+        admitted(&mut || {
+            unconfirmed = store.ask_generation_deletion(archive_id, backup_generation, now_ms)?;
+            Ok(())
+        })?;
+        let asked: Vec<BackupObjectId> = store
+            .objects(archive_id, backup_generation)?
+            .into_iter()
+            .filter(|object| object.released_at_ms.is_none())
+            .map(|object| object.object_id)
+            .collect();
+        drop(store);
+        self.authorised
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(
+                asked
+                    .iter()
+                    .map(|object_id| (archive_id, backup_generation, *object_id)),
+            );
+        Ok(unconfirmed)
+    }
+
+    /// Why the person may not ask the service to delete a generation now, or nothing when they may.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
+    pub fn deletion_refusal(
+        &self,
+        archive_id: ArchiveId,
+        backup_generation: BackupGeneration,
+    ) -> Result<Option<String>> {
+        self.store().deletion_refusal(archive_id, backup_generation)
+    }
+
+    /// Decides again, before its request leaves, a deletion written down for the person: the
+    /// standing it was asked under must still hold ([`BackupStore::confirm_asked_deletion`]), and
+    /// while privacy mode is on the object must be one the person has just asked for.
+    ///
+    /// The fence is read in the same hold of the store as the standing, so a request is not
+    /// confirmed after privacy mode came on unless the person is the one who asked: a deletion this
+    /// host decided on for itself and wrote down before is not the person's, and waits for privacy
+    /// mode to be off.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::Refused`] when the standing no longer holds or privacy mode is
+    /// on and the person did not just ask, [`ControllerError::InvalidArgument`] when no deletion of
+    /// that object is written down, and [`ControllerError::RegistryUnavailable`] when the store
+    /// cannot be read.
+    pub fn confirm_asked_deletion(
+        &self,
+        archive_id: ArchiveId,
+        backup_generation: BackupGeneration,
+        object_id: BackupObjectId,
+    ) -> Result<()> {
+        let store = self.store();
+        if store.privacy_status()?.inhibited_at().is_some()
+            && !self
+                .authorised
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&(archive_id, backup_generation, object_id))
+        {
+            return Err(ControllerError::Refused {
+                code: kr_protocol::error::ErrorCode::PermissionDenied,
+                detail: "privacy mode is on, and only a deletion the person has just asked for is \
+                         sent while it is"
+                    .to_owned(),
+            });
+        }
+        store.confirm_asked_deletion(archive_id, backup_generation, object_id)
+    }
+
+    /// The objects the person has just asked to have deleted, which the carrier sends under a
+    /// privacy fence.
+    #[must_use]
+    pub fn authorised_deletions(&self) -> BTreeSet<(ArchiveId, BackupGeneration, BackupObjectId)> {
+        self.authorised
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The generations the host is deleting whole: it records objects for each, and a deletion of
+    /// every one is written down, whether or not the service has confirmed it. Such a generation is
+    /// no backup the host has, so the producer does not count it as the newest and retention does
+    /// not count it among the generations it keeps.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
+    pub fn generations_being_deleted(&self) -> Result<BTreeSet<(ArchiveId, BackupGeneration)>> {
+        let store = self.store();
+        let mut deleting = BTreeSet::new();
+        for record in store.generations()? {
+            let objects = store.objects(record.archive_id, record.backup_generation)?;
+            if !objects.is_empty()
+                && objects
+                    .iter()
+                    .all(|object| object.deletion_asked_at_ms.is_some())
+            {
+                deleting.insert((record.archive_id, record.backup_generation));
+            }
+        }
+        Ok(deleting)
     }
 
     /// Whether the disk still holds ciphertext that no generation needs any more.
@@ -2072,10 +2222,10 @@ impl PrivacySubsystem for BackupPrivacy<'_> {
     /// Names the archives that had already left this host.
     ///
     /// Privacy mode does not erase them and does not claim it could. What it offers is this list:
-    /// the reference is the archive and generation, never a path. `deletable` is false, because
-    /// this host holds no route through which it could ask a service to remove one; the separately
-    /// authorised deletion action section 24 asks for needs that route, and building it belongs
-    /// with the component that carries an object to a service.
+    /// the reference is the archive and generation, never a path. `deletable` is true when the
+    /// person's own deletion of the generation would be accepted now, which is the store's rule
+    /// ([`BackupStore::deletion_refusal`]) and not privacy mode's; the host then asks the service
+    /// to delete every object of it when the person asks.
     ///
     /// What a service holds is read from the generation's own record of it, which production being
     /// cancelled never changes. An archive whose ciphertext was acknowledged and whose production
@@ -2127,6 +2277,31 @@ impl PrivacySubsystem for BackupPrivacy<'_> {
                         .filter_map(|object| object.released_at_ms.map(TimestampMs::get))
                         .collect();
                     let wholly_deleted = !objects.is_empty() && deleted.len() == objects.len();
+                    // A deletion is asked and not confirmed only for a generation the host is
+                    // deleting whole, which is what the carrier sends. An object the host asked for
+                    // under its own rule, of a generation it is not deleting whole, is asked again
+                    // by that rule while it still holds, and until then the generation is listed as
+                    // it stands.
+                    let being_deleted = !objects.is_empty()
+                        && objects
+                            .iter()
+                            .all(|object| object.deletion_asked_at_ms.is_some());
+                    let unconfirmed = if being_deleted {
+                        objects
+                            .iter()
+                            .filter(|object| object.released_at_ms.is_none())
+                            .count()
+                    } else {
+                        0
+                    };
+                    let refusal = store
+                        .deletion_refusal(record.archive_id, record.backup_generation)
+                        .map_err(|error| {
+                            unavailable(
+                                "the backup store cannot say whether a generation may be deleted",
+                                &error,
+                            )
+                        })?;
                     if wholly_deleted
                         && deleted.iter().max().is_some_and(|last| {
                             self.now_ms.get() >= last.saturating_add(TOMBSTONE_DAYS * 86_400_000)
@@ -2137,6 +2312,8 @@ impl PrivacySubsystem for BackupPrivacy<'_> {
                     Ok(Some(Exported {
                         kind: if wholly_deleted {
                             "backup archive, deleted and awaiting removal at the service".to_owned()
+                        } else if unconfirmed > 0 {
+                            "backup archive, deletion asked and not yet confirmed".to_owned()
                         } else if !deleted.is_empty() {
                             "backup archive, partly deleted".to_owned()
                         } else if record.remote == Remote::Published {
@@ -2147,8 +2324,11 @@ impl PrivacySubsystem for BackupPrivacy<'_> {
                             "backup archive, outcome unknown".to_owned()
                         } else {
                             // A service acknowledged its ciphertext and no descriptor of it was
-                            // published. The bytes are there; the archive is not complete.
-                            "backup object ciphertext".to_owned()
+                            // published. The bytes are there; the archive is not complete, and
+                            // this host has no way to ask for their removal.
+                            "backup object ciphertext, no archive was published from it, and \
+                             this host cannot ask for its removal"
+                                .to_owned()
                         },
                         reference: format!(
                             "{} generation {}",
@@ -2156,16 +2336,48 @@ impl PrivacySubsystem for BackupPrivacy<'_> {
                             record.backup_generation.get()
                         ),
                         left_at_ms: record.settled_at_ms.unwrap_or(record.created_at_ms),
-                        // False, and it stays false until this host holds a route to ask for the
-                        // removal. `deletable` says this host has a way to ask; it does not say a
-                        // person cannot ask the service themselves. Claiming otherwise would offer an
-                        // action nothing here can perform, which is the false promise section 24
-                        // forbids.
-                        deletable: false,
+                        // `deletable` says this host has a way to ask and would accept the ask
+                        // now. It does not say a person cannot ask the service themselves, and it
+                        // is false for a copy nothing here can ask the removal of, so no action is
+                        // offered that this host cannot perform.
+                        deletable: !wholly_deleted && refusal.is_none(),
                     }))
                 },
             )
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(listed.into_iter().flatten().collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    /// A deletion the person asks for is admitted inside the hold of the store, the order a change
+    /// of privacy mode takes the two in. The registration taken first and the store after would
+    /// let a change that holds the store wait for the registration the deletion holds, and the
+    /// deletion wait for the store.
+    #[test]
+    fn a_deletion_is_admitted_inside_the_hold_of_the_store() {
+        let root = tempfile::tempdir().expect("a disposable directory");
+        let service = BackupService::in_memory(&root.path().join("backup")).expect("a service");
+        let admitted_with_the_store_held = Cell::new(None);
+        // A host with no setup refuses the deletion in the write; the admission is asked for first.
+        let _ = service.ask_deletion(
+            ArchiveId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16])),
+            BackupGeneration::new(1),
+            TimestampMs::new(1),
+            &|write| {
+                admitted_with_the_store_held.set(Some(service.store.try_lock().is_err()));
+                write()
+            },
+        );
+        assert_eq!(
+            admitted_with_the_store_held.get(),
+            Some(true),
+            "the registration is taken while the store is held"
+        );
     }
 }

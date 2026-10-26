@@ -27,6 +27,16 @@ and the settlement, it is offered the same announcements when it restarts, and t
 them: one announcement is one event and one set of notifications. If the daemon stops before the
 commit, nothing is lost, because the store still holds what was never settled.
 
+The host's pairing outbox feeds the journal the same way. A completed pairing is an event of its own
+kind, named by the invitation the device paired through and by the device it created, and its cursor
+is the outbox row's sequence, kept in this journal under a consumer of its own. The outbox removes
+nothing and holds no registration for it. Each pass reads the rows past the journal's cursor,
+commits the events and the cursor in one transaction, and produces from them at once. Every
+destination the notice's audience admits, except the device that paired, is told, by this pass or
+by the next one after a stop, because the event's key names that device. The event is dated and expires from the moment the
+pairing committed, not from the moment it is produced, so a journal that starts again at the
+outbox's first row takes the old pairings and sends none that is more than four hours old.
+
 Producing is a separate step that reads the notice the journal holds for each event. A pass that
 fails while it produces is finished by the next pass, without a restart.
 
@@ -113,12 +123,17 @@ with this action is not known, so the device can try to register again, but with
 the first registration attempt is not yet finished, the device is informed that it should ask again.
 
 Both questions come out of the gateway's allowances for this host, so the host rations them. One
-device may have a credential confirmed three times in a burst and then six times an hour. The status
-question comes out of the sweep's share of the status allowance. The nonce comes out of the sixty
+device may have a credential confirmed three times in a burst and then six times an hour. A
+registration that keeps the authorisation and installation of the destination in service and only
+changes the choice of previews has an allowance of its own of the same size, so that changing the
+choice does not spend what the next token refresh needs; its bearer is confirmed like any other, and
+it spends the same nonce allowance below, so one device can spend the whole of the host's burst of
+nonces between its two allowances. The status question comes out of the sweep's share of the
+status allowance. The nonce comes out of the sixty
 requests an hour that the gateway takes from this host for renewing and revoking together, where
 every renewal and every revocation takes two, so all devices together may ask for six nonces in a
 burst and six an hour, and only for a bearer that passed the first question. A device over any of
-the three limits is told to wait (`RATE_LIMITED`), and the gateway is not asked the question that
+these limits is told to wait (`RATE_LIMITED`), and the gateway is not asked the question that
 limit covers: a host that has spent its nonces has still asked the status question first.
 A registration that replaces an authorisation also owes the gateway a revocation, which is two
 requests more, outside these limits.
@@ -162,13 +177,24 @@ delegate, and the legs there call the delegate method themselves.
 
 The companion's core waits by reading the record each half second. That is a read of a local file
 and sends nothing. When the record says `answered` it checks that the phone is still paired with the
-host the person chose, asks the gateway for `push.sender.issue` under the authorisation identifier
-the phone keeps for that host (a new one the first time), and hands the credential to the host with
-`device.push.register` and the preview key with `device.preview_key.update`. The credential lives in
-memory between the two calls and is never kept. The preview key's seed goes to a store that a
-receiver reads and nothing else is put in: on Android a directory of its own beside the secure
-store, which separates files and not processes, and on iOS the shared keychain group the extension
-reads.
+host the person chose, files the preview keys the receivers hold, connects to the host, asks the
+gateway for `push.sender.issue` under the authorisation identifier the phone keeps for that host (a
+new one the first time), and hands the credential to the host with `device.push.register` and the
+preview key with `device.preview_key.update`. The host is reached before the gateway issues, because
+an issue replaces the credential the host holds at once: a host that cannot be reached keeps the
+one it has. The credential lives in memory between the issue and the registration and is never kept.
+`device.push.register` carries whether the person wants previews, which is a choice made for each
+host. A host told that it is off seals no preview and names no recipient key in its notifications.
+Changing the choice for a host that is on repeats the connection, the issue and the registration,
+under the same authorisation identifier and with no new token proposal and no challenge.
+
+The receivers read the keys that open a preview from a store that nothing else is put in: this
+phone's preview seed, and the preview public key of each paired host whose previews are on. The
+application replaces the whole set each time it changes, so a host whose previews are off or that
+the person forgot is out of it, and the seed is in it only while a host that may use it is. On
+Android the store is one sealed item in a directory of its own beside the secure store, which
+separates files and not processes, and on iOS it is items in the shared keychain group the
+extension reads.
 
 Every step can be repeated. A lost answer, a restart or a changed token is mended by starting again
 from the proposal or the issue under a new action. Issuing again under the same record identifier
@@ -189,14 +215,23 @@ registrations for several hosts go one at a time. A provider makes its registrat
 after the person agrees, and the phone waits up to twenty seconds for it before it stops and says
 so.
 
-The phone shows the host's generic alert and nothing more. A sealed preview is delivered and left
-unopened, and the key is filed so that an opener added later needs no new registration. Android
-receives a data message, which the gateway sends at high priority for every push because a
-normal-priority one waits for an application that is not in front, and shows the notification
-itself, under the identifier the host gave it and with a tap that opens the attention screen. On
-iOS the system shows the alert, and a tap is routed by the notification delegate, which is set
-before the launch ends. The notification service extension is installed with the application and
-has nothing to open until a preview opener exists.
+Each receiver opens a sealed preview with one Rust function (`companion-preview`), which Android
+reaches through JNI and the iOS extension links as a static library of its own. It is given the
+envelope as the gateway sent it, this phone's preview seed, the sending host's public key and the
+generic alert the message is shown with. It opens the envelope only if the routing outside it
+matches what the seal authenticated, the two key identifiers inside it name the keys that opened
+it, it has not expired, and the alert it repeats is the one shown. It answers the text to show or the
+name of the check that refused, never anything the preview held. The generic alert stands for a
+preview that does not open, for one from a host this phone holds no key for (`sender_unknown`), for
+one sealed to a key this phone does not hold, for one read before the first unlock, and for one that
+opens to no text (`empty_preview`). The seal holds text only for the sentences the host raises
+itself; what a session said is not in it, so a session's question opens to nothing and keeps the
+generic alert. Android receives a data message, which the gateway sends at high priority for every
+push because a normal-priority one waits for an application that is not in front, and shows the
+notification itself, under the identifier the host gave it and with a tap that opens the attention
+screen. On iOS the system shows the alert, the notification service extension replaces its body when
+a preview opens, and a tap is routed by the notification delegate, which is set before the launch
+ends.
 
 ### What neither question shows
 
@@ -321,7 +356,7 @@ journal, out of service and with no rule, as the name of what was sent to it.
 A notification is built for a destination only when the recipient's grant reaches what the notice is
 about, and the grant is read as it stands. A notice about sessions needs `session.view` over every
 one of them. A notice about a workflow needs `automation.manage` under the grant the workflow itself
-acts under. A notice about the environment needs `host.manage`. Earlier history is opt-in: a grant
+acts under. A notice about the environment needs `host.manage`; a completed pairing is one. Earlier history is opt-in: a grant
 reaches what was first seen at or after its history cursor, or at or after the moment it began when
 it has none. A notice outside a destination's reach writes no record, because it is not a refusal. A
 destination with no rule, or one whose grant no longer stands, gets a refused record that says why.
@@ -685,7 +720,8 @@ it, so the wait would never end, and it is listed as a copy that may have left. 
 under an earlier generation is refused rather than published.
 
 A pending question or approval still alerts a paired device while privacy mode is on, under the
-grant the device holds, but with no preview and none of its words. The notification is the generic
+grant the device holds, but with no preview and none of its words. A completed pairing does too, to
+push destinations only and not to the device that paired. The notification is the generic
 alert, grouped on the device by its rule and the privacy generation and by nothing that names the
 session. It is the only thing the outbox takes under the fence, and it is admitted in the same
 transaction as its event. Every other announcement decided while privacy mode is on is taken from

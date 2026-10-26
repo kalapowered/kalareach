@@ -79,6 +79,8 @@ pub struct Spec {
     /// Whether it holds the approval interpreter's grant and the trust to decode the connector's
     /// approval request.
     pub interpreting: bool,
+    /// Whether its package declares an action that answers an approval.
+    pub answering: bool,
 }
 
 impl Spec {
@@ -95,6 +97,7 @@ impl Spec {
             observation: true,
             component: Some("recording"),
             interpreting: false,
+            answering: false,
         }
     }
 
@@ -111,6 +114,7 @@ impl Spec {
             observation: false,
             component: None,
             interpreting: true,
+            answering: false,
         }
     }
 
@@ -143,6 +147,13 @@ impl Spec {
             },
             ..Self::observer(number)
         }
+    }
+
+    /// Declaring the action that answers an approval, `approval.answer`.
+    #[must_use]
+    pub const fn answering(mut self) -> Self {
+        self.answering = true;
+        self
     }
 
     /// With another component.
@@ -424,6 +435,12 @@ impl Observing {
             broker
                 .grant_streams(binding(spec.number), spec.streams)
                 .expect("the streams are granted");
+            if spec.answering {
+                let refused = broker
+                    .register_actions(binding(spec.number), &[answering_declaration()])
+                    .expect("the action is registered");
+                assert!(refused.is_empty(), "{refused:?}");
+            }
             let Some(name) = spec.component else {
                 continue;
             };
@@ -486,11 +503,16 @@ impl Observing {
             hosted.environment_id,
             "agent-user",
         );
+        let carrying =
+            owner.dispatch().expect("it carries operations") as Arc<dyn UpstreamDispatch>;
+        // The transport carries the operations of the instance, and the answers to the requests
+        // asked on this connection.
+        broker.bind_connection_dispatch(
+            kr_protocol::ids::GatewayConnectionId::new(1),
+            Arc::clone(&carrying),
+        );
         broker
-            .bind_dispatch(
-                instance(),
-                owner.dispatch().expect("it carries operations") as Arc<dyn UpstreamDispatch>,
-            )
+            .bind_dispatch(instance(), carrying)
             .expect("the transport is bound");
         let written = Arc::new(Mutex::new(Vec::new()));
         let (sender, injected) = tokio::sync::mpsc::unbounded_channel();
@@ -744,6 +766,105 @@ impl Observing {
         }
     }
 
+    /// The owner answers the approval `resource` with `option`, as `agent.approval.respond`, and
+    /// returns what the worker says of it.
+    pub async fn respond(
+        &self,
+        window: &mut kr_ipc::client::LocalClient,
+        resource: PendingResourceId,
+        option: &str,
+    ) -> kr_protocol::envelope::Outcome {
+        let revision = self
+            .broker()
+            .binding_state(instance())
+            .expect("the instance is bound")
+            .binding_revision;
+        self.respond_with(
+            window,
+            kr_protocol::method::Method::AgentApprovalRespond,
+            ActionId::new(kr_ipc::new_uuid()),
+            &kr_protocol::agent::AgentApprovalRespondParams {
+                target: kr_protocol::agent::AgentMutationTarget {
+                    subject: kr_worker::broker::subject(self.hosted.session_id, instance()),
+                    binding_revision: revision,
+                },
+                resource_id: resource,
+                option_id: option.to_owned(),
+            },
+            revision,
+        )
+        .await
+    }
+
+    /// The owner answers the approval `resource` with `decision`, through the action `approval.answer`
+    /// of the package, as `plugin.action.invoke`, and returns what the worker says of it.
+    pub async fn invoke_answer(
+        &self,
+        window: &mut kr_ipc::client::LocalClient,
+        resource: PendingResourceId,
+        decision: &str,
+    ) -> kr_protocol::envelope::Outcome {
+        let revision = self
+            .broker()
+            .binding_state(instance())
+            .expect("the instance is bound")
+            .binding_revision;
+        self.respond_with(
+            window,
+            kr_protocol::method::Method::PluginActionInvoke,
+            ActionId::new(kr_ipc::new_uuid()),
+            &kr_protocol::agent::PluginActionInvokeParams {
+                target: kr_protocol::agent::AgentMutationTarget {
+                    subject: kr_worker::broker::subject(self.hosted.session_id, instance()),
+                    binding_revision: revision,
+                },
+                plugin_id: package(),
+                action: kr_protocol::broker::ActionName::new("approval.answer")
+                    .expect("an action name"),
+                draft_id: Nullable::null(),
+                resource_id: Nullable::some(resource),
+                parameters: kr_protocol::scalars::Bytes::from(
+                    serde_json::json!({ "decision": decision })
+                        .to_string()
+                        .into_bytes(),
+                ),
+            },
+            revision,
+        )
+        .await
+    }
+
+    /// Sends one mutation on the instance, at `revision`, and returns what the worker says of it.
+    pub async fn respond_with<P: serde::Serialize>(
+        &self,
+        window: &mut kr_ipc::client::LocalClient,
+        method: kr_protocol::method::Method,
+        action_id: ActionId,
+        params: &P,
+        revision: kr_protocol::ids::AgentBindingRevision,
+    ) -> kr_protocol::envelope::Outcome {
+        use kr_protocol::envelope::{MutationRequest, ParamsValue};
+        let mutation = MutationRequest {
+            request_id: kr_protocol::ids::RequestId::new(1),
+            method: method.into(),
+            method_version: kr_protocol::method::MethodVersion::V1,
+            action_id,
+            grant_id: Nullable::null(),
+            target: kr_protocol::envelope::ActionTarget {
+                environment_id: self.hosted.environment_id,
+                session_id: Nullable::some(self.hosted.session_id),
+                session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+                application_instance_id: Nullable::some(instance()),
+                agent_binding_revision: Nullable::some(revision),
+            },
+            expected: ParamsValue::empty(),
+            action_window_id: window.action_window().action_window_id.clone(),
+            requested_ttl_ms: kr_protocol::scalars::DurationMs::new(60_000),
+            params: ParamsValue::from_typed(params).expect("encodes"),
+        };
+        super::acting::send(window, mutation).await
+    }
+
     /// Attaches the owner's terminal to the session, which leaves a receipt.
     pub async fn attach(&self, window: &mut kr_ipc::client::LocalClient) -> ActionId {
         let action_id = ActionId::new(kr_ipc::new_uuid());
@@ -990,6 +1111,28 @@ fn install_named(
     }
 }
 
+/// The action that answers an approval through the connector table's decision destination.
+pub fn answering_declaration() -> kr_plugin_sdk::effect::ActionDeclaration {
+    serde_json::from_value(serde_json::json!({
+        "id": "approval.answer",
+        "label": "Answer",
+        "effect": "approval.respond",
+        "implementation": { "type": "decision_destination", "decision": "decision" },
+        "parameters": { "parameters": [{
+            "name": "decision",
+            "kind": { "type": "choice", "choices": [
+                { "id": "allow", "label": "Allow" },
+                { "id": "deny", "label": "Deny" },
+            ] },
+            "label": "Decision",
+            "required": true,
+        }] },
+        "description": "Answers the approval the call names",
+        "confirmation_required": false,
+    }))
+    .expect("a declaration the manifest format reads")
+}
+
 /// The connector table the package ships: what the upstream and the terminal may send.
 pub fn table() -> kr_protocol::gateway::DeclarativeTable {
     use kr_protocol::gateway::{DeclarativeEntry, NativeMethodClass};
@@ -1029,6 +1172,13 @@ pub fn table() -> kr_protocol::gateway::DeclarativeTable {
             ),
         ],
     };
+    // An approval is answered in the member the table names: `{"id": ..., "result": {"outcome":
+    // "allow"}}`.
+    for entry in &mut table.entries {
+        if entry.method.as_str() == "session/request_permission" {
+            entry.approval_option_field = Nullable::some("outcome".to_owned());
+        }
+    }
     table.digest = table.canonical_digest().expect("encodable");
     table
 }

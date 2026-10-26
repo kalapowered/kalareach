@@ -1025,12 +1025,12 @@ fn a_release_that_cannot_be_removed_for_no_program_s_sake_is_reported() {
     );
 }
 
-/// KR-REQ-26.06: a file of a release that is a second name for a file outside, whose access list
-/// denies its owner the right to change attributes but is not the seal's, is not given back: the
-/// list of the file outside is as it was, the removal reports it, and the release stays in the trash.
+/// Removes a release whose program is a second name for a read-only file elsewhere that carries the
+/// access list `icacls` makes of `lists` (each a call's arguments), and checks that the list of the
+/// file outside is as it was, that the removal reports it and that the release stays in the trash.
+/// `put_right` is the call that undoes the lists, so that the test leaves nothing behind.
 #[cfg(windows)]
-#[test]
-fn a_list_that_is_not_the_seal_s_is_left_as_it_is() {
+fn removal_meets_a_list_that_is_not_the_seal_s(lists: &[&[&str]], put_right: &[&str]) {
     let test = TestStore::create();
     let one = release("0.1.0+aaaaaaaaaaaa");
     let program = test.install(&one);
@@ -1052,7 +1052,9 @@ fn a_list_that_is_not_the_seal_s_is_left_as_it_is() {
         assert!(run.status.success(), "icacls {arguments:?}");
         String::from_utf8_lossy(&run.stdout).into_owned()
     };
-    icacls(&["/deny", "*S-1-1-0:(WA)"]);
+    for list in lists {
+        icacls(list);
+    }
     let before = icacls(&[]);
     let update = test
         .store
@@ -1064,22 +1066,56 @@ fn a_list_that_is_not_the_seal_s_is_left_as_it_is() {
     let after = icacls(&[]);
 
     // Put it right, so that the test leaves nothing behind.
-    icacls(&["/remove:d", "*S-1-1-0"]);
+    icacls(put_right);
     let kept = std::fs::read_dir(test.store.trash())
         .expect("reads the trash")
         .flatten()
         .next()
-        .expect("what could not be removed is in the trash")
-        .path();
-    kr_ipc::install::remove_sealed_tree(&kept).expect("the release goes once the list is right");
+        .map(|entry| entry.path());
+    if let Some(kept) = &kept {
+        kr_ipc::install::remove_sealed_tree(kept)
+            .expect("the release goes once the list is right");
+    }
     assert!(
         answer.is_err(),
         "a list that is not the seal's is reported, not taken for a program: {answer:?}"
+    );
+    assert!(
+        kept.is_some(),
+        "what could not be removed is in the trash: {answer:?}"
     );
     assert_eq!(before, after, "the list of the file outside is as it was");
     assert_eq!(
         std::fs::read(&shared).expect("still there"),
         b"shared contents"
+    );
+}
+
+/// KR-REQ-26.06: a file of a release that is a second name for a file outside, whose access list
+/// denies its owner the right to change attributes but is not the seal's, is not given back: the
+/// list of the file outside is as it was, the removal reports it, and the release stays in the trash.
+#[cfg(windows)]
+#[test]
+fn a_list_that_is_not_the_seal_s_is_left_as_it_is() {
+    removal_meets_a_list_that_is_not_the_seal_s(
+        &[&["/deny", "*S-1-1-0:(WA)"]],
+        &["/remove:d", "*S-1-1-0"],
+    );
+}
+
+/// KR-REQ-26.06: a list that begins as the seal's does, with the denial of the owner-rights
+/// principal's right to change attributes, but is not the whole of the seal's list, is not given
+/// back either. Here the list is `D:P(D;;0x100;;;OW)(A;;FA;;;OW)`.
+#[cfg(windows)]
+#[test]
+fn a_list_that_begins_as_the_seal_s_does_and_is_not_the_seal_s_is_left_as_it_is() {
+    removal_meets_a_list_that_is_not_the_seal_s(
+        &[
+            &["/inheritance:r"],
+            &["/grant", "*S-1-3-4:(F)"],
+            &["/deny", "*S-1-3-4:(WA)"],
+        ],
+        &["/reset"],
     );
 }
 
@@ -1401,6 +1437,67 @@ fn removing_a_release_follows_no_link_and_touches_nothing_outside_it() {
         b"shared contents"
     );
     assert!(read_only(&outside.join("shared")), "its attribute is kept");
+}
+
+/// KR-REQ-26.06: a directory of a release that another process of the account turns into a junction
+/// after the removal has pinned it and checked that it is a plain directory leads the removal
+/// nowhere. The pin keeps the directory from being renamed or deleted, and does not keep it from
+/// being made a junction (the system allows that to any handle that may write attributes, whatever
+/// its share mode), so what is in the directory is read through the pinned handle and each name
+/// opened relative to it: the listing is the directory's own and empty, the directory goes as a
+/// name, and the folder the junction names keeps everything in it.
+#[cfg(windows)]
+#[test]
+fn a_directory_made_a_junction_after_it_was_checked_leads_the_removal_nowhere() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let test = TestStore::create();
+    let one = release("0.1.0+aaaaaaaaaaaa");
+    test.install(&one);
+    let directory = test.store.release_directory(&one);
+    std::fs::create_dir_all(directory.join("share/empty")).expect("an empty directory");
+    seal_tree(&directory);
+    let outside = test.root.join("outside");
+    std::fs::create_dir_all(outside.join("inner")).expect("a folder elsewhere");
+    std::fs::write(outside.join("kept"), b"kept").expect("written");
+    std::fs::write(outside.join("inner/kept"), b"kept too").expect("written");
+    let target = outside.clone();
+    let turned = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&turned);
+    kr_ipc::install::removal_race::after_pin(Some(Arc::new(move |pinned: &Path| {
+        if pinned.file_name().is_some_and(|name| name == "empty") {
+            kr_ipc::install::removal_race::make_junction_in_place(pinned, &target)
+                .expect("the pinned directory becomes a junction");
+            counted.fetch_add(1, Ordering::SeqCst);
+        }
+    })));
+    let update = test
+        .store
+        .try_lock_update()
+        .expect("locks")
+        .expect("nothing else updates");
+
+    let answer = test.store.retire(&one, &update);
+    kr_ipc::install::removal_race::after_pin(None);
+
+    assert_eq!(turned.load(Ordering::SeqCst), 1, "the race was run once");
+    assert!(
+        answer.as_ref().is_ok_and(|removed| *removed),
+        "the release is removed: {answer:?}"
+    );
+    assert_eq!(
+        std::fs::read(outside.join("kept")).ok().as_deref(),
+        Some(&b"kept"[..]),
+        "the folder the junction named keeps its file"
+    );
+    assert_eq!(
+        std::fs::read(outside.join("inner/kept")).ok().as_deref(),
+        Some(&b"kept too"[..]),
+        "and its subfolder"
+    );
+    let in_the_trash = std::fs::read_dir(test.store.trash()).map(|entries| entries.count());
+    assert_eq!(in_the_trash.ok(), Some(0), "nothing of the release is left");
 }
 
 /// KR-REQ-26.06: `current` is a junction to the release's own directory, `Store::current` reads the

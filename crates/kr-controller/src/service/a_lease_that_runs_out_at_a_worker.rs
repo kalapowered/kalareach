@@ -314,7 +314,7 @@ async fn world(steps: &Steps) -> World {
     // A paired device whose connection this daemon admitted at that revision.
     let connection_id = ConnectionId::new(kr_ipc::new_uuid());
     let actor_id = ActorId::new("device:a-test-phone").expect("a principal");
-    controller.admitted_table().insert(
+    controller.admitted_write().insert(
         connection_id,
         super::AdmittedConnection::new(actor_id.clone(), revision),
     );

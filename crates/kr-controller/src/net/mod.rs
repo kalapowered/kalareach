@@ -499,7 +499,9 @@ impl HostHandler for NetworkHost {
         // Section 23 gives the end of the control stream a consequence: the transport revokes the
         // data streams, and stopping remote lease renewal is the host's half. Withdrawing the
         // registration is what does it here, because a lease is renewed only for a connection the
-        // authority store still holds.
+        // authority store still holds. A commit that stands on a registration while the stream is
+        // lost delays the withdrawal until no commit or withdrawal holds the registrations, and
+        // the lease is renewed meanwhile.
         if let Some(controller) = self.controller.upgrade() {
             tokio::spawn(async move {
                 controller.deregister(connection_id);
@@ -551,7 +553,7 @@ impl NetworkHost {
                     .to_owned(),
             });
         }
-        let mut admitted = controller.admitted_table();
+        let mut admitted = controller.admitted_write();
         admitted.insert(
             session.connection_id,
             AdmittedConnection::new(record.principal(), admitted_revision)
@@ -4411,7 +4413,7 @@ pub(crate) mod tests {
         let kept = ConnectionId::new(kr_ipc::new_uuid());
         let principal = || ActorId::new("device:test").expect("a principal");
         for connection_id in [lost, kept] {
-            controller.admitted_table().insert(
+            controller.admitted_write().insert(
                 connection_id,
                 crate::service::AdmittedConnection::new(principal(), revision),
             );
@@ -4449,7 +4451,7 @@ pub(crate) mod tests {
         network.guard.host.control_stream_lost(lost);
         // The withdrawal runs on a task of its own.
         let waited = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while controller.admitted_table().contains_key(&lost) {
+        while controller.admitted_read().contains_key(&lost) {
             assert!(
                 std::time::Instant::now() < waited,
                 "the lost connection's registration is withdrawn"

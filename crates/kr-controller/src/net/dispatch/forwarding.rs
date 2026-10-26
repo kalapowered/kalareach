@@ -177,7 +177,20 @@ impl RemoteConnection {
             Ok(session_id) => self
                 .proxy_for(session_id, &asked.acting)
                 .await
-                .map_err(|error| error.to_protocol_error()),
+                .map_err(|error| match error {
+                    // A closed session has no worker to narrow its output to a grant, and this
+                    // host serves a device nothing of it.
+                    ControllerError::SessionClosed { .. }
+                        if entry.method == Method::HistoryPage =>
+                    {
+                        ProtocolError::new(
+                            ErrorCode::SessionClosed,
+                            "this host does not serve a closed session's retained output to a \
+                             paired device",
+                        )
+                    }
+                    other => other.to_protocol_error(),
+                }),
             Err(_) if entry.method == Method::ActionRead => {
                 self.receipt_owner(request, entry, &asked.acting).await
             }
@@ -263,6 +276,8 @@ impl RemoteConnection {
         // an answer that is not shown to the device all leave the record where it is. A draft is
         // sent to one session, and an attachment belongs to one, so a draft that is for another
         // session, or holds an attachment that belongs to one, is refused here and nothing is sent.
+        // A draft written for another application than the prompt's is refused the same way, as a
+        // conflict: the person prepared it for a conversation that is not the one named.
         // What the draft gets after this is the session's too, so the session's agent finds
         // nothing in it that is not held, whenever it reads it, and a repeat of the prompt has
         // nothing left to record. A prompt the worker refuses was still sent to that session, and
@@ -270,13 +285,13 @@ impl RemoteConnection {
         // The record is made under the admission this prompt arrived under, asked again where the
         // transfer service writes: a deadline that passed or a registration that was withdrawn
         // while the prompt waited for its worker's link records nothing and sends nothing.
-        if let Some(draft_id) = crate::transfer::prompted_draft(mutation)
+        if let Some(prompted) = crate::transfer::prompted_draft(mutation)
             && let Err(error) = self
                 .controller
                 .transfer
                 .record_submission(
                     &self.device.principal(),
-                    draft_id,
+                    prompted,
                     session_id,
                     crate::transfer::TransferAdmission::new(
                         Arc::clone(&self.controller),

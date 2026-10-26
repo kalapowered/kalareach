@@ -1208,6 +1208,18 @@ impl Environment {
             .await
     }
 
+    /// The host's first owner, connected: its grant carries `host.manage`.
+    async fn owner_phone(&self) -> Phone {
+        let device = Device::with_keys(self.owner.clone()).await;
+        let record = self.host.owner.clone().expect("the host's first owner");
+        let connection = RawDevice::connect(&self.host, &device, &record).await;
+        Phone {
+            device,
+            record,
+            connection,
+        }
+    }
+
     /// Pairs a device whose grant reaches only `sessions`, and connects it.
     async fn phone_for_sessions(&self, sessions: kr_protocol::grant::SessionSelector) -> Phone {
         let keys = DeviceKeys::generate().expect("device keys");
@@ -1411,6 +1423,16 @@ impl Phone {
         environment: &Environment,
         credential: &PushDeliveryCredential,
     ) -> Result<DevicePushRegisterResult, kr_protocol::error::ProtocolError> {
+        self.register_choosing(environment, credential, true).await
+    }
+
+    /// The device hands the daemon the credential, and says whether it wants previews.
+    async fn register_choosing(
+        &self,
+        environment: &Environment,
+        credential: &PushDeliveryCredential,
+        previews_enabled: bool,
+    ) -> Result<DevicePushRegisterResult, kr_protocol::error::ProtocolError> {
         self.connection
             .mutate(
                 Method::DevicePushRegister,
@@ -1418,7 +1440,7 @@ impl Phone {
                 ActionTarget::environment(environment.environment_id()),
                 &DevicePushRegisterParams {
                     credential: credential.clone(),
-                    previews_enabled: true,
+                    previews_enabled,
                 },
             )
             .await
@@ -1668,6 +1690,141 @@ async fn a_paired_device_that_registers_is_told_of_the_next_question_and_still_i
     })
     .await;
     assert_eq!(environment.gateway.state().bearers_refused, 0);
+}
+
+/// KR-REQ-10.08: every completed pairing is a notification to the owner's devices that may manage
+/// the host, through the gateway, in the closed vocabulary's generic words: the name the new device
+/// chose is inside the seal of the preview and nowhere the gateway can read. A device whose grant
+/// may only see sessions is told nothing of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_completed_pairing_reaches_the_owners_device_and_no_device_that_may_not_manage_the_host()
+{
+    const NAME: &str = "A test phone";
+    let environment = Environment::start().await;
+    let owner = environment.owner_phone().await;
+    let owner_sender = PushSenderRecordId::new(uuid(0x61));
+    let credential = environment.gateway.issue(
+        owner_sender,
+        owner.installation(),
+        environment.host_signing_key(),
+    );
+    owner
+        .register(&environment, &credential)
+        .await
+        .expect("the owner's device registers");
+
+    // A device that may only see sessions pairs, and registers: the owner's device is told of its
+    // pairing.
+    let viewer = environment.phone().await;
+    let viewer_sender = PushSenderRecordId::new(uuid(0x62));
+    let viewer_credential = environment.gateway.issue(
+        viewer_sender,
+        viewer.installation(),
+        environment.host_signing_key(),
+    );
+    viewer
+        .register(&environment, &viewer_credential)
+        .await
+        .expect("the viewer registers");
+    until("the owner's device being told of the pairing", || {
+        !environment.gateway.delivered().is_empty()
+    })
+    .await;
+    let request = environment.gateway.delivered().remove(0);
+    assert_eq!(request.sender_record_id, owner_sender);
+    assert_eq!(request.hints.alert, PushAlert::SessionNeedsAttention);
+    let host_preview = environment
+        .controller()
+        .delivery()
+        .with(|producer| Ok(*producer.preview_public()))
+        .expect("the host's preview key");
+    let opened = kr_delivery::preview::open_preview(
+        &owner.device.keys().notification_preview,
+        &host_preview,
+        request.preview.as_ref().expect("a preview"),
+        now(),
+    )
+    .expect("the device opens its own preview");
+    assert_eq!(opened.rule, "pairing.completed");
+    assert!(opened.summary.contains(NAME), "{}", opened.summary);
+    let wire = serde_json::to_string(&request).expect("the request");
+    assert!(!wire.contains(NAME), "the gateway is not given the name");
+
+    // Another device pairs: the owner's device is told again, and the one that may only see
+    // sessions is told of neither.
+    let _third = environment.phone().await;
+    until("the owner's device being told of the next pairing", || {
+        environment.gateway.delivered().len() == 2
+    })
+    .await;
+    assert!(
+        environment
+            .gateway
+            .delivered()
+            .iter()
+            .all(|request| request.sender_record_id == owner_sender),
+        "only a device that may manage the host is told"
+    );
+    assert!(
+        environment
+            .deliveries_to(&viewer.device_id().to_string())
+            .is_empty()
+    );
+}
+
+/// KR-REQ-16.11: a device that registers again with previews off, after it registered with them on,
+/// is delivered to with the generic alert and nothing sealed: the host takes the choice with each
+/// registration, and the next question carries no preview and names no recipient key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_device_that_registers_again_with_previews_off_is_delivered_no_preview() {
+    const WORDS: &str = "Deploy the release to production?";
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0x52));
+    let credential =
+        environment
+            .gateway
+            .issue(sender, phone.installation(), environment.host_signing_key());
+    phone
+        .register_choosing(&environment, &credential, true)
+        .await
+        .expect("the daemon registers a credential its gateway confirms");
+
+    environment._worker.ask("deploy-1", WORDS);
+    until("the first question being delivered", || {
+        !environment.gateway.delivered().is_empty()
+    })
+    .await;
+    let with = environment.gateway.delivered().remove(0);
+    assert!(with.preview.is_present(), "previews on: a sealed preview");
+
+    phone
+        .register_choosing(&environment, &credential, false)
+        .await
+        .expect("the daemon takes the choice with the registration");
+    let destination = environment
+        .destination(phone.device_id())
+        .expect("the device is still a destination");
+    assert!(
+        !destination
+            .as_push()
+            .expect("a push destination")
+            .previews_enabled,
+        "the destination records the choice"
+    );
+
+    environment._worker.ask("deploy-2", WORDS);
+    until("the second question being delivered", || {
+        environment.gateway.delivered().len() == 2
+    })
+    .await;
+    let without = environment.gateway.delivered().remove(1);
+    assert!(
+        !without.preview.is_present(),
+        "previews off: nothing sealed, and no recipient key named"
+    );
+    assert_eq!(without.hints.alert, PushAlert::QuestionWaiting);
+    assert_eq!(without.sender_record_id, sender);
 }
 
 /// KR-REQ-16.08: a daemon takes a credential only from the gateway its managed service stands at.
@@ -3280,6 +3437,142 @@ async fn a_device_that_registers_over_and_over_is_not_confirmed_with_the_gateway
         .register(&environment, &theirs)
         .await
         .expect("another device is confirmed");
+}
+
+/// What a device registers a destination with: a credential from the gateway for the authorisation
+/// it already has (a new bearer, which retires the last), and whether it wants previews.
+async fn reissue_and_register(
+    environment: &Environment,
+    phone: &Phone,
+    sender: PushSenderRecordId,
+    previews_enabled: bool,
+) -> Result<DevicePushRegisterResult, kr_protocol::error::ProtocolError> {
+    let credential =
+        environment
+            .gateway
+            .issue(sender, phone.installation(), environment.host_signing_key());
+    phone
+        .register_choosing(environment, &credential, previews_enabled)
+        .await
+}
+
+/// KR-REQ-16.11: a person who changes the choice of previews does not spend what the next token
+/// refresh needs. A device that has registered new credentials as often as it may in a row is still
+/// taken when its registration keeps the authorisation and installation its destination names and
+/// only changes the choice, and the gateway is asked about that credential like any other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_change_of_previews_is_taken_after_the_device_has_spent_its_allowance_for_new_credentials()
+ {
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0xe1));
+    let probes = || {
+        environment
+            .gateway
+            .answers_on("/api/push/deliver/status")
+            .len()
+    };
+    for attempt in 1..=3 {
+        reissue_and_register(&environment, &phone, sender, true)
+            .await
+            .unwrap_or_else(|error| panic!("new credential {attempt}: {error:?}"));
+    }
+    assert_eq!(probes(), 3);
+
+    reissue_and_register(&environment, &phone, sender, false)
+        .await
+        .expect("the change of previews is taken");
+    assert_eq!(probes(), 4, "and its bearer was confirmed with the gateway");
+    let destination = environment
+        .destination(phone.device_id())
+        .expect("the device is still a destination");
+    assert!(
+        !destination
+            .as_push()
+            .expect("a push destination")
+            .previews_enabled,
+        "the destination records the choice"
+    );
+}
+
+/// KR-REQ-16.11: a device that changes the choice of previews over and over is stopped like one
+/// that registers new credentials over and over: the fourth change in a row is refused without the
+/// gateway being asked, and the destination keeps the choice it had.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_device_that_changes_its_previews_over_and_over_is_not_confirmed_with_the_gateway_each_time()
+ {
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0xe2));
+    let probes = || {
+        environment
+            .gateway
+            .answers_on("/api/push/deliver/status")
+            .len()
+    };
+    reissue_and_register(&environment, &phone, sender, true)
+        .await
+        .expect("the first registration");
+    for (change, previews) in [(1, false), (2, true), (3, false)] {
+        reissue_and_register(&environment, &phone, sender, previews)
+            .await
+            .unwrap_or_else(|error| panic!("change {change}: {error:?}"));
+    }
+    assert_eq!(probes(), 4);
+
+    let refused = reissue_and_register(&environment, &phone, sender, true)
+        .await
+        .expect_err("the fourth change in a row is not put to the gateway");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::RateLimited,
+        "a refusal that says to wait"
+    );
+    assert_eq!(probes(), 4, "and the gateway was not asked");
+    assert!(
+        !environment
+            .destination(phone.device_id())
+            .expect("the device is still a destination")
+            .as_push()
+            .expect("a push destination")
+            .previews_enabled,
+        "the destination keeps the choice it had"
+    );
+}
+
+/// KR-REQ-16.08, KR-REQ-16.11: changes of previews do not widen what new credentials may spend. After
+/// two changes, a device that registers new credentials is still stopped at the third in a row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn changes_of_previews_do_not_let_a_device_register_more_new_credentials() {
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0xe3));
+    let probes = || {
+        environment
+            .gateway
+            .answers_on("/api/push/deliver/status")
+            .len()
+    };
+    reissue_and_register(&environment, &phone, sender, true)
+        .await
+        .expect("the first registration");
+    for previews in [false, true] {
+        reissue_and_register(&environment, &phone, sender, previews)
+            .await
+            .expect("a change of previews");
+    }
+    for attempt in 2..=3 {
+        reissue_and_register(&environment, &phone, sender, true)
+            .await
+            .unwrap_or_else(|error| panic!("new credential {attempt}: {error:?}"));
+    }
+    assert_eq!(probes(), 5);
+
+    let refused = reissue_and_register(&environment, &phone, sender, true)
+        .await
+        .expect_err("the fourth new credential in a row is not put to the gateway");
+    assert_eq!(refused.code, kr_protocol::error::ErrorCode::RateLimited);
+    assert_eq!(probes(), 5, "and the gateway was not asked");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -4977,7 +5270,8 @@ async fn privacy_read_by(phone: &Phone) -> kr_protocol::hostinfo::HostPrivacySta
         .expect("host.info says where privacy mode stands")
 }
 
-/// KR-REQ-24.27: a privacy change that waits for a message on the wire does not hold up `host.info`,
+/// KR-REQ-24.27 and KR-REQ-24.28: a privacy change that waits for a message on the wire does not
+/// hold up `host.info`,
 /// and `host.info` says the host is changing privacy mode for as long as it waits. The message is
 /// held at the destination's end; the change is asked for on a connection of its own and is proved
 /// queued by the state refusing a new reading; a paired device then reads `host.info` and is

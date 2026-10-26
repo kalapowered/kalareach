@@ -1,0 +1,106 @@
+{
+  "cases": [
+    {
+      "bytes": "1b5b303b303b31323335343b313b303b315f",
+      "covers": "KR-REQ-08.52 KR-REQ-08.56",
+      "id": "composed-character",
+      "records": [
+        {
+          "control_keys": 0,
+          "key_down": true,
+          "repeat": 1,
+          "scan_code": 0,
+          "unicode": 12354,
+          "virtual_key": 0
+        }
+      ]
+    },
+    {
+      "bytes": "1b5b303b303b35353339393b313b303b315f1b5b303b303b35363839333b313b303b315f",
+      "covers": "KR-REQ-08.52 KR-REQ-08.56",
+      "id": "character-outside-the-basic-plane",
+      "records": [
+        {
+          "control_keys": 0,
+          "key_down": true,
+          "repeat": 1,
+          "scan_code": 0,
+          "unicode": 55399,
+          "virtual_key": 0
+        },
+        {
+          "control_keys": 0,
+          "key_down": true,
+          "repeat": 1,
+          "scan_code": 0,
+          "unicode": 56893,
+          "virtual_key": 0
+        }
+      ]
+    },
+    {
+      "bytes": "1b5b3232313b32363b303b313b303b315f1b5b36393b31383b3233343b313b303b315f",
+      "covers": "KR-REQ-08.56",
+      "id": "dead-key-then-the-character-it-composes",
+      "records": [
+        {
+          "control_keys": 0,
+          "key_down": true,
+          "repeat": 1,
+          "scan_code": 26,
+          "unicode": 0,
+          "virtual_key": 221
+        },
+        {
+          "control_keys": 0,
+          "key_down": true,
+          "repeat": 1,
+          "scan_code": 18,
+          "unicode": 234,
+          "virtual_key": 69
+        }
+      ]
+    },
+    {
+      "bytes": "1b5b35303b333b36343b313b393b315f",
+      "covers": "KR-REQ-08.52 KR-REQ-08.56",
+      "id": "alt-graph",
+      "records": [
+        {
+          "control_keys": 9,
+          "key_down": true,
+          "repeat": 1,
+          "scan_code": 3,
+          "unicode": 64,
+          "virtual_key": 50
+        }
+      ]
+    },
+    {
+      "bytes": "1b5b36353b33303b39373b313b303b345f1b5b36353b33303b39373b303b303b315f",
+      "covers": "KR-REQ-08.52 KR-REQ-08.56",
+      "id": "repeat-and-key-up",
+      "records": [
+        {
+          "control_keys": 0,
+          "key_down": true,
+          "repeat": 4,
+          "scan_code": 30,
+          "unicode": 97,
+          "virtual_key": 65
+        },
+        {
+          "control_keys": 0,
+          "key_down": false,
+          "repeat": 1,
+          "scan_code": 30,
+          "unicode": 97,
+          "virtual_key": 65
+        }
+      ]
+    }
+  ],
+  "description": "KR-REQ-08.52. The console's key records and the bytes the win32 input mode encodes each as, `CSI Vk;Sc;Uc;Kd;Cs;Rc _` with every field written. The bytes are written by hand and the encoder is checked against them. The client's ordinary, modifyOtherKeys and Kitty encodings are in `client-encodings.json`.",
+  "name": "input-encodings",
+  "profile": "kr-vt/1"
+}

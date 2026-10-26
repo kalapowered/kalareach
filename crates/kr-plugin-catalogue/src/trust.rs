@@ -28,7 +28,7 @@
 //! Terminating-role semantics and the delegation traversal itself are the client's, and the suite
 //! qualifies the selected release's actual behaviour rather than trusting a crate overview.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
 use kr_plugin_sdk::catalogue::CatalogueIndex;
@@ -102,6 +102,160 @@ pub(crate) fn resets_floors(old: &[u8], new: &[u8]) -> CatalogueResult<bool> {
     ]
     .into_iter()
     .any(|role| old.signed.keys(role).ne(new.signed.keys(role))))
+}
+
+/// Where a root that cannot be trusted is met, which decides what a person can do about it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Met {
+    /// A root offered to be adopted for a repository.
+    Enrolment,
+    /// The root of the generation this build carries.
+    Bundle,
+    /// A root a repository's metadata moved to, or ended on.
+    Rotation,
+}
+
+impl Met {
+    /// What to do about a root met here: said in each refusal, because the way out differs.
+    const fn remedy(self) -> &'static str {
+        match self {
+            Self::Enrolment => {
+                "ask the repository's publisher for a root that gives each role a key of its \
+                 own, and enrol the repository with that root"
+            }
+            Self::Bundle => {
+                "this build does not seed the bundled catalogue, and a release whose bundled \
+                 root gives each role a key of its own seeds it"
+            }
+            Self::Rotation => {
+                "the repository stays on the root it holds until its publisher signs a root \
+                 over this one that gives each role a key of its own"
+            }
+        }
+    }
+}
+
+/// The name of a top-level role, as a refusal says it.
+const fn role_name(role: tough::schema::RoleType) -> &'static str {
+    match role {
+        tough::schema::RoleType::Root => "root",
+        tough::schema::RoleType::Targets => "targets",
+        tough::schema::RoleType::Snapshot => "snapshot",
+        tough::schema::RoleType::Timestamp => "timestamp",
+        tough::schema::RoleType::DelegatedTargets => "delegated targets",
+    }
+}
+
+/// A key as the client parsed it: its family and its public bytes.
+pub(crate) type KeyMaterial = (&'static str, Vec<u8>);
+
+/// The keys a root names for one role.
+pub(crate) type RoleKeys = BTreeSet<KeyMaterial>;
+
+/// A key as the client parsed it: its family and its public bytes. Two names for one key differ in
+/// the identifier, the member order or the description's spelling, and share these.
+fn key_material(key: &tough::schema::key::Key) -> KeyMaterial {
+    use tough::schema::key::Key;
+    match key {
+        Key::Ed25519 { keyval, .. } => ("ed25519", keyval.public.to_vec()),
+        Key::Rsa { keyval, .. } => ("rsa", keyval.public.to_vec()),
+        Key::Ecdsa { keyval, .. } | Key::EcdsaOld { keyval, .. } => {
+            ("ecdsa", keyval.public.to_vec())
+        }
+    }
+}
+
+/// The keys a root names for its own role, which are what a repository's trust is anchored in: the
+/// same set is the same root whatever its version, its expiry or the other roles' keys, and a
+/// rotation that replaces one of them is another set. `None` when the root cannot be read.
+pub(crate) fn root_role_keys(root: &[u8]) -> Option<RoleKeys> {
+    let signed: tough::schema::Signed<tough::schema::Root> = serde_json::from_slice(root).ok()?;
+    let role = signed.signed.roles.get(&tough::schema::RoleType::Root)?;
+    Some(
+        role.keyids
+            .iter()
+            .map(|identifier| match signed.signed.keys.get(identifier) {
+                Some(key) => key_material(key),
+                None => ("identifier", identifier.to_vec()),
+            })
+            .collect(),
+    )
+}
+
+/// Whether `newer` is a root that `older`'s own keys signed over: a later version whose
+/// signatures carry a threshold of the keys `older` names for its root role.
+///
+/// That is how a client follows a rotation, so a root for which this holds belongs to the lineage
+/// of `older`, with no record of the rotation kept. It reaches one step only: a root two rotations
+/// on was signed by the root between, which is not held here. Either root that cannot be read is
+/// not in a lineage with anything.
+pub(crate) fn root_descends_from(older: &[u8], newer: &[u8]) -> bool {
+    let read = |bytes: &[u8]| {
+        serde_json::from_slice::<tough::schema::Signed<tough::schema::Root>>(bytes).ok()
+    };
+    let (Some(older), Some(newer)) = (read(older), read(newer)) else {
+        return false;
+    };
+    newer.signed.version > older.signed.version && older.signed.verify_role(&newer).is_ok()
+}
+
+/// Checks that no role of `root` names one key under two identifiers and that no two roles name
+/// the same key.
+///
+/// A role holds the authority of its keys, so a key that two roles share lets whoever holds it
+/// act for both, and a root cannot say afterwards which of the two the key was meant for. A key
+/// the root does not describe stands for its identifier.
+///
+/// The comparison is by the bytes the client parsed for each key, within a family of keys. It does
+/// not find one key written two ways (an Ed25519 key as its raw bytes and as a
+/// `SubjectPublicKeyInfo`, an RSA key in two encodings, a point compressed and uncompressed), an
+/// Ed25519 key and its negation or its sum with a small-order point, or two RSA keys of one
+/// modulus: reducing those is the key ceremony's, and a root that passes this check has not been
+/// shown to hold independent keys beyond it.
+///
+/// # Errors
+///
+/// Returns [`CatalogueError::Untrusted`] naming the roles, and what to do about it where `met`
+/// says the root was met.
+pub(crate) fn check_role_keys(root: &tough::schema::Root, met: Met) -> CatalogueResult<()> {
+    let mut roles: Vec<_> = root.roles.iter().collect();
+    roles.sort_by_key(|(role, _)| role_name(**role));
+    let mut named: Vec<(&'static str, RoleKeys)> = Vec::new();
+    for (role, keys) in roles {
+        let identifiers: HashSet<_> = keys.keyids.iter().collect();
+        let material: BTreeSet<_> = identifiers
+            .iter()
+            .map(|identifier| match root.keys.get(*identifier) {
+                Some(key) => key_material(key),
+                None => ("identifier", identifier.to_vec()),
+            })
+            .collect();
+        if material.len() != identifiers.len() {
+            return Err(CatalogueError::Untrusted {
+                detail: format!(
+                    "the root names one key under two identifiers for its {} role, which counts \
+                     it twice toward the role's threshold; {}",
+                    role_name(*role),
+                    met.remedy()
+                ),
+            });
+        }
+        named.push((role_name(*role), material));
+    }
+    for (at, (first, keys)) in named.iter().enumerate() {
+        for (second, others) in &named[at + 1..] {
+            if !keys.is_disjoint(others) {
+                return Err(CatalogueError::Untrusted {
+                    detail: format!(
+                        "the root names one key for its {first} role and for its {second} role, \
+                         so whoever holds that key acts for both; {}",
+                        met.remedy()
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Returns the version a trusted root declares.
@@ -486,6 +640,9 @@ pub async fn verify(
                 >(&enrolment.root)
                 && new_signed.signed.version > old_signed.signed.version
             {
+                // The root a load moved to before it failed is kept so that old trust is not
+                // restored; one that gives two roles a key is not kept, and says why.
+                check_role_keys(&new_signed.signed, Met::Rotation)?;
                 on_root_rotated(bytes)?;
             }
             return Err(classify(&source));
@@ -500,6 +657,11 @@ pub async fn verify(
                 .to_owned(),
         });
     }
+    // The root this load ended on is the one that is kept, whether or not it moved: it is held to
+    // the rule before anything that follows can use it. The root the host held before the load is
+    // not refused first, because the publisher's way out of a root that fails is a root signed
+    // over it, which a host that refused it first could never read.
+    check_role_keys(&repository.root().signed, Met::Rotation)?;
     let versions = MetadataVersions {
         root: repository.root().signed.version.get(),
         timestamp: repository.timestamp().signed.version.get(),

@@ -14,7 +14,7 @@
     "pushPendingSet",
     "pushPendingGet",
     "pushPendingClear",
-    "pushLimitedKey",
+    "pushPreviewKeys",
     "pushRoute"
   ]
 }

@@ -73,10 +73,13 @@ pub trait ControlTransport: Send + Sync + std::fmt::Debug {
     }
 
     /// Why this device ended the connection itself, in the words a person is told, when it did:
-    /// the account the connection was opened under signed out or was replaced. A transport that
-    /// ends only as the host or the network ends it, or has not ended, says none. Asking also
-    /// settles whether the connection should have ended already, so the answer is the latest one,
-    /// and a transport that wraps another forwards the question or loses the words.
+    /// the account the connection was opened under signed out or was replaced, or the connection
+    /// presents no lease of its own and the keeper of that account's lease holds none the host
+    /// took, in which case the words are the keeper's stop. A transport that ends only as the host
+    /// or the network ends it, or has not ended, says none. Asking also settles whether the account
+    /// has changed since the connection was opened, so that answer is the latest one; a connection
+    /// that presents no lease of its own is ended for want of a lease only when a request is sent
+    /// on it. A transport that wraps another forwards the question or loses the words.
     fn ended_by_this_device(&self) -> Option<ProtocolError>;
 
     /// Sends one control frame.

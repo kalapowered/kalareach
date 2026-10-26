@@ -866,6 +866,8 @@ fn releasing_the_fence_admits_backup_production_again_under_the_new_generation()
 // The privacy hook, under the privacy generation contract.
 // ---------------------------------------------------------------------------------------------
 
+/// KR-REQ-24.27: privacy mode fences the backup service, takes back what was not sent and removes
+/// the ciphertext this host staged.
 #[test]
 fn privacy_mode_fences_cancels_and_removes_what_this_host_still_holds() {
     let environment = Environment::open();
@@ -1888,6 +1890,8 @@ fn a_late_upload_acknowledgement_while_fenced_does_not_enqueue_publication() {
     );
 }
 
+/// KR-REQ-24.28: an upload that finishes after privacy mode stopped it enqueues no publication,
+/// and the reconciliation completes.
 #[test]
 fn an_upload_finishing_after_privacy_mode_stops_does_not_enqueue_publication_and_completes_reconciliation()
  {
@@ -2058,8 +2062,12 @@ fn an_upload_finishing_after_privacy_mode_stops_does_not_enqueue_publication_and
             .exported()
             .expect("a list")
             .iter()
-            .any(|artifact| artifact.kind == "backup object ciphertext"),
-        "privacy mode shows what the service holds rather than deleting the evidence of it"
+            .any(
+                |artifact| artifact.kind.starts_with("backup object ciphertext")
+                    && !artifact.deletable
+            ),
+        "privacy mode shows what the service holds rather than deleting the evidence of it, and \
+         offers no deletion of ciphertext no archive was published from"
     );
 }
 
@@ -8345,6 +8353,8 @@ async fn an_upload_the_service_completed_is_reported_unknown_when_it_will_not_be
     host.web.stored_once();
 }
 
+/// KR-REQ-24.28: a privacy fence raised in the middle of an upload sends no further part, object or
+/// publication, and abandons the upload at the service.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_privacy_fence_raised_mid_upload_stops_everything_not_yet_sent() {
     let host = Host::open();
@@ -8586,7 +8596,8 @@ async fn a_pass_that_ends_an_attempt_without_abandoning_its_upload_says_the_aban
     assert_eq!(host.web.count(|asked| matches!(asked, Asked::Abort(_))), 1);
 }
 
-/// Ending work in flight under privacy mode does not wait out a delay the service asked for.
+/// KR-REQ-24.28: ending work in flight under privacy mode does not wait out a delay the service
+/// asked for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_privacy_fence_ends_the_work_in_flight_inside_a_delay_the_service_asked_for() {
     let host = Host::open();
@@ -9871,6 +9882,449 @@ async fn retention_leaves_a_generation_privacy_mode_drew_a_line_under() {
     // The control: a generation admitted after the cycle is deleted in its turn.
     host.publish_generations(&mut uploader, 4, 6).await;
     ask(4).expect("a generation of the generation in force, with two newer published");
+}
+
+/// The store decides a deletion the person asks for in the transaction that writes it down, and
+/// refuses it for each reason on its own. Neither a privacy fence nor the line privacy mode drew
+/// under a generation is one of them: the copies privacy mode lists are what the action is for. The
+/// control is the same deletion with none of the reasons standing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_store_refuses_a_deletion_the_person_asks_for_each_reason_on_its_own() {
+    let ask = |host: &Host, generation: u64| {
+        host.service.ask_deletion(
+            archive_id(),
+            BackupGeneration::new(generation),
+            TimestampMs::new(99_000),
+            &|write| write(),
+        )
+    };
+    // A host with two published generations and a setup, a fresh one for each case.
+    let published = async || {
+        let host = Host::open();
+        host.set_up();
+        let mut uploader = host.uploader(10_000);
+        host.publish_generations(&mut uploader, 1, 2).await;
+        host
+    };
+    let refused = |answer: Result<u64, ControllerError>| {
+        assert!(
+            matches!(answer, Err(ControllerError::Refused { .. })),
+            "{answer:?}"
+        );
+    };
+
+    // The control: every object of the generation is written down, and asking again changes
+    // nothing it wrote.
+    let host = published().await;
+    assert_eq!(
+        ask(&host, 1).expect("asked"),
+        2,
+        "a member and the manifest"
+    );
+    let written: Vec<_> = host
+        .service
+        .objects(archive_id(), BackupGeneration::new(1))
+        .expect("a read")
+        .iter()
+        .map(|object| (object.object_id, object.deletion_asked_at_ms))
+        .collect();
+    assert!(written.iter().all(|(_, asked)| asked.is_some()));
+    host.service
+        .ask_deletion(
+            archive_id(),
+            BackupGeneration::new(1),
+            TimestampMs::new(99_500),
+            &|write| write(),
+        )
+        .expect("asked again");
+    assert_eq!(
+        host.service
+            .objects(archive_id(), BackupGeneration::new(1))
+            .expect("a read")
+            .iter()
+            .map(|object| (object.object_id, object.deletion_asked_at_ms))
+            .collect::<Vec<_>>(),
+        written,
+        "a request already written down is left as it is"
+    );
+    // The newest generation is deletable too: the person decides what they keep.
+    ask(&host, 2).expect("the newest published generation");
+
+    // A generation this host never admitted.
+    let host = published().await;
+    refused(ask(&host, 9));
+
+    // A privacy fence is not a reason.
+    let host = published().await;
+    host.service
+        .raise_fence(PrivacyGeneration::new(1), TimestampMs::new(98_000))
+        .expect("the fence goes up");
+    ask(&host, 1).expect("the person's deletion is not stopped by privacy mode");
+
+    // Nor is the line a complete privacy cycle drew under a generation: retention leaves that
+    // generation, and the person may not be refused what retention is.
+    let host = published().await;
+    host.service
+        .raise_fence(PrivacyGeneration::new(1), TimestampMs::new(98_000))
+        .expect("the fence goes up");
+    host.service
+        .cancel_undispatched_work(PrivacyGeneration::new(1), TimestampMs::new(98_100))
+        .expect("the work is taken back");
+    host.service
+        .run_cleanup(PrivacyGeneration::new(1), TimestampMs::new(98_200))
+        .expect("cleanup");
+    host.service
+        .release_fence(
+            PrivacyGeneration::new(1),
+            PrivacyGeneration::new(2),
+            TimestampMs::new(98_300),
+        )
+        .expect("a release");
+    ask(&host, 1).expect("a generation under the line is the person's to delete");
+
+    // An object another generation names.
+    let host = published().await;
+    rusqlite::Connection::open(host.state.join("backup.sqlite"))
+        .expect("the store")
+        .execute(
+            "INSERT INTO objects (archive_id, backup_generation, object_id, encrypted_hash,
+                                  encrypted_len, staged_path, local_state, acknowledged_bytes)
+             SELECT archive_id, 2, object_id, encrypted_hash, encrypted_len, staged_path || 'x',
+                    'absent', encrypted_len
+               FROM objects WHERE backup_generation = 1 AND object_id = ?1",
+            rusqlite::params![member_of(1, 0).get().as_bytes().as_slice()],
+        )
+        .expect("a second generation that names the object");
+    refused(ask(&host, 1));
+    assert!(
+        host.service
+            .objects(archive_id(), BackupGeneration::new(1))
+            .expect("a read")
+            .iter()
+            .all(|object| object.deletion_asked_at_ms.is_none()),
+        "a refused deletion writes nothing down"
+    );
+
+    // An attempt of the generation that is still open.
+    let host = published().await;
+    rusqlite::Connection::open(host.state.join("backup.sqlite"))
+        .expect("the store")
+        .execute(
+            "INSERT INTO outbox (archive_id, backup_generation, step, privacy_generation, status,
+                                 enqueued_at_ms)
+             VALUES (?1, 1, 'upload', 0, 'queued', 1)",
+            rusqlite::params![archive_id().get().as_bytes().as_slice()],
+        )
+        .expect("an open attempt");
+    refused(ask(&host, 1));
+
+    // A retired writer.
+    let host = published().await;
+    host.service
+        .retire_writer(
+            archive_id(),
+            host.producer.writer.key_id(),
+            TimestampMs::new(98_000),
+        )
+        .expect("the writer is retired");
+    refused(ask(&host, 1));
+
+    // An archive that is not the setup's.
+    let host = published().await;
+    let other = ArchiveId::new(Uuid::from_bytes([0x12; 16]));
+    host.service
+        .commit_setup(
+            &a_setup(other, &host.producer, "QQQQ2345"),
+            true,
+            TimestampMs::new(98_000),
+        )
+        .expect("a replacement");
+    refused(ask(&host, 1));
+
+    // A host with no setup.
+    let host = Host::open();
+    let mut uploader = host.uploader(10_000);
+    host.publish_generations(&mut uploader, 1, 2).await;
+    refused(ask(&host, 1));
+}
+
+/// A generation whose outcome this host could not establish is the person's to delete once a newer
+/// generation of the archive is published, because a publication of it landing later would name
+/// objects that are gone. Before then it is refused, and the control is the same generation after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_generation_of_unknown_outcome_is_deleted_by_the_person_only_once_a_newer_one_is_published()
+ {
+    let (host, mut uploader) = a_host_with_an_unknown_generation(&[(member_of(1, 0), 64)]).await;
+    host.set_up();
+    let ask = || {
+        host.service.ask_deletion(
+            archive_id(),
+            BackupGeneration::new(1),
+            TimestampMs::new(99_000),
+            &|write| write(),
+        )
+    };
+    assert!(matches!(ask(), Err(ControllerError::Refused { .. })));
+    assert!(
+        host.service
+            .objects(archive_id(), BackupGeneration::new(1))
+            .expect("a read")
+            .iter()
+            .all(|object| object.deletion_asked_at_ms.is_none())
+    );
+
+    host.admit(2, &[64]);
+    passes(&mut uploader, 40_000).await;
+    assert_eq!(host.generation(2).remote, Remote::Published);
+    ask().expect("a newer generation is published");
+}
+
+/// Under a privacy fence the carrier sends the deletions the person has just asked for and nothing
+/// else: a deletion this host decided on for itself and wrote down before privacy mode came on is
+/// not sent, because privacy mode's copies go by the person's action and no other. Once the fence is
+/// down it is asked again by the rule that wrote it down, as that rule stands then: the person's
+/// deletion of generation 2 leaves generations 1 and 3 as the two the host keeps, and generation 1
+/// is behind the line privacy mode drew, which only the person's own deletion crosses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn under_a_fence_the_carrier_sends_the_deletions_the_person_asked_for_and_no_others() {
+    let host = Host::open();
+    host.set_up();
+    let mut uploader = host.uploader(10_000);
+    host.publish_generations(&mut uploader, 1, 3).await;
+    // A retention deletion of generation 1's member, written down and not yet sent.
+    BackupStore::open(&host.state)
+        .expect("the store")
+        .note_retained_deletion_asked(
+            archive_id(),
+            BackupGeneration::new(1),
+            member_of(1, 0),
+            2,
+            TimestampMs::new(50_000),
+        )
+        .expect("asked");
+    host.service
+        .raise_fence(PrivacyGeneration::new(1), TimestampMs::new(98_000))
+        .expect("the fence goes up");
+
+    // The control: the fence alone sends nothing.
+    assert!(passes(&mut uploader, 60_000).await.is_empty());
+    assert_eq!(deletions(&host), 0);
+
+    // The person asks for generation 2: its objects go and no others.
+    host.service
+        .ask_deletion(
+            archive_id(),
+            BackupGeneration::new(2),
+            TimestampMs::new(61_000),
+            &|write| write(),
+        )
+        .expect("asked");
+    passes(&mut uploader, 62_000).await;
+    assert!(host.deleted_at_the_service(2));
+    assert_eq!(
+        deletions(&host),
+        2,
+        "a member and the manifest of generation 2"
+    );
+    assert!(host.held_at_the_service(1));
+    assert!(host.held_at_the_service(3));
+
+    // A restart forgets which deletions were just asked for and keeps the rows written down: under
+    // the fence nothing is sent for generation 1.
+    let mut host = host;
+    let (mut uploader, _) = host.restart(70_000).await;
+    assert!(passes(&mut uploader, 70_000).await.is_empty());
+    assert_eq!(deletions(&host), 2);
+
+    // The fence comes down. The account keeps two generations, and with generation 2 being deleted
+    // the two are 1 and 3, so retention's request for generation 1 is not one it would make now and
+    // is not sent.
+    host.web.scripted().daily_snapshots = Some(2);
+    host.service
+        .cancel_undispatched_work(PrivacyGeneration::new(1), TimestampMs::new(98_100))
+        .expect("the work is taken back");
+    host.service
+        .run_cleanup(PrivacyGeneration::new(1), TimestampMs::new(98_200))
+        .expect("cleanup");
+    host.service
+        .release_fence(
+            PrivacyGeneration::new(1),
+            PrivacyGeneration::new(2),
+            TimestampMs::new(98_300),
+        )
+        .expect("a release");
+    passes(&mut uploader, 80_000).await;
+    assert!(
+        host.held_at_the_service(1),
+        "a generation retention would keep now is not deleted by its earlier request"
+    );
+    assert!(host.held_at_the_service(3));
+    assert_eq!(deletions(&host), 2, "only the person's deletion was sent");
+
+    // The control: a newer generation does not send retention's request for generation 1, which
+    // is behind privacy mode's line, and the person's own deletion of it is sent.
+    host.admit(4, &[64]);
+    passes(&mut uploader, 90_000).await;
+    assert_eq!(host.generation(4).remote, Remote::Published);
+    assert!(host.held_at_the_service(1));
+    host.service
+        .ask_deletion(
+            archive_id(),
+            BackupGeneration::new(1),
+            TimestampMs::new(91_000),
+            &|write| write(),
+        )
+        .expect("the person asks");
+    passes(&mut uploader, 92_000).await;
+    assert!(host.deleted_at_the_service(1));
+    assert!(host.held_at_the_service(3));
+    assert!(host.held_at_the_service(4));
+}
+
+/// A deletion retention wrote down and the service did not answer is asked again by retention's
+/// rule as it stands then, and not by the person's. The person deletes generation 2, which leaves
+/// generations 1 and 3 as the two the host keeps, so the request for generation 1 is not sent; once
+/// a fourth generation is published it is one of the older ones again, and the request is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deletion_retention_wrote_down_is_asked_again_only_while_retention_would_make_it() {
+    let host = Host::open();
+    host.set_up();
+    let mut uploader = host.uploader(10_000);
+    host.publish_generations(&mut uploader, 1, 3).await;
+    // Retention's deletion of generation 1's member, written down and not sent.
+    BackupStore::open(&host.state)
+        .expect("the store")
+        .note_retained_deletion_asked(
+            archive_id(),
+            BackupGeneration::new(1),
+            member_of(1, 0),
+            2,
+            TimestampMs::new(50_000),
+        )
+        .expect("asked");
+    host.service
+        .ask_deletion(
+            archive_id(),
+            BackupGeneration::new(2),
+            TimestampMs::new(60_000),
+            &|write| write(),
+        )
+        .expect("the person asks");
+    host.web.scripted().daily_snapshots = Some(2);
+
+    passes(&mut uploader, 70_000).await;
+    assert!(host.deleted_at_the_service(2));
+    assert!(
+        host.held_at_the_service(1),
+        "a generation retention would keep now is not deleted by its earlier request"
+    );
+    assert_eq!(deletions(&host), 2, "only the person's deletion was sent");
+    assert!(
+        privacy(&host.service)
+            .exported()
+            .expect("a list")
+            .iter()
+            .all(|copy| !copy.kind.contains("deletion asked and not yet confirmed")),
+        "the list does not say a deletion is asked that the host will not send"
+    );
+
+    host.admit(4, &[64]);
+    passes(&mut uploader, 80_000).await;
+    assert_eq!(host.generation(4).remote, Remote::Published);
+    assert!(host.deleted_at_the_service(1));
+    assert!(host.held_at_the_service(3));
+    assert!(host.held_at_the_service(4));
+}
+
+/// While privacy mode is on, a deletion is confirmed before its request leaves only for an object
+/// the person has just asked for. A deletion this host decided on for itself and wrote down is not
+/// the person's: a pass that read its row before privacy mode came on must not send it after. The
+/// control is the same confirmation with no fence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn under_a_fence_only_a_deletion_the_person_just_asked_for_is_confirmed() {
+    let host = Host::open();
+    host.set_up();
+    let mut uploader = host.uploader(10_000);
+    host.publish_generations(&mut uploader, 1, 3).await;
+    BackupStore::open(&host.state)
+        .expect("the store")
+        .note_retained_deletion_asked(
+            archive_id(),
+            BackupGeneration::new(1),
+            member_of(1, 0),
+            2,
+            TimestampMs::new(50_000),
+        )
+        .expect("asked");
+    let confirm = |generation: u64, object: BackupObjectId| {
+        host.service
+            .confirm_asked_deletion(archive_id(), BackupGeneration::new(generation), object)
+    };
+    confirm(1, member_of(1, 0)).expect("without a fence a written deletion is confirmed");
+
+    host.service
+        .raise_fence(PrivacyGeneration::new(1), TimestampMs::new(98_000))
+        .expect("the fence goes up");
+    assert!(
+        matches!(
+            confirm(1, member_of(1, 0)),
+            Err(ControllerError::Refused { .. })
+        ),
+        "the host's own deletion is not confirmed under a fence"
+    );
+
+    host.service
+        .ask_deletion(
+            archive_id(),
+            BackupGeneration::new(2),
+            TimestampMs::new(99_000),
+            &|write| write(),
+        )
+        .expect("the person asks");
+    for object in host
+        .service
+        .objects(archive_id(), BackupGeneration::new(2))
+        .expect("a read")
+    {
+        confirm(2, object.object_id).expect("the person just asked for it");
+    }
+}
+
+/// A deletion the person asked for under a privacy fence waits out a delay the service asked for,
+/// as any request does: the fence opens the gate to ending work in flight and to nothing else. The
+/// control is the same pass once the delay has passed, which sends every request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn under_a_fence_a_deletion_the_person_asked_for_waits_out_the_delay_the_service_asked_for() {
+    let host = Host::open();
+    host.set_up();
+    let mut publisher = host.uploader(10_000);
+    host.publish_generations(&mut publisher, 1, 3).await;
+    let clock = Moving::new();
+    let quiet = Arc::new(Quiet::new(clock.clone()));
+    let mut uploader = host.uploader_asked_to_wait(60_000, Arc::clone(&quiet));
+    host.service
+        .raise_fence(PrivacyGeneration::new(1), TimestampMs::new(98_000))
+        .expect("the fence goes up");
+    for generation in [1, 2] {
+        host.service
+            .ask_deletion(
+                archive_id(),
+                BackupGeneration::new(generation),
+                TimestampMs::new(61_000),
+                &|write| write(),
+            )
+            .expect("asked");
+    }
+    quiet.owe(std::time::Duration::from_secs(600));
+
+    passes(&mut uploader, 62_000).await;
+    assert_eq!(deletions(&host), 0, "nothing is sent inside the delay");
+
+    clock.advance(std::time::Duration::from_secs(601));
+    passes(&mut uploader, 63_000).await;
+    assert!(host.deleted_at_the_service(1));
+    assert!(host.deleted_at_the_service(2));
+    assert!(host.held_at_the_service(3));
 }
 
 /// The end of a production pass tells the cleanup a fence owes, and wakes neither the producer nor

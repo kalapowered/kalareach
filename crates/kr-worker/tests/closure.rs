@@ -80,7 +80,18 @@ async fn host(script: &str) -> Host {
 /// recogniser. The endpoint and its connections run where the caller does, and so does a closure's
 /// sequence unless whoever releases its gate enters another runtime first.
 async fn host_on(script: &str, tasks: &tokio::runtime::Handle) -> Host {
-    host_served(script, tasks, Listener::bind).await
+    host_served(
+        kr_worker::testing::posix_script(script),
+        tasks,
+        Listener::bind,
+    )
+    .await
+}
+
+/// Hosts a session whose root shell is `shell`, and serves it on the worker's endpoint.
+#[cfg(windows)]
+async fn host_running(shell: kr_worker::pty::ShellCommand) -> Host {
+    host_served(shell, &tokio::runtime::Handle::current(), Listener::bind).await
 }
 
 /// Hosts a session whose shell runs `script`, served on a listener whose connections are given a
@@ -90,16 +101,18 @@ async fn host_on(script: &str, tasks: &tokio::runtime::Handle) -> Host {
 /// than what a platform's default holds.
 #[cfg(unix)]
 async fn host_on_a_narrow_transport(script: &str) -> Host {
-    host_served(script, &tokio::runtime::Handle::current(), |endpoint| {
-        Listener::bind_with_send_buffer(endpoint, SEND_BUFFER)
-    })
+    host_served(
+        kr_worker::testing::posix_script(script),
+        &tokio::runtime::Handle::current(),
+        |endpoint| Listener::bind_with_send_buffer(endpoint, SEND_BUFFER),
+    )
     .await
 }
 
-/// Hosts a session whose shell runs `script`, with the session's own tasks on `tasks`, served on
+/// Hosts a session whose root shell is `shell`, with the session's own tasks on `tasks`, served on
 /// the listener `bind` makes.
 async fn host_served(
-    script: &str,
+    shell: kr_worker::pty::ShellCommand,
     tasks: &tokio::runtime::Handle,
     bind: impl FnOnce(&kr_ipc::paths::Endpoint) -> kr_ipc::Result<Listener>,
 ) -> Host {
@@ -129,7 +142,7 @@ async fn host_served(
         session_epoch: SessionEpoch::V1,
         environment_id,
         display_number: DisplayNumber::new(1),
-        shell: kr_worker::testing::posix_script(script),
+        shell,
         shell_mode: ShellMode::NativeCompat,
         worker_profile: WorkerProfile::HeadlessUser,
         desktop: DesktopBinding::none(),
@@ -873,4 +886,154 @@ async fn a_read_that_returned_before_the_drain_ended_reaches_every_attachment_be
     close_past_the_drain(&host, tasks.handle()).await;
     drop(reading);
     each_was_sent_the_line_first(&host, [&mut first, &mut second]).await;
+}
+
+/// KR-REQ-07.52: a root shell that is ended from outside, as a crash ends it, closes its session,
+/// every attachment is sent how, and nothing starts a shell again: the session's root is still the
+/// process that was ended, and it stays ended.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_root_shell_ended_from_outside_closes_its_session_and_is_not_started_again() {
+    use kr_ipc::identity::{ProcessState, Stop, Stopped, process_state, stop_process};
+
+    let host = host("sleep 300").await;
+    let mut first = watching(&host).await;
+    let mut second = watching(&host).await;
+    let root = host
+        .runtime
+        .session()
+        .root_identity()
+        .expect("the session has a root shell");
+
+    assert_eq!(
+        stop_process(&root, Stop::Kill),
+        Stopped::Signalled,
+        "the root shell is ended from outside the session"
+    );
+    let record = closed(&host).await;
+    assert!(
+        matches!(
+            record.reason,
+            ClosureReason::RootExit | ClosureReason::RootSignal
+        ),
+        "the shell's ending closed the session, not a request: {record:?}"
+    );
+    for (client, what) in [(&mut first, "the first"), (&mut second, "the second")] {
+        let (_, sent) = until_the_closure(client).await;
+        assert_eq!(
+            sent, record,
+            "{what} attachment was sent the session's own record"
+        );
+    }
+    assert_eq!(
+        host.runtime.state(),
+        kr_protocol::session::SessionState::Closed
+    );
+    assert_eq!(
+        host.runtime.session().root_identity(),
+        Some(root.clone()),
+        "no other shell took the root's place"
+    );
+    assert!(
+        matches!(process_state(&root), ProcessState::Ended),
+        "and the one that was ended stays ended"
+    );
+}
+
+/// KR-REQ-07.53: closing sets the session closing at once and refuses input from then on; what
+/// ignores the request to stop is not forced before five seconds from the request, and is after;
+/// the final status names the reason and the process that needed force, and is recorded within the
+/// two seconds output may drain for.
+///
+/// The shell here is PowerShell with the console's interrupt turned into a key it never reads,
+/// which is the one request this platform makes of a shell. Whether the five seconds were kept is
+/// read from the first moment the shell is seen gone, polled every 50 ms from the request: a force
+/// before five seconds can only make that moment earlier, and a loaded machine only later.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_forces_what_ignores_it_only_after_five_seconds_and_records_the_final_status() {
+    use kr_ipc::identity::{ProcessState, process_state};
+
+    /// The grace section 7 gives an owned process between the request to stop and force, and the
+    /// time it lets output drain after the owned processes have stopped. They are the specification's
+    /// figures, not the worker's constants, so a worker whose constants drift fails here.
+    const GRACE_PERIOD: Duration = Duration::from_secs(5);
+    const DRAIN_PERIOD: Duration = Duration::from_secs(2);
+    /// What the worker is allowed beyond the drain to be scheduled and write the record.
+    const RECORD_ALLOWANCE: Duration = Duration::from_secs(1);
+    /// How often the shell is looked for, and so how close to a moment a sample speaks for it.
+    const RESOLUTION: Duration = Duration::from_millis(50);
+
+    let host = host_running(kr_worker::testing::powershell_command(
+        "[Console]::TreatControlCAsInput = $true; \
+         Write-Host -NoNewline 'kr-stubborn-ready.'; \
+         Start-Sleep -Seconds 300",
+    ))
+    .await;
+    let (mut client, mut keys) = attached_holding_the_keys(&host).await;
+    common::produced(&host.runtime, b"kr-stubborn-ready.").await;
+    let root = host
+        .runtime
+        .session()
+        .root_identity()
+        .expect("the session has a root shell");
+    assert!(matches!(process_state(&root), ProcessState::Running));
+
+    // Closing is set at once, whatever the shell does about the request.
+    let requested = std::time::Instant::now();
+    let (acceptance, gate) = host.runtime.close(ClosureReason::CloseRequested);
+    assert_eq!(
+        acceptance.state,
+        kr_protocol::session::SessionState::Closing
+    );
+    assert_eq!(
+        host.runtime.state(),
+        kr_protocol::session::SessionState::Closing
+    );
+    gate.release();
+
+    // And input is refused from then on.
+    assert!(
+        !keys.offer_bytes(&host.runtime, b"echo typed-while-closing\r"),
+        "a closing session takes no input"
+    );
+
+    // The shell ignores the request, so it is there until the five seconds are over.
+    let gone = loop {
+        if !matches!(process_state(&root), ProcessState::Running) {
+            break requested.elapsed();
+        }
+        assert!(
+            requested.elapsed() < LIVENESS_DEADLINE,
+            "the shell was never ended"
+        );
+        tokio::time::sleep(RESOLUTION).await;
+    };
+    let gone_at = std::time::SystemTime::now();
+    assert!(
+        gone + RESOLUTION >= GRACE_PERIOD,
+        "the shell was forced {gone:?} after the request, before the five seconds were up"
+    );
+
+    // The final status: why the session closed and what it needed force for, recorded within the
+    // drain.
+    let record = closed(&host).await;
+    assert_eq!(record.reason, ClosureReason::CloseRequested);
+    assert!(
+        record
+            .terminated
+            .iter()
+            .any(|process| process.identity == root && process.forced),
+        "the record names the shell among what needed force: {record:?}"
+    );
+    let recorded_at = std::time::UNIX_EPOCH + Duration::from_millis(record.closed_at_ms.get());
+    assert!(
+        recorded_at.duration_since(gone_at).unwrap_or_default() <= DRAIN_PERIOD + RECORD_ALLOWANCE,
+        "the final status was recorded more than {DRAIN_PERIOD:?} after the shell was gone"
+    );
+    let (_, sent) = until_the_closure(&mut client).await;
+    assert_eq!(
+        sent, record,
+        "the attachment was sent the session's own record"
+    );
 }

@@ -81,9 +81,9 @@ use kr_client::sync::membership::{
     CollectionRef, Device, DeviceDirectory, KeyRecordService, SyncMembership,
 };
 use kr_client::sync::{
-    CollectionKeys, ConflictCopy, Published, Restored, SettingValue, SharedCollectionService,
-    StoredCollectionKeys, SyncBody, SyncCheckpoint, SyncClient, SyncError, SyncObject,
-    SyncSettings, SyncStore, Unread, fresh_object_id, fresh_revision,
+    CollectionKeys, ConflictCopy, KeptCopy, Published, Restored, SettingValue,
+    SharedCollectionService, StoredCollectionKeys, SyncBody, SyncCheckpoint, SyncClient, SyncError,
+    SyncObject, SyncSettings, SyncStore, Unread, fresh_object_id, fresh_revision,
 };
 use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::SecretStore;
@@ -376,6 +376,32 @@ impl Record {
             ))
         })
     }
+}
+
+/// A copy the service kept of a write it refused this computer, as privacy mode lists it.
+#[derive(Clone, Debug)]
+pub struct SyncCopy {
+    /// What kind of copy it is.
+    pub kind: String,
+    /// How the copy is named to the person, which names exactly one copy on this computer.
+    pub reference: String,
+    /// When it left this computer.
+    pub left_at_ms: TimestampMs,
+    /// Whether this computer can ask the service to drop it now.
+    pub deletable: bool,
+    place: Place,
+    /// The copy's identity, when it is a copy this computer can ask the service to drop. A record
+    /// this build cannot read is listed so that the list does not read as complete, and has none.
+    copy: Option<SyncConflictId>,
+}
+
+/// Which of this computer's synchronisation stores records a copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Place {
+    /// The settings collection's store.
+    Settings,
+    /// The store of the drafts that left through one host.
+    Drafts(kr_protocol::ids::EnvironmentId),
 }
 
 /// Settings sync from this computer.
@@ -848,21 +874,7 @@ impl SettingsSync {
                 Some(mode)
             }
         };
-        let service = self.managed(&record.origin()?)?;
-        let status = self
-            .membership_asking(&service, Ask::Never)?
-            .members()
-            .map_err(member_failure)?
-            .ok_or_else(|| {
-                CommandError::local_failure("this computer holds no settings collection")
-            })?;
-        let (collection, epoch) = (
-            status.collection,
-            status.installed.map(|(epoch, _)| epoch).ok_or_else(|| {
-                CommandError::local_failure("the collection has no key installed")
-            })?,
-        );
-        let (client, _) = self.client(&service, collection, epoch, record.floor)?;
+        let (service, client) = self.client_of(&record)?;
         // The choice first, on this computer; the service is told after, and may be told later.
         if let Some(mode) = chosen {
             self.local.set_colour_mode(mode)?;
@@ -892,6 +904,141 @@ impl SettingsSync {
         Ok(())
     }
 
+    /// The client for the collection this computer is in, over the service its record names, with
+    /// nothing asked of the service. Called with a step in hand.
+    fn client_of(&self, record: &Record) -> Result<(Arc<ManagedSyncService>, SyncClient)> {
+        let service = self.managed(&record.origin()?)?;
+        let status = self
+            .membership_asking(&service, Ask::Never)?
+            .members()
+            .map_err(member_failure)?
+            .ok_or_else(|| {
+                CommandError::local_failure("this computer holds no settings collection")
+            })?;
+        let (collection, epoch) = (
+            status.collection,
+            status.installed.map(|(epoch, _)| epoch).ok_or_else(|| {
+                CommandError::local_failure("the collection has no key installed")
+            })?,
+        );
+        let (client, _) = self.client(&service, collection, epoch, record.floor)?;
+        Ok((service, client))
+    }
+
+    /// The copies the service kept of writes it refused this computer, in the settings' store and
+    /// in each host's drafts store, which privacy mode shows and does not erase. Nothing is sent.
+    ///
+    /// A copy can be dropped while the sync that holds it is on: settings sync for a settings
+    /// copy, and settings sync with drafts sync for a drafts copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns a local failure when the records cannot be read.
+    pub fn kept_copies(&self) -> Result<Vec<SyncCopy>> {
+        let settings_on = self.record()?.is_some();
+        let drafts_on = settings_on && self.drafts.enabled()?;
+        let listed = |kept: KeptCopy, deletable: bool, place: Place| SyncCopy {
+            kind: kept.listed.kind,
+            reference: kept.listed.reference,
+            left_at_ms: kept.listed.left_at_ms,
+            deletable: deletable && kept.listed.deletable,
+            place,
+            copy: Some(kept.copy),
+        };
+        let mut copies: Vec<SyncCopy> = kr_client::sync::kept_copies(&self.store()?)
+            .map_err(sync_failure)?
+            .into_iter()
+            .map(|kept| listed(kept, settings_on, Place::Settings))
+            .collect();
+        for (environment, kept) in self.drafts.kept_copies()? {
+            copies.push(listed(kept, drafts_on, Place::Drafts(environment)));
+        }
+        // A record this build cannot read may account for a copy that left: it is listed, as the
+        // client lists it, and nothing can be asked of it.
+        let mut unreadable =
+            kr_client::sync::unreadable_records(&self.store()?).map_err(sync_failure)?;
+        unreadable.extend(self.drafts.unreadable_records()?);
+        copies.extend(unreadable.into_iter().map(|entry| SyncCopy {
+            kind: entry.kind,
+            reference: entry.reference,
+            left_at_ms: entry.left_at_ms,
+            deletable: false,
+            place: Place::Settings,
+            copy: None,
+        }));
+        copies.sort_by_key(|copy| copy.left_at_ms.get());
+        Ok(copies)
+    }
+
+    /// Asks the service to drop the one copy listed under `reference`, and says whether the service
+    /// has dropped it. A service that cannot be asked leaves the choice recorded, and the next
+    /// step that reaches it asks again.
+    ///
+    /// # Errors
+    ///
+    /// Returns a refusal when no one copy is listed under the reference or the sync that holds it
+    /// is off, and a local failure when a record cannot be read or kept.
+    pub async fn drop_kept_copy(&self, reference: &str) -> Result<bool> {
+        let copies = self.kept_copies()?;
+        let mut named = copies.iter().filter(|copy| copy.reference == reference);
+        let (Some(wanted), None) = (named.next(), named.next()) else {
+            return Err(CommandError::invalid(
+                "this computer lists no one copy kept by the sync service under that reference",
+            ));
+        };
+        let Some(copy) = wanted.copy else {
+            return Err(CommandError::refused(
+                "this computer cannot ask the sync service to drop that copy: the record of it \
+                 cannot be read",
+            ));
+        };
+        if !wanted.deletable {
+            return Err(CommandError::refused(
+                "that copy is dropped while the sync that holds it is on",
+            ));
+        }
+        match wanted.place {
+            Place::Settings => self.drop_settings_copy(copy).await,
+            Place::Drafts(environment) => {
+                if !self.drafts.choose_to_drop(environment, copy)? {
+                    return Err(CommandError::refused(
+                        "this computer holds no such copy of its drafts at the service",
+                    ));
+                }
+                // The next pass asks the service, and asks until it has dropped the copy. The
+                // person is asking now, so one is made now, and a pass that could not reach the
+                // service leaves the choice made.
+                let _ = self.catch_up_now().await;
+                Ok(!self
+                    .drafts
+                    .kept_copies()?
+                    .iter()
+                    .any(|(host, kept)| *host == environment && kept.copy == copy))
+            }
+        }
+    }
+
+    async fn drop_settings_copy(&self, copy: SyncConflictId) -> Result<bool> {
+        let _step = self.step().await?;
+        let Some(record) = self.record()? else {
+            return Err(CommandError::refused("settings sync is not on"));
+        };
+        let (_, client) = self.client_of(&record)?;
+        if client
+            .drop_kept_copy(copy)
+            .await
+            .map_err(sync_failure)?
+            .is_none()
+        {
+            // The choice was made before and the service has not dropped the copy: it is asked again.
+            client.finish_resolutions().await.map_err(sync_failure)?;
+        }
+        Ok(!kr_client::sync::kept_copies(&self.store()?)
+            .map_err(sync_failure)?
+            .iter()
+            .any(|kept| kept.copy == copy))
+    }
+
     /// The agreement itself: see the module's list.
     #[allow(clippy::too_many_lines)]
     async fn agree(
@@ -910,6 +1057,10 @@ impl SettingsSync {
             .reconcile_unsettled(now_ms)
             .await
             .map_err(sync_failure)?;
+        // A copy the person chose to have the service drop is asked about before anything that can
+        // end this step early: a choice of settings that waits for the person must not hold the
+        // drop back, or a service that could not be reached would never be asked again.
+        client.finish_resolutions().await.map_err(sync_failure)?;
         let chosen = self.local.chosen_colour_mode();
         let mut held = store.object(object_id).map_err(sync_failure)?;
         // A marker for settings this computer no longer holds is spent.
@@ -970,7 +1121,6 @@ impl SettingsSync {
                     .map_err(sync_failure)?;
             }
         }
-        client.finish_resolutions().await.map_err(sync_failure)?;
         // The file is the one source: the object this computer holds is made again whenever it
         // does not carry what the file says, which is also how a change that was written to the
         // file and not yet to the object (a stop between the two) is carried on.

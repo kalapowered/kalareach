@@ -319,13 +319,13 @@ its `PostToolUse` hook says which thread ran it, naming the call by its request 
 Code runs `PostToolUse` only for a call that succeeded; a refused call is a `PostToolUseFailure`,
 which names no request. So while the identifier names this one question, its reports are the
 reports of the call that asked it. If they name the thread recorded when the question was asked,
-the question is bound to the revision recorded then, and a later switch of thread invalidates it for
-every client. If the reports name another thread, or disagree with each other, the question stays
-bound to the application alone and claims no thread-switch detection. Once the identifier is used
-again, by an exact retry that returns the question or by another question the same launch asked
-under it, no one call asked under it, so no later report binds either question. A question already
-bound by then was bound by its own call's report, before any other call used the identifier, and
-stays bound.
+the question is bound to the revision recorded then, its identity header carries that revision, and
+a later switch of thread invalidates it for every client. If the reports name another thread, or
+disagree with each other, the question stays bound to the application alone, carries no revision and
+claims no thread-switch detection. Once the identifier is used again, by an exact retry that
+returns the question or by another question the same launch asked under it, no one call asked
+under it, so no later report binds either question. A question already bound by then was bound by
+its own call's report, before any other call used the identifier, and stays bound.
 
 ## Channels
 

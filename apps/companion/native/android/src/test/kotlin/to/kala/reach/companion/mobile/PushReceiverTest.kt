@@ -323,7 +323,7 @@ class PushReceiverTest {
         assertEquals("gateway_403", read.getString("reason"))
     }
 
-    // The limited preview key.
+    // The limited preview keys.
 
     private object Plain : Sealer {
         override fun seal(plain: ByteArray, associated: ByteArray) = plain
@@ -332,25 +332,36 @@ class PushReceiverTest {
     }
 
     /**
-     * KR-REQ-10.48: the store a receiver reads holds the one key that opens a notification
-     * preview, filed by the identifier of its public half, and the application's secure store, with
-     * the authorisation key in it, is another directory the limited store neither reads nor writes.
+     * KR-REQ-10.48: the store a receiver reads holds the keys that open a notification preview and
+     * nothing else, each set the application hands over replaces the one before it whole, and the
+     * application's secure store, with the authorisation key in it, is another directory the limited
+     * store neither reads nor writes.
      */
     @Test
-    fun theLimitedStoreHoldsTheOneKeyAPreviewOpensWithAndNeverTheAuthorisationKey() {
+    fun theLimitedStoreHoldsTheKeysAPreviewOpensWithAndNeverTheAuthorisationKey() {
         val noBackup = folder.newFolder("no-backup")
         val authorisation = ByteArray(32) { 7 }
         PushStores.secrets(noBackup, Plain).write("device/device-key/authorisation", authorisation)
 
         val recipient = ByteArray(32) { 0x91.toByte() }
-        val preview = ByteArray(32) { 3 }
+        val seed = ByteArray(32) { 3 }
+        val firstHost = ByteArray(32) { 0x21 }
+        val secondHost = ByteArray(32) { 0x22 }
         val limited = PushStores.limited(noBackup, Plain)
-        limited.write(recipient, preview)
+        assertNull("nothing is held before the application hands anything over", limited.read())
+        limited.replace(
+            PreviewKeySet.of(
+                listOf(recipient to seed),
+                listOf(firstHost to ByteArray(32) { 5 }, secondHost to ByteArray(32) { 6 })
+            )
+        )
 
-        assertEquals(preview.toList(), limited.read(recipient)!!.toList())
-        assertNull("no other recipient has a key here", limited.read(ByteArray(32) { 1 }))
+        val held = limited.read()!!
+        assertEquals(seed.toList(), held.recipientSeed(recipient)!!.toList())
+        assertEquals(ByteArray(32) { 5 }.toList(), held.senderKey(firstHost)!!.toList())
+        assertNull("no other recipient has a seed here", held.recipientSeed(ByteArray(32) { 1 }))
         assertEquals(
-            "the limited store is one file for the one key",
+            "the limited store is one file for the whole set",
             1,
             File(noBackup, PushStores.LIMITED_DIRECTORY).listFiles()!!.size
         )
@@ -363,8 +374,34 @@ class PushReceiverTest {
             authorisation.toList(),
             PushStores.secrets(noBackup, Plain).read("device/device-key/authorisation")!!.toList()
         )
-        limited.delete(recipient)
-        assertNull(limited.read(recipient))
+
+        // A host turned off is in the next set no longer, and the seed with it when no host is left.
+        limited.replace(PreviewKeySet.of(listOf(recipient to seed), listOf(secondHost to ByteArray(32) { 6 })))
+        assertNull(limited.read()!!.senderKey(firstHost))
+        assertEquals(ByteArray(32) { 6 }.toList(), limited.read()!!.senderKey(secondHost)!!.toList())
+        limited.replace(PreviewKeySet.of(emptyList(), emptyList()))
+        assertNull(limited.read()!!.recipientSeed(recipient))
+        assertNull(limited.read()!!.senderKey(secondHost))
+    }
+
+    /** A set whose member is not a key, or that names one identifier twice, is not read at all. */
+    @Test
+    fun aSetOfKeysThatIsNotMadeOfKeysIsNotRead() {
+        val encoder = java.util.Base64.getEncoder()
+        fun item(id: ByteArray, field: String, value: ByteArray) =
+            JSONObject().put("id", encoder.encodeToString(id)).put(field, encoder.encodeToString(value))
+        fun set(recipients: List<JSONObject>, senders: List<JSONObject>) =
+            JSONObject()
+                .put("recipients", org.json.JSONArray(recipients))
+                .put("senders", org.json.JSONArray(senders))
+                .toString()
+        val id = ByteArray(32) { 1 }
+        val key = ByteArray(32) { 2 }
+        assertTrue(PreviewKeySet.parse(set(listOf(item(id, "seed", key)), listOf(item(id, "key", key)))) != null)
+        assertNull("a seed of another length", PreviewKeySet.parse(set(listOf(item(id, "seed", ByteArray(31))), emptyList())))
+        assertNull("an identifier of another length", PreviewKeySet.parse(set(emptyList(), listOf(item(ByteArray(8), "key", key)))))
+        assertNull("one sender twice", PreviewKeySet.parse(set(emptyList(), listOf(item(id, "key", key), item(id, "key", key)))))
+        assertNull("not a set", PreviewKeySet.parse("{}"))
     }
 
     // The message.

@@ -13,9 +13,17 @@
  * that changes.
  */
 
-import { useCallback, useEffect, useRef, useState, type ReactNode, type RefObject } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type ReactNode,
+  type RefObject
+} from 'react'
 
-import { Button, Card } from '../components/ui'
+import { Button, Card, Switch } from '../components/ui'
 import { useApp } from '../app/state'
 import {
   failureMessage,
@@ -763,6 +771,10 @@ function Pasted({
  * and never as an alert: nothing is wrong. A stop says what is, and offers another go, and the
  * system's settings when that is where the person has to act. On says so and asks for nothing: only
  * the host ends a destination, and the system's setting stops the notifications on this phone.
+ *
+ * Beneath the words, once the person has asked for notifications, is one choice: whether the
+ * notification shows what needs them or only that something does. It takes effect at once on this
+ * phone and is passed to the host; while a step is running it waits.
  */
 function HostNotifications({
   host,
@@ -771,8 +783,11 @@ function HostNotifications({
   readonly host: HostRow
   readonly notifications: Notifications
 }): ReactNode {
-  const { view, enable, openSettings } = notifications
+  const { view, enable, setPreviews, openSettings } = notifications
   const [failure, setFailure] = useState<string | null>(null)
+  // What the person just chose, shown at once and until native code has answered.
+  const [asked, setAsked] = useState<boolean | null>(null)
+  const previewsHelp = useId()
   if (view === null || !view.available) return null
   const row = view.hosts.find((each) => each.reference === host.reference)
   const state = row?.state ?? 'off'
@@ -780,7 +795,7 @@ function HostNotifications({
     state === 'off'
       ? 'Notifications are off.'
       : state === 'on'
-        ? 'Notifications are on.'
+        ? 'This host took this phone for notifications.'
         : (row?.words ?? '')
   return (
     <div className="host-notifications" data-testid="host-notifications" data-state={state}>
@@ -821,6 +836,37 @@ function HostNotifications({
           ) : null}
         </div>
       ) : null}
+      {row === undefined || state === 'off' ? null : (
+        <div
+          className="account-switch"
+          data-testid="notifications-previews"
+          data-state={(asked ?? row.previews) ? 'on' : 'off'}
+        >
+          <div className="account-switch-head">
+            <p className="account-lead">Previews</p>
+            <Switch
+              checked={asked ?? row.previews}
+              label="Previews"
+              describedBy={previewsHelp}
+              disabled={state === 'working'}
+              onChange={(next) => {
+                setFailure(null)
+                setAsked(next)
+                setPreviews(host.reference, next)
+                  .catch((error: unknown) => {
+                    setFailure(failureMessage(error))
+                  })
+                  .finally(() => {
+                    setAsked(null)
+                  })
+              }}
+            />
+          </div>
+          <p className="account-note" id={previewsHelp}>
+            {PREVIEWS_HELP}
+          </p>
+        </div>
+      )}
       {failure === null ? null : (
         <p role="alert" className="small" data-testid="notifications-failure">
           {failure}
@@ -829,6 +875,9 @@ function HostNotifications({
     </div>
   )
 }
+
+/** What the choice of previews does, in the words the row gives beside it. */
+const PREVIEWS_HELP = 'The notification shows what needs you. Off, it shows only that something does.'
 
 /** The hosts this computer is paired with, newest first. */
 function PairedHosts({

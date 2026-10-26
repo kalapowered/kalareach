@@ -66,6 +66,12 @@ impl Controller {
         Arc::new(AttentionReach(self.me.clone()))
     }
 
+    /// Returns which sessions this daemon holds.
+    #[must_use]
+    pub fn held_sessions(&self) -> Arc<dyn crate::attention::HeldSessions> {
+        Arc::new(AttentionReach(self.me.clone()))
+    }
+
     /// Starts the attention store's reading of every session it has to read, and its own work.
     pub(super) async fn start_attention(self: &Arc<Self>) -> Result<()> {
         self.watch_open_sessions().await?;
@@ -73,6 +79,11 @@ impl Controller {
         // the store and the journal left off before the timers run.
         self.attention
             .consume_automation(Arc::clone(self.automation.journal()))
+            .await;
+        // The change-set store's versions are the other: review work for each, caught up with
+        // before anything is served.
+        self.attention
+            .consume_change_sets(Arc::clone(self.changesets.service()), self.held_sessions())
             .await;
         self.attention.maintain(self.attention_reach());
         Ok(())
@@ -191,19 +202,39 @@ impl crate::attention::Reach for AttentionReach {
         })
     }
 
+    fn cleanup_owed<'a>(
+        &'a self,
+        session_id: SessionId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(controller) = self.0.upgrade() else {
+                return true;
+            };
+            let privacy = Arc::clone(&controller.privacy);
+            // The record's lock is held across slow steps, so it is asked on the blocking pool,
+            // as the reads of a closed session's history ask it. A record that cannot be asked is
+            // one whose cleanup is taken as owed.
+            tokio::task::spawn_blocking(move || privacy.owes_cleanup(session_id))
+                .await
+                .unwrap_or(true)
+        })
+    }
+
     fn closed_journal(&self, session_id: SessionId) -> ClosedJournal {
         let Some(controller) = self.0.upgrade() else {
             return ClosedJournal::Unreadable;
         };
         // A session that closed under an earlier build wrote an earlier schema, and the archive
         // brings it forward once no worker may own it. Until then the journal is held back, which
-        // the store tries again later and does not take for a journal it cannot read.
+        // the store tries again later and does not take for a journal it cannot read. A migration
+        // that was made and failed is told apart, since the store tries it again only so often.
         let forward = controller.archive().bring_forward(session_id);
         match kr_worker::journal::Journal::open_read_only(
             controller.paths.journal_database(session_id),
         ) {
             Ok(journal) => ClosedJournal::Open(Box::new(journal)),
             Err(_) if forward == crate::archive::Forward::HeldBack => ClosedJournal::HeldBack,
+            Err(_) if forward == crate::archive::Forward::Failed => ClosedJournal::Failing,
             Err(_) => ClosedJournal::Unreadable,
         }
     }
@@ -216,5 +247,27 @@ impl crate::attention::Reach for AttentionReach {
         )
         .ok()
         .map(|history| history.oldest_retained_cursor())
+    }
+}
+
+impl crate::attention::HeldSessions for AttentionReach {
+    fn holds<'a>(
+        &'a self,
+        session_id: SessionId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(controller) = self.0.upgrade() else {
+                return false;
+            };
+            // The directory first, then the closure: a closure is recorded before its worker leaves
+            // the directory, so a session that is closing is found by one of the two.
+            if controller.directory.lock().await.get(session_id).is_some() {
+                return true;
+            }
+            matches!(
+                controller.registry.lock().await.closure(session_id),
+                Ok(Some(_))
+            )
+        })
     }
 }

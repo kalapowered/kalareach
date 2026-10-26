@@ -39,6 +39,15 @@ const MAX_EVIDENCE_PAGES: usize = 64;
 /// acknowledgements.
 const MAX_PAGE_RETRIES: u32 = 10;
 
+/// How many times the read-back at a restart asks again, for one worker, for a revision's first
+/// page that the worker refused because its dispatch boundary was held.
+///
+/// The pause before the first of these is [`PAGE_RETRY_PAUSE`] and it doubles, so the retries wait
+/// 140 milliseconds at most. A worker holds the boundary for a moment when another of the
+/// daemon's links presents its generation, which is the case this covers. The bound is the
+/// worker's own, so a worker that stays busy cannot cut the walk of another.
+const MAX_READ_BACK_RETRIES: u32 = 3;
+
 /// How often the daemon looks for names a worker still owes, apart from the announcements that
 /// ask for them.
 const EVIDENCE_PASS_INTERVAL: std::time::Duration = DEBT_PASS_INTERVAL;
@@ -79,11 +88,11 @@ impl Retries {
         }
     }
 
-    /// What the read-back at a restart may spend: nothing, so that it is one exchange for each
-    /// revision it asks about and no more.
-    fn none() -> Self {
+    /// What the read-back at a restart may spend on one worker: a few retries of a refusal for now,
+    /// besides the one exchange for each revision it asks about.
+    fn for_the_read_back() -> Self {
         Self {
-            left: 0,
+            left: MAX_READ_BACK_RETRIES,
             ..Self::for_an_announcement()
         }
     }
@@ -1320,7 +1329,7 @@ impl Controller {
                         })
                         .flatten()
                         .collect();
-                let mut admitted = self.admitted_table();
+                let mut admitted = self.admitted_withdraw();
                 if host_wide {
                     admitted.retain(|_, connection| connection.admitted_revision >= revision);
                 } else {
@@ -1339,7 +1348,7 @@ impl Controller {
                     // refused inside its own transaction as before.
                     admitted.retain(|_, connection| {
                         !revoked.contains(&connection.actor_id)
-                            && connection.acting.is_disjoint(&revoked_grants)
+                            && connection.acts_under_none_of(&revoked_grants)
                     });
                     for connection in admitted.values_mut() {
                         connection.admitted_revision = revision;
@@ -1480,7 +1489,10 @@ impl Controller {
     /// has taken them all, and a replacement controller has taken none, so it still holds them
     /// for the newest [`kr_worker::journal::MAX_HELD_REVOCATIONS`] revocations. The first page is
     /// asked for each of the revisions at or below the one the registry holds the worker as having
-    /// acknowledged, that many at most, in one exchange each and none asked again. The answers
+    /// acknowledged, that many at most, in one exchange each. A worker that answers that its
+    /// dispatch boundary is held for the moment is asked again, at most [`MAX_READ_BACK_RETRIES`]
+    /// times for the walk of that worker, so a worker takes the exchanges for its revisions and
+    /// those retries, and a worker that stays busy ends only its own walk. The answers
     /// carry into no result: each opens a report of its own, which a repeat of that revocation
     /// reads, and the pages that follow the first are collected by the evidence pass. The daemon keeps a report for
     /// [`crate::authority::MAX_HELD_FENCE_REPORTS`] revisions of a worker in all, so the older of
@@ -1510,8 +1522,10 @@ impl Controller {
 
     /// As [`Self::recover_what_workers_hold`], on this task.
     async fn read_back_what_workers_hold(&self, workers: &[(SessionId, AuthorityRevision)]) {
-        let mut retries = Retries::none();
         for (session_id, held) in workers {
+            // Each worker has retries of its own, so one that stays busy does not cut the walk of
+            // another.
+            let mut retries = Retries::for_the_read_back();
             let oldest = held
                 .get()
                 .saturating_sub(kr_worker::journal::MAX_HELD_REVOCATIONS as u64 - 1)

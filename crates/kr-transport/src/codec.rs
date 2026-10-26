@@ -19,6 +19,15 @@ use serde::Serialize;
 
 use crate::error::{Result, TransportError};
 
+/// How a frame is admitted to the stream, one attempt at a time.
+///
+/// It is called in the same poll as each attempt to hand bytes to the stream, with the attempt as
+/// its argument. It returns `false` without making the attempt when the frame is no longer
+/// admitted, and otherwise makes it once and returns `true`; whatever it holds to decide, a lock
+/// on the state the decision reads, it keeps until the attempt has returned. It runs inside a
+/// poll, so it must not block and must not wait on the stream.
+pub type Admission<'a> = &'a (dyn Fn(&mut dyn FnMut()) -> bool + Send + Sync);
+
 /// Writes frames of one stream kind.
 #[derive(Debug)]
 pub struct FrameWriter {
@@ -180,11 +189,13 @@ impl FrameWriter {
 
     /// Writes one message while `admits` holds, and says whether it went.
     ///
-    /// `admits` is evaluated in the same poll as every attempt to hand bytes to the stream, so no
-    /// byte of this frame reaches the stream without it having held at that moment. That is what
-    /// makes an authority check a delivery barrier rather than a check before a wait: a frame
-    /// queued behind a peer that has stopped reading is abandoned where it waits, however long it
-    /// waits there.
+    /// `admits` is evaluated in the same poll as every attempt to hand bytes to the stream, and
+    /// that attempt is made inside it ([`Admission`]), so no byte of this frame reaches the stream
+    /// without it having held at that moment, and what it holds stays held until the attempt has
+    /// ended. That is what makes an authority check a delivery barrier rather than a check before a
+    /// wait: a frame queued behind a peer that has stopped reading is abandoned where it waits,
+    /// however long it waits there, and a change of what the check reads waits for an attempt in
+    /// progress rather than falling between the check and the write.
     ///
     /// An abandoned frame leaves the stream in pieces when part of it had already gone, so the
     /// stream is reset and carries nothing more. That is the right end for a stream whose
@@ -197,7 +208,7 @@ impl FrameWriter {
     pub async fn write_message_while<T: Serialize + ?Sized>(
         &mut self,
         message: &T,
-        admits: &(dyn Fn() -> bool + Send + Sync),
+        admits: Admission<'_>,
     ) -> Result<bool> {
         let payload = kr_cbor::to_canonical_vec_within(
             message,
@@ -220,7 +231,7 @@ impl FrameWriter {
         &mut self,
         prefix: &[u8],
         payload: &[u8],
-        admits: &(dyn Fn() -> bool + Send + Sync),
+        admits: Admission<'_>,
     ) -> Result<bool> {
         if self.interrupted {
             self.reset();
@@ -235,15 +246,20 @@ impl FrameWriter {
             while written < part.len() {
                 let stream = &mut self.stream;
                 let attempt = std::future::poll_fn(|context| {
-                    // In the same poll as the attempt. A poll that hands bytes to the stream is a
-                    // poll in which this held; a wake that arrives after the authority went
-                    // returns here and abandons the frame instead.
-                    if !admits() {
-                        return std::task::Poll::Ready(None);
+                    // In the same poll as the attempt, and the attempt inside it. A poll that
+                    // hands bytes to the stream is a poll in which this held, and went on holding
+                    // until the bytes were handed over; a wake that arrives after the authority
+                    // went returns here and abandons the frame instead.
+                    let mut polled = None;
+                    let admitted = admits(&mut || {
+                        polled = Some(
+                            std::pin::Pin::new(&mut *stream).poll_write(context, &part[written..]),
+                        );
+                    });
+                    match polled {
+                        Some(poll) if admitted => poll.map(Some),
+                        _ => std::task::Poll::Ready(None),
                     }
-                    std::pin::Pin::new(&mut *stream)
-                        .poll_write(context, &part[written..])
-                        .map(Some)
                 })
                 .await;
                 match attempt {

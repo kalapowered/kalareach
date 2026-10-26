@@ -11,9 +11,11 @@
 use std::sync::Arc;
 
 use kr_ipc::testing::TempHost;
-use kr_protocol::ids::{ActionId, ActorId, DraftId, EnvironmentId, SessionId, TransferId};
+use kr_protocol::ids::{
+    ActionId, ActorId, ApplicationInstanceId, DraftId, EnvironmentId, SessionId, TransferId,
+};
 use kr_protocol::insertion::{InsertionBegin, InsertionClaim, InsertionReport, ReportedOutcome};
-use kr_protocol::scalars::{Bytes, Digest256, Nullable, U64};
+use kr_protocol::scalars::{Bytes, Digest256, Nullable, U64, Uuid};
 use kr_protocol::transfer::InsertionState;
 use kr_protocol::transfer::{
     AttachmentHandle, ChunkDescriptor, ChunkLayout, UploadBeginParams, UploadBeginResult,
@@ -312,6 +314,11 @@ impl Harness {
 #[must_use]
 pub fn digest(bytes: &[u8]) -> Digest256 {
     Digest256::from_bytes(kr_cbor::sha256(bytes))
+}
+
+/// The application the drafts of these suites that name one are written for.
+pub fn an_application() -> ApplicationInstanceId {
+    ApplicationInstanceId::new(Uuid::from_bytes([10; 16]))
 }
 
 /// Returns one chunk's descriptor and payload under the protocol's chunk size.

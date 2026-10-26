@@ -229,9 +229,10 @@ impl Controller {
         // journal cannot be read, a request it will not take) cannot be allowed to change what
         // is retained before the worker has said. A draft this caller does not hold has no
         // attachments for this host to retain, so naming one is not a failure, and a draft that is
-        // for another session is refused before anything is sent.
+        // for another session, or was written for another application than the prompt's, is
+        // refused before anything is sent.
         if accepted.is_some()
-            && let Some(draft_id) = crate::transfer::prompted_draft(mutation)
+            && let Some(prompted) = crate::transfer::prompted_draft(mutation)
         {
             let asked = tokio::time::timeout_at(
                 budget,
@@ -261,7 +262,7 @@ impl Controller {
                 .transfer
                 .record_submission(
                     actor_id,
-                    draft_id,
+                    prompted,
                     session_id,
                     crate::transfer::TransferAdmission::new(Arc::clone(self), carried),
                 )

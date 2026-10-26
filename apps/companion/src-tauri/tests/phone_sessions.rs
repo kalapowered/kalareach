@@ -124,7 +124,7 @@ fn code(refusal: &Value) -> &str {
 async fn redeem(phone: &Phone, host: &Host, invitation_id: InvitationId) {
     let device = phone.companion.device();
     let paired = device.host_in_use().expect("a host in use");
-    let identity = device.pairing().candidate.paired_identity(paired.device_id);
+    let identity = device.pairing().paired_identity_for(&paired);
     let session = device
         .pairing()
         .link
@@ -1860,6 +1860,22 @@ async fn kr_req_19_08_every_command_that_reaches_a_session_goes_by_the_route_the
         "STALE_SESSION",
         "no pending resource",
     );
+    refused_by_the_worker(
+        "plugin_action_invoke",
+        about(
+            "plugin_action_invoke",
+            json!({
+                "target": target,
+                "plugin_id": "kalareach.codex",
+                "action": "turn.cancel",
+                "draft_id": null,
+                "resource_id": null,
+                "parameters": "e30",
+            }),
+        ),
+        "STALE_SESSION",
+        "is not an action",
+    );
     // A receipt the worker does not hold is the worker's own answer: the read reached it on the
     // session's link and was not refused on the way.
     let unheld = ActionId::new(kr_ipc::new_uuid()).to_string();
@@ -1944,12 +1960,18 @@ async fn kr_req_19_08_every_command_that_reaches_a_session_goes_by_the_route_the
     )
     .expect("the session is closed on the link of its opening");
 
+    // A page of retained output is read on the link of the opening, and the host narrows it to the
+    // share's history, which begins when the share was issued: the session has written nothing
+    // since, so the page is whole and holds none of it.
+    let page = about(
+        "history_page",
+        json!({ "session_id": session, "from_cursor": "0", "max_bytes": "4096" }),
+    )
+    .expect("the page is read on the link of the share's opening");
+    assert_eq!(page["bytes"], "", "{page}");
+
     // What a paired host does not serve a device is refused in words, before anything is sent.
     for (command, body) in [
-        (
-            "history_page",
-            json!({ "params": { "session_id": session, "from_cursor": "0", "max_bytes": "4096" } }),
-        ),
         ("shell_launch", json!({ "params": {}, "subject": {} })),
         ("draft_create", json!({ "params": {}, "subject": {} })),
         (

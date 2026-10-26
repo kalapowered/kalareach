@@ -34,8 +34,8 @@ import {
   acceptedWords,
   endsLine,
   hostWords,
+  offerAccess,
   offerEnds,
-  offerRole,
   offerTitle,
   sessionWords,
   showsLines,
@@ -382,7 +382,7 @@ export function Offers({ surface }: { readonly surface: Surface }): ReactNode {
                       </span>
                       <span className="m-row-title">{offerTitle(host, offer)}</span>
                       <span className="m-row-detail">
-                        {offerRole(offer)} · {offerEnds(offer, view.readAtMs)}
+                        {offerAccess(offer)} · {offerEnds(offer, view.readAtMs)}
                       </span>
                     </button>
                   </li>

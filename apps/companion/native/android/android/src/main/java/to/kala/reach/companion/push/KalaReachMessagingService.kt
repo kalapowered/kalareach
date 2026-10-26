@@ -12,11 +12,10 @@ import to.kala.reach.companion.mobile.IncomingWork
 import to.kala.reach.companion.mobile.PreviewDecider
 import to.kala.reach.companion.mobile.PushMessage
 import to.kala.reach.companion.mobile.PushStores
-import to.kala.reach.companion.mobile.SharedClientPreviewOpener
 import to.kala.reach.companion.mobile.WorkPlacement
 import to.kala.reach.companion.mobile.placeWork
-import to.kala.reach.companion.mobile.planNotification
 import to.kala.reach.companion.mobile.readMessage
+import to.kala.reach.companion.mobile.showDelivery
 
 /**
  * The receiver the system starts when a push arrives.
@@ -112,19 +111,22 @@ class KalaReachMessagingService : FirebaseMessagingService() {
                 )
             return
         }
-        Notifier.show(applicationContext, plan(delivery))
-        Log.i(TAG, "delivery: shown")
+        val plan =
+            showDelivery(
+                delivery,
+                decide = {
+                    PreviewDecider(
+                            keys = KeystorePreviewKeys(applicationContext),
+                            opener = RustPreviewOpening()
+                        )
+                        .decide(delivery.data, System.currentTimeMillis())
+                }
+            ) { plan, posting ->
+                Notifier.show(applicationContext, plan, posting)
+            }
+        // By reason and never by content: why the alert stands, or that a preview was shown.
+        Log.i(TAG, "delivery: shown (${plan.reason.ifEmpty { "revealed" }})")
     }
-
-    private fun plan(delivery: PushMessage.Delivery) =
-        planNotification(
-            delivery,
-            PreviewDecider(
-                    keys = KeystorePreviewKeys(applicationContext),
-                    opener = SharedClientPreviewOpener
-                )
-                .decide(delivery.data, System.currentTimeMillis())
-        )
 
     companion object {
         private const val TAG = "KalaReachPush"

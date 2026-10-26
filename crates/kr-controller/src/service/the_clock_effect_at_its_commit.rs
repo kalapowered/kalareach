@@ -76,7 +76,7 @@ async fn an_establishment_that_lapses_while_it_waits(at: At, lapse: Lapse) {
         Lapse::TheDeadlinePasses => continuous.advance(Duration::from_secs(61)),
         Lapse::AFenceIsOwed => controller.hold_fence(true),
         Lapse::TheRegistrationIsWithdrawn => {
-            controller.admitted_table().remove(&door.connection_id());
+            controller.admitted_write().remove(&door.connection_id());
         }
     }
     go.send(()).expect("the effect goes on");
@@ -230,13 +230,16 @@ async fn a_signer_revoked_while_the_establishment_waits_cannot_spend_its_answer(
 /// standing from the check to the commit, so a withdrawal is ordered wholly before the effect or
 /// wholly after it. The effect is stopped inside its commit, after every row is written and
 /// checked and before the commit, and a withdrawal started there does not complete until the
-/// effect has committed: it reads the clock as established when it does.
+/// effect has committed: it reads the clock as established when it does. A connection that ends
+/// there is noted as ended and returns at once, and its registration goes with the commit's end.
 ///
 /// That the withdrawal waits is decided by the lock a withdrawal takes: the registrations are held
-/// while the effect commits, which is the one thing that says so without a delay. The thread's own
-/// reading afterwards shows the order the lock gave.
+/// against it while the effect commits, and the withdrawal has arrived at the lock before the
+/// effect goes on. The thread's own reading afterwards shows the order the lock gave.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_withdrawal_started_inside_the_commit_completes_after_it() {
+    use std::sync::atomic::Ordering;
+
     let (temp, controller, ..) = distrusting().await;
     let door = Door::open(&temp, &controller).await;
     let challenge = door.challenge().await;
@@ -247,13 +250,19 @@ async fn a_withdrawal_started_inside_the_commit_completes_after_it() {
         async move { door.establish().await }
     });
     arrived.await.expect("the effect reached its commit");
+    let connection_id = door.connection_id();
+
+    controller.deregister(connection_id);
+    assert!(
+        controller.admitted_read().contains_key(&connection_id),
+        "a connection that ends inside the commit is withdrawn when the commit has ended"
+    );
 
     let withdrawal = {
         let controller = Arc::clone(&controller);
-        let connection_id = door.connection_id();
         let database = temp.environment().registry_database();
         std::thread::spawn(move || {
-            controller.deregister(connection_id);
+            drop(controller.admitted_withdraw());
             rusqlite::Connection::open(database)
                 .expect("opens the registry")
                 .query_row(
@@ -264,9 +273,12 @@ async fn a_withdrawal_started_inside_the_commit_completes_after_it() {
                 .expect("the clock record is readable")
         })
     };
+    while controller.withdrawals_waiting.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
     assert!(
-        controller.admitted.try_lock().is_err(),
-        "the registrations are held while the effect commits"
+        controller.commit_hold.try_write().is_err(),
+        "the registrations are held against a withdrawal while the effect commits"
     );
     assert!(
         !withdrawal.is_finished(),
@@ -278,6 +290,10 @@ async fn a_withdrawal_started_inside_the_commit_completes_after_it() {
     assert!(
         withdrawal.join().expect("the withdrawal ends").is_some(),
         "the withdrawal completed after the commit, and found the clock established"
+    );
+    assert!(
+        !controller.admitted_read().contains_key(&connection_id),
+        "the connection that ended is withdrawn once the commit has ended"
     );
     assert!(proven(&controller));
 }

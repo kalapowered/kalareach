@@ -1484,19 +1484,24 @@ impl Store {
     ///
     /// A draft that targets another session, a draft already sent to another session, and a draft
     /// that holds an attachment belonging to another session are each refused, and the refusal
-    /// writes nothing.
+    /// writes nothing. So is a draft written for another application than the one the prompt is
+    /// for: its text and attachments were composed for that conversation, and sending them to this
+    /// one is not what the person prepared. A draft that names no application is sent to any.
     ///
     /// Returns how many attachments the draft holds.
     ///
     /// # Errors
     ///
-    /// Returns [`TransferError::InvalidArgument`] for each refusal above,
+    /// Returns [`TransferError::DraftConflict`] for a draft written for another application and for
+    /// one whose attachment is being offered to the agent,
+    /// [`TransferError::InvalidArgument`] for each other refusal above,
     /// [`TransferError::SessionEnded`] when the session has ended, and
     /// [`TransferError::StoreUnavailable`] when the write fails.
     pub fn record_prompt(
         &mut self,
         draft_id: DraftId,
         session_id: SessionId,
+        application_instance_id: ApplicationInstanceId,
         at_ms: TimestampMs,
     ) -> Result<usize> {
         let draft = self
@@ -1568,6 +1573,19 @@ impl Store {
                 "an attachment of this draft belongs to another session, and an attachment is \
                  held by one session",
             ));
+        }
+        // Last of the refusals and before the first write, so a draft that is wrong in its session
+        // is refused as that whichever application the prompt is for. The application a draft is
+        // for is fixed when it is made, so the read at the top stands for the transaction.
+        if draft
+            .application_instance_id
+            .is_some_and(|written_for| written_for != application_instance_id)
+        {
+            return Err(TransferError::DraftConflict {
+                detail: "this draft was written for another application, so it is not sent to \
+                         this one"
+                    .to_owned(),
+            });
         }
         transaction
             .execute(

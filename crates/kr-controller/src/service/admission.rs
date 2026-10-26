@@ -45,7 +45,7 @@ impl Controller {
         // connection was accepted, and this one happens where the registration is written, so
         // nothing can be admitted between the two.
         peer.authorise(kr_ipc::paths::current_uid())?;
-        let mut admitted = self.admitted_table();
+        let mut admitted = self.admitted_write();
         admitted.insert(
             connection_id,
             AdmittedConnection::local(actor_id.clone(), admitted_revision, kind),
@@ -76,7 +76,7 @@ impl Controller {
     ) -> Result<()> {
         self.check_fence()?;
         let authority_revision = registry.authority_revision()?;
-        let admitted = self.admitted_table();
+        let admitted = self.admitted_read();
         let connection = admitted.get(&admission.connection_id);
         let registered =
             connection.is_some_and(|connection| connection.admitted_revision >= authority_revision);
@@ -136,6 +136,8 @@ impl Controller {
                 self.feed_refusal(connection.grant.as_ref()).or_else(|| {
                     connection
                         .shares
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .values()
                         .find_map(|share| self.feed_refusal(Some(share)))
                 })
@@ -161,8 +163,12 @@ impl Controller {
         for grant in [&device.grant, acting] {
             grants.insert(grant.grant_id, grant.clone());
         }
-        if let Some(connection) = self.admitted_table().get(&connection_id) {
-            for (grant_id, share) in &connection.shares {
+        if let Some(connection) = self.admitted_read().get(&connection_id) {
+            for (grant_id, share) in &*connection
+                .shares
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            {
                 grants.entry(*grant_id).or_insert_with(|| share.clone());
             }
         }
@@ -199,17 +205,107 @@ impl Controller {
         }
     }
 
-    /// Returns the table of admitted connections.
+    /// Returns the table of admitted connections to read.
+    ///
+    /// Every request, every output batch and every check of an admission reads the table, and
+    /// any number of them do at once. The table is held only for the length of a reading or a
+    /// change of it, never for the length of a commit that stands on a registration
+    /// ([`Self::under_registration`]), so nothing that reads it waits for one.
     ///
     /// A synchronous lock, deliberately: nothing is awaited while it is held, and the registry
     /// guard often is. A connection table behind an asynchronous lock would make every reader of
     /// it require the registry to be shared across threads, which a SQLite connection is not.
-    pub(super) fn admitted_table(
+    pub(super) fn admitted_read(
         &self,
-    ) -> std::sync::MutexGuard<'_, BTreeMap<ConnectionId, AdmittedConnection>> {
+    ) -> std::sync::RwLockReadGuard<'_, BTreeMap<ConnectionId, AdmittedConnection>> {
         self.admitted
-            .lock()
+            .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Returns the table of admitted connections to add to or to tie a write boundary to: a
+    /// registration made, or the latch of a boundary attached to one.
+    ///
+    /// Neither takes away what a commit stands on, so neither waits for a commit. A registration
+    /// removed, or moved to another revision, takes [`Self::admitted_withdraw`] instead.
+    pub(super) fn admitted_write(
+        &self,
+    ) -> std::sync::RwLockWriteGuard<'_, BTreeMap<ConnectionId, AdmittedConnection>> {
+        self.admitted
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Waits until no commit stands on a registration, and holds the commits off while the caller
+    /// withdraws a registration or moves registrations to another revision.
+    ///
+    /// A commit that stands on a registration ([`Self::under_registration`]) holds this for
+    /// reading, so a withdrawal lands wholly before such a commit's check or wholly after its end.
+    /// The wait is as long as the commit. Where it is made on a thread of a multi-thread runtime,
+    /// the runtime hands that thread's other tasks to another one first, so the wait holds no
+    /// task up. The lock does not say whether a commit that begins while a withdrawal waits goes
+    /// first or waits behind it.
+    ///
+    /// Taken before any lock a withdrawal holds for longer than the change it makes (the policy's),
+    /// and never while holding one a commit takes. Letting go of it, however it is let go of,
+    /// withdraws the registrations of the connections that ended meanwhile ([`Held`]).
+    pub(super) fn withdraw_hold(&self) -> WithdrawHold<'_> {
+        #[cfg(test)]
+        self.withdrawals_waiting
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let wait = || {
+            self.commit_hold
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        let on_a_worker = tokio::runtime::Handle::try_current().is_ok_and(|runtime| {
+            runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        });
+        let guard = if on_a_worker {
+            tokio::task::block_in_place(wait)
+        } else {
+            wait()
+        };
+        Held {
+            guard: Some(guard),
+            controller: self,
+        }
+    }
+
+    /// The connection table to withdraw from or to move to another revision, once
+    /// [`Self::withdraw_hold`] has been taken.
+    pub(super) fn withdrawing<'a>(&'a self, hold: WithdrawHold<'a>) -> Withdrawing<'a> {
+        Withdrawing {
+            table: self.admitted_write(),
+            hold,
+        }
+    }
+
+    /// [`Self::withdraw_hold`] and then the table.
+    pub(super) fn admitted_withdraw(&self) -> Withdrawing<'_> {
+        let hold = self.withdraw_hold();
+        self.withdrawing(hold)
+    }
+
+    /// The hold on commits for writing, where no commit stands on a registration and no
+    /// withdrawal is under way now; `None` where one is. It does not wait, so it queues nothing
+    /// that would hold later commits off.
+    fn try_commit_write(&self) -> Option<std::sync::RwLockWriteGuard<'_, ()>> {
+        match self.commit_hold.try_write() {
+            Ok(guard) => Some(guard),
+            Err(std::sync::TryLockError::Poisoned(held)) => Some(held.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+
+    /// As [`Self::admitted_withdraw`], where no commit stands on a registration now; `None` where
+    /// one does.
+    fn try_admitted_withdraw(&self) -> Option<Withdrawing<'_>> {
+        let guard = self.try_commit_write()?;
+        Some(self.withdrawing(Held {
+            guard: Some(guard),
+            controller: self,
+        }))
     }
 
     /// Runs one service transaction under a carried admission.
@@ -246,7 +342,7 @@ impl Controller {
 
     /// Refuses a request on a connection whose registration has been withdrawn.
     pub(super) fn authorised(&self, connection_id: ConnectionId) -> Result<ActorId> {
-        let admitted = self.admitted_table();
+        let admitted = self.admitted_read();
         match admitted.get(&connection_id) {
             Some(connection) => Ok(connection.actor_id.clone()),
             None => Err(ControllerError::PermissionDenied {
@@ -259,7 +355,7 @@ impl Controller {
 
     /// The door a connection came through, when its registration stands.
     pub(super) fn door_of(&self, connection_id: ConnectionId) -> Option<Door> {
-        self.admitted_table()
+        self.admitted_read()
             .get(&connection_id)
             .map(|connection| connection.door)
     }
@@ -349,7 +445,7 @@ impl Controller {
         &self,
         admission: &crate::authority::AdmittedMutation,
     ) -> Result<()> {
-        self.check_registration_in(&self.admitted_table(), admission)
+        self.check_registration_in(&self.admitted_read(), admission)
     }
 
     /// Runs `commit` while a mutation's registration is held standing, and refuses it where
@@ -357,12 +453,18 @@ impl Controller {
     /// or the deadline passed.
     ///
     /// [`Self::check_registration`] answers for the moment it is asked. A change that becomes
-    /// durable later asks here instead: the connection table stays held from the check to the end
-    /// of `commit`, and revoking authority and withdrawing a connection both take that table, so
-    /// a withdrawal is ordered wholly before the check or wholly after the commit. `commit` is
-    /// synchronous and awaits nothing, because the table is a synchronous lock that every admission
-    /// waits on. It may be a store transaction, including its sync to disk, and holds nothing else
-    /// of this host's that a table holder takes.
+    /// durable later asks here instead: the hold on commits is taken for reading from the check to
+    /// the end of `commit`, and revoking authority and raising a refusal of the authority feed take
+    /// it for writing ([`Self::withdraw_hold`]), so each is ordered wholly before the check or
+    /// wholly after the commit. The connection table itself is held only for the check, so a
+    /// request, a key, an output batch and a connection that is registered never wait for a
+    /// commit, however long it takes. A connection's end does not wait for it either: its
+    /// registration goes when the commit has ended ([`Self::deregister`]). A revocation or a raise
+    /// that lands meanwhile does wait for it, holding the registry, which delays the requests that
+    /// need the registry until the commit has ended, and the commits that begin behind it wait for
+    /// it too. `commit` is synchronous and awaits nothing, because the hold is a synchronous lock
+    /// that every revocation waits on. It may be a store transaction, including its sync to disk,
+    /// and holds nothing else of this host's that a withdrawal takes.
     ///
     /// # Errors
     ///
@@ -372,11 +474,18 @@ impl Controller {
         admission: &crate::authority::AdmittedMutation,
         commit: impl FnOnce() -> T,
     ) -> Result<T> {
-        let admitted = self.admitted_table();
-        self.check_registration_in(&admitted, admission)?;
-        let committed = commit();
-        drop(admitted);
-        Ok(committed)
+        // Letting go of the hold, at the end of the commit or by a panic in it, withdraws the
+        // registrations of the connections that ended meanwhile.
+        let _hold: CommitHold<'_> = Held {
+            guard: Some(
+                self.commit_hold
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ),
+            controller: self,
+        };
+        let checked = self.check_registration_in(&self.admitted_read(), admission);
+        checked.map(|()| commit())
     }
 
     /// Returns the wall-clock deadline a mutation was accepted under, for the receipt it leaves.
@@ -446,7 +555,7 @@ impl Controller {
         &self,
         connection_id: ConnectionId,
     ) -> Result<AuthorityRevision> {
-        let admitted = self.admitted_table();
+        let admitted = self.admitted_read();
         admitted.get(&connection_id).map_or_else(
             || {
                 Err(ControllerError::PermissionDenied {
@@ -471,9 +580,9 @@ impl Controller {
         connection_id: ConnectionId,
         grant_id: kr_protocol::ids::GrantId,
     ) -> bool {
-        self.admitted_table()
-            .get_mut(&connection_id)
-            .map(|registration| registration.acting.insert(grant_id))
+        self.admitted_read()
+            .get(&connection_id)
+            .map(|registration| registration.note(grant_id))
             .is_some()
     }
 
@@ -486,8 +595,12 @@ impl Controller {
         connection_id: ConnectionId,
         grant: &kr_protocol::grant::Grant,
     ) {
-        if let Some(registration) = self.admitted_table().get_mut(&connection_id) {
-            registration.shares.insert(grant.grant_id, grant.clone());
+        if let Some(registration) = self.admitted_read().get(&connection_id) {
+            registration
+                .shares
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(grant.grant_id, grant.clone());
         }
     }
 
@@ -497,15 +610,69 @@ impl Controller {
         &self,
         connection_id: ConnectionId,
     ) -> std::collections::BTreeSet<kr_protocol::ids::GrantId> {
-        self.admitted_table()
+        self.admitted_read()
             .get(&connection_id)
-            .map(|registration| registration.acting.clone())
+            .map(AdmittedConnection::noted)
             .unwrap_or_default()
     }
 
     /// Withdraws one connection's registration.
+    ///
+    /// A withdrawal is ordered after every commit that stands on a registration and every other
+    /// withdrawal. Where one is under way, the connection is noted as ended and its registration
+    /// goes when whoever holds the registrations lets go ([`Self::settle_ended`]): nothing waits
+    /// for it, and no withdrawal is queued that would hold the commits that begin meanwhile off.
     pub(super) fn deregister(&self, connection_id: ConnectionId) {
-        self.admitted_table().remove(&connection_id);
+        if let Some(mut table) = self.try_admitted_withdraw() {
+            table.remove(&connection_id);
+            return;
+        }
+        self.ended
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(connection_id);
+        // The holder can have let go between the attempt above and the note.
+        self.settle_ended();
+    }
+
+    /// Withdraws the registrations of the connections that ended while the registrations were
+    /// held, once nothing holds them. Whoever holds them settles the rest when it lets go: a
+    /// commit that stands on a registration ([`CommitHold`]) and a withdrawal ([`WithdrawHold`])
+    /// both do. A connection that ends while this holds them is withdrawn by the next turn of
+    /// its loop.
+    fn settle_ended(&self) {
+        while self.ended_waiting() {
+            let Some(hold) = self.try_commit_write() else {
+                return;
+            };
+            let mut table = self.admitted_write();
+            self.remove_ended(&mut table);
+            drop(table);
+            drop(hold);
+        }
+    }
+
+    /// Whether a connection has ended whose registration is still to go.
+    fn ended_waiting(&self) -> bool {
+        !self
+            .ended
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    }
+
+    /// Removes from `table` the registrations of the connections that ended while the
+    /// registrations were held.
+    fn remove_ended(&self, table: &mut BTreeMap<ConnectionId, AdmittedConnection>) {
+        let ended = std::mem::take(
+            &mut *self
+                .ended
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for connection_id in ended {
+            table.remove(&connection_id);
+        }
     }
 
     /// Ties the latch of a connection's write boundary to its registration, so that the
@@ -520,7 +687,7 @@ impl Controller {
         connection_id: ConnectionId,
         latch: &Arc<std::sync::atomic::AtomicBool>,
     ) {
-        let mut admitted = self.admitted_table();
+        let mut admitted = self.admitted_write();
         match admitted.get_mut(&connection_id) {
             Some(registration) => {
                 debug_assert!(
@@ -949,6 +1116,17 @@ impl Controller {
                 }
                 let _: kr_protocol::privacy::PrivacySetParams = parse(&mutation.params)?;
             }
+            // The copies privacy mode lists belong to the environment, not to a session.
+            Method::PrivacyRetainedDelete => {
+                if mutation.target.session_id.as_ref().is_some() {
+                    return Err(ControllerError::InvalidArgument(
+                        "the copies privacy mode lists belong to this environment, not to one \
+                         session"
+                            .to_owned(),
+                    ));
+                }
+                let _: kr_protocol::privacy::PrivacyRetainedDeleteParams = parse(&mutation.params)?;
+            }
             // The description settings and the fetch of the model's files belong to the
             // environment: the target names it and no session.
             _ if crate::describe::serves(method) => {
@@ -1147,6 +1325,69 @@ impl From<LeaseDenied> for ControllerError {
     }
 }
 
+/// The hold on commits ([`Controller::commit_hold`]), for reading by a commit that stands on a
+/// registration ([`CommitHold`]) or for writing by a withdrawal or a replacement of registrations
+/// ([`WithdrawHold`]).
+///
+/// A connection that ends while the registrations are held is noted, and its registration goes
+/// when the hold is let go of ([`Controller::deregister`]), or when a commit that began first
+/// ends, whichever withdraws it. Whoever holds the registrations, and however the hold is let go
+/// of, the connections that ended are withdrawn once it is: a holder that had already taken the
+/// notes before the connection ended cannot leave the registration standing.
+pub(super) struct Held<'a, Guard> {
+    guard: Option<Guard>,
+    controller: &'a Controller,
+}
+
+/// The hold on commits taken for reading by a commit that stands on a registration.
+type CommitHold<'a> = Held<'a, std::sync::RwLockReadGuard<'a, ()>>;
+
+/// The hold on commits taken for writing by a withdrawal or a replacement of registrations.
+pub(super) type WithdrawHold<'a> = Held<'a, std::sync::RwLockWriteGuard<'a, ()>>;
+
+impl<Guard> Drop for Held<'_, Guard> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        self.controller.settle_ended();
+    }
+}
+
+/// The connection table held to withdraw a registration from it or to move registrations to
+/// another revision, with the hold on commits that stand on a registration taken first.
+///
+/// The registrations of the connections that ended while the hold was taken
+/// ([`Controller::deregister`]) go when this is let go of, before the table is, and those that
+/// ended after that go when the hold is let go of ([`Held`]).
+pub(super) struct Withdrawing<'a> {
+    // The fields are let go of in the order they are declared: the table, then the hold. The
+    // hold's letting go takes the table again, so a table still held by this thread then would
+    // wait for itself.
+    table: std::sync::RwLockWriteGuard<'a, BTreeMap<ConnectionId, AdmittedConnection>>,
+    hold: WithdrawHold<'a>,
+}
+
+impl Drop for Withdrawing<'_> {
+    fn drop(&mut self) {
+        self.hold.controller.remove_ended(&mut self.table);
+        #[cfg(test)]
+        self.hold.controller.after_the_ended_are_taken.wait();
+    }
+}
+
+impl std::ops::Deref for Withdrawing<'_> {
+    type Target = BTreeMap<ConnectionId, AdmittedConnection>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.table
+    }
+}
+
+impl std::ops::DerefMut for Withdrawing<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.table
+    }
+}
+
 /// One connection this daemon has admitted, and the authority it was admitted under.
 ///
 /// The transport's contract names this as the host's to keep: the final validation of the caller's
@@ -1171,14 +1412,24 @@ pub(super) struct AdmittedConnection {
     /// record is read for it. A revocation that reaches a grant withdraws the connections that
     /// decided a request under it, whether they answered from the daemon itself or through a link
     /// to a worker, and no others ([`super::barrier::Reach::Grants`]).
-    pub(super) acting: std::collections::BTreeSet<kr_protocol::ids::GrantId>,
+    ///
+    /// Noted under the connection table's read lock, so that a request does not wait for a
+    /// registration to change; a revocation reads it under the table's write lock, which no
+    /// noting is under.
+    acting: std::sync::Mutex<std::collections::BTreeSet<kr_protocol::ids::GrantId>>,
     /// The door the connection came through.
     door: Door,
     /// The pairing grant a connection through the network was admitted under, which says whether
     /// the authority feed's removal refuses it ([`Controller::feed_refusal`]).
     grant: Option<kr_protocol::grant::Grant>,
     /// The shares the connection has decided a request under, as the grant store holds them.
-    shares: std::collections::BTreeMap<kr_protocol::ids::GrantId, kr_protocol::grant::Grant>,
+    ///
+    /// Noted under the connection table's read lock, like `acting`: a share is added
+    /// only, by the request that decides under it, before that request does any work, and what
+    /// reads it takes a copy under this lock.
+    shares: std::sync::Mutex<
+        std::collections::BTreeMap<kr_protocol::ids::GrantId, kr_protocol::grant::Grant>,
+    >,
 }
 
 /// The grants a remote request stands on, copied when the work starts
@@ -1214,10 +1465,10 @@ impl AdmittedConnection {
             actor_id,
             admitted_revision,
             latch: None,
-            acting: std::collections::BTreeSet::new(),
+            acting: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             door: Door::Network,
             grant: None,
-            shares: std::collections::BTreeMap::new(),
+            shares: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -1238,11 +1489,40 @@ impl AdmittedConnection {
             actor_id,
             admitted_revision,
             latch: None,
-            acting: std::collections::BTreeSet::new(),
+            acting: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             door: Door::Local(kind),
             grant: None,
-            shares: std::collections::BTreeMap::new(),
+            shares: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         }
+    }
+}
+
+impl AdmittedConnection {
+    /// Notes that this connection decides a request under `grant_id`.
+    fn note(&self, grant_id: kr_protocol::ids::GrantId) {
+        self.acting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(grant_id);
+    }
+
+    /// The grants this connection has decided a request under.
+    fn noted(&self) -> std::collections::BTreeSet<kr_protocol::ids::GrantId> {
+        self.acting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Whether this connection has decided a request under none of `grants`.
+    pub(super) fn acts_under_none_of(
+        &self,
+        grants: &std::collections::BTreeSet<kr_protocol::ids::GrantId>,
+    ) -> bool {
+        self.acting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_disjoint(grants)
     }
 }
 

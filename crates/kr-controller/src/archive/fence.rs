@@ -89,6 +89,9 @@ pub struct Fenced {
     pub surviving: Vec<SurvivingResource>,
     /// Whether every owned process was accounted for.
     pub coverage: OwnershipCoverage,
+    /// Whether the worker's own record of its processes names an earlier boot than this host's,
+    /// so that the worker went with that boot and owned nothing that outlived it.
+    pub earlier_boot: bool,
 }
 
 impl Fenced {
@@ -103,6 +106,21 @@ impl Fenced {
             ended: Vec::new(),
             surviving: Vec::new(),
             coverage: OwnershipCoverage::Incomplete,
+            earlier_boot: false,
+        }
+    }
+
+    /// Returns what a closure records for a worker whose own record of its processes names an
+    /// earlier boot than this host's: nothing is stopped, because no process of one boot is
+    /// running in another, and nothing is listed as surviving, because nothing outlives a boot.
+    #[must_use]
+    pub const fn of_an_earlier_boot(session_id: kr_protocol::ids::SessionId) -> Self {
+        Self {
+            session_id,
+            ended: Vec::new(),
+            surviving: Vec::new(),
+            coverage: OwnershipCoverage::Incomplete,
+            earlier_boot: true,
         }
     }
 
@@ -121,6 +139,7 @@ impl Fenced {
                  session owned was not looked for and was not stopped: {detail}"
             ))],
             coverage: OwnershipCoverage::Incomplete,
+            earlier_boot: false,
         }
     }
 }
@@ -129,6 +148,9 @@ impl Fenced {
 enum Recorded {
     /// A record of this boot.
     Usable(Box<OwnedRecord>),
+    /// A record of an earlier boot of the same kind as this one, with a value this boot's cannot
+    /// be: the worker went with that boot.
+    EarlierBoot,
     /// No record this pass may act on, and why.
     Unusable(String),
 }
@@ -165,6 +187,13 @@ impl ArchiveService {
     /// `unit` is the service-manager unit the worker was started as, named from its reservation,
     /// where the platform has one. Nothing here creates a worker, and nothing is signalled that
     /// the worker did not record or that is not in the unit's control group.
+    ///
+    /// A record that names an earlier boot, of the same kind and length as this boot's, says the
+    /// worker went with that boot. The answer then stops nothing and lists nothing as surviving,
+    /// and it says so ([`Fenced::earlier_boot`]), so that the closure can give the host's restart
+    /// as the reason whatever this daemon's history is. A record of a boot that cannot be compared
+    /// with this one, one that names no boot and a missing one are not acted on, and the answer
+    /// says why.
     pub async fn fence_owned(&self, ownership: &RecoveryOwnership, unit: Option<&str>) -> Fenced {
         let session_id = ownership.session_id;
         let paths = self.paths().clone();
@@ -178,6 +207,9 @@ impl ArchiveService {
         let mut left: Vec<ProcessStartIdentity> = Vec::new();
         let mut record: Option<OwnedRecord> = None;
         match recorded {
+            // A process of one boot is not running in another: there is nothing to stop and
+            // nothing that outlived the boot.
+            Recorded::EarlierBoot => return Fenced::of_an_earlier_boot(session_id),
             Recorded::Usable(usable) => {
                 for identity in &usable.processes {
                     if left_for_a_daemon(identity, &usable.root, usable.cgroup.as_deref()) {
@@ -478,6 +510,7 @@ impl ArchiveService {
             } else {
                 OwnershipCoverage::Incomplete
             },
+            earlier_boot: false,
         }
     }
 }
@@ -586,17 +619,35 @@ fn read_record(
     let now = kr_ipc::identity::boot_identity().ok();
     match (&record.boot, now) {
         (Some(recorded), Some(now)) if *recorded == now => Recorded::Usable(Box::new(record)),
+        (Some(recorded), Some(now)) if is_an_earlier_boot(recorded, &now) => Recorded::EarlierBoot,
         (None, _) => Recorded::Unusable(format!(
             "the worker's record of its processes came from an earlier build and names no boot; its \
              root shell was {}",
             record.root.pid.get()
         )),
         _ => Recorded::Unusable(
-            "the worker's record of its processes is from another boot or this boot could not be \
-             read, and a process identity means nothing across boots"
+            "the worker's record of its processes is from a boot this host cannot compare with \
+             this one, or this boot could not be read, and a process identity means nothing \
+             across boots"
                 .to_owned(),
         ),
     }
+}
+
+/// Whether `recorded` names a boot before the one `now` names: the same kind of identity, of the
+/// same length, with another value.
+///
+/// A different kind, or a value of another length, says nothing about whether it is the same boot,
+/// so it is not an earlier one. Only the kind and the length are compared: a build that changed how
+/// one kind of value is made without changing its length would have this take a record of its own
+/// boot for an earlier boot's.
+fn is_an_earlier_boot(
+    recorded: &kr_protocol::identity::BootIdentity,
+    now: &kr_protocol::identity::BootIdentity,
+) -> bool {
+    recorded.source == now.source
+        && recorded.value.as_slice().len() == now.value.as_slice().len()
+        && recorded.value != now.value
 }
 
 /// The control group of the service a worker ran as.

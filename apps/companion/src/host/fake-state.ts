@@ -321,6 +321,8 @@ export class ScriptedRecords {
   /** The sessions created here, each running a shell with no agent in it yet. */
   readonly #shells = new Set<string>()
   readonly #output = new Map<string, RetainedOutput>()
+  /** The cursor each session's output is reached from, where a reader's grant begins later. */
+  readonly #reach = new Map<string, bigint>()
   #attention: AttentionItem[]
   #revision = 10
   #reviews: ReviewState[]
@@ -937,8 +939,12 @@ export class ScriptedRecords {
     const read = decodeParams<HistoryPageParams>(params, HISTORY_PAGE_PARAMS)
     this.#agentOf(read.session_id)
     const retained = this.#output.get(read.session_id) ?? { oldest: 0n, bytes: new Uint8Array() }
-    const oldest = retained.oldest
-    const end = oldest + BigInt(retained.bytes.length)
+    // A reader whose grant reaches the output from a cursor on is served from there, as a worker
+    // does for a paired device: the oldest cursor it is told is the later of the two, and the gap
+    // it is told of names a cause only when retention took the reach as well.
+    const reach = this.#reach.get(read.session_id) ?? 0n
+    const end = retained.oldest + BigInt(retained.bytes.length)
+    const oldest = reach > end ? end : reach > retained.oldest ? reach : retained.oldest
     const resident = end - OUTPUT_RESIDENT_BYTES > oldest ? end - OUTPUT_RESIDENT_BYTES : oldest
     const asked = BigInt(read.from_cursor)
     const limit = BigInt(read.max_bytes)
@@ -947,7 +953,7 @@ export class ScriptedRecords {
     const wanted = start + bound > end ? end : start + bound
     // A read from the spool stops where the memory begins.
     const stop = start < resident && wanted > resident ? resident : wanted
-    const bytes = retained.bytes.slice(Number(start - oldest), Number(stop - oldest))
+    const bytes = retained.bytes.slice(Number(start - retained.oldest), Number(stop - retained.oldest))
     return {
       from_cursor: String(start),
       next_cursor: String(stop),
@@ -955,7 +961,11 @@ export class ScriptedRecords {
       oldest_retained_cursor: String(oldest),
       gap:
         asked < oldest
-          ? { from_cursor: String(asked), to_cursor: String(oldest), cause: 'retention' }
+          ? {
+              from_cursor: String(asked),
+              to_cursor: String(oldest),
+              cause: oldest > retained.oldest ? null : 'retention'
+            }
           : null
     }
   }
@@ -1372,6 +1382,15 @@ export class ScriptedRecords {
     const end = held.oldest + BigInt(held.bytes.length)
     const kept = cursor > end ? end : cursor
     this.#output.set(sessionId, { oldest: kept, bytes: held.bytes.slice(Number(kept - held.oldest)) })
+  }
+
+  /**
+   * Limits what a reader is served of a session's output to what comes from `cursor` on, as a
+   * paired device's grant does: a read from before it is answered from there, with a gap that
+   * names no cause, since nothing took what the grant does not reach.
+   */
+  reachOutputFrom(sessionId: string, cursor: bigint): void {
+    this.#reach.set(sessionId, cursor)
   }
 
   /** Where a session's output ends now. */

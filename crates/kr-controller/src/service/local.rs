@@ -636,9 +636,7 @@ impl Controller {
                         crate::transfer::WRONG_ENDPOINT,
                     )
                 }
-                ControlFrame::Request(request)
-                    if negotiated && request.method.method().is_some_and(Self::releases) =>
-                {
+                ControlFrame::Request(request) if negotiated && Self::releases(&request) => {
                     // The attention store's reads carry session text and a session's description
                     // carries what a model wrote. Neither leaves this daemon except under the
                     // privacy fence it was read under: its ticket is checked before every write.

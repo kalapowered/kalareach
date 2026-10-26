@@ -52,6 +52,7 @@ pub mod push;
 pub mod questions;
 pub mod recovery;
 pub mod remote;
+pub mod retained;
 pub mod revocation;
 pub mod settings;
 pub mod setup;
@@ -546,6 +547,11 @@ fn tell_the_page_the_records_are_open(app: &tauri::AppHandle) {
     if let Ok(owner) = state.owner() {
         let _ = app.emit(pairing::CONFIRMATIONS_EVENT, owner.view());
     }
+    // The notifications desk opens with the records, after the page asked for it and was told
+    // there was none.
+    if let Some(desk) = state.push() {
+        let _ = app.emit(push::PUSH_EVENT, desk.view());
+    }
 }
 
 /// Starts what needs the pairing records: on a phone the host its commands last went to, and
@@ -881,10 +887,8 @@ pub fn start_push<R: tauri::Runtime>(
         Arc::new(push::PluginNative(app.clone())),
         Arc::new(push::ConnectionRegistrar(device)),
         push::Wiring::product(),
-        move || {
-            if let Some(desk) = emitter.state::<AppState>().push() {
-                let _ = emitter.emit(push::PUSH_EVENT, desk.view());
-            }
+        move |view| {
+            let _ = emitter.emit(push::PUSH_EVENT, view);
         },
     )?;
     state.push_opened(desk);

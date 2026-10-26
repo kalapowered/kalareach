@@ -12,6 +12,7 @@
 //
 
 import Foundation
+import Security
 import UserNotifications
 
 /// Where the person's answer to the system's notification question stands, and asking it.
@@ -22,11 +23,10 @@ protocol NotificationPermissions {
     func ask(then: @escaping (PushPermission) -> Void)
 }
 
-/// Files the limited preview key where the notification extension reads it.
+/// Files the limited preview keys where the notification extension reads them.
 protocol LimitedKeyWriting {
-    /// Files `seed` under the recipient identifier (the key identifier in standard base64). False when
-    /// the keychain refused.
-    func write(recipientKeyID: String, seed: Data) -> Bool
+    /// Makes the place the extension reads hold exactly `keys`. False when the keychain refused.
+    func replace(with keys: PreviewKeySet) -> Bool
 }
 
 /// The token the provider gave this installation. Whether a registration still names it is the
@@ -152,11 +152,9 @@ public final class PushAdapter: NSObject {
                 return refuse("the pending registration could not be removed")
             }
             answer([:])
-        case "pushLimitedKey":
-            guard let id = args["recipient_key_id"] as? String,
-                let seed = (args["seed"] as? String).flatMap({ Data(base64Encoded: $0) }),
-                keys.write(recipientKeyID: id, seed: seed)
-            else { return refuse("the preview key could not be filed") }
+        case "pushPreviewKeys":
+            guard let set = PreviewKeySet.parse(args) else { return refuse("the preview keys are not keys") }
+            guard keys.replace(with: set) else { return refuse("the preview keys could not be filed") }
             answer([:])
         case "pushRoute":
             answer(["route": route.take() ?? NSNull()])
@@ -199,7 +197,27 @@ private struct ProductPermissions: NotificationPermissions {
 
 /// The shared keychain group the extension reads, written the way `SecureKeys` writes every key.
 private struct ProductLimitedKeys: LimitedKeyWriting {
-    func write(recipientKeyID: String, seed: Data) -> Bool {
-        SecureKeys().store(seed, purpose: .notificationPreview, account: recipientKeyID) == errSecSuccess
+    func replace(with keys: PreviewKeySet) -> Bool {
+        let store = SecureKeys()
+        let parts: [(StoredKeyPurpose, [Data: Data])] = [
+            (.notificationPreview, keys.recipients),
+            (.notificationPreviewSender, keys.senders),
+        ]
+        // What is no longer wanted goes first: a key removed is the direction that matters, and a
+        // failure to add one after it leaves the generic alert, never a preview that was turned off.
+        for (purpose, wanted) in parts {
+            guard let held = store.accounts(purpose: purpose) else { return false }
+            let wantedAccounts = Set(wanted.keys.map { $0.base64EncodedString() })
+            for account in held where !wantedAccounts.contains(account) {
+                guard store.remove(purpose: purpose, account: account) == errSecSuccess else { return false }
+            }
+        }
+        for (purpose, wanted) in parts {
+            for (id, key) in wanted {
+                guard store.store(key, purpose: purpose, account: id.base64EncodedString()) == errSecSuccess
+                else { return false }
+            }
+        }
+        return true
     }
 }

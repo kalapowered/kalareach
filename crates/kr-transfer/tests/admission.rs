@@ -714,6 +714,7 @@ fn the_record_of_a_prompt_the_host_refuses_inside_the_lock_leaves_the_draft_unse
             &harness.actor,
             draft.draft_id,
             session_id,
+            crate::support::an_application(),
             &Admission::new(Arc::clone(&host) as Arc<dyn AdmissionHook>),
         );
         assert_not_admitted(recorded, refuses, &host);
@@ -729,6 +730,7 @@ fn the_record_of_a_prompt_the_host_refuses_inside_the_lock_leaves_the_draft_unse
             &harness.actor,
             draft.draft_id,
             session_id,
+            crate::support::an_application(),
             &Admission::new(Arc::clone(&host) as Arc<dyn AdmissionHook>),
         )
         .expect("under an admission that stands the prompt is recorded");

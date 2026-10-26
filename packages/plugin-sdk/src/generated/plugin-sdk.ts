@@ -3647,6 +3647,11 @@ export interface IntegrationBackend {
    * A launch whose first word is absent, or one of these, and that types no option, is a plain
    * launch of the terminal. Any other launch (a subcommand that is not a terminal, an option,
    * a prompt) runs as typed, because the closed list is what the package qualified.
+   *
+   * Listing a word also says that the first bare word after it names a saved conversation the
+   * launch works on (see [`IntegrationBackend::saved_conversation`]), whatever the word means
+   * to the application. A second launch of that conversation on this host, in this session or in
+   * another session of the same user, gets no second server and runs as typed.
    */
   launching_words: string[]
 }

@@ -268,6 +268,8 @@ struct TestReach {
     workers: std::sync::Mutex<BTreeMap<SessionId, Reached>>,
     unaccounted: AtomicBool,
     unreadable: AtomicBool,
+    /// Whether privacy mode's cleanup of a closed session is owed, as this suite sets it.
+    cleanup_owed: AtomicBool,
     /// The oldest output position a closed session's spool retains, as this suite sets it.
     floor: std::sync::atomic::AtomicU64,
     /// A worker endpoint whose connection is never made, as if the worker accepted it and then
@@ -357,6 +359,14 @@ impl Reach for TestReach {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
         let unaccounted = self.unaccounted.load(Ordering::SeqCst);
         Box::pin(async move { unaccounted })
+    }
+
+    fn cleanup_owed<'a>(
+        &'a self,
+        _session_id: SessionId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        let owed = self.cleanup_owed.load(Ordering::SeqCst);
+        Box::pin(async move { owed })
     }
 
     fn closed_journal(&self, session_id: SessionId) -> ClosedJournal {
@@ -1070,6 +1080,44 @@ async fn a_finished_session_s_journal_serves_text_in_batches() {
         ticket.is_empty(),
         "text from a finished journal carries no lease"
     );
+}
+
+/// KR-REQ-24.28: a closed session's journal serves no text while privacy mode's cleanup of the
+/// session is owed, whether or not privacy mode is on and whether or not the journal has been given
+/// the privacy state yet, and serves it again once it is not. The control is the same read of the
+/// same records with nothing owed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_finished_session_s_journal_serves_no_text_while_its_cleanup_is_owed() {
+    let one = worker().await;
+    notify(&one, "the build finished");
+    let temp = kr_ipc::testing::TempHost::create();
+    let module = store_at(&temp);
+    let reach = Arc::new(TestReach::default());
+    reach.add(&one);
+    module.session_closed(&*reach, one.session_id).await;
+    let records = [kr_attention::EventCursor::in_session(
+        one.session_id,
+        AttentionSource::HostEvents,
+        1,
+    )];
+
+    let (texts, _) = module.delivery_texts(&*reach, &records).await;
+    assert_eq!(
+        texts,
+        vec![Some("Normal: the build finished".to_owned())],
+        "the control serves the notice"
+    );
+    reach.cleanup_owed.store(true, Ordering::SeqCst);
+    let (texts, _) = module.delivery_texts(&*reach, &records).await;
+    assert_eq!(
+        texts,
+        vec![None],
+        "nothing is served while the cleanup is owed"
+    );
+    reach.cleanup_owed.store(false, Ordering::SeqCst);
+    let (texts, _) = module.delivery_texts(&*reach, &records).await;
+    assert_eq!(texts.len(), 1);
+    assert!(texts[0].is_some(), "and the text is served once it is not");
 }
 
 /// KR-REQ-24.11: the environment's store has one owner. While a daemon holds it, another opener is

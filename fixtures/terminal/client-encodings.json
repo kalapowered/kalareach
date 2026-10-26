@@ -1,0 +1,1630 @@
+{
+  "name": "client-encodings",
+  "profile": "kr-vt/1",
+  "description": "KR-REQ-08.59. The bytes the client's input encoder spells a key as under the ordinary encoding, modifyOtherKeys and the Kitty keyboard protocol, written by hand from xterm's control sequence documentation and the Kitty protocol's specification. They are not the encoder's output: kr-client's tests check the encoder against them. A case with `refused` is one the encoder must not spell, and `release` is the key coming up with the modifiers and locks it comes up with.",
+  "cases": [
+    {
+      "id": "legacy-letter",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": {
+          "char": "a"
+        }
+      },
+      "bytes": "61"
+    },
+    {
+      "id": "legacy-letter-above-ascii",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": {
+          "char": "\u00e9"
+        }
+      },
+      "bytes": "c3a9"
+    },
+    {
+      "id": "legacy-control-a",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": {
+          "char": "a"
+        },
+        "modifiers": [
+          "control"
+        ]
+      },
+      "bytes": "01"
+    },
+    {
+      "id": "legacy-control-z",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": {
+          "char": "z"
+        },
+        "modifiers": [
+          "control"
+        ]
+      },
+      "bytes": "1a"
+    },
+    {
+      "id": "legacy-control-space",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": {
+          "char": " "
+        },
+        "modifiers": [
+          "control"
+        ]
+      },
+      "bytes": "00"
+    },
+    {
+      "id": "legacy-alt-letter-is-escape-prefixed",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": {
+          "char": "a"
+        },
+        "modifiers": [
+          "alt"
+        ]
+      },
+      "bytes": "1b61"
+    },
+    {
+      "id": "legacy-control-alt-letter",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": {
+          "char": "a"
+        },
+        "modifiers": [
+          "control",
+          "alt"
+        ]
+      },
+      "bytes": "1b01"
+    },
+    {
+      "id": "legacy-enter",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": "enter"
+      },
+      "bytes": "0d"
+    },
+    {
+      "id": "legacy-tab",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": "tab"
+      },
+      "bytes": "09"
+    },
+    {
+      "id": "legacy-shift-tab-is-back-tab",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": "tab",
+        "modifiers": [
+          "shift"
+        ]
+      },
+      "bytes": "1b5b5a"
+    },
+    {
+      "id": "legacy-backspace",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": "backspace"
+      },
+      "bytes": "7f"
+    },
+    {
+      "id": "legacy-control-backspace",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": "backspace",
+        "modifiers": [
+          "control"
+        ]
+      },
+      "bytes": "08"
+    },
+    {
+      "id": "legacy-alt-backspace",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": "backspace",
+        "modifiers": [
+          "alt"
+        ]
+      },
+      "bytes": "1b7f"
+    },
+    {
+      "id": "legacy-escape",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": "escape"
+      },
+      "bytes": "1b"
+    },
+    {
+      "id": "legacy-alt-enter",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": "enter",
+        "modifiers": [
+          "alt"
+        ]
+      },
+      "bytes": "1b0d"
+    },
+    {
+      "id": "legacy-arrow-up",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": "up"
+      },
+      "bytes": "1b5b41"
+    },
+    {
+      "id": "legacy-arrow-up-in-application-cursor-keys",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": true
+      },
+      "event": {
+        "key": "up"
+      },
+      "bytes": "1b4f41"
+    },
+    {
+      "id": "legacy-arrow-down",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": "down"
+      },
+      "bytes": "1b5b42"
+    },
+    {
+      "id": "legacy-arrow-down-in-application-cursor-keys",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": true
+      },
+      "event": {
+        "key": "down"
+      },
+      "bytes": "1b4f42"
+    },
+    {
+      "id": "legacy-arrow-right",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": "right"
+      },
+      "bytes": "1b5b43"
+    },
+    {
+      "id": "legacy-arrow-right-in-application-cursor-keys",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": true
+      },
+      "event": {
+        "key": "right"
+      },
+      "bytes": "1b4f43"
+    },
+    {
+      "id": "legacy-arrow-left",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": "left"
+      },
+      "bytes": "1b5b44"
+    },
+    {
+      "id": "legacy-arrow-left-in-application-cursor-keys",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": true
+      },
+      "event": {
+        "key": "left"
+      },
+      "bytes": "1b4f44"
+    },
+    {
+      "id": "legacy-control-arrow-up",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": "up",
+        "modifiers": [
+          "control"
+        ]
+      },
+      "bytes": "1b5b313b3541"
+    },
+    {
+      "id": "legacy-shift-arrow-left",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": "left",
+        "modifiers": [
+          "shift"
+        ]
+      },
+      "bytes": "1b5b313b3244"
+    },
+    {
+      "id": "legacy-alt-arrow-right",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": "right",
+        "modifiers": [
+          "alt"
+        ]
+      },
+      "bytes": "1b5b313b3343"
+    },
+    {
+      "id": "legacy-modified-arrow-ignores-application-cursor-keys",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": true
+      },
+      "event": {
+        "key": "up",
+        "modifiers": [
+          "control"
+        ]
+      },
+      "bytes": "1b5b313b3541"
+    },
+    {
+      "id": "legacy-home",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": "home"
+      },
+      "bytes": "1b5b48"
+    },
+    {
+      "id": "legacy-end",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": "end"
+      },
+      "bytes": "1b5b46"
+    },
+    {
+      "id": "legacy-home-in-application-cursor-keys",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": true
+      },
+      "event": {
+        "key": "home"
+      },
+      "bytes": "1b4f48"
+    },
+    {
+      "id": "legacy-end-in-application-cursor-keys",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": true
+      },
+      "event": {
+        "key": "end"
+      },
+      "bytes": "1b4f46"
+    },
+    {
+      "id": "legacy-insert",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": "insert"
+      },
+      "bytes": "1b5b327e"
+    },
+    {
+      "id": "legacy-delete",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": "delete"
+      },
+      "bytes": "1b5b337e"
+    },
+    {
+      "id": "legacy-page-up",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": "page_up"
+      },
+      "bytes": "1b5b357e"
+    },
+    {
+      "id": "legacy-page-down",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": "page_down"
+      },
+      "bytes": "1b5b367e"
+    },
+    {
+      "id": "legacy-control-delete",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": "delete",
+        "modifiers": [
+          "control"
+        ]
+      },
+      "bytes": "1b5b333b357e"
+    },
+    {
+      "id": "legacy-f1",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": {
+          "function": 1
+        }
+      },
+      "bytes": "1b4f50"
+    },
+    {
+      "id": "legacy-f2",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": {
+          "function": 2
+        }
+      },
+      "bytes": "1b4f51"
+    },
+    {
+      "id": "legacy-f3",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": {
+          "function": 3
+        }
+      },
+      "bytes": "1b4f52"
+    },
+    {
+      "id": "legacy-f4",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": {
+          "function": 4
+        }
+      },
+      "bytes": "1b4f53"
+    },
+    {
+      "id": "legacy-f5",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": {
+          "function": 5
+        }
+      },
+      "bytes": "1b5b31357e"
+    },
+    {
+      "id": "legacy-f6",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": {
+          "function": 6
+        }
+      },
+      "bytes": "1b5b31377e"
+    },
+    {
+      "id": "legacy-f7",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": {
+          "function": 7
+        }
+      },
+      "bytes": "1b5b31387e"
+    },
+    {
+      "id": "legacy-f8",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": {
+          "function": 8
+        }
+      },
+      "bytes": "1b5b31397e"
+    },
+    {
+      "id": "legacy-f9",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": {
+          "function": 9
+        }
+      },
+      "bytes": "1b5b32307e"
+    },
+    {
+      "id": "legacy-f10",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": {
+          "function": 10
+        }
+      },
+      "bytes": "1b5b32317e"
+    },
+    {
+      "id": "legacy-f11",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": {
+          "function": 11
+        }
+      },
+      "bytes": "1b5b32337e"
+    },
+    {
+      "id": "legacy-f12",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": {
+          "function": 12
+        }
+      },
+      "bytes": "1b5b32347e"
+    },
+    {
+      "id": "legacy-shift-f1",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": {
+          "function": 1
+        },
+        "modifiers": [
+          "shift"
+        ]
+      },
+      "bytes": "1b5b313b3250"
+    },
+    {
+      "id": "legacy-control-f5",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": {
+          "function": 5
+        },
+        "modifiers": [
+          "control"
+        ]
+      },
+      "bytes": "1b5b31353b357e"
+    },
+    {
+      "id": "legacy-menu",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "legacy",
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": "menu"
+      },
+      "bytes": "1b5b32397e"
+    },
+    {
+      "id": "modify-other-keys-1-leaves-a-spelled-key-alone",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "modify_other_keys",
+        "level": 1,
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": {
+          "char": "i"
+        },
+        "modifiers": [
+          "control"
+        ]
+      },
+      "bytes": "09"
+    },
+    {
+      "id": "modify-other-keys-1-reports-a-key-with-no-spelling",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "modify_other_keys",
+        "level": 1,
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": {
+          "char": ";"
+        },
+        "modifiers": [
+          "control"
+        ]
+      },
+      "bytes": "1b5b32373b353b35397e"
+    },
+    {
+      "id": "modify-other-keys-2-reports-control-i-apart-from-tab",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "modify_other_keys",
+        "level": 2,
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": {
+          "char": "i"
+        },
+        "modifiers": [
+          "control"
+        ]
+      },
+      "bytes": "1b5b32373b353b3130357e"
+    },
+    {
+      "id": "modify-other-keys-2-reports-control-digit",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "modify_other_keys",
+        "level": 2,
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": {
+          "char": "1"
+        },
+        "modifiers": [
+          "control"
+        ]
+      },
+      "bytes": "1b5b32373b353b34397e"
+    },
+    {
+      "id": "modify-other-keys-2-reports-shift-enter",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "modify_other_keys",
+        "level": 2,
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": "enter",
+        "modifiers": [
+          "shift"
+        ]
+      },
+      "bytes": "1b5b32373b323b31337e"
+    },
+    {
+      "id": "modify-other-keys-2-reports-control-tab",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "modify_other_keys",
+        "level": 2,
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": "tab",
+        "modifiers": [
+          "control"
+        ]
+      },
+      "bytes": "1b5b32373b353b397e"
+    },
+    {
+      "id": "modify-other-keys-2-plain-letter",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "modify_other_keys",
+        "level": 2,
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": {
+          "char": "a"
+        }
+      },
+      "bytes": "61"
+    },
+    {
+      "id": "modify-other-keys-keeps-arrows",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "modify_other_keys",
+        "level": 2,
+        "application_cursor_keys": false
+      },
+      "event": {
+        "key": "up"
+      },
+      "bytes": "1b5b41"
+    },
+    {
+      "id": "kitty-text-key-stays-text",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": {
+          "char": "a"
+        }
+      },
+      "bytes": "61"
+    },
+    {
+      "id": "kitty-shifted-text-key-stays-text",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": {
+          "char": "A"
+        },
+        "base": "a",
+        "modifiers": [
+          "shift"
+        ]
+      },
+      "bytes": "41"
+    },
+    {
+      "id": "kitty-escape",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": "escape"
+      },
+      "bytes": "1b5b323775"
+    },
+    {
+      "id": "kitty-control-a",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": {
+          "char": "a"
+        },
+        "modifiers": [
+          "control"
+        ]
+      },
+      "bytes": "1b5b39373b3575"
+    },
+    {
+      "id": "kitty-alt-a",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": {
+          "char": "a"
+        },
+        "modifiers": [
+          "alt"
+        ]
+      },
+      "bytes": "1b5b39373b3375"
+    },
+    {
+      "id": "kitty-control-alt-a",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": {
+          "char": "a"
+        },
+        "modifiers": [
+          "control",
+          "alt"
+        ]
+      },
+      "bytes": "1b5b39373b3775"
+    },
+    {
+      "id": "kitty-control-shift-a-is-the-unshifted-key",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": {
+          "char": "A"
+        },
+        "base": "a",
+        "modifiers": [
+          "control",
+          "shift"
+        ]
+      },
+      "bytes": "1b5b39373b3675"
+    },
+    {
+      "id": "kitty-control-super-a",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": {
+          "char": "a"
+        },
+        "modifiers": [
+          "control",
+          "super"
+        ]
+      },
+      "bytes": "1b5b39373b313375"
+    },
+    {
+      "id": "kitty-enter-stays-a-byte",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": "enter"
+      },
+      "bytes": "0d"
+    },
+    {
+      "id": "kitty-tab-stays-a-byte",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": "tab"
+      },
+      "bytes": "09"
+    },
+    {
+      "id": "kitty-backspace-stays-a-byte",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": "backspace"
+      },
+      "bytes": "7f"
+    },
+    {
+      "id": "kitty-control-enter",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": "enter",
+        "modifiers": [
+          "control"
+        ]
+      },
+      "bytes": "1b5b31333b3575"
+    },
+    {
+      "id": "kitty-shift-tab",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": "tab",
+        "modifiers": [
+          "shift"
+        ]
+      },
+      "bytes": "1b5b393b3275"
+    },
+    {
+      "id": "kitty-arrow-up",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": "up"
+      },
+      "bytes": "1b5b41"
+    },
+    {
+      "id": "kitty-control-arrow-up",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": "up",
+        "modifiers": [
+          "control"
+        ]
+      },
+      "bytes": "1b5b313b3541"
+    },
+    {
+      "id": "kitty-home",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": "home"
+      },
+      "bytes": "1b5b48"
+    },
+    {
+      "id": "kitty-end",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": "end"
+      },
+      "bytes": "1b5b46"
+    },
+    {
+      "id": "kitty-insert",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": "insert"
+      },
+      "bytes": "1b5b327e"
+    },
+    {
+      "id": "kitty-delete",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": "delete"
+      },
+      "bytes": "1b5b337e"
+    },
+    {
+      "id": "kitty-shift-delete",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": "delete",
+        "modifiers": [
+          "shift"
+        ]
+      },
+      "bytes": "1b5b333b327e"
+    },
+    {
+      "id": "kitty-page-up",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": "page_up"
+      },
+      "bytes": "1b5b357e"
+    },
+    {
+      "id": "kitty-page-down",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": "page_down"
+      },
+      "bytes": "1b5b367e"
+    },
+    {
+      "id": "kitty-f1",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": {
+          "function": 1
+        }
+      },
+      "bytes": "1b5b50"
+    },
+    {
+      "id": "kitty-f2",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": {
+          "function": 2
+        }
+      },
+      "bytes": "1b5b51"
+    },
+    {
+      "id": "kitty-f3",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": {
+          "function": 3
+        }
+      },
+      "bytes": "1b5b31337e"
+    },
+    {
+      "id": "kitty-f4",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": {
+          "function": 4
+        }
+      },
+      "bytes": "1b5b53"
+    },
+    {
+      "id": "kitty-f5",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": {
+          "function": 5
+        }
+      },
+      "bytes": "1b5b31357e"
+    },
+    {
+      "id": "kitty-f12",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": {
+          "function": 12
+        }
+      },
+      "bytes": "1b5b32347e"
+    },
+    {
+      "id": "kitty-shift-f1",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": {
+          "function": 1
+        },
+        "modifiers": [
+          "shift"
+        ]
+      },
+      "bytes": "1b5b313b3250"
+    },
+    {
+      "id": "kitty-control-f3",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": {
+          "function": 3
+        },
+        "modifiers": [
+          "control"
+        ]
+      },
+      "bytes": "1b5b31333b357e"
+    },
+    {
+      "id": "kitty-f13",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": {
+          "function": 13
+        }
+      },
+      "bytes": "1b5b353733373675"
+    },
+    {
+      "id": "kitty-f35",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": {
+          "function": 35
+        }
+      },
+      "bytes": "1b5b353733393875"
+    },
+    {
+      "id": "kitty-print-screen",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": "print_screen"
+      },
+      "bytes": "1b5b353733363175"
+    },
+    {
+      "id": "kitty-pause",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": "pause"
+      },
+      "bytes": "1b5b353733363275"
+    },
+    {
+      "id": "kitty-menu",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": "menu"
+      },
+      "bytes": "1b5b353733363375"
+    },
+    {
+      "id": "kitty-lock-bits-ride-in-the-modifiers",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": {
+          "char": "a"
+        },
+        "modifiers": [
+          "control"
+        ],
+        "locks": [
+          "caps_lock"
+        ],
+        "base": "a"
+      },
+      "bytes": "1b5b39373b363975"
+    },
+    {
+      "id": "kitty-caps-lock-without-the-unshifted-key-is-refused",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": {
+          "char": "a"
+        },
+        "modifiers": [
+          "control"
+        ],
+        "locks": [
+          "caps_lock"
+        ]
+      },
+      "refused": true
+    },
+    {
+      "id": "kitty-num-lock-bit",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": {
+          "char": "a"
+        },
+        "modifiers": [
+          "control"
+        ],
+        "locks": [
+          "num_lock"
+        ]
+      },
+      "bytes": "1b5b39373b31333375"
+    },
+    {
+      "id": "kitty-a-function-key-past-the-protocol-is-refused",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": {
+          "function": 36
+        }
+      },
+      "refused": true
+    },
+    {
+      "id": "kitty-events-escape-press",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 3
+      },
+      "event": {
+        "key": "escape"
+      },
+      "bytes": "1b5b323775"
+    },
+    {
+      "id": "kitty-events-escape-repeat",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 3
+      },
+      "event": {
+        "key": "escape",
+        "kind": "repeat"
+      },
+      "bytes": "1b5b32373b313a3275"
+    },
+    {
+      "id": "kitty-events-escape-release",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 3
+      },
+      "event": {
+        "key": "escape"
+      },
+      "release": {
+        "modifiers": [],
+        "locks": []
+      },
+      "bytes": "1b5b32373b313a3375"
+    },
+    {
+      "id": "kitty-events-arrow-up-release",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 3
+      },
+      "event": {
+        "key": "up"
+      },
+      "release": {
+        "modifiers": [],
+        "locks": []
+      },
+      "bytes": "1b5b313b313a3341"
+    },
+    {
+      "id": "kitty-events-control-a-release",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 3
+      },
+      "event": {
+        "key": {
+          "char": "a"
+        },
+        "modifiers": [
+          "control"
+        ]
+      },
+      "release": {
+        "modifiers": [
+          "control"
+        ],
+        "locks": []
+      },
+      "bytes": "1b5b39373b353a3375"
+    },
+    {
+      "id": "kitty-events-control-a-release-after-control-comes-up",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 3
+      },
+      "event": {
+        "key": {
+          "char": "a"
+        },
+        "modifiers": [
+          "control"
+        ]
+      },
+      "release": {
+        "modifiers": [],
+        "locks": []
+      },
+      "bytes": "1b5b39373b313a3375"
+    },
+    {
+      "id": "kitty-events-a-release-is-nothing-without-event-types",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 1
+      },
+      "event": {
+        "key": "escape"
+      },
+      "release": {
+        "modifiers": [],
+        "locks": []
+      },
+      "bytes": ""
+    },
+    {
+      "id": "kitty-all-letter",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 9
+      },
+      "event": {
+        "key": {
+          "char": "a"
+        }
+      },
+      "bytes": "1b5b393775"
+    },
+    {
+      "id": "kitty-all-enter",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 9
+      },
+      "event": {
+        "key": "enter"
+      },
+      "bytes": "1b5b313375"
+    },
+    {
+      "id": "kitty-all-tab",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 9
+      },
+      "event": {
+        "key": "tab"
+      },
+      "bytes": "1b5b3975"
+    },
+    {
+      "id": "kitty-all-backspace",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 9
+      },
+      "event": {
+        "key": "backspace"
+      },
+      "bytes": "1b5b31323775"
+    },
+    {
+      "id": "kitty-all-shifted-letter-reports-the-key",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 9
+      },
+      "event": {
+        "key": {
+          "char": "A"
+        },
+        "base": "a",
+        "modifiers": [
+          "shift"
+        ]
+      },
+      "bytes": "1b5b39373b3275"
+    },
+    {
+      "id": "kitty-all-release-of-enter",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 11
+      },
+      "event": {
+        "key": "enter"
+      },
+      "release": {
+        "modifiers": [],
+        "locks": []
+      },
+      "bytes": "1b5b31333b313a3375"
+    },
+    {
+      "id": "kitty-alternate-keys-flag-is-refused",
+      "covers": "KR-REQ-08.59",
+      "encoding": {
+        "kind": "kitty",
+        "flags": 5
+      },
+      "event": {
+        "key": {
+          "char": "a"
+        },
+        "modifiers": [
+          "control"
+        ]
+      },
+      "refused": true
+    }
+  ]
+}

@@ -44,9 +44,13 @@ import to.kala.reach.companion.mobile.CallNews
 import to.kala.reach.companion.mobile.CallOpenings
 import to.kala.reach.companion.mobile.CallRefused
 import to.kala.reach.companion.mobile.CallWire
+import to.kala.reach.companion.mobile.CurrentTokenHolder
+import to.kala.reach.companion.mobile.KeyFilings
 import to.kala.reach.companion.mobile.NotificationRoute
 import to.kala.reach.companion.mobile.OwnerAuthenticators
+import to.kala.reach.companion.mobile.PreviewKeySet
 import to.kala.reach.companion.mobile.PushStores
+import to.kala.reach.companion.mobile.PushToken
 import to.kala.reach.companion.mobile.SecretFiles
 import to.kala.reach.companion.mobile.SignInSession
 
@@ -93,12 +97,6 @@ class WrittenArguments {
     lateinit var value: String
 }
 
-@InvokeArg
-class LimitedKeyArguments {
-    lateinit var recipient_key_id: String
-    lateinit var seed: String
-}
-
 /**
  * The Android half of the companion's platform plugin.
  *
@@ -135,6 +133,8 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
     private val askingLock = Any()
     private var asking: Asking? = null
     private val deadlines = Handler(Looper.getMainLooper())
+
+    private val keyFilings = KeyFilings { PushStores.limited(noBackup, KeystoreSealer()) }
 
     private val secrets by lazy {
         SecretFiles(File(activity.noBackupFilesDir, "secrets"), KeystoreSealer())
@@ -328,13 +328,27 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
         invoke.resolve(JSObject().put("state", notificationState()))
     }
 
-    /** The registration token the provider gave this installation, when it has given one. */
+    /**
+     * The registration token the provider gave this installation, when it has given one: the
+     * provider's current token when it answers within a short time, and the one the messaging
+     * service stored otherwise. The wait is off the thread the command arrived on.
+     */
     @Command
     fun pushToken(invoke: Invoke) {
-        val token = activity
-            .getSharedPreferences(PushStores.TOKEN_STORE, Context.MODE_PRIVATE)
-            .getString(PushStores.TOKEN_KEY, null)
-        invoke.resolve(JSObject().put("token", token ?: JSONObject.NULL))
+        val preferences = activity.getSharedPreferences(PushStores.TOKEN_STORE, Context.MODE_PRIVATE)
+        Thread {
+            val token = PushToken.read(
+                stored = { preferences.getString(PushStores.TOKEN_KEY, null) },
+                source = CurrentTokenHolder.source,
+                keep = { current ->
+                    preferences.edit()
+                        .putString(PushStores.TOKEN_KEY, current)
+                        .putLong(PushStores.TOKEN_AT_KEY, System.currentTimeMillis())
+                        .commit()
+                }
+            )
+            invoke.resolve(JSObject().put("token", token ?: JSONObject.NULL))
+        }.start()
     }
 
     @Command
@@ -372,18 +386,26 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
-    /** Files the notification-preview key in the limited store, by its recipient identifier. */
+    /**
+     * Makes the limited store hold exactly the keys the application hands over: the device's
+     * preview seeds and the public key of each host that may seal a preview to them. A set that is
+     * not made of keys is refused and the store is left as it was.
+     */
     @Command
-    fun pushLimitedKey(invoke: Invoke) {
-        val arguments = invoke.parseArgs(LimitedKeyArguments::class.java)
-        try {
-            PushStores.limited(noBackup, KeystoreSealer()).write(
-                Base64.decode(arguments.recipient_key_id, Base64.NO_WRAP),
-                Base64.decode(arguments.seed, Base64.NO_WRAP)
-            )
-            invoke.resolve(done())
-        } catch (failure: Exception) {
-            invoke.reject("the preview key could not be filed")
+    fun pushPreviewKeys(invoke: Invoke) {
+        val keys = PreviewKeySet.parse(invoke.getArgs().toString())
+        if (keys == null) {
+            invoke.reject("the preview keys are not keys")
+            return
+        }
+        // A change waits for the receivers that are deciding, which a command's own thread (the main
+        // thread) must not do.
+        keyFilings.file(keys) { failure ->
+            if (failure == null) {
+                invoke.resolve(done())
+            } else {
+                invoke.reject("the preview keys could not be filed")
+            }
         }
     }
 

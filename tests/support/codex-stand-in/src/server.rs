@@ -65,6 +65,8 @@ struct Server {
     second_asked: bool,
     /// The threads the server has made, and whether its one client is subscribed to each.
     threads: BTreeMap<String, bool>,
+    /// The names saved conversations are resumed by, and the thread each stands for.
+    names: BTreeMap<String, String>,
     /// How many threads and how many turns the server has made, for the identifiers it gives them.
     threads_made: u32,
     turns_made: u32,
@@ -402,6 +404,8 @@ impl Server {
             }
             "thread/resume" => {
                 let wanted = frame["params"]["threadId"].as_str().unwrap_or_default();
+                // A saved conversation is resumed by its identifier or by the name it was given.
+                let wanted = self.names.get(wanted).map_or(wanted, String::as_str);
                 if !self.threads.contains_key(wanted) {
                     return self.refuse(id, -32600, "thread not found").await;
                 }
@@ -663,7 +667,14 @@ pub async fn run(variants: Variants) -> ! {
         sent: BTreeMap::new(),
         commands: Vec::new(),
         second_asked: false,
-        threads: BTreeMap::new(),
+        threads: saved()
+            .into_iter()
+            .map(|(_, thread)| (thread, false))
+            .collect(),
+        names: saved()
+            .into_iter()
+            .filter(|(name, thread)| name != thread)
+            .collect(),
         threads_made: 0,
         turns_made: 0,
         running: None,
@@ -733,4 +744,18 @@ pub fn exec_in_new_session(words: &[String]) -> ! {
         .exec();
     eprintln!("stand-in: {} could not run: {error}", words[0]);
     std::process::exit(127);
+}
+
+/// The saved conversations the server holds when it starts, each as the word a terminal resumes it
+/// by and the thread it stands for: `id` is its own name, and `name=id` is a name given to it.
+fn saved() -> Vec<(String, String)> {
+    std::env::var(crate::variants::SAVED_VARIABLE)
+        .unwrap_or_default()
+        .split(',')
+        .filter(|saved| !saved.is_empty())
+        .map(|saved| match saved.split_once('=') {
+            Some((name, thread)) => (name.to_owned(), thread.to_owned()),
+            None => (saved.to_owned(), saved.to_owned()),
+        })
+        .collect()
 }

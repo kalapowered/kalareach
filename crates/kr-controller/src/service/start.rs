@@ -971,6 +971,13 @@ impl Controller {
         // and every announcement it decides is stamped with the privacy state the delivery module
         // publishes its send gate from.
         delivery_runtime.attach_attention(Arc::clone(&attention));
+        // And the completed pairings the host's security outbox holds are taken the same way, under
+        // a cursor of their own.
+        delivery_runtime.attach_pairings(net::invitations::InvitationRows::new(
+            Arc::clone(&devices),
+            Arc::clone(&lifetimes),
+            Arc::clone(&feed_refusal),
+        ));
         attention.attach_privacy(delivery.privacy_state().clone());
         // Privacy mode's record comes before anything the subsystems it drives do. It is read and
         // published into the delivery module's send gate here, and whatever it asks for is taken
@@ -1035,7 +1042,13 @@ impl Controller {
             proxies: std::sync::Mutex::new(BTreeMap::new()),
             pending: Mutex::new(BTreeMap::new()),
             reservations: Arc::default(),
-            admitted: std::sync::Mutex::new(BTreeMap::new()),
+            admitted: std::sync::RwLock::new(BTreeMap::new()),
+            commit_hold: std::sync::RwLock::new(()),
+            ended: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            after_the_ended_are_taken: BlockingPause::default(),
+            #[cfg(test)]
+            withdrawals_waiting: std::sync::atomic::AtomicUsize::new(0),
             identity,
             secret_store: setup.secret_store,
             generation,
@@ -1177,6 +1190,8 @@ impl Controller {
             authority_epoch: std::sync::atomic::AtomicU64::new(0),
             feed_refusal,
             feed_drain: std::sync::Mutex::default(),
+            #[cfg(test)]
+            lock_ask: std::sync::Mutex::default(),
             feed_withheld: std::sync::Mutex::default(),
             local_access: super::local_access::LocalAccessState::default(),
             host_authorisation_key,
@@ -1210,6 +1225,7 @@ impl Controller {
                 kr_ipc::install::measured_environment(),
             )),
             finalising: Mutex::new(()),
+            removing_closed: Mutex::new(()),
             crash_flights: std::sync::Mutex::new(std::collections::HashMap::new()),
             left_by_an_earlier_boot: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             collection: crate::collection::Collection::default(),
@@ -1730,7 +1746,8 @@ impl Controller {
                 // as it is. Nothing reads it afterwards either: writing the closure removes the
                 // worker row and retires the descriptor, so the closure carries the fact itself,
                 // and a session whose closure names a worker this host never saw end is refused
-                // every archive read rather than served an incomplete one.
+                // every archive read, rather than served an incomplete one, until the process its
+                // launch ran is shown to have ended.
                 let archive = self.archive();
                 let ownership = archive.take_ownership(
                     row.session_id,
@@ -1996,6 +2013,77 @@ impl Controller {
     }
 }
 
+impl Controller {
+    /// Has the archive remove what the ended workers of the sessions privacy mode owes retained.
+    ///
+    /// A live session's worker records the privacy state and removes its own retained output and
+    /// receipts when it is told privacy mode is on. A session whose worker has ended has nobody to
+    /// tell, and what it kept is on the disk until something removes it, so the archive takes the
+    /// session's recovery ownership and records the state and does the removals itself, one
+    /// session after another. A session whose stores are held by another recovery, or that a
+    /// worker may still own, is left for the next pass; a removal that left something is owed with
+    /// the reason and tried again on a schedule. Only a removal that left nothing ends the
+    /// session's obligation.
+    pub(crate) async fn remove_closed_content(self: &Arc<Self>) {
+        let _alone = self.removing_closed.lock().await;
+        let privacy = Arc::clone(&self.privacy);
+        let now_ms = kr_ipc::now_ms();
+        let due = tokio::task::spawn_blocking(move || privacy.awaiting_removal(now_ms))
+            .await
+            .unwrap_or_default();
+        for session_id in due {
+            let controller = Arc::clone(self);
+            let _ =
+                tokio::task::spawn_blocking(move || controller.remove_one_closed(session_id)).await;
+        }
+    }
+
+    /// Brings the record up to date with the sessions that have ended and has the archive remove
+    /// what they retained, outside the tick's schedule, so that a change to privacy mode answers
+    /// with the removal done when it can be.
+    pub(crate) async fn settle_closed_sessions(self: &Arc<Self>) {
+        if let Some(seen) = see_the_sessions(&Arc::downgrade(self)).await {
+            let now_ms = kr_ipc::now_ms();
+            let _ = tokio::task::spawn_blocking(move || seen.record(now_ms)).await;
+        }
+        self.remove_closed_content().await;
+    }
+
+    /// Removes what one ended worker retained, under the recovery ownership of its session.
+    fn remove_one_closed(&self, session_id: SessionId) {
+        let archive = self.archive();
+        let now_ms = kr_ipc::now_ms();
+        let refused = |reason: String| {
+            self.privacy
+                .note_removal_refused(session_id, reason, now_ms)
+        };
+        let ownership = match archive.own_closed(session_id, || {
+            self.collectable(session_id).map(|collectable| !collectable)
+        }) {
+            Ok(ownership) => ownership,
+            // Another recovery holds the stores, or a worker may remain: the removal did not run,
+            // and the report says why until a later pass has run it.
+            Err(error) => {
+                refused(error.to_string());
+                return;
+            }
+        };
+        // The state in force when the removal begins: the journal is told the generation a worker
+        // of the session would hold now.
+        match archive.remove_retained_content(&ownership, self.privacy.state().now()) {
+            Ok(removed) if removed.is_complete() => {
+                if let Err(error) = self.privacy.note_removed(session_id) {
+                    refused(format!(
+                        "its content is removed, and its obligation could not be ended: {error}"
+                    ));
+                }
+            }
+            Ok(removed) => refused(removed.left_behind.join("; ")),
+            Err(error) => refused(error.to_string()),
+        }
+    }
+}
+
 /// One pass of privacy mode's tick, or `None` once the daemon has gone.
 ///
 /// The record learns which workers are running and which have ended, retries what it owes, and
@@ -2009,8 +2097,19 @@ async fn privacy_pass(daemon: &std::sync::Weak<Controller>) -> Option<bool> {
     let seen = see_the_sessions(daemon).await?;
     let now_ms = kr_ipc::now_ms();
     let privacy = Arc::clone(&seen.privacy);
-    let (notices, dormant) = tokio::task::spawn_blocking(move || {
+    // The record learns which workers have ended before the archive is asked to settle them.
+    let Ok(seen) = tokio::task::spawn_blocking(move || {
         seen.record(now_ms);
+        seen
+    })
+    .await
+    else {
+        // The record's pass stopped before it could say what it learned. The daemon is still here,
+        // so the tick goes on and the next pass learns it again.
+        return Some(false);
+    };
+    daemon.upgrade()?.remove_closed_content().await;
+    let (notices, dormant) = tokio::task::spawn_blocking(move || {
         let _ = seen.privacy.tick(now_ms);
         let notices = seen.privacy.notices_due(now_ms);
         // Dormant only when the registry could be read, so that what the pass has just learned of

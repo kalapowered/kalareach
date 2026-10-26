@@ -26,6 +26,28 @@ pub struct PrivacySetParams {
     pub enabled: bool,
 }
 
+/// Parameters of `privacy.retained.delete`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PrivacyRetainedDeleteParams {
+    /// The reference of the copy to delete, exactly as the `exported` list of `privacy.status`
+    /// shows it. The host acts only on a copy that list shows now with a way to ask for its
+    /// removal, and only when exactly one copy has this reference.
+    pub reference: String,
+}
+
+/// The result of `privacy.retained.delete`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PrivacyRetainedDeleteResult {
+    /// True when the service holding the copy has said it no longer holds it. False while the
+    /// request has been made and the service has not answered: the host asks again when it is asked
+    /// to delete the same copy again, and the report shows the copy as one whose deletion was asked.
+    pub deleted: bool,
+    /// Where privacy mode stands after the request.
+    pub report: PrivacyReport,
+}
+
 /// Parameters of `privacy.status`. The environment is the one the connection reaches.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

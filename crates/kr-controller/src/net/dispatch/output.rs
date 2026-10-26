@@ -68,11 +68,12 @@ pub struct RemoteOutput {
 /// can be exercised against a writer that is held and a peer that stops reading, which a real
 /// stream does not let a test arrange on demand.
 pub(super) trait FrameSink: Send + Sync + std::fmt::Debug {
-    /// Sends one frame for as long as `admits` holds, as [`ControlSender::send_while`] does.
+    /// Sends one frame for as long as `admits` holds, making each attempt to hand bytes over inside
+    /// it, as [`ControlSender::send_while`] does.
     fn send_while<'a>(
         &'a self,
         frame: &'a ControlFrame,
-        admits: &'a (dyn Fn() -> bool + Send + Sync),
+        admits: kr_transport::codec::Admission<'a>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = kr_transport::Result<bool>> + Send + 'a>>;
 
     /// Ends the connection, which is what stops a write that is still waiting on it.
@@ -90,7 +91,7 @@ impl FrameSink for ControlStream {
     fn send_while<'a>(
         &'a self,
         frame: &'a ControlFrame,
-        admits: &'a (dyn Fn() -> bool + Send + Sync),
+        admits: kr_transport::codec::Admission<'a>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = kr_transport::Result<bool>> + Send + 'a>>
     {
         Box::pin(self.sender.send_while(frame, admits))
@@ -101,6 +102,61 @@ impl FrameSink for ControlStream {
             WITHDRAWN.into(),
             b"this connection's authority was withdrawn",
         );
+    }
+}
+
+/// The privacy state a page of retained output was read under.
+///
+/// The page is released only while that state stands: privacy mode off, in the generation it was
+/// read in, and held while the bytes are handed to the stream. A page read with privacy mode on is
+/// never released: the daemon publishes the mode before it tells a worker to remove what it
+/// retained, so a worker can still answer with output that is about to go. Output a worker read
+/// before privacy mode started is not sent after it, however long the answer waited to be written.
+#[derive(Clone, Debug)]
+pub(super) struct ReadUnder {
+    state: crate::privacy::PrivacyState,
+    decided: crate::privacy::Published,
+}
+
+impl ReadUnder {
+    /// Takes the privacy state as it stands, before the worker is asked.
+    ///
+    /// It is read under the state's read side, which waits behind a change of privacy mode, so on
+    /// a thread that may wait.
+    pub(super) async fn now(
+        controller: &Controller,
+    ) -> Result<Self, kr_protocol::error::ProtocolError> {
+        let state = controller.privacy.state().clone();
+        let read = state.clone();
+        let decided = tokio::task::spawn_blocking(move || read.now())
+            .await
+            .map_err(|_| {
+                kr_protocol::error::ProtocolError::new(
+                    kr_protocol::error::ErrorCode::ResourceUnavailable,
+                    "privacy mode's state could not be read",
+                )
+            })?;
+        Ok(Self { state, decided })
+    }
+
+    /// Takes the state the page was read under, held, when it still stands and privacy mode was
+    /// off. A change of state waits until the reading is dropped.
+    ///
+    /// It waits for nothing, so it can be asked in the poll that hands bytes to the stream: a
+    /// change of state being made, or waiting to be, counts as the state having moved.
+    pub(super) fn holding(&self) -> Option<crate::privacy::Reading<'_>> {
+        if self.decided.private {
+            return None;
+        }
+        self.state
+            .try_reading()
+            .filter(|reading| reading.published() == self.decided)
+    }
+
+    /// Answers whether the state the page was read under still stands, for a decision that is not
+    /// the write of a byte.
+    pub(super) fn stands(&self) -> bool {
+        self.holding().is_some()
     }
 }
 
@@ -412,7 +468,7 @@ impl RemoteOutput {
         under: &[HeldBound],
         relaying: Option<Relaying<'_>>,
     ) -> Written {
-        self.write_held(frame, under, relaying, false).await
+        self.write_held(frame, under, relaying, false, None).await
     }
 
     /// As [`Self::write`], and, for an answer to a request decided before this write, held to the
@@ -425,12 +481,17 @@ impl RemoteOutput {
     /// once bytes are moving the connection ends. Not the epoch: it moves at every change of the
     /// policy, and an answer cut for one that touched nothing the decision stood on would end a
     /// connection for no refusal. A failure frame is not held, so the device is told why.
+    ///
+    /// A page of retained output is held to the privacy state it was read under, `read_under`, in
+    /// the same places: a page that no longer stands before any of it went is decided again, and
+    /// the connection ends once bytes are moving.
     pub(super) async fn write_held(
         &self,
         frame: &ControlFrame,
         under: &[HeldBound],
         relaying: Option<Relaying<'_>>,
         answer: bool,
+        read_under: Option<&ReadUnder>,
     ) -> Written {
         #[cfg(test)]
         self.queued.fetch_add(1, Ordering::SeqCst);
@@ -448,7 +509,7 @@ impl RemoteOutput {
             self.withdraw();
             return Written::Withdrawn;
         }
-        let decided = || {
+        let bounds_hold_now = || {
             !(answer
                 && self
                     .authority
@@ -460,16 +521,28 @@ impl RemoteOutput {
                     .as_ref()
                     .is_none_or(|relaying| relaying.grant.holds(&self.authority.controller))
         };
+        let decided = || bounds_hold_now() && read_under.is_none_or(ReadUnder::stands);
         if !decided() {
             return Written::Undecided;
         }
         // Set the first time a byte may have gone. Until then the stream is whole whatever
         // happens to this frame.
         let begun = AtomicBool::new(false);
-        let admits = || {
-            let admitted = self.fence() && decided();
+        // The privacy state a page was read under is taken for the attempt and kept until the
+        // bytes of the attempt are handed over, so a change of privacy mode is published before
+        // the check or after the write, and never between them.
+        let admits = |attempt: &mut dyn FnMut()| {
+            let _standing = match read_under {
+                Some(read_under) => match read_under.holding() {
+                    Some(standing) => Some(standing),
+                    None => return false,
+                },
+                None => None,
+            };
+            let admitted = self.fence() && bounds_hold_now();
             if admitted {
                 begun.store(true, Ordering::Release);
+                attempt();
             }
             admitted
         };

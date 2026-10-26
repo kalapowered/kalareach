@@ -9,7 +9,10 @@
  * the host's terms rather than showing a shorter history as if it were all there was.
  *
  * A live session's output is read from its own worker and an ended one's from the host's archive,
- * by native code, with the same method and the same answer.
+ * by native code, with the same method and the same answer. Over a host this device is paired with,
+ * the host serves the output the device's grant reaches, from the first of it: what comes before is
+ * not for the device to see, and the view says it is not available to the device rather than that
+ * the host kept nothing, which it may well still hold.
  */
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
@@ -20,6 +23,7 @@ import { base64UrlToBytes } from '@kalareach/protocol'
 import { Banner, Button } from '../components/ui'
 import { readOnCadence } from '../app/cadence'
 import { AGENT_READ_CADENCE_MS } from '../app/agent'
+import { useHeldConnection } from '../app/rights'
 import { useApp, useSession } from '../app/state'
 import { failureMessage } from '../host/port'
 import { ask } from '../mobile/model/call'
@@ -93,6 +97,7 @@ export function RetainedOutput({
   readonly cadenceMs?: number
 }): ReactNode {
   const { port, sessions } = useApp()
+  const { paired } = useHeldConnection()
   const { state, update } = useSession(sessionId)
   const output = state.output
   const scroller = useRef<HTMLDivElement | null>(null)
@@ -361,14 +366,19 @@ export function RetainedOutput({
       >
         {lost ? (
           <p className="small faint output-edge" data-testid="output-gap">
-            Output before this is not kept
-            {cause === null ? '.' : `: ${GAP_WORDS[cause]}.`}
+            {cause !== null
+              ? `Output before this is not kept: ${GAP_WORDS[cause]}.`
+              : paired
+                ? 'Output before this is not available to this device.'
+                : 'Output before this is not kept.'}
           </p>
         ) : null}
         {!loaded ? <p className="small faint output-edge">Reading this session’s output…</p> : null}
         {empty ? (
           <p className="small faint output-edge" data-testid="output-empty">
-            The host keeps nothing this session wrote.
+            {paired
+              ? 'This session has written nothing this device may see yet.'
+              : 'The host keeps nothing this session wrote.'}
           </p>
         ) : null}
         {output.pages.map((each, index) => (

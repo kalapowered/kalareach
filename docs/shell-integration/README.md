@@ -254,9 +254,9 @@ Every package records, and the worker keeps with the session:
 Everything below comes from the reader itself, at the moment the reader does the thing. This is the
 contract a bridge speaks and the host answers; which of these a given package sends is that
 package's own declaration. The Zsh, Bash and fish packages send every event in this table. The
-PSReadLine package sends `command_block` for each line, and sends `command_resolve` only when a
-command-lookup handler calls its `Resolve-KalaReachCommand`, so a command in that shell runs as it
-was typed unless a handler asks about it.
+PSReadLine package sends `command_block` for each line, and sends `command_resolve` from the
+command-lookup handler it installs once its hooks are live, so a command in that shell runs as it
+was typed unless that handler asks about it.
 
 | Event | When | Fields |
 | --- | --- | --- |
@@ -358,9 +358,25 @@ file, an `eval`, a trap or a prompt hook runs is not a command of the line. None
 each runs as it was typed. A script is a process of its own, so only the interpreter it is started
 with is asked about. Zsh expands a filename pattern and applies the assignments in front of a
 command only in the child it forks, so a command with either is not asked about either: `PATH` or
-`ARGV0` there would change the file or the vector that runs. The PSReadLine package asks through
-`Resolve-KalaReachCommand`, which a command-lookup handler calls for a line that is one native
-command and nothing else.
+`ARGV0` there would change the file or the vector that runs. The PSReadLine package asks from a
+handler of its own for the commands PowerShell has found (`PostCommandLookupAction`), which it puts in
+front of the person's when its hooks go live and takes off when it goes, putting the person's back
+only if its own is still the one installed. The person's handler is called first, and what it makes
+of the command stands, so a handler that replaces a program with a function of its own takes the
+program out of the integration, and it is asked once about each command the line runs, whether the
+shell runs it as typed or through the launcher. A handler the person sets later is theirs and stays
+where they put it: one that calls the handler it replaced still reaches this one, and one that does
+not leaves the commands to run as typed. The handler for a name about to be looked up
+(`PreCommandLookupAction`) is not touched, and a program it answers with is a program found like any other. A handler of the person's that throws leaves the command to run as typed. The handler acts on a line that is one
+native command whose words are all plain constants, and only when the command PowerShell would run
+for that name is the program: an alias, a function, a cmdlet or a script that has the name is what
+runs, and nothing is asked. It changes a lookup only when the worker answers with a backend, so
+every other command runs untouched and leaves `$?`, `$LASTEXITCODE` and `$Error` as the program
+left them. After a command that ran through the launcher, the launcher's exit code is in
+`$LASTEXITCODE` and in the line's block, and `$?` is true: a script block that replaces the command
+cannot report the program's failure as its own. A person whose profile turns a failed program into
+an error (`$PSNativeCommandUseErrorActionPreference` with `$ErrorActionPreference = 'Stop'`) gets
+that error as it stands, from the launcher and not from the program, and `$?` is false.
 
 The shell waits at most one second for the answer. A bypass, a refusal, the deadline and a lost
 endpoint all run the command exactly as the shell would have run it without asking: the same file,
@@ -374,8 +390,9 @@ launcher is only ever the absolute path the answer gives and is never searched f
 an absolute path to an executable file is refused, and the command runs as it was typed.
 
 None of this changes what the person sees: no key binding, function, alias or hook is added or
-replaced, the history holds the line as it was typed, and `type` and `which` report the command as
-they did before.
+replaced (PowerShell's handler for found commands goes in front of the person's own, which it calls first), the
+history holds the line as it was typed, and `type` and `which` report the command as they did
+before.
 
 Each line also reports its command block from the reader's own boundaries. When a primary line is
 accepted, its block starts with the line as the editor accepted it, the directory and that
@@ -569,7 +586,8 @@ user change to the gesture: the bridge records it with the prompt it takes effec
 character typed at the current prompt is still judged by the gesture that was in force when it was
 typed. Disabled `VEOF` leaves the terminal with no gesture, so no character is one. Windows uses the
 configured PSReadLine gesture, which is a chord rather than a byte, and the worker supplies it in the
-accept.
+accept. PSReadLine's Windows edit mode binds no end-of-file chord, so there the module reports the
+gesture as disabled at the first prompt, and no key detaches the session until the person binds one.
 
 ## The fence and detach state machine
 
@@ -755,7 +773,7 @@ What it pins is a range rather than a release: PowerShell 7.4 or later with PSRe
 3.0. The module declares the versions it found in its handshake and the worker refuses an editor
 ABI it was not qualified for. The module also refuses a PowerShell release that a published
 advisory affects, naming the advisory and the first fixed release of the series
-(`powershell_release_affected`; the advisories are listed in `docs/shell-integration/upstream.md`). A build that does not keep the reader's own key queue where this
+(`powershell_release_affected`; the advisories are listed in `docs/shell-integration/upstream.md`). The module makes that refusal inside the shell, which then sends no hello, so a managed create learns of it when the qualification bound runs out; the words it ends with name the entry and the publish command, and the publish names the advisory. On Linux and macOS it does the same for a .NET runtime below the fixed one of the advisory that lists the platform, and it refuses a runtime that describes itself in words it cannot read (`powershell_runtime_unreadable`) rather than taking it as clear. A build that does not keep the reader's own key queue where this
 package was qualified to find it is refused with a named error rather than registered.
 
 Section 7 says this package does not claim that the stock public API has an asynchronous editing

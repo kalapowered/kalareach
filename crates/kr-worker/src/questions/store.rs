@@ -561,12 +561,9 @@ impl Store {
     pub fn list(&self, include_resolved: bool) -> Result<Vec<Question>> {
         let mut statement = self
             .connection
-            .prepare(
-                "SELECT question_id, revision, state, kind, context, question, choices, source,
-                        created_at_ms, pending_since_ms, expires_at_ms, answer, resolved_at_ms,
-                        token_nonce, token_sealed, payload_digest, source_key, token_tag
-                 FROM questions ORDER BY created_at_ms, rowid",
-            )
+            .prepare(&format!(
+                "SELECT {ROW_COLUMNS} FROM questions ORDER BY created_at_ms, rowid"
+            ))
             .map_err(QuestionError::unavailable)?;
         let rows = statement
             .query_map([], |row| Ok(self.hydrate(row)))
@@ -1022,10 +1019,9 @@ impl Store {
     fn by_request(&self, source_key: &str, request_id: &str) -> Result<Option<Row>> {
         self.connection
             .query_row(
-                "SELECT question_id, revision, state, kind, context, question, choices, source,
-                        created_at_ms, pending_since_ms, expires_at_ms, answer, resolved_at_ms,
-                        token_nonce, token_sealed, payload_digest, source_key, token_tag
-                 FROM questions WHERE source_key = ?1 AND request_id = ?2",
+                &format!(
+                    "SELECT {ROW_COLUMNS} FROM questions WHERE source_key = ?1 AND request_id = ?2"
+                ),
                 params![source_key, request_id],
                 |row| Ok(self.hydrate(row)),
             )
@@ -1037,10 +1033,7 @@ impl Store {
     fn row(&self, question_id: QuestionId) -> Result<Option<Row>> {
         self.connection
             .query_row(
-                "SELECT question_id, revision, state, kind, context, question, choices, source,
-                        created_at_ms, pending_since_ms, expires_at_ms, answer, resolved_at_ms,
-                        token_nonce, token_sealed, payload_digest, source_key, token_tag
-                 FROM questions WHERE question_id = ?1",
+                &format!("SELECT {ROW_COLUMNS} FROM questions WHERE question_id = ?1"),
                 params![question_id.get().as_bytes().as_slice()],
                 |row| Ok(self.hydrate(row)),
             )
@@ -1055,9 +1048,15 @@ impl Store {
 }
 
 /// The columns every question read selects, in the order [`hydrate_row`] expects them.
+///
+/// The last is the binding revision a bridge placed the question under, if one did. It is read
+/// from the binding record and not from the stored header, which is written once, when the
+/// question is created, before any report of the call that asked it can have arrived.
 const ROW_COLUMNS: &str = "question_id, revision, state, kind, context, question, choices, source,
          created_at_ms, pending_since_ms, expires_at_ms, answer, resolved_at_ms,
-         token_nonce, token_sealed, payload_digest, source_key, token_tag";
+         token_nonce, token_sealed, payload_digest, source_key, token_tag,
+         (SELECT revision FROM question_bindings
+           WHERE question_bindings.question_id = questions.question_id)";
 
 /// Reads one question inside a transaction.
 fn read_row_in(
@@ -1117,6 +1116,18 @@ fn hydrate_row(
         .get::<_, Option<i64>>(12)
         .map_err(QuestionError::unavailable)?
         .map(|value| TimestampMs::new(u64::try_from(value).unwrap_or_default()));
+    // A question a qualified bridge placed in a thread reads with the revision it was asked under,
+    // which is what tells a reader that a switch of thread invalidates it. One no bridge placed
+    // has none, and keeps the header it was created with.
+    let mut source = decode::<QuestionSource>(&read(7)?)?;
+    if let Some(bound) = row
+        .get::<_, Option<i64>>(18)
+        .map_err(QuestionError::unavailable)?
+    {
+        source.agent_binding_revision = Nullable::some(AgentBindingRevision::new(
+            u64::try_from(bound).unwrap_or_default(),
+        ));
+    }
     Ok(Row {
         question: Question {
             question_id: QuestionId::new(uuid_from(&read(0)?)?),
@@ -1128,7 +1139,7 @@ fn hydrate_row(
             context: text(4)?,
             question: text(5)?,
             choices: decode::<Vec<QuestionChoice>>(&read(6)?)?,
-            source: decode::<QuestionSource>(&read(7)?)?,
+            source,
             created_at_ms: TimestampMs::new(number(8)?),
             expires_at_ms: TimestampMs::new(number(10)?),
             answer: Nullable(answer),

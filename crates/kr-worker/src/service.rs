@@ -64,6 +64,7 @@ use kr_transport::clock::{ContinuousClock, ContinuousInstant, SystemContinuousCl
 use kr_transport::window::{AcceptedDeadline, ActionWindowIssuer, MAX_WINDOW_VALIDITY};
 
 use crate::broker::MAX_SNAPSHOT_RESOURCES;
+use crate::broker::encode::{EncodeRequest, Encoded};
 use crate::broker::prepare::{Preparation, PreparationRequest};
 use crate::error::{Result, WorkerError};
 use crate::history_filter::retained::{Disclosure, Occasion};
@@ -364,6 +365,11 @@ pub struct WorkerService {
     /// preparation for as long as they need. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     preparation_stall: crate::testing::Stall,
+    /// How long, in milliseconds, an admitted operation has to reach its upstream, which this
+    /// host's own tests shorten to reach the deadline without waiting out the shipped one. It is
+    /// compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    upstream_deadline_ms: std::sync::atomic::AtomicU64,
     /// A pause in the binding of a question's or an alert's source to the session, which this
     /// host's own tests arm to stand a caller there while a keystroke arrives. It is compiled
     /// away in every shipped build.
@@ -718,6 +724,10 @@ impl WorkerService {
             #[cfg(feature = "testing")]
             preparation_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
+            upstream_deadline_ms: std::sync::atomic::AtomicU64::new(
+                u64::try_from(UPSTREAM_SUBMIT_DEADLINE.as_millis()).unwrap_or(u64::MAX),
+            ),
+            #[cfg(feature = "testing")]
             refused_for_the_boundary: tokio::sync::watch::Sender::new(0),
             #[cfg(feature = "testing")]
             announcement_watch: Mutex::new(None),
@@ -761,6 +771,15 @@ impl WorkerService {
         admissions.install_into(&self.broker, kr_ipc::now_ms());
         self.plugin_admissions = admissions;
         self.connector_sources = sources;
+        self
+    }
+
+    /// Has this worker claim the saved conversations its instances own on the host, so that no
+    /// other session of the user runs a second agent against one of them. Without it the worker
+    /// knows only the instances of its own session.
+    #[must_use]
+    pub fn with_conversation_claims(self, claims: crate::broker::host_claims::HostClaims) -> Self {
+        self.broker.set_host_claims(claims);
         self
     }
 
@@ -1217,6 +1236,34 @@ impl WorkerService {
         std::sync::mpsc::Sender<()>,
     ) {
         self.fence_stall.arm()
+    }
+
+    /// Sets how long an admitted operation has to reach its upstream before the worker records an
+    /// outcome nobody can establish.
+    ///
+    /// It exists so that this host's own tests can reach the deadline without waiting out the
+    /// shipped one. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn set_upstream_deadline_for_tests(&self, deadline: std::time::Duration) {
+        self.upstream_deadline_ms.store(
+            u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+
+    /// How long an admitted operation has to reach its upstream.
+    fn upstream_deadline(&self) -> std::time::Duration {
+        #[cfg(feature = "testing")]
+        {
+            std::time::Duration::from_millis(
+                self.upstream_deadline_ms
+                    .load(std::sync::atomic::Ordering::Acquire),
+            )
+        }
+        #[cfg(not(feature = "testing"))]
+        {
+            UPSTREAM_SUBMIT_DEADLINE
+        }
     }
 
     /// Stops the next accepted action's preparation before it begins, for this host's own tests.
@@ -4929,7 +4976,7 @@ impl WorkerService {
     /// Prepares one accepted action's effect, holding nothing of this worker.
     ///
     /// The preparation is bounded by what is left of the action's accepted deadline.
-    async fn prepare(&self, pending: &PendingPreparation) -> Preparation {
+    async fn prepare(&self, pending: &PendingPreparation) -> Made {
         #[cfg(feature = "testing")]
         self.preparation_stall.stand();
         let within = pending.deadline.saturating_duration_since(self.clock.now());
@@ -4949,9 +4996,12 @@ impl WorkerService {
                     receipt.state == kr_protocol::receipt::ReceiptState::Accepted
                 })
         };
-        self.broker
-            .prepare(&pending.request, within, &accepted)
-            .await
+        match &pending.request {
+            Asked::Prepare(request) => Made::Prepared(Box::new(
+                self.broker.prepare(request, within, &accepted).await,
+            )),
+            Asked::Encode(request) => Made::Encoded(self.broker.encode(request, within).await),
+        }
     }
 
     /// Finishes an accepted action whose effect has been prepared: the revalidation inside the
@@ -4993,11 +5043,15 @@ impl WorkerService {
         &self,
         state: &mut ConnectionState,
         pending: &PendingPreparation,
-        preparation: Preparation,
+        preparation: Made,
     ) -> Result<Answered> {
         let mutation = &pending.mutation;
         let caller = &pending.caller;
-        let method = Method::PluginActionInvoke;
+        let method = mutation.method.method().ok_or_else(|| {
+            WorkerError::InvalidArgument(
+                "this action's method is not one this worker serves".to_owned(),
+            )
+        })?;
         let _barrier = self
             .dispatch
             .lock()
@@ -5159,17 +5213,41 @@ impl WorkerService {
     /// may have reached the upstream is. The bound is this worker's own: an upstream that has not
     /// answered by then leaves an outcome nobody can establish, which section 9 records as unknown
     /// rather than as a refusal the caller would read as "nothing happened".
-    async fn finish_upstream(&self, pending: PendingUpstream) -> ControlFrame {
+    async fn finish_upstream(self: &Arc<Self>, pending: PendingUpstream) -> ControlFrame {
         // Everything the broker settles happens on this task, and the resource an answer resolves
         // is settled before the receipt is recorded and before the caller hears: at the deadline,
         // what `carry` was waiting for is dropped here, and an answer's claim goes with it.
-        let deadline = tokio::time::Instant::now() + UPSTREAM_SUBMIT_DEADLINE;
+        let deadline = tokio::time::Instant::now() + self.upstream_deadline();
         let mut handoff = pending.handoff;
         let claim = handoff.claim.take();
-        let outcome = handoff.carry(deadline).await;
-        off_the_executor(|| {
-            self.settle_upstream(&pending.actor_id, pending.action_id, outcome.as_ref());
+        let (revision, operation, action, turn_id) = (
+            handoff.admitted.binding_revision(),
+            handoff.admitted.operation(),
+            handoff.admitted.action().cloned(),
+            handoff.admitted.turn_id().cloned(),
+        );
+        let (outcome, late) = handoff.carry(deadline).await;
+        let settled = off_the_executor(|| {
+            self.settle_upstream(&pending.actor_id, pending.action_id, outcome.as_ref())
         });
+        // An outcome nobody could establish is settled by the upstream's answer if one comes
+        // later, matched to the operation by the identifier it was sent under. The claim is made
+        // after the receipt says unknown, so the answer is read against that state whenever it
+        // came.
+        if settled == Some(kr_protocol::receipt::ReceiptState::Unknown)
+            && let Some(late) = late
+        {
+            let operation = LateOperation {
+                actor_id: pending.actor_id.clone(),
+                action_id: pending.action_id,
+                name: operation.as_str().to_owned(),
+                action,
+                revision,
+                turn_id,
+                request: late.upstream_request_id().clone(),
+            };
+            self.watch_late(operation, &late);
+        }
         // The offer is reported from what the receipt now says: applied is accepted, a refusal the
         // upstream proved is a failure, and anything else is unknown.
         if let Some(claim) = claim {
@@ -5208,12 +5286,10 @@ impl WorkerService {
         actor_id: &ActorId,
         action_id: kr_protocol::ids::ActionId,
         outcome: std::result::Result<&ParamsValue, &WorkerError>,
-    ) {
+    ) -> Option<kr_protocol::receipt::ReceiptState> {
         let now = kr_ipc::now_ms();
         let mut session = self.runtime.session();
-        let Some(journal) = session.journal_mut() else {
-            return;
-        };
+        let journal = session.journal_mut()?;
         let settled = match outcome {
             // The upstream answered and this is what it said. Nothing earlier than its own
             // acknowledgement reaches here: a queue that took the bytes and a socket that wrote
@@ -5246,12 +5322,116 @@ impl WorkerService {
                 now,
             ),
         };
-        if let Err(failure) = settled {
-            session.note_journal_failure(&failure);
-        }
+        let state = match &settled {
+            Ok(receipt) => Some(receipt.state),
+            Err(failure) => {
+                session.note_journal_failure(failure);
+                None
+            }
+        };
         // Privacy mode is prospective: the content this receipt carries goes where it settles.
         if session.privacy().is_enabled() {
             session.redact_settled_action(actor_id, action_id);
+        }
+        state
+    }
+
+    /// Waits for the upstream's answer to an operation whose receipt says unknown, and records it
+    /// as the evidence it is.
+    ///
+    /// The answer is matched to the operation by the identifier this host sent it under, which is
+    /// correlation evidence the receipt contract lets settle an unknown outcome. A connection that
+    /// ends first ends the wait, and nothing is recorded. The task holds the service weakly, so a
+    /// session that has gone is not kept alive by an answer that never comes.
+    fn watch_late(self: &Arc<Self>, operation: LateOperation, late: &crate::broker::LateHandle) {
+        use crate::broker::LateClaim;
+
+        match late.claim() {
+            LateClaim::Ready(verdict) => {
+                off_the_executor(|| self.record_late(&operation, &verdict));
+            }
+            LateClaim::Refused => {}
+            LateClaim::Waiting(answer) => {
+                let service = Arc::downgrade(self);
+                tokio::spawn(async move {
+                    let Ok(verdict) = answer.await else {
+                        return;
+                    };
+                    if let Some(service) = service.upgrade() {
+                        off_the_executor(|| service.record_late(&operation, &verdict));
+                    }
+                });
+            }
+        }
+    }
+
+    /// Records what the upstream's late answer to an operation said, beside the operation's
+    /// receipt, which the evidence settles when the contract lets it.
+    fn record_late(&self, operation: &LateOperation, verdict: &crate::broker::LateVerdict) {
+        use crate::broker::LateVerdict;
+        use kr_protocol::action::{ActionObservation, ObservationProvenance, ObservedResult};
+
+        let observation = ActionObservation {
+            action_id: operation.action_id,
+            provenance: ObservationProvenance::UpstreamCorrelation,
+            subject: format!("{}:{}", operation.name, operation.request),
+            subject_revision: Nullable::some(U64::new(operation.revision.get())),
+            source_cursor: Nullable::null(),
+            claimed_result: match verdict {
+                LateVerdict::Applied => ObservedResult::Applied,
+                LateVerdict::Refused(_) => ObservedResult::Refused,
+                LateVerdict::Failed => ObservedResult::Indeterminate,
+            },
+            observed_at_ms: kr_ipc::now_ms(),
+        };
+        // What an applied receipt keeps is what the on-time path keeps for the operation: the
+        // identifier it was sent under, the provenance and the turn it was admitted against. A
+        // late answer is not read for a turn, so a prompt, which learns its turn from its answer,
+        // keeps none.
+        let result = matches!(verdict, LateVerdict::Applied)
+            .then(|| {
+                let mutation = kr_protocol::agent::AgentMutationResult {
+                    binding_revision: operation.revision,
+                    provenance: kr_protocol::broker::ActionProvenance::UpstreamTypedRpc,
+                    upstream_request_id: Nullable::some(operation.request.clone()),
+                    turn_id: Nullable::from(operation.turn_id.clone()),
+                };
+                match operation.action.clone() {
+                    Some(action) => encode(&kr_protocol::agent::PluginActionInvokeResult {
+                        mutation: Nullable::some(mutation),
+                        action,
+                    }),
+                    None => encode(&mutation),
+                }
+                .ok()
+                .map(|value| kr_cbor::encode(value.as_value()))
+            })
+            .flatten();
+        let refusal = match verdict {
+            LateVerdict::Refused(detail) => Some(
+                WorkerError::Broker(crate::broker::BrokerError::UpstreamRefused {
+                    detail: detail.clone(),
+                })
+                .to_protocol_error(),
+            ),
+            _ => None,
+        };
+        let mut session = self.runtime.session();
+        let Some(journal) = session.journal_mut() else {
+            return;
+        };
+        match journal.record_observation_settling(
+            &operation.actor_id,
+            &observation,
+            result.as_deref(),
+            refusal,
+        ) {
+            Ok(_) => {
+                if session.privacy().is_enabled() {
+                    session.redact_settled_action(&operation.actor_id, operation.action_id);
+                }
+            }
+            Err(failure) => session.note_journal_failure(&failure),
         }
     }
 
@@ -5777,7 +5957,7 @@ impl WorkerService {
         deadline: ContinuousInstant,
         admitted: bool,
         volatile_permitted: bool,
-        preparation: Option<Preparation>,
+        preparation: Option<Made>,
     ) -> Result<Answered> {
         let actor_id = caller.actor_id.clone();
         let second_pass = preparation.is_some();
@@ -5845,10 +6025,10 @@ impl WorkerService {
         };
         // An action whose effect is prepared outside the boundary stops here, with its receipt
         // still `accepted` and no marker written. It comes back through `dispatch_prepared`.
-        if let Some(Prepared::NeedsPreparation(request)) = prepared {
+        if let Some(Prepared::NeedsPreparation(asked)) = prepared {
             return if admitted {
                 Ok(Answered::Prepare(Box::new(PendingPreparation {
-                    request: *request,
+                    request: *asked,
                     mutation: mutation.clone(),
                     caller: caller.clone(),
                     deadline,
@@ -6825,6 +7005,43 @@ impl WorkerService {
         }))
     }
 
+    /// Takes the bytes a component wrote as the answer to an approval, or says why there are none.
+    ///
+    /// A component that could not write them has not answered the request, and the table does not
+    /// stand in for it. If the request was resolved while the component worked, the caller is told
+    /// that instead: a native answer that came first has won, and nothing is lost by the component's
+    /// failure.
+    fn encoded_bytes(
+        &self,
+        encoded: Encoded,
+        expected: Option<kr_protocol::ids::BrokerBindingId>,
+        target: &kr_protocol::agent::AgentMutationTarget,
+        resource_id: kr_protocol::ids::PendingResourceId,
+        now: kr_protocol::scalars::TimestampMs,
+    ) -> Result<Vec<u8>> {
+        if expected.is_some_and(|binding_id| binding_id != encoded.binding_id) {
+            return Err(crate::broker::BrokerError::PreconditionFailed {
+                detail: "the answer was written by another binding than the one this call names"
+                    .to_owned(),
+            }
+            .into());
+        }
+        match encoded.bytes {
+            Ok(bytes) => Ok(bytes),
+            Err(why) => {
+                self.broker
+                    .check_resource_answerable(target, resource_id, now)?;
+                Err(crate::broker::BrokerError::ResourceUnavailable {
+                    detail: format!(
+                        "the component that read this request could not write its answer: {}",
+                        why.words()
+                    ),
+                }
+                .into())
+            }
+        }
+    }
+
     /// Refuses, before the dispatch marker, everything the effect itself would refuse.
     ///
     /// Section 9 makes a refusal this host can decide a rejection rather than an outcome nobody
@@ -6838,7 +7055,7 @@ impl WorkerService {
         mutation: &MutationRequest,
         method: Method,
         caller: &Caller,
-        preparation: Option<Preparation>,
+        preparation: Option<Made>,
     ) -> Result<Option<Prepared>> {
         // Whether this session is still running, for the methods that need it to be. Each of those
         // effects asks this first, so this does too.
@@ -6956,11 +7173,43 @@ impl WorkerService {
                 let params: kr_protocol::agent::AgentApprovalRespondParams =
                     parse(&mutation.params)?;
                 self.wait_before_admission();
-                let admitted = self.broker.admit_approval(
-                    &Self::broker_caller(caller),
-                    &params,
-                    kr_ipc::now_ms(),
-                )?;
+                let now = kr_ipc::now_ms();
+                let caller = Self::broker_caller(caller);
+                let admitted = match preparation {
+                    // The component that read the request has written its answer: the broker
+                    // checks all of it again, and adopts the bytes only if they answer the request.
+                    Some(Made::Encoded(encoded)) => {
+                        let bytes = self.encoded_bytes(
+                            encoded,
+                            None,
+                            &params.target,
+                            params.resource_id,
+                            now,
+                        )?;
+                        self.broker
+                            .admit_encoded_approval(&caller, &params, &bytes, now)?
+                    }
+                    Some(Made::Prepared(_)) => {
+                        return Err(WorkerError::InvalidArgument(
+                            "an approval's answer is not an action's prepared effect".to_owned(),
+                        ));
+                    }
+                    None => {
+                        // A request a component read is answered by that component, which is asked
+                        // outside the boundary; the receipt stays `accepted` while it is.
+                        if let Some(request) = self.broker.answer_encoding(
+                            &params.target,
+                            params.resource_id,
+                            &params.option_id,
+                            now,
+                        )? {
+                            return Ok(Some(Prepared::NeedsPreparation(Box::new(Asked::Encode(
+                                Box::new(request),
+                            )))));
+                        }
+                        self.broker.admit_approval(&caller, &params, now)?
+                    }
+                };
                 Ok(Some(self.handoff(admitted, UpstreamKind::Approval)))
             }
             Method::PluginActionInvoke => {
@@ -6970,6 +7219,11 @@ impl WorkerService {
                     params.target.subject.application_instance_id,
                 )?;
                 let registered = self.broker.registered_action(binding_id, &params.action)?;
+                let (preparation, encoded) = match preparation {
+                    Some(Made::Prepared(prepared)) => (Some(*prepared), None),
+                    Some(Made::Encoded(encoded)) => (None, Some(encoded)),
+                    None => (None, None),
+                };
                 // What was prepared is what the first pass checked: the same binding, under the
                 // same declaration, whichever route the declaration names now. A package replaced
                 // while its action was prepared is a different action, and the plan prepared for
@@ -7014,12 +7268,54 @@ impl WorkerService {
                     .is_some_and(|registered| registered.decision.is_some());
                 if answers {
                     self.wait_before_admission();
-                    let admitted = self.broker.admit_plugin_answer(
-                        &Self::broker_caller(caller),
-                        binding_id,
-                        &params,
-                        kr_ipc::now_ms(),
-                    )?;
+                    let now = kr_ipc::now_ms();
+                    let broker_caller = Self::broker_caller(caller);
+                    let admitted = match encoded {
+                        // The binding's component has written the answer to the request it read:
+                        // the broker checks everything again, and adopts the bytes only if they
+                        // answer the request.
+                        Some(encoded) => {
+                            let resource_id =
+                                params.resource_id.as_ref().copied().ok_or_else(|| {
+                                    crate::broker::BrokerError::invalid(format!(
+                                        "{} answers a pending request, and this call names none",
+                                        params.action
+                                    ))
+                                })?;
+                            let bytes = self.encoded_bytes(
+                                encoded,
+                                Some(binding_id),
+                                &params.target,
+                                resource_id,
+                                now,
+                            )?;
+                            self.broker.admit_encoded_plugin_answer(
+                                &broker_caller,
+                                binding_id,
+                                &params,
+                                &bytes,
+                                now,
+                            )?
+                        }
+                        None => {
+                            // A request the binding's component read is answered by that
+                            // component, which is asked outside the boundary.
+                            if let Some(request) = self
+                                .broker
+                                .plugin_answer_encoding(binding_id, &params, now)?
+                            {
+                                return Ok(Some(Prepared::NeedsPreparation(Box::new(
+                                    Asked::Encode(Box::new(request)),
+                                ))));
+                            }
+                            self.broker.admit_plugin_answer(
+                                &broker_caller,
+                                binding_id,
+                                &params,
+                                now,
+                            )?
+                        }
+                    };
                     return Ok(Some(self.handoff(
                         admitted,
                         UpstreamKind::PluginAnswer {
@@ -7077,7 +7373,9 @@ impl WorkerService {
                             binding_id,
                             &params,
                         )?;
-                        return Ok(Some(Prepared::NeedsPreparation(Box::new(request))));
+                        return Ok(Some(Prepared::NeedsPreparation(Box::new(Asked::Prepare(
+                            Box::new(request),
+                        )))));
                     };
                     let effect = prepared.effect?;
                     // Held through the admission and the validation: whatever refuses the action
@@ -7743,44 +8041,88 @@ impl WorkerService {
         }
     }
 
-    /// Serves `history.page`: the session's retained output, to the local owner alone.
+    /// Serves `history.page`: the session's retained output, to the caller's history.
     ///
-    /// A page is a byte range and a grant's history scope is a moment in time, so nothing here can
-    /// narrow one to the other, and a host that cannot narrow content to a grant refuses it rather
-    /// than serving more than the grant allows. The daemon already refuses a paired device this
-    /// read; every caller but the local owner is refused here too, whichever socket it came in on,
-    /// a paired device in the daemon's own words.
+    /// The local owner reads all of it. A caller whose read came with the history scope of the grant
+    /// the daemon decided it under reads what that scope reaches, and a page is a byte range while a
+    /// scope is a moment in time, so the range is narrowed through the record of when the output was
+    /// produced ([`crate::output_times`]): a scope that begins at a moment is served from the start
+    /// of the first interval the record proves was written at or after it, and nothing before that.
+    /// Output the record does not time after that point is served, since cursors only grow; output
+    /// before it is never claimed, timed or not. A caller with no scope that is not the owner is
+    /// refused, whichever socket it came in on, and so is any caller but the owner once the
+    /// session is closed.
     fn history_page(
         &self,
         state: &ConnectionState,
         params: &ParamsValue,
         caller: &Caller,
     ) -> Result<ParamsValue> {
-        if !caller.is_local_owner() {
+        let Some(filter) = caller.history_filter(Method::HistoryPage.entry()) else {
             let refused = if caller.ingress == ActorIngress::PairedDevice {
                 "a paired device"
             } else {
                 "a caller acting under a grant"
             };
             return Err(WorkerError::PermissionDenied {
-                detail: format!("this host does not serve retained history to {refused}"),
+                detail: format!(
+                    "this host does not serve retained history to {refused} whose read came with no \
+                     history scope"
+                ),
             });
-        }
+        };
+        let Some(bound) = filter.first_moment(crate::history_filter::Surface::EventPage) else {
+            return Err(WorkerError::PermissionDenied {
+                detail: "this grant's history does not reach the session's retained output"
+                    .to_owned(),
+            });
+        };
         let params: HistoryPageParams = parse(params)?;
-        let session = self.runtime.session();
-        Self::check_session(&session, params.session_id)?;
         // A page that filled the control frame exactly would not fit once its own metadata was
         // encoded around it, so the request is clamped to what the frame can actually carry, and
         // to what the peer said it can receive.
-        let bound = state
+        let limit = state
             .peer_limits
             .max_control_frame_len
             .get()
             .saturating_sub(kr_protocol::limits::MAX_STREAM_HEADER_LEN as u64)
-            .min(MAX_REPLAY_PAGE_BYTES);
-        let page =
-            session.history_page(params.from_cursor.get(), params.max_bytes.get().min(bound))?;
+            .min(MAX_REPLAY_PAGE_BYTES)
+            .min(params.max_bytes.get());
+        let reach = if bound == 0 {
+            crate::history::Reach::Whole
+        } else {
+            // The record is read with the session let go: the read loop that takes the output in
+            // waits for that lock, and the record is a file. The end of the output is taken first,
+            // so that output written while the record is read is still ahead of the reader.
+            let (end, times) = {
+                let session = self.runtime.session();
+                Self::check_page_session(&session, params.session_id, caller)?;
+                (session.output_cursor(), session.output_time_index())
+            };
+            match times.and_then(|times| times.first_cursor_from(bound)) {
+                Some(first) => crate::history::Reach::From(first),
+                None => crate::history::Reach::Nothing { end },
+            }
+        };
+        let session = self.runtime.session();
+        Self::check_page_session(&session, params.session_id, caller)?;
+        let page = session.history_page_within(params.from_cursor.get(), limit, reach)?;
         encode(&page)
+    }
+
+    /// Checks that a page of retained output is asked of the session this endpoint serves, and, for
+    /// a caller that is not the local owner, that the session is not closed.
+    ///
+    /// A worker goes on answering while the closure it recorded is delivered, and the daemon
+    /// serves a device nothing of a closed session, so a read forwarded in that interval is
+    /// refused here as it would be there. It is decided under the session's lock, so a page is
+    /// read from a session that is not closed or not at all.
+    fn check_page_session(session: &Session, named: SessionId, caller: &Caller) -> Result<()> {
+        Self::check_session(session, named)?;
+        if caller.is_local_owner() {
+            return Ok(());
+        }
+        session.require_live()
     }
 
     /// Serves `events.subscribe`: the screen, the resources the broker arbitrates, and everything
@@ -10665,6 +11007,26 @@ pub struct PendingUpstream {
     handoff: Box<UpstreamHandoff>,
 }
 
+/// An operation whose receipt says unknown and whose upstream answer may still come.
+#[derive(Debug)]
+struct LateOperation {
+    actor_id: ActorId,
+    action_id: kr_protocol::ids::ActionId,
+    /// The operation's name, which the observation's subject begins with.
+    name: String,
+    /// The action of a package the operation carried out, where it carried one: its result names
+    /// the action, as the result of an action that was answered on time does.
+    action: Option<kr_protocol::broker::ActionName>,
+    /// The binding revision the operation was admitted at.
+    revision: kr_protocol::ids::AgentBindingRevision,
+    /// The turn the operation was admitted against, which a steer or a cancellation names. The
+    /// result of an operation answered on time keeps it, and so does the result of one answered
+    /// late.
+    turn_id: Option<kr_protocol::ids::AgentTurnId>,
+    /// The identifier the operation was sent to the upstream under.
+    request: kr_protocol::ids::UpstreamRequestId,
+}
+
 /// What a connection's loop waits for next.
 enum Next {
     /// A frame the peer sent.
@@ -10675,11 +11037,29 @@ enum Next {
     Held(Box<ReadyPreparation>),
 }
 
-/// An accepted action and what its preparation came to.
+/// What the first pass of an accepted action asks of a component, outside the boundary.
+#[derive(Debug)]
+pub enum Asked {
+    /// The package's component prepares the effect of an action.
+    Prepare(Box<PreparationRequest>),
+    /// The component that read an approval writes the answer to it.
+    Encode(Box<EncodeRequest>),
+}
+
+/// What asking a component came to.
+#[derive(Debug)]
+pub enum Made {
+    /// An action's prepared effect, or why there is none.
+    Prepared(Box<Preparation>),
+    /// An approval's answer, or why there is none.
+    Encoded(Encoded),
+}
+
+/// An accepted action and what asking a component for it came to.
 #[derive(Debug)]
 pub struct ReadyPreparation {
     pending: PendingPreparation,
-    preparation: Preparation,
+    preparation: Made,
 }
 
 /// One accepted action whose effect is being prepared outside the boundary.
@@ -10688,8 +11068,8 @@ pub struct ReadyPreparation {
 /// holds nothing up.
 #[derive(Debug)]
 pub struct PendingPreparation {
-    /// What preparing it needs.
-    request: PreparationRequest,
+    /// What the component is asked.
+    request: Asked,
     /// The request as it arrived, for the request identifier and the action.
     mutation: MutationRequest,
     /// Who asked, with the rights the control daemon decided the request under.
@@ -10778,12 +11158,13 @@ enum UpstreamKind {
 pub enum Prepared {
     /// An admitted operation whose transport work happens once the session boundary ends.
     Upstream(Box<UpstreamHandoff>),
-    /// An action whose effect the package's component prepares, which has passed every check that
-    /// can be made before it is prepared.
+    /// An action whose effect the package's component prepares, or an approval whose answer the
+    /// component that read it writes, which has passed every check that can be made before the
+    /// component is asked.
     ///
-    /// Preparing it is a call to another process, so it happens outside the boundary, with the
-    /// receipt still `accepted`; the action comes back with the preparation attached.
-    NeedsPreparation(Box<PreparationRequest>),
+    /// Asking it is a call to another process, so it happens outside the boundary, with the
+    /// receipt still `accepted`; the action comes back with what the component made attached.
+    NeedsPreparation(Box<Asked>),
     /// An action the host carries out itself by redrawing the package's own document, admitted on
     /// its class's right: its receipt is all it is answered with, and nothing leaves the host.
     Presentation(kr_protocol::broker::ActionName),
@@ -10833,12 +11214,28 @@ impl UpstreamHandoff {
     /// deadline this stops waiting for that call or for the upstream, and an answer's claim, which
     /// never left this task, leaves its resource uncertain before this returns; whatever the
     /// transport does afterwards settles nothing.
-    async fn carry(self, deadline: tokio::time::Instant) -> Result<ParamsValue> {
+    async fn carry(
+        self,
+        deadline: tokio::time::Instant,
+    ) -> (Result<ParamsValue>, Option<crate::broker::LateHandle>) {
+        let mut late = None;
+        let outcome = self.carry_with(deadline, &mut late).await;
+        (outcome, late)
+    }
+
+    /// Does what [`Self::carry`] does, and leaves in `late` what claims the upstream's answer to
+    /// the operation if it comes after this has stopped waiting for it.
+    async fn carry_with(
+        self,
+        deadline: tokio::time::Instant,
+        late: &mut Option<crate::broker::LateHandle>,
+    ) -> Result<ParamsValue> {
         let now = kr_ipc::now_ms();
         match self.kind {
             UpstreamKind::Mutation => {
                 let taken = self.broker.take_mutation(&self.admitted)?;
                 let pending = submit_within(taken.transmission(), deadline).await?;
+                *late = pending.late_handle();
                 let flight = taken.submitted(pending);
                 encode(&within(deadline, flight.settled()).await??)
             }
@@ -10849,6 +11246,7 @@ impl UpstreamHandoff {
             UpstreamKind::PluginAction => {
                 let taken = self.broker.take_plugin_action(&self.admitted)?;
                 let pending = submit_within(taken.transmission(), deadline).await?;
+                *late = pending.late_handle();
                 let flight = taken.submitted(pending);
                 encode(&within(deadline, flight.settled()).await??)
             }

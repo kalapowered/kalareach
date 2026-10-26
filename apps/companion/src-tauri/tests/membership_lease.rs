@@ -30,6 +30,11 @@
 //! | KR-REQ-17.53 | `a_lease_that_arrives_after_the_account_changed_is_not_presented` |
 //! | KR-REQ-17.53 | `a_sign_out_ends_the_member_connection_at_once` |
 //! | KR-REQ-17.53 | `a_kept_visit_is_given_the_lease_again_when_the_one_it_holds_has_ended` |
+//! | KR-REQ-17.53 | `a_kept_visit_goes_on_when_the_chain_for_its_new_lease_cannot_be_read` |
+//! | KR-REQ-17.53 | `a_kept_visit_goes_on_when_the_host_finds_its_new_lease_not_yet_valid` |
+//! | KR-REQ-17.53 | `a_kept_visit_presents_a_lease_the_host_refused_no_oftener_than_it_asks_the_service` |
+//! | KR-REQ-17.53 | `a_kept_visit_goes_on_when_the_host_finds_its_new_lease_issued_before_its_key_took_over` |
+//! | KR-REQ-17.53 | `a_kept_visit_goes_on_when_the_host_distrusts_its_clock_at_the_new_lease` |
 //! | KR-REQ-17.53 | `a_visit_that_cannot_get_a_lease_says_why_and_is_not_out_of_contact` |
 //! | KR-REQ-17.53 | `a_sign_in_made_since_clears_what_was_held_against_the_account` |
 //! | KR-REQ-17.53 | `a_visit_does_not_ask_for_the_chain_of_keys_while_the_service_asks_for_a_wait` |
@@ -170,6 +175,8 @@ struct Signing {
     foreign_chain: AtomicBool,
     /// How far behind the host's wall clock the service's runs, in milliseconds.
     behind_ms: AtomicU64,
+    /// How far ahead of the host's wall clock the service's runs, in milliseconds.
+    ahead_ms: AtomicU64,
     /// The rights every lease the organisation signs carries.
     rights: Vec<ActionRight>,
 }
@@ -190,11 +197,20 @@ impl Signing {
             .get()
             .saturating_add_signed(self.moved.load(Ordering::SeqCst))
             .saturating_sub(self.behind_ms.load(Ordering::SeqCst))
+            .saturating_add(self.ahead_ms.load(Ordering::SeqCst))
     }
 
     /// From now on the service's clock is `by` behind the host's.
     fn runs_behind(&self, by: Duration) {
         self.behind_ms.store(
+            u64::try_from(by.as_millis()).expect("a short time"),
+            Ordering::SeqCst,
+        );
+    }
+
+    /// From now on the service's clock is `by` ahead of the host's.
+    fn runs_ahead(&self, by: Duration) {
+        self.ahead_ms.store(
             u64::try_from(by.as_millis()).expect("a short time"),
             Ordering::SeqCst,
         );
@@ -489,6 +505,7 @@ impl Rig {
             other: Organisation::new(0x66, kr_ipc::now_ms().get()),
             foreign_chain: AtomicBool::new(false),
             behind_ms: AtomicU64::new(0),
+            ahead_ms: AtomicU64::new(0),
             rights: rights.to_vec(),
         });
         served.web().serve_organisation(
@@ -597,6 +614,20 @@ impl Rig {
         let member = listed.enrolments.first()?.members.first()?;
         let lease = member.lease.as_ref()?;
         Some((lease.issued_at_ms.get(), lease.expires_at_ms.get()))
+    }
+
+    /// The host holds the lease the organisation signed last.
+    async fn host_holds_the_newest_lease(&self) {
+        let issued = self.signing.issued();
+        let newest = issued.last().expect("a lease");
+        assert_eq!(
+            self.host_holds().await,
+            Some((
+                newest.payload.issued_at_ms.get(),
+                newest.payload.expires_at_ms.get()
+            )),
+            "the host holds the lease the organisation signed last"
+        );
     }
 
     /// How many lease requests have reached the organisation's service.
@@ -742,7 +773,7 @@ impl Rig {
             .into_iter()
             .next()
             .expect("a paired host");
-        let identity = pairing.candidate.paired_identity(host.device_id);
+        let identity = pairing.paired_identity_for(&host);
         tokio::time::timeout(WATCHDOG, pairing.link.connect_paired(&host, &identity))
             .await
             .expect("the connection ends one way or the other")
@@ -760,7 +791,7 @@ impl Rig {
             .into_iter()
             .next()
             .expect("a paired host");
-        let identity = pairing.candidate.paired_identity(host.device_id);
+        let identity = pairing.paired_identity_for(&host);
         tokio::time::timeout(
             WATCHDOG,
             pairing.link.visit_paired(&host, &identity, &|| None),
@@ -1530,6 +1561,226 @@ async fn a_kept_visit_is_given_the_lease_again_when_the_one_it_holds_has_ended()
     assert!(rig.lease_requests() > requests, "a new lease was asked for");
 }
 
+/// A member host the inbox keeps a visit to, read once. Five minutes have passed by the device's
+/// clock, which is when the lease the host holds is due to be replaced, and by that clock the lease
+/// has ten minutes left; the host's clock has not moved. The host in use, which the application was
+/// told to use so that the member host is only visited, is returned to be kept running.
+async fn visit_kept_with_its_lease_due() -> (Rig, Host, Arc<InboxDesk>) {
+    let rig = Rig::start().await;
+    rig.connection(true).await;
+    let elsewhere = rig.uses_another_host().await;
+    let desk = Arc::new(InboxDesk::default());
+    let first = rig.inbox_of(&desk).await;
+    assert_eq!(first.state, HostInboxState::Read, "{:?}", first.refusal);
+    rig.waits.time_passes(Duration::from_secs(5 * 60 + 1));
+    (rig, elsewhere, desk)
+}
+
+/// KR-REQ-17.53: a kept visit that cannot replace its lease goes on while the lease the host holds
+/// lasts, and the lease the service gave is presented once what stopped it has passed. The
+/// organisation has rotated its key, so the new lease needs the chain of keys, and the request for
+/// the chain fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kept_visit_goes_on_when_the_chain_for_its_new_lease_cannot_be_read() {
+    let (rig, _elsewhere, desk) = visit_kept_with_its_lease_due().await;
+    rig.fixture.pass_wall(Duration::from_millis(MINUTE_MS));
+    assert_eq!(rig.signing.rotates(), 3);
+    rig.fixture.pass_wall(Duration::from_millis(MINUTE_MS));
+    let (held, requests, chains) = (
+        rig.host_holds().await,
+        rig.lease_requests(),
+        rig.authority_requests(),
+    );
+    rig.refuses_the_next_chain(Moment::Refuse {
+        status: 503,
+        code: "SERVICE_UNAVAILABLE",
+        retry_after_seconds: None,
+    });
+
+    let renewing = rig.inbox_of(&desk).await;
+    assert_eq!(
+        renewing.state,
+        HostInboxState::Read,
+        "{:?}",
+        renewing.refusal
+    );
+    assert_eq!(
+        rig.lease_requests(),
+        requests + 1,
+        "a new lease was asked for"
+    );
+    assert_eq!(
+        rig.authority_requests(),
+        chains + 1,
+        "its chain was refused"
+    );
+    assert_eq!(
+        rig.host_holds().await,
+        held,
+        "the host holds the lease it held"
+    );
+
+    // What is held against the service ends, and the chain is read: the lease that was got is
+    // presented and not asked for again.
+    rig.waits.time_passes(Duration::from_secs(61));
+    let renewed = rig.inbox_of(&desk).await;
+    assert_eq!(renewed.state, HostInboxState::Read, "{:?}", renewed.refusal);
+    assert_eq!(
+        rig.lease_requests(),
+        requests + 1,
+        "nothing more was asked for"
+    );
+    rig.host_holds_the_newest_lease().await;
+}
+
+/// KR-REQ-17.53: a kept visit goes on when the host refuses its new lease as not yet valid, which
+/// time mends: the service's clock runs ahead of the host's. The host's clock reaches the moment the
+/// lease was issued, and the lease that was got is presented.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kept_visit_goes_on_when_the_host_finds_its_new_lease_not_yet_valid() {
+    let (rig, _elsewhere, desk) = visit_kept_with_its_lease_due().await;
+    rig.signing.runs_ahead(Duration::from_secs(2 * 60));
+    let (held, requests) = (rig.host_holds().await, rig.lease_requests());
+
+    let renewing = rig.inbox_of(&desk).await;
+    assert_eq!(
+        renewing.state,
+        HostInboxState::Read,
+        "{:?}",
+        renewing.refusal
+    );
+    assert_eq!(
+        rig.lease_requests(),
+        requests + 1,
+        "a new lease was asked for"
+    );
+    assert_eq!(
+        rig.host_holds().await,
+        held,
+        "the host holds the lease it held"
+    );
+
+    rig.fixture.pass_wall(Duration::from_secs(3 * 60));
+    rig.waits.time_passes(Duration::from_secs(61));
+    let renewed = rig.inbox_of(&desk).await;
+    assert_eq!(renewed.state, HostInboxState::Read, "{:?}", renewed.refusal);
+    assert_eq!(
+        rig.lease_requests(),
+        requests + 1,
+        "nothing more was asked for"
+    );
+    rig.host_holds_the_newest_lease().await;
+}
+
+/// KR-REQ-17.53: a kept visit does not present again a new lease the host refused until what is
+/// held against the service is over, however often the inbox passes: the host records each
+/// presentation, refused or not, and never removes the row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kept_visit_presents_a_lease_the_host_refused_no_oftener_than_it_asks_the_service() {
+    let (rig, _elsewhere, desk) = visit_kept_with_its_lease_due().await;
+    rig.signing.runs_ahead(Duration::from_secs(2 * 60));
+    let renewing = rig.inbox_of(&desk).await;
+    assert_eq!(
+        renewing.state,
+        HostInboxState::Read,
+        "{:?}",
+        renewing.refusal
+    );
+    let (rows, requests) = (rig.recorded_actions(), rig.lease_requests());
+
+    for _ in 0..4 {
+        let pass = rig.inbox_of(&desk).await;
+        assert_eq!(pass.state, HostInboxState::Read, "{:?}", pass.refusal);
+    }
+    assert_eq!(
+        rig.recorded_actions(),
+        rows,
+        "a pass while the renewal is waited out writes no row"
+    );
+    assert_eq!(rig.lease_requests(), requests);
+}
+
+/// KR-REQ-17.53: a kept visit goes on when the host refuses its new lease as issued before the
+/// signing key took over, which the service's clock being right again mends: the lease is dropped
+/// and another is asked for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kept_visit_goes_on_when_the_host_finds_its_new_lease_issued_before_its_key_took_over() {
+    let (rig, _elsewhere, desk) = visit_kept_with_its_lease_due().await;
+    rig.fixture.pass_wall(Duration::from_millis(MINUTE_MS));
+    assert_eq!(rig.signing.rotates(), 3);
+    rig.fixture.pass_wall(Duration::from_millis(MINUTE_MS));
+    // The first renewal brings the new key in, with its chain.
+    let first = rig.inbox_of(&desk).await;
+    assert_eq!(first.state, HostInboxState::Read, "{:?}", first.refusal);
+    rig.host_holds_the_newest_lease().await;
+
+    // Five minutes on, the service's clock runs behind the moment the key took over.
+    rig.waits.time_passes(Duration::from_secs(5 * 60 + 1));
+    rig.fixture.pass_wall(Duration::from_millis(5 * MINUTE_MS));
+    rig.signing.runs_behind(Duration::from_secs(7 * 60));
+    let (held, requests) = (rig.host_holds().await, rig.lease_requests());
+
+    let renewing = rig.inbox_of(&desk).await;
+    assert_eq!(
+        renewing.state,
+        HostInboxState::Read,
+        "{:?}",
+        renewing.refusal
+    );
+    assert_eq!(
+        rig.lease_requests(),
+        requests + 1,
+        "a new lease was asked for"
+    );
+    assert_eq!(
+        rig.host_holds().await,
+        held,
+        "the host holds the lease it held"
+    );
+
+    rig.signing.runs_behind(Duration::ZERO);
+    rig.waits.time_passes(Duration::from_secs(61));
+    let renewed = rig.inbox_of(&desk).await;
+    assert_eq!(renewed.state, HostInboxState::Read, "{:?}", renewed.refusal);
+    assert_eq!(
+        rig.lease_requests(),
+        requests + 2,
+        "the lease the host refused was dropped and another asked for"
+    );
+    rig.host_holds_the_newest_lease().await;
+}
+
+/// KR-REQ-17.53: a kept visit goes on when the host refuses its new lease because it distrusts its
+/// clock, and the host still serves the lease it holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kept_visit_goes_on_when_the_host_distrusts_its_clock_at_the_new_lease() {
+    let (rig, _elsewhere, desk) = visit_kept_with_its_lease_due().await;
+    // The host's wall clock goes back by more than it allows, and the host finds out.
+    rig.fixture.pass_wall(Duration::from_millis(2 * MINUTE_MS));
+    assert!(rig.fixture.listed().await.clock_trusted);
+    rig.fixture.moved.fetch_sub(10_000, Ordering::SeqCst);
+    assert!(!rig.fixture.listed().await.clock_trusted);
+    let (held, requests) = (rig.host_holds().await, rig.lease_requests());
+
+    let renewing = rig.inbox_of(&desk).await;
+    assert_eq!(
+        renewing.state,
+        HostInboxState::Read,
+        "{:?}",
+        renewing.refusal
+    );
+    assert_eq!(
+        rig.lease_requests(),
+        requests + 1,
+        "a new lease was asked for"
+    );
+    assert_eq!(
+        rig.host_holds().await,
+        held,
+        "the host holds the lease it held"
+    );
+}
+
 /// KR-REQ-17.53: a visit that cannot give the host the device's lease says why. A host that is
 /// reachable is not out of contact because this device is signed out: the row shows the reason in
 /// words, and no loss of contact is noted.
@@ -1890,7 +2141,7 @@ async fn an_owner_that_cannot_get_its_lease_is_shown_why_and_is_not_out_of_conta
 /// the preview key is not sent: the host would take it under the lease of the account that left.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_push_run_sends_its_changes_only_under_the_account_its_connection_was_opened_under() {
-    use companion_tauri::push::{ConnectionRegistrar, Reach, Registrar as _};
+    use companion_tauri::push::{ConnectionRegistrar, LineStop, Reach, Registrar as _};
 
     let rig = Rig::start().await;
     rig.connection(true).await;
@@ -1913,10 +2164,13 @@ async fn a_push_run_sends_its_changes_only_under_the_account_its_connection_was_
     rig.switches_to("bea").await;
     let key = *device.identity().keys.notification_preview.public();
     let refused = line
-        .update_preview_key(key)
+        .update_preview_key(key, kr_protocol::ids::DeviceKeyRevision::new(1))
         .await
         .expect_err("the key is not sent for an account that has left");
-    assert!(refused.contains("changed"), "{refused}");
+    assert!(
+        matches!(&refused, LineStop::Phone(words) if words.contains("changed")),
+        "the phone stopped itself, in the lease's words: {refused:?}"
+    );
 }
 
 /// The rights of a member who may type into a session's terminal.
