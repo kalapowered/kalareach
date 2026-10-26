@@ -1,0 +1,31 @@
+[package]
+name = "kr-release-matrix-check"
+description = "The question a release asks before it is published: whether the signed release matrix the managed service publishes lists a tier for the build being released"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "kr-release-matrix-check"
+path = "src/main.rs"
+
+[dependencies]
+# The matrix client: the same verifier and the same pin a host's daemon uses, so a release is held
+# to what the hosts that run it will read.
+kr-client.workspace = true
+# The package version this build carries, which is the client axis of the matrix.
+kr-protocol.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+
+[dev-dependencies]
+# The program is run against the stand-in service, which signs a matrix with a key of its own.
+kr-service-stand-in = { path = "../../tests/support/service-stand-in" }
+kr-crypto.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "process", "rt-multi-thread"] }
+
+[lints]
+workspace = true
