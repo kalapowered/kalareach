@@ -3995,8 +3995,9 @@ async fn a_stored_apply_node_is_admitted_across_an_update_and_a_rollback() {
 /// refuses an owner device for the wait. A rollback to the release before is not refused, and it
 /// leaves the record where it was, unread: the release before serves the same device, which is the
 /// loss the guide states. An update again finds the record, and the host waits again, refusing the
-/// device and with the record rewritten to name the policy it holds and the moment the restore was
-/// found kept, until the person at the machine confirms.
+/// device and with the record rewritten to name the policy it holds, and the moment the restore was
+/// found and the list of what the wait owes kept, until the person at the machine has revoked what
+/// the list names and confirms.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_leaves_the_record_of_a_restored_policy_and_an_update_again_waits_on_it() {
     use kr_controller::grants::restored::{self, Found, Record};
@@ -4014,12 +4015,24 @@ async fn a_rollback_leaves_the_record_of_a_restored_policy_and_an_update_again_w
     door.is_served_again()
         .await
         .expect("the control: with no wait standing the owner device is served");
+    // A device the wait will owe: the record lists it, and the release before knows nothing of the
+    // list.
+    let guest = door
+        .pair_a_guest(&endpoint, updated.host.tree.environment_id(), "A guest")
+        .await;
     assert!(updated.host.stop_the_daemon().await, "the daemon stops");
     bind_the_network_at(&updated.host, &door.host_socket().to_string());
-    let found = Record::of(
-        kr_protocol::scalars::Digest256::from_bytes([7; 32]),
-        kr_protocol::scalars::TimestampMs::new(1_000),
-    );
+    let owed = restored::Owed {
+        origin: kr_protocol::scalars::Digest256::from_bytes([9; 32]),
+        target: restored::Target::Device(guest),
+    };
+    let found = Record {
+        owed: vec![owed],
+        ..Record::of(
+            kr_protocol::scalars::Digest256::from_bytes([7; 32]),
+            kr_protocol::scalars::TimestampMs::new(1_000),
+        )
+    };
     restored::write(&file, &found).expect("a record of a restore");
     let controller = updated.host.store.stable(Program::Controller);
     updated.host.start_daemon(&controller).await;
@@ -4041,6 +4054,7 @@ async fn a_rollback_leaves_the_record_of_a_restored_policy_and_an_update_again_w
     };
     assert_ne!(held.subject, found.subject);
     assert_eq!(held.found_at_ms, found.found_at_ms);
+    assert_eq!(held.owed, vec![owed], "and kept the list");
     let written = std::fs::read(&file).expect("the record reads");
 
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
@@ -4104,6 +4118,32 @@ async fn a_rollback_leaves_the_record_of_a_restored_policy_and_an_update_again_w
     let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
         .await
         .expect("reaches the daemon");
+    let refused = pairing::mutate_as::<_, HostPolicyConfirmResult>(
+        host.tree.environment_id(),
+        &mut client,
+        kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+        Method::HostPolicyConfirm,
+        &HostPolicyConfirmParams {},
+    )
+    .await
+    .expect_err("the guest the list owes is live, so the wait is not ended");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::PermissionDenied
+    );
+    assert!(
+        refused.message.contains(&guest.to_string()),
+        "the refusal names it: {refused:?}"
+    );
+    let _: kr_protocol::sharing::RevocationResult = pairing::mutate_as(
+        host.tree.environment_id(),
+        &mut client,
+        kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+        Method::DeviceRevoke,
+        &kr_protocol::sharing::DeviceRevokeParams { device_id: guest },
+    )
+    .await
+    .expect("the person at this machine revokes the guest");
     let confirmed: HostPolicyConfirmResult = pairing::mutate_as(
         host.tree.environment_id(),
         &mut client,

@@ -279,13 +279,27 @@ async fn a_record_that_describes_no_policy_is_removed() {
 /// name the row now held. Nobody confirmed that row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_record_naming_another_row_is_a_wait_and_is_rewritten_to_name_the_row_held() {
+    // The record also lists a device the wait owes, which the rewrite must keep.
+    let owed = restored::Owed {
+        origin: Digest256::from_bytes([9; 32]),
+        target: restored::Target::Device(kr_protocol::ids::DeviceId::new(
+            kr_protocol::scalars::Uuid::from_bytes([5; 16]),
+        )),
+    };
     let Restored {
         host,
         device,
         record,
         ..
     } = a_host_started_on(|registry| {
-        restored::write(&restored::file_beside(registry), &a_record()).expect("a record")
+        restored::write(
+            &restored::file_beside(registry),
+            &Record {
+                owed: vec![owed],
+                ..a_record()
+            },
+        )
+        .expect("a record")
     })
     .await;
     assert!(
@@ -305,6 +319,7 @@ async fn a_record_naming_another_row_is_a_wait_and_is_rewritten_to_name_the_row_
         a_record().found_at_ms,
         "and the moment the restore was found stays"
     );
+    assert_eq!(named.owed, vec![owed], "and what the wait owes is kept");
     let host = host.restart().await;
     assert!(
         is_refused_for_the_restored_policy(&doctor_as_the_device(&host, &device, &record).await),

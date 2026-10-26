@@ -825,6 +825,31 @@ async fn a_refusal_is_on_immutable_ground_only_when_the_issuers_record_fixes_it(
         "the key of a revoked device that did not sign, which is the same fact"
     );
 
+    // The grant's own fact holds of a viewer that is revoked now as it did the day it paired.
+    let former_viewer_key = AuthorisationKeyPair::generate().expect("a key");
+    let former_viewer = paired_signing_as(
+        &controller,
+        5,
+        *former_viewer_key.public(),
+        &[ActionRight::SessionView],
+        None,
+    );
+    controller
+        .devices
+        .revoke(former_viewer.device_id, TimestampMs::new(2))
+        .expect("the viewer is revoked");
+    assert_eq!(
+        judged(&signed(
+            &controller,
+            &former_viewer_key,
+            former_viewer.device_id,
+            named.device_id,
+            11
+        )),
+        refused(RejectionReason::NoOwnerAuthority, Ground::Immutable),
+        "a revoked device whose grant never held the right to manage the host"
+    );
+
     // Mutable: no device of that identity; a device that is no longer paired, revoked or expired;
     // and a request that names nothing the registry holds.
     assert_eq!(

@@ -1359,7 +1359,7 @@ pub struct PolicyArguments {
     /// it comes after this command unless the terminal can end it. A host that is exclusively
     /// organisation-managed cannot withdraw its last enrolment until exclusive management has
     /// ended. A host that reads an authority feed refuses the confirmation until a scan of this run
-    /// has read the feed through and carried out, or settled, every record it holds; run the
+    /// has read the feed through and written what it owes; run the
     /// command again once `kr doctor` no longer says so. It also refuses while a device or share
     /// that a request the feed holds names is live here: the refusal names them, and you revoke
     /// each at this machine with `kr device revoke` or `kr share revoke`. When they are every owner

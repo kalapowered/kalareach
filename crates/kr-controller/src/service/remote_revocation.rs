@@ -291,20 +291,24 @@ impl Controller {
                 Ground::Immutable,
             ));
         }
+        // A grant is written once, when the device pairs: lacking the right to manage this host is
+        // the grant's own fact, and not the configuration's ceiling, which can change. It holds of
+        // a device that is revoked or expired now as it did on the day it paired.
+        if held
+            .as_ref()
+            .is_some_and(|record| !record.grant.actions.contains(&ActionRight::HostManage))
+        {
+            return Ok(Judged::Refuse(
+                RejectionReason::NoOwnerAuthority,
+                Ground::Immutable,
+            ));
+        }
         let Some(issuer) = held.filter(DeviceRecord::is_paired) else {
             return Ok(Judged::Refuse(
                 RejectionReason::NoOwnerAuthority,
                 Ground::Mutable,
             ));
         };
-        // A grant is written once, when the device pairs: lacking the right to manage this host is
-        // the grant's own fact, and not the configuration's ceiling, which can change.
-        if !issuer.grant.actions.contains(&ActionRight::HostManage) {
-            return Ok(Judged::Refuse(
-                RejectionReason::NoOwnerAuthority,
-                Ground::Immutable,
-            ));
-        }
         match self.standing_to_manage(&issuer, now_ms, Some(place)) {
             Standing::Holds => {}
             Standing::Not => {

@@ -7078,8 +7078,8 @@ The feed takes a request from anyone who holds a key, so the hold has a bound. T
 run that reads the feed through while a wait stands fixes the highest sequence it saw, and a request
 above it was published after the restore the wait is for. The host judges that request as before: it
 refuses it when it cannot carry it out, and owes nothing for it. A restart fixes the bound again
-from its own first reading, and so does each finding. A request on the feed when the run first read
-it is held and owed whoever published it. The cost is that a stranger's request that names a device the
+from its own first reading, and so does each finding. A request at or below the bound is held and
+owed whoever published it. The cost is that a stranger's request that names a device the
 person wants to keep costs the person that device's revocation, and the host has no command that
 refuses a held request.
 
@@ -7088,15 +7088,18 @@ it, with a digest of the origin of the feed it came from. The host writes what a
 names to the record before it acts on any record of the page, so a stop, an error, an abort of the
 carrier or the feed's removal part way through a scan keeps it. A write that fails stops the pass
 before the host acts on the page, and the next pass writes again. An entry leaves the list when its
-target is no longer live, or when a scan that read the feed through settled the requests that named
-it. It never leaves because the scan did not meet a request: a request the feed dropped after its
-retention leaves its entry where it was. A scan of another feed clears only entries of its own
+target is no longer live, or when a scan of the run that wrote it, having read the feed through,
+settled every request of that run that named it. It never leaves because a scan did not meet a
+request: a request the feed dropped after its retention leaves its entry where it was, even when a
+request left on the feed names the same target and is settled. An entry an earlier run wrote leaves
+only when its target is no longer live, because nothing in the record says which request wrote it,
+and a request the feed has since dropped may have. A scan of another feed clears only entries of its own
 origin, so pointing the host at a feed that holds nothing for it clears nothing. A device is live
 while the registry holds it unrevoked, and a share is live while an unrevoked device holds it as its
 pairing grant or the grant store holds it unrevoked. A registry that cannot be read shows every
 target live. The list can hold a target whose request the host then dismissed on evidence, until the
-next scan that reads the feed through clears it, or, on a host that reads no feed, until the person
-revokes the target. It holds at most 512 entries, and the file at most 64 KiB. Past that the host
+scan of the run that wrote the entry reads the feed through and clears it, or, when a stop came
+first, until the person revokes the target. It holds at most 512 entries, and the file at most 64 KiB. Past that the host
 keeps what it holds and adds by the lowest sequence, the scan does not count as read through, and the
 refusal says that the list is full; revoking some lets the next scan find the others. A list of
 exactly 512 entries reads as full after a restart while an entry is live.
@@ -7150,11 +7153,12 @@ judge. Until then the registry is the restored one, a device an owner revoked th
 after the copy is live in it, and the list may belong to a registry that an earlier restore left
 behind; a confirmation would end the refusal that holds it back. The refusal says so, the doctor's
 `restored-policy` check says it until the scan is done, and the host asks its feed again by itself.
-Where the scan is held behind the request of a device whose
-standing the host cannot decide because the clock lost its continuity, the refusal and the doctor name
-the device. A reboot of the machine ends the lost continuity, and revoking the device at the machine
-holds its request, with what the request names still owed; either lets the next scan finish. Establishing the clock does not, because an
-owner device's confirmation is refused while the wait stands.
+A request whose issuer's standing the host cannot decide, because the clock lost its continuity,
+waits and does not hold the confirmation back: what it names is owed, and the refusal names those
+devices and shares. The feed check of `kr doctor` names the issuing device. A reboot of the machine
+ends the lost continuity, so that the host judges the request. Revoking the issuing device holds the
+request, with what it names still owed. Establishing the clock does not help, because an owner
+device's confirmation is refused while the wait stands.
 A host that cannot reach its feed is confirmed by taking `authority.origin` out of the configuration
 document and starting the daemon again, once no device or share on its list is live. The list stays
 in the record, so taking the origin out does not end what the host owes. The cost is that the host
