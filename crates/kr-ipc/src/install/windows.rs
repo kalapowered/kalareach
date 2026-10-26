@@ -663,28 +663,41 @@ impl Left {
     }
 }
 
-/// What a test runs at the one moment a removal can be raced: right after a directory was pinned
-/// and checked, before its names are read.
-#[cfg(feature = "testing")]
-pub(super) static AFTER_PIN: std::sync::Mutex<Option<PinHook>> = std::sync::Mutex::new(None);
+/// The moments of a removal at which another process of the account can act, and at which a test
+/// acts in its place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Moment {
+    /// The store's trash was checked to be a plain directory and is about to be opened.
+    TrashChecked,
+    /// A directory was pinned and checked, before its names are read.
+    Pinned,
+    /// A name was opened to be deleted, before it is marked for deletion.
+    Opened,
+    /// The access list of a file is open and is about to be reset.
+    AboutToGiveBack,
+}
 
-/// What a test runs, with the pinned directory's path.
+/// What a test runs at each moment, with the path of what the removal is at.
 #[cfg(feature = "testing")]
-pub(super) type PinHook = std::sync::Arc<dyn Fn(&Path) + Send + Sync>;
+pub(super) static HOOK: std::sync::Mutex<Option<Hook>> = std::sync::Mutex::new(None);
+
+/// What a test runs at a moment.
+#[cfg(feature = "testing")]
+pub type Hook = std::sync::Arc<dyn Fn(Moment, &Path) + Send + Sync>;
 
 #[cfg(feature = "testing")]
-fn after_pin(directory: &Path) {
-    let hook = AFTER_PIN
+pub(super) fn at(moment: Moment, path: &Path) {
+    let hook = HOOK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     if let Some(hook) = hook {
-        hook(directory);
+        hook(moment, path);
     }
 }
 
 #[cfg(not(feature = "testing"))]
-fn after_pin(_directory: &Path) {}
+pub(super) fn at(_moment: Moment, _path: &Path) {}
 
 /// A failure that is not a program's hold: the operating system's code is left out of it, so that
 /// nothing takes it for one.
@@ -785,7 +798,7 @@ fn remove_directory(reach: Reach<'_>, shown: &Path, left: &mut Left) -> bool {
         left.add(refused("cannot give back", shown, &error));
         return false;
     }
-    after_pin(shown);
+    at(Moment::Pinned, shown);
     let mut emptied = true;
     let mut restart = true;
     loop {
@@ -927,7 +940,7 @@ fn list_next(handle: &File, restart: bool) -> io::Result<Option<Vec<Listed>>> {
 fn remove_name(reach: Reach<'_>, shown: &Path) -> io::Result<()> {
     let denied =
         |error: &io::Error| error.raw_os_error() == Some(ERROR_ACCESS_DENIED.cast_signed());
-    match delete_name(reach) {
+    match delete_name(reach, shown) {
         Err(error) if denied(&error) => {
             match reach.open(FILE_WRITE_ATTRIBUTES, SHARE_ALL) {
                 Ok(_) => return Err(error),
@@ -937,6 +950,7 @@ fn remove_name(reach: Reach<'_>, shown: &Path) -> io::Result<()> {
             let sealed = reach
                 .open(READ_CONTROL | WRITE_DAC, SHARE_ALL)
                 .map_err(|error| refused("cannot give back", shown, &error))?;
+            at(Moment::AboutToGiveBack, shown);
             if !has_the_seals_list(&sealed)
                 .map_err(|error| refused("cannot read the list of", shown, &error))?
             {
@@ -948,7 +962,7 @@ fn remove_name(reach: Reach<'_>, shown: &Path) -> io::Result<()> {
             }
             set_list_on(&sealed, OWNER_ONLY)
                 .map_err(|error| refused("cannot give back", shown, &error))?;
-            delete_name(reach)
+            delete_name(reach, shown)
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         done => done,
@@ -1131,8 +1145,10 @@ fn open_name(path: &Path, access: u32, share: u32) -> io::Result<File> {
 /// Deletes the name `reach` reaches through a handle opened for the purpose, so that a file other
 /// names share is not changed in any way, and a name goes at once even while a program has the file
 /// open with its delete shared.
-fn delete_name(reach: Reach<'_>) -> io::Result<()> {
-    mark_for_deletion(&reach.open(DELETE, SHARE_ALL)?)
+fn delete_name(reach: Reach<'_>, shown: &Path) -> io::Result<()> {
+    let name = reach.open(DELETE, SHARE_ALL)?;
+    at(Moment::Opened, shown);
+    mark_for_deletion(&name)
 }
 
 /// Marks the object `file` is open on for deletion, with POSIX semantics and the system's rule for

@@ -630,6 +630,99 @@ fn a_release_whose_directory_spells_an_end_record_is_read() {
     assert_eq!(written.len(), 4);
 }
 
+/// The extra data of an entry that makes the parser give up on the directory it is in and take
+/// another end record: a Unicode path field whose checksum is wrong, then a 64-bit end record, its
+/// locator and an end record of its own, which name a directory of many entries. `at` is where in
+/// the archive the extra data begins.
+fn extra_data_with_a_fallback(at: u64) -> Vec<u8> {
+    let unicode_name = b"kr.exe";
+    let mut extra = 0x7075_u16.to_le_bytes().to_vec();
+    extra.extend_from_slice(
+        &u16::try_from(1 + 4 + unicode_name.len())
+            .expect("short")
+            .to_le_bytes(),
+    );
+    extra.push(1);
+    extra.extend_from_slice(&0xDEAD_BEEF_u32.to_le_bytes());
+    extra.extend_from_slice(unicode_name);
+    let record_64_at = at + extra.len() as u64;
+    extra.extend_from_slice(b"PK\x06\x06");
+    extra.extend_from_slice(&44_u64.to_le_bytes());
+    extra.extend_from_slice(&[45, 0, 45, 0]);
+    extra.extend_from_slice(&[0; 8]);
+    extra.extend_from_slice(&5_000_000_u64.to_le_bytes());
+    extra.extend_from_slice(&5_000_000_u64.to_le_bytes());
+    extra.extend_from_slice(&1_u64.to_le_bytes());
+    extra.extend_from_slice(&0_u64.to_le_bytes());
+    extra.extend_from_slice(b"PK\x06\x07");
+    extra.extend_from_slice(&0_u32.to_le_bytes());
+    extra.extend_from_slice(&record_64_at.to_le_bytes());
+    extra.extend_from_slice(&1_u32.to_le_bytes());
+    extra.extend_from_slice(b"PK\x05\x06");
+    extra.extend_from_slice(&[0; 4]);
+    extra.extend_from_slice(&[0xff; 4]);
+    extra.extend_from_slice(&[0xff; 8]);
+    extra.extend_from_slice(&0_u16.to_le_bytes());
+    extra
+}
+
+/// KR-REQ-26.06: a name or the extra data of an entry that holds the signature of an end record, of
+/// its 64-bit form or of that form's locator is refused before the parser runs. The parser gives up
+/// on a directory whose entry it cannot read and takes an earlier end record, here one the archive's
+/// writer set inside an entry's extra data, and sizes what it keeps for the entries that record
+/// counts before anything checks them. The control is the same extra data without the signatures,
+/// which is read; a signature in a checksum or a size is not refused (see the case that reads it).
+#[test]
+fn a_signature_in_a_name_or_in_extra_data_is_refused_before_the_parser_runs() {
+    let first = |extra: Vec<u8>| {
+        let mut members = release();
+        members[0].extra = extra;
+        archive_of(&members)
+    };
+    // Where the directory starts, and so where the first entry's extra data does.
+    let placeholder = first(vec![0; extra_data_with_a_fallback(0).len()]);
+    let directory = placeholder
+        .windows(4)
+        .position(|window| window == b"PK\x01\x02")
+        .expect("a directory");
+    let extra_at = (directory + 46 + release()[0].name.len()) as u64;
+    let harmless = {
+        let mut extra = 0xAAAA_u16.to_le_bytes().to_vec();
+        let filler = extra_data_with_a_fallback(0).len() - 4;
+        extra.extend_from_slice(&u16::try_from(filler).expect("short").to_le_bytes());
+        extra.extend(std::iter::repeat_n(b'x', filler));
+        extra
+    };
+    let mut named = release();
+    named.push(Member::stored(
+        format!("{TOP}/share/PK\x05\x06"),
+        b"a name that holds a signature",
+    ));
+    let refused: Vec<(&str, Vec<u8>)> = vec![
+        (
+            "an end record set inside an entry's extra data",
+            first(extra_data_with_a_fallback(extra_at)),
+        ),
+        ("an end record in a name", archive_of(&named)),
+    ];
+    for (name, bytes) in &refused {
+        let case = Case::new();
+        let error = case
+            .read(bytes, &Limits::DEFAULT)
+            .expect_err("the archive is refused");
+        assert!(
+            error.contains("end record"),
+            "{name} is refused for the signature, before the parser: {error}"
+        );
+        assert!(case.staged().is_empty(), "{name}: nothing was written");
+    }
+    let case = Case::new();
+    assert!(
+        case.read(&first(harmless), &Limits::DEFAULT).is_ok(),
+        "extra data of the same size without a signature is read"
+    );
+}
+
 /// Nothing is written outside the staging directory by an archive that names a place beyond it.
 #[test]
 fn nothing_is_written_beside_the_staging_directory() {

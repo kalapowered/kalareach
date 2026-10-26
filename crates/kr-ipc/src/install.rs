@@ -100,19 +100,18 @@ mod windows;
 #[cfg(windows)]
 pub use windows::{free_space, seal_directory, seal_file, unseal_directory, windows_version};
 
-/// What a test needs to meet a removal at the moment another process of the account changes the
-/// directory it works in.
+/// What a test needs to meet a removal at the moment another process of the account changes
+/// something it works in.
 #[cfg(all(windows, feature = "testing"))]
 pub mod removal_race {
     use std::path::Path;
 
-    /// What runs, with the directory's path, when a removal has pinned a directory.
-    pub type Hook = super::windows::PinHook;
+    pub use super::windows::{Hook, Moment};
 
-    /// Sets what runs when a removal has pinned a directory and checked that it is a plain one,
-    /// before it reads the names in it; `None` takes it away.
-    pub fn after_pin(hook: Option<Hook>) {
-        *super::windows::AFTER_PIN
+    /// Sets what runs at each moment of a removal, with the path the removal is at; `None` takes it
+    /// away.
+    pub fn hook(hook: Option<Hook>) {
+        *super::windows::HOOK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
     }
@@ -2137,6 +2136,7 @@ impl Store {
                 std::io::Error::other(error),
             )
         })?;
+        windows::at(windows::Moment::TrashChecked, &self.trash());
         let removed = self
             .trash()
             .join(format!("{release}-{}", crate::new_uuid()));
