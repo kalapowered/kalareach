@@ -159,8 +159,8 @@ pub struct ApplicationDirectory {
 ///
 /// Gemini CLI's is `.gemini` in the home directory, where it reads `extensions/`. Its recipe's
 /// removal leaves the record of where an extension is installed in place for as long as anything
-/// else stays in the extension's directory ([`keeps_while_others_remain`]), because Gemini CLI
-/// refuses to start while such a directory has no record.
+/// else stays in the extension's directory (a rule of the host's, not of the recipe), because
+/// Gemini CLI refuses to start while such a directory has no record.
 ///
 /// An application this host does not name here has no directory, and a recipe for it places
 /// nothing.
