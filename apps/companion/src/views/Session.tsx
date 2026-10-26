@@ -239,6 +239,7 @@ export function Session({
           sessionId={sessionId}
           subject={subject}
           connected={connected}
+          retried={attempt}
         />
       ) : pane === 'output' ? (
         // What the session wrote, as the host keeps it: one view per session, opening where the
@@ -247,6 +248,7 @@ export function Session({
       ) : (
         <RawTerminal
           sessionId={sessionId}
+          retried={attempt}
           onLeave={() => {
             go({ view: 'session', sessionId, pane: 'semantic' })
           }}
