@@ -571,12 +571,12 @@ as the junction itself and goes as a name. What a junction names is never reache
 
 A file is deleted as a name, through a handle, and nothing else about it changes: a file of the
 release that is a second name for a file outside it goes as a name, and the file outside keeps its
-contents, its attribute and its entries. The one exception is a file whose list begins with the
-seal's own entry, the denial of the owner-rights principal. Deleting a read-only file needs the
-right to change attributes, which that entry denies the owner, so the removal resets the list first;
-a file outside that is a second name for such a file has its list reset with it. A list that denies
-the right and does not begin so is somebody else's: it is left as it is, the removal reports it, and
-the release stays in `trash\`.
+contents, its attribute and its entries. The one exception is a file whose whole access list is the
+seal's own, every entry of it. Deleting a read-only file needs the right to change attributes, which
+the seal's first entry denies the owner, so the removal resets the list first; a file outside that
+is a second name for such a file has its list reset with it. Any other list that denies the right,
+whatever it begins with, is somebody else's: it is left as it is, the removal reports it, and the
+release stays in `trash\`.
 
 A program that runs from a file keeps it: the rest of the release is deleted, and what is left
 stays in `trash\` until an update finds the program ended. A refusal that no program caused, such as

@@ -43,7 +43,7 @@ use windows_sys::Win32::Security::Authorization::{
     SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    ACCESS_DENIED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce,
+    ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, GetSecurityDescriptorDacl,
     PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SetKernelObjectSecurity,
 };
 use windows_sys::Win32::Storage::FileSystem::{
@@ -60,7 +60,6 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::IO::{DeviceIoControl, IO_STATUS_BLOCK};
 use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
 use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
-use windows_sys::Win32::System::SystemServices::ACCESS_DENIED_ACE_TYPE;
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, PROCESS_NAME_WIN32, QueryFullProcessImageNameW,
 };
@@ -916,8 +915,8 @@ fn list_next(handle: &File, restart: bool) -> io::Result<Option<Vec<Listed>>> {
 ///
 /// Deleting a read-only file asks for the right to change attributes, and the entries the seal puts
 /// on a file deny its owner that right. A refusal is therefore either the seal or a program that
-/// runs from the file, and the right is asked for to tell which. When the list denies it and begins
-/// with the seal's own entry, the file is given back to its owner, the one change to a file's
+/// runs from the file, and the right is asked for to tell which. When the file's list is the
+/// seal's own, the whole of it, the file is given back to its owner, the one change to a file's
 /// access list a removal makes, and the delete is tried again. A list that denies the right and is
 /// not the seal's is somebody else's, and it is left as it is and reported.
 ///
@@ -938,7 +937,7 @@ fn remove_name(reach: Reach<'_>, shown: &Path) -> io::Result<()> {
             let sealed = reach
                 .open(READ_CONTROL | WRITE_DAC, SHARE_ALL)
                 .map_err(|error| refused("cannot give back", shown, &error))?;
-            if !begins_with_the_seals_entry(&sealed)
+            if !has_the_seals_list(&sealed)
                 .map_err(|error| refused("cannot read the list of", shown, &error))?
             {
                 return Err(refused(
@@ -956,54 +955,98 @@ fn remove_name(reach: Reach<'_>, shown: &Path) -> io::Result<()> {
     }
 }
 
-/// The SID of the owner-rights principal, `S-1-3-4`, as the bytes an entry carries it in.
-const OWNER_RIGHTS_SID: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 3, 4, 0, 0, 0];
+/// The entries of the access list at `list`, each as the bytes it is stored in, in order.
+///
+/// # Safety
+///
+/// `list` is null or points at a list that lives for the call.
+unsafe fn entries_of(list: *mut ACL) -> Vec<Vec<u8>> {
+    let mut entries = Vec::new();
+    if list.is_null() {
+        return entries;
+    }
+    // SAFETY: the list is valid, as the caller says.
+    for index in 0..u32::from(unsafe { (*list).AceCount }) {
+        let mut entry: *mut std::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: the list is valid, `index` is below its count, and `entry` is a live out
+        // parameter; the entry is read only as far as its own header says it reaches.
+        let stored = unsafe {
+            if GetAce(list, index, &raw mut entry) == 0 {
+                break;
+            }
+            std::slice::from_raw_parts(
+                entry.cast::<u8>(),
+                usize::from((*entry.cast::<ACE_HEADER>()).AceSize),
+            )
+            .to_vec()
+        };
+        entries.push(stored);
+    }
+    entries
+}
 
-/// Whether the access list of the open file begins with the entry the seal puts first: one that
-/// denies the owner-rights principal the right to write attributes. The handle was opened with the
-/// right to read the list.
-fn begins_with_the_seals_entry(file: &File) -> io::Result<bool> {
-    let mut list: *mut ACL = std::ptr::null_mut();
-    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-    // SAFETY: the handle is the open file's own, and `list` and `descriptor` are live out
-    // parameters; the descriptor owns the list and is freed after its last use below.
-    let status = unsafe {
-        GetSecurityInfo(
-            file.as_raw_handle(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
+/// Whether the access list of the open file is the seal's own, every entry of it: the list
+/// [`sealed_list`] writes for a file, nothing added and nothing missing. The handle was opened with
+/// the right to read the list.
+fn has_the_seals_list(file: &File) -> io::Result<bool> {
+    let wide: Vec<u16> = sealed_list(false).encode_utf16().chain([0]).collect();
+    let mut sealed: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: `wide` is null-terminated and outlives the call, and `sealed` is a live out
+    // parameter; the size is not asked for.
+    let parsed = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wide.as_ptr(),
+            SDDL_REVISION_1,
+            &raw mut sealed,
             std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &raw mut list,
-            std::ptr::null_mut(),
-            &raw mut descriptor,
         )
     };
-    if status != 0 {
-        return Err(io::Error::from_raw_os_error(status.cast_signed()));
+    if parsed == 0 {
+        return Err(io::Error::last_os_error());
     }
-    let mut first: *mut std::ffi::c_void = std::ptr::null_mut();
-    // SAFETY: `list` is the file's list, which `descriptor` keeps alive, and the entry is read
-    // only after the call says it exists and only as far as its own header says it reaches.
-    let sealed = !list.is_null()
-        && unsafe { GetAce(list, 0, &raw mut first) } != 0
-        && unsafe {
-            let header = first.cast::<ACE_HEADER>();
-            let entry = first.cast::<ACCESS_DENIED_ACE>();
-            let sid_at = std::mem::offset_of!(ACCESS_DENIED_ACE, SidStart);
-            u8::try_from(ACCESS_DENIED_ACE_TYPE).is_ok_and(|kind| (*header).AceType == kind)
-                && usize::from((*header).AceSize) >= sid_at + OWNER_RIGHTS_SID.len()
-                && (*entry).Mask & FILE_WRITE_ATTRIBUTES != 0
-                && std::slice::from_raw_parts(
-                    (&raw const (*entry).SidStart).cast::<u8>(),
-                    OWNER_RIGHTS_SID.len(),
-                ) == OWNER_RIGHTS_SID
+    let mut present = 0;
+    let mut defaulted = 0;
+    let mut seal: *mut ACL = std::ptr::null_mut();
+    // SAFETY: `sealed` is the descriptor just built, and the three outputs are live.
+    let found = unsafe {
+        GetSecurityDescriptorDacl(sealed, &raw mut present, &raw mut seal, &raw mut defaulted)
+    };
+    let result = if found == 0 || present == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        let mut list: *mut ACL = std::ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: the handle is the open file's own, and `list` and `descriptor` are live out
+        // parameters; the descriptor owns the list and is freed after its last use below.
+        let status = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &raw mut list,
+                std::ptr::null_mut(),
+                &raw mut descriptor,
+            )
         };
-    // SAFETY: `descriptor` was allocated by the call above and is freed exactly once.
+        if status == 0 {
+            // SAFETY: both lists are valid until their descriptors are freed, which is below.
+            let same = unsafe { entries_of(list) == entries_of(seal) };
+            // SAFETY: `descriptor` was allocated by the call above and is freed exactly once.
+            unsafe {
+                LocalFree(descriptor);
+            }
+            Ok(same)
+        } else {
+            Err(io::Error::from_raw_os_error(status.cast_signed()))
+        }
+    };
+    // SAFETY: `sealed` was allocated by the conversion above and is freed exactly once.
     unsafe {
-        LocalFree(descriptor);
+        LocalFree(sealed);
     }
-    Ok(sealed)
+    result
 }
 
 /// Opens the one name `name` inside the directory `directory` is open on, never what a link there
