@@ -807,30 +807,31 @@ observable, and puts its end-of-file decision on the configured gesture in front
 bound there. A handler the person wrote themselves is left exactly as it is, identified by what the
 editor holds rather than by the name a handler carries, and the editor's own binding is put back on
 each key the module took when it is removed, except where the person has since bound that key
-themselves (and, in the Vi edit mode, a key whose lookup returns both tables' entries: see below).
-Four things hold for the key the gesture is on and for no other. The module binds its decision there in front of whatever
-was bound, the person's own script included, which it runs outside the detach condition. When the
-decision comes off that key it writes back the binding it found and does not look at what the key
-holds by then. In the Emacs edit mode and in the Vi insert table the editor has an operation on
-Ctrl+d, which the module wraps like any other bound key before it binds the decision, so the binding
-it finds there is its own wrapper, and removing the module writes that wrapper back: Ctrl+d keeps
-calling the module's function and not the editor's operation. And the module moves its decision to a
-changed gesture's key when it promotes the change, which is the first end-of-file decision at the
-prompt the change names or after it, or the next prompt's entry while the bridge is registered,
-whichever comes first, and not when it reports the change: until then the new key has no decision on it. The press of the old key that promotes
-the change runs what stood on that old key, which the module reads before it decides, and not what
-the new key held. A key that held nothing does what the editor does with an unbound key: the
-character the press carries goes into the line, and a press that carries none does nothing. Both
-run with the key information of the press that happened. The press that promotes a disabled gesture
-runs what stood on its key in the same way.
+themselves. Four things hold for the key the gesture is on and for no other. The module binds its
+decision there in front of whatever was bound, the person's own script included, which it runs
+outside the detach condition. When the decision comes off that key it puts back what it found only
+while the key is still the module's decision, so a binding the person made on the key since stays
+theirs, and a script of theirs goes back with the description the editor gave it. In the Emacs edit
+mode and in the Vi insert table the editor has an operation on Ctrl+d, which the module wraps like
+any other bound key before it binds the decision, so what it finds there is its own wrapper. The
+wrapper goes back on the key when the decision comes off, and removing the module then puts the
+editor's operation back on it. And the module moves its decision to a changed gesture's key when it
+promotes the change, which is the first end-of-file decision at the prompt the change names or after
+it, or the next prompt's entry while the bridge is registered, whichever comes first, and not when
+it reports the change: until then the new key has no decision on it. The press of the old key that
+promotes the change runs what stood on that old key, which the module reads before it decides, and
+not what the new key held. A key that held nothing does what the editor does with an unbound key:
+the character the press carries goes into the line, and a press that carries none does nothing.
+Whatever runs gets the key information of the press that happened. The press that promotes a
+disabled gesture runs what stood on its key in the same way.
 
 The Vi edit mode has two key tables, and the module binds into the insert table only: the editor
 puts a binding made without `-ViMode` there, and the module wraps none of the command table's keys,
 which the editor lists in angle brackets (`<Ctrl+d>`). In the command table, which Escape opens,
 Ctrl+d stays the editor's own `ViAcceptLineOrExit`, which ends the shell at an empty line, and no
 key of that table takes the decision or reads the mailbox. A lookup of a key that both tables bind
-returns both entries, except for Escape, whose command table entry is `Ignore`. Removing the module
-takes such a key for one the person has rebound and leaves its wrapper on it.
+returns both entries, except for Escape, whose command table entry is `Ignore`, and the module takes
+the entry that is spelled as the key itself, which is the insert table's.
 
 What it pins is a range rather than a release: PowerShell 7.4 or later with PSReadLine 2.3.4 up to
 3.0. The module declares the versions it found in its handshake and the worker refuses an editor
