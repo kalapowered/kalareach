@@ -6905,7 +6905,7 @@ number of enrolments, whether exclusive management is on and the bound.
 A start reads the record. The host waits when the record names the policy it holds, when it names
 another policy (an earlier release rewrote it, or the owner changed it while the wait stood, and
 nobody confirmed the policy now held; the record is then rewritten to name the policy held and keeps
-the moment the restore was found), and when it cannot be read (the file stays and the doctor says so).
+the moment the restore was found, unless the directory cannot be flushed), and when it cannot be read (the file stays and the doctor says so).
 It waits for nothing when there is no record, and it removes a record when it holds no policy. When
 the copy of the policy cannot be read, the start writes the record before it replaces the copy, and
 stops with an error naming the file if it cannot. A pass that cannot write the record of its first
@@ -6919,13 +6919,19 @@ policy as it stands and changes none of it. What the restore revived (an enrolme
 exclusive management ended since, a device revoked at the machine since) stays in force until the
 command that ends it is run. `kr organisation withdraw`, `kr device revoke` and `kr share revoke`
 need no confirmation and work while the wait stands. Ending exclusive management takes an owner
-device's confirmation, which the wait refuses, or the terminal's when no owner device is left that
-can confirm, so it comes after the confirmation. The bound has no command. When it lapses the host
-refuses remote access under a personal grant until it next synchronises, and the bound stays. The
-call is refused while the host knows it is behind its feed. A host that reads a feed and has not
-reached it since it started does not know, so a confirmation then ends the wait until the first
-pass that reads the feed finds the restore again and raises it. The host keeps no record of the
-call: asked again after a lost reply it answers that it lifted nothing. No owner
+device's confirmation, which the wait refuses, or the terminal's when no owner device is left whose
+grant could confirm, which the wait does not change. A host that is exclusively organisation-managed
+cannot withdraw its last enrolment until exclusive management has ended, so on such a host the
+terminal ends it first where it can, and otherwise the confirmation comes first. The bound has no
+command. When it lapses the host refuses remote access under a personal grant until it next
+synchronises, and the bound stays. The call is refused while the host knows it is behind its feed,
+with or without a wait standing. A host that reads a feed and has not reached it since it started
+does not know. A confirmation then ends the wait, and the host serves remote devices from the
+registry as restored, a device that an owner revoked through the feed after the copy among them,
+until the first pass that reads the feed finds the restore again and raises the wait. The host
+keeps no record of the call: asked again after a lost reply it answers that it lifted nothing. The
+call is asked again under the record's lock for the registration and the deadline it was accepted
+under, because it can wait there behind a finding. No owner
 device can make it, since the wait refuses every owner device, and a ceremony would need a new
 subject of an owner confirmation, which changes the level of the protocol. The call is therefore an
 exception to the rule that an owner operation which enlarges what the host answers to takes the
@@ -6940,8 +6946,11 @@ A release from before this store does not name it and neither reads nor writes t
 rollback to it drops the wait: that release serves the restored policy to remote devices as it
 always did. The record stays where it is, and the update that follows reads it and waits again. A
 record that the update check cannot read as a canonical map with a whole-number version also stops
-`kr host update` to a release that lists the store, until the confirmation removes it. A record that
-is such a map but lacks a member makes this build wait and stops no update. The limits: a host stopped between its first finding and the write, and
+`kr host update` to a release that lists the store, until the confirmation removes it, or by hand
+when something other than a file is at its place. A record that the check passes and this build
+cannot read (a member missing or unknown, permissions wider than the owner's) makes this build
+wait, and the check does not stop the update for it; the version it states must still be one the
+target reads. The limits: a host stopped between its first finding and the write, and
 started with its feed unreachable, finds nothing to wait for; and the record is in the state
 directory, so a restore of that directory removes or replaces it.
 
@@ -6997,7 +7006,7 @@ refusal by itself, and a restored policy waits until the person at the machine c
 
 The refusal a removed feed puts on the grants that rest on it applies by kind of grant: work that a
 connection under such a grant had admitted before the removal is held to it where it commits and
-where its answer is written, as it is for the two refusals above, and the default owner grant is
+where its answer is written, as it is for the three refusals above, and the default owner grant is
 not refused. A share a connection acts under is asked as well as the grant it was admitted under,
 because a share keeps the organisation requirement of what it was delegated from. A relayed batch
 stays with the policy's epoch. The grants the removal refuses can widen after it: the owner bounds

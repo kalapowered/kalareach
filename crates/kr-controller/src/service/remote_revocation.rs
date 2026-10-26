@@ -738,7 +738,7 @@ impl Controller {
     /// work which holds the registry's guard or the connection table from its check to its commit
     /// is wholly before it or wholly after it, and it ends the links of the connections it
     /// reaches. It does not wait for the writes to the pairing records that were under way, as the
-    /// two refusals on every remote grant do. A write that read the standing before the removal
+    /// other refusals on every remote grant do. A write that read the standing before the removal
     /// rose, an owner confirmation among them, can commit after the raise has returned: nothing
     /// that follows depends on the order, and a registry that cannot take a write would keep the
     /// removal from being recorded and shown.
