@@ -1265,19 +1265,21 @@ impl Holds {
             if reached.is_err() {
                 let answer = answers.until(via, change, Duration::from_secs(1)).await;
                 panic!(
-                    "{what}: the change never reached held commit {held}; its answer: {answer:?}"
+                    "{what}: the change never reached its commit {}; its answer: {answer:?}",
+                    plan.pass + held
                 );
             }
-            // A device that connects and goes while the change is inside its commit: the host
-            // registers it and withdraws it, and neither waits for the commit or stops a key.
+            // A device that connects and goes while the change is inside its commit, before the
+            // key is typed.
             let (device, record) = &rig.paired;
             RawDevice::connect(&rig.host, device, record).await.close();
             rig.send_key(b"k").await;
             let arrived = rig.until_everything_typed_arrived().await;
             assert!(
                 arrived.is_some() && !self.let_go.load(Ordering::SeqCst),
-                "{what}: the key typed while the change was held at commit {held} did not reach \
-                 the application until the watchdog let the change go"
+                "{what}: the key typed while the change was held at its commit {} did not reach \
+                 the application until the watchdog let the change go",
+                plan.pass + held
             );
             self.go.send(()).expect("the change is waiting");
         }
@@ -1302,14 +1304,15 @@ impl Holds {
 /// the last usable generation and the installed release stayed usable. Nothing here decides by
 /// how long anything took.
 ///
-/// 1. A full mirror whose payload budget this repository does not fit: the sync refuses with that
-///    resource limit. The commit that keeps the generation's trust goes by; the held commits are
-///    the time checkpoint the sync keeps after the limit refused the mirror and the admission
+/// 1. A full mirror whose payload budget this repository does not fit, meeting a second
+///    generation: the sync refuses with that resource limit and the first generation stays the
+///    one in use. The commit that keeps the generation's trust goes by; the held commits are the
+///    time checkpoint the sync keeps after the limit refused the mirror and the admission
 ///    revision's raise that follows a change that stopped.
 /// 2. An update whose second release signs a length shorter than its presentation's bytes: the
-///    installation caches the manifest, stops at the presentation and is unwound. The held commits
-///    are the manifest's cache write, made before the update stopped, and the admission revision's
-///    raise after it.
+///    second generation is synchronised, and the installation caches the manifest, stops at the
+///    presentation and is unwound. The held commits are the manifest's cache write, made before
+///    the update stopped, and the admission revision's raise after it.
 /// 3. A repository that publishes an older generation again, under metadata versions newer than
 ///    the ones this host accepted, so that every signature and version holds and the generation
 ///    number alone refuses it. The held commits are the one that keeps the generation's trust,
@@ -1407,8 +1410,25 @@ async fn a_key_reaches_the_application_while_the_catalogue_meets_a_mirror_limit_
         .await;
     let _: wire::PluginInstallResult = ok(answer).to_typed().expect("an installation result");
 
+    // The repository publishes a second release whose signed length for its presentation is
+    // shorter than the presentation's bytes, and the second generation that lists it. Nothing has
+    // read it yet: the first leg refuses to synchronise it, and the third leg's repository is
+    // built from it.
+    let second = generations::Generation::build(
+        &home.path().join("second"),
+        generations::GenerationSpec {
+            understated_presentation: Some(presentation_length(&first, &package) - 10),
+            ..crowded(2, "0.2.0", Some(first.keys()))
+        },
+    )
+    .await;
+    first.replace_with(&second);
+
     // 1. The owner turns the full mirror on with a payload budget that no part of this repository
-    // fits.
+    // fits, and the sync of the second generation is refused for it. A reclaim that must make room
+    // waits for every worker to say what it holds at the revision the installation raised, so the
+    // case lets each report first: the refusal it meets is the budget's.
+    until_every_worker_has_reported(&rig).await;
     set_budgets(&rig, &repository, |budgets| {
         budgets.full_offline_mirror = true;
         budgets.payload_cache_bytes = U64::new(64);
@@ -1432,26 +1452,15 @@ async fn a_key_reaches_the_application_while_the_catalogue_meets_a_mirror_limit_
     );
     assert_eq!(
         commits, 3,
-        "the held commits are the last ones the sync makes"
+        "the held commits are the last ones the change makes"
     );
-    still_serves(&rig, &repository, 1, first_release).await;
+    still_serves(&rig, &repository, 1, first_release, &package).await;
     set_budgets(&rig, &repository, |budgets| {
         *budgets = kr_plugin_sdk::limits::RepositoryBudgets::defaults();
     })
     .await;
 
-    // 2. The repository publishes a second release whose signed length for its presentation is
-    // shorter than the presentation's bytes. The generation verifies; the release does not install.
-    let second = generations::Generation::build(
-        &home.path().join("second"),
-        generations::GenerationSpec {
-            asset_copy: true,
-            understated_presentation: Some(presentation_length(&first) - 10),
-            ..crowded(2, "0.2.0", Some(first.keys()))
-        },
-    )
-    .await;
-    first.replace_with(&second);
+    // 2. The second generation verifies; its release does not install.
     let (answer, _) = holds
         .hold(
             &mut rig,
@@ -1479,7 +1488,7 @@ async fn a_key_reaches_the_application_while_the_catalogue_meets_a_mirror_limit_
     let said = stopped_on(answer, ErrorCode::AttachmentIntegrity);
     assert!(said.contains("longer than"), "the refusal says why: {said}");
     assert_eq!(commits, 2, "the held commits are all the update makes");
-    still_serves(&rig, &repository, 2, first_release).await;
+    still_serves(&rig, &repository, 2, first_release, &package).await;
 
     // 3. The repository publishes generation one again, signed under newer metadata versions than
     // generation two was accepted at.
@@ -1509,7 +1518,7 @@ async fn a_key_reaches_the_application_while_the_catalogue_meets_a_mirror_limit_
         "the generation number refused it: {said}"
     );
     assert_eq!(commits, 2, "the held commits are all the sync makes");
-    still_serves(&rig, &repository, 2, first_release).await;
+    still_serves(&rig, &repository, 2, first_release, &package).await;
 
     other.close();
     rig.close().await;
@@ -1558,12 +1567,13 @@ fn stopped_on(answer: Outcome, code: ErrorCode) -> String {
 
 /// What the case checks after each event: the catalogue still reads `generation` of the
 /// repository offline, in whole, and the release installed from the first generation is the one
-/// installed.
+/// installed, with every file its manifest declares where it was put.
 async fn still_serves(
     rig: &Rig,
     repository: &kr_plugin_catalogue::RepositoryId,
     generation: u64,
     installed: kr_plugin_sdk::digest::PayloadDigest,
+    plugin: &kr_protocol::ids::PluginId,
 ) {
     let catalogue = rig.host.controller().catalogue().catalogue().lock().await;
     let index = catalogue
@@ -1571,22 +1581,57 @@ async fn still_serves(
         .expect("the active generation is read offline");
     assert_eq!(index.generation.get(), generation);
     assert_eq!(index.entries.len(), 10_000);
-    let plugin = kr_protocol::ids::PluginId::new("kalareach/example-declarative")
-        .expect("a plugin identifier");
     let release = catalogue
-        .installation(rig.host.environment_id, &plugin)
+        .installation(rig.host.environment_id, plugin)
         .expect("readable")
         .expect("installed");
     assert_eq!(release.package_digest, installed);
+    let complete = catalogue
+        .store_of(&release)
+        .check_package(installed, kr_plugin_catalogue::PackageLimits::format())
+        .expect("a readable store");
+    assert!(
+        matches!(complete, kr_plugin_catalogue::PackageCheck::Complete(_)),
+        "the installed release's files are all where they were put"
+    );
 }
 
-/// The length the first release declares for its presentation.
-fn presentation_length(generation: &generations::Generation) -> u64 {
+/// Waits until every worker has said what it holds at the catalogue's admission revision, which a
+/// change that installs a package raises, and which a reclaim that must make room waits for.
+async fn until_every_worker_has_reported(rig: &Rig) {
+    let deadline = tokio::time::Instant::now() + LIVENESS_DEADLINE;
+    loop {
+        let pending = rig
+            .host
+            .controller()
+            .pending_admissions()
+            .await
+            .expect("the admission revision is readable");
+        if pending.is_empty() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the workers did not report at the admission revision: {pending:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The length the release of `plugin` in `generation` declares for its presentation.
+fn presentation_length(
+    generation: &generations::Generation,
+    plugin: &kr_protocol::ids::PluginId,
+) -> u64 {
     let index: kr_plugin_sdk::catalogue::CatalogueIndex = serde_json::from_slice(
         &std::fs::read(generation.targets_dir().join("index.json")).expect("an index"),
     )
     .expect("a readable index");
-    index.entries[0]
+    index
+        .entries
+        .iter()
+        .find(|entry| &entry.plugin_id == plugin)
+        .expect("the release is listed")
         .payloads
         .iter()
         .find(|payload| payload.path.as_str() == kr_plugin_sdk::package::PRESENTATION_FILE)
