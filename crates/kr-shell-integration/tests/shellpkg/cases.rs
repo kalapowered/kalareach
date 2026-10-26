@@ -860,12 +860,20 @@ pub fn a_cancellation_after_a_detach_does_not_detach_the_next_attachment(kind: S
 ///
 /// An escape starts a sequence the editor waits to see finished, and the cancellation ends the
 /// wait with nothing selected. What the reader is left holding is the end of the input, which is
-/// not a byte, and reading it as the byte 0xff would make it the gesture.
+/// not a byte, and reading it as the byte 0xff would make it the gesture. The editor's wait for
+/// the rest of a sequence is made long, so that it is the cancellation that ends it and not the
+/// wait.
 pub fn a_cancelled_key_sequence_is_not_the_gesture_on_a_terminal_whose_eof_byte_is_0xff(
     kind: ShellKind,
 ) {
     let package = Package::built(kind);
-    let mut session = Session::start(&package);
+    let mut session = Session::start_with_profile(
+        &package,
+        Profile {
+            after_configuration: "KEYTIMEOUT=6000\n",
+            ..Profile::ORDINARY
+        },
+    );
     session.first_prompt();
     session.forget_events();
     assert!(session.answered("kr-ready"));
@@ -982,8 +990,8 @@ pub fn the_key_that_promotes_a_changed_gesture_runs_what_was_bound_to_it(kind: S
     );
     session.first_prompt();
 
-    // Nothing is typed before the key itself: the change takes effect at the prompt's first key,
-    // and a command run first would have the next prompt take it on entry.
+    // No command runs before the key itself: the change takes effect at the first gesture key the
+    // prompt sees, and a command run first would have the next prompt take it on entry.
     assert!(session.wait_for_prompt());
     assert!(session.wait_for_editor_reading());
     let start = session.written();
@@ -2072,7 +2080,9 @@ fn worker_side(reason: LaunchRejectionReason) -> bool {
     matches!(
         reason,
         // `revoked` has its own case; the rest are the worker's answers when the reader is gone,
-        // has left, or is not the one the transaction was reserved against.
+        // has left, or is not the one the transaction was reserved against. The PowerShell reader
+        // also gives `editor_left`, for a launch it reads while its editor is not reading, and that
+        // has a case of its own.
         LaunchRejectionReason::Revoked
             | LaunchRejectionReason::ConfirmationLost
             | LaunchRejectionReason::SessionClosing
