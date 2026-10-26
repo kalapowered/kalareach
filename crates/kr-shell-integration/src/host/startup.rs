@@ -1439,7 +1439,7 @@ impl HeldRecord<'_> {
 
 /// A path as the record keeps it: its own bytes in hexadecimal, two digits to a byte.
 #[cfg(unix)]
-fn encoded(path: &Path) -> String {
+pub(crate) fn encoded(path: &Path) -> String {
     use std::os::unix::ffi::OsStrExt as _;
 
     path.as_os_str()
@@ -1452,7 +1452,7 @@ fn encoded(path: &Path) -> String {
 /// A path as the record keeps it: its UTF-16 units in hexadecimal, four digits to a unit, so an
 /// unpaired surrogate is kept as it is.
 #[cfg(not(unix))]
-fn encoded(path: &Path) -> String {
+pub(crate) fn encoded(path: &Path) -> String {
     use std::os::windows::ffi::OsStrExt as _;
 
     path.as_os_str()
@@ -1463,7 +1463,7 @@ fn encoded(path: &Path) -> String {
 
 /// The path a record entry names, or `None` for text [`encoded`] does not write.
 #[cfg(unix)]
-fn decoded(text: &str) -> Option<PathBuf> {
+pub(crate) fn decoded(text: &str) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStringExt as _;
 
     let bytes = hexadecimal_units(text, 2)?
@@ -1475,7 +1475,7 @@ fn decoded(text: &str) -> Option<PathBuf> {
 
 /// The path a record entry names, or `None` for text [`encoded`] does not write.
 #[cfg(not(unix))]
-fn decoded(text: &str) -> Option<PathBuf> {
+pub(crate) fn decoded(text: &str) -> Option<PathBuf> {
     use std::os::windows::ffi::OsStringExt as _;
 
     let units = hexadecimal_units(text, 4)?
@@ -1572,7 +1572,7 @@ impl FileLock {
     ///
     /// Returns the underlying failure, or a timeout when another writer held it throughout.
     #[cfg(unix)]
-    fn take(path: &Path) -> std::io::Result<Self> {
+    pub(crate) fn take(path: &Path) -> std::io::Result<Self> {
         Self::acquire(Self::beside(path)?, path)
     }
 
@@ -1650,7 +1650,7 @@ impl FileLock {
     ///
     /// Returns the underlying failure, or a timeout when another writer held it throughout.
     #[cfg(not(unix))]
-    fn take(path: &Path) -> std::io::Result<Self> {
+    pub(crate) fn take(path: &Path) -> std::io::Result<Self> {
         Self::acquire(Self::beside(path)?, path)
     }
 
