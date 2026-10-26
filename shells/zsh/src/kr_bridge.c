@@ -137,10 +137,6 @@ static struct {
     unsigned long hinted_prompt;
     char hint[KR_HINT_MAX];
 
-    /* A launch this bridge installed and has not yet accepted. */
-    int launch_pending;
-    unsigned char launch_transaction[KR_UUID_LEN];
-
     /* Transactions the worker has revoked. A revocation the worker sent before the reader's own
      * step is one that step has to see, whichever read took it off the endpoint. */
     unsigned char revoked[KR_REVOKED_MAX][KR_UUID_LEN];
@@ -485,7 +481,6 @@ kr_disconnect(int loss)
     kr.registered = 0;
     kr.fence_live = 0;
     kr.fence_retry = 0;
-    kr.launch_pending = 0;
     /* Nothing more will be answered, so nothing is owed and nothing is waited for. */
     kr.owed = 0;
     kr.detach_count = 0;
@@ -1227,12 +1222,6 @@ kr_bridge_cancel_settled(void)
 }
 
 int
-kr_bridge_launch_pending(void)
-{
-    return kr.launch_pending;
-}
-
-int
 kr_bridge_take_fence_retry(void)
 {
     kr_reader_state state;
@@ -1402,7 +1391,6 @@ kr_bridge_editor_leave(int reason)
     if (reason < 0 || reason > KR_LEAVE_ROOT_EXIT) {
         reason = KR_LEAVE_CANCELLATION;
     }
-    kr.launch_pending = 0;
     kr_shell_reader_state(&state);
 
     kr_open_event(&writer, "editor_leave");
@@ -1860,7 +1848,9 @@ kr_launch_text(const kr_cbor_doc *doc, int command, size_t *length)
  * The launch check, on the reader's own thread, in the order the reasons matter.
  *
  * The revocation check is in this same step: the endpoint delivers frames in order, so a
- * revocation the worker sent before this step is one this step has already read.
+ * revocation the worker sent before this step and that has reached the reader is one this step
+ * has already read. One still in transit is not seen, and the launch it names is then accepted:
+ * the answer is final, and the worker records the late installation.
  */
 static void
 kr_answer_launch(unsigned long long id, const kr_cbor_doc *doc, int request, int revoked)
@@ -1954,12 +1944,8 @@ kr_answer_launch(unsigned long long id, const kr_cbor_doc *doc, int request, int
     }
     free(text);
 
-    kr.launch_pending = 1;
-    memcpy(kr.launch_transaction, transaction, KR_UUID_LEN);
-
     /* Installed, so the answer carries the caller's own command back and the buffer's new
-     * revision. The line is then accepted, and only then is the transaction no longer one a
-     * revocation could take back. */
+     * revision. The line is accepted with it. */
     kr_open_answer(&writer, id, "launch");
     kr_cbor_variant(&writer, "accepted");
     kr_cbor_map(&writer, 6);
@@ -1982,10 +1968,8 @@ kr_answer_launch(unsigned long long id, const kr_cbor_doc *doc, int request, int
     kr_cbor_variant_end(&writer);
     kr_send(&writer);
 
-    /*
-     * Installed and accepted. The transaction stays this bridge's own until the reader actually
-     * leaves, because a revocation that arrives in that window still has text to take back out.
-     */
+    /* The answer is final: the command is in the editor and the line is accepted, so a revocation
+     * read after this changes nothing. */
     kr_shell_accept_line();
 }
 
@@ -2378,12 +2362,6 @@ kr_take_revocation(const kr_cbor_doc *doc, int frame)
         return;
     }
     kr_remember_revocation(transaction);
-    if (kr.launch_pending && memcmp(kr.launch_transaction, transaction, KR_UUID_LEN) == 0) {
-        /* Installed but not accepted: the text comes out, so a revoked launch leaves nothing
-         * behind. */
-        kr_shell_remove_installed();
-        kr.launch_pending = 0;
-    }
 }
 
 /* Handles one frame. */

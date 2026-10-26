@@ -474,10 +474,7 @@ the reader, in the step where it reads its mailbox:
   its own reason's code, which is `EDITOR_BUSY` for `revoked` and for every transition failure, and
   `DRAFT_CONFLICT` where the editor's own state had moved. It is then a fact rather than a guess.
   An acceptance means the reader had installed the command when it answered, before it saw the
-  revocation: the caller is told what happened and the session records the late installation. A
-  reader can still read the revocation after it has answered and before the line is accepted, and
-  the Zsh, Bash and Fish readers then take the text back out and send no second answer, so the
-  caller can be told a command was installed that never ran.
+  revocation: the caller is told what happened and the session records the late installation.
 - Every cancellation works the same way, not just the timeout. A reader leave, a lease change, a
   detach or a lost integration all revoke a dispatched transaction and wait for the reader's word,
   because a refusal that claimed nothing was installed would be claiming something the worker cannot
@@ -680,7 +677,7 @@ indefinitely.
 | Launch request in any other state | unchanged | Refuse with `EDITOR_BUSY` or, for a prompt that has moved, `DRAFT_CONFLICT`. Install nothing |
 | Launch answered | `fenced` | Answer the caller, release the held input in order. An acceptance records the requesting attachment as the origin of the line it installs |
 | Launch hold expiry | `fenced` | Revoke the transaction and release the held input in order. The caller's answer waits for the reader's confirmation |
-| The reader's confirmation after a revocation | unchanged | `revoked` is `EDITOR_BUSY`; an acceptance means the command was in the editor when the reader answered, so the caller is told that and the late installation is recorded (a reader that then reads the revocation before it accepts the line takes the text out again, and says nothing more) |
+| The reader's confirmation after a revocation | unchanged | `revoked` is `EDITOR_BUSY`; an acceptance means the command was in the editor when the reader answered, so the caller is told that and the late installation is recorded |
 | The bridge ends with a confirmation outstanding | `unfenced` or `outside` | Answer `OUTCOME_UNKNOWN`: nothing left can say whether the command reached the editor |
 | An acceptance for a transaction nobody is waiting for | unchanged | Record the installation: the editor held a command whose transaction is over. It shows no breach by the package, because the answer may have crossed the revocation |
 | Interrupt under the current epoch | unchanged | Interrupt. It bypasses the hold and accepts only the configured native action |

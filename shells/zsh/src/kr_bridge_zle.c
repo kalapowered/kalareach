@@ -94,9 +94,6 @@ kr_zle_service(void)
     }
 }
 
-/* A launch this reader installed, so a revocation can take exactly that text back out. */
-static int kr_installed_chars;
-
 /* True from a line's acceptance until the next primary reader: its commands are running. */
 static int kr_line_running;
 
@@ -251,39 +248,8 @@ kr_shell_install_command(const char *text, size_t len)
     if (metafied) {
         metafy_line();
     }
-    kr_installed_chars = zlell;
     kr_track_buffer();
     return zlell > 0;
-}
-
-int
-kr_shell_remove_installed(void)
-{
-    int metafied = 0;
-
-    if (kr_installed_chars <= 0) {
-        return 0;
-    }
-    if (!zleactive) {
-        kr_installed_chars = 0;
-        return 0;
-    }
-    if (zlemetaline != NULL) {
-        unmetafy_line();
-        metafied = 1;
-    }
-    /* Only the text this launch installed comes out, and only while it is still all there. */
-    if (zlell == kr_installed_chars) {
-        zlecs = 0;
-        foredel(zlell, CUT_RAW);
-    }
-    if (metafied) {
-        metafy_line();
-    }
-    kr_installed_chars = 0;
-    done = 0;
-    kr_track_buffer();
-    return 1;
 }
 
 void
@@ -1305,7 +1271,6 @@ kr_zle_enter(void)
     kr_track_cwd();
     kr_buffer_hash = kr_hash_line();
     kr_buffer_revision++;
-    kr_installed_chars = 0;
     kr_pending_quoted = kr_pending_numeric = kr_pending_paste_open = 0;
     kr_cancel_requested = kr_cancel_consumed = kr_in_key_wait = 0;
     kr_key_selected = kr_idle_reported = 0;
@@ -1334,7 +1299,6 @@ kr_zle_leave(int eof_sent)
         reason = KR_LEAVE_CANCELLATION;
     }
     kr_inside_reader = 0;
-    kr_installed_chars = 0;
     kr_cancel_requested = kr_cancel_consumed = 0;
     kr_bridge_cancel_settled();
     if (reason == KR_LEAVE_COMMAND_ACCEPTED) {
