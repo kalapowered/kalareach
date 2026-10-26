@@ -630,6 +630,93 @@ fn a_release_whose_directory_spells_an_end_record_is_read() {
     assert_eq!(written.len(), 4);
 }
 
+/// How many entries the end record inside the extra data below counts: far more than the archive
+/// holds, and what the parser would size its list for before anything checked it.
+const FALLBACK_ENTRIES: u16 = 65_000;
+
+/// The extra data of an entry that makes the parser give up on the directory it is in, followed by
+/// an end record of its own: a Unicode path field too short to hold what it must, which no reader
+/// takes, and then an end record that counts [`FALLBACK_ENTRIES`] entries and names `directory_at`
+/// as where they begin, which is where the real directory does. `padding` is how many bytes of
+/// extra data there are besides.
+fn extra_data_with_a_fallback(directory_at: u32) -> Vec<u8> {
+    let mut extra = 0x7075_u16.to_le_bytes().to_vec();
+    extra.extend_from_slice(&2_u16.to_le_bytes());
+    // What the field's reader takes for its version and checksum before it finds the field too short.
+    extra.extend_from_slice(&[0; 5]);
+    extra.extend_from_slice(b"PK\x05\x06");
+    extra.extend_from_slice(&[0; 4]);
+    extra.extend_from_slice(&FALLBACK_ENTRIES.to_le_bytes());
+    extra.extend_from_slice(&FALLBACK_ENTRIES.to_le_bytes());
+    extra.extend_from_slice(&0_u32.to_le_bytes());
+    extra.extend_from_slice(&directory_at.to_le_bytes());
+    extra.extend_from_slice(&0_u16.to_le_bytes());
+    extra
+}
+
+/// KR-REQ-26.06: a name or the extra data of an entry that holds the signature of an end record, of
+/// its 64-bit form or of that form's locator is refused before the parser runs. The parser gives up
+/// on a directory whose entry it cannot read and takes an earlier end record, here one the
+/// archive's writer set inside an entry's extra data, and sizes what it keeps for the entries that
+/// record counts before anything checks them. The archive is one that the parser refuses whatever
+/// it does, so a refusal that is the reader's own, which names the signature, shows that the
+/// parser never ran. The control is extra data of the same size without a signature, which is
+/// read; a signature in a checksum is not refused (see the case that reads it).
+#[test]
+fn a_signature_in_a_name_or_in_extra_data_is_refused_before_the_parser_runs() {
+    let big = vec![b'a'; 70_000];
+    let with_extra = |extra: Vec<u8>| {
+        let mut members = vec![
+            Member::stored(format!("{TOP}/share/big"), &big),
+            Member::stored(format!("{TOP}/release.json"), b"{\"signed\":{}}"),
+        ];
+        members[0].extra = extra;
+        archive_of(&members)
+    };
+    let length = extra_data_with_a_fallback(0).len();
+    // Where the directory starts: after the data, which the extra data does not change.
+    let placeholder = with_extra(vec![0; length]);
+    let directory_at = placeholder
+        .windows(4)
+        .position(|window| window == b"PK\x01\x02")
+        .expect("a directory");
+    let crafted = with_extra(extra_data_with_a_fallback(
+        u32::try_from(directory_at).expect("small"),
+    ));
+    let mut harmless = 0xAAAA_u16.to_le_bytes().to_vec();
+    harmless.extend_from_slice(&u16::try_from(length - 4).expect("short").to_le_bytes());
+    harmless.extend(std::iter::repeat_n(b'x', length - 4));
+    let named = archive_of(&[
+        Member::stored(format!("{TOP}/release.json"), b"{\"signed\":{}}"),
+        Member::stored(
+            format!("{TOP}/share/PK\x05\x06"),
+            b"a name with a signature",
+        ),
+    ]);
+    for (name, bytes) in [
+        ("an end record set inside an entry's extra data", &crafted),
+        ("an end record in a name", &named),
+    ] {
+        let case = Case::new();
+        let error = case
+            .read(bytes, &Limits::DEFAULT)
+            .expect_err("the archive is refused");
+        assert!(
+            error.contains("end record"),
+            "{name} is refused by the reader, for the signature: {error}"
+        );
+        assert!(case.staged().is_empty(), "{name}: nothing was written");
+    }
+    let case = Case::new();
+    let (directory, _) = case
+        .read(&with_extra(harmless), &Limits::DEFAULT)
+        .expect("extra data of the same size without a signature is read");
+    assert_eq!(
+        std::fs::read(directory.join("share/big")).expect("the file"),
+        big
+    );
+}
+
 /// Nothing is written outside the staging directory by an archive that names a place beyond it.
 #[test]
 fn nothing_is_written_beside_the_staging_directory() {

@@ -608,9 +608,13 @@ The reader is given the archive's directory only after it has been judged here: 
 the last 22 bytes of the file, with no comment and no 64-bit form, and the directory is exactly the
 bytes before it (at most 64 MiB), holding that many entries one after another, each with a name of
 at most 1,024 bytes, at most 1,024 bytes of extra data and no comment. The checker applies the same
-rules. The directory is not searched for signatures, because a file's checksum can spell one. The
-reader is shown those bytes and zeros for the rest of the file until it has its list of entries,
-and the directory it parsed must start where the end record says, or the archive is refused. A name
+rules. No name and no extra data in it holds the signature of an end record, of its 64-bit form or
+of that form's locator: the parser falls back to an earlier end record when an entry does not parse,
+and sizes what it keeps for the entries that record counts before anything is checked. The fixed
+fields (a checksum, a size, an offset) are not searched, because a file's checksum can spell a
+signature, and an archive that does is read. The reader is shown those bytes and zeros for the rest
+of the file until it has its list of entries, and the directory it parsed must start where the end
+record says, or the archive is refused. A name
 has at most 32 parts. An archive is refused whole when it has an entry that is a link or a device,
 that is encrypted or compressed in a way a release is not, or that is named twice, or whose name
 Windows would read as another (an absolute, drive or UNC path, a `..`, a device name such as
