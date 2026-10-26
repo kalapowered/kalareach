@@ -10,7 +10,7 @@
 //!
 //! | Platform | CPU | I/O |
 //! | --- | --- | --- |
-//! | Windows | the idle priority class, within the process's background mode | very low, which the background mode sets for the whole process |
+//! | Windows | the idle priority class of the process | very low I/O priority of the process |
 //! | macOS | the caller's own (this module sets none) | the throttled disk policy of the process |
 //! | Linux | the caller's own (this module sets none) | the lowest best-effort level of the calling thread, which threads it starts afterwards inherit |
 //! | the remaining platforms | none | none |
@@ -20,6 +20,13 @@
 //! load, under a deadline; a busy disk would hold that read for as long as it stayed busy. The
 //! lowest best-effort level still yields to every other process on a scheduler that honours
 //! priorities, and it cannot be starved by one.
+//!
+//! Windows has a background mode for a process (`PROCESS_MODE_BACKGROUND_BEGIN`) that lowers the
+//! CPU, I/O and memory priority together, and this module does not use it: on Windows Server 2025
+//! it holds the process's working set to about 32 MB however much memory the process writes, which
+//! leaves a model that must stay resident to fault its weights back in on every token, and makes
+//! the process's resident set read as 32 MB to anything that measures it. The idle priority class
+//! and the very low I/O priority are set on their own and leave the working set alone.
 //!
 //! The system applies an I/O class only through the I/O scheduler that serves the disk. A scheduler
 //! that ignores priorities (the `none` scheduler of most NVMe disks) keeps the class and acts on
@@ -79,16 +86,12 @@ pub struct ProcessClass {
     pub idle_priority_class: bool,
     /// The process's I/O class, when it is one this module names.
     pub io: Option<IoClass>,
-    /// The process's memory priority, from 1 (lowest) to 5 (normal).
-    pub memory_priority: u32,
 }
 
-/// Puts the calling process into the background class: the idle priority class, and the
-/// background mode that lowers its I/O and memory priority, and reads them back.
+/// Puts the calling process into the background class: the idle priority class and the very low
+/// I/O priority, each read back from the system.
 ///
-/// The process stays in the class until it ends or calls [`leave_process_background`]. The mode is
-/// begun first, because beginning it sets the priority class back to the normal one, and the idle
-/// class is set after it.
+/// The process stays in the class until it ends or calls [`leave_process_background`].
 ///
 /// # Errors
 ///
@@ -98,16 +101,14 @@ pub fn enter_process_background() -> std::result::Result<ProcessClass, Refusal> 
     platform::enter_process_background()
 }
 
-/// Reads the priority class, the I/O class and the memory priority the system holds for the
-/// calling process.
+/// Reads the priority class and the I/O class the system holds for the calling process.
 #[cfg(all(windows, any(test, feature = "testing")))]
 #[must_use]
 pub fn process_class() -> Option<ProcessClass> {
     platform::process_class()
 }
 
-/// Reads the priority class, the I/O class and the memory priority the system holds for the process
-/// `pid`, which a parent uses to check what its child reports of itself.
+/// Reads the priority class and the I/O class the system holds for the process `pid`, which a parent uses to check what its child reports of itself.
 ///
 /// Nothing when the process is not there or the system will not tell.
 #[cfg(all(windows, any(test, feature = "testing")))]
@@ -117,7 +118,8 @@ pub fn process_class_of(pid: u32) -> Option<ProcessClass> {
 }
 
 /// Takes the calling process out of the background class and back to the priority class it had
-/// before [`enter_process_background`], which a test uses to leave its own process as it found it.
+/// before [`enter_process_background`] and the normal I/O priority, which a test uses to leave its
+/// own process as it found it.
 ///
 /// # Errors
 ///
@@ -234,23 +236,35 @@ mod platform {
 mod platform {
     #![expect(
         unsafe_code,
-        reason = "the priority class, I/O priority and memory priority of a process have no safe interface"
+        reason = "the priority class and I/O priority of a process have no safe interface"
     )]
 
     use super::{IoClass, ProcessClass, Refusal};
     use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessIoPriority};
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, GetPriorityClass, GetProcessInformation, IDLE_PRIORITY_CLASS,
-        MEMORY_PRIORITY_INFORMATION, PROCESS_MODE_BACKGROUND_BEGIN, ProcessMemoryPriority,
-        SetPriorityClass,
+        GetCurrentProcess, GetPriorityClass, IDLE_PRIORITY_CLASS, SetPriorityClass,
     };
 
-    /// The I/O priority the background mode sets.
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        /// `NtSetInformationProcess`, which the bindings this crate uses do not declare.
+        fn NtSetInformationProcess(
+            process: HANDLE,
+            class: i32,
+            information: *mut std::ffi::c_void,
+            length: u32,
+        ) -> i32;
+    }
+
+    /// The I/O priority of a process that has been asked to stay out of the way.
     const IO_VERY_LOW: u32 = 0;
+    /// The I/O priority of an ordinary process.
+    #[cfg(any(test, feature = "testing"))]
+    const IO_NORMAL: u32 = 2;
 
     pub(super) fn lower_io_class() -> std::result::Result<IoClass, Refusal> {
-        Err("on this platform the background mode lowers the I/O class of the whole process")
+        Err("on this platform the I/O class is the whole process's, set with its priority class")
     }
 
     pub(super) fn io_class() -> Option<IoClass> {
@@ -258,17 +272,13 @@ mod platform {
     }
 
     pub(super) fn enter_process_background() -> std::result::Result<ProcessClass, Refusal> {
-        // SAFETY: the call takes the pseudo-handle of the calling process and an option, and reads
+        // SAFETY: the call takes the pseudo-handle of the calling process and a class, and reads
         // no memory of this process.
-        let begun = unsafe { SetPriorityClass(GetCurrentProcess(), PROCESS_MODE_BACKGROUND_BEGIN) };
-        if begun == 0 {
-            return Err("this host refused the background mode");
-        }
-        // SAFETY: as above.
         let idle = unsafe { SetPriorityClass(GetCurrentProcess(), IDLE_PRIORITY_CLASS) };
         if idle == 0 {
             return Err("this host refused the idle priority class");
         }
+        set_io_priority(IO_VERY_LOW).map_err(|()| "this host refused the very low I/O priority")?;
         let class = process_class().ok_or("this host did not report the class it was given")?;
         if !class.idle_priority_class {
             return Err("this host reports a priority class that is not the idle class");
@@ -277,6 +287,21 @@ mod platform {
             return Err("this host reports an I/O priority that is not the very low one");
         }
         Ok(class)
+    }
+
+    /// Sets the I/O priority of the calling process.
+    fn set_io_priority(priority: u32) -> std::result::Result<(), ()> {
+        let mut priority = priority;
+        // SAFETY: the call reads one 32-bit value through a pointer to a live local of that size.
+        let status = unsafe {
+            NtSetInformationProcess(
+                GetCurrentProcess(),
+                ProcessIoPriority,
+                (&raw mut priority).cast(),
+                4,
+            )
+        };
+        if status < 0 { Err(()) } else { Ok(()) }
     }
 
     pub(super) fn process_class() -> Option<ProcessClass> {
@@ -325,24 +350,9 @@ mod platform {
         if queried < 0 {
             return None;
         }
-        let mut memory = MEMORY_PRIORITY_INFORMATION { MemoryPriority: 0 };
-        // SAFETY: the call writes one `MEMORY_PRIORITY_INFORMATION` through a pointer to a live
-        // local of that type, and the size passed is its size.
-        let read = unsafe {
-            GetProcessInformation(
-                process,
-                ProcessMemoryPriority,
-                (&raw mut memory).cast(),
-                size_of::<MEMORY_PRIORITY_INFORMATION>() as u32,
-            )
-        };
-        if read == 0 {
-            return None;
-        }
         Some(ProcessClass {
             idle_priority_class: priority_class == IDLE_PRIORITY_CLASS,
             io: (io == IO_VERY_LOW).then_some(IoClass::VeryLow),
-            memory_priority: memory.MemoryPriority,
         })
     }
 
@@ -350,17 +360,9 @@ mod platform {
     pub(super) fn leave_process_background(
         priority_class: u32,
     ) -> std::result::Result<(), Refusal> {
-        // SAFETY: as in `enter_process_background`.
-        let ended = unsafe {
-            SetPriorityClass(
-                GetCurrentProcess(),
-                windows_sys::Win32::System::Threading::PROCESS_MODE_BACKGROUND_END,
-            )
-        };
-        if ended == 0 {
-            return Err("this host refused to end the background mode");
-        }
-        // SAFETY: as above.
+        set_io_priority(IO_NORMAL).map_err(|()| "this host refused the normal I/O priority")?;
+        // SAFETY: the call takes the pseudo-handle of the calling process and a class, and reads
+        // no memory of this process.
         let restored = unsafe { SetPriorityClass(GetCurrentProcess(), priority_class) };
         if restored == 0 {
             return Err("this host refused to restore the priority class");
@@ -451,7 +453,7 @@ mod tests {
     }
 
     /// The process enters the background class, and the system reports the idle priority class,
-    /// the very low I/O priority and the lowest memory priority, both to the process itself and to
+    /// the very low I/O priority, both to the process itself and to
     /// a handle opened on it by its identifier. The process is put back as it was found, so the
     /// tests that run beside this one are not left in the class.
     #[cfg(windows)]
@@ -474,7 +476,6 @@ mod tests {
         let in_the_class = ProcessClass {
             idle_priority_class: true,
             io: Some(IoClass::VeryLow),
-            memory_priority: 1,
         };
         assert_eq!(entered, Ok(in_the_class));
         assert_eq!(seen_from_outside, Some(in_the_class));

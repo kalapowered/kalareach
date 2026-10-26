@@ -180,13 +180,18 @@ reason.
   the `none` scheduler of most NVMe disks, keeps the class and acts on nothing.
 - **macOS:** the model thread takes the lowest ordinary thread priority, and the process takes the
   throttled disk policy.
-- **Windows:** the whole process takes the idle priority class inside the system's background mode,
-  which also lowers its I/O priority to very low and its memory priority to the lowest. It is the
-  process and not the thread, because a thread that another thread starts begins at the normal
+- **Windows:** the whole process takes the idle priority class and the very low I/O priority. It is
+  the process and not the thread, because a thread that another thread starts begins at the normal
   priority, and the compute threads of the model runtime are started by the thread that loads it.
   The idle class is served only when nothing else wants the processor, so a machine that other
   work keeps fully busy can answer the process later than the daemon waits for it, and the daemon
-  ends a process that does not acknowledge a cancellation in time.
+  ends a process that does not acknowledge a cancellation in time. Windows also has a background
+  mode for a process that lowers CPU, I/O and memory priority together, and this build does not
+  use it. On Windows Server 2025 (build 26100) a process that enters it and writes 600 MB keeps a
+  working set of 32 MB, with 683 MB committed, where a process with only the idle class, only the
+  I/O priority or only the lowest memory priority keeps 694 MB. A model that must stay resident
+  would fault its weights back in on every token, and the daemon's reading of the process would
+  show 32 MB.
 - **Other Unix systems:** the lowest ordinary thread priority, and no I/O class.
 
 ## The queue
