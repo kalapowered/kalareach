@@ -441,6 +441,9 @@ pub struct Controller {
     /// What reads this host's own mailbox, when its configuration document selects an authority
     /// feed, whose service holds that mailbox.
     mailbox_reader: Option<crate::mailbox_reader::MailboxReader>,
+    /// What reads the signed release matrix, when this host's `relay.origin` is the managed
+    /// service, and what the relay lease service asks before it sends a request for a new lease.
+    release_matrix: Option<crate::release_matrix::ReleaseMatrixRuntime>,
     /// Wakes the task that gives the owner's inbox its notices about the authority feed.
     feed_notice_wake: Arc<tokio::sync::Notify>,
     /// That task, which ends when the daemon is dropped.
@@ -1183,6 +1186,12 @@ impl Controller {
     #[must_use]
     pub const fn mailbox_reader(&self) -> Option<&crate::mailbox_reader::MailboxReader> {
         self.mailbox_reader.as_ref()
+    }
+
+    /// What reads the signed release matrix, when this host's `relay.origin` is the managed service.
+    #[must_use]
+    pub const fn release_matrix(&self) -> Option<&crate::release_matrix::ReleaseMatrixRuntime> {
+        self.release_matrix.as_ref()
     }
 }
 
