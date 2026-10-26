@@ -402,4 +402,21 @@ describe('what a read is taken to say', () => {
     })
     expect(await screen.findByTestId('launch-take-control')).toBeInTheDocument()
   })
+
+  // A view is read only once it is attached: before that it has no link to ask on, and the first
+  // thing the surface says must not be that the view is still opening.
+  it('does not read a view before it is attached', async () => {
+    const { port, controls } = fakeHost()
+    controls.holdTerminalViews()
+    open(port, 'terminal')
+    await waitFor(() => {
+      expect(controls.terminalViews).toHaveLength(1)
+    })
+    act(() => {
+      controls.terminalViews[0]?.attach()
+    })
+    expect(await screen.findByTestId('launch-take-control')).toBeInTheDocument()
+    expect(screen.queryByTestId('launch-unread')).toBeNull()
+    expect(controls.terminalViews[0]?.launchReadsWhileOpening).toBe(0)
+  })
 })
