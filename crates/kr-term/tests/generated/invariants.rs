@@ -493,7 +493,12 @@ pub fn read_split_changes_nothing(whole: &Seen, split: &Seen, how: u64) -> Vec<V
 /// it ends the run read at once.
 pub fn a_read_in_pieces_holds(whole: &Seen, split: &Seen, how: u64) -> Vec<Violation> {
     let mut found = read_split_changes_nothing(whole, split, how);
-    found.extend(the_engine_is_in_its_bounds(split));
+    found.extend(the_engine_is_in_its_bounds(split).into_iter().map(|bound| {
+        violation(
+            bound.invariant,
+            format!("{} (read kind {how})", bound.detail),
+        )
+    }));
     found
 }
 
