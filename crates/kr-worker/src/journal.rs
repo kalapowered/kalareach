@@ -3700,6 +3700,37 @@ impl Journal {
         Ok(records)
     }
 
+    /// Removes the content every settled receipt carries when this store's own privacy record says
+    /// privacy mode is on, and returns how many records lost content.
+    ///
+    /// A transition this journal commits while the record says privacy mode is on holds no content
+    /// ([`Self::settle`] and the rejections), so a store whose record says it is on and whose
+    /// settled receipts still carry content was written by a release that removed it in a second
+    /// transaction, and stopped between the two. The record is the store's own, so this decides
+    /// the same way for a journal whose worker has ended, long after the environment's privacy mode
+    /// has changed again: what settled under the record is withheld under it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read or the write fails.
+    pub fn redact_if_private(&mut self) -> Result<u64> {
+        // The record is read and the receipts written in one transaction, which takes the write
+        // lock first, so a settlement cannot commit between the two.
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| faulted(&self.health, error))?;
+        if !privacy_mode_is_on(&self.health, &transaction)? {
+            return Ok(0);
+        }
+        let records = withhold_settled_content(&self.health, &transaction)?;
+        crate::input_domain::assert_not_held("a journal commit");
+        transaction
+            .commit()
+            .map_err(|error| faulted(&self.health, error))?;
+        Ok(records)
+    }
+
     /// Returns the schema version this store records.
     ///
     /// # Errors

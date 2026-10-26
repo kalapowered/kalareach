@@ -240,6 +240,101 @@ fn recovery_resolves_what_a_crashed_worker_left_unfinished() {
     );
 }
 
+/// A closed session's journal whose privacy record is `private` and whose one applied receipt
+/// still carries the result its action produced and the envelope its caller sent.
+///
+/// With the record saying privacy mode is on, that is what a worker leaves when it stops after a
+/// release that removed the content in a second transaction committed the settlement, and what it
+/// leaves when it stops between recording privacy mode and removing what that asks.
+fn journal_with_a_settled_receipt_holding_content(
+    archive: &ArchiveService,
+    session_id: SessionId,
+    private: bool,
+) {
+    let actor = ActorId::new("test:archive").expect("an actor");
+    let mut journal = journal_for(archive, session_id);
+    journal.accept(&submission(1)).expect("an intent");
+    journal
+        .mark_dispatching(
+            actor.clone(),
+            kr_worker::journal::action_id_from([1; 16]),
+            kr_ipc::now_ms(),
+        )
+        .expect("a marker");
+    journal
+        .settle(
+            actor,
+            kr_worker::journal::action_id_from([1; 16]),
+            kr_protocol::receipt::ReceiptState::Applied,
+            Some(b"what the action answered"),
+            None,
+            kr_ipc::now_ms(),
+        )
+        .expect("settles with its result");
+    journal
+        .record_privacy(1, private, kr_ipc::now_ms())
+        .expect("records the privacy state");
+}
+
+/// KR-REQ-24.27: the archive's recovery and its collection take the content out of a journal whose
+/// own privacy record says privacy mode is on, with no obligation standing and whatever the
+/// daemon's privacy mode says now, and keep the receipt's metadata. The control is a journal whose
+/// record says privacy mode is off, which holds what it holds: content kept while privacy mode was
+/// off is the owner's.
+#[test]
+fn recovery_and_collection_take_the_content_a_journal_that_records_privacy_mode_still_holds() {
+    let actor = ActorId::new("test:archive").expect("an actor");
+    let action = kr_worker::journal::action_id_from([1; 16]);
+    for entry in ["recovery", "collection"] {
+        let (_temp, archive) = host();
+        let private = session();
+        let public = session();
+        journal_with_a_settled_receipt_holding_content(&archive, private, true);
+        journal_with_a_settled_receipt_holding_content(&archive, public, false);
+        let read = |session_id| {
+            archive
+                .receipt(session_id, &actor, action, true)
+                .expect("reads the receipt")
+        };
+        assert!(
+            read(private).result.0.is_some(),
+            "{entry}: the control: the remnant is served as it stands"
+        );
+
+        for session_id in [private, public] {
+            let ownership = take(&archive, session_id);
+            if entry == "recovery" {
+                archive.recover_journal(&ownership).expect("recovers");
+            } else {
+                archive
+                    .collect(&ownership, kr_ipc::now_ms(), true)
+                    .expect("collects");
+            }
+        }
+
+        let taken = read(private);
+        assert_eq!(
+            taken.receipt.state,
+            kr_protocol::receipt::ReceiptState::Applied,
+            "{entry}: the metadata is kept"
+        );
+        assert!(taken.result.0.is_none(), "{entry}: the result is gone");
+        let journal =
+            Journal::open_read_only(archive.paths().journal_database(private)).expect("reads");
+        assert!(
+            journal
+                .read_intent(&actor, action)
+                .expect("reads")
+                .is_none(),
+            "{entry}: the envelope is gone"
+        );
+        assert!(
+            read(public).result.0.is_some(),
+            "{entry}: a journal that records privacy mode as off keeps what it holds"
+        );
+    }
+}
+
 #[test]
 fn recovery_of_a_session_with_no_journal_creates_none() {
     let (_temp, archive) = host();

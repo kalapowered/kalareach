@@ -4843,9 +4843,13 @@ the spool with it, and the content a settled receipt carries (the intent envelop
 and the result the action produced) is taken out of the journal while the receipt's own metadata
 stays. A receipt that has *not* settled keeps its envelope, because recovery reads it and a retry of
 an action this host may already have performed is answered from it. It loses its content in the
-transaction that settles it: that transaction reads the journal's own privacy record, and while the
+transaction that settles it. That transaction reads the journal's own privacy record, and while the
 record says privacy mode is on, a receipt that settles or is rejected is committed without its
-result and its envelope. A crash after the commit leaves no content to remove.
+result and its envelope, so a crash after the commit leaves nothing to remove. A journal written by
+an earlier release can still hold content under such a record, if that release stopped between the
+commit and the removal. The archive takes that content out when it recovers or collects the
+session, whether or not the session still owes cleanup and whatever the daemon's privacy mode says
+by then.
 
 Privacy mode does not reach two stores. The canonical grid keeps its own scrollback, which a client
 can still page through, and the worker keeps a bounded log of the semantic entries that a bound
@@ -5091,9 +5095,6 @@ what it removes is exactly the thing a person cannot check for themselves.
   screen needs an interface the projection does not have.
 * **Application notices keep their content.** A notification's title and body are written to the
   host-event store, and privacy cleanup removes neither the rows already there nor later ones.
-* **The archive does not enforce any of this.** A session read after its worker has gone is served
-  from the store as it stands: the archive neither finishes an unfinished cleanup nor holds a read
-  while one is owed.
 
 ## Session names and descriptions
 
