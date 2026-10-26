@@ -217,10 +217,12 @@ test.describe('the first-start assistant', () => {
     await capture(page, 'setup-accounts-26.42')
   })
 
-  test('offers the two hosts and the terminal profile separately, all off', async ({ page }) => {
+  test('offers the two hosts, the shell startup entry and the terminal profile separately, all off', async ({
+    page
+  }) => {
     await openSetup(page)
     await step(page, 'host')
-    for (const id of ['gui_host', 'headless_host', 'terminal_profile']) {
+    for (const id of ['gui_host', 'headless_host', 'shell_startup', 'terminal_profile']) {
       const card = page.getByTestId(`setup-install-${id}`)
       await expect(card.getByRole('switch')).toHaveAttribute('aria-checked', 'false')
     }
@@ -755,6 +757,37 @@ test.describe('the first-start assistant', () => {
         await expect(card.getByTestId('setup-model-retry')).toHaveText('Ask again')
         await footerHolds(page, 'the card while the host does not answer', card, footer, width)
         await capture(page, `setup-descriptions-footer-${size}-${width}-22.01`)
+      })
+    }
+  }
+
+  // KR-REQ-26.04: the four offers and the commands that carry them out stay inside the window at
+  // the largest text size, on a wide window and a narrow one, in the runner's face: the terminal
+  // profile's command is the longest of them.
+  for (const [width, height] of WINDOWS) {
+    for (const [size, ratio] of TEXT_SIZES) {
+      test(`keeps the four offers and their commands inside the window at the ${size} text size, ${width} wide`, async ({
+        page
+      }) => {
+        await openSetup(page)
+        await step(page, 'host')
+        await sizeTo(page, width, height, ratio)
+        expect(
+          await overrunning(page, '[data-testid^="setup-install-"]'),
+          'the offers draw past their boxes'
+        ).toEqual([])
+        for (const id of ['gui_host', 'headless_host', 'shell_startup', 'terminal_profile']) {
+          await page.getByTestId(`setup-install-${id}`).getByRole('switch').click()
+        }
+        await capture(page, `setup-offers-${size}-${width}-26.04`)
+        await step(page, 'ready')
+        await expect(page.getByTestId('setup-commands')).toContainText(
+          'kr host terminal-profile install <terminal>'
+        )
+        expect(
+          await overrunning(page, '[data-testid="setup-chosen"]'),
+          'the summary of what was chosen draws past its box'
+        ).toEqual([])
       })
     }
   }
