@@ -520,7 +520,12 @@ describe('delivery', () => {
     }
   })
 
-  /** KR-REQ-16.17: the free allowance and the payload bounds are the section 16 figures. */
+  /**
+   * KR-REQ-16.17: the free allowance and the payload bounds are the section 16 figures.
+   *
+   * KR-REQ-16.12, the part about the figures: the inner limit is 1,800 bytes, the complete payload
+   * bound is 3,500, and the bound is exclusive.
+   */
   it('holds the limits section 16 fixes', () => {
     expect(push.limits).toEqual({
       registration_challenge_lifetime_ms: String(REGISTRATION_CHALLENGE_LIFETIME_MS),

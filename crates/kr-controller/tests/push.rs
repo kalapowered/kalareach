@@ -829,7 +829,10 @@ fn a_destination_with_previews_disabled_still_gets_the_alert() {
     assert_eq!(sent[0].hints.alert, PushAlert::ApprovalWaiting);
 }
 
-/// KR-REQ-16.13: the payload bound is measured, and the excess moves to an encrypted object.
+/// KR-REQ-16.12: the payload bound is measured, and the excess moves to a retained object.
+///
+/// What is queued for a preview of 1,400 bytes is inside the 3,500-byte bound the gateway enforces,
+/// the summary is gone from it, and the detail is retained here behind a reference.
 #[test]
 fn a_preview_that_does_not_fit_is_not_sent_as_it_stands() {
     let environment = environment();
