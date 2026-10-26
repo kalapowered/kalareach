@@ -621,8 +621,10 @@ discipline to read an end-of-file character from, so when the first prompt begin
 the gesture as disabled, in every edit mode, effective at that prompt. It takes its decision off
 Ctrl+d when it promotes that report, which is at the first Ctrl+d that reaches the module at that
 prompt or a later one (one pressed in the Vi command table does not) or at the next prompt's entry
-while the bridge is registered, whichever comes first, and a Ctrl+d that promotes it runs `DeleteCharOrExit` whatever was bound to the key, which at
-an empty line ends the shell. From then on no key detaches the session there, and
+while the bridge is registered, whichever comes first, and the Ctrl+d that promotes it runs what stood on the key before the
+module's decision went there, as every Ctrl+d outside the detach condition does. Where the editor
+binds none, as its Windows edit mode does not, that is the editor's handling of an unbound key. From
+then on no key detaches the session there, and
 `kr detach --attachment <id>` is the way. The protocol also carries a gesture
 as a chord (`chord` with `keys`), which the module honours and the worker does not send.
 
@@ -815,12 +817,12 @@ it finds there is its own wrapper, and removing the module writes that wrapper b
 calling the module's function and not the editor's operation. And the module moves its decision to a
 changed gesture's key when it promotes the change, which is the first end-of-file decision at the
 prompt the change names or after it, or the next prompt's entry while the bridge is registered,
-whichever comes first, and not when it reports the change: until then the new key has no decision on it, and the press of the old key that promotes the change runs
-what the new key held in place of the old key's own binding. Where a key held nothing, the module
-runs `SelfInsert` if the chord it has bound by then is one character long and `DeleteCharOrExit` for
-any other chord, and both run with the key information of the press that happened. The press that
-promotes a disabled gesture runs `DeleteCharOrExit` for the same reason: the promotion has already
-cleared what was saved.
+whichever comes first, and not when it reports the change: until then the new key has no decision on it. The press of the old key that promotes
+the change runs what stood on that old key, which the module reads before it decides, and not what
+the new key held. A key that held nothing does what the editor does with an unbound key: the
+character the press carries goes into the line, and a press that carries none does nothing. Both
+run with the key information of the press that happened. The press that promotes a disabled gesture
+runs what stood on its key in the same way.
 
 The Vi edit mode has two key tables, and the module binds into the insert table only: the editor
 puts a binding made without `-ViMode` there, and the module wraps none of the command table's keys,

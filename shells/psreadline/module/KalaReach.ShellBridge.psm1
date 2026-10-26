@@ -1667,6 +1667,10 @@ function Invoke-KalaReachGesture {
 
     # The editor is reading, which is what makes its buffer this reader's own.
     $script:State.Reading = $true
+    # What stood on this key is read before the decision, because the decision can move the gesture
+    # to another key and take that key's binding with it. The press is this key's whatever happens
+    # next.
+    $before = $script:Hooks.GestureBefore
     # The mailbox is read first: the fence this decision rests on is the one the worker last
     # published, and a frame already on the endpoint belongs before this key. Whatever happens
     # there, the key the person pressed still does what the editor says it does.
@@ -1681,15 +1685,16 @@ function Invoke-KalaReachGesture {
     if ($decision -eq 'consume') { return }
 
     # Outside the detach condition the previous function or script block runs. A key that had
-    # nothing bound to it does what this editor does with an unbound key: a printable one goes
-    # into the line, and the end-of-file key ends the shell.
-    $before = $script:Hooks.GestureBefore
+    # nothing bound to it does what this editor does with an unbound key: the character it carries
+    # goes into the line, and a key that carries none does nothing. The end-of-file key is no
+    # different, so where the editor binds none, as its Windows mode does not, this key is not one
+    # that ends the shell.
     if ($null -eq $before) {
-        $chord = "$($script:Hooks.GestureChord)"
-        $native = if ($chord.Length -eq 1) { 'SelfInsert' } else { 'DeleteCharOrExit' }
-        try {
-            Invoke-KrEditorOperation $native $Key $Argument
-        } catch { }
+        if ($null -ne $Key -and $Key.KeyChar -ne [char]0) {
+            try {
+                Invoke-KrEditorOperation 'SelfInsert' $Key $Argument
+            } catch { }
+        }
         return
     }
     if ($before -is [scriptblock]) {

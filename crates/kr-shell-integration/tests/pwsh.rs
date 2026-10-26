@@ -177,6 +177,20 @@ fn a_cancellation_that_ends_nothing_leaves_the_next_sequence_alone() {
     shellpkg::a_cancellation_that_ends_nothing_leaves_the_next_sequence_alone(PWSH);
 }
 
+/// KR-REQ-07.37, KR-REQ-07.73
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn an_unbound_gesture_key_does_what_the_editor_does_with_an_unbound_key() {
+    shellpkg::an_unbound_gesture_key_does_what_the_editor_does_with_an_unbound_key(PWSH);
+}
+
+/// KR-REQ-07.37, KR-REQ-07.73
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn the_key_that_promotes_a_changed_gesture_runs_what_was_bound_to_it() {
+    shellpkg::the_key_that_promotes_a_changed_gesture_runs_what_was_bound_to_it(PWSH);
+}
+
 /// KR-REQ-07.37, KR-REQ-07.73, `psreadline-chord-gesture`
 #[test]
 #[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
