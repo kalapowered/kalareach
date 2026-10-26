@@ -939,6 +939,41 @@ impl Rig {
         .await
     }
 
+    /// What the record of the restore lists as owed.
+    fn what_the_record_lists(&self) -> Vec<restored::Target> {
+        match self.the_record() {
+            Found::Record(record) => record.owed.iter().map(|entry| entry.target).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The confirmation, which the wait owes something to, and the words it is refused in.
+    async fn the_confirmation_is_refused(&self) -> kr_protocol::error::ProtocolError {
+        let refused = self
+            .the_owner_tries_to_confirm()
+            .await
+            .expect_err("the wait owes a device that is live");
+        assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+        refused
+    }
+
+    /// Ends the wait by the route the refusal gives, which removes the record's file by hand while
+    /// the daemon is stopped and starts it again. What the host owes is not asked.
+    async fn the_wait_is_ended_by_hand(self) -> Self {
+        self.restarted(false, |tree| {
+            restored::remove(&restored::file_beside(
+                &tree.environment().registry_database(),
+            ))
+            .expect("the record is removed");
+        })
+        .await
+    }
+
+    /// The person at the machine revokes a share.
+    async fn revokes_a_share_at_the_machine(&self, grant_id: kr_protocol::ids::GrantId) {
+        net_support::worker::revoke(&self.host, grant_id).await;
+    }
+
     /// What the host has written down of a restore.
     fn the_record(&self) -> Found {
         restored::read(&restored::file_beside(
@@ -1285,15 +1320,16 @@ async fn a_confirmation_is_refused_until_a_pass_of_this_run_has_read_the_feed() 
                 .expect("the fault is gone");
         })
         .await;
-    assert!(!rig.runtime().has_compared_in_this_run());
+    assert!(!rig.runtime().has_read_the_feed_through());
     let refused = rig
         .the_owner_tries_to_confirm()
         .await
         .expect_err("a confirmation before the host has read its feed in this run is refused");
     assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
     assert!(
-        refused.message.contains("authority.origin"),
-        "and says why, and how a host that cannot reach its feed is confirmed: {refused:?}"
+        refused.message.contains(&revoked.1.device_id.to_string()),
+        "and names the device the feed revoked, which the first run wrote down and the registry \
+         still holds live: {refused:?}"
     );
     assert!(
         matches!(rig.the_record(), Found::Record(_)),
@@ -1304,15 +1340,15 @@ async fn a_confirmation_is_refused_until_a_pass_of_this_run_has_read_the_feed() 
         .await
         .expect("the doctor says the policy waits");
     assert!(
-        check.detail().contains("and none has yet"),
-        "and says the confirmation is held for the feed: {}",
+        check.detail().contains(&revoked.1.device_id.to_string()),
+        "and says the confirmation is held for it: {}",
         check.detail()
     );
 
     // Passes go on until one reads the feed through: the feed's four refusals end, the registry
     // takes the revocation, and the host catches up.
     within("a pass reads the feed through", async {
-        while !rig.runtime().has_compared_in_this_run() {
+        while !rig.runtime().has_read_the_feed_through() {
             rig.poll().await;
         }
     })
@@ -1365,7 +1401,7 @@ async fn a_confirmation_is_not_held_for_a_feed_that_removed_the_host() {
         .await
         .expect("a key the host named removes the feed");
     within("a pass finds the feed removed the host", async {
-        while !rig.runtime().has_compared_in_this_run() {
+        while !rig.runtime().has_read_the_feed_through() {
             rig.poll().await;
         }
     })
@@ -1377,34 +1413,28 @@ async fn a_confirmation_is_not_held_for_a_feed_that_removed_the_host() {
     );
 }
 
-/// KR-REQ-24.15: a revocation that the feed shows pending and not complete, which this host carried
-/// out after the copy the registry was put back to, is put off while the host is behind its feed
-/// and carried out by the scan that follows the catch-up. The confirmation is refused until that
-/// scan has read the feed through: else it ends the wait while the device is live in the registry
-/// as restored.
+/// KR-REQ-24.15: a request the host has not taken, which it puts off while it is behind its feed and
+/// carries out in the scan that follows the catch-up, names a device that is live in the registry
+/// as restored. The host wrote what the page names before it put the request off, so the
+/// confirmation is refused for that device while the scan that carries it out is still to finish.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_confirmation_is_refused_until_a_pending_revocation_is_carried_out_again() {
+async fn a_confirmation_is_refused_until_a_request_put_off_while_behind_is_carried_out() {
     let rig = Rig::start().await;
     let target = rig.pairs(&[ActionRight::SessionView]).await;
     let kept = rig.pairs(&[ActionRight::SessionView]).await;
+    let earlier = rig.pairs(&[ActionRight::SessionView]).await;
     rig.until_the_carrier_is_idle().await;
-    // The owner revoked `target` through the feed, and an earlier run of the host carried it out
-    // under revision 1 with a worker still to confirm, so the feed shows it pending. The registry
-    // that runs now never saw it, and stands behind the feed.
+    // An earlier run of the host carried out a request that revoked `earlier` under revision 1,
+    // which the registry that runs now never saw, so it stands behind the feed. The owner's request
+    // naming `target` is published and the host has not taken it.
+    let first = rig.signed_by(&rig.owner.authorisation, 0xa0, devices(earlier.1.device_id));
+    rig.published_as(&rig.owner.authorisation, &first).await;
+    rig.an_earlier_run_carried_out(&first, 0, 1).await;
     let request = rig.signed_by(&rig.owner.authorisation, 0xa1, devices(target.1.device_id));
     rig.published_as(&rig.owner.authorisation, &request).await;
-    rig.an_earlier_run_acknowledged(
-        &request,
-        0,
-        1,
-        RevocationCompletion::Pending {
-            pending_workers: U64::new(1),
-        },
-    )
-    .await;
 
-    // The first scan finds the host behind, writes the finding, puts the pending request off and
-    // catches up. The scan that follows reads the feed, and the feed holds that read open.
+    // The first scan finds the host behind, writes the finding, puts the request off and catches
+    // up. The scan that follows reads the feed, and the feed holds that read open.
     let reads = rig.arrivals("read");
     rig.served
         .web()
@@ -1413,7 +1443,7 @@ async fn a_confirmation_is_refused_until_a_pending_revocation_is_carried_out_aga
     rig.until_arrivals("read", reads + 2).await;
     assert!(matches!(rig.the_record(), Found::Record(_)));
     assert!(
-        !rig.runtime().has_compared_in_this_run(),
+        !rig.has_revoked(target.1.device_id).await,
         "the request was put off, and the scan that carries it out has not read the feed through"
     );
     let refused = rig
@@ -1422,20 +1452,23 @@ async fn a_confirmation_is_refused_until_a_pending_revocation_is_carried_out_aga
         .expect_err("the device is live in the registry, and the wait holds it back");
     assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
     assert!(
-        refused.message.contains("authority.origin"),
-        "refused for the comparison it owes: {refused:?}"
+        refused.message.contains(&target.1.device_id.to_string()),
+        "refused for what the request it put off names, which was written before the scan went on: \
+         {refused:?}"
     );
 
     // The read ends without an answer, and a later scan carries the request out.
     rig.served.web().release_held();
-    within("a scan reads the feed through", async {
-        while !rig.runtime().has_compared_in_this_run() {
+    within("a scan carries the request out", async {
+        while !rig.has_revoked(target.1.device_id).await {
             rig.poll().await;
         }
     })
     .await;
     assert!(rig.the_owner_confirms().await.lifted);
     rig.connects_while_a_revocation_is_held(&target.0, &target.1)
+        .await;
+    rig.connects_while_a_revocation_is_held(&earlier.0, &earlier.1)
         .await;
     rig.serves(&kept.0, &kept.1)
         .await
@@ -1507,10 +1540,19 @@ async fn a_confirmation_is_refused_while_a_withdrawal_is_held_behind_a_request_t
 /// KR-REQ-24.15: a pass that found the registry behind the feed and stopped before the catch-up
 /// leaves the refusal for being behind up, and a feed that then removes the host is read no more,
 /// so nothing ends it. The wait for the restored policy takes its place and the person at this
-/// machine ends it.
+/// machine ends it, once the device the first scan met and could not revoke is revoked: the pass
+/// that stopped on an error kept what it met.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_feed_that_removes_the_host_before_the_catch_up_leaves_the_confirmation_open() {
-    let (Restorable { rig, earlier, .. }, earlier_mirror) = a_policy_the_registry_will_lose().await;
+    let (
+        Restorable {
+            rig,
+            revoked,
+            earlier,
+            ..
+        },
+        earlier_mirror,
+    ) = a_policy_the_registry_will_lose().await;
     let rig = rig
         .restarted(false, |tree| {
             put_the_registry_back(tree, &earlier);
@@ -1539,11 +1581,21 @@ async fn a_feed_that_removes_the_host_before_the_catch_up_leaves_the_confirmatio
         .await
         .expect("a key the host named removes the feed");
     within("a pass finds the feed removed the host", async {
-        while !rig.runtime().has_compared_in_this_run() {
+        while !rig.runtime().has_read_the_feed_through() {
             rig.poll().await;
         }
     })
     .await;
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&revoked.1.device_id.to_string()),
+        "the removal does not end what the scan met and could not carry out: {refused:?}"
+    );
+    rusqlite::Connection::open(rig.host.tree().environment().registry_database())
+        .expect("the registry opens")
+        .execute_batch("DROP TRIGGER refuse_revocation;")
+        .expect("the fault is cleared");
+    rig.revokes_at_the_machine(revoked.1.device_id).await;
     assert!(
         rig.the_owner_confirms().await.lifted,
         "a feed that removed the host is read no more, so no catch-up can end"
@@ -1819,11 +1871,15 @@ struct Unverifiable {
 /// remove the feed, counted from the first change after the other owner is paired: the first of
 /// them is the change that follows the withdrawal, and the feed turning it back is what leaves the
 /// device's key listed when the registry is put back. The host is then left to run on its own after
-/// the restart only when `then_idle`; else the case waits for what it wants to see.
+/// the restart only when `then_idle`; else the case waits for what it wants to see. The wait for the
+/// restored policy that the restore puts on the host stands when `waits`; else the person ends it
+/// by the route the refusal gives, which removes the record's file by hand, so that what the case
+/// holds is what the feed does beyond that wait.
 async fn a_withdrawal_by_an_owner_the_host_does_not_know(
     victim_rights: &[ActionRight],
     delegations: &[(u32, Moment)],
     then_idle: bool,
+    waits: bool,
 ) -> Unverifiable {
     let rig = Rig::start().await;
     let victim = rig.pairs(victim_rights).await;
@@ -1917,18 +1973,20 @@ async fn a_withdrawal_by_an_owner_the_host_does_not_know(
     let delegated = rig.arrivals("delegate");
 
     // The registry goes back to before that owner was paired.
-    let rig = rig
+    let mut rig = rig
         .restarted(false, |tree| put_the_registry_back(tree, &earlier))
         .await;
     if then_idle {
         rig.until_the_carrier_is_idle().await;
         rig.until_the_carrier_is_idle().await;
         // The host found its policy restored with its registry, and waits for the person at the
-        // machine as well; what these cases hold is what the feed does beyond that wait. A feed
-        // that turns the change back keeps the host from finishing its catch-up, and the
-        // confirmation waits for that.
-        if delegations.is_empty() {
-            rig.the_owner_confirms().await;
+        // machine as well; what most of these cases hold is what the feed does beyond that wait.
+        // A feed that turns the change back keeps the host from finishing its catch-up, and the
+        // wait is not ended for that.
+        if delegations.is_empty() && !waits {
+            rig = rig.the_wait_is_ended_by_hand().await;
+            rig.until_the_carrier_is_idle().await;
+            rig.until_the_carrier_is_idle().await;
         }
     }
     Unverifiable {
@@ -1967,8 +2025,13 @@ async fn a_withdrawal_by_an_owner_the_host_does_not_know_keeps_remote_access_ref
         owner,
         share,
         ..
-    } = a_withdrawal_by_an_owner_the_host_does_not_know(&[ActionRight::SessionView], &[], true)
-        .await;
+    } = a_withdrawal_by_an_owner_the_host_does_not_know(
+        &[ActionRight::SessionView],
+        &[],
+        true,
+        false,
+    )
+    .await;
 
     let refused = rig.answers(&kept.0, &kept.1).await;
     assert!(
@@ -2080,8 +2143,13 @@ async fn an_owner_confirmation_a_remote_owner_device_signed_is_not_spent_while_t
  {
     let Unverifiable {
         rig, victim, share, ..
-    } = a_withdrawal_by_an_owner_the_host_does_not_know(&[ActionRight::SessionView], &[], true)
-        .await;
+    } = a_withdrawal_by_an_owner_the_host_does_not_know(
+        &[ActionRight::SessionView],
+        &[],
+        true,
+        false,
+    )
+    .await;
     let mut local = rig.host.client().await;
     let refused = rig
         .owner_device_invites(&mut local)
@@ -2386,6 +2454,7 @@ async fn a_device_an_unverifiable_withdrawal_names_cannot_end_the_refusal_by_rem
         &[ActionRight::HostManage, ActionRight::SessionView],
         &[],
         true,
+        false,
     )
     .await;
     let refused = rig.answers(&kept.0, &kept.1).await;
@@ -2469,6 +2538,7 @@ async fn a_feed_that_still_lists_the_key_of_a_device_a_withdrawal_names_does_not
         &[ActionRight::HostManage, ActionRight::SessionView],
         &turned_back,
         true,
+        false,
     )
     .await;
     assert!(
@@ -2523,6 +2593,7 @@ async fn the_key_of_a_device_a_withdrawal_names_is_taken_off_the_feeds_list_when
         &[ActionRight::HostManage, ActionRight::SessionView],
         &faults,
         true,
+        false,
     )
     .await;
 
@@ -2563,6 +2634,7 @@ async fn a_change_to_the_feeds_list_taken_after_the_feed_was_removed_does_not_en
     } = a_withdrawal_by_an_owner_the_host_does_not_know(
         &[ActionRight::HostManage, ActionRight::SessionView],
         &[(1, TURNED_BACK), (2, Moment::Gate)],
+        false,
         false,
     )
     .await;
@@ -2875,6 +2947,7 @@ async fn a_change_to_the_feeds_list_turned_back_with_a_delay_is_the_last_request
     let Unverifiable { rig, delegated, .. } = a_withdrawal_by_an_owner_the_host_does_not_know(
         &[ActionRight::HostManage, ActionRight::SessionView],
         &[(1, TURNED_BACK), (2, delayed)],
+        false,
         false,
     )
     .await;
@@ -3341,7 +3414,17 @@ async fn a_request_put_off_ahead_of_a_withdrawal_the_host_cannot_verify_is_carri
         first,
     } = a_request_the_host_has_not_taken_ahead_of_a_withdrawal_it_has(false).await;
     rig.until_the_carrier_is_idle().await;
-    rig.the_owner_confirms().await;
+    // The withdrawal names the issuer, who is live here: the wait owes it, and the confirmation is
+    // refused until the person has revoked it. What this case holds is what the feed does beyond
+    // the wait, so the wait is ended by the route that removes the record by hand.
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&issuer.1.device_id.to_string()),
+        "and it names the issuer the withdrawal names: {refused:?}"
+    );
+    let rig = rig.the_wait_is_ended_by_hand().await;
+    rig.until_the_carrier_is_idle().await;
+    rig.until_the_carrier_is_idle().await;
 
     let refused = rig.answers(&kept.0, &kept.1).await;
     assert!(
@@ -3383,13 +3466,15 @@ async fn a_request_put_off_ahead_of_a_withdrawal_the_host_cannot_verify_is_carri
         .await;
 }
 
-/// KR-REQ-24.15: a limit. A request put off while the host was behind its feed, whose issuer a later
-/// withdrawal by an owner the host knows revoked, is refused: the registry holds the issuer revoked,
-/// and the host refuses the request of a revoked issuer wherever the feed puts it, because the feed
-/// sets the order and a signature does not cover it. What the request named is not withdrawn. Only
-/// a record the host kept of its own that it had begun the request could finish it.
+/// KR-REQ-24.15: a request put off while the host was behind its feed, whose issuer a later
+/// withdrawal by an owner the host knows revoked, is held while the wait stands and owes what it
+/// names. The registry holds the issuer revoked, but that may be the person's act after the restore
+/// and says nothing of whether the request was made, so the host neither carries it out nor sends
+/// the feed a refusal, which a later restore would read as "never applied", and the confirmation is
+/// refused for the device it names until the person has revoked it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_request_put_off_ahead_of_a_withdrawal_the_host_carried_out_again_is_refused() {
+async fn a_request_put_off_ahead_of_a_withdrawal_the_host_carried_out_again_is_held_and_its_target_owed()
+ {
     let PutOff {
         rig,
         issuer,
@@ -3398,22 +3483,42 @@ async fn a_request_put_off_ahead_of_a_withdrawal_the_host_carried_out_again_is_r
         first,
     } = a_request_the_host_has_not_taken_ahead_of_a_withdrawal_it_has(true).await;
     rig.until_the_carrier_is_idle().await;
-    rig.the_owner_confirms().await;
 
     let held = rig.held_as(&issuer.0.keys().authorisation, &first).await;
     assert_eq!(
-        held.rejected.0,
-        Some(RejectionReason::NoOwnerAuthority),
-        "the issuer is revoked, and its request is refused wherever it stands: {held:?}"
+        held.rejected.0, None,
+        "the issuer is revoked, and the request is held and not refused: {held:?}"
     );
     assert!(rig.has_revoked(issuer.1.device_id).await);
     assert!(!rig.has_revoked(target.1.device_id).await);
-    for served in [&target, &kept] {
-        let session = connect(&rig.host, &served.0, &served.1).await;
-        rig.doctor_as(&session)
+    assert!(
+        rig.what_the_record_lists()
+            .contains(&restored::Target::Device(target.1.device_id)),
+        "and what it names is written to the record of the restore"
+    );
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&target.1.device_id.to_string()),
+        "the confirmation is refused for the device the request names: {refused:?}"
+    );
+    rig.revokes_at_the_machine(target.1.device_id).await;
+    assert!(rig.the_owner_confirms().await.lifted);
+    let session = connect(&rig.host, &kept.0, &kept.1).await;
+    rig.doctor_as(&session)
+        .await
+        .expect("a device the request did not name is served");
+    rig.connects_while_a_revocation_is_held(&target.0, &target.1)
+        .await;
+    // The wait is over, and the next scan judges the request as today and refuses it.
+    rig.poll().await;
+    assert_eq!(
+        rig.held_as(&issuer.0.keys().authorisation, &first)
             .await
-            .expect("a device the request named is served: it was not withdrawn");
-    }
+            .rejected
+            .0,
+        Some(RejectionReason::NoOwnerAuthority),
+        "the first scan after the wait refuses it"
+    );
 }
 
 /// KR-REQ-24.15: where a withdrawal the host cannot verify stands in the feed is read from the feed
@@ -5485,5 +5590,823 @@ async fn the_notices_about_the_feed_keep_their_order_when_the_clock_is_put_back(
     assert!(
         rig.shown().await.removal_item.is_some(),
         "the feed removes the host again, and the owner is told again"
+    );
+}
+
+// What a restored policy's wait owes: the devices and shares the requests the feed holds name that
+// the host has not carried out or set aside on what a restore cannot change.
+
+type Paired = (Device, kr_controller::service::net::devices::DeviceRecord);
+
+/// Writes a record of a restore that names no row the host holds, so that the next start waits for
+/// the person at the machine, level with a feed that holds nothing the registry lacks.
+fn a_restore_was_found(tree: &kr_ipc::testing::TempHost) {
+    restored::write(
+        &restored::file_beside(&tree.environment().registry_database()),
+        &restored::Record::of(
+            kr_protocol::scalars::Digest256::from_bytes([1; 32]),
+            TimestampMs::new(1),
+        ),
+    )
+    .expect("a record");
+}
+
+/// A host whose feed holds a request by a key the host does not know that names `target`, and then
+/// `fillers` requests of other keys that name nothing the host holds. The host has not read them.
+struct Stranger {
+    rig: Rig,
+    /// The device the request names.
+    target: Paired,
+    /// A device nothing names.
+    kept: Paired,
+    /// The key that signed the request.
+    key: AuthorisationKeyPair,
+    /// The request.
+    request: RevocationRequest,
+}
+
+async fn a_request_by_a_key_the_host_does_not_know(fillers: usize) -> Stranger {
+    let rig = Rig::start().await;
+    let target = rig.pairs(&[ActionRight::SessionView]).await;
+    let kept = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.until_the_carrier_is_idle().await;
+    let key = AuthorisationKeyPair::generate().expect("a key");
+    let request = rig.request_of(
+        &key,
+        DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([0x0f; 16])),
+        0xd1,
+        devices(target.1.device_id),
+    );
+    rig.published_as(&key, &request).await;
+    // The feed keeps a publisher to 32 of what the host has not finished with.
+    let strangers: Vec<_> = (0..3)
+        .map(|_| AuthorisationKeyPair::generate().expect("a key"))
+        .collect();
+    for position in 0..fillers {
+        let id = u8::try_from(position + 1).expect("few fillers");
+        let nothing = DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([id; 16]));
+        let key = &strangers[position / 32];
+        let filler = rig.request_of(key, nothing, id, devices(nothing));
+        rig.published_as(key, &filler).await;
+    }
+    Stranger {
+        rig,
+        target,
+        kept,
+        key,
+        request,
+    }
+}
+
+/// KR-REQ-24.15: the host writes what a page of the feed names to the record of the restore before
+/// it acts on any record of the page, so that a daemon that stops part way through a scan, and
+/// starts again with no feed to read, still owes the device the first page named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_page_is_written_before_the_host_acts_on_it() {
+    let Stranger { rig, target, .. } = a_request_by_a_key_the_host_does_not_know(70).await;
+    // The first page holds 64 records, and the host reads the second after it has dealt with them;
+    // the feed holds that read open.
+    let reads = rig.arrivals("read");
+    rig.served
+        .web()
+        .fail_with_member(AUTHORITY, "read", 2, Moment::Hold);
+    let rig = rig.restarted(false, a_restore_was_found).await;
+    rig.until_arrivals("read", reads + 2).await;
+    assert!(
+        rig.what_the_record_lists()
+            .contains(&restored::Target::Device(target.1.device_id)),
+        "the device the first page names is in the record before the scan has read the second"
+    );
+
+    // The daemon stops there, and the next start reads no feed.
+    rig.runtime().crash();
+    rig.served.web().release_held();
+    let rig = rig
+        .restarted(false, |tree| net_support::write_feed_document(tree, None))
+        .await;
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&target.1.device_id.to_string()),
+        "and a host that reads no feed still owes it: {refused:?}"
+    );
+    rig.revokes_at_the_machine(target.1.device_id).await;
+    assert!(rig.the_owner_confirms().await.lifted);
+}
+
+/// KR-REQ-24.15: a feed that answers that it removed the host part way through a scan does not end
+/// what the scan met on the pages before: the confirmation is refused for it, and a start after the
+/// removal is recorded still refuses it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_feed_that_removes_the_host_part_way_through_a_scan_does_not_end_what_the_scan_met() {
+    let Stranger { rig, target, .. } = a_request_by_a_key_the_host_does_not_know(70).await;
+    let reads = rig.arrivals("read");
+    // The feed holds the second page's read before it acts on it, and the owner removes the feed
+    // meanwhile: the read is answered with the removal.
+    rig.served
+        .web()
+        .fail_with_member(AUTHORITY, "read", 2, Moment::Gate);
+    let rig = rig.restarted(false, a_restore_was_found).await;
+    rig.until_arrivals("read", reads + 2).await;
+    rig.remote
+        .remove(rig.feed())
+        .await
+        .expect("a key the host named removes the feed");
+    rig.served.web().release_held();
+    within("a pass finds the feed removed the host", async {
+        while !rig.runtime().has_read_the_feed_through() {
+            rig.poll().await;
+        }
+    })
+    .await;
+    assert!(rig.shown().await.removal_item.is_some());
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&target.1.device_id.to_string()),
+        "the removal does not end what the scan met: {refused:?}"
+    );
+
+    // A start after the removal is recorded still refuses it: the list is on disk.
+    let rig = rig.restarted(false, |_| {}).await;
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&target.1.device_id.to_string()),
+        "and so does the start that follows: {refused:?}"
+    );
+    rig.revokes_at_the_machine(target.1.device_id).await;
+    assert!(rig.the_owner_confirms().await.lifted);
+}
+
+/// KR-REQ-24.15: a host that reads no feed owes what an earlier run of it learned from the feed,
+/// which the record keeps: taking `authority.origin` out of the configuration does not end it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_started_with_no_feed_still_owes_what_a_scan_found() {
+    let Stranger {
+        rig, target, kept, ..
+    } = a_request_by_a_key_the_host_does_not_know(0).await;
+    let rig = rig.restarted(false, a_restore_was_found).await;
+    rig.until_the_carrier_is_idle().await;
+    assert!(
+        rig.what_the_record_lists()
+            .contains(&restored::Target::Device(target.1.device_id)),
+        "the scan wrote what the request names"
+    );
+    let rig = rig
+        .restarted(false, |tree| net_support::write_feed_document(tree, None))
+        .await;
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&target.1.device_id.to_string()),
+        "a host with no feed owes the device the request named: {refused:?}"
+    );
+    assert!(
+        !refused.message.contains(&kept.1.device_id.to_string()),
+        "and not one nothing named: {refused:?}"
+    );
+    rig.revokes_at_the_machine(target.1.device_id).await;
+    assert!(rig.the_owner_confirms().await.lifted);
+}
+
+/// KR-REQ-24.15: a request published before the run first read the feed, by a key the host does not
+/// know, is held while the wait stands and owes what it names; the host sends the feed no refusal,
+/// which a later restore would read as "never applied". One published after the run read the feed
+/// is judged as today and refused, and holds nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_published_before_the_runs_first_reading_is_held_and_owed() {
+    let Stranger {
+        rig,
+        target,
+        kept,
+        key,
+        request,
+    } = a_request_by_a_key_the_host_does_not_know(0).await;
+    let rig = rig.restarted(false, a_restore_was_found).await;
+    rig.until_the_carrier_is_idle().await;
+    assert_eq!(
+        rig.held_as(&key, &request).await.rejected.0,
+        None,
+        "the request is held and not refused"
+    );
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&target.1.device_id.to_string()),
+        "and the confirmation is refused for the device it names: {refused:?}"
+    );
+
+    // A request published after the run read the feed is refused, and names nothing the host owes.
+    let later = rig.request_of(
+        &key,
+        DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([0x0f; 16])),
+        0xd2,
+        devices(kept.1.device_id),
+    );
+    rig.published_as(&key, &later).await;
+    rig.poll().await;
+    assert_eq!(
+        rig.held_as(&key, &later).await.rejected.0,
+        Some(RejectionReason::NoOwnerAuthority),
+        "a request published after the first reading is judged as today"
+    );
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        !refused.message.contains(&kept.1.device_id.to_string()),
+        "and holds the lift for nothing: {refused:?}"
+    );
+
+    rig.revokes_at_the_machine(target.1.device_id).await;
+    assert!(rig.the_owner_confirms().await.lifted);
+    rig.poll().await;
+    assert_eq!(
+        rig.held_as(&key, &request).await.rejected.0,
+        Some(RejectionReason::NoOwnerAuthority),
+        "the first scan after the wait refuses what it held"
+    );
+}
+
+/// KR-REQ-24.15: a stranger's request published after the run first read the feed does not hold the
+/// lift, whether or not the refusal reaches the feed: it names what it names, and nothing is owed
+/// for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stranger_request_published_after_the_runs_first_reading_does_not_hold_the_lift() {
+    let rig = Rig::start().await;
+    let target = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.until_the_carrier_is_idle().await;
+    let rig = rig.restarted(false, a_restore_was_found).await;
+    rig.until_the_carrier_is_idle().await;
+    let key = AuthorisationKeyPair::generate().expect("a key");
+    let by = DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([0x0f; 16]));
+    let request = rig.request_of(&key, by, 0xd3, devices(target.1.device_id));
+    rig.published_as(&key, &request).await;
+    // The refusal does not reach the feed, and the feed then removes the host.
+    rig.served
+        .web()
+        .fail_with_member(AUTHORITY, "reject", 1, TURNED_BACK);
+    rig.poll().await;
+    assert_eq!(
+        rig.held_as(&key, &request).await.rejected.0,
+        None,
+        "the feed turned the refusal back"
+    );
+    rig.the_feed_removes_the_host().await;
+    assert!(
+        rig.the_owner_confirms().await.lifted,
+        "what a request published after the first reading names is not owed"
+    );
+}
+
+impl Rig {
+    /// The feed's client as the host, which signs with the host's own key.
+    fn as_the_host(&self) -> AuthorityFeedClient {
+        let gateway = GatewayOrigin::new(self.served.origin()).expect("an origin");
+        let http: Arc<dyn ServiceHttp> = Arc::new(
+            HttpService::with(
+                gateway.clone(),
+                HttpDeadlines::default(),
+                managed_response_limits(),
+            )
+            .expect("a transport"),
+        );
+        AuthorityFeedClient::new(
+            gateway,
+            http,
+            Arc::new(HostAtTheFeed(self.host_keys.authorisation.clone())),
+        )
+    }
+}
+
+/// A host whose registry was put back to before an owner was paired, with a request of that owner
+/// that an earlier run of the host carried out and acknowledged as Pending.
+struct PendingRequest {
+    rig: Rig,
+    /// The device the request names.
+    target: Paired,
+    /// A device nothing names.
+    kept: Paired,
+    /// The key that signed it, which the restored registry does not hold.
+    key: AuthorisationKeyPair,
+    /// The request.
+    request: RevocationRequest,
+}
+
+async fn a_pending_request_of_an_owner_the_restored_registry_lacks() -> PendingRequest {
+    let rig = Rig::start().await;
+    let target = rig.pairs(&[ActionRight::SessionView]).await;
+    let kept = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.until_the_carrier_is_idle().await;
+    let earlier = a_copy_of_the_registry(&rig.host, "registry-before-the-owner.sqlite3");
+    let owner = rig
+        .pairs(&[ActionRight::HostManage, ActionRight::SessionView])
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    let key = owner.0.keys().authorisation.clone();
+    let request = rig.request_of(&key, owner.1.device_id, 0xa1, devices(target.1.device_id));
+    rig.published_as(&key, &request).await;
+    // An earlier run carried it out under revision 1 with a worker still to confirm, so the feed
+    // shows it pending, and the registry put back never saw it.
+    rig.an_earlier_run_acknowledged(
+        &request,
+        0,
+        1,
+        RevocationCompletion::Pending {
+            pending_workers: U64::new(1),
+        },
+    )
+    .await;
+    let rig = rig
+        .restarted(false, |tree| put_the_registry_back(tree, &earlier))
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    rig.until_the_carrier_is_idle().await;
+    PendingRequest {
+        rig,
+        target,
+        kept,
+        key,
+        request,
+    }
+}
+
+/// KR-REQ-24.15: a request the feed shows this host acknowledged as Pending, whose issuer was paired
+/// after the copy the registry was put back to, cannot be judged against the registry as restored:
+/// the issuer is not in it. The host does not refuse it, which the feed would keep for a week and a
+/// later restore would read as "never applied"; it owes the device the request names, writes it to
+/// the record, and the confirmation is refused for it until the person has revoked it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_acknowledged_pending_request_from_an_issuer_the_restored_registry_lacks_owes_its_target()
+ {
+    let PendingRequest {
+        rig,
+        target,
+        kept,
+        key,
+        request,
+    } = a_pending_request_of_an_owner_the_restored_registry_lacks().await;
+    assert_eq!(
+        rig.held_as(&key, &request).await.rejected.0,
+        None,
+        "the request is not refused"
+    );
+    assert!(
+        rig.what_the_record_lists()
+            .contains(&restored::Target::Device(target.1.device_id)),
+        "the device it names is written to the record of the restore"
+    );
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&target.1.device_id.to_string()),
+        "the confirmation is refused for it: {refused:?}"
+    );
+    rig.revokes_at_the_machine(target.1.device_id).await;
+    rig.until_the_carrier_is_idle().await;
+    assert!(rig.the_owner_confirms().await.lifted);
+    rig.serves(&kept.0, &kept.1)
+        .await
+        .expect("the device nothing names is served");
+}
+
+/// KR-REQ-24.15: a withdrawal the host cannot verify keeps the device it names owed, across a
+/// confirmation that is refused and a start with the feed down: the person revokes it, and then the
+/// confirmation lifts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_withdrawal_the_host_cannot_verify_keeps_its_device_owed_across_a_confirmation_and_a_restart()
+ {
+    let Unverifiable {
+        rig, victim, share, ..
+    } = a_withdrawal_by_an_owner_the_host_does_not_know(
+        &[ActionRight::SessionView],
+        &[],
+        true,
+        true,
+    )
+    .await;
+    let refused = rig.the_confirmation_is_refused().await;
+    for named in [
+        format!("device {}", victim.1.device_id),
+        format!("share {}", share.grant_id),
+    ] {
+        assert!(
+            refused.message.contains(&named),
+            "{named} is not named in: {refused:?}"
+        );
+    }
+    let listed = rig.what_the_record_lists();
+    assert!(listed.contains(&restored::Target::Device(victim.1.device_id)));
+    assert!(listed.contains(&restored::Target::Grant(share.grant_id)));
+
+    // A start with the feed down reads the list from the record.
+    let rig = rig.restarted(true, |_| {}).await;
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&victim.1.device_id.to_string()),
+        "a host that cannot read its feed still owes the device the feed named: {refused:?}"
+    );
+    rig.revokes_at_the_machine(victim.1.device_id).await;
+    rig.revokes_a_share_at_the_machine(share.grant_id).await;
+    within("a scan reads the feed through", async {
+        while !rig.runtime().has_read_the_feed_through() {
+            rig.poll().await;
+        }
+    })
+    .await;
+    assert!(rig.the_owner_confirms().await.lifted);
+}
+
+/// KR-REQ-24.15: revoking the issuer of a request the host cannot judge refuses nothing at the feed
+/// and ends nothing: the request is held, its target stays owed, and only revoking the target lifts
+/// the confirmation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revoking_the_requester_of_a_request_the_host_cannot_judge_does_not_end_the_wait() {
+    let Undecidable {
+        rig,
+        issuer,
+        target,
+        first,
+        ..
+    } = a_request_whose_issuer_the_host_cannot_decide(&[], 0).await;
+    let rig = rig
+        .restarted(false, |tree| {
+            a_restore_was_found(tree);
+            let _ = std::fs::remove_file(tree.environment().utc_floor_file());
+        })
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    let key = issuer.0.keys().authorisation.clone();
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&target.1.device_id.to_string()),
+        "the request waits for the clock, and what it names is owed: {refused:?}"
+    );
+
+    // The remedy that was offered: revoke the requester.
+    rig.revokes_at_the_machine(issuer.1.device_id).await;
+    rig.poll().await;
+    assert_eq!(
+        rig.held_as(&key, &first).await.rejected.0,
+        None,
+        "the request of a revoked issuer is held, and not refused"
+    );
+    assert!(!rig.has_revoked(target.1.device_id).await);
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&target.1.device_id.to_string()),
+        "and still owes what it names: {refused:?}"
+    );
+    rig.revokes_at_the_machine(target.1.device_id).await;
+    assert!(rig.the_owner_confirms().await.lifted);
+}
+
+/// KR-REQ-24.15: a scan clears an entry of the list when it settles on evidence the request that
+/// named it, so a device a forged request named does not stay owed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scan_clears_the_entries_of_the_records_it_settled() {
+    let rig = Rig::start().await;
+    let target = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.until_the_carrier_is_idle().await;
+    // Signed by a key the registry's device of that identity does not hold: no request that device
+    // made, whatever a restore changed.
+    let key = AuthorisationKeyPair::generate().expect("a key");
+    let request = rig.request_of(&key, rig.owner_device(), 0xd5, devices(target.1.device_id));
+    rig.published_as(&key, &request).await;
+    let origin = restored::origin_digest(rig.served.origin());
+    let target_id = target.1.device_id;
+    let rig = rig
+        .restarted(false, |tree| {
+            restored::write(
+                &restored::file_beside(&tree.environment().registry_database()),
+                &restored::Record {
+                    owed: vec![restored::Owed {
+                        origin,
+                        target: restored::Target::Device(target_id),
+                    }],
+                    ..restored::Record::of(
+                        kr_protocol::scalars::Digest256::from_bytes([1; 32]),
+                        TimestampMs::new(1),
+                    )
+                },
+            )
+            .expect("a record");
+        })
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    assert_eq!(
+        rig.held_as(&key, &request).await.rejected.0,
+        Some(RejectionReason::NoOwnerAuthority),
+        "the forgery is refused on what a restore cannot change"
+    );
+    assert!(
+        rig.what_the_record_lists().is_empty(),
+        "and the entry it made is cleared"
+    );
+    assert!(rig.the_owner_confirms().await.lifted);
+}
+
+/// KR-REQ-24.15: a completed request whose issuer the person revoked at the machine after the
+/// restore, before the scan reached it, is not dismissed for that: the registry's revocation may be
+/// the person's act and not the issuer's, so what the request names stays owed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_issuer_of_a_complete_request_revoked_after_the_restore_does_not_dismiss_it() {
+    let rig = Rig::start().await;
+    let victim = rig.pairs(&[ActionRight::SessionView]).await;
+    let issuer = rig
+        .pairs(&[ActionRight::HostManage, ActionRight::SessionView])
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    let earlier = a_copy_of_the_registry(&rig.host, "registry-with-the-issuer.sqlite3");
+    let key = issuer.0.keys().authorisation.clone();
+    let request = rig.request_of(&key, issuer.1.device_id, 0xa1, devices(victim.1.device_id));
+    rig.published_as(&key, &request).await;
+    rig.poll().await;
+    rig.until_the_revocation_is_acknowledged(&request).await;
+    assert!(rig.has_revoked(victim.1.device_id).await);
+
+    // The registry is put back, and the feed holds the first read while the person revokes the
+    // issuer, as a lost phone is revoked.
+    let reads = rig.arrivals("read");
+    rig.served
+        .web()
+        .fail_with_member(AUTHORITY, "read", 1, Moment::Hold);
+    let rig = rig
+        .restarted(false, |tree| put_the_registry_back(tree, &earlier))
+        .await;
+    rig.until_arrivals("read", reads + 1).await;
+    rig.revokes_at_the_machine(issuer.1.device_id).await;
+    rig.served.web().release_held();
+    rig.poll().await;
+    rig.until_the_carrier_is_idle().await;
+
+    assert!(
+        !rig.has_revoked(victim.1.device_id).await,
+        "the request of a revoked issuer is not carried out again"
+    );
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&victim.1.device_id.to_string()),
+        "and what it names is owed: {refused:?}"
+    );
+    rig.revokes_at_the_machine(victim.1.device_id).await;
+    assert!(rig.the_owner_confirms().await.lifted);
+}
+
+/// KR-REQ-24.15: a feed the person points the host at does not clear what an earlier feed owed: its
+/// entries keep the origin that named them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_of_feed_does_not_clear_what_an_earlier_feed_owed() {
+    let Stranger { rig, target, .. } = a_request_by_a_key_the_host_does_not_know(0).await;
+    let rig = rig.restarted(false, a_restore_was_found).await;
+    rig.until_the_carrier_is_idle().await;
+    assert!(
+        rig.what_the_record_lists()
+            .contains(&restored::Target::Device(target.1.device_id))
+    );
+    let rig = rig.pointed_at(serve().await).await;
+    rig.until_the_carrier_is_idle().await;
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&target.1.device_id.to_string()),
+        "a feed that holds nothing for the host does not clear what the first one owed: {refused:?}"
+    );
+}
+
+/// KR-REQ-24.15: a pass that stops because the feed turned a page back keeps what the pages before
+/// it named, and a feed that then removes the host does not end it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pass_that_stops_on_an_error_keeps_what_it_met_when_the_feed_then_removes_the_host() {
+    let Stranger { rig, target, .. } = a_request_by_a_key_the_host_does_not_know(70).await;
+    let reads = rig.arrivals("read");
+    rig.served
+        .web()
+        .fail_with_member(AUTHORITY, "read", 2, TURNED_BACK);
+    let rig = rig.restarted(false, a_restore_was_found).await;
+    rig.until_arrivals("read", reads + 2).await;
+    rig.remote
+        .remove(rig.feed())
+        .await
+        .expect("a key the host named removes the feed");
+    rig.timer.release_held();
+    within("a pass finds the feed removed the host", async {
+        while !rig.runtime().has_read_the_feed_through() {
+            rig.poll().await;
+        }
+    })
+    .await;
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&target.1.device_id.to_string()),
+        "the first page was read before the second was turned back: {refused:?}"
+    );
+    rig.revokes_at_the_machine(target.1.device_id).await;
+    assert!(rig.the_owner_confirms().await.lifted);
+}
+
+/// KR-REQ-24.15: a record of the restore that cannot be read is not written over: what the run owes
+/// stays in memory, the confirmation names it, and revoking it lets the confirmation remove the
+/// record that cannot be read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unreadable_record_does_not_empty_what_the_run_owes() {
+    let Stranger { rig, target, .. } = a_request_by_a_key_the_host_does_not_know(0).await;
+    let rig = rig
+        .restarted(false, |tree| {
+            std::fs::write(
+                restored::file_beside(&tree.environment().registry_database()),
+                b"junk",
+            )
+            .expect("junk");
+        })
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    assert!(
+        matches!(rig.the_record(), Found::Unreadable(_)),
+        "the record is not written over"
+    );
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&target.1.device_id.to_string()),
+        "what the run owes is in memory: {refused:?}"
+    );
+    rig.revokes_at_the_machine(target.1.device_id).await;
+    assert!(rig.the_owner_confirms().await.lifted);
+    assert_eq!(rig.the_record(), Found::Missing);
+}
+
+/// KR-REQ-24.15: a request the feed dropped after its retention leaves its entry where it was: an
+/// entry leaves the list when it is cleared or no longer live, and never because no request names
+/// it now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_the_feed_dropped_after_its_retention_stays_owed() {
+    let Unverifiable { rig, victim, .. } = a_withdrawal_by_an_owner_the_host_does_not_know(
+        &[ActionRight::SessionView],
+        &[],
+        true,
+        true,
+    )
+    .await;
+    assert!(
+        rig.what_the_record_lists()
+            .contains(&restored::Target::Device(victim.1.device_id))
+    );
+    rig.served.web().a_week_passes_in_the_feeds();
+    rig.poll().await;
+    rig.poll().await;
+    assert!(
+        rig.what_the_record_lists()
+            .contains(&restored::Target::Device(victim.1.device_id)),
+        "the list holds the entry the dropped request made"
+    );
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&victim.1.device_id.to_string()),
+        "and the confirmation is refused for it: {refused:?}"
+    );
+}
+
+/// KR-REQ-24.15: a request the host carried out and could not acknowledge, a restore, the person's
+/// revocation of what it names as the refusal says, and a second restore to the same copy: the host
+/// sends the feed no refusal during the wait, so the feed never reads "rejected", and the second
+/// finding owes the device again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_restore_in_one_wait_owes_the_target_again_and_no_refusal_reaches_the_feed() {
+    let rig = Rig::start().await;
+    let target = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.until_the_carrier_is_idle().await;
+    let earlier = a_copy_of_the_registry(&rig.host, "registry-before-the-owner.sqlite3");
+    let owner = rig
+        .pairs(&[ActionRight::HostManage, ActionRight::SessionView])
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    let key = owner.0.keys().authorisation.clone();
+    let request = rig.request_of(&key, owner.1.device_id, 0xa1, devices(target.1.device_id));
+    rig.published_as(&key, &request).await;
+    // The host carries the request out, and the acknowledgement never arrives.
+    rig.served
+        .web()
+        .fail_with_member(AUTHORITY, "acknowledge", 1, Moment::Before);
+    rig.poll().await;
+    assert!(rig.has_revoked(target.1.device_id).await);
+    assert!(
+        rig.held_as(&key, &request)
+            .await
+            .acknowledgement
+            .0
+            .is_none(),
+        "the acknowledgement was lost"
+    );
+
+    let rig = rig
+        .restarted(false, |tree| put_the_registry_back(tree, &earlier))
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    rig.until_the_carrier_is_idle().await;
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&target.1.device_id.to_string()),
+        "the request names a device the restore brought back: {refused:?}"
+    );
+    // The person revokes it, as the refusal says.
+    rig.revokes_at_the_machine(target.1.device_id).await;
+    rig.poll().await;
+    assert_eq!(
+        rig.held_as(&key, &request).await.rejected.0,
+        None,
+        "the host sends no refusal while the wait stands"
+    );
+
+    // The registry is put back to the same copy again, before the person confirmed.
+    let rig = rig
+        .restarted(false, |tree| put_the_registry_back(tree, &earlier))
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    rig.until_the_carrier_is_idle().await;
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&target.1.device_id.to_string()),
+        "and the second finding owes the device again: {refused:?}"
+    );
+}
+
+/// KR-REQ-24.15: a request the feed shows this host acknowledged and then refused is carried out
+/// again: the refusal is no evidence that the host never applied it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_record_that_holds_the_hosts_acknowledgement_is_carried_out_again() {
+    let rig = Rig::start().await;
+    let target = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.until_the_carrier_is_idle().await;
+    let request = rig.signed_by(&rig.owner.authorisation, 0xa1, devices(target.1.device_id));
+    rig.published_as(&rig.owner.authorisation, &request).await;
+    rig.an_earlier_run_acknowledged(
+        &request,
+        0,
+        1,
+        RevocationCompletion::Pending {
+            pending_workers: U64::new(1),
+        },
+    )
+    .await;
+    rig.as_the_host()
+        .reject(request.request_id, RejectionReason::Superseded)
+        .await
+        .expect("the host refuses the record it acknowledged");
+    assert!(rig.held(&request).await.rejected.0.is_some());
+    let rig = rig.restarted(false, |_| {}).await;
+    rig.until_the_carrier_is_idle().await;
+    assert!(
+        rig.has_revoked(target.1.device_id).await,
+        "the host carried it out again, whatever the feed shows besides"
+    );
+}
+
+/// KR-REQ-24.15: an acknowledged-Pending request the host carries out again after a restore is
+/// acknowledged complete under the revision the feed already holds for it, so the feed stops
+/// holding one of its publisher's open records, and the host issues no revision of its own for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_acknowledged_pending_request_carried_out_again_is_acknowledged_complete() {
+    let rig = Rig::start().await;
+    let target = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.until_the_carrier_is_idle().await;
+    let request = rig.signed_by(&rig.owner.authorisation, 0xa1, devices(target.1.device_id));
+    rig.published_as(&rig.owner.authorisation, &request).await;
+    rig.an_earlier_run_acknowledged(
+        &request,
+        0,
+        1,
+        RevocationCompletion::Pending {
+            pending_workers: U64::new(1),
+        },
+    )
+    .await;
+    assert_eq!(
+        rig.held(&request)
+            .await
+            .acknowledgement
+            .0
+            .as_ref()
+            .map(|held| held.completion),
+        Some(RevocationCompletion::Pending {
+            pending_workers: U64::new(1)
+        })
+    );
+    let revisions = rig.arrivals("revise");
+
+    let rig = rig.restarted(false, |_| {}).await;
+    rig.until_the_carrier_is_idle().await;
+    rig.until_the_carrier_is_idle().await;
+    assert!(rig.has_revoked(target.1.device_id).await);
+    let held = rig.held(&request).await;
+    let acknowledged = held.acknowledgement.0.as_ref().expect("acknowledged");
+    assert_eq!(acknowledged.completion, RevocationCompletion::Complete);
+    assert_eq!(
+        acknowledged.authority_revision,
+        AuthorityRevision::new(1),
+        "under the revision the feed already held for it"
+    );
+    assert_eq!(
+        rig.arrivals("revise"),
+        revisions,
+        "and the host issued no revision of its own"
+    );
+    let acknowledgements = rig.arrivals("acknowledge");
+    rig.poll().await;
+    assert_eq!(
+        rig.arrivals("acknowledge"),
+        acknowledgements,
+        "a request the feed shows complete is not acknowledged again"
     );
 }

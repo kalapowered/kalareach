@@ -75,6 +75,7 @@ mod recovery;
 pub(crate) mod remote_revocation;
 mod rendezvous;
 mod restored_policy;
+pub use self::restored_policy::OwedWrite;
 mod revocation;
 mod routes;
 mod standing;
@@ -743,6 +744,14 @@ pub struct Controller {
     /// the lock that orders a change of it and of the wait it keeps
     /// ([`crate::grants::restored`]). Taken before the registry's guard.
     restored_policy: tokio::sync::Mutex<crate::grants::restored::Kept>,
+    /// How many times this run found the registry behind its authority feed from a state of not
+    /// being behind it, or found the registry's revision lower than at the run's last comparison
+    /// (a registry put back again). The carrier restarts its scan on each, even when the write of
+    /// the record of the finding failed ([`Controller::authority_feed_behind`]).
+    restores_found: std::sync::atomic::AtomicU64,
+    /// The highest revision the registry has stood at in this run's comparisons with the feed or
+    /// in a request the carrier carried out.
+    compared_revision: std::sync::atomic::AtomicU64,
     /// The wait for the pairing records' write lock that a refusal which rose is in, while it has
     /// gone on past the database's busy timeout ([`Controller::stuck_drain`]).
     feed_drain: std::sync::Mutex<Option<remote_revocation::StuckDrain>>,

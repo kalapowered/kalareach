@@ -355,6 +355,12 @@ impl Kept {
         &self.file
     }
 
+    /// The most entries the list holds.
+    #[must_use]
+    pub const fn most(&self) -> usize {
+        self.most
+    }
+
     /// Lowers the most the list holds, for a suite that fills it.
     #[cfg(any(test, feature = "testing"))]
     pub const fn limit_the_list_to(&mut self, most: usize) {

@@ -65,7 +65,7 @@ use kr_protocol::hostinfo::{DoctorCheck, DoctorStatus};
 use kr_protocol::ids::{AuthorityRevision, DeviceId, GrantId, RevocationRequestId};
 use kr_protocol::pairing::{
     AUTHORITY_REVISION_DOMAIN, AuthorityRevisionRecord, RevocationAcknowledgement,
-    RevocationCompletion,
+    RevocationCompletion, RevocationRequest,
 };
 use kr_protocol::scalars::{CanonicalSet, KeyId, Signature64, TimestampMs};
 use kr_protocol::service::GatewayOrigin;
@@ -76,9 +76,10 @@ use tokio::task::JoinHandle;
 use crate::error::{ControllerError, Result};
 use crate::grants::Refusal;
 use crate::grants::feed::{FEED_POLL_INTERVAL_MS, RetainedRevocation};
+use crate::grants::restored::Target;
 use crate::quiet::{Quiet, Timer};
-use crate::service::Controller;
-use crate::service::remote_revocation::{DrainWhy, Judged, Replay, StuckDrain, Unverified};
+use crate::service::remote_revocation::{DrainWhy, Ground, Judged, Replay, StuckDrain, Unverified};
+use crate::service::{Controller, OwedWrite};
 
 /// The deadlines the feed's exchanges are made under. A request and its answer are small.
 pub const FEED_DEADLINES: HttpDeadlines = HttpDeadlines {
@@ -191,10 +192,68 @@ struct Observed {
     /// and that a withdrawal this host cannot verify names: revoking one of them refuses its
     /// request.
     waiting_named: Vec<DeviceId>,
-    /// The devices that made the requests a scan that read the feed through held records behind,
-    /// because this host could not yet decide who may manage it. The records wait for a scan that
-    /// can, so the comparison with the feed is not done until one has.
-    held_behind: Option<Vec<DeviceId>>,
+}
+
+/// What the scan in hand owes the wait for a restored policy: the devices and grants the requests
+/// it met name, until it settles the request that names them. Held in memory, and written to the
+/// record of the restore before the host acts on the page that names them, so a stop, an error, an
+/// abort or a removal part way through a scan keeps them ([`crate::grants::restored`]).
+#[derive(Debug, Default)]
+struct Owing {
+    /// Each target an unsettled record names, with the sequences of the records that name it.
+    unsettled: std::collections::BTreeMap<Target, std::collections::BTreeSet<u64>>,
+    /// The targets each unsettled record names.
+    by_record: std::collections::BTreeMap<u64, Vec<Target>>,
+    /// The targets that records this scan settled named, which the reconcile takes out of the list
+    /// unless an unsettled record names them too.
+    settled: std::collections::BTreeSet<Target>,
+}
+
+impl Owing {
+    /// A record at `sequence` names `targets`, and is not settled.
+    fn add(&mut self, sequence: u64, targets: Vec<Target>) {
+        for target in &targets {
+            self.unsettled.entry(*target).or_default().insert(sequence);
+        }
+        self.by_record.insert(sequence, targets);
+    }
+
+    /// The record at `sequence` is settled: carried out, or dismissed on evidence.
+    fn settle(&mut self, sequence: u64) {
+        let Some(targets) = self.by_record.remove(&sequence) else {
+            return;
+        };
+        for target in targets {
+            let Some(sequences) = self.unsettled.get_mut(&target) else {
+                continue;
+            };
+            sequences.remove(&sequence);
+            if sequences.is_empty() {
+                self.unsettled.remove(&target);
+                self.settled.insert(target);
+            }
+        }
+    }
+
+    /// The targets unsettled records name, lowest feed sequence first.
+    fn unsettled_in_order(&self) -> Vec<Target> {
+        let mut targets: Vec<(u64, Target)> = self
+            .unsettled
+            .iter()
+            .filter_map(|(target, sequences)| sequences.first().map(|first| (*first, *target)))
+            .collect();
+        targets.sort();
+        targets.into_iter().map(|(_, target)| target).collect()
+    }
+
+    /// The targets only settled records named: what the reconcile takes out of the list.
+    fn cleared(&self) -> Vec<Target> {
+        self.settled
+            .iter()
+            .filter(|target| !self.unsettled.contains_key(*target))
+            .copied()
+            .collect()
+    }
 }
 
 /// What the carrier shares with the daemon.
@@ -222,12 +281,25 @@ struct Shared {
     #[cfg(feature = "testing")]
     wakes: AtomicU64,
     removed: AtomicBool,
-    /// Whether a scan of this run has read the feed through since the registry was last found
-    /// behind it, and has carried out, or settled, every record the feed holds: what it shows
-    /// completed, and what it did not show completed that was put off while the host was behind or
-    /// held behind a request it could not judge. Held in memory only: a start begins without it,
-    /// and a finding that the registry is behind the feed clears it.
-    comparison_done: AtomicBool,
+    /// Whether a scan of this run has read the feed through since the last finding that the
+    /// registry is behind it, and has written what it owes to the record of the restore (or had no
+    /// record to write it to, which is checked in memory), without the cap keeping an entry out.
+    /// Held in memory only: a start begins without it. It guards the list in the record against
+    /// being one from another registry: a second restore between two runs leaves the file in place,
+    /// and its list does not describe what this run's scan has yet to learn.
+    read_through: AtomicBool,
+    /// The cutoff of a wait: the highest sequence the first scan of this run that read the feed
+    /// through while a wait stood saw, or the maximum before it. A request above it was published
+    /// after the run read the feed, and is judged as today. A finding resets it.
+    finding_through: AtomicU64,
+    /// The highest sequence the scan in hand has seen.
+    scan_highest: AtomicU64,
+    /// How many findings the scan has handled ([`Controller::findings`]).
+    findings_seen: AtomicU64,
+    /// What the scan in hand owes.
+    owing: Mutex<Owing>,
+    /// Whether the cap kept an owed target out of the record, since the last finding.
+    owing_full: AtomicBool,
     /// The highest sequence of the feed up to which everything is settled, where a scan starts.
     settled_through: AtomicU64,
     /// Where a scan that stopped at the page limit goes on, or 0 when none is under way.
@@ -250,19 +322,138 @@ impl Shared {
     fn observed(&self) -> std::sync::MutexGuard<'_, Observed> {
         self.observed.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    fn owing(&self) -> std::sync::MutexGuard<'_, Owing> {
+        self.owing.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The record at `sequence` is settled: what only it named is no longer owed by this scan.
+    fn settle(&self, sequence: u64) {
+        self.owing().settle(sequence);
+    }
+
+    /// Whether a record at `sequence` is one the host holds and does not refuse for a ground a
+    /// restore can change: a wait for a restored policy stands, and the record is at or below the
+    /// cutoff, so it may be a request the host carried out before the restore.
+    fn holds_for_the_wait(&self, controller: &Controller, sequence: u64) -> bool {
+        controller.restored_policy_waits()
+            && sequence <= self.finding_through.load(Ordering::SeqCst)
+    }
 }
 
-/// What the comparison of the registry with the feed still waits for.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ComparisonOwed {
-    /// No scan of this run has read the feed through, carried out what it shows and settled every
-    /// record, since the host started or found the registry behind the feed.
-    AScanThrough,
-    /// A scan read the feed through, but the records behind the requests of these devices are not
-    /// carried out: this host cannot yet decide who may manage it, so it cannot judge them. A
-    /// later scan can, once the clock is decided, or once the person at this machine has revoked
-    /// the devices, which refuses their requests.
-    RequestsItCannotJudge(Vec<DeviceId>),
+/// Restarts the scan when a finding was made since the last pass handled one: the registry was
+/// found behind the feed, or put back again. What the scan settled, and its cursor, belong to a
+/// registry that is gone. Says whether it did.
+fn handle_findings(shared: &Shared, controller: &Controller) -> bool {
+    let count = controller.findings();
+    if shared.findings_seen.swap(count, Ordering::SeqCst) == count {
+        return false;
+    }
+    shared.settled_through.store(0, Ordering::SeqCst);
+    shared.scan_cursor.store(0, Ordering::SeqCst);
+    shared.scan_unfinished.store(false, Ordering::SeqCst);
+    shared.scan_put_off.store(false, Ordering::SeqCst);
+    *shared
+        .scan_found
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Unverified::default();
+    *shared
+        .scan_undecided
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = None;
+    shared.scan_highest.store(0, Ordering::SeqCst);
+    *shared.owing() = Owing::default();
+    shared.owing_full.store(false, Ordering::SeqCst);
+    shared.read_through.store(false, Ordering::SeqCst);
+    shared.finding_through.store(u64::MAX, Ordering::SeqCst);
+    true
+}
+
+/// Writes what the requests on a page name to the record of the restore, before the host acts on
+/// any record of it, while a wait stands. A request above the cutoff is not written: it was
+/// published after the run read the feed. A write that fails stops the pass before anything is
+/// carried out.
+async fn write_ahead(
+    shared: &Shared,
+    controller: &Controller,
+    records: &[AuthorityFeedRecord],
+) -> std::result::Result<(), Stopped> {
+    if !controller.restored_policy_waits() {
+        return Ok(());
+    }
+    let cutoff = shared.finding_through.load(Ordering::SeqCst);
+    let ahead = {
+        let mut owing = shared.owing();
+        for record in records
+            .iter()
+            .filter(|record| record.sequence.get() <= cutoff)
+        {
+            let named = controller.named_targets_of(&record.request);
+            if !named.is_empty() {
+                owing.add(record.sequence.get(), named);
+            }
+        }
+        owing.unsettled_in_order()
+    };
+    if ahead.is_empty() {
+        return Ok(());
+    }
+    if let OwedWrite::Kept { full: true } = controller
+        .keep_what_is_owed(&shared.origin, &ahead, &[])
+        .await
+        .map_err(Stopped::local)?
+    {
+        shared.owing_full.store(true, Ordering::SeqCst);
+    }
+    Ok(())
+}
+
+/// What a scan that read the feed through does with what it owes: the record's list gains every
+/// target an unsettled record names and loses every target only settled records named, and the
+/// scan's own memory of it ends once the record holds it. The first read-through of a run that
+/// stands in a wait sets the cutoff.
+async fn reconcile(shared: &Shared, controller: &Controller) -> std::result::Result<(), Stopped> {
+    let (add, clear) = {
+        let owing = shared.owing();
+        (owing.unsettled_in_order(), owing.cleared())
+    };
+    if !controller.restored_policy_waits() {
+        *shared.owing() = Owing::default();
+        shared.read_through.store(true, Ordering::SeqCst);
+        return Ok(());
+    }
+    match controller
+        .keep_what_is_owed(&shared.origin, &add, &clear)
+        .await
+        .map_err(Stopped::local)?
+    {
+        OwedWrite::Kept { full } => {
+            // A list the cap kept an entry out of is not the whole of what is owed: the scan keeps
+            // what it met, for the confirmation to name, and does not count as read through.
+            if !full {
+                *shared.owing() = Owing::default();
+            }
+            shared.owing_full.store(full, Ordering::SeqCst);
+            shared.read_through.store(!full, Ordering::SeqCst);
+        }
+        // The record could not be read at the start and is not written over: what the run owes
+        // stays in memory, where a confirmation reads it.
+        OwedWrite::NoRecord => shared.read_through.store(true, Ordering::SeqCst),
+        // The wait ended while the scan ran.
+        OwedWrite::NotWaiting => {
+            *shared.owing() = Owing::default();
+            shared.read_through.store(true, Ordering::SeqCst);
+            return Ok(());
+        }
+    }
+    // A request above this sequence was published after the run read the feed.
+    let _ = shared.finding_through.compare_exchange(
+        u64::MAX,
+        shared.scan_highest.load(Ordering::SeqCst),
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+    );
+    Ok(())
 }
 
 /// The carrier of the host's authority feed.
@@ -314,7 +505,12 @@ impl FeedRuntime {
                 #[cfg(feature = "testing")]
                 wakes: AtomicU64::new(0),
                 removed: AtomicBool::new(false),
-                comparison_done: AtomicBool::new(false),
+                read_through: AtomicBool::new(false),
+                finding_through: AtomicU64::new(u64::MAX),
+                scan_highest: AtomicU64::new(0),
+                findings_seen: AtomicU64::new(0),
+                owing: Mutex::default(),
+                owing_full: AtomicBool::new(false),
                 settled_through: AtomicU64::new(0),
                 scan_cursor: AtomicU64::new(0),
                 scan_unfinished: AtomicBool::new(false),
@@ -337,26 +533,30 @@ impl FeedRuntime {
     }
 
     /// Whether this host has nothing left to learn from its feed in this run: a scan has read it
-    /// through, compared its revision with the registry's and carried out, or settled, every record
-    /// it holds, or the feed removed this host and is read no more. A host that has not cannot tell
-    /// whether the registry it started on still holds live a device an owner revoked through the
-    /// feed.
+    /// through since the registry was last found behind it and written what it owes to the record
+    /// of the restore, or the feed removed this host and is read no more. A host that has not
+    /// cannot tell whether the registry it started on still holds live a device an owner revoked
+    /// through the feed.
     #[must_use]
-    pub fn has_compared_in_this_run(&self) -> bool {
-        self.shared.comparison_done.load(Ordering::SeqCst)
+    pub fn has_read_the_feed_through(&self) -> bool {
+        self.shared.read_through.load(Ordering::SeqCst)
             || self.shared.removed.load(Ordering::SeqCst)
     }
 
-    /// What the comparison with the feed still waits for, none when it is done.
+    /// The devices and grants the scan in hand owes and has not yet written to the record, with
+    /// whether the cap kept an owed target out of the record. A confirmation reads these beside
+    /// the record's list.
     #[must_use]
-    pub fn what_the_comparison_waits_for(&self) -> Option<ComparisonOwed> {
-        if self.has_compared_in_this_run() {
-            return None;
-        }
-        Some(match self.shared.observed().held_behind.clone() {
-            Some(devices) => ComparisonOwed::RequestsItCannotJudge(devices),
-            None => ComparisonOwed::AScanThrough,
-        })
+    pub fn what_the_scan_owes(&self) -> (Vec<Target>, bool) {
+        let owing = self
+            .shared
+            .owing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        (
+            owing.unsettled_in_order(),
+            self.shared.owing_full.load(Ordering::SeqCst),
+        )
     }
 
     /// The origin this carrier reads.
@@ -991,7 +1191,13 @@ async fn pass(
         // registry restored to an earlier state is behind a revision this host issued.
         if !compared {
             compared = true;
-            let behind = match controller.authority_feed_behind(now.revision).await {
+            let behind = controller.authority_feed_behind(now.revision).await;
+            // A finding restarts the scan, however its record fared: the count of findings is
+            // raised before the record is written, so a write that failed and is made again by the
+            // next pass is still a finding here, and so is a registry put back while the host was
+            // catching up.
+            let found_anew = handle_findings(shared, controller);
+            let behind = match behind {
                 Ok(behind) => behind,
                 Err(error) => {
                     // A finding that could not be written down stops the pass with the host still
@@ -1001,14 +1207,19 @@ async fn pass(
                 }
             };
             shared.observed().catching_up = behind;
-            if behind {
-                // The registry is behind the feed: nothing compared before this is the comparison
-                // of the registry as it stands now, and the records the feed holds are carried out
-                // again by the scan that follows the catch-up.
-                shared.comparison_done.store(false, Ordering::SeqCst);
+            if found_anew && cursor > 0 {
+                // The page was read after a cursor the finding has taken away: the scan starts at
+                // the first record, and nothing is settled on this page.
+                return Ok(Pass::More);
             }
         }
+        // What the page names is written to the record of the restore before any record of it is
+        // acted on: a stop, an error, an abort or a removal after this keeps it.
+        write_ahead(shared, controller, &state.records).await?;
         for record in &state.records {
+            shared
+                .scan_highest
+                .fetch_max(record.sequence.get(), Ordering::SeqCst);
             // A request is judged by its issuer's standing, and judgment stays in the order the feed
             // holds the requests: one behind a request whose issuer's standing could not be decided
             // waits for the scan that can decide it. What the feed shows complete is only carried
@@ -1031,9 +1242,16 @@ async fn pass(
             }
             match settle(shared, controller, record, &mut now).await? {
                 Settled::Done => {
+                    shared.settle(record.sequence.get());
                     if contiguous {
                         through = record.sequence.get();
                     }
+                }
+                Settled::Held => {
+                    // A request this host cannot settle while the wait stands, and neither carries
+                    // out nor refuses: it owes what it names, is judged again by every scan, and is
+                    // refused as today once the wait has ended.
+                    contiguous = false;
                 }
                 Settled::Unverified(these) => {
                     // Refused from this moment, and read again by every scan until the owner at
@@ -1134,6 +1352,9 @@ async fn pass(
         .scan_undecided
         .lock()
         .unwrap_or_else(PoisonError::into_inner) = None;
+    // What the scan owes is reconciled with the record before anything is carried out for the
+    // catch-up, and the scan counts as read through only when the record holds it.
+    reconcile(shared, controller).await?;
     // Read through, the scan has seen every withdrawal the feed shows complete that is not settled:
     // the refusal is lifted when it saw none, and stands, naming what they name, when it saw one.
     controller
@@ -1162,15 +1383,9 @@ async fn pass(
                 return Ok(Pass::More);
             }
         }
-        if let Some(Undecided {
-            refusal,
-            requesters,
-            ..
-        }) = undecided
-        {
-            // The records held behind these requests are not carried out, so the comparison with
-            // the feed is not done until a scan can judge them.
-            shared.observed().held_behind = Some(requesters.iter().copied().collect());
+        if let Some(Undecided { refusal, .. }) = undecided {
+            // The records held behind these requests are not carried out, and what they name is
+            // owed until a scan can judge them.
             // The refusal and the catch-up are done, and what the feed shows complete is carried
             // out again, but for what waits. A pass that could not judge a request is no
             // synchronisation: nothing is shown as read, no key is added to the owners' list, and
@@ -1189,17 +1404,10 @@ async fn pass(
         }
     }
     // The feed is read through, the registry is level with it, and every record it holds is carried
-    // out or settled: a revocation still pending in the workers is carried out, and a withdrawal
-    // this host cannot verify raises the refusal that its own wait keeps up. Nothing was put off
-    // while the host was behind, and nothing is held behind a request it could not judge.
-    {
-        let mut observed = shared.observed();
-        observed.held_behind = None;
-        observed.stopped = None;
-    }
-    if !put_off {
-        shared.comparison_done.store(true, Ordering::SeqCst);
-    }
+    // out, settled, or held with what it names written to the record of the restore: a revocation
+    // still pending in the workers is carried out, and a withdrawal this host cannot verify raises
+    // the refusal that its own wait keeps up.
+    shared.observed().stopped = None;
     controller.authority_feed_synchronised();
     Ok(if unfinished {
         Pass::Unfinished
@@ -1230,7 +1438,6 @@ async fn removed(
     let mut observed = shared.observed();
     observed.unverified = unverified;
     observed.waiting_named.clear();
-    observed.held_behind = None;
     if caught_up {
         observed.catching_up = false;
     }
@@ -1371,6 +1578,10 @@ enum Settled {
     /// This host cannot yet decide whether the device that made it may manage the host, for the
     /// reason given. It stays unsettled, and a later scan judges it again.
     Undecided(Refusal),
+    /// While a wait for a restored policy stands, this host neither carries it out nor refuses it
+    /// and sends nothing: it cannot settle it on evidence a restore cannot change. It owes what it
+    /// names, every scan judges it again, and the first scan after the wait refuses it as today.
+    Held,
     /// The feed answered a change to this host's records by saying it removed the host.
     Removed,
 }
@@ -1416,6 +1627,15 @@ fn shown_complete(record: &AuthorityFeedRecord) -> bool {
             .is_some_and(|held| held.completion == RevocationCompletion::Complete)
 }
 
+/// Whether the feed's record carries an acknowledgement this host made.
+fn acknowledged_by(record: &AuthorityFeedRecord, host: DeviceId) -> bool {
+    record
+        .acknowledgement
+        .0
+        .as_ref()
+        .is_some_and(|held| held.host_device_id == host)
+}
+
 /// Settles one record the feed holds: refuses it, or carries it out and acknowledges it.
 async fn settle(
     shared: &Arc<Shared>,
@@ -1423,24 +1643,99 @@ async fn settle(
     record: &AuthorityFeedRecord,
     latest: &mut Latest,
 ) -> std::result::Result<Settled, Stopped> {
-    if shown_complete(record) {
-        // A registry restored to an earlier state has lost what this host carried out for the
-        // request, which the feed still shows complete: what the registry does not show done is
-        // carried out again, whatever its counter says.
-        let id = record.request.request_id;
-        return match controller
-            .replay_feed_request(&record.request, record.sequence.get())
-            .await
-            .map_err(Stopped::local)?
-        {
-            Replay::Done => {
-                controller.authority_feed_settled(id, shared.host_device_id);
-                Ok(Settled::Done)
-            }
-            Replay::Unverified(found) => Ok(Settled::Unverified(found)),
-        };
+    // A request the feed shows this host acknowledged took effect here, as an acknowledgement is
+    // only made after the host carried it out, whatever its completion and whether or not the
+    // record is also refused. A registry restored to an earlier state has lost what this host
+    // carried out for it: what the registry does not show done is carried out again, whatever its
+    // counter says. When the registry holds a note of this very request, the note decides as it
+    // always did.
+    let noted_this = controller
+        .authority_feed_record(record.request.request_id)
+        .is_some_and(|held| held.request == record.request);
+    if shown_complete(record) || (acknowledged_by(record, shared.host_device_id) && !noted_this) {
+        return replay_a_record(shared, controller, record, latest).await;
     }
     settle_request(shared, controller, record, latest).await
+}
+
+/// Carries out again a request the feed shows this host acknowledged, and, when the feed shows it
+/// Pending and the barrier now holds, says so.
+async fn replay_a_record(
+    shared: &Arc<Shared>,
+    controller: &Arc<Controller>,
+    record: &AuthorityFeedRecord,
+    latest: &mut Latest,
+) -> std::result::Result<Settled, Stopped> {
+    let pending = record.rejected.0.is_none()
+        && record.acknowledgement.0.as_ref().is_some_and(|held| {
+            held.host_device_id == shared.host_device_id
+                && held.completion != RevocationCompletion::Complete
+        });
+    let place = record.sequence.get();
+    let replayed = if pending {
+        controller
+            .replay_a_pending_request(&record.request, place)
+            .await
+    } else {
+        controller.replay_feed_request(&record.request, place).await
+    }
+    .map_err(Stopped::local)?;
+    match replayed {
+        Replay::Done => {
+            controller.authority_feed_settled(&record.request, shared.host_device_id);
+            Ok(Settled::Done)
+        }
+        Replay::Applied(RevocationCompletion::Complete) => {
+            acknowledge_as_complete(shared, controller, record, latest).await
+        }
+        // The barrier has not held for every worker: a later scan applies it again and reads it.
+        Replay::Applied(_) => Ok(Settled::Waiting),
+        Replay::Unverified(found) => Ok(Settled::Unverified(found)),
+        Replay::Owed => Ok(Settled::Held),
+    }
+}
+
+/// Acknowledges a request the feed shows Pending as complete, under the revision the feed's own
+/// acknowledgement names, which the feed checks applied the request, at a time not older than
+/// that acknowledgement's. The feed keeps a record until the host completes or refuses it, and one
+/// that is left Pending holds one of its publisher's open records for ever.
+async fn acknowledge_as_complete(
+    shared: &Arc<Shared>,
+    controller: &Arc<Controller>,
+    record: &AuthorityFeedRecord,
+    latest: &mut Latest,
+) -> std::result::Result<Settled, Stopped> {
+    let Some(held) = record.acknowledgement.0.as_ref() else {
+        return Ok(Settled::Waiting);
+    };
+    let acknowledgement = RevocationAcknowledgement {
+        request_id: record.request.request_id,
+        host_device_id: shared.host_device_id,
+        authority_revision: held.authority_revision,
+        completion: RevocationCompletion::Complete,
+        acknowledged_at_ms: TimestampMs::new(
+            controller.wall_now_ms().max(held.acknowledged_at_ms.get()),
+        ),
+    };
+    let announcement =
+        announcement_to_the_issuer(shared, controller, record, RevocationCompletion::Complete);
+    match shared
+        .client
+        .acknowledge(&acknowledgement, announcement.as_ref())
+        .await
+    {
+        Ok(state) => {
+            if latest.took(&state) {
+                return Ok(Settled::Removed);
+            }
+            controller.authority_feed_settled(&record.request, shared.host_device_id);
+            Ok(Settled::Done)
+        }
+        // The feed refused the acknowledgement: the record was refused or completed meanwhile, or
+        // its time is older. The next scan reads the record as the feed holds it now.
+        Err(error) if error.service_code() == Some("INVALID_REQUEST") => Ok(Settled::Waiting),
+        Err(error) => Err(Stopped::of(&error, &shared.quiet)),
+    }
 }
 
 /// Settles a record the feed does not show complete: refuses it, or carries it out and
@@ -1457,7 +1752,7 @@ async fn settle_request(
     if record.rejected.0.is_some() {
         // Only this host refuses a request, so a note it kept of this one is a refusal.
         controller
-            .authority_feed_refusal_noted(id, shared.host_device_id)
+            .authority_feed_refusal_noted(request, shared.host_device_id)
             .map_err(Stopped::local)?;
         return Ok(Settled::Done);
     }
@@ -1471,17 +1766,57 @@ async fn settle_request(
     let now = controller.wall_now_ms();
     let noted = controller.authority_feed_record(id);
     let plan = match &noted {
-        // A different request under an identity this host took, or one this host refused after
-        // it began to take it and is published again: refused, and never carried out.
-        Some(held) if held.request != *request || held.is_refused_by(shared.host_device_id) => {
-            return refuse(shared, controller, id, RejectionReason::Superseded, latest).await;
+        // A different request under an identity this host took: refused, and never carried out.
+        // While a wait stands the note is a fact about the registry and not about this request,
+        // which may be one the host carried out before the restore, so it is held.
+        Some(held) if held.request != *request => {
+            if shared.holds_for_the_wait(controller, place) {
+                return Ok(Settled::Held);
+            }
+            return refuse(
+                shared,
+                controller,
+                request,
+                RejectionReason::Superseded,
+                latest,
+            )
+            .await;
+        }
+        // One this host refused after it began to take it and is published again: refused, and
+        // never carried out. The feed shows this host acknowledged it, which a refusal in the same
+        // registry contradicts (two states of it): during a wait it is held.
+        Some(held) if held.is_refused_by(shared.host_device_id) => {
+            if acknowledged_by(record, shared.host_device_id)
+                && shared.holds_for_the_wait(controller, place)
+            {
+                return Ok(Settled::Held);
+            }
+            return refuse(
+                shared,
+                controller,
+                request,
+                RejectionReason::Superseded,
+                latest,
+            )
+            .await;
         }
         Some(_) => controller.plan_of(request).map_err(Stopped::local)?,
         None => match controller
             .judge_feed_request(request, now, place)
             .map_err(Stopped::local)?
         {
-            Judged::Refuse(reason) => return refuse(shared, controller, id, reason, latest).await,
+            Judged::Refuse(reason, ground) => {
+                // A refusal the feed keeps for a week reads, at a later restore, as "this host
+                // never applied it". While a wait stands the host sends one only on what a
+                // restore cannot change; on anything else it holds the request, which owes what
+                // it names.
+                if ground == Ground::Mutable && shared.holds_for_the_wait(controller, place) {
+                    return Ok(Settled::Held);
+                }
+                // The obligation ends with the decision, whatever becomes of the delivery.
+                shared.settle(place);
+                return refuse(shared, controller, request, reason, latest).await;
+            }
             Judged::Apply(plan) => plan,
             Judged::Undecided(refusal) => return Ok(Settled::Undecided(refusal)),
         },
@@ -1508,7 +1843,19 @@ async fn settle_request(
     // since it began, because it compares the registry with what it was then.
     let numbered = held.authority_revision.is_some();
     if !numbered && applied.revision <= held.registry_revision {
-        return refuse(shared, controller, id, RejectionReason::Superseded, latest).await;
+        // What the request names was withdrawn already, as the registry stands: a fact about the
+        // registry, which a restore can undo, so the refusal is not sent while a wait stands.
+        if shared.holds_for_the_wait(controller, place) {
+            return Ok(Settled::Held);
+        }
+        return refuse(
+            shared,
+            controller,
+            request,
+            RejectionReason::Superseded,
+            latest,
+        )
+        .await;
     }
     // This host numbers what it issues from the registry, and the feed takes only a number above
     // the one it holds. A request not numbered yet therefore needs the registry past the feed; a
@@ -1559,7 +1906,7 @@ async fn settle_request(
         return Ok(Settled::Removed);
     }
     if applied.completion == RevocationCompletion::Complete {
-        controller.authority_feed_settled(id, shared.host_device_id);
+        controller.authority_feed_settled(request, shared.host_device_id);
         Ok(Settled::Done)
     } else {
         Ok(Settled::Waiting)
@@ -1605,18 +1952,18 @@ fn tells_something_new(
 async fn refuse(
     shared: &Arc<Shared>,
     controller: &Arc<Controller>,
-    id: RevocationRequestId,
+    request: &RevocationRequest,
     reason: RejectionReason,
     latest: &mut Latest,
 ) -> std::result::Result<Settled, Stopped> {
     // Written down before it is sent: a refusal that never arrives is made again, and the same
     // request published again after the feed dropped it is refused again and not carried out.
     controller
-        .authority_feed_refusal_noted(id, shared.host_device_id)
+        .authority_feed_refusal_noted(request, shared.host_device_id)
         .map_err(Stopped::local)?;
     let state = shared
         .client
-        .reject(id, reason)
+        .reject(request.request_id, reason)
         .await
         .map_err(|error| Stopped::of(&error, &shared.quiet))?;
     if latest.took(&state) {

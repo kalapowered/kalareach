@@ -1232,6 +1232,8 @@ impl Controller {
             authority_epoch: std::sync::atomic::AtomicU64::new(0),
             feed_refusal,
             restored_policy: tokio::sync::Mutex::new(restored_policy),
+            restores_found: std::sync::atomic::AtomicU64::new(0),
+            compared_revision: std::sync::atomic::AtomicU64::new(0),
             feed_drain: std::sync::Mutex::default(),
             #[cfg(test)]
             lock_ask: std::sync::Mutex::default(),

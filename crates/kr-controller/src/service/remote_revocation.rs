@@ -23,6 +23,7 @@ use super::revocation::Audience;
 use super::{Controller, FeedStanding};
 use crate::config::ceilings::CeilingRefusal;
 use crate::error::Result;
+use crate::grants::restored::Target;
 use crate::grants::{AccessRequest, GrantRecord, Refusal, RemoteRefusal, StoredRemoval};
 use crate::service::net::devices::{DeviceRecord, LockProbe, Unwritable};
 
@@ -112,11 +113,29 @@ pub(crate) struct Plan {
     grants: Vec<GrantId>,
 }
 
+/// What a refusal of a request rests on, for a host whose policy was found restored: a restore and
+/// the person's later acts can change what the registry says about an issuer, and cannot change
+/// what the issuer's own record fixed when it was paired.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Ground {
+    /// A fact the issuer's own record fixes and the registry never rewrites: the request is
+    /// addressed to another host, the device the registry holds for the issuer holds a key that did
+    /// not sign it, or its pairing grant does not hold the right to manage this host. A refusal on
+    /// it says nothing a restore can undo.
+    Immutable,
+    /// Anything else the registry says about an issuer or a request: the issuer is not held, not
+    /// paired, revoked or expired; the ceiling, the policy, the clock or the withheld keys exclude
+    /// it; or the request names nothing the registry holds. It may be a fact about the registry
+    /// after the restore, and not about the request.
+    Mutable,
+}
+
 /// What this host decided about a request it read from the feed.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Judged {
-    /// This host will not apply it, for a reason the feed's publisher can read.
-    Refuse(RejectionReason),
+    /// This host will not apply it, for a reason the feed's publisher can read, on evidence of the
+    /// kind given.
+    Refuse(RejectionReason, Ground),
     /// This host applies it.
     Apply(Plan),
     /// This host cannot decide whether the device that made it may manage the host: the clock is
@@ -147,14 +166,22 @@ pub(crate) struct Applied {
     pub completion: RevocationCompletion,
 }
 
-/// What carrying out again a request the feed shows complete came to.
+/// What carrying out again a request the feed shows this host acknowledged came to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Replay {
     /// Nothing more is to be done for the request: what it names is withdrawn here, or its owner is
     /// known and it is not a request this host could have carried out.
     Done,
+    /// The whole request of a record acknowledged Pending was applied, which withdraws nothing
+    /// already withdrawn and reports the barrier as it stands, and the barrier stands at this.
+    Applied(RevocationCompletion),
     /// The request names something live here, and its owner is not one this host knows.
     Unverified(Unverified),
+    /// While a wait for a restored policy stands: the request names something live here, and this
+    /// host can neither carry it out nor dismiss it on evidence a restore cannot change. Its issuer
+    /// is revoked, or the ceiling now removes the right, or the registry holds a refusal of the
+    /// same request that the feed's acknowledgement contradicts. What it names is owed.
+    Owed,
 }
 
 /// What withdrawals the feed shows complete, and this host cannot verify, name: the owners that
@@ -220,10 +247,15 @@ pub(crate) struct Withheld {
 enum Issuer {
     /// A device that could have made it, and the host could have carried it out.
     Could,
-    /// The registry holds the device that made it and it could not have, or holds devices that
+    /// The registry holds the device that made it and the key it holds did not sign the request,
+    /// or its pairing grant does not hold the right to manage this host, or holds devices that
     /// hold the key it names and none of them signed it: no request this host could have carried
-    /// out.
-    CouldNot,
+    /// out, on evidence its own record fixes.
+    CouldNotEver,
+    /// The registry holds the device that made it, which signed it and whose grant holds the
+    /// right, and it is revoked now or the ceiling removes the right now: a fact about the
+    /// registry as it stands, which a restore or a later act may have made.
+    CouldNotNow,
     /// The registry cannot show who made it.
     Unknown,
 }
@@ -242,28 +274,53 @@ impl Controller {
     ) -> Result<Judged> {
         let host = self.host_device_id();
         if request.host_device_id != host {
-            return Ok(Judged::Refuse(RejectionReason::UnknownTarget));
+            return Ok(Judged::Refuse(
+                RejectionReason::UnknownTarget,
+                Ground::Immutable,
+            ));
         }
-        let Some(issuer) = self
-            .devices
-            .record_for_device(request.issuer_device_id)?
-            .filter(DeviceRecord::is_paired)
-        else {
-            return Ok(Judged::Refuse(RejectionReason::NoOwnerAuthority));
+        let held = self.devices.record_for_device(request.issuer_device_id)?;
+        // A device row is inserted once and its key never changes: the key it holds not having
+        // signed the request is a fact about the issuer, whatever else the row says.
+        if held.as_ref().is_some_and(|record| {
+            kr_pairing::grants::verify_revocation_request(request, host, &record.authorisation)
+                .is_err()
+        }) {
+            return Ok(Judged::Refuse(
+                RejectionReason::NoOwnerAuthority,
+                Ground::Immutable,
+            ));
+        }
+        let Some(issuer) = held.filter(DeviceRecord::is_paired) else {
+            return Ok(Judged::Refuse(
+                RejectionReason::NoOwnerAuthority,
+                Ground::Mutable,
+            ));
         };
-        if kr_pairing::grants::verify_revocation_request(request, host, &issuer.authorisation)
-            .is_err()
-        {
-            return Ok(Judged::Refuse(RejectionReason::NoOwnerAuthority));
+        // A grant is written once, when the device pairs: lacking the right to manage this host is
+        // the grant's own fact, and not the configuration's ceiling, which can change.
+        if !issuer.grant.actions.contains(&ActionRight::HostManage) {
+            return Ok(Judged::Refuse(
+                RejectionReason::NoOwnerAuthority,
+                Ground::Immutable,
+            ));
         }
         match self.standing_to_manage(&issuer, now_ms, Some(place)) {
             Standing::Holds => {}
-            Standing::Not => return Ok(Judged::Refuse(RejectionReason::NoOwnerAuthority)),
+            Standing::Not => {
+                return Ok(Judged::Refuse(
+                    RejectionReason::NoOwnerAuthority,
+                    Ground::Mutable,
+                ));
+            }
             Standing::Undecided(refusal) => return Ok(Judged::Undecided(refusal)),
         }
         let plan = self.plan_of(request)?;
         if plan.devices.is_empty() && plan.grants.is_empty() {
-            return Ok(Judged::Refuse(RejectionReason::UnknownTarget));
+            return Ok(Judged::Refuse(
+                RejectionReason::UnknownTarget,
+                Ground::Mutable,
+            ));
         }
         Ok(Judged::Apply(plan))
     }
@@ -487,6 +544,30 @@ impl Controller {
         Ok(plan)
     }
 
+    /// What a request names, as it states it: the devices and the grants by their identifiers, with
+    /// nothing read from the registry, so collecting it cannot fail. A request addressed to another
+    /// host names nothing. Whether a target is live is [`Self::target_liveness`].
+    pub(crate) fn named_targets_of(&self, request: &RevocationRequest) -> Vec<Target> {
+        if request.host_device_id != self.host_device_id() {
+            return Vec::new();
+        }
+        match &request.target {
+            RevocationTarget::Devices { device_ids } => {
+                device_ids.iter().copied().map(Target::Device).collect()
+            }
+            RevocationTarget::Grants { grant_ids } => {
+                grant_ids.iter().copied().map(Target::Grant).collect()
+            }
+        }
+    }
+
+    /// How many times this run has found the registry behind its feed, or put back again
+    /// ([`Self::authority_feed_behind`]).
+    pub(crate) fn findings(&self) -> u64 {
+        self.restores_found
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Carries a plan out through the same revocations the owner at this machine makes.
     ///
     /// A revocation of what is already revoked withdraws nothing and advances no revision, so a
@@ -519,6 +600,8 @@ impl Controller {
             revision = revision.max(result.authority_revision);
             pending += result.barrier.pending().len() as u64;
         }
+        self.compared_revision
+            .fetch_max(revision.get(), std::sync::atomic::Ordering::SeqCst);
         Ok(Applied {
             revision,
             completion: if pending == 0 {
@@ -672,30 +755,34 @@ impl Controller {
     }
 
     /// Writes down that this host refuses a request it began to take, before it says so to the
-    /// feed.
+    /// feed. A note that holds another request under the same identity is not changed.
     ///
     /// # Errors
     ///
     /// Returns an error when the record cannot be written.
     pub(crate) fn authority_feed_refusal_noted(
         &self,
-        request_id: kr_protocol::ids::RevocationRequestId,
+        request: &RevocationRequest,
         host: DeviceId,
     ) -> Result<()> {
         let mut feed = self.authority_feed();
-        feed.note_refusal(request_id, host);
+        feed.note_refusal(request, host);
         self.keep_feed(&mut feed)
     }
 
     /// Writes down that this host has nothing more to do for a request the feed holds: it was
-    /// acknowledged as complete.
-    pub(crate) fn authority_feed_settled(
-        &self,
-        request_id: kr_protocol::ids::RevocationRequestId,
-        host: DeviceId,
-    ) {
+    /// acknowledged as complete. A note that holds another request under the same identity is not
+    /// changed, and a note that is not numbered is not either: an acknowledged note without a
+    /// revision reads as a refusal.
+    pub(crate) fn authority_feed_settled(&self, request: &RevocationRequest, host: DeviceId) {
         let mut feed = self.authority_feed();
-        feed.acknowledge(request_id, host);
+        if !feed
+            .record(request.request_id)
+            .is_some_and(|record| record.request == *request && record.authority_revision.is_some())
+        {
+            return;
+        }
+        feed.acknowledge(request, host);
         if let Err(error) = self.keep_feed(&mut feed) {
             eprintln!("kr-controller: could not write the authority feed's record down: {error}");
         }
@@ -799,6 +886,19 @@ impl Controller {
     /// written.
     pub(crate) async fn authority_feed_behind(&self, feed_revision: u64) -> Result<bool> {
         let registry = self.authority_revision().await?;
+        let was_behind = self.policy().behind_its_feed();
+        // The highest revision this run's carrier has seen the registry at: a comparison, or a
+        // request it carried out. A registry below it has been put back.
+        let high = self
+            .compared_revision
+            .swap(registry.get(), std::sync::atomic::Ordering::SeqCst);
+        // A finding is counted before anything is written, so one whose record cannot be written
+        // is still found by the scan, which restarts on the count and not on this call's answer:
+        // the refusal for being behind is up by the next pass, and a retry would see no change.
+        if registry.get() < high || (feed_revision > registry.get() && !was_behind) {
+            self.restores_found
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         if feed_revision > registry.get() {
             self.move_a_feed_refusal(
                 RemoteRefusal::BEHIND_ITS_FEED,
@@ -854,6 +954,34 @@ impl Controller {
         request: &RevocationRequest,
         place: u64,
     ) -> Result<Replay> {
+        self.replay(request, place, false).await
+    }
+
+    /// As [`Self::replay_feed_request`], for a request the feed shows this host acknowledged as
+    /// Pending, which the registry shows no note of: a barrier left running, and a registry put
+    /// back. The whole of what the request names is applied, so that an already withdrawn target
+    /// withdraws nothing and the barrier is reported as it stands, and a request that has nothing
+    /// live left to withdraw still has its barrier read. Only when its issuer is one that could
+    /// have made it; any other issuer is judged as for a request shown complete.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a record cannot be read, a revocation cannot be written or its barrier
+    /// cannot be raised.
+    pub(crate) async fn replay_a_pending_request(
+        &self,
+        request: &RevocationRequest,
+        place: u64,
+    ) -> Result<Replay> {
+        self.replay(request, place, true).await
+    }
+
+    async fn replay(
+        &self,
+        request: &RevocationRequest,
+        place: u64,
+        pending: bool,
+    ) -> Result<Replay> {
         let host = self.host_device_id();
         if request.host_device_id != host {
             return Ok(Replay::Done);
@@ -863,7 +991,8 @@ impl Controller {
         let mut plan = Plan {
             devices: named
                 .devices
-                .into_iter()
+                .iter()
+                .copied()
                 .filter(|id| {
                     held.iter()
                         .any(|record| record.device_id == *id && record.revoked_at_ms.is_none())
@@ -871,7 +1000,7 @@ impl Controller {
                 .collect(),
             grants: Vec::new(),
         };
-        for grant_id in named.grants {
+        for grant_id in named.grants.iter().copied() {
             if self
                 .sharing
                 .grants()
@@ -881,13 +1010,30 @@ impl Controller {
                 plan.grants.push(grant_id);
             }
         }
-        if plan.devices.is_empty() && plan.grants.is_empty() {
+        let nothing_live = plan.devices.is_empty() && plan.grants.is_empty();
+        if nothing_live && !pending {
             return Ok(Replay::Done);
         }
+        let waits = self.restored_policy_waits();
         match self.issuer_of_a_completed_request(request, &held) {
             Issuer::Could => {}
-            Issuer::CouldNot => return Ok(Replay::Done),
+            Issuer::CouldNotEver => return Ok(Replay::Done),
+            // A revoked issuer or a narrowed ceiling is a fact about the registry as it stands.
+            // In a history that is linear the request took effect before the revocation, but a
+            // registry put back to an earlier state holds neither the request nor the revocation,
+            // and the person's own act after the restore (revoking a lost phone) says nothing of
+            // whether the request was made: what it names is owed while the wait stands.
+            Issuer::CouldNotNow => {
+                return Ok(if waits && !nothing_live {
+                    Replay::Owed
+                } else {
+                    Replay::Done
+                });
+            }
             Issuer::Unknown => {
+                if nothing_live {
+                    return Ok(Replay::Done);
+                }
                 return Ok(Replay::Unverified(Unverified::of(
                     request.issuer_device_id,
                     request.issuer_key_id,
@@ -896,11 +1042,23 @@ impl Controller {
                 )));
             }
         }
+        // The registry's own line of what this host refused is the refusal of this very request,
+        // and nothing else under the same identity. An acknowledgement of the request that the
+        // feed holds contradicts a refusal in the same registry: the two come from different
+        // states of it, and during the wait the request is neither carried out nor dismissed.
         if self
             .authority_feed_record(request.request_id)
-            .is_some_and(|noted| noted.is_refused_by(host))
+            .is_some_and(|noted| noted.request == *request && noted.is_refused_by(host))
         {
-            return Ok(Replay::Done);
+            return Ok(if waits && !nothing_live {
+                Replay::Owed
+            } else {
+                Replay::Done
+            });
+        }
+        if pending {
+            let applied = self.apply_feed_plan(&named).await?;
+            return Ok(Replay::Applied(applied.completion));
         }
         self.apply_feed_plan(&plan).await?;
         Ok(Replay::Done)
@@ -927,8 +1085,11 @@ impl Controller {
         {
             return if record.revoked_at_ms.is_none() && could(record) {
                 Issuer::Could
+            } else if !signed_by(record) || !record.grant.actions.contains(&ActionRight::HostManage)
+            {
+                Issuer::CouldNotEver
             } else {
-                Issuer::CouldNot
+                Issuer::CouldNotNow
             };
         }
         let holders: Vec<&DeviceRecord> = held
@@ -945,7 +1106,7 @@ impl Controller {
             Issuer::Could
         } else if !holders.is_empty() && !holders.iter().any(|record| signed_by(record)) {
             // Nobody who holds the key signed it: no request this host could have carried out.
-            Issuer::CouldNot
+            Issuer::CouldNotEver
         } else {
             Issuer::Unknown
         }

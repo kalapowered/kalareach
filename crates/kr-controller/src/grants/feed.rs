@@ -325,27 +325,34 @@ impl AuthorityFeed {
         Ok(())
     }
 
-    /// Notes that `host` refused a request it began to take, before the refusal is sent, so a
-    /// refusal that never arrives is made again and a request published again is refused again.
-    /// A request that took effect is not refused: it has a revision.
-    pub fn note_refusal(&mut self, request_id: RevocationRequestId, host: DeviceId) {
+    /// Notes that `host` refused `request`, which it began to take, before the refusal is sent, so
+    /// a refusal that never arrives is made again and a request published again is refused again.
+    /// A request that took effect is not refused: it has a revision. A note that holds another
+    /// request under the same identity is not changed: the identity was used again after the feed
+    /// dropped the first request, and the note is that request's.
+    pub fn note_refusal(&mut self, request: &RevocationRequest, host: DeviceId) {
         if self
             .records
-            .get(&request_id)
-            .is_some_and(|record| record.authority_revision.is_none())
+            .get(&request.request_id)
+            .is_some_and(|record| record.request == *request && record.authority_revision.is_none())
         {
-            self.acknowledge(request_id, host);
+            self.acknowledge(request, host);
         }
     }
 
-    /// Records one enrolled host's acknowledgement of one revocation record.
+    /// Records one enrolled host's acknowledgement of the revocation record that holds `request`.
+    /// A note that holds another request under the same identity is left as it is.
     ///
     /// Returns whether every enrolled host has now acknowledged it. The record is kept either way:
     /// what changes when it settles is that this host stops owing its delivery, not that it
     /// forgets the revocation happened.
-    pub fn acknowledge(&mut self, request_id: RevocationRequestId, device_id: DeviceId) -> bool {
+    pub fn acknowledge(&mut self, request: &RevocationRequest, device_id: DeviceId) -> bool {
         let enrolled = self.enrolled.clone();
-        let Some(record) = self.records.get_mut(&request_id) else {
+        let Some(record) = self
+            .records
+            .get_mut(&request.request_id)
+            .filter(|record| record.request == *request)
+        else {
             return false;
         };
         let added = record.acknowledged_by.insert(device_id);

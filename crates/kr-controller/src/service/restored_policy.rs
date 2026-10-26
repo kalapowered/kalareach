@@ -15,10 +15,9 @@ use kr_protocol::organisation::HostPolicyConfirmResult;
 
 use super::Controller;
 use crate::authority::AdmittedMutation;
-use crate::authority_feed::ComparisonOwed;
 use crate::error::{ControllerError, Result};
 use crate::grants::RemoteRefusal;
-use crate::grants::restored::{self, Found, Kept, Target};
+use crate::grants::restored::{self, Found, Kept, Owed, Target};
 
 /// What a host that reads an authority feed owes a confirmation, said once for both remedies.
 macro_rules! feed_note {
@@ -27,14 +26,14 @@ macro_rules! feed_note {
          read the feed through and carried out, or settled, every record it holds, so that a \
          device an owner revoked through the feed since the copy is not served by a confirmation \
          made earlier; this check says when that is still owed, and the host asks its feed again \
-         by itself. Where the request of a device waits for this host to decide who may manage \
-         it, reboot the machine, which ends a lost continuity of the clock, or revoke that device \
-         at this machine with `kr device revoke`, which refuses its request. A host that cannot \
-         reach its feed is confirmed by taking `authority.origin` out of the configuration \
-         document and starting the daemon again, at this cost: the host then reads no feed, so it \
-         serves every device an owner revoked through the feed since the copy until the person \
-         has revoked it at this machine, and learns no remote revocation while it reads none; \
-         revoke those devices at this machine first. "
+         by itself. Where a request waits for this host to decide who may manage it, because its \
+         clock lost its continuity, reboot the machine, which ends that, so that the host judges \
+         the request again. A host that cannot reach its feed is confirmed by taking \
+         `authority.origin` out of the configuration document and starting the daemon again, once \
+         no device or share this host's list names is live, at this cost: the host then reads no \
+         feed, so it serves every device an owner revoked through the feed since the copy that \
+         the list does not name until the person has revoked it at this machine, and learns no \
+         remote revocation while it reads none; revoke those devices at this machine first. "
     };
 }
 
@@ -73,47 +72,125 @@ const UNREADABLE_REMEDY: &str = concat!(
     exclusive_note!()
 );
 
+/// As [`WAITS_REMEDY`], for a list that names every live owner device: revoking them all would leave
+/// no way to pair another, so the way that keeps one goes through the record's file.
+const OWNER_ROUTE_REMEDY: &str = concat!(
+    "The devices and shares this check names are every owner device of this host and what else \
+     the authority feed's requests name. Revoke every other one at this machine with `kr device \
+     revoke` and `kr share revoke`, which need no confirmation and work while this stands. Do not \
+     revoke the last owner device: pairing waits for an owner device's confirmation, which this \
+     wait refuses, and the terminal confirms nothing on an owned host. To keep it, stop the \
+     daemon; remove the file `restored-policy.cbor` beside the registry database in this host's \
+     state directory (the refusal of `kr host policy --confirm` names its full path), after \
+     which this host waits for nothing and checks nothing else on its list; start the daemon; \
+     pair a new owner device with the kept owner device's confirmation; and revoke the kept owner \
+     device if it must go. If a withdrawal this host cannot verify also refuses remote grants, \
+     take `authority.origin` out of the configuration document before the daemon starts and set \
+     it back after the new owner device is paired. ",
+    feed_note!(),
+    exclusive_note!()
+);
+
 /// How many devices a refusal or the doctor names.
 const MOST_NAMED: usize = 8;
 
-/// The words of the refusal of a confirmation while the comparison with the feed is owed.
-fn the_refusal_while_the_feed_is_owed(owed: &ComparisonOwed) -> String {
+/// What a confirmation still waits for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Owing {
+    /// No scan of this run has read the feed through and written what it owes.
+    AScanThrough,
+    /// Devices or grants the requests the feed holds name are live here.
+    Targets(OwedNow),
+}
+
+/// The targets a restored policy's wait owes that are live now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OwedNow {
+    /// The live targets, sorted.
+    named: Vec<Target>,
+    /// Whether the list reached its cap or the scan met more than it holds: more may be owed than
+    /// `named` says.
+    full: bool,
+    /// Whether every live owner device of this host is among them (named, or by its pairing
+    /// grant), so that revoking what is named would leave no way to pair another owner device.
+    every_owner: bool,
+}
+
+/// Names a target in a refusal.
+fn named(target: &Target) -> String {
+    match target {
+        Target::Device(device) => format!("device {device}"),
+        Target::Grant(grant) => format!("share {grant}"),
+    }
+}
+
+/// The steps that keep an owner device when the list names every live owner device. `file` is the
+/// record of the restore, which the person removes by hand.
+fn the_way_that_keeps_an_owner(file: &std::path::Path) -> String {
+    format!(
+        "these are every owner device of this host, so revoking all of them would leave no way to \
+         pair another owner device (pairing waits for an owner device's confirmation, which this \
+         wait refuses): revoke every other device and share named above; stop the daemon; remove \
+         the record of the restore by hand, the file {}, after which this host waits for \
+         nothing and checks nothing else on its list; start the daemon; pair a new owner device \
+         with the kept owner device's confirmation; revoke the kept owner device if it must go. If \
+         `kr doctor` also says that a withdrawal this host cannot verify refuses remote grants, \
+         take `authority.origin` out of the configuration document before the daemon starts, and \
+         set it back after the new owner device is paired",
+        file.display()
+    )
+}
+
+/// The words of the refusal of a confirmation while the wait owes something.
+fn the_refusal_while_the_wait_is_owed(owing: &Owing, file: &std::path::Path) -> String {
     let cost = "taking `authority.origin` out of the configuration document and starting the \
-                daemon again confirms a host that cannot reach its feed, at this cost: the host \
-                then reads no feed, so it serves every device an owner revoked through the feed \
-                since the copy until the person has revoked it at this machine with `kr device \
+                daemon again confirms a host that cannot reach its feed once no device or share \
+                its list names is live, at this cost: the host then reads no feed, so it serves \
+                every device an owner revoked through the feed since the copy that the list does \
+                not name until the person has revoked it at this machine with `kr device \
                 revoke`, and it learns no remote revocation while it reads none; revoke those \
                 devices first";
-    match owed {
-        ComparisonOwed::AScanThrough => format!(
+    match owing {
+        Owing::AScanThrough => format!(
             "this host reads an authority feed, and no scan of this run has read it through and \
              carried out what it holds, so a device an owner revoked through the feed since the \
              copy may be live in the registry and would be served once the wait ends; ask again \
              when `kr doctor` no longer says that a confirmation is refused until a scan has, for \
              the host asks its feed again by itself; {cost}"
         ),
-        ComparisonOwed::RequestsItCannotJudge(devices) => {
-            let named = devices
+        Owing::Targets(owed) => {
+            let names = owed
+                .named
                 .iter()
                 .take(MOST_NAMED)
-                .map(ToString::to_string)
+                .map(named)
                 .collect::<Vec<_>>()
                 .join(", ");
-            let more = devices.len().saturating_sub(MOST_NAMED);
+            let more = owed.named.len().saturating_sub(MOST_NAMED);
             let more = if more > 0 {
                 format!(" and {more} more")
             } else {
                 String::new()
             };
-            format!(
-                "this host has read its authority feed through, but the records behind the \
-                 request of device {named}{more} are not carried out: this host cannot yet decide \
-                 who may manage it, so it cannot judge the request, and a device an owner revoked \
-                 through the feed since the copy may be live in the registry and would be served \
-                 once the wait ends; reboot the machine, which ends a lost continuity of the clock \
-                 so that the host judges the request again, or revoke the device at this machine \
-                 with `kr device revoke`, which refuses its request; {cost}"
-            )
+            let mut said = format!(
+                "this host owes {names}{more}: requests its authority feed holds name them, this \
+                 host has not carried those out or set them aside on what a restore cannot \
+                 change, and they are live in the registry, so ending the wait would serve them \
+                 again; revoke each at this machine, with `kr device revoke` for a device and \
+                 `kr share revoke` for a share, which need no confirmation and work while the \
+                 wait stands, and confirm again"
+            );
+            if owed.full {
+                said.push_str(
+                    "; the list this host keeps is full, so more may be owed than it names: once \
+                     these are revoked it asks its feed again by itself and finds the rest",
+                );
+            }
+            if owed.every_owner {
+                said.push_str("; ");
+                said.push_str(&the_way_that_keeps_an_owner(file));
+            }
+            said
         }
     }
 }
@@ -371,9 +448,12 @@ impl Controller {
                 });
             } else if !self.policy().restored_policy_waits() {
                 false
-            } else if let Some(owed) = self.comparison_owed() {
+            } else if let Some(owing) = self.what_the_confirmation_waits_for(
+                kept.known().map_or(&[], |known| known.owed.as_slice()),
+                kept.most(),
+            ) {
                 return Err(ControllerError::PermissionDenied {
-                    detail: the_refusal_while_the_feed_is_owed(&owed),
+                    detail: the_refusal_while_the_wait_is_owed(&owing, kept.file()),
                 });
             } else {
                 {
@@ -401,11 +481,63 @@ impl Controller {
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
     }
 
-    /// What the comparison of the registry with this host's authority feed still waits for, none
-    /// when the host reads no feed, the feed removed it, or a scan of this run has done it.
-    fn comparison_owed(&self) -> Option<ComparisonOwed> {
-        self.feed_runtime()
-            .and_then(|feed| feed.what_the_comparison_waits_for())
+    /// What a confirmation still waits for, given the list the record holds: the devices and
+    /// grants the wait owes that are live now, from the record and from what the scan in hand owes
+    /// and has not written; else, on a host that reads a feed that has not removed it, a scan of
+    /// this run that reads the feed through. None when nothing is owed.
+    fn what_the_confirmation_waits_for(&self, held: &[Owed], most: usize) -> Option<Owing> {
+        if let Some(owed) = self.what_is_owed_now(held, most) {
+            return Some(Owing::Targets(owed));
+        }
+        let feed = self.feed_runtime()?;
+        (!feed.has_read_the_feed_through()).then_some(Owing::AScanThrough)
+    }
+
+    /// The targets the wait owes that are live now.
+    fn what_is_owed_now(&self, held: &[Owed], most: usize) -> Option<OwedNow> {
+        let (in_memory, full_in_memory) = self
+            .feed_runtime()
+            .map_or((Vec::new(), false), |feed| feed.what_the_scan_owes());
+        let live = self.target_liveness();
+        let mut targets: Vec<Target> = held
+            .iter()
+            .map(|entry| entry.target)
+            .chain(in_memory)
+            .collect();
+        targets.sort();
+        targets.dedup();
+        targets.retain(|target| live(target));
+        if targets.is_empty() {
+            return None;
+        }
+        let owners: Vec<(kr_protocol::ids::DeviceId, kr_protocol::ids::GrantId)> = self
+            .devices
+            .devices()
+            .map(|devices| {
+                devices
+                    .into_iter()
+                    .filter(|record| {
+                        record.is_paired()
+                            && record.revoked_at_ms.is_none()
+                            && record
+                                .grant
+                                .actions
+                                .contains(&kr_protocol::rights::ActionRight::HostManage)
+                    })
+                    .map(|record| (record.device_id, record.grant.grant_id))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let every_owner = !owners.is_empty()
+            && owners.iter().all(|(device, grant)| {
+                targets.contains(&Target::Device(*device))
+                    || targets.contains(&Target::Grant(*grant))
+            });
+        Some(OwedNow {
+            named: targets,
+            full: full_in_memory || held.len() >= most,
+            every_owner,
+        })
     }
 
     /// A feed that removed this host is read no more, so a pass that found the registry behind it
@@ -463,21 +595,54 @@ impl Controller {
         if unreadable {
             detail = detail.stated("; the record of the restore cannot be read");
         }
-        detail = match self.comparison_owed() {
+        let held: &[Owed] = match &record {
+            Found::Record(record) => &record.owed,
+            _ => &[],
+        };
+        let owing = self.what_the_confirmation_waits_for(held, restored::MOST_OWED);
+        let every_owner = matches!(&owing, Some(Owing::Targets(owed)) if owed.every_owner);
+        detail = match owing {
             None => detail,
-            Some(ComparisonOwed::AScanThrough) => detail.stated(
+            Some(Owing::AScanThrough) => detail.stated(
                 "; a confirmation is refused until a scan of this run has read this host's \
                  authority feed through and carried out what it holds, and none has yet",
             ),
-            Some(ComparisonOwed::RequestsItCannotJudge(devices)) => {
-                devices.iter().take(MOST_NAMED).fold(
+            Some(Owing::Targets(owed)) => {
+                let detail = owed.named.iter().take(MOST_NAMED).fold(
                     detail.stated(
-                        "; a scan of this run has read the feed through, but the records behind \
-                         the request of each of these devices wait for this host to decide who \
-                         may manage it, and a confirmation is refused until they are carried out",
+                        "; a confirmation is refused while a device or share that requests the \
+                         authority feed holds name is live here, and this host owes it",
                     ),
-                    |detail, device| detail.stated("; device ").identifier(device),
-                )
+                    |detail, target| match target {
+                        Target::Device(device) => detail.stated("; device ").identifier(device),
+                        Target::Grant(grant) => detail
+                            .stated("; share ")
+                            .identifier(&kr_protocol::ids::DeviceId::new(grant.get())),
+                    },
+                );
+                let detail = match owed.named.len().saturating_sub(MOST_NAMED) {
+                    0 => detail,
+                    beyond => detail
+                        .stated("; ")
+                        .number(beyond as u64)
+                        .stated(" more are not listed"),
+                };
+                let detail = if owed.full {
+                    detail.stated("; the list this host keeps is full, so more may be owed")
+                } else {
+                    detail
+                };
+                if owed.every_owner {
+                    detail
+                        .stated(
+                            "; these are every owner device of this host, so revoking all of them \
+                         would leave no way to pair another: see the steps that keep one, \
+                         which end by removing the file of the record of the restore, named ",
+                        )
+                        .path(&restored::file_beside(&self.paths().registry_database()))
+                } else {
+                    detail
+                }
             }
         };
         Some(DoctorCheck::new(
@@ -487,6 +652,8 @@ impl Controller {
             detail,
             Some(if unreadable {
                 UNREADABLE_REMEDY
+            } else if every_owner {
+                OWNER_ROUTE_REMEDY
             } else {
                 WAITS_REMEDY
             }),
