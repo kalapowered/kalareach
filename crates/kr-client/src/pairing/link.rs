@@ -1594,10 +1594,10 @@ mod tests {
         pool.close().await;
     }
 
-    /// KR-REQ-10.27: a visit's hold stops other visits and nothing the person asks. While a visit
-    /// holds an endpoint, the person's own request for another configuration on its relay closes it
-    /// and binds, for an endpoint and for a hold alike; a visit is refused beside the visit's hold,
-    /// and a hold that is not a visit's stops every request.
+    /// A visit's hold stops other visits and nothing the person asks. While a visit holds an
+    /// endpoint, the person's own request for another configuration on its relay closes it and
+    /// binds, for an endpoint and for a hold alike; a visit is refused beside the visit's hold, and
+    /// a hold that is not a visit's stops every request.
     #[tokio::test]
     async fn a_visit_hold_stops_other_visits_and_not_the_persons_own_requests() {
         let pool = EndpointPool::new(TransportIdentityKeyPair::generate().expect("a key"))
