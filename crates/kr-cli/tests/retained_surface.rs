@@ -98,6 +98,14 @@ const SAME: &[Same] = &[
                  which is what their page has always carried.",
     },
     Same {
+        root: "AttentionSource",
+        digest: "415befd07fa85ab6141cfc8fcdde142f37070a4889f3444e326fe2a1e02e585f",
+        reason: "Only the description of the host events source changed: it now says the source \
+                 also holds the turns and commands the worker records of the session's own work. \
+                 The sources, their names and what is accepted for each are as the retained \
+                 level has them.",
+    },
+    Same {
         root: "AttentionHostRecord",
         digest: "5e8a7b903039d58297233e2b2b1ce7f986d6d6161f058cf1bb0917ffb71e8878",
         reason: "A member that is absent from the wire unless this build's worker recorded an agent \
