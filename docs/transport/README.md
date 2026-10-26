@@ -29,12 +29,14 @@ These are the exact versions this build links:
 | `boot-time` | 0.1.3 |
 
 The relay and discovery services do not move with the client. The relay and discovery hosts run
-`iroh-relay` 1.2.0 and `iroh-dns-server` 1.2.0 on Hetzner, and a client that links iroh 1.4.1 meets
-them as one that links 1.2.0 does: the relay protocol and the Pkarr record format are the same
-source in the two releases, and a client may run ahead of the services inside iroh 1.x. Client,
-relay and discovery compatibility is explicit in the signed release matrix: deploy a
-backward-compatible network tier before a client that needs its new behaviour, and retain the
-compatible tier for the documented installed-client window.
+forks of `iroh-relay` 1.2.0 and `iroh-dns-server` 1.2.0 on Hetzner, and a client that links iroh
+1.4.1 meets them as one that links 1.2.0 does: the relay protocol and the Pkarr record format are
+the same source in the two releases, and a 1.4.1 client and a 1.2.0 client exchange data, closes
+and resets, address discovery and Pkarr and DNS lookups through those services alike. A later iroh
+release is run against the deployed services before a client that links it ships. Client, relay and
+discovery compatibility is explicit in the signed release matrix: deploy a backward-compatible
+network tier before a client that needs its new behaviour, and retain the compatible tier for the
+documented installed-client window.
 
 ## Endpoint configuration
 
