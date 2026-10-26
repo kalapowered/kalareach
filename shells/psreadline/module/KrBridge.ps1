@@ -1125,6 +1125,12 @@ function Invoke-KrAnswerLaunch {
     if ($reader.reader_context -ne 'primary') {
         Send-KrLaunchRejection $Id $transaction $fenceId 'not_primary_reader' $reader; return
     }
+    # The editor clears its buffer when a read starts, so a line installed before one, or after it
+    # has ended, is a line nobody would run. The buffer is this reader's own only while the editor
+    # is reading.
+    if (-not $script:State.Reading) {
+        Send-KrLaunchRejection $Id $transaction $fenceId 'editor_left' $reader; return
+    }
     if ($waited -ge $deadline) {
         Send-KrLaunchRejection $Id $transaction $fenceId 'timeout' $reader; return
     }

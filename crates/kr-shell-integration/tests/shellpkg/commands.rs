@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 
 use kr_protocol::root::{
     CommandBypassReason, DETACH_HINT, FENCE_EXCHANGE_TIMEOUT, FenceCause, LAUNCH_READER_BUDGET,
-    LaunchCommand, ReaderContext, RootCommandResolveParams, RootEditorFenceParams,
+    LaunchCommand, PromptGeneration, ReaderContext, RootCommandResolveParams,
+    RootEditorFenceParams,
 };
 use kr_protocol::session::{CommandIntegration, EnvironmentVariable};
 use kr_shell_integration::contract::events::ConsumeReason;
@@ -2142,6 +2143,71 @@ pub fn frames_that_arrive_while_a_command_waits_reach_the_reader_once(kind: Shel
         answered, probed,
         "each request the reader held was answered once, in the order it came"
     );
+}
+
+/// KR-REQ-07.37: a reader whose editor is not reading refuses a launch, ahead of every check on
+/// the buffer.
+///
+/// What the worker sends while a line's command waits is read by the next reader as it enters,
+/// before the editor's read has started. The editor clears its buffer when that read starts, so a
+/// command installed then is one nobody would run, and the reader answering that it was installed
+/// would be claiming something that is not so. The frames are a fence for that reader and a launch
+/// under it that names the prompt the reader will have, so what is left of the check is only how
+/// far it goes.
+pub fn a_launch_is_refused_while_the_editor_is_not_reading(kind: ShellKind) {
+    let package = Package::built(kind);
+    let probes = Probes::new();
+    let mut session = a_session_with_probes(&package, &probes);
+    let reader = session.latest_prompt();
+
+    let fence = fence_for(&reader, fence_id(9), attachment_id(9), epoch(1));
+    let next = PromptGeneration::new(reader.prompt_generation.0.get() + 1);
+    let id = RequestId::new(session.next_request);
+    session.next_request += 1;
+    session.commands.before_resolve_answer = vec![
+        BridgeFrame::FencePublished(FencePublication::Published(fence.clone())),
+        BridgeFrame::Request {
+            id,
+            request: WorkerRequest::Launch(LaunchMailboxRequest {
+                session_id: session.session_id,
+                transaction: LaunchTransactionId::new(Uuid::from_bytes([0x95; 16])),
+                fence_id: fence.fence_id,
+                command: LaunchCommand::Arguments(vec![
+                    "echo".to_owned(),
+                    "kr-never-installed".to_owned(),
+                ]),
+                expected_prompt_generation: next,
+                expected_buffer_revision: reader.editor.buffer_revision,
+                expected_cwd_revision: reader.cwd_revision,
+                deadline_ms: LAUNCH_READER_BUDGET,
+            }),
+        },
+    ];
+
+    assert!(session.run("kr-probe while-the-next-reader-enters", "probe-ran"));
+    let BridgeAnswer::Launch(decision) = session.answer(id) else {
+        panic!("the reader answered a launch with something else")
+    };
+    let LaunchDecision::Rejected(rejection) = decision else {
+        panic!("a launch read before the editor's read started was installed")
+    };
+    assert_eq!(
+        rejection.prompt_generation, next,
+        "the launch was read by another reader than the one that entered after the line"
+    );
+    assert_eq!(
+        rejection.reason,
+        LaunchRejectionReason::EditorLeft,
+        "a reader whose editor was not reading judged the launch against the buffer"
+    );
+    assert!(
+        !session.terminal_output().contains("kr-never-installed"),
+        "a launch refused before the read started ran:\n{}",
+        session.terminal_output()
+    );
+    session
+        .still_serving("kr-launch-refused-served")
+        .unwrap_or_else(|why| panic!("a launch read before the read left nothing working: {why}"));
 }
 
 // --------------------------------------------------------------------------------------------

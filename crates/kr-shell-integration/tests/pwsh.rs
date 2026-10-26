@@ -198,6 +198,13 @@ fn the_configured_chord_detaches_and_any_other_key_is_the_editors_own() {
     shellpkg::the_configured_chord_carries_the_detach_and_any_other_key_is_the_editors_own(PWSH);
 }
 
+/// KR-REQ-07.37
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_launch_read_before_the_editors_read_starts_is_refused_whatever_the_buffer_says() {
+    shellpkg::a_launch_is_refused_while_the_editor_is_not_reading(PWSH);
+}
+
 /// KR-REQ-12.07, KR-REQ-07.45
 #[test]
 #[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]

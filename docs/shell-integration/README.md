@@ -498,7 +498,9 @@ named. The reason decides what the caller is told:
 
 The PowerShell reader also gives `buffer_not_empty` for an argument vector whose first word names no
 application, or that names a batch program and would not reach it as named, because it has no line
-to install.
+to install. It gives `editor_left` for a launch it reads while its editor is not reading, before a
+read has started or after it has ended, because the editor clears its buffer when a read starts and
+a command installed then would never run.
 
 Section 23 lists the preconditions of `shell.launch` as `terminal.input`, the current input lease, a
 qualified root editor, an empty prompt and fence, the working-directory revision and the launch
