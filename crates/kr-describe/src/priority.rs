@@ -20,14 +20,23 @@
 //! | --- | --- | --- |
 //! | Linux | `SCHED_BATCH` with the lowest niceness, on the calling thread and the threads it starts, which is the scheduler class for non-interactive work | the lowest level of the best-effort class, on the calling thread and the threads it starts |
 //! | macOS and the other Unix systems | the lowest ordinary thread priority | the throttled disk policy of the process on macOS; none elsewhere |
-//! | Windows | the idle priority class of the whole process, inside the process's background mode | very low, which the background mode sets for the whole process |
+//! | Windows | the idle priority class of the whole process | very low, for the whole process |
 //!
 //! Windows lowers the class of the whole process, because a thread started by another thread there
 //! begins at the normal priority, and the compute threads of the model runtime are started by the
 //! thread that loads it. The idle class is served only when no other work on the machine wants the
 //! processor, and the process's control thread is in it too: a machine that keeps every core busy
-//! with other work can answer the process later than the daemon waits for it, and the daemon ends
-//! a process that does not answer a cancellation in time.
+//! with other work can answer the process later than the daemon waits for it, and the daemon ends a
+//! process that does not answer a cancellation in time.
+//!
+//! The class is the idle priority class and the very low IO priority, set on their own. Windows
+//! also has a background mode for a process, which lowers the CPU, IO and memory priority together,
+//! and this module does not use it: on Windows Server 2025 (build 26100) a process that begins it
+//! and then writes 600 MB keeps a working set of 32 MB, with 683 MB committed, where the same
+//! process with only the idle class, only the IO priority or only the lowest memory priority keeps
+//! 694 MB. A model that must stay resident would fault its weights back in on every token, and the
+//! process's resident set would read as 32 MB to the daemon's memory ceiling and to the process's
+//! own check.
 //!
 //! An IO class that a platform does not give is reported as not applied, with the reason, and the
 //! qualification matrix carries it as an open item rather than as a claim. Inference reads its
@@ -41,8 +50,8 @@ pub enum Mechanism {
     LinuxSchedBatch,
     /// The lowest ordinary thread priority this platform has.
     LowestThreadPriority,
-    /// The idle priority class inside Windows' background mode.
-    WindowsBackgroundMode,
+    /// The idle priority class of a Windows process.
+    WindowsIdlePriorityClass,
     /// This build applies nothing on this platform.
     None,
 }
@@ -54,7 +63,7 @@ impl Mechanism {
         match self {
             Self::LinuxSchedBatch => "linux_sched_batch",
             Self::LowestThreadPriority => "lowest_thread_priority",
-            Self::WindowsBackgroundMode => "windows_background_mode",
+            Self::WindowsIdlePriorityClass => "windows_idle_priority_class",
             Self::None => "none",
         }
     }
@@ -124,7 +133,7 @@ pub fn background_current_thread() -> Applied {
 fn apply() -> Applied {
     match kr_ipc::background::enter_process_background() {
         Ok(class) => Applied {
-            mechanism: Mechanism::WindowsBackgroundMode,
+            mechanism: Mechanism::WindowsIdlePriorityClass,
             cpu: class.idle_priority_class,
             io: class.io.is_some(),
             io_class: class.io.map(kr_ipc::background::IoClass::as_str),

@@ -240,7 +240,7 @@ fn the_process_ended(reports: &[Report]) -> bool {
 
 /// KR-REQ-22.11: the description process runs its model in the background class and reports what
 /// the system holds of it. Asked from outside, the system agrees where the platform lets a parent
-/// ask: on Windows the process's priority class, I/O priority and memory priority, and on Linux
+/// ask: on Windows the process's priority class and I/O priority, and on Linux
 /// the scheduling policy of the process's threads.
 #[test]
 fn the_process_runs_its_model_in_the_background_class_the_system_reports() {
@@ -257,7 +257,7 @@ fn the_process_runs_its_model_in_the_background_class_the_system_reports() {
     let pid = rig.driver.pid().expect("the process is running");
 
     let mechanism = if cfg!(windows) {
-        "windows_background_mode"
+        "windows_idle_priority_class"
     } else if cfg!(target_os = "linux") {
         "linux_sched_batch"
     } else {
@@ -274,7 +274,6 @@ fn the_process_runs_its_model_in_the_background_class_the_system_reports() {
         Some(kr_ipc::background::ProcessClass {
             idle_priority_class: true,
             io: Some(kr_ipc::background::IoClass::VeryLow),
-            memory_priority: 1,
         }),
         "the system's own account of the process"
     );
