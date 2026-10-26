@@ -143,6 +143,33 @@ pub fn loopback() -> EndpointConfig {
     }
 }
 
+/// Returns once a datagram socket can be bound to `address`. A daemon that stood on an address and
+/// was shut down does not free it at once: the endpoint closes its sockets only when the last handle
+/// on it is dropped, and the tasks the shutdown ended drop theirs when the runtime next runs them.
+/// A daemon started on that address before then fails to bind it.
+///
+/// # Panics
+///
+/// Panics when the address stays taken for ten seconds, or cannot be bound for another reason.
+async fn until_the_address_is_free(address: std::net::SocketAddr) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match std::net::UdpSocket::bind(address) {
+            Ok(socket) => {
+                drop(socket);
+                return;
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AddrInUse
+                    && std::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => panic!("the daemon's address {address} cannot be bound: {error}"),
+        }
+    }
+}
+
 /// One daemon, its local endpoint and its network, with a temporary environment of its own.
 pub struct Host {
     temp: kr_ipc::testing::TempHost,
@@ -781,6 +808,13 @@ impl Host {
         boot: Option<BootIdentity>,
         waits: Waits,
     ) -> Self {
+        if let Some(address) = settings
+            .endpoint
+            .bind_addr
+            .filter(|address| address.port() != 0)
+        {
+            until_the_address_is_free(address).await;
+        }
         let environment = temp.environment();
         let environment_id = temp.environment_id();
         let account_origin = match &account_at {
