@@ -1085,8 +1085,8 @@ or voice broker, which takes a restart to put into force.
 
 The `configuration-overrides` check names the two variables that take part in the precedence, and
 the variables this build reads outside it that are set here, each with what it selects: the
-platform's locations and login, and the proxy variables and `SystemRoot` that the endpoint's
-network library reads itself. It also says that `SSL_CERT_FILE` and `SSL_CERT_DIR` are not read,
+platform's locations and login, and `SystemRoot`, which the endpoint's network library reads
+itself. It also says that `SSL_CERT_FILE` and `SSL_CERT_DIR` are not read,
 and which of them is set: an authority given only through one of them is not trusted by the
 managed-service, rendezvous, delivery, plugin repository and mail clients until it is installed in
 the system store. The network endpoint's relays and discovery servers are verified against the

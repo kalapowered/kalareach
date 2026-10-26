@@ -16,23 +16,25 @@ endpoint        one explicit selection of network services, nothing inherited
 
 ## Pinned versions
 
-The relay and discovery services must run releases that match the client. These are the exact
-versions this build links, and the versions the relay and DNS deployments install:
+These are the exact versions this build links:
 
 | Crate | Version |
 | --- | --- |
-| `iroh` | 1.2.0 |
-| `iroh-base` | 1.2.0 |
-| `iroh-relay` | 1.2.0 |
+| `iroh` | 1.4.1 |
+| `iroh-base` | 1.4.1 |
+| `iroh-dns` | 1.4.1 |
+| `iroh-relay` | 1.4.1 |
 | `iroh-mdns-address-lookup` | 0.5.0 |
 | `iroh-mainline-address-lookup` | 0.5.0 |
 | `boot-time` | 0.1.3 |
 
-`iroh-dns-server` 1.2.0 is the matching discovery server release. The relay and discovery hosts run
-`iroh-relay` 1.2.0 and `iroh-dns-server` 1.2.0 on Hetzner. Client, relay and discovery compatibility
-is explicit in the signed release matrix: deploy a backward-compatible network tier before a client
-that needs its new behaviour, and retain the compatible tier for the documented installed-client
-window.
+The relay and discovery services do not move with the client. The relay and discovery hosts run
+`iroh-relay` 1.2.0 and `iroh-dns-server` 1.2.0 on Hetzner, and a client that links iroh 1.4.1 meets
+them as one that links 1.2.0 does: the relay protocol and the Pkarr record format are the same
+source in the two releases, and a client may run ahead of the services inside iroh 1.x. Client,
+relay and discovery compatibility is explicit in the signed release matrix: deploy a
+backward-compatible network tier before a client that needs its new behaviour, and retain the
+compatible tier for the documented installed-client window.
 
 ## Endpoint configuration
 
@@ -115,15 +117,20 @@ The proxy is each machine's own choice. A pairing invitation and a host bundle c
 discovery services a device dials with, never the proxy the inviting machine goes through. Nothing
 reads it from the environment: `bind` never calls iroh's `proxy_from_env`, and the Pkarr publisher
 and resolver are this crate's own, built on iroh's public `AddressLookup` trait, because iroh's own
-build their HTTP client with no way to name a proxy and follow `HTTP_PROXY`, `HTTPS_PROXY` and
-`ALL_PROXY` instead. They publish and read the same signed records, verified by iroh's record code,
-and a record longer than a signed record can be is refused before it is read whole. With no proxy
-selected, iroh still builds the client for its relay latency probe and captive-portal check with
-the environment's proxy settings, so those two requests follow `HTTP_PROXY`, `HTTPS_PROXY` and
-`ALL_PROXY` when they are set.
+take the endpoint's proxy when one is selected but, given none, follow `HTTP_PROXY`,
+`HTTPS_PROXY` and `ALL_PROXY`. They publish and read the same signed records, verified by iroh's
+record code, and a record longer than a signed record can be is refused before it is read whole.
+With no proxy selected, iroh builds the clients for its relay latency probe and captive-portal
+check with no proxy, so those two requests go directly, whatever the environment names.
 
 A proxy that needs credentials is not supported. `ProxyUrl` refuses an address that names a user or
 a password, even an empty one, rather than using the proxy with the credential dropped.
+
+This build installs no log subscriber, so it writes no iroh log. iroh's relay client logs the proxy
+address, and would log a credential in it and the whole `CONNECT` request, at debug level, from
+the module `iroh_relay::client::tls`. A build that installs a subscriber must hold that module at
+info or above, and a proxy that needs credentials waits for that filter and for a case that shows
+it.
 
 A network that blocks WebSocket upgrades lets the relay's HTTPS through and answers the relay
 connection's upgrade with something other than `101 Switching Protocols`, such as `403`. The relay
@@ -315,7 +322,7 @@ residual case is named rather than glossed.
   Nothing is *read* before that wait, so no frame is ever acted on before the peer's endpoint
   identity is authenticated. The answer is not certain, though: if the connection's driver finishes
   the handshake before the listener's task accepts the buffered stream, early data arrives marked as
-  ordinary. Closing that window needs an upstream change: iroh 1.2.0 fixes the server's TLS
+  ordinary. Closing that window needs an upstream change: iroh 1.4.1 fixes the server's TLS
   early-data size at its maximum and exposes no way to refuse it. That fixed value stays as it is
   and this build does not fork iroh to change it. The residual case is covered by the layer above:
   the only surface reachable in early data is pairing, and pairing consumes an invitation once, so a

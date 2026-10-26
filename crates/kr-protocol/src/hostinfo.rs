@@ -5774,11 +5774,12 @@ pub mod configuration {
     /// itself names its conventional locations, and reading them is what "native OS-appropriate
     /// locations" means rather than an exception to it. The session variables are how the platform
     /// describes the login this host is running in, which is a reading of the environment rather
-    /// than a choice about it. The network variables are read by the endpoint's library, which
-    /// offers no way not to: with no proxy selected, iroh's relay latency probe and captive-portal
-    /// check go through the proxy the environment names, and on Windows the endpoint's resolver
-    /// reads the hosts file under `SystemRoot`. They move where those requests go and can mislead
-    /// the captive-portal check; they choose no relay, no service and no trust.
+    /// than a choice about it. The network variable is read by the endpoint's library, which
+    /// offers no way not to: on Windows the endpoint's resolver reads the hosts file under
+    /// `SystemRoot`. It moves where a lookup goes; it chooses no relay, no service and no trust.
+    /// No proxy variable is read: with no proxy selected, iroh's relay latency probe and
+    /// captive-portal check are built with no proxy, and the Pkarr clients and the resolver are
+    /// this build's own and take none.
     ///
     /// Every network selection, the proxy included, the voice broker's origin, the managed
     /// storage service's origin, the authority feed's origin, the mailbox service's origin and the
@@ -5794,10 +5795,10 @@ pub mod configuration {
     /// that establishes it.
     ///
     /// The list names what this build reads that decides something: a location, the login this
-    /// host describes, or where the endpoint's relay checks and lookups go. It is not an inventory
+    /// host describes, or where the endpoint's lookups go. It is not an inventory
     /// of every variable a process in this tree ever looks at, and it does not claim to be one. A
     /// name that is in neither this table nor [`ALLOWLIST`] takes no part in the precedence.
-    pub const UNGOVERNED: [UngovernedVariable; 25] = [
+    pub const UNGOVERNED: [UngovernedVariable; 16] = [
         UngovernedVariable {
             variable: "TMPDIR",
             locates: true,
@@ -5879,55 +5880,6 @@ pub mod configuration {
                       and LOGNAME in that way",
         },
         UngovernedVariable {
-            variable: "HTTPS_PROXY",
-            locates: false,
-            selects: "the proxy iroh's relay latency probe goes through when network.proxy_url \
-                      names none",
-        },
-        UngovernedVariable {
-            variable: "https_proxy",
-            locates: false,
-            selects: "the same, where HTTPS_PROXY is not set",
-        },
-        UngovernedVariable {
-            variable: "HTTP_PROXY",
-            locates: false,
-            selects: "the proxy iroh's captive-portal check goes through when network.proxy_url \
-                      names none",
-        },
-        UngovernedVariable {
-            variable: "http_proxy",
-            locates: false,
-            selects: "the same, where HTTP_PROXY is not set",
-        },
-        UngovernedVariable {
-            variable: "ALL_PROXY",
-            locates: false,
-            selects: "the proxy either of those relay checks goes through when network.proxy_url \
-                      names none and the check's own variable is not set",
-        },
-        UngovernedVariable {
-            variable: "all_proxy",
-            locates: false,
-            selects: "the same, where ALL_PROXY is not set",
-        },
-        UngovernedVariable {
-            variable: "NO_PROXY",
-            locates: false,
-            selects: "the relays those two checks reach without the proxy the variables name",
-        },
-        UngovernedVariable {
-            variable: "no_proxy",
-            locates: false,
-            selects: "the same, where NO_PROXY is not set",
-        },
-        UngovernedVariable {
-            variable: "REQUEST_METHOD",
-            locates: false,
-            selects: "whether those two relay checks take a proxy from the environment at all: \
-                      while it is set, as in a CGI program, they take none",
-        },
-        UngovernedVariable {
             variable: "SystemRoot",
             locates: false,
             selects: "where the network endpoint reads the Windows hosts file, which may name an \
@@ -5968,31 +5920,10 @@ pub mod configuration {
     /// matters to a person reading a diagnostic is whether this host is running under one.
     #[must_use]
     pub fn ungoverned_here() -> Vec<UngovernedVariable> {
-        ungoverned_among(
-            |variable| std::env::var_os(variable).is_some(),
-            cfg!(windows),
-        )
-    }
-
-    /// Returns the entries of [`UNGOVERNED`] that `set` says are set, each variable once.
-    ///
-    /// Windows names its variables without regard to case, so there `HTTPS_PROXY` and
-    /// `https_proxy` are one variable, and it is reported under the first name the table gives it.
-    pub(super) fn ungoverned_among(
-        set: impl Fn(&str) -> bool,
-        case_blind: bool,
-    ) -> Vec<UngovernedVariable> {
-        let mut here: Vec<UngovernedVariable> = Vec::new();
-        for entry in UNGOVERNED {
-            let repeated = case_blind
-                && here
-                    .iter()
-                    .any(|kept| kept.variable.eq_ignore_ascii_case(entry.variable));
-            if !repeated && set(entry.variable) {
-                here.push(entry);
-            }
-        }
-        here
+        UNGOVERNED
+            .into_iter()
+            .filter(|entry| std::env::var_os(entry.variable).is_some())
+            .collect()
     }
 
     /// Returns the variables in [`CERTIFICATE_STORE_VARIABLES`] that this process has set.
@@ -9270,8 +9201,8 @@ mod tests {
 
     /// KR-REQ-26.14: what this build reads outside the precedence is written down, not implied:
     /// the platform's own naming of its locations and its login, and what the endpoint's library
-    /// reads for its relay checks and lookups. A variable of this product's own either takes part
-    /// in the precedence or is not read at all, and so is a certificate store's.
+    /// reads for its lookups. A variable of this product's own either takes part in the precedence
+    /// or is not read at all, and so is a certificate store's.
     #[test]
     fn every_variable_this_build_reads_outside_the_precedence_is_named() {
         for entry in &configuration::UNGOVERNED {
@@ -9299,28 +9230,14 @@ mod tests {
                 .all(|entry| !entry.variable.contains("OWNER")),
             "no variable names this host's owner"
         );
-        // What the endpoint's library still reads is named with why: the proxy variables its two
-        // relay checks follow when no proxy is selected, and the Windows root it reads the hosts
-        // file under.
-        for variable in [
-            "HTTPS_PROXY",
-            "https_proxy",
-            "HTTP_PROXY",
-            "http_proxy",
-            "ALL_PROXY",
-            "all_proxy",
-            "NO_PROXY",
-            "no_proxy",
-            "REQUEST_METHOD",
-            "SystemRoot",
-        ] {
-            assert!(
-                configuration::UNGOVERNED
-                    .iter()
-                    .any(|entry| entry.variable == variable),
-                "{variable} takes part and is named"
-            );
-        }
+        // What the endpoint's library still reads is named with why: the Windows root it reads the
+        // hosts file under.
+        assert!(
+            configuration::UNGOVERNED
+                .iter()
+                .any(|entry| entry.variable == "SystemRoot"),
+            "SystemRoot takes part and is named"
+        );
         // The account name the host, a worker and a bridge helper report, and the home an agent's
         // tool configuration goes under on Windows, are read from the login's environment, and
         // named.
@@ -9344,21 +9261,6 @@ mod tests {
             );
             assert!(configuration::is_known_term(variable), "{variable}");
         }
-    }
-
-    /// Where a platform names its variables without regard to case, a variable the table lists
-    /// under two spellings is reported once, under the first; elsewhere they are two variables.
-    #[test]
-    fn a_variable_is_reported_once_where_case_does_not_count() {
-        let set = |variable: &str| variable.eq_ignore_ascii_case("HTTPS_PROXY");
-        let reported = |case_blind| {
-            configuration::ungoverned_among(set, case_blind)
-                .into_iter()
-                .map(|entry| entry.variable)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(reported(true), vec!["HTTPS_PROXY"]);
-        assert_eq!(reported(false), vec!["HTTPS_PROXY", "https_proxy"]);
     }
 
     /// The variables that used to select this host's network and its voice broker.

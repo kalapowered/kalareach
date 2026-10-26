@@ -231,7 +231,7 @@ variables an older build read joins nothing because of them.
 | `network.relay_only` | every packet through the relay, and no direct path | `true` or `false`; `true` needs at least one relay |
 | `network.local_discovery` | discovery of peers on the local network | `true` or `false` |
 | `network.mainline_dht` | the public Mainline DHT, which carries no KalaReach service guarantee | `true` or `false` |
-| `network.proxy_url` | the HTTP proxy this host's connections to services go through: the endpoint's relay connection, relay latency probe, captive-portal check and Pkarr servers, the rendezvous, delivery and webhooks, mail submission, the managed voice broker and account service, backups to the managed storage service, the authority feed, the mailbox service, the relay lease service, the model's files, and plugin repositories; the host's own name lookups do not use it, and absent everything goes directly, apart from the relay latency probe and captive-portal check, which then follow `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` when those are set | an absolute `http` or `https` origin, with no user information, no path and no trailing slash |
+| `network.proxy_url` | the HTTP proxy this host's connections to services go through: the endpoint's relay connection, relay latency probe, captive-portal check and Pkarr servers, the rendezvous, delivery and webhooks, mail submission, the managed voice broker and account service, backups to the managed storage service, the authority feed, the mailbox service, the relay lease service, the model's files, and plugin repositories; the host's own name lookups do not use it, and absent everything goes directly | an absolute `http` or `https` origin, with no user information, no path and no trailing slash |
 | `voice.broker_origin` | the managed broker this host starts a device's voice session at, through the proxy `network.proxy_url` selects | an absolute `https` origin, or an `http` origin on `localhost`, `127.0.0.1` or `[::1]`, of at most 128 bytes, in lower case, with no path and no port its scheme already implies; a plain-HTTP origin cannot be combined with `network.proxy_url`, because the proxy would carry the account token in clear text |
 | `storage.origin` | the managed storage service this host uploads its backups to | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash; the daemon refuses to start unless it is the managed account service |
 | `authority.origin` | the authority feed this host reads its remote revocations from, and where it reads its own mailbox, in which a remote owner announces a change to the feed; a section of level 2: a release that reads level 1 ignores it, and its host takes a device's revocation only from the owner at the machine | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
@@ -279,13 +279,18 @@ to the relays over UDP to learn this host’s public address, for connecting to 
 for local discovery and for connecting to nodes in the Mainline DHT where those are selected in the
 endpoint, and for Git operations requested by the owner.
 
-Without a proxy every connection on that list goes directly, apart from iroh's relay latency probe
-and captive-portal check, which then follow `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` when those
-are set. The daemon reads the proxy when it starts, like the rest of the section, and every client
-takes that one reading. A daemon that starts over a document it cannot use makes no HTTPS connection
-to the push gateway, a webhook address or a chat service, a plugin repository, the model's files or
-the managed account service, submits no mail, and uploads no backup, until it starts again over one
-it can use.
+Without a proxy every connection on that list goes directly, iroh's relay latency probe and
+captive-portal check included, whatever `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` name. The
+daemon reads the proxy when it starts, like the rest of the section, and every client takes that
+one reading. A daemon that starts over a document it cannot use makes no HTTPS connection to the
+push gateway, a webhook address or a chat service, a plugin repository, the model's files or the
+managed account service, submits no mail, and uploads no backup, until it starts again over one it
+can use.
+
+The daemon installs no log subscriber, so it writes no iroh log. iroh's relay client logs the proxy
+address, and would log a credential in it, at debug level, from the module
+`iroh_relay::client::tls`. A build that installs a subscriber must hold that module at info or
+above, and a proxy that needs credentials waits for that filter and for a case that shows it.
 
 The daemon reads both sections once, when it starts, because that is when its endpoint and its
 voice service are built. `kr doctor` prints each field with its value, its source
@@ -882,12 +887,12 @@ those set here rather than leaving the sentence above to be read as more than it
 | --- | --- | --- |
 | platform locations | `TMPDIR`, `XDG_RUNTIME_DIR`, `XDG_STATE_HOME`, `XDG_CONFIG_HOME`, `HOME`, `LOCALAPPDATA`, `USERPROFILE` | the operating system's own conventional directories, which is what the native locations above are derived from, and on Windows the home an agent's tool configuration is written under |
 | session readings | `PATH`, `DISPLAY`, `XAUTHORITY`, `XDG_SESSION_ID`, `SESSIONNAME`, `USER`, `LOGNAME`, `USERNAME` | what the platform says about the login this host is running in, its account name included, and where a capability probe looks for the tools it reports on |
-| network library | `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` and their lower-case spellings, `REQUEST_METHOD`, `SystemRoot` | with no `network.proxy_url`, the proxy iroh's relay latency probe and captive-portal check go through; and on Windows where the endpoint reads the hosts file. iroh reads these itself and offers no way not to |
+| network library | `SystemRoot` | on Windows, where the endpoint reads the hosts file. iroh reads it itself and offers no way not to |
 
 No group reaches authority, a provider origin or whom this host trusts. The network library's
-variables move where two relay checks and a lookup go; they choose no relay, no service and no
-trust. No variable selects a network service, the proxy or the voice broker: those are the
-configuration document's `network` and `voice` sections. The managed-service, rendezvous, delivery,
+variable moves where a lookup goes; it chooses no relay, no service and no trust. No proxy
+variable is read at all. No variable selects a network service, the proxy or the voice broker:
+those are the configuration document's `network` and `voice` sections. The managed-service, rendezvous, delivery,
 plugin repository and mail clients verify a server against the platform's own store, and
 `SSL_CERT_FILE` and `SSL_CERT_DIR` are not read, so an authority given only through them is not
 trusted by those clients until it is installed in the system store; `kr doctor` says so. The

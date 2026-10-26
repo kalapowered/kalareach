@@ -1211,8 +1211,8 @@ pub fn checks(effective: &EffectiveConfiguration) -> Vec<DoctorCheck> {
         "configuration-overrides",
         "Which environment variables participate",
         // What is read outside the precedence is the platform's naming of its locations and its
-        // login, and the proxy and hosts file variables the endpoint's library reads for its
-        // relay checks and lookups. Every provider origin this host uses is its configuration
+        // login, and the hosts file variable the endpoint's library reads for its lookups. No
+        // proxy variable is read. Every provider origin this host uses is its configuration
         // document's, the certificates it trusts are the platform store's and, for the endpoint,
         // the public and document anchors, and its owner is recorded by pairing, so no inherited
         // variable here reaches authority, an origin or whom this host trusts.
