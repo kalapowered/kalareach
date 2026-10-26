@@ -1815,16 +1815,19 @@ async fn a_device_at_the_door_of_the_updated_host_meets_the_worker_of_the_releas
 
     // The launch surface is read of the worker, and the worker of the release before has no row for
     // it: it would refuse it as it refuses any method it does not serve, which reads as a missing
-    // right. It states what it serves, so the daemon refuses the read itself and sends it nothing.
-    let refused = session
-        .read_launch_surface(session_id)
-        .await
-        .expect_err("the worker of the release before does not serve the launch surface");
+    // right. It states what it serves, so the daemon refuses the read itself and sends it nothing,
+    // and the device is told the host does not serve the read. The read goes on a connection of its
+    // own, as a phone's session screen does, because a connection that reads from a worker ends
+    // with the worker's session.
+    let screen = door.connect_again().await;
     assert_eq!(
-        refused.code(),
-        kr_protocol::error::ErrorCode::UnsupportedCapability,
-        "{refused:?}"
+        screen
+            .read_launch_surface(session_id)
+            .await
+            .expect("the read is answered"),
+        kr_client::LaunchSurfaceRead::NotServed
     );
+    screen.close();
 
     // The worker is the process it was, and runs the release before.
     updated.the_worker_is_as_it_was().await;

@@ -45,7 +45,13 @@ pub struct Door {
     /// The keys the device holds, which confirm what an owner device confirms.
     pub keys: DeviceKeys,
     /// The endpoint the device dials from, kept for as long as the session is.
-    _endpoint: Endpoint,
+    endpoint: Endpoint,
+    /// What the device presents when it dials the host.
+    identity: LocalIdentity,
+    /// Where the host is.
+    payload: kr_protocol::pairing::DirectQrPayload,
+    /// The host the device paired with.
+    host: PairedPeer,
 }
 
 /// A device the host has paired, with what it needs to dial the host again.
@@ -206,8 +212,26 @@ impl Door {
             device_id: paired.device_id,
             session: Session::start(Arc::new(transport)).expect("a session"),
             keys: paired.keys,
-            _endpoint: paired.endpoint,
+            endpoint: paired.endpoint,
+            identity,
+            payload: paired.payload,
+            host: paired.host,
         }
+    }
+
+    /// Connects the same device to the host a second time, as a phone does for each session it
+    /// shows: a connection that reads from a session's worker ends with the session, and this one
+    /// is not the device's first.
+    pub async fn connect_again(&self) -> Session {
+        let transport = pairing::connect_until_answered(
+            &self.endpoint,
+            pairing::host_addr(&self.payload),
+            &self.identity,
+            &self.host,
+        )
+        .await
+        .expect("the paired device connects again");
+        Session::start(Arc::new(transport)).expect("a session")
     }
 
     /// Pairs a second device, called `name`, as a guest: it holds no right and no session, as a

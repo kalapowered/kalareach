@@ -131,6 +131,9 @@ struct HostScript {
     windows: Mutex<Vec<String>>,
     /// Answer this many of the next reads with this error instead of a result.
     refuse_reads_with: Mutex<Option<(ErrorCode, u32)>>,
+    /// Answer every read of this method with this error instead of a result, as a host that does
+    /// not list the method does.
+    refuse_method_with: Mutex<Option<(kr_protocol::method::Method, ErrorCode)>>,
     /// Answer every mutation with a correlated protocol error instead of a receipt.
     refuse_mutations_with: Mutex<Option<ErrorCode>>,
     /// Answer this many of the next mutations with the method's own result instead of a receipt.
@@ -243,6 +246,14 @@ fn spawn_host(
                                     _ => None,
                                 }
                             };
+                            let refused_method = *script.refuse_method_with.lock().await;
+                            let refusal = refusal.or_else(|| {
+                                refused_method
+                                    .filter(|(method, _)| {
+                                        method.entry().name == request.method.as_str()
+                                    })
+                                    .map(|(_, code)| code)
+                            });
                             let record = if request.method.as_str()
                                 == kr_protocol::method::Method::ActionRead.entry().name
                             {
@@ -392,7 +403,58 @@ fn answer_read(request: &kr_protocol::envelope::Request) -> ParamsValue {
         })
         .expect("a result");
     }
+    if request.method.as_str() == kr_protocol::method::Method::SessionRead.entry().name {
+        return ParamsValue::from_typed(&live_session()).expect("a result");
+    }
+    if request.method.as_str() == kr_protocol::method::Method::ShellLaunchSurface.entry().name {
+        return ParamsValue::from_typed(&launch_surface()).expect("a result");
+    }
     ParamsValue::from_typed(&SessionList { count: 2 }).expect("a result")
+}
+
+/// The session `session.read` answers about: live, with nothing set that a read here decides on.
+fn live_session() -> kr_protocol::session::SessionReadResult {
+    kr_protocol::session::SessionReadResult {
+        session: kr_protocol::session::SessionSummary {
+            session_id: SessionId::new(Uuid::from_bytes([5; 16])),
+            session_epoch: kr_protocol::ids::SessionEpoch::V1,
+            environment_id: EnvironmentId::new(Uuid::from_bytes([3; 16])),
+            display_number: kr_protocol::session::DisplayNumber::new(1),
+            state: kr_protocol::session::SessionState::Live,
+            shell_mode: kr_protocol::session::ShellMode::NativeCompat,
+            shell_path: "/bin/sh".to_owned(),
+            cwd: "/".to_owned(),
+            worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+            desktop: kr_protocol::identity::DesktopBinding::none(),
+            created_at_ms: TimestampMs::new(1),
+            dimensions: kr_protocol::session::Dimensions::new(80, 24),
+            attachment_count: U64::ZERO,
+            application_state: Nullable::null(),
+            root_process: Nullable::null(),
+            closure: Nullable::null(),
+            environment_sources: None,
+            root: None,
+            application: None,
+        },
+        endpoint: Nullable::null(),
+        launch_profile: Nullable::null(),
+        last_command_block: Nullable::null(),
+        outstanding_launches: Nullable::null(),
+        metrics: None,
+    }
+}
+
+/// The launch surface a host that serves it answers with.
+fn launch_surface() -> kr_protocol::root::ShellLaunchSurfaceResult {
+    kr_protocol::root::ShellLaunchSurfaceResult {
+        session_id: SessionId::new(Uuid::from_bytes([5; 16])),
+        editor: kr_protocol::root::LaunchEditor::Unverified {
+            reason: kr_protocol::root::LaunchUnverified::StockShell,
+        },
+        input: kr_protocol::root::LaunchInput::Free,
+        shell: Nullable::some(kr_protocol::root::LaunchShell::Sh),
+        offers: Vec::new(),
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema, Debug, PartialEq, Eq)]
@@ -1141,6 +1203,145 @@ async fn a_refusal_as_not_permitted_reaches_the_holder_unless_the_read_was_the_q
             .await
             .is_err(),
         "nothing was raised for the question's own refusal"
+    );
+
+    session.close();
+    serving.abort();
+}
+
+/// KR-REQ-13.11: a host that does not list the launch surface refuses it as it refuses any method it
+/// does not list, as not permitted, while it answers `session.read` under the same right. The read
+/// is then one the host does not serve, and nothing is raised to the holder: the connection was
+/// not withdrawn.
+#[tokio::test]
+async fn a_host_that_does_not_list_the_launch_surface_does_not_serve_it_and_raises_nothing() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    *script.refuse_method_with.lock().await = Some((
+        kr_protocol::method::Method::ShellLaunchSurface,
+        ErrorCode::PermissionDenied,
+    ));
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+    let session_id = SessionId::new(Uuid::from_bytes([5; 16]));
+
+    assert_eq!(
+        session
+            .read_launch_surface(session_id)
+            .await
+            .expect("the read is answered"),
+        kr_client::LaunchSurfaceRead::NotServed
+    );
+    assert!(
+        tokio::time::timeout(Duration::ZERO, session.denied())
+            .await
+            .is_err(),
+        "a host too old for the method did not withdraw the connection"
+    );
+
+    session.close();
+    serving.abort();
+}
+
+/// KR-REQ-13.11: a grant that has lost its right is refused the launch surface and `session.read`
+/// alike. That is a refusal, returned as one, and it is raised to the holder as every refusal of
+/// the right is.
+#[tokio::test]
+async fn a_launch_surface_refused_with_the_right_it_reads_under_is_a_refusal_and_is_raised() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    *script.refuse_reads_with.lock().await = Some((ErrorCode::PermissionDenied, 2));
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+
+    let refused = session
+        .read_launch_surface(SessionId::new(Uuid::from_bytes([5; 16])))
+        .await
+        .expect_err("the grant lost its right");
+    assert!(
+        matches!(&refused, ClientError::Host(error) if error.code == ErrorCode::PermissionDenied),
+        "{refused:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(5), session.denied())
+        .await
+        .expect("the refusal of the right was raised");
+
+    session.close();
+    serving.abort();
+}
+
+/// KR-REQ-13.11: a host that refuses the launch surface once and then answers is served: the first
+/// refusal was not about the method.
+#[tokio::test]
+async fn a_launch_surface_refused_once_and_then_answered_is_served() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    *script.refuse_reads_with.lock().await = Some((ErrorCode::PermissionDenied, 1));
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+
+    assert_eq!(
+        session
+            .read_launch_surface(SessionId::new(Uuid::from_bytes([5; 16])))
+            .await
+            .expect("the read is answered"),
+        kr_client::LaunchSurfaceRead::Served(launch_surface())
+    );
+    assert!(
+        tokio::time::timeout(Duration::ZERO, session.denied())
+            .await
+            .is_err(),
+        "nothing was raised"
+    );
+
+    session.close();
+    serving.abort();
+}
+
+/// KR-REQ-13.11: a host whose worker is of an earlier release refuses the launch surface as an
+/// unsupported capability, which is the host not serving the read; any other refusal is returned as
+/// it is, and no probe is made for it.
+#[tokio::test]
+async fn a_launch_surface_refused_as_unsupported_is_not_served_and_any_other_refusal_is_returned() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+    let session_id = SessionId::new(Uuid::from_bytes([5; 16]));
+
+    *script.refuse_method_with.lock().await = Some((
+        kr_protocol::method::Method::ShellLaunchSurface,
+        ErrorCode::UnsupportedCapability,
+    ));
+    assert_eq!(
+        session
+            .read_launch_surface(session_id)
+            .await
+            .expect("the read is answered"),
+        kr_client::LaunchSurfaceRead::NotServed
+    );
+
+    *script.refuse_method_with.lock().await = Some((
+        kr_protocol::method::Method::ShellLaunchSurface,
+        ErrorCode::UnknownSession,
+    ));
+    let before = script.reads.load(Ordering::Acquire);
+    let refused = session
+        .read_launch_surface(session_id)
+        .await
+        .expect_err("the host does not know the session");
+    assert!(
+        matches!(&refused, ClientError::Host(error) if error.code == ErrorCode::UnknownSession),
+        "{refused:?}"
+    );
+    assert_eq!(
+        script.reads.load(Ordering::Acquire),
+        before + 1,
+        "a refusal that is not about the method is not probed"
     );
 
     session.close();

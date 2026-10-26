@@ -427,7 +427,8 @@ impl WorkerLinks {
     /// method it does not list for a missing right. On a host this device is paired with, no worker
     /// answered the hello: the host's daemon refuses the read for a worker that does not state it,
     /// and a daemon of an earlier release refuses it as unlisted, which the client library tells
-    /// from a withdrawn right by asking for what the same right reads.
+    /// from a withdrawn right by asking for what the same right reads. Either way the answer is
+    /// that the read is not served.
     ///
     /// # Errors
     ///
