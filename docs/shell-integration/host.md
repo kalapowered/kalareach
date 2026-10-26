@@ -161,7 +161,7 @@ The caller's answer is the reader's word. The sequence is:
    editor, and a qualified phase.
 2. Inside the session boundary the machine reserves the current fence, holds later input, and the
    request goes into the reader's mailbox with the worker's own recorded working-directory revision
-   and what is left of the 250 ms.
+   and a reader budget of 200 ms.
 3. The boundary ends there. The caller waits outside it, so a transaction does not hold every other
    mutation on the worker behind it.
 4. At the deadline the worker revokes the transaction, releases the held input in its original order
