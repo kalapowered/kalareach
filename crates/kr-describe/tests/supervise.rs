@@ -28,7 +28,7 @@ use kr_describe::service::{
 use kr_describe::store::DescriptionStore;
 use kr_describe::supervise::{
     ANSWER_GRACE_MS, CANCEL_MS, Check, Checked, Driver, HANDSHAKE_MS, Launch, READER_THREAD,
-    Report, WRITER_THREAD,
+    Report, SAMPLE_MS, WRITER_THREAD,
 };
 use kr_describe::testing::{
     CATALOGUE_VARIABLE, Raw, SCRIPT_VARIABLE, STARTED_PREFIX, Script, TestAsset, TestCatalogue,
@@ -1837,6 +1837,83 @@ fn a_publication_past_the_ceiling_stands_and_the_pause_follows_through_the_proce
         |reports, _| a_job_ended(reports),
     );
     assert_eq!(rig.driver.pid(), pid);
+    assert_eq!(rig.driver.started(), 1);
+}
+
+/// KR-REQ-22.10: a job whose process really holds more memory than an owner's ceiling allows is
+/// ended by the daemon's own reading of the process, and the host is told memory pressure paused
+/// inference: nothing is published, the job is not queued again, and the process is gone. The
+/// ceiling is the owner's, below section 22's, and the profile still fits under it, so admission
+/// let the job run. The reading is taken at the turn whose time the test chooses, after the process
+/// has said its memory is in place, so what decides is the process's resident set and never a wait.
+#[test]
+fn a_job_whose_process_runs_past_the_owners_ceiling_is_ended_by_the_daemons_sampler() {
+    const MIB: u64 = 1 << 20;
+    let (catalogue, _) = tiny();
+    let fits = catalogue
+        .catalogue()
+        .default_profile()
+        .execution()
+        .resident_estimate
+        .total();
+    assert!(fits < Budgets::DEFAULTS.process_memory_ceiling_bytes);
+    let mut rig = Rig::over(
+        &Script {
+            hold_bytes: fits + 64 * MIB,
+            generate_until_cancelled: true,
+            mark_work: true,
+            ..Script::default()
+        },
+        ResourceSettings {
+            owner_ceiling_bytes: Some(fits),
+            ..ResourceSettings::default()
+        },
+        Some(&catalogue),
+    );
+    assert_eq!(rig.driver.service().ceiling_bytes(), fits);
+    queue(rig.service(), &session(1), Priority::Ordinary, at(0));
+    rig.job_sent(at(3_000));
+    stub::wait_until_began(&rig.placed.directory("runtime"), "held");
+    assert!(
+        rig.driver.pid().is_some(),
+        "no turn has read the process's memory yet"
+    );
+
+    let reports = rig.until(
+        &roomy(),
+        at(3_000 + SAMPLE_MS),
+        "the process ended by its resident set",
+        |reports, _| the_process_ended(reports),
+    );
+    assert!(
+        outcomes(&reports).contains(&&Outcome::ProcessEnded {
+            why: ProcessEnd::MemoryCeiling
+        }),
+        "{reports:?}"
+    );
+    assert!(
+        outcomes(&reports)
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Failed { session_id, .. } if *session_id == session(1))),
+        "the job ends failed, not published and not queued again: {reports:?}"
+    );
+    assert_eq!(rig.driver.pid(), None, "the process is gone");
+    assert_eq!(
+        rig.driver.service().resource_state(),
+        ResourceState::ResourcePaused {
+            reason: PauseReason::MemoryPressure,
+            unloaded: true
+        }
+    );
+    assert!(
+        rig.driver
+            .service()
+            .store()
+            .generated(&session(1))
+            .expect("a read")
+            .is_none(),
+        "nothing was published"
+    );
     assert_eq!(rig.driver.started(), 1);
 }
 
