@@ -2075,6 +2075,10 @@ fn a_review_subject_recorded_before_the_viewers_history_is_answered_as_one_never
     );
 }
 
+/// KR-REQ-25.04, the part about the comparison: what changed since a visit is what the log holds
+/// after the cursor the actor acknowledged (six changes for three turns), nothing once the actor
+/// has visited to the end, and the changes after that when more arrive. Not shown here: the
+/// markers for history that is missing, which the case on a lost range shows.
 #[test]
 fn changed_since_a_visit_compares_the_acknowledged_cursor_with_the_current_events() {
     let mut attention = engine();
@@ -2219,6 +2223,10 @@ fn a_summary_is_written_from_the_interval_since_the_acknowledged_cursor() {
     );
 }
 
+/// KR-REQ-25.04, the part about omitted history: when a retained source lost a range of events,
+/// what changed since a visit states the range (its source and the sequences it spans) and does not
+/// close over it, still shows what survived, and does not state it again to an actor that has
+/// visited past it.
 #[test]
 fn a_range_a_retained_source_lost_is_shown_in_what_changed_since_a_visit() {
     let mut attention = engine();
@@ -2838,6 +2846,11 @@ fn the_view_a_client_used_last_is_the_one_the_bound_keeps() {
 
 /// KR-REQ-25.27: a view whose range retention took is served from the oldest byte still held with
 /// its filter kept, and the evicted range is stated as a gap.
+///
+/// KR-REQ-25.04, the part about omitted history: that gap is the marker the view of what changed
+/// since the last visit carries for output retention took, from the offset the view was reading to
+/// the oldest byte still held. Not shown here: the marker for events the retained source lost,
+/// which the case on a lost range shows.
 #[test]
 fn a_view_whose_range_retention_took_is_served_from_the_oldest_byte_and_told_about_the_gap() {
     let mut attention = engine();

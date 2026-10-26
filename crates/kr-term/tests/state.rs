@@ -3370,6 +3370,11 @@ fn the_carried_history_figure_matches_a_walk_of_the_rows() {
 /// what is on it. A reconnecting client is handed the flags in force as a state, and the entries
 /// behind them travel with the snapshot so that an application's next pop lands where it would
 /// have landed had nothing been disconnected.
+///
+/// KR-REQ-27.06, the part about the alternate screen: a snapshot taken while a full-screen
+/// application is on the alternate screen restores the keyboard flags and the stack of both
+/// buffers, the primary screen's among them. Not shown here: the saved cursor, output cut off
+/// mid-sequence and the absence of clipboard replay.
 #[test]
 fn a_restoration_reproduces_the_keyboard_stack() {
     let mut engine = Engine::new(EngineConfig {
