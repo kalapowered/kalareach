@@ -245,7 +245,8 @@ a build.
    the subscription.
 
 Together those mean a signature is possible only from a workflow run in this repository, in the
-`release-signing` environment, which a person approved. A fork cannot get one. A stolen copy of the
+`release-signing` environment, which a person approved, for as long as no other principal holds the
+signer role. A fork cannot get one. A stolen copy of the
 repository cannot get one, because there is no private key or secret in the repository to steal.
 
 Environment protection applies to the `release` job referencing the `release-signing` environment,
@@ -342,8 +343,12 @@ run is suspected, or signing access must be revoked immediately:
    - The GitHub repository administrator audits and restores required reviewers and deployment branch and
      tag policies on the `release-signing` environment.
 4. Investigate signatures and revoke compromised certificates or releases:
-   - Review the Artifact Signing service's signing history in the Azure portal (or diagnostic logs in
-     Log Analytics if configured) for data-plane signing requests during the incident window.
+   - Read the account's record of what it signed during the incident window. That record is the
+     account's `Sign Transactions` resource log, and Azure writes it only where a diagnostic setting
+     on the account sends it to a storage account (the container `insights-logs-signtransactions`),
+     an event hub or a partner solution ([Microsoft's steps](https://learn.microsoft.com/en-us/azure/artifact-signing/how-to-sign-history)).
+     None of the four things above creates such a setting, so the account holds the record only if
+     its owner made a setting before the incident.
    - Review Azure Activity Logs for control-plane role, profile, or account modifications.
    - Audit GitHub Actions workflow run histories and release assets.
    - If unauthorized signatures were produced:
@@ -356,10 +361,15 @@ run is suspected, or signing access must be revoked immediately:
        the certificate's validity, and the files signed with the certificate become invalid from that
        time on ([Microsoft's steps](https://learn.microsoft.com/en-us/azure/artifact-signing/how-to-cert-revocation)).
        The owner enters a time no later than the first unauthorised signature under that certificate,
-       which the signing history gives, and not the time of the discovery, or the unauthorised files
-       signed before it stay valid. Every legitimate file the certificate signed after that time
-       becomes invalid too, so each Windows release that carries one is released again from a new
-       commit, under that commit's tag.
+       which the record above gives, and not the time of the discovery, or the unauthorised files
+       signed before it stay valid. Where no record covers the window, nothing says which
+       certificates carry an unauthorised signature or when the first was made, so the owner treats
+       every certificate created since the window began as carrying one and enters the creation date
+       and time the portal lists for each as its revocation time, the earliest Microsoft accepts.
+       Every legitimate file the certificate signed after the revocation time becomes invalid too, so
+       each Windows release that carries one is released again from a new commit, under that
+       commit's tag; `share/signatures.txt` of a release names the thumbprint of the certificate that
+       signed each of its files.
      - The GitHub repository administrator deletes any compromised release draft or published release,
        purges published artefacts from distribution, and notifies downstream consumers.
 5. Treat the Apple signing credentials as leaked, whatever step 4 finds:
