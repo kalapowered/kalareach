@@ -336,7 +336,7 @@ export function RawTerminal({
   // holds the session's input once the person takes control, so it is the one whose answer can
   // light a button.
   const { rights } = useHeldConnection()
-  const launchReads = useLaunchSurface(port, `${sessionId}:${openingKey}`, launch?.read ?? null)
+  const launchReads = useLaunchSurface(port, launch?.read ?? null)
   // Taking control or giving it back changes who holds the input, which the surface says: it is
   // read again at once rather than a cadence later.
   const controlState = control?.state ?? null

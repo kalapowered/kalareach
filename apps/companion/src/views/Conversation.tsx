@@ -1439,7 +1439,7 @@ function SessionLaunchSurface({
   const { port } = useApp()
   const { rights } = useHeldConnection()
   const read = useCallback(() => port.launchSurface({ session_id: sessionId }), [port, sessionId])
-  const reads = useLaunchSurface(port, sessionId, read)
+  const reads = useLaunchSurface(port, read)
   return (
     <LaunchSurface
       reads={reads}

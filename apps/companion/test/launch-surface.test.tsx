@@ -9,17 +9,19 @@
  * went stale is refused by the host, shows no success, and is followed by a read.
  */
 
+import type { ReactNode } from 'react'
 import { describe, expect, it } from 'vitest'
 import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 import { App } from '../src/App'
-import { AppProvider, type Place } from '../src/app/state'
+import { AppProvider, useApp, type Place } from '../src/app/state'
 import { fakeHost } from '../src/host/fake'
 import type { HostPort } from '../src/host/port'
 import { UNVERIFIED_WORDS } from '../src/model/launch'
 
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+const SESSION_BUILD = '8a7b6c50-22bb-4c3d-8e4f-000000000102'
 const ENVIRONMENT = '3f1a2c40-11aa-4b2c-9d3e-000000000001'
 
 function open(port: HostPort, pane: 'semantic' | 'terminal', sessionId = SESSION_MAIN): void {
@@ -347,5 +349,57 @@ describe('the buttons that start something', () => {
       await Promise.resolve()
     })
     await waitFor(allLit)
+  })
+})
+
+describe('what a read is taken to say', () => {
+  /** A way to go to another session's terminal, as the session tabs are. */
+  function GoTo({ sessionId }: { readonly sessionId: string }): ReactNode {
+    const { go } = useApp()
+    return (
+      <button
+        type="button"
+        onClick={() => {
+          go({ view: 'session', sessionId, pane: 'terminal' })
+        }}
+      >
+        {`Go to ${sessionId}`}
+      </button>
+    )
+  }
+
+  // The view that read the surface is the one whose answer is shown: returning to a session opens
+  // a new view, and the answer to the earlier one is not drawn under it before the new one has read.
+  it('does not show an earlier view of the session under a new one', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    render(
+      <AppProvider port={port} initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'terminal' }}>
+        <App />
+        <GoTo sessionId={SESSION_BUILD} />
+        <GoTo sessionId={SESSION_MAIN} />
+      </AppProvider>
+    )
+    await takeControl(person)
+    await screen.findByTestId('launch-surface')
+
+    const reads = controls.hold('launchSurface')
+    const views = controls.terminalViews
+    await person.click(screen.getByRole('button', { name: `Go to ${SESSION_BUILD}` }))
+    await waitFor(() => {
+      expect(views[1]?.launchReads).toBe(1)
+    })
+    await person.click(screen.getByRole('button', { name: `Go to ${SESSION_MAIN}` }))
+    await waitFor(() => {
+      expect(views[2]?.launchReads).toBe(1)
+    })
+    // The new view has read and has not been answered: nothing of the earlier view's answer is drawn.
+    expect(screen.queryByTestId('launch-surface')).toBeNull()
+
+    await act(async () => {
+      reads.release()
+      await Promise.resolve()
+    })
+    expect(await screen.findByTestId('launch-take-control')).toBeInTheDocument()
   })
 })
