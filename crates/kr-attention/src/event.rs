@@ -270,7 +270,9 @@ pub enum EventKind {
     CommandCompleted {
         /// The session it ran in.
         session_id: SessionId,
-        /// The command, as the shell adapter reported it.
+        /// What names the command: the shell adapter's own line, or the sequence of the record
+        /// that reported it, which stands for the command where the line is not kept. Two
+        /// failures are two conditions only if this differs.
         command: String,
         /// Its exit status. Nought raises nothing.
         exit_code: i32,

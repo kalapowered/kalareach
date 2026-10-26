@@ -3769,8 +3769,11 @@ pub fn question_event(session_id: SessionId, record: &AttentionQuestionRecord) -
 
 /// Turns one host event into the event the store reads.
 ///
-/// Only a notification is a rule's condition, and one is known to the store by its fingerprint
-/// rather than by what it said. Anything else moves the cursor and nothing more.
+/// A notification is a rule's condition, and one is known to the store by its fingerprint rather
+/// than by what it said. So is a turn that ended and a command that failed, which the worker
+/// records itself: the record's sequence is the version of the turn's result and the identity of
+/// the command, so a turn that ends again is later review work and two commands that read alike
+/// are two failures. Anything else moves the cursor and nothing more.
 #[must_use]
 pub fn host_event(session_id: SessionId, record: &AttentionHostRecord) -> SourceEvent {
     // A worker's notice about a plugin binding it holds is the trusted adapter rule's. Only the
@@ -3790,6 +3793,25 @@ pub fn host_event(session_id: SessionId, record: &AttentionHostRecord) -> Source
             kr_protocol::attention::AdapterTransition::Cleared => EventKind::AdapterRecovered {
                 plugin_id: notice.plugin_id.clone(),
             },
+        }
+    } else if let Some(work) = record.session_event.as_ref() {
+        match work {
+            kr_protocol::attention::SessionEventNotice::TurnCompleted { turn_id } => {
+                EventKind::TurnCompleted {
+                    session_id,
+                    turn_id: turn_id.clone(),
+                    version: record.sequence.get(),
+                    change_set: None,
+                    summary: String::new(),
+                }
+            }
+            kr_protocol::attention::SessionEventNotice::CommandCompleted { exit_status } => {
+                EventKind::CommandCompleted {
+                    session_id,
+                    command: record.sequence.get().to_string(),
+                    exit_code: i32::try_from(exit_status.get()).unwrap_or(i32::MAX),
+                }
+            }
         }
     } else if record.notification {
         EventKind::ApplicationNotice {

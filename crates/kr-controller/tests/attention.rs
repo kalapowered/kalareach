@@ -7,6 +7,8 @@
 //! against a whole daemon on its own socket and over the network, where a paired device reads under
 //! its grant.
 
+#[cfg(unix)]
+mod gateway_support;
 mod net_support;
 
 use std::collections::BTreeMap;
@@ -61,6 +63,9 @@ struct Worker {
     known: KnownWorker,
     controller: Arc<ControllerIdentity>,
     boot: kr_protocol::identity::BootIdentity,
+    /// The task that serves the worker's endpoint, which a restart ends.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    serving: tokio::task::JoinHandle<kr_worker::Result<()>>,
 }
 
 fn build() -> BuildId {
@@ -79,7 +84,25 @@ async fn worker_for(session_id: SessionId) -> Worker {
 /// A worker for the session named whose shell runs `script`, which can print what an application
 /// prints.
 async fn worker_running(session_id: SessionId, script: &str) -> Worker {
-    let temp = kr_ipc::testing::TempHost::create();
+    worker_on(
+        kr_ipc::testing::TempHost::create(),
+        None,
+        DisplayNumber::new(1),
+        session_id,
+        script,
+    )
+    .await
+}
+
+/// A worker for the session named on the tree given, whose daemon is `controller` where one is
+/// given, at the display number given.
+async fn worker_on(
+    temp: kr_ipc::testing::TempHost,
+    controller: Option<Arc<ControllerIdentity>>,
+    display_number: DisplayNumber,
+    session_id: SessionId,
+    script: &str,
+) -> Worker {
     let environment = temp.environment();
     let environment_id = temp.environment_id();
     let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
@@ -96,10 +119,12 @@ async fn worker_running(session_id: SessionId, script: &str) -> Worker {
     );
     let store =
         kr_crypto::store::open_store_in(&environment.secrets_dir()).expect("a secret store");
-    let controller = Arc::new(
-        ControllerIdentity::initialise(store.store.as_ref(), environment_id)
-            .expect("a controller identity"),
-    );
+    let controller = controller.unwrap_or_else(|| {
+        Arc::new(
+            ControllerIdentity::initialise(store.store.as_ref(), environment_id)
+                .expect("a controller identity"),
+        )
+    });
     let journal_path = environment.journal_database(session_id);
     if let Some(parent) = journal_path.parent() {
         std::fs::create_dir_all(parent).expect("the journal directory");
@@ -108,7 +133,7 @@ async fn worker_running(session_id: SessionId, script: &str) -> Worker {
         session_id,
         session_epoch: SessionEpoch::V1,
         environment_id,
-        display_number: DisplayNumber::new(1),
+        display_number,
         shell: kr_worker::testing::posix_script(script),
         shell_mode: ShellMode::NativeCompat,
         worker_profile: WorkerProfile::HeadlessUser,
@@ -129,7 +154,7 @@ async fn worker_running(session_id: SessionId, script: &str) -> Worker {
             .expect("starts the runtime"),
     );
     let endpoint = environment
-        .worker_endpoint(DisplayNumber::new(1))
+        .worker_endpoint(display_number)
         .expect("an endpoint");
     let listener = Listener::bind(&endpoint).expect("binds the endpoint");
     let service = Arc::new(
@@ -148,14 +173,14 @@ async fn worker_running(session_id: SessionId, script: &str) -> Worker {
         )
         .expect("a worker service"),
     );
-    tokio::spawn(Arc::clone(&service).serve(listener));
+    let serving = tokio::spawn(Arc::clone(&service).serve(listener));
     let known = KnownWorker {
         level: kr_protocol::retained::Level::this(),
         descriptor: kr_protocol::worker::WorkerDescriptor {
             session_id,
             session_epoch: SessionEpoch::V1,
             environment_id,
-            display_number: DisplayNumber::new(1),
+            display_number,
             boot_identity: boot.clone(),
             process_start_identity: process,
             protocol_version: PROTOCOL_VERSION,
@@ -174,6 +199,39 @@ async fn worker_running(session_id: SessionId, script: &str) -> Worker {
         known,
         controller,
         boot,
+        serving,
+    }
+}
+
+/// A shell that outlasts any case: a session whose shell ends is closed, and what a case waits for
+/// must not depend on how long the machine took to place the programs.
+#[cfg(unix)]
+const LASTING: &str = "sleep 600";
+
+#[cfg(unix)]
+impl Worker {
+    /// The session's worker started again over the journal this one kept: the old one takes no
+    /// more connections, and a new one, at another endpoint, reads what the journal holds and goes
+    /// on from it, as a worker that is started again for a session does. The old worker's session
+    /// stays live and keeps the links it already has, so its shell is one that outlasts the case.
+    async fn restarted(self) -> Self {
+        let Self {
+            _temp,
+            session_id,
+            controller,
+            serving,
+            ..
+        } = self;
+        serving.abort();
+        let _ = serving.await;
+        worker_on(
+            _temp,
+            Some(controller),
+            DisplayNumber::new(2),
+            session_id,
+            LASTING,
+        )
+        .await
     }
 }
 
@@ -4009,4 +4067,339 @@ async fn a_device_sees_an_automation_item_only_under_its_grant() {
         "a device's acknowledgement is its own"
     );
     host.stop().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// A session's own work: agent turns that end and commands that fail
+// ---------------------------------------------------------------------------------------------
+
+/// A terminal behind a gateway runs a turn in a session its worker serves, and a shell reports the
+/// commands that finish in it. Nothing is handed to the store: the worker records what it saw in
+/// its journal, and the daemon reads it from there.
+#[cfg(unix)]
+mod session_work {
+    use super::*;
+
+    use crate::gateway_support::Gateway;
+    use kr_protocol::attention::SemanticChangeKind;
+
+    /// How long a condition is waited for before the test gives up on it. A bound for a machine
+    /// under load, never a figure a test depends on.
+    const PATIENCE: Duration = Duration::from_secs(120);
+
+    /// A worker for a session of a new identity whose shell outlasts the case.
+    async fn lasting_worker() -> Worker {
+        worker_running(SessionId::new(kr_ipc::new_uuid()), LASTING).await
+    }
+
+    /// A daemon that reads the worker's session, and the owner's connection to it.
+    async fn daemon_over(worker: &Worker) -> (net_support::Host, LocalClient, Arc<TestReach>) {
+        let owner_keys = DeviceKeys::generate().expect("owner keys");
+        let host = net_support::Host::start(&owner_keys).await;
+        let reach = Arc::new(TestReach::default());
+        reach.add(worker);
+        host.controller()
+            .attention()
+            .watch(Arc::clone(&reach) as Arc<dyn Reach>, worker.known.clone());
+        let control = host.client().await;
+        (host, control, reach)
+    }
+
+    /// The completed turn the worker's stand-in runs, as a review subject.
+    fn the_turn(worker: &Worker) -> ReviewSubject {
+        ReviewSubject::CompletedTurn {
+            session_id: worker.session_id,
+            turn_id: AgentTurnId::new("turn-1").expect("an identifier"),
+        }
+    }
+
+    /// The review state of `subject` once `holds` says it is the one waited for.
+    async fn review_when(
+        control: &mut LocalClient,
+        subject: &ReviewSubject,
+        holds: impl Fn(&ReviewState) -> bool,
+    ) -> ReviewState {
+        let session_id = match subject {
+            ReviewSubject::CompletedTurn { session_id, .. }
+            | ReviewSubject::ChangeSet { session_id, .. } => *session_id,
+        };
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            let reviews = owner_reviews(control, session_id).await;
+            if let Some(state) = reviews
+                .iter()
+                .find(|state| state.subject == *subject && holds(state))
+            {
+                return state.clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the review state did not get there: {reviews:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// The sequence of the newest host event the worker's journal holds, which is the version of the
+    /// turn that ended last and the identity of the command that failed last.
+    fn newest_event(worker: &Worker) -> u64 {
+        worker
+            .service
+            .runtime()
+            .session()
+            .journal()
+            .expect("the worker keeps a journal")
+            .host_events_head()
+            .expect("the journal reads")
+    }
+
+    /// Reports a command block to the session as the shell integration's hook does.
+    fn report(worker: &Worker, generation: u64, command: &str, status: u64) {
+        use kr_protocol::root::{CwdRevision, PromptGeneration, RootCommandBlockParams};
+        use kr_worker::fence::{CommandHook, Effects, Step};
+
+        let block = RootCommandBlockParams {
+            session_id: worker.session_id,
+            prompt_generation: PromptGeneration::new(generation),
+            command: command.to_owned(),
+            started_at_ms: TimestampMs::new(1),
+            duration_ms: Nullable::some(DurationMs::new(1)),
+            exit_status: Nullable::some(U64::new(status)),
+            cwd: "/tmp".to_owned(),
+            cwd_revision: CwdRevision::new(0),
+        };
+        let _ = worker
+            .service
+            .runtime()
+            .session()
+            .apply_fence_effects(Effects {
+                steps: vec![Step::CommandHook(
+                    RequestId::new(1),
+                    Box::new(CommandHook::Block(Box::new(block))),
+                )],
+                ..Effects::default()
+            });
+    }
+
+    /// KR-REQ-14.35, KR-REQ-25.04 and KR-REQ-18.01: a turn that ends in a session is review work at
+    /// a version of its own, one item the owner is served, and one change since the last visit,
+    /// all read from the worker's journal by the daemon and with nothing handed to the store. The
+    /// turn is an agent's, run through the gateway by a stand-in for the application.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_turn_that_ends_is_review_work_an_item_and_a_change_since_the_visit() {
+        let worker = lasting_worker().await;
+        let gateway = Gateway::over(&worker.service, worker.session_id);
+        let (host, mut control, _reach) = daemon_over(&worker).await;
+        assert!(
+            owner_reviews(&mut control, worker.session_id)
+                .await
+                .is_empty(),
+            "nothing has ended, so nothing is waiting for review"
+        );
+
+        let mut terminal = gateway.run_a_turn("first");
+        terminal.prints("TUI: turn/completed").await;
+        let subject = the_turn(&worker);
+        let state = review_when(&mut control, &subject, |_| true).await;
+        assert_eq!(state.current_version, U64::new(newest_event(&worker)));
+        assert!(state.outstanding, "nobody has reviewed it");
+
+        let items = owner_inbox(&mut control).await;
+        let ready = of_rule(&items, AttentionRule::ReviewReady);
+        assert_eq!(ready.len(), 1, "one item for the turn: {items:?}");
+        assert_eq!(ready[0].session_id.0, Some(worker.session_id));
+        assert!(
+            ready[0].summary.0.is_some(),
+            "the owner is served what the worker says of it"
+        );
+
+        let changed = owner_changes(&mut control, worker.session_id).await;
+        let turns: Vec<_> = changed
+            .changes
+            .iter()
+            .filter(|change| change.kind == SemanticChangeKind::TurnCompleted)
+            .collect();
+        assert_eq!(turns.len(), 1, "one change since the visit: {changed:?}");
+        let words = turns[0]
+            .summary
+            .0
+            .as_deref()
+            .expect("the owner may be served it");
+        assert!(
+            !words.contains('\n'),
+            "the words hold no line of identifiers: {words:?}"
+        );
+
+        terminal.ends().await;
+        gateway.finish().await;
+        host.stop().await;
+    }
+
+    /// KR-REQ-14.35: a review acknowledgement binds the version it was made against, and a turn
+    /// that ends again after the worker was started again is a later version of the same subject:
+    /// the stand-in names its turn the same way each time, so what makes the second one new work
+    /// is the version, which the worker takes from its journal and not from what it counted since
+    /// it started.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_turn_that_ends_again_after_the_worker_restarted_reopens_the_review() {
+        let first = lasting_worker().await;
+        let gateway = Gateway::over(&first.service, first.session_id);
+        let (host, mut control, reach) = daemon_over(&first).await;
+        let mut terminal = gateway.run_a_turn("first");
+        terminal.prints("TUI: turn/completed").await;
+        terminal.ends().await;
+        gateway.finish().await;
+        let subject = the_turn(&first);
+        let before = review_when(&mut control, &subject, |_| true).await;
+        let _: ReviewAcknowledgeResult = owner_mutation(
+            &mut control,
+            &host,
+            Method::ReviewAcknowledge,
+            &ReviewAcknowledgeParams {
+                session_id: first.session_id,
+                subject: subject.clone(),
+                version: before.current_version,
+            },
+        )
+        .await;
+        let acknowledged = review_when(&mut control, &subject, |state| !state.outstanding).await;
+        assert_eq!(
+            acknowledged.acknowledged_version,
+            Nullable::some(before.current_version)
+        );
+
+        // The worker is started again over the journal, and the daemon reaches it there.
+        let second = first.restarted().await;
+        reach.add(&second);
+        host.controller()
+            .attention()
+            .watch(Arc::clone(&reach) as Arc<dyn Reach>, second.known.clone());
+        let again = Gateway::over(&second.service, second.session_id);
+        let mut terminal = again.run_a_turn("second");
+        terminal.prints("TUI: turn/completed").await;
+        let reopened = review_when(&mut control, &subject, |state| {
+            state.current_version > before.current_version
+        })
+        .await;
+        assert!(reopened.outstanding, "a later version is new review work");
+        assert_eq!(
+            reopened.acknowledged_version,
+            Nullable::some(before.current_version),
+            "and what was acknowledged is still the earlier version"
+        );
+
+        terminal.ends().await;
+        again.finish().await;
+        host.stop().await;
+    }
+
+    /// KR-REQ-18.01: a command that finishes with a status other than nought raises
+    /// `attention.command_failed`, one that finishes well raises nothing, and a command is told
+    /// from another by the record of its ending and not by its words: the same line failing twice
+    /// is two items, and while privacy mode is on the item is raised and says nothing of the
+    /// command, nor does any record written before it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_command_that_fails_is_an_item_of_its_own_whatever_it_says() {
+        let worker = lasting_worker().await;
+        let (host, mut control, _reach) = daemon_over(&worker).await;
+        let failed = |items: &[AttentionItem]| of_rule(items, AttentionRule::CommandFailed);
+
+        report(&worker, 1, "make", 1);
+        let deadline = Instant::now() + PATIENCE;
+        let first = loop {
+            let items = failed(&owner_inbox(&mut control).await);
+            if !items.is_empty() {
+                break items;
+            }
+            assert!(Instant::now() < deadline, "the failure was not raised");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(first.len(), 1);
+        assert!(
+            first[0].summary.0.is_some(),
+            "the owner is served the words"
+        );
+
+        // A command that ends well, then the very same line failing again, then once more under
+        // privacy mode.
+        report(&worker, 2, "true", 0);
+        report(&worker, 3, "make", 1);
+        enable_privacy(&worker);
+        report(&worker, 4, "make", 1);
+        let deadline = Instant::now() + PATIENCE;
+        let items = loop {
+            let items = failed(&owner_inbox(&mut control).await);
+            if items.len() >= 3 {
+                break items;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the failures were not raised: {items:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(
+            items.len(),
+            3,
+            "three failures are three items, and the success is none: {items:?}"
+        );
+        assert!(
+            items.iter().all(|item| item.summary.0.is_none()),
+            "and once privacy mode has been on, none of them is served words: {items:?}"
+        );
+        host.stop().await;
+    }
+
+    /// KR-REQ-18.01 and KR-REQ-25.04: privacy mode serves the identifiers of a turn and withholds
+    /// its words, and a turn that ends after privacy mode is off is served its own while the
+    /// earlier one stays withheld.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_turn_that_ends_under_privacy_mode_is_listed_and_says_nothing() {
+        let worker = lasting_worker().await;
+        let gateway = Gateway::over(&worker.service, worker.session_id);
+        let (host, mut control, _reach) = daemon_over(&worker).await;
+        enable_privacy(&worker);
+
+        let mut terminal = gateway.run_a_turn("private");
+        terminal.prints("TUI: turn/completed").await;
+        terminal.ends().await;
+        let subject = the_turn(&worker);
+        let state = review_when(&mut control, &subject, |_| true).await;
+        assert!(
+            state.outstanding,
+            "the turn is listed whatever privacy mode says"
+        );
+        let items = owner_inbox(&mut control).await;
+        let ready = of_rule(&items, AttentionRule::ReviewReady);
+        assert_eq!(ready.len(), 1, "{items:?}");
+        assert_eq!(ready[0].summary, Nullable::null(), "and says nothing");
+
+        disable_privacy(&worker);
+        let mut terminal = gateway.run_a_turn("open");
+        terminal.prints("TUI: turn/completed").await;
+        terminal.ends().await;
+        let deadline = Instant::now() + PATIENCE;
+        let turns = loop {
+            let changed = owner_changes(&mut control, worker.session_id).await;
+            let turns: Vec<_> = changed
+                .changes
+                .into_iter()
+                .filter(|change| change.kind == SemanticChangeKind::TurnCompleted)
+                .map(|change| change.summary.0)
+                .collect();
+            if turns.len() >= 2 {
+                break turns;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the second turn was not seen: {turns:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(turns[0], None, "the earlier turn stays withheld");
+        assert!(turns[1].is_some(), "the later one is served: {turns:?}");
+
+        gateway.finish().await;
+        host.stop().await;
+    }
 }

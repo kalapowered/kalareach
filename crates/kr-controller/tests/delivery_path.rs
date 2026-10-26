@@ -13,6 +13,8 @@
 //!
 //! Everything is on the internal disk: the environment is a temporary host tree.
 
+#[cfg(unix)]
+mod gateway_support;
 mod net_support;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -1962,6 +1964,57 @@ async fn an_approval_a_worker_relays_through_its_channel_is_delivered_as_an_appr
         1,
         "the end of an approval raises nothing"
     );
+}
+
+/// KR-REQ-18.01, KR-REQ-14.35: a turn that ends in a session is told to a paired device as work
+/// complete, and the gateway is given neither the session nor the turn. The turn is an agent's, run
+/// through the gateway by a stand-in for the application, so what the daemon is told of it is what
+/// the worker recorded in its journal.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_turn_that_ends_is_delivered_as_a_work_complete_alert() {
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0x92));
+    let credential =
+        environment
+            .gateway
+            .issue(sender, phone.installation(), environment.host_signing_key());
+    phone
+        .register(&environment, &credential)
+        .await
+        .expect("the credential is registered");
+    assert!(
+        environment.gateway.delivered().is_empty(),
+        "the control: nothing has ended, so nothing is delivered"
+    );
+
+    let gateway = gateway_support::Gateway::over(
+        &environment._worker.service,
+        environment._worker.session_id,
+    );
+    let mut terminal = gateway.run_a_turn("turn");
+    terminal.prints("TUI: turn/completed").await;
+    let work_complete = || {
+        environment
+            .gateway
+            .delivered()
+            .into_iter()
+            .find(|request| request.hints.alert == PushAlert::WorkComplete)
+    };
+    until("the end of the turn being delivered", || {
+        work_complete().is_some()
+    })
+    .await;
+    let request = work_complete().expect("a delivery that tells of the end of the turn");
+    assert_eq!(request.sender_record_id, sender);
+    let wire = serde_json::to_string(&request).expect("the request");
+    for private in ["turn-1", &environment.worker_session.to_string()] {
+        assert!(!wire.contains(private), "the gateway is given {private}");
+    }
+
+    terminal.ends().await;
+    gateway.finish().await;
 }
 
 /// KR-REQ-16.17, KR-REQ-25.01: twenty-two distinct approvals relayed at once are all retained by
