@@ -492,7 +492,7 @@ def self_test():
         expect_zip(
             "a zip with an end record in a name",
             True,
-            lambda: zipped([(f"{ztop}/share/PK\x05\x06", 0o100644, b"x")]),
+            lambda: zipped(files={**good_files(), "share/PK\x05\x06": b"x"}),
         )
         deep = "/".join(["d"] * (ZIP_DEPTH + 1))
         expect_zip("a zip with a path of more parts than a host reads", True, lambda: zipped(files={**good_files(), deep: b"x"}))
