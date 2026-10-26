@@ -83,10 +83,12 @@ pub struct LaunchMailboxRequest {
     pub expected_cwd_revision: CwdRevision,
     /// How long the reader has to decide, measured from when it receives this request.
     ///
-    /// The worker sends the reader's own budget, 200 ms, which ends before the worker's 250 ms
-    /// hold does: past it, the reader installs nothing and answers `timeout`. That is what makes
-    /// "install no command" true on a timeout, rather than the worker hoping its own answer
-    /// arrives first. The worker sends it whole, whatever time the request waits in its own queue.
+    /// The worker sends the reader's own budget, 200 ms, which is shorter than the worker's 250 ms
+    /// hold: past it, the reader installs nothing and answers `timeout`. The worker sends it whole,
+    /// whatever time the request waits in its own queue, and the reader counts it from the moment
+    /// it reads the request, so a request that waited long can leave a budget that ends after the
+    /// hold. What the caller is told is the reader's answer, not the worker's timer: an acceptance
+    /// the worker has already revoked is recorded as a late installation.
     pub deadline_ms: DurationMs,
 }
 
@@ -140,7 +142,9 @@ pub enum LaunchRejectionReason {
     ///
     /// The reader's confirmation, rather than the worker's own timer, is what makes "install no
     /// command" a fact: the frames on this endpoint are ordered, so a revocation the worker sent
-    /// before the reader's atomic step is one the reader sees in that step.
+    /// before the reader's atomic step and that has reached the reader is one it sees in that step.
+    /// One still in transit is not seen, and the acceptance that results is recorded as a late
+    /// installation.
     Revoked,
     /// The bridge ended before it confirmed what it had done with the transaction.
     ///

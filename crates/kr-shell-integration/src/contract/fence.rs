@@ -1678,10 +1678,11 @@ impl FenceMachine {
             expected_prompt_generation: request.params.expected_prompt_generation,
             expected_buffer_revision: request.params.expected_buffer_revision,
             expected_cwd_revision: editor.cwd_revision,
-            // The reader's own budget, which ends before the worker's hold does. It is sent whole:
-            // the hold starts at `at`, so all of it is still ahead, and the time the request waits
-            // in the worker's own queue does not shorten it. The reader counts it from the moment
-            // it reads the request.
+            // The reader's own budget, shorter than the worker's hold. It is sent whole: the hold
+            // starts at `at`, so all of it is still ahead, and the time the request waits in the
+            // worker's own queue does not shorten it. The reader counts it from the moment it
+            // reads the request, so it can end after the hold has, and what the caller is told
+            // rests on the reader's answer rather than on either clock.
             deadline_ms: LAUNCH_READER_BUDGET,
         }));
     }
