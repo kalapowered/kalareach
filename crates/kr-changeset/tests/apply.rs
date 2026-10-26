@@ -435,8 +435,9 @@ fn a_versioned_reference_moves_to_the_named_object_while_it_holds_the_expected_v
 /// its own update from the other writer's.
 ///
 /// KR-REQ-14.04, the part about an apply checking concurrent changes: a reference another writer
-/// moved after the comparison is left as that writer set it, and the apply is refused as a
-/// conflict.
+/// moved after the comparison is left as that writer set it, and the apply is refused, as a
+/// conflict when the writer set another object and as an unknown outcome when it set the object
+/// the request names.
 #[cfg(not(windows))]
 #[test]
 fn a_reference_that_moves_after_the_comparison_stays_as_the_other_writer_set_it() {
@@ -1274,7 +1275,8 @@ fn a_direct_apply_is_refused_until_its_limitation_has_been_shown() {
 ///
 /// KR-REQ-14.28, the part about a crash between file installations: a direct apply to
 /// `shared_existing` stopped after one path is settled by recovery as an interrupted apply that
-/// names the path that landed as changed and the other as unresolved.
+/// names one path as changed and another as unresolved, and the destination holds the new
+/// `README.md` and the old `src/lib.rs`.
 #[cfg(not(windows))]
 #[test]
 fn a_crash_after_one_file_never_yields_an_atomic_success_receipt() {
