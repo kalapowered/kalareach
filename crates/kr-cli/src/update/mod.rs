@@ -2731,13 +2731,6 @@ fn collect(
     // What an earlier removal left because a program that holds nothing ran from the release. It
     // goes first, so that a release this run moves into the trash and cannot finish removing is
     // told once, as that release, and not again as something left there.
-    #[cfg(windows)]
-    if let Err(error) = store.sweep_trash(update) {
-        not_removed.push(NotRemoved {
-            what: Remains::Trash,
-            reason: said(&error),
-        });
-    }
     // Without the current release no release can be judged unneeded, so none is removed.
     let (current, releases) = match store
         .current()
@@ -2767,6 +2760,13 @@ fn collect(
                 reason: said(&error),
             }),
         }
+    }
+    #[cfg(windows)]
+    if let Err(error) = store.sweep_trash(update) {
+        not_removed.push(NotRemoved {
+            what: Remains::Trash,
+            reason: said(&error),
+        });
     }
     (removed, not_removed)
 }
@@ -2873,10 +2873,10 @@ mod collecting {
                 .expect("icacls runs");
             assert!(run.success(), "icacls {arguments:?}");
         };
-        icacls(&["/deny", "*S-1-1-0:(WA)"]);
         let directory = store.release_directory(&releases[0]);
         std::fs::create_dir_all(directory.join("bin")).expect("a directory");
         std::fs::hard_link(&shared, directory.join("bin").join("kr.exe")).expect("a hard link");
+        icacls(&["/deny", "*S-1-1-0:(WA)"]);
 
         let (removed, not_removed) = collected(&store);
 
