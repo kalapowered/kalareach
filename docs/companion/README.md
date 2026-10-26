@@ -119,7 +119,8 @@ agent at the prompt once the person has taken control of the terminal and the ho
 prompt empty; a stock shell's show the command to type and start nothing. The conversation shows
 the same surface in words and never lights a button, since the link it reads on holds no input.
 Where the host does not serve the read, the screen says that starting something is not available
-on that host. Attaching, detaching, closing, file transfer, agents and the terminal work in both. The
+on that host. The phone's session screen draws no launch surface at all. Attaching, detaching,
+closing, file transfer, agents and the terminal work in both. The
 creation sheet shows the two side by side before anything exists, and a stock shell is labelled in
 the session list, the session's header and settings, and the phone's list. A managed shell the host
 cannot qualify is refused with the host's reason; a stock shell is created only when the person
