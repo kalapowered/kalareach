@@ -2,7 +2,7 @@
 
 A managed root shell has to answer one question the rest of the host cannot answer for it: whose
 keystrokes reached the line editor. Ctrl-D at an empty root prompt detaches the client that typed
-it, a launch installs a command in the root editor and nowhere else, and neither may happen while an
+it (where the terminal has an end-of-file character), a launch installs a command in the root editor and nowhere else, and neither may happen while an
 application is reading the terminal. A prompt hook, a process-group check or an empty kernel queue
 cannot tell you any of that, so this contract is built on what the shell's own reader can prove.
 
@@ -14,7 +14,7 @@ against their own readers:
 | Zsh 5.9+ | `key_sequence_boundary_mailbox`: the published ZLE patch checks a mailbox at key-sequence boundaries, with immediate line acceptance and non-destructive cancellation | `native_hook`, in the same patch, immediately before ZLE's empty-EOF branch |
 | Bash 5.2+ | `idle_reader_mailbox`: the published patch to the bundled Readline runs a callback after buffered input is consumed | `native_hook`, immediately before Readline's own EOF decision, after the next character has been selected |
 | Fish 4.x | `reader_event_bridge` against the Rust reader | `named_reader_binding`: a named binding that receives the actual reader context |
-| PowerShell 7.4+ | `reader_thread_queue`: the qualified PSReadLine module's request queue and signal | `reader_state_handler` over PSReadLine's buffer and invocation state, under the configured gesture |
+| PowerShell 7.4+ | `reader_thread_queue`: the qualified PSReadLine module's request queue and signal | `reader_state_handler` over PSReadLine's buffer and invocation state, under the terminal's end-of-file character (a Windows console has none, so there the module reports no gesture) |
 
 The mechanisms are per package, and the handshake checks them that way: a declaration naming another
 shell's mailbox or pre-EOF mechanism describes a reader this package does not have.
@@ -418,12 +418,14 @@ Three requests, each answered on the reader's own thread:
 | --- | --- | --- | --- |
 | `fence` | `session_id`, `fence_id`, `prompt_generation`, `reader_revision`, `deadline_ms`, `cause` (`editor_entry`, `lease_change`, `retry`) | Read its key queues atomically under its own lock, and say which of the tty/typeahead, macro and partial-key queues are clear | `acknowledged` with `fence_id`, `reader_context`, `prompt_generation`, `reader_revision`, `queues`, `snapshot`, `editor`, `cwd_revision`; or `refused` with `reader_busy`, `queues_not_drained`, `reader_moved` or `cancellation_unavailable` |
 | `launch` | `session_id`, `transaction`, `fence_id`, `command`, `expected_prompt_generation`, `expected_buffer_revision`, `expected_cwd_revision`, `deadline_ms` | Check its actual state against every expectation and its own deadline, then install and submit or refuse, atomically | `accepted` with `transaction`, `fence_id`, `prompt_generation`, `buffer_revision`, `reader_revision`; or `rejected` with `transaction`, `fence_id`, `reason`, `prompt_generation`, `buffer_revision` |
-| `cancel` | `session_id`, `epoch`, `prompt_generation`, `reader_revision` | End the pending key wait and keep the edit buffer | `cancelled` (which operations ended), `buffer_preserved`, `discarded_bytes`, echoing `epoch`, `prompt_generation` and `reader_revision` |
+| `cancel` | `session_id`, `sequence`, `epoch`, `prompt_generation`, `reader_revision` | End the pending key wait and keep the edit buffer | `cancelled` (which operations ended), `buffer_preserved`, `discarded_bytes`, echoing `sequence`, `epoch`, `prompt_generation` and `reader_revision` |
 
-A report or an answer that names a reader the worker did not ask, or a cancellation it is not
-waiting on, is ignored rather than acted on. Two takeovers can happen at one prompt in one reader,
-which is why the cancellation carries the epoch it belongs to: the reader's identity alone cannot
-tell one from the next.
+A report or an answer that names a reader the worker did not ask is ignored rather than acted on,
+and so is a cancellation report whose `sequence` is not the one the worker is waiting on: the worker
+matches a cancellation report on that sequence alone. Two takeovers can happen at one prompt in one
+reader, and a departure can happen at the epoch a takeover just produced, which is why the
+cancellation carries a sequence of its own beside its epoch: neither the reader's identity nor the
+epoch tells one cancellation from the next.
 
 The takeover receipt waits on that report, and only for the hold. The lease change is acknowledged
 the moment it happens, because it stands whatever the reader says, and its acknowledgement says
@@ -457,8 +459,10 @@ the reader, in the step where it reads its mailbox:
   the reader's window and never extends it.
 - When the hold expires the worker releases the held input, because that is what the hold was for,
   and sends `launch_revoked`. The frames on this endpoint are ordered, so a revocation the worker
-  sent before the reader's atomic step is one that step sees, and the reader then installs nothing
-  and answers `revoked`.
+  sent before the reader's atomic step and received by it is one that step sees, and the reader then
+  installs nothing and answers `revoked`. The reader sees what it has received: a revocation still in
+  transit when the step runs is not seen, and the acceptance that results is the late installation
+  described below.
 - The caller's answer waits for the reader's word, not for the worker's timer. A rejection carries
   its own reason's code, which is `EDITOR_BUSY` for `revoked` and for every transition failure, and
   `DRAFT_CONFLICT` where the editor's own state had moved. It is then a fact rather than a guess.
@@ -527,9 +531,10 @@ unqualified.
 Readline and ZLE recognise an empty-line end of file before an ordinary binding runs, so the decision
 belongs to a native hook immediately before that branch, after the next character has been selected
 from the reader's input sources. An ordinary key-binding wrapper is downstream of the decision it
-claims to make. Readline's buffering makes the point twice over: it returns pending and macro input
-without consulting the character callback, and `rl_gather_tyi` can call the callback while it fills a
-buffer, before preceding characters have changed `rl_end`.
+claims to make. Readline's buffering shows the same of a character callback alone
+(`rl_getc_function`): Readline returns pending and macro input without consulting it, and
+`rl_gather_tyi` can call it while it fills a buffer, before preceding characters have changed
+`rl_end`, so a test of `rl_end` there can classify typeahead wrongly.
 
 The hook is handed the character (`key`: a `byte` or a `chord`) and the detach condition
 (`managed_root_editor`, `reader_context`, `source`, `editor`), at the prompt generation and reader
@@ -545,6 +550,11 @@ binding, and `consume` continues the same reader call. `BridgeFenceView::decide`
 | No fence, or one from an earlier prompt or another reader revision | Consume, with at most one hint per prompt | `consume` |
 | The worker refused the detach | Consume, with at most one hint per prompt | already consumed |
 
+The three compiled bridges (Zsh, Bash and Fish) apply one more rule between the second and third
+rows: the gesture is the whole sequence that invoked the operation, so a gesture byte that ends a
+longer key sequence is the editor's own and the hook returns `native`. The PowerShell module has no
+such rule.
+
 The hint is exactly `Use kr detach --attachment <id> to detach.` The `<id>` stays literal: the hint is
 printed only when no fence can name an attachment, and an identifier guessed from the current lease
 would be the uncertain attribution the gesture was consumed to avoid. The person names one. After a
@@ -557,8 +567,12 @@ their normal closure behaviour.
 
 ### The detach condition
 
-It requires the managed root editor, the primary prompt and an empty buffer. Ten states exclude it,
-evaluated in this order:
+It requires the managed root editor, the primary prompt and an empty buffer. Ten states exclude it.
+They are evaluated in this order: the reader's context (`continuation_input`, then `read_builtin`);
+the source of the character (`macro_input` for a `macro` or `pushed_back` character, then `paste` for
+a `paste` one); the buffer (`buffer_not_empty`); and then the flags the reader holds, from
+`quoted_insertion` to `paste` in the order of the table, where `macro_input` is a macro the reader is
+consuming and `paste` is an open bracketed paste:
 
 | Exclusion | Holds when |
 | --- | --- |
@@ -587,10 +601,13 @@ handles the key normally.
 The default is Ctrl-D, read from the line discipline rather than assumed. A `VEOF` reassignment is a
 user change to the gesture: the bridge records it with the prompt it takes effect at, and the
 character typed at the current prompt is still judged by the gesture that was in force when it was
-typed. Disabled `VEOF` leaves the terminal with no gesture, so no character is one. Windows uses the
-configured PSReadLine gesture, which is a chord rather than a byte, and the worker supplies it in the
-accept. PSReadLine's Windows edit mode binds no end-of-file chord, so there the module reports the
-gesture as disabled at the first prompt, and no key detaches the session until the person binds one.
+typed. Disabled `VEOF` leaves the terminal with no gesture, so no character is one. On Windows the
+worker supplies the same default as on Unix, the terminal's end-of-file byte 4, in the accept, and the
+PSReadLine module puts its decision on Ctrl+d when its hooks go live. A Windows console has no line
+discipline to read an end-of-file character from, so at the first prompt the module reports the
+gesture as disabled, in every edit mode, and takes its decision off Ctrl+d again. From then on no key
+detaches the session there, and `kr detach --attachment <id>` is the way. The protocol also carries a
+gesture as a chord (`chord` with `keys`), which the module honours and the worker does not send.
 
 ## The fence and detach state machine
 
@@ -647,7 +664,7 @@ indefinitely.
 | Launch hold expiry | `fenced` | Revoke the transaction and release the held input in order. The caller's answer waits for the reader's confirmation |
 | The reader's confirmation after a revocation | unchanged | `revoked` is `EDITOR_BUSY`; an acceptance means the command is in the editor, so the caller is told that and the late installation is recorded |
 | The bridge ends with a confirmation outstanding | `unfenced` or `outside` | Answer `OUTCOME_UNKNOWN`: nothing left can say whether the command reached the editor |
-| An acceptance for a transaction nobody is waiting for | unchanged | Record the installation and the breach: the package installed a command after its own budget |
+| An acceptance for a transaction nobody is waiting for | unchanged | Record the installation: the editor holds a command whose transaction is over. It shows no breach by the package, because the answer may have crossed the revocation |
 | Interrupt under the current epoch | unchanged | Interrupt. It bypasses the hold and accepts only the configured native action |
 | Command accepted | unchanged | Record the origin through the fenced context, which for an installed launch is the client that asked for it |
 | The integration lost its hooks or its bridge | `unfenced` | Invalidate the fence, cancel a launch, release the hold: nothing left can answer for the reader |
@@ -716,7 +733,7 @@ private key into the pseudo-terminal. That fallback is not a value a qualified d
 ## What each reader can prove, and what it cannot
 
 The four packages answer one contract, and the mechanism table at the top of this document says
-which mechanism each of them answers it with. Two of those mechanisms are not a patched reader, so
+which mechanism each of them answers it with. Two of those mechanisms are not a native hook, so
 what they can and cannot establish is written out here rather than left to be discovered.
 
 ### fish
@@ -770,7 +787,11 @@ editor's own operations so the reader has a boundary to answer at and the states
 observable, and puts its end-of-file decision on the configured gesture in front of whatever was
 bound there. A handler the person wrote themselves is left exactly as it is, identified by what the
 editor holds rather than by the name a handler carries, and what the module installed is put back
-when it is removed, except where the person has since bound that key themselves.
+when it is removed, except where the person has since bound that key themselves. Two things hold for
+the key the gesture is on and for no other: the module binds its decision there in front of whatever
+was bound, the person's own script included, which it runs outside the detach condition, and when the
+decision comes off that key it writes back the binding it found and does not look at what the key
+holds by then.
 
 What it pins is a range rather than a release: PowerShell 7.4 or later with PSReadLine 2.3.4 up to
 3.0. The module declares the versions it found in its handshake and the worker refuses an editor
@@ -786,18 +807,23 @@ method, and that is exactly what it cannot do:
 - **The reader is reached when it steps.** The module's queue is serviced on the reader's own
   thread, after each of the editor's own operations has run: every chord the editor has a binding
   for goes through the module, which runs the editor's operation and then reads the queue. The
-  read-line entry reports the reader and reads nothing, because the editor clears its buffer when
-  its read starts. A key the person bound to a script of their own is theirs and carries no
-  boundary, and an ordinary character goes straight to the editor's own insertion, so a request
-  that arrives at a parked reader is answered at its next bound key rather than immediately. Until
-  then the reader's last idle report is what the worker has to go on.
+  read-line entry reports the reader and reads the mailbox once, before the editor's read starts,
+  and the editor clears its buffer when its read starts. The module has no check of its own that
+  holds a launch back from that one read; what keeps one from reaching it is the contract's order,
+  since a launch quotes a fence the worker publishes only after the reader has acknowledged one. A
+  key the person bound to a script of their own is theirs and carries no boundary, and an ordinary
+  character goes straight to the editor's own insertion, so a request that arrives at a parked
+  reader is answered at its next bound key rather than immediately. Until then the reader's last
+  idle report is what the worker has to go on.
 - **A launch is installed where it is decided and accepted at the next step.** The decision, the
   state check and the installation all happen on the reader's thread, inside the fence, at a point
   where the reader is between operations: a key of the person's that has been read and not yet run
-  is never one the launch goes in front of. The editor's own accept is what ends the read, and it
-  ends it when the operation the module answered from returns. Nothing is decided before the read
-  starts, because the editor clears its buffer there and a line installed then is one nobody would
-  run.
+  is never one the launch goes in front of, except the end-of-file key, whose handler reads the
+  mailbox before it decides that key, so a launch already on the endpoint is installed ahead of it.
+  The editor's own accept is what ends the read, and it ends it when the operation the module
+  answered from returns. The module asks for that accept only while the editor is reading, because
+  the editor clears its buffer when a read starts and a line installed before then is one nobody
+  would run.
 - **A cancellation ends nothing here, and says so.** Every operation that waits for another key
   runs this editor's own read loop, and nothing of the module's runs on the reader's thread while
   one is running, so a cancellation arrives after the operation it was meant for has finished or
@@ -807,7 +833,7 @@ method, and that is exactly what it cannot do:
 - **The queues are the editor's own.** The reader's key queue is read directly, under the version
   range this package was qualified against. Asking the console whether a key is available instead
   would take the lock the editor's own read is holding, and the reader would wait for itself.
-- **What the reader cannot prove, it does not claim.** The editor decodes the terminal's bytes
+- **The proof here is the editor's own key queue.** The editor decodes the terminal's bytes
   inside its own key read, where nothing of the module's runs. What the module reports is the
   editor's own key queue and the operations it is inside; a sequence the editor has begun to
   decode and not finished is in neither, so the queue proof here is as good as that queue and no
@@ -817,8 +843,9 @@ method, and that is exactly what it cannot do:
   next read starting, the editor still holds the line that has gone; the module reports the buffer
   it is about to have, which is empty, and counts no change the person did not make.
 
-Running the module on Windows, where the endpoint is a named pipe and the gesture is the configured
-chord rather than the line discipline's own character, is qualified separately.
+Running the module on Windows, where the endpoint is a named pipe and the console has no line
+discipline to name an end-of-file character, so that the module reports the gesture as disabled at its
+first prompt, is qualified separately.
 
 ## The scenarios
 
@@ -862,8 +889,9 @@ cargo run -p kr-shell-integration --bin kr-shell-fixtures -- --check
 | `eof-stale-fence`, `eof-missing-fence` | A detach the worker refuses, and a gesture the bridge consumes with one hint per prompt |
 | `eof-repeated-after-detach` | A repeated gesture that cannot adopt the next attachment's identity, and the hint a refused detach prints |
 | `eof-after-detach-succession` | No new fence until the old queues drain, and the next attachment's own fence when they do |
-| `veof-change`, `veof-disabled`, `psreadline-chord-gesture` | A reassigned gesture taking effect at the next prompt, a terminal with no gesture, and the configured Windows chord |
+| `veof-change`, `veof-disabled`, `psreadline-chord-gesture` | A reassigned gesture taking effect at the next prompt, a terminal with no gesture, and a gesture the accept names as a chord, which the contract carries and the worker does not send |
 | `acceptance-mixed-context` | A recorded origin, a mixed one and an unverifiable one, what `kr detach` resolves to in each case, and a lease change that does not move it |
+| `acceptance-read-builtin` | Input a running command reads through the line editor: it is accepted like a line and is not one, so the record stays with the line that started the command and an unqualified `kr detach` still belongs to the terminal that line was typed in |
 | `editor-leave-boundaries` | The five reader boundaries a leave is reported at, and a stale leave that is ignored |
 | `retry-at-entry-and-leave` | A retry at the reader's next entry, and a leave that releases what was held |
 | `interrupt-bypasses-the-hold` | An interrupt that is not held, and the two ways it is refused |
