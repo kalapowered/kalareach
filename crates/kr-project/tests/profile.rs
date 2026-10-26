@@ -5,8 +5,6 @@
 //! the things that would trigger them: a status, a review refresh, a clone and an adoption. A
 //! sentinel file means a helper ran, and no sentinel may exist.
 //!
-//! KR-ACC-030, KR-REQ-14.23 and KR-REQ-14.24.
-//!
 //! Every test here asks the project service to run Git. On Windows it runs none: an application
 //! container cannot keep a repository from being executed from and cannot bound which ports a
 //! remote operation reaches, so the service refuses there rather than claiming a boundary it does
@@ -32,6 +30,10 @@ use support::{
 
 /// KR-REQ-19.05: a repository's own configuration is untrusted data: every helper it plants is
 /// neutralised, and none runs while the host reads the repository's status or refreshes a review.
+///
+/// KR-REQ-14.24, KR-REQ-14.23 and KR-ACC-030, the part about status and review refresh: with a
+/// filter, a textconv driver, an external diff and an fsmonitor planted and changes for them to run
+/// on, the status and the diff of the working tree leave no sentinel.
 #[test]
 fn no_planted_helper_runs_during_a_status_or_a_review_refresh() {
     let fixture = Fixture::create();
@@ -97,6 +99,10 @@ fn no_planted_helper_runs_during_a_status_or_a_review_refresh() {
 
 /// KR-REQ-19.05: cloning or adopting a repository runs nothing its content planted, and a clone
 /// copies none of its hooks.
+///
+/// KR-REQ-14.23 and KR-ACC-030, the part about clone and adoption: a local clone and an adoption of
+/// the planted repository leave no sentinel, and the clone holds no hook out of the planted
+/// template.
 #[test]
 fn no_planted_helper_runs_during_a_clone_of_the_planted_repository_or_an_adoption_of_it() {
     let fixture = Fixture::with_brokers(installed_broker());
@@ -167,6 +173,10 @@ fn no_planted_helper_runs_during_a_clone_of_the_planted_repository_or_an_adoptio
 
 /// KR-REQ-19.05: a repository whose configuration names a helper this host cannot neutralise is
 /// refused as untrusted rather than taken into the registry, and nothing runs before the refusal.
+///
+/// KR-ACC-030 and KR-REQ-14.23, the part about a helper the profile cannot neutralise: a remote
+/// helper and an `insteadOf` rewrite are exposed as limitations, adoption is refused as untrusted
+/// and names them, and no sentinel appears before the refusal.
 #[test]
 fn a_repository_whose_configuration_names_a_remote_helper_is_refused_rather_than_adopted() {
     let fixture = Fixture::create();
@@ -224,6 +234,9 @@ fn a_repository_whose_configuration_names_a_remote_helper_is_refused_rather_than
     );
 }
 
+/// KR-REQ-14.23, the part about the fixture's neutralised keys: every key the fixture plants is
+/// exposed as a limitation of the repository, and the filter, diff and merge drivers its attributes
+/// name are stated by name.
 #[test]
 fn every_neutralised_key_the_fixture_names_is_exposed_as_a_limitation() {
     // Section 14 says that where faithful interpretation requires an ungranted helper, the host
@@ -563,6 +576,8 @@ fn no_configuration_outside_the_repository_reaches_a_git_invocation() {
     }
 }
 
+/// KR-REQ-14.23, the part about the audit: reading a planted repository's own configuration through
+/// the profile finds its filter driver by name and blanks its fsmonitor, and no sentinel appears.
 #[test]
 fn the_audit_reads_the_repositorys_own_configuration_through_the_profile() {
     // The classifier is unit-tested against recorded listings; this proves it reads a real
@@ -633,6 +648,9 @@ fn a_git_invocation_that_runs_too_long_is_stopped_and_says_so() {
     );
 }
 
+/// KR-REQ-14.23, the part about the fixture document: every key it neutralises has a rule in this
+/// host's table or a driver section, and every key it refuses is refused by that table and not
+/// blanked.
 #[test]
 fn the_fixture_document_and_the_hosts_own_table_name_the_same_keys() {
     // The fixture is the list a person reads and the table is the list the code applies. A key in
@@ -684,6 +702,9 @@ fn the_fixture_document_and_the_hosts_own_table_name_the_same_keys() {
     }
 }
 
+/// KR-REQ-14.24, KR-REQ-14.23 and KR-ACC-030, the part about a driver the audit cannot see: a
+/// filter defined in a submodule's own configuration is invisible to the parent's audit, and the
+/// status that counts the submodule from the index leaves no sentinel.
 #[test]
 fn a_submodules_own_filter_never_runs_because_this_host_never_enters_one() {
     // A submodule's configuration lives in the parent's modules directory, which the parent's own
@@ -757,6 +778,9 @@ fn a_submodules_own_filter_never_runs_because_this_host_never_enters_one() {
     );
 }
 
+/// KR-REQ-14.24, KR-REQ-14.23 and KR-ACC-030, the part about spellings of a driver's name: a
+/// filter whose name differs in case, and one whose name holds an equals sign, are each found by the
+/// audit and neither runs during a status.
 #[test]
 fn a_driver_named_in_a_spelling_an_override_could_miss_still_never_runs() {
     // A configuration subsection is case-sensitive, and a command-line `-c` splits its argument at
@@ -800,6 +824,9 @@ fn a_driver_named_in_a_spelling_an_override_could_miss_still_never_runs() {
     }
 }
 
+/// KR-REQ-14.23 and KR-ACC-030, the part about a driver the profile cannot override: a repository
+/// whose configuration holds a driver name this host cannot carry in an override is refused as
+/// untrusted, and the refusal says the key cannot be expressed.
 #[cfg(unix)]
 #[test]
 fn a_configuration_key_this_host_cannot_express_stops_it_reading_the_repository_at_all() {
@@ -959,6 +986,9 @@ fn a_configuration_key_that_carries_a_credential_is_not_repeated_in_a_diagnostic
     }
 }
 
+/// KR-REQ-14.23, the part about the options that would restore what the profile disables: a
+/// template (`--t`, `--templ`) and a configuration override (`--conf`) named by an abbreviation
+/// Git accepts are each refused as an invalid argument, as the spelled-out forms are.
 #[test]
 fn the_shortest_abbreviation_of_a_forbidden_option_is_refused() {
     // Git accepts an unambiguous abbreviation of a long option, so a check that only looks at the
@@ -1350,6 +1380,9 @@ fn a_planted_marker_records_under_the_environment_git_gives_it() {
     );
 }
 
+/// KR-REQ-14.27, the part about the expected-old-value update: a reference holding another value
+/// does not move, a deletion or a creation written as an update is refused before Git runs, the
+/// expected old value moves it in one step, and the working tree is not written.
 #[test]
 fn reference_update_with_expected_old_value_performs_compare_and_swap_bounded_to_git_dir() {
     let fixture = Fixture::create();
