@@ -574,9 +574,9 @@
         "version": 1,
         "migrates_from": 1
       },
-      "digest": "06afc78e53fa4e2a3e19497e9dc1fbf4eef347d2f4d23632d376aeffeb17758b",
+      "digest": "8fea1a9a11c06250449b5723677b07db74cd07f59ed00102bd357638f94d7ba9",
       "kept": [
-        "Record (crates/kr-controller/src/grants/restored.rs)",
+        "Record, Owed, Target (crates/kr-controller/src/grants/restored.rs)",
         "StoredPolicy, StoredEnrolment, StoredBinding, StoredLeaseRecord (crates/kr-controller/src/grants/durable.rs)"
       ]
     },

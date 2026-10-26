@@ -23,6 +23,15 @@
 //! to the file's presence alone; it says whether the row changed since the restore was found, and
 //! the file is rewritten to name the row held.
 //!
+//! The file also holds what the wait owes: the devices and grants that the requests its authority
+//! feed holds name and that the host has not carried out or dismissed on evidence. A confirmation
+//! is refused while one of them is live in the registry, so a device an owner revoked through the
+//! feed after the copy is not served again by the lift, whatever became of the scan that was to
+//! carry the request out: the list outlives a stop, a feed that removed the host and a start that
+//! reads no feed. It names the identifiers a request states, with a digest of the feed's origin,
+//! and is checked against the registry's own record of what is live when it is used. It holds at
+//! most [`MOST_OWED`] entries, and a list of exactly that length reads as full.
+//!
 //! An earlier release does not name this store, so it neither reads nor writes the file, and a host
 //! that goes back to it serves the restored row to remote devices as that release always did. The
 //! file stays, and the release that knows it waits again on the next start.
@@ -31,12 +40,14 @@
 //! replaces it. A host that is stopped between its first finding and the write, and starts with
 //! its feed unreachable, finds nothing to wait for.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use super::durable::StoredPolicy;
 use crate::error::{ControllerError, Result};
+use kr_protocol::ids::{DeviceId, GrantId};
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs};
 
 /// The name this store has in a release's list of the stores it reads.
@@ -47,8 +58,12 @@ pub const STORE_NAME: &str = "restored-policy";
 /// would write back without.
 pub const RECORD_VERSION: u32 = 1;
 
-/// The largest file this host will read, in bytes.
-const MAX_RECORD_LEN: u64 = 4 * 1024;
+/// The largest file this host will read, in bytes: room for a full list of owed entries.
+const MAX_RECORD_LEN: u64 = 64 * 1024;
+
+/// The most entries the list of what is owed holds. About 74 bytes each, so a full list is about
+/// 38 KB, inside the file limit and the reader's collection limit.
+pub const MOST_OWED: usize = 512;
 
 /// What the file holds.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,17 +75,114 @@ pub struct Record {
     pub subject: Digest256,
     /// When the host first found the restore, in UTC milliseconds.
     pub found_at_ms: TimestampMs,
+    /// What the requests the authority feed holds name and the host has not settled: sorted, with
+    /// no entry twice, and at most [`MOST_OWED`] long. A confirmation is refused while a target in
+    /// it is live in the registry.
+    pub owed: Vec<Owed>,
 }
 
 impl Record {
-    /// A record of this format.
+    /// A record of this format that owes nothing.
     #[must_use]
     pub const fn of(subject: Digest256, found_at_ms: TimestampMs) -> Self {
         Self {
             version: RECORD_VERSION,
             subject,
             found_at_ms,
+            owed: Vec::new(),
         }
+    }
+}
+
+/// A device or a grant that a request the feed holds names, as the request states it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Target {
+    /// A device, by its identifier.
+    Device(DeviceId),
+    /// A grant, by its identifier. A pairing grant is revoked by revoking the device that holds
+    /// it, so it is live while that device is.
+    Grant(GrantId),
+}
+
+/// One entry of what a restored policy's wait owes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Owed {
+    /// The digest of the feed's origin that holds the request that names the target
+    /// ([`origin_digest`]): a feed the person points the host at does not clear what an earlier
+    /// one owed.
+    pub origin: Digest256,
+    /// What the request names.
+    pub target: Target,
+}
+
+/// The digest that names a feed's origin in the list.
+#[must_use]
+pub fn origin_digest(origin: &str) -> Digest256 {
+    Digest256::from_bytes(kr_cbor::sha256(origin.as_bytes()))
+}
+
+/// A change to the list: what a page of the feed names, in the order of the lowest feed sequence
+/// that names it, and what a scan that settled the requests naming them clears.
+#[derive(Clone, Copy, Debug)]
+pub struct Change<'a> {
+    /// The origin the change is for. It adds and clears only entries of this origin.
+    pub origin: Digest256,
+    /// Targets to add, lowest feed sequence first.
+    pub add: &'a [Target],
+    /// Targets of this origin to take out: each was named only by requests this scan settled on
+    /// evidence.
+    pub clear: &'a [Target],
+}
+
+/// The list after a change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Merged {
+    /// The new list, sorted.
+    pub owed: Vec<Owed>,
+    /// Whether the cap kept an entry out.
+    pub full: bool,
+}
+
+/// The list `held` becomes under `change`.
+///
+/// An entry leaves it when `change` clears it, or when its target is no longer live, and never
+/// because no request names it now: a request the feed dropped after its retention left its entry
+/// where it was. A target not live is not added, and one that cannot be shown not to be live is.
+/// The entries held stay, new ones are added in order until `most` entries are held, and the rest
+/// are left out and `full` is set.
+#[must_use]
+pub fn merged(
+    held: &[Owed],
+    change: &Change<'_>,
+    most: usize,
+    live: impl Fn(&Target) -> bool,
+) -> Merged {
+    let mut owed: BTreeSet<Owed> = held
+        .iter()
+        .filter(|entry| {
+            !(entry.origin == change.origin && change.clear.contains(&entry.target))
+                && live(&entry.target)
+        })
+        .copied()
+        .collect();
+    let mut full = false;
+    for target in change.add {
+        let entry = Owed {
+            origin: change.origin,
+            target: *target,
+        };
+        if owed.contains(&entry) || !live(target) {
+            continue;
+        }
+        if owed.len() >= most {
+            full = true;
+            continue;
+        }
+        owed.insert(entry);
+    }
+    Merged {
+        owed: owed.into_iter().collect(),
+        full,
     }
 }
 
@@ -133,6 +245,12 @@ pub fn read(file: &Path) -> Found {
             "it is of format {}, and this build reads format {RECORD_VERSION}",
             record.version
         ));
+    }
+    if record.owed.len() > MOST_OWED || !record.owed.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Found::Unreadable(
+            "the list of what is owed is longer than it can be, or not sorted, or names an entry              twice"
+                .to_owned(),
+        );
     }
     Found::Record(record)
 }
@@ -203,16 +321,20 @@ fn flush_after_removal(file: &Path) -> Result<()> {
     })
 }
 
-/// The record this daemon knows to be on disk, and where.
+/// The record this daemon holds, whether it is proven durable, and where it is.
 ///
 /// A record counts as durable only when a write of it returned success in this run, or a start read
 /// it from disk and then flushed the directory it is in. A write that failed after the rename
 /// leaves a file with the right bytes that a crash can still lose, so a matching file proves
-/// nothing: the next call writes again.
+/// nothing: the next call writes again. What the daemon holds of the record (`known`, the list
+/// included) is kept apart from that: a flush that failed at a start leaves the record unproven,
+/// and the next write still carries the list it read, not an empty one.
 #[derive(Debug)]
 pub struct Kept {
     file: PathBuf,
-    durable: Option<Record>,
+    known: Option<Record>,
+    durable: bool,
+    most: usize,
 }
 
 impl Kept {
@@ -221,7 +343,9 @@ impl Kept {
     pub const fn new(file: PathBuf) -> Self {
         Self {
             file,
-            durable: None,
+            known: None,
+            durable: false,
+            most: MOST_OWED,
         }
     }
 
@@ -231,25 +355,44 @@ impl Kept {
         &self.file
     }
 
+    /// Lowers the most the list holds, for a suite that fills it.
+    #[cfg(any(test, feature = "testing"))]
+    pub const fn limit_the_list_to(&mut self, most: usize) {
+        self.most = most;
+    }
+
     /// Takes a record a start read from disk as durable once the directory it is in is flushed.
     ///
     /// An earlier run can have stopped after the rename that gave the file its name, when the
     /// flush that makes the name survive a crash failed. The file reads the same, so the flush is
     /// made here. A flush that fails leaves the record unproven, and the next call to
-    /// [`Self::ensure`] writes it again.
+    /// [`Self::ensure`] writes it again; the record, its list included, is held all the same.
     pub fn adopt(&mut self, record: Record) {
-        self.durable = flush_beside(&self.file).is_ok().then_some(record);
+        self.durable = flush_beside(&self.file).is_ok();
+        self.known = Some(record);
     }
 
     /// The record known to be durable.
     #[must_use]
     pub const fn record(&self) -> Option<&Record> {
-        self.durable.as_ref()
+        if self.durable {
+            self.known.as_ref()
+        } else {
+            None
+        }
+    }
+
+    /// The record the daemon holds, durable or not: what a start read, or what it last wrote. None
+    /// when the file could not be read, or none was written.
+    #[must_use]
+    pub const fn known(&self) -> Option<&Record> {
+        self.known.as_ref()
     }
 
     /// Makes sure a record naming `subject` is durable, and writes one if it is not. The moment
     /// the restore was first found stays as it was while the daemon holds a record as durable; a
-    /// record it cannot prove durable is written again with the moment of that write.
+    /// record it cannot prove durable is written again with the moment of that write. The list the
+    /// daemon holds is written with it.
     ///
     /// # Errors
     ///
@@ -264,21 +407,74 @@ impl Kept {
         now_ms: u64,
         publish: impl FnOnce(&Path, &[u8]) -> Result<()>,
     ) -> Result<()> {
-        if self
-            .durable
-            .as_ref()
-            .is_some_and(|durable| durable.subject == subject)
+        if self.durable
+            && self
+                .known
+                .as_ref()
+                .is_some_and(|known| known.subject == subject)
         {
             return Ok(());
         }
-        let found_at_ms = self
-            .durable
+        let owed = self
+            .known
             .as_ref()
-            .map_or_else(|| TimestampMs::new(now_ms), |durable| durable.found_at_ms);
-        let record = Record::of(subject, found_at_ms);
+            .map(|known| known.owed.clone())
+            .unwrap_or_default();
+        let found_at_ms = self
+            .known
+            .as_ref()
+            .filter(|_| self.durable)
+            .map_or_else(|| TimestampMs::new(now_ms), |known| known.found_at_ms);
+        let record = Record {
+            version: RECORD_VERSION,
+            subject,
+            found_at_ms,
+            owed,
+        };
+        self.durable = false;
         publish(&self.file, &encode(&record)?)?;
-        self.durable = Some(record);
+        self.known = Some(record);
+        self.durable = true;
         Ok(())
+    }
+
+    /// Changes the list the record holds, and writes the record when the list is not the one that
+    /// stands or the record is not proven durable. Says whether the cap kept an entry out. The
+    /// record's subject and the moment it was found stay as they are.
+    ///
+    /// Does nothing when the daemon holds no record to change: a file that could not be read is
+    /// not written over.
+    ///
+    /// # Errors
+    ///
+    /// Returns the write's error. The list the daemon holds is then as it was, and the record is
+    /// not known to be durable.
+    pub fn keep(&mut self, change: &Change<'_>, live: impl Fn(&Target) -> bool) -> Result<bool> {
+        self.keep_by(change, live, publish)
+    }
+
+    fn keep_by(
+        &mut self,
+        change: &Change<'_>,
+        live: impl Fn(&Target) -> bool,
+        publish: impl FnOnce(&Path, &[u8]) -> Result<()>,
+    ) -> Result<bool> {
+        let Some(known) = self.known.as_ref() else {
+            return Ok(false);
+        };
+        let merged = merged(&known.owed, change, self.most, live);
+        if self.durable && merged.owed == known.owed {
+            return Ok(merged.full);
+        }
+        let record = Record {
+            owed: merged.owed,
+            ..known.clone()
+        };
+        self.durable = false;
+        publish(&self.file, &encode(&record)?)?;
+        self.known = Some(record);
+        self.durable = true;
+        Ok(merged.full)
     }
 
     /// Removes the file, and with it what the daemon knows of it.
@@ -291,7 +487,8 @@ impl Kept {
     /// next call, which finds the file gone, flushes the directory again before it succeeds.
     pub fn lift(&mut self) -> Result<()> {
         unlink(&self.file)?;
-        self.durable = None;
+        self.known = None;
+        self.durable = false;
         flush_after_removal(&self.file)
     }
 }
@@ -488,6 +685,7 @@ mod tests {
             version: RECORD_VERSION + 1,
             subject: Digest256::from_bytes([2; 32]),
             found_at_ms: TimestampMs::new(1),
+            owed: Vec::new(),
         };
         std::fs::write(&file, kr_cbor::to_canonical_vec(&other).expect("encodes"))
             .expect("written");
@@ -659,5 +857,277 @@ mod tests {
             remove(&file).is_ok(),
             "and so does a removal of a file that is not there"
         );
+    }
+
+    fn device(byte: u8) -> Target {
+        Target::Device(DeviceId::new(kr_protocol::scalars::Uuid::from_bytes(
+            [byte; 16],
+        )))
+    }
+
+    fn grant(byte: u8) -> Target {
+        Target::Grant(GrantId::new(kr_protocol::scalars::Uuid::from_bytes(
+            [byte; 16],
+        )))
+    }
+
+    fn entry(origin: u8, target: Target) -> Owed {
+        Owed {
+            origin: Digest256::from_bytes([origin; 32]),
+            target,
+        }
+    }
+
+    fn with_a_list(owed: Vec<Owed>) -> Record {
+        Record {
+            owed,
+            ..Record::of(subject_of(&row()), TimestampMs::new(55))
+        }
+    }
+
+    #[test]
+    fn a_record_with_a_list_is_written_and_read_back() {
+        let (_directory, file) = tree();
+        let record = with_a_list(vec![
+            entry(1, device(2)),
+            entry(1, grant(1)),
+            entry(2, device(1)),
+        ]);
+        let mut sorted = record.owed.clone();
+        sorted.sort();
+        let record = Record {
+            owed: sorted,
+            ..record
+        };
+        write(&file, &record).expect("written");
+        assert_eq!(read(&file), Found::Record(record));
+    }
+
+    #[test]
+    fn a_list_that_is_not_sorted_or_repeats_an_entry_or_is_too_long_is_unreadable() {
+        let (_directory, file) = tree();
+        let unreadable = |what: &str, owed: Vec<Owed>| {
+            std::fs::write(
+                &file,
+                kr_cbor::to_canonical_vec(&with_a_list(owed)).expect("encodes"),
+            )
+            .expect("written");
+            match read(&file) {
+                Found::Unreadable(_) => {}
+                other => panic!("{what}: {other:?}"),
+            }
+        };
+        unreadable("not sorted", vec![entry(1, device(3)), entry(1, device(2))]);
+        unreadable(
+            "an entry twice",
+            vec![entry(1, device(2)), entry(1, device(2))],
+        );
+        // A list over the cap, sorted and without repeats: made long with distinct origins.
+        let mut distinct: Vec<Owed> = (0..=MOST_OWED)
+            .map(|index| Owed {
+                origin: Digest256::from_bytes({
+                    let mut bytes = [0u8; 32];
+                    bytes[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                    bytes
+                }),
+                target: device(1),
+            })
+            .collect();
+        distinct.sort();
+        unreadable("longer than the cap", distinct);
+    }
+
+    #[test]
+    fn a_list_at_the_cap_is_written_and_read_and_fits_the_file_limit() {
+        let (_directory, file) = tree();
+        let mut full: Vec<Owed> = (0..MOST_OWED)
+            .map(|index| Owed {
+                origin: Digest256::from_bytes({
+                    let mut bytes = [0u8; 32];
+                    bytes[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                    bytes
+                }),
+                target: grant(7),
+            })
+            .collect();
+        full.sort();
+        let record = with_a_list(full);
+        write(&file, &record).expect("written");
+        assert_eq!(read(&file), Found::Record(record));
+        assert!(
+            std::fs::metadata(&file).expect("a file").len() < MAX_RECORD_LEN,
+            "a full list is inside the file limit"
+        );
+    }
+
+    #[test]
+    fn a_change_adds_in_order_clears_only_its_origin_and_keeps_what_is_not_named_now() {
+        let alive = |_: &Target| true;
+        let held = vec![
+            entry(1, device(1)),
+            entry(1, device(2)),
+            entry(2, device(2)),
+        ];
+        let origin = Digest256::from_bytes([1; 32]);
+        let merged = merged(
+            &held,
+            &Change {
+                origin,
+                add: &[device(9), grant(3), device(1)],
+                clear: &[device(2)],
+            },
+            MOST_OWED,
+            alive,
+        );
+        assert_eq!(
+            merged.owed,
+            vec![
+                entry(1, device(1)),
+                entry(1, device(9)),
+                entry(1, grant(3)),
+                entry(2, device(2)),
+            ],
+            "an entry of another origin stays, one of this origin that was cleared goes, and what no \
+             request names now stays too"
+        );
+        assert!(!merged.full);
+    }
+
+    #[test]
+    fn an_entry_that_is_not_live_leaves_the_list_and_is_not_added() {
+        let held = vec![entry(1, device(1)), entry(2, device(2))];
+        let origin = Digest256::from_bytes([1; 32]);
+        let merged = merged(
+            &held,
+            &Change {
+                origin,
+                add: &[device(3), device(4)],
+                clear: &[],
+            },
+            MOST_OWED,
+            |target| *target != device(2) && *target != device(3),
+        );
+        assert_eq!(merged.owed, vec![entry(1, device(1)), entry(1, device(4))]);
+    }
+
+    #[test]
+    fn the_cap_keeps_what_is_held_adds_in_order_and_says_it_is_full() {
+        let origin = Digest256::from_bytes([1; 32]);
+        let held = vec![entry(1, device(1))];
+        let merged = merged(
+            &held,
+            &Change {
+                origin,
+                add: &[device(5), device(4), device(3)],
+                clear: &[],
+            },
+            3,
+            |_| true,
+        );
+        assert_eq!(
+            merged.owed,
+            vec![
+                entry(1, device(1)),
+                entry(1, device(4)),
+                entry(1, device(5))
+            ],
+            "the held entry and the first two added, in the order they were given"
+        );
+        assert!(merged.full);
+    }
+
+    /// A start that read the record and could not flush the directory holds it unproven, and the
+    /// next write carries the list it read and not an empty one.
+    #[test]
+    fn a_flush_that_failed_at_a_start_does_not_cost_the_list() {
+        let (_directory, file) = tree();
+        let subject = subject_of(&row());
+        let record = Record {
+            owed: vec![entry(1, device(1))],
+            ..Record::of(subject, TimestampMs::new(55))
+        };
+        write(&file, &record).expect("written");
+        let directory = file.parent().expect("a directory").to_path_buf();
+        let refused = kr_flush::testing::refuse_flushes_of(directory);
+        let mut started = Kept::new(file.clone());
+        started.adopt(record.clone());
+        assert!(started.record().is_none(), "not proven durable");
+        assert_eq!(started.known(), Some(&record), "but held, list and all");
+        drop(refused);
+        started.ensure(subject, 200).expect("written again");
+        assert_eq!(
+            read(&file),
+            Found::Record(Record {
+                found_at_ms: TimestampMs::new(200),
+                ..record
+            }),
+            "the list read is the list written, with the moment of the write that held"
+        );
+    }
+
+    /// A write of the list that fails after the rename leaves the list the daemon holds as it was
+    /// and the record not known to be durable; the next write that holds succeeds.
+    #[test]
+    fn a_list_write_that_failed_after_the_rename_leaves_the_list_as_it_was() {
+        let (_directory, file) = tree();
+        let subject = subject_of(&row());
+        let mut kept = Kept::new(file.clone());
+        kept.ensure(subject, 100).expect("written");
+        let origin = Digest256::from_bytes([1; 32]);
+        let change = Change {
+            origin,
+            add: &[device(1)],
+            clear: &[],
+        };
+        let failed = kept.keep_by(
+            &change,
+            |_| true,
+            |file, bytes| {
+                publish(file, bytes).expect("the file is in place");
+                Err(ControllerError::registry(
+                    "the directory could not be flushed",
+                ))
+            },
+        );
+        assert!(failed.is_err());
+        assert!(kept.record().is_none(), "not known to be durable");
+        assert_eq!(
+            kept.known().map(|known| known.owed.clone()),
+            Some(Vec::new()),
+            "the list the daemon holds is as it was"
+        );
+        kept.keep(&change, |_| true).expect("written again");
+        assert_eq!(
+            kept.record().map(|known| known.owed.clone()),
+            Some(vec![entry(1, device(1))])
+        );
+        kept.keep_by(
+            &change,
+            |_| true,
+            |_, _| panic!("a list that stands on a durable record is not written again"),
+        )
+        .expect("nothing to do");
+    }
+
+    /// A file that could not be read is not written over: a daemon that holds no record changes
+    /// nothing.
+    #[test]
+    fn a_record_that_could_not_be_read_is_not_written_over() {
+        let (_directory, file) = tree();
+        std::fs::write(&file, b"junk").expect("junk");
+        let mut kept = Kept::new(file.clone());
+        assert!(matches!(read(&file), Found::Unreadable(_)));
+        let origin = Digest256::from_bytes([1; 32]);
+        kept.keep_by(
+            &Change {
+                origin,
+                add: &[device(1)],
+                clear: &[],
+            },
+            |_| true,
+            |_, _| panic!("nothing is written over a file that could not be read"),
+        )
+        .expect("nothing to do");
+        assert_eq!(std::fs::read(&file).expect("the file"), b"junk");
     }
 }

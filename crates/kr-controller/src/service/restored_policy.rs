@@ -18,7 +18,7 @@ use crate::authority::AdmittedMutation;
 use crate::authority_feed::ComparisonOwed;
 use crate::error::{ControllerError, Result};
 use crate::grants::RemoteRefusal;
-use crate::grants::restored::{self, Found, Kept};
+use crate::grants::restored::{self, Found, Kept, Target};
 
 /// What a host that reads an authority feed owes a confirmation, said once for both remedies.
 macro_rules! feed_note {
@@ -116,6 +116,23 @@ fn the_refusal_while_the_feed_is_owed(owed: &ComparisonOwed) -> String {
             )
         }
     }
+}
+
+/// What a write to the list of what a restored policy's wait owes came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwedWrite {
+    /// The list stands as the change makes it, written or already so. `full` says that the cap
+    /// kept an entry out.
+    Kept {
+        /// Whether the cap kept an entry out.
+        full: bool,
+    },
+    /// No wait stands: nothing is written, so a scan that ends after a confirmation cannot bring
+    /// the wait back at the next start.
+    NotWaiting,
+    /// The record could not be read at the start and is not written over: what the run owes stays
+    /// in memory, where a confirmation reads it.
+    NoRecord,
 }
 
 impl Controller {
@@ -243,6 +260,83 @@ impl Controller {
             restored::subject_of(&self.policy().snapshot()),
             self.wall_now_ms(),
         )
+    }
+
+    /// Changes the list of what the wait owes: adds the targets of `origin`'s requests that `add`
+    /// names, takes out those `clear` names, and drops every entry that is no longer live, in one
+    /// write through the durable gate. The record's lock is taken here, so a write and a
+    /// confirmation wait for each other, and nothing is written once no wait stands.
+    ///
+    /// # Errors
+    ///
+    /// Returns the write's error. The list is then as it was and the caller owes the targets from
+    /// memory.
+    pub async fn keep_what_is_owed(
+        &self,
+        origin: &str,
+        add: &[Target],
+        clear: &[Target],
+    ) -> Result<OwedWrite> {
+        self.keep_the_list(origin, add, clear, || self.target_liveness())
+            .await
+    }
+
+    /// [`Self::keep_what_is_owed`] with the test of liveness made when the lock is held, so the
+    /// registry is read after the wait for the lock and not before it.
+    async fn keep_the_list<L: Fn(&Target) -> bool>(
+        &self,
+        origin: &str,
+        add: &[Target],
+        clear: &[Target],
+        liveness: impl FnOnce() -> L,
+    ) -> Result<OwedWrite> {
+        let mut kept = self.restored_policy.lock().await;
+        if !self.policy().restored_policy_waits() {
+            return Ok(OwedWrite::NotWaiting);
+        }
+        if kept.known().is_none() {
+            return Ok(OwedWrite::NoRecord);
+        }
+        let change = restored::Change {
+            origin: restored::origin_digest(origin),
+            add,
+            clear,
+        };
+        let full = kept.keep(&change, liveness())?;
+        Ok(OwedWrite::Kept { full })
+    }
+
+    /// Lowers the most the list of what is owed holds, for a suite that fills it.
+    #[cfg(feature = "testing")]
+    pub async fn limit_the_owed_list_to(&self, most: usize) {
+        self.restored_policy.lock().await.limit_the_list_to(most);
+    }
+
+    /// The test of whether a target is live, made from the registry as it stands when this is
+    /// called. A device is live while the directory holds it unrevoked; a grant, while an
+    /// unrevoked device holds it as its pairing grant or the grant store holds it unrevoked. A
+    /// registry that cannot be read shows every target live, and a target the registry does not
+    /// hold is not live now.
+    pub fn target_liveness(&self) -> impl Fn(&Target) -> bool + '_ {
+        let held = self.devices.devices();
+        move |target| {
+            let Ok(held) = &held else {
+                return true;
+            };
+            match target {
+                Target::Device(id) => held
+                    .iter()
+                    .any(|record| record.device_id == *id && record.revoked_at_ms.is_none()),
+                Target::Grant(id) => {
+                    held.iter().any(|record| {
+                        record.grant.grant_id == *id && record.revoked_at_ms.is_none()
+                    }) || match self.sharing.grants().record(*id) {
+                        Ok(record) => record.is_some_and(|record| record.revoked_at_ms.is_none()),
+                        Err(_) => true,
+                    }
+                }
+            }
+        }
     }
 
     /// `host.policy.confirm`: the person at this machine confirms the policy this host holds,
@@ -572,6 +666,136 @@ mod tests {
             "a wait stands exactly when its record does"
         );
     }
+    fn a_device(byte: u8) -> Target {
+        Target::Device(kr_protocol::ids::DeviceId::new(
+            kr_protocol::scalars::Uuid::from_bytes([byte; 16]),
+        ))
+    }
+
+    /// A list write, like a finding, takes the record's lock, and writes only while a wait stands:
+    /// a scan that ends after the confirmation cannot write a record that would make the next
+    /// start wait again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_list_write_after_a_lift_writes_nothing() {
+        use crate::service::a_floor_owed_its_record::daemon;
+
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = daemon(&temp).await;
+        let file = restored::file_beside(&controller.paths().registry_database());
+        assert_eq!(
+            controller
+                .keep_the_list("feed", &[a_device(1)], &[], || |_: &Target| true)
+                .await
+                .expect("answered"),
+            OwedWrite::NotWaiting,
+            "no wait stands, so there is nothing to write into"
+        );
+        assert_eq!(restored::read(&file), Found::Missing);
+
+        controller
+            .find_the_policy_restored()
+            .await
+            .expect("the finding is written down");
+        assert_eq!(
+            controller
+                .keep_the_list("feed", &[a_device(1)], &[], || |_: &Target| true)
+                .await
+                .expect("answered"),
+            OwedWrite::Kept { full: false }
+        );
+        let Found::Record(held) = restored::read(&file) else {
+            panic!("the record is there");
+        };
+        assert_eq!(held.owed.len(), 1);
+
+        let (_, carried) = admitted(&controller, None);
+        let confirmed: HostPolicyConfirmResult = controller
+            .confirm_the_restored_policy(carried)
+            .await
+            .expect("answered")
+            .to_typed()
+            .expect("an answer");
+        assert!(confirmed.lifted);
+        assert_eq!(
+            controller
+                .keep_the_list("feed", &[a_device(2)], &[], || |_: &Target| true)
+                .await
+                .expect("answered"),
+            OwedWrite::NotWaiting,
+            "a scan that ends after the confirmation writes nothing"
+        );
+        assert_eq!(restored::read(&file), Found::Missing);
+    }
+
+    /// A list write and a confirmation take the one lock, so a confirmation that passed its check
+    /// does not remove a record a write has just changed, and the other way round.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_list_write_and_a_confirmation_wait_for_each_other() {
+        use crate::service::a_floor_owed_its_record::daemon;
+
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = daemon(&temp).await;
+        controller
+            .find_the_policy_restored()
+            .await
+            .expect("the finding is written down");
+        let held = controller.restored_policy.lock().await;
+        let (_, carried) = admitted(&controller, None);
+        let mut confirmation = std::pin::pin!(controller.confirm_the_restored_policy(carried));
+        let named = [a_device(1)];
+        let mut writing =
+            std::pin::pin!(controller.keep_the_list("feed", &named, &[], || |_: &Target| true));
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        assert!(
+            std::future::Future::poll(confirmation.as_mut(), &mut cx).is_pending(),
+            "the confirmation waits for the lock"
+        );
+        assert!(
+            std::future::Future::poll(writing.as_mut(), &mut cx).is_pending(),
+            "the write waits for the lock"
+        );
+        drop(held);
+        let (confirmed, written) = tokio::join!(confirmation, writing);
+        confirmed.expect("the confirmation is answered");
+        let written = written.expect("the write is answered");
+        let record = restored::read(&restored::file_beside(
+            &controller.paths().registry_database(),
+        ));
+        assert_eq!(
+            controller.restored_policy_waits(),
+            matches!(record, Found::Record(_)),
+            "a wait stands exactly when its record does"
+        );
+        match (written, record) {
+            (OwedWrite::NotWaiting, Found::Missing) => {}
+            (OwedWrite::Kept { .. }, Found::Missing) => {}
+            (_, other) => panic!("the write and the confirmation left {other:?}"),
+        }
+    }
+
+    /// A registry that cannot be read shows every target live, so a list is never shortened by a
+    /// fault; a target it does not hold is not live.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_registry_that_cannot_be_read_shows_every_target_live() {
+        use crate::service::a_floor_owed_its_record::daemon;
+
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = daemon(&temp).await;
+        assert!(
+            !controller.target_liveness()(&a_device(1)),
+            "the registry holds no such device"
+        );
+        rusqlite::Connection::open(controller.paths().registry_database())
+            .expect("the registry opens")
+            .execute_batch("DROP TABLE network_devices;")
+            .expect("the table is gone");
+        assert!(
+            controller.target_liveness()(&a_device(1)),
+            "a read that fails counts the target as live"
+        );
+    }
+
     /// The confirmation is refused while the host is still catching up with its feed, since the
     /// policy it holds is not yet the one it will hold, and lifts the wait once it has.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

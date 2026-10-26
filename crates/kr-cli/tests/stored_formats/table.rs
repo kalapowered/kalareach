@@ -1188,7 +1188,10 @@ pub fn table() -> Vec<Store> {
             ),
             owned: Vec::new(),
             kept: vec![
-                Kept::Source("crates/kr-controller/src/grants/restored.rs", &["Record"]),
+                Kept::Source(
+                    "crates/kr-controller/src/grants/restored.rs",
+                    &["Record", "Owed", "Target"],
+                ),
                 Kept::Source(
                     "crates/kr-controller/src/grants/durable.rs",
                     &[
