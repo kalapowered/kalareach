@@ -1911,10 +1911,13 @@ async fn a_revision_answered_by_the_feeds_removal_refuses_the_grants_that_rest_o
 /// feed until the registry has taken a write, and the check is a warning with a remedy. Another
 /// handle on the registry holds its write lock until the case lets it go, and the wait says it goes
 /// on once it has waited out the database's busy timeout. When the write ends the wait ends, and the
-/// check no longer says it.
+/// check no longer says it. A wait whose ask for the lock the database has not answered in time
+/// names the unanswered ask instead, as a busy machine brings about with no write held, so the case
+/// reads the check until it names the write.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_doctor_says_that_a_refusal_waits_for_a_write_to_the_pairing_records() {
     const WAITS: &str = "waits for the registry to take a write";
+    const HELD: &str = "a write to the pairing records has held the registry's write lock";
 
     let rig = Rig::start().await;
     // The last pass stopped because the feed turned a request back, and the check carries the advice
@@ -1943,10 +1946,10 @@ async fn the_doctor_says_that_a_refusal_waits_for_a_write_to_the_pairing_records
             controller.raise_the_unverified_withdrawal_refusal().await;
         }
     });
-    let check = within("the check says that the refusal waits", async {
+    let check = within("the check names the write that holds the wait", async {
         loop {
             let check = rig.shown().await.check.expect("the feed check");
-            if check.detail().contains(WAITS) {
+            if check.detail().contains(HELD) {
                 break check;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1955,8 +1958,8 @@ async fn the_doctor_says_that_a_refusal_waits_for_a_write_to_the_pairing_records
     .await;
     assert_eq!(check.status, DoctorStatus::Warning, "{}", check.detail());
     assert!(
-        check.detail().contains("a write to the pairing records"),
-        "it says what the wait is for: {}",
+        check.detail().contains(WAITS),
+        "it says that the refusal waits: {}",
         check.detail()
     );
     assert!(
