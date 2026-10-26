@@ -618,6 +618,25 @@
     },
     {
       "entry": {
+        "store": "terminal-profiles",
+        "scope": "state_root",
+        "path": "terminal-profiles.json",
+        "recording": {
+          "kind": "json_member",
+          "member": "version",
+          "absent": 0
+        },
+        "version": 1,
+        "migrates_from": 0
+      },
+      "digest": "b64812c52b67b139bed9aae69dca22424c6747a0e72a192bd093ff85c5ee566f",
+      "kept": [
+        "Recorded, RecordedProfile, Wrote, FileWrote, SettingsWrote, RecordedKey, RecordedList, PreferencesWrote (crates/kr-shell-integration/src/host/terminal_profile/record.rs)",
+        "ProfileTerminal (crates/kr-shell-integration/src/host/terminal_profile/mod.rs)"
+      ]
+    },
+    {
+      "entry": {
         "store": "transfers",
         "scope": "environment",
         "path": "transfers/transfers.sqlite",
@@ -916,6 +935,14 @@
       "scope": "state_root",
       "path": ".shell-entries.json.kalareach-lock",
       "reason": "the lock `kr shell install` and `kr shell remove` hold on the record of the startup files they changed; empty",
+      "children": [],
+      "opaque": false,
+      "databases": false
+    },
+    {
+      "scope": "state_root",
+      "path": ".terminal-profiles.json.kalareach-lock",
+      "reason": "the lock `kr host terminal-profile install` and `kr host terminal-profile remove` hold on the record of the terminal profiles they wrote; empty",
       "children": [],
       "opaque": false,
       "databases": false

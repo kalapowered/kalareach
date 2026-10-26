@@ -17,6 +17,7 @@
 //! | [`quoting`] | Per-shell quoting of one word, as the startup entries write a path |
 //! | [`refusal`] | Why a startup entry was not written or taken out, in this host's own words |
 //! | [`terminal`] | The terminal application a presented session opens, in the order section 7 fixes |
+//! | [`terminal_profile`] | The optional profile that makes each new window or tab of one emulator a session, and the record of what installing it wrote |
 //! | [`command`] | Opt-in command integration, and the command blocks the private hooks report |
 
 pub mod command;
@@ -31,5 +32,6 @@ pub mod refusal;
 pub mod scripted;
 pub mod startup;
 pub mod terminal;
+pub mod terminal_profile;
 
 pub use crate::host::error::{HostError, Result};
