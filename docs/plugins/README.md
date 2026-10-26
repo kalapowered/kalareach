@@ -30,7 +30,7 @@ What holds for every package, the first-party ones included:
 
 The generation compiled into the host differs from a repository's in how it arrives and not in what its packages may do. At every start the daemon seeds the catalogue from it without any action of the owner. It enrols the official repository against a root that the build trusts by key identifiers it commits, activates the generation once with expiry waived, installs each bundled package enabled with an empty grant (so the one ordinary rule it skips is that every capability past the ceiling be granted before an install, because the seed grants nothing), and serves the bundle's payloads from its own bytes. The repository it enrols is never refused a publisher's name that the root of another repository holds, so a shipped publisher's name is the build's whichever repository was enrolled first; a build that seeds nothing holds the official repository to that rule like any other ([Enrolment comes first](catalogue.md#enrolment-comes-first)). A shipped build commits no production root key yet, so it seeds nothing; a build with debug assertions seeds only when it is started with `--seed` ([Seeding](runtime.md#seeding)).
 
-Core is not free of application names. These are the places in its product code that carry them; its tests and fixtures name applications too (`fixtures/bridges/`, which holds the hook tables and the Qoder CLI launch elements the plugins repository pins the official packages to, `fixtures/plugins/released/kalareach/`, and the Codex stand-in), and a running host reads none of that.
+Core is not free of application names. These are the places in its product code that carry them; its tests and fixtures name applications too (`fixtures/bridges/`, which holds the bridges' registration files and the Qoder CLI launch elements the plugins repository pins the official packages to, `fixtures/plugins/released/kalareach/`, and the Codex stand-in), and a running host reads none of that.
 
 | Where | Which applications | What it does |
 | --- | --- | --- |
@@ -151,7 +151,7 @@ names the installation location, by the path segments the program's directory en
 one that names only the executable, when one publisher published all the packages left through one
 repository. Two products of one publisher that share a command name are told apart this way, while
 both packages are admitted. Packages of different publishers, or of one publisher's name from
-different repositories (each has a root of its own), that recognise a program equally well are a
+different repositories, that recognise a program equally well are a
 conflict, and neither is bound.
 
 ### Command integration
