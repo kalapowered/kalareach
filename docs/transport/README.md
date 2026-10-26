@@ -232,8 +232,11 @@ The first bidirectional stream carries four frames, in this order:
    capabilities, the client's receive limits, and a fresh 256-bit client nonce.
 2. `HelloReply`: either `Selected(HostSelection)` carrying a fresh host nonce, the connection
    identity, the selected version, the selected capabilities, the negotiated limits, the host's
-   endpoint and device identity and its boot and clock epochs; or `Refused(ProtocolError)`. A major
-   mismatch is refused here with `UNSUPPORTED_SCHEMA`, before any session data.
+   endpoint and device identity and its boot and clock epochs; or `Refused(ProtocolError)`. The
+   host selects the highest version present in both lists, and supporting one minor says nothing
+   about the minors below it ([Version negotiation](../protocol/README.md#version-negotiation)). An
+   offer that shares no version with the host's list, a major mismatch being the usual case, is
+   refused here with `UNSUPPORTED_SCHEMA`, before any session data.
 3. `ConnectProof`: the client's signature over
    `CBOR(["kr-connect/1", offer, selection, client_endpoint_id, host_endpoint_id])`.
 4. `ConnectReply`: either `Accepted` with the host's proof over the same transcript and this
@@ -246,7 +249,8 @@ another request, and says nothing about what the peer decided. A selection that 
 because it does not answer the offer (a version, capability or limit outside the offer, or a nonce
 it does not echo) or because it names an endpoint other than the one that answered reaches the
 caller as `TransportError::Selection`, on the paired path and the unpaired one alike. An extension
-the offer did not carry and limits below the floor stay `TransportError::Handshake`.
+the offer did not carry and limits below the floor stay `TransportError::Handshake`. A proof that
+fails to bind or verify on the client's side reaches the caller as `TransportError::Crypto`.
 
 The host verifies the client's proof before sending its own, so a peer that cannot prove its
 authorisation key never obtains the host's signature over a transcript it chose.
@@ -275,9 +279,13 @@ limits are what the control stream enforces, in both directions.
 
 ### Unpaired connections
 
-An endpoint with no paired record is not refused. It negotiates framing and version and then reaches
-the bounded pre-authorisation pairing surface: `pair.redeem`, `pair.finish` and
-candidate-authenticated `pair.status`, and nothing else. The surface is narrow on purpose:
+An endpoint with no paired record is not refused. It exchanges only the first two frames above, the
+offer and the host's selection, with no proofs. The client checks the selection as a paired client
+does, against its offer and against the endpoint iroh authenticated. What only an invitation or a
+bundle can confirm, that this is the endpoint it names and the host's device identity, it leaves to
+its caller. It then reaches the bounded pre-authorisation pairing surface: `pair.redeem`,
+`pair.finish` and candidate-authenticated `pair.status`, and nothing else. The surface is narrow on
+purpose:
 
 * frames are bounded at 8 KiB rather than the control stream's 1 MiB;
 * a connection may make at most 16 requests, at most 4 in any 10-second window;
