@@ -122,9 +122,11 @@ stops, so a limit that a part has is written in that part's own document.
   Qoder CLI recognise those agents in a session, and the broker in each worker holds each binding,
   the evidence for what it can do, and the approvals. Typed requests to submit or queue a prompt,
   steer or cancel a turn and answer an approval act only where a binding has evidence for them, so
-  what an agent offers depends on its package and its build. Claude Code's approvals are answered
-  over its bridge channel, and the Gemini CLI and Qoder CLI packages report an agent's hooks to the
-  worker. An approval is only ever created from the agent's own protocol: [the
+  what an agent offers depends on its package and its build. The Claude Code and Gemini CLI
+  bridges are applied only where a signed index names a qualified build of the agent's executable,
+  and no index names one yet: Claude Code's approvals are then answered over its bridge channel and
+  Gemini CLI's hooks reach the worker. The Qoder CLI package reports an agent's hooks to the worker
+  with no bridge. An approval is only ever created from the agent's own protocol: [the
   broker](host/README.md#the-broker), [the bridges](bridges/claude-code/README.md) and
   [plugins](plugins/README.md).
 - **Attaching from elsewhere.** `kr attach` in an ordinary terminal, and the companion application
