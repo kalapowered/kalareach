@@ -1113,8 +1113,8 @@ The exit status is 0 when no check failed and 1 when one did. `--json` returns o
 ### Support bundles
 
 `--bundle <path>` writes an uncompressed `tar` archive holding `manifest.json`, which carries the
-software versions, the capability evidence, the diagnostics, the effective configuration and this
-host's errors, and `report.txt`, the same diagnostics as readable lines. Both are written from the
+software versions, the capability evidence, the diagnostics, the effective configuration and a list
+of this host's errors, which `kr doctor` leaves empty, and `report.txt`, the same diagnostics as readable lines. Both are written from the
 bundle's own exported copy rather than from what the terminal showed: the report on your screen
 names your paths because you are at this machine, and the file you send somebody carries each of
 them as its class and its length.
@@ -1134,7 +1134,8 @@ the bundle rather than repeated.
 The daemon's own build identity is the one thing a bundle names although it arrived in a reply,
 because which build is running is the first thing somebody reading one needs. Nothing of the text
 survives the parse: what is kept is the program's name, out of the closed list of the programs this
-product builds, and the three numbers of its version. What is printed is composed from those.
+product builds, the three numbers of its version and, when the reply gives one, the twelve
+lower-case hexadecimal digits of its commit. What is printed is composed from those.
 `kr-controller/0.1.0` is named in full; a component this product does not build and a version that
 is not three numbers are not a build identity, and carry their length like any other name. The
 parse settles the shape and not the build: the reply still chooses the three numbers, so a bundle
@@ -1158,14 +1159,16 @@ those created after privacy mode is on, and those that have not yet been cleaned
 mode was turned off (you can list these sessions using `kr privacy status`). If the worker of one of
 these sessions ended before it could complete the cleanup, it stays on the list, even after you turn
 off privacy mode, until the daemon has removed what it kept. The daemon does that when privacy mode
-is turned on, and tries again when it cannot; `kr privacy status` gives the reason. There is no
-other reason why a session would be private. Turning privacy mode off starts new retention from that
-point, so a session that went through a private period but does not owe anything to it anymore is
-exported, and so is a session that was created when privacy mode was on but has completed its
-cleanup.
+is turned on, for a worker that has ended by then, and at its next pass for a worker that ends
+later. When a removal leaves anything, the daemon tries again on a schedule, with privacy mode on or
+off, and `kr privacy status` gives the reason. There is no other reason why a session would be
+private. Turning privacy mode off starts new retention from that point, so a session that went
+through a private period but does not owe anything to it anymore is exported, and so is a session
+that was created when privacy mode was on but has completed its cleanup.
 
 This first reads whether the host is in privacy mode, then reads the sessions, and then reads
-whether the host is in privacy mode again. If the host is in privacy mode at either read, or if the
+whether the host is in privacy mode again. A session that either read lists as still owing cleanup
+is left out too. If the host is in privacy mode at either read, or if the
 generation of privacy mode changes between the two reads of privacy mode, this will not export any
 sessions and, if the host lists any, print the number of sessions that it left out and the reason.
 (If privacy mode is off at the second read but changed since the first, the reason will tell you to
