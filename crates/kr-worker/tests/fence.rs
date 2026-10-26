@@ -8447,7 +8447,7 @@ async fn kr_req_13_11_what_changes_the_picture_after_the_fence_makes_the_read_un
         .write_input(
             holder,
             epoch,
-            3,
+            2,
             b"\x1b",
             None,
             std::time::Instant::now() + Duration::from_secs(3600),
