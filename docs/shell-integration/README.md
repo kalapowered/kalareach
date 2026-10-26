@@ -784,18 +784,19 @@ method, and that is exactly what it cannot do:
 - **The reader is reached when it steps.** The module's queue is serviced on the reader's own
   thread, after each of the editor's own operations has run: every chord the editor has a binding
   for goes through the module, which runs the editor's operation and then reads the queue. The
-  read-line entry reports the reader and reads nothing, because the editor clears its buffer when
-  its read starts. A key the person bound to a script of their own is theirs and carries no
-  boundary, and an ordinary character goes straight to the editor's own insertion, so a request
-  that arrives at a parked reader is answered at its next bound key rather than immediately. Until
-  then the reader's last idle report is what the worker has to go on.
+  read-line entry reports the reader and reads the queue, and refuses a launch it finds there,
+  because the editor clears its buffer when its read starts. A key the person bound to a script of
+  their own is theirs and carries no boundary, and an ordinary character goes straight to the
+  editor's own insertion, so a request that arrives at a parked reader is answered at its next bound
+  key rather than immediately. Until then the reader's last idle report is what the worker has to go
+  on.
 - **A launch is installed where it is decided and accepted at the next step.** The decision, the
   state check and the installation all happen on the reader's thread, inside the fence, at a point
   where the reader is between operations: a key of the person's that has been read and not yet run
   is never one the launch goes in front of. The editor's own accept is what ends the read, and it
-  ends it when the operation the module answered from returns. Nothing is decided before the read
+  ends it when the operation the module answered from returns. Nothing is installed before the read
   starts, because the editor clears its buffer there and a line installed then is one nobody would
-  run.
+  run: a launch read then is refused with `editor_left`.
 - **A cancellation ends nothing here, and says so.** Every operation that waits for another key
   runs this editor's own read loop, and nothing of the module's runs on the reader's thread while
   one is running, so a cancellation arrives after the operation it was meant for has finished or
