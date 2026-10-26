@@ -22,6 +22,7 @@ import { UNVERIFIED_WORDS } from '../src/model/launch'
 
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 const SESSION_BUILD = '8a7b6c50-22bb-4c3d-8e4f-000000000102'
+const SESSION_GONE = '8a7b6c50-22bb-4c3d-8e4f-0000000009ff'
 const ENVIRONMENT = '3f1a2c40-11aa-4b2c-9d3e-000000000001'
 
 function open(port: HostPort, pane: 'semantic' | 'terminal', sessionId = SESSION_MAIN): void {
@@ -418,5 +419,22 @@ describe('what a read is taken to say', () => {
     expect(await screen.findByTestId('launch-take-control')).toBeInTheDocument()
     expect(screen.queryByTestId('launch-unread')).toBeNull()
     expect(controls.terminalViews[0]?.launchReadsWhileOpening).toBe(0)
+  })
+
+  // A session the host does not know has no surface: nothing is drawn, and nothing apologises.
+  it('draws nothing for a session the host does not know', async () => {
+    const { port, controls } = fakeHost()
+    const reads = controls.hold('launchSurface')
+    open(port, 'semantic', SESSION_GONE)
+    await waitFor(() => {
+      expect(reads.count).toBe(1)
+    })
+    // The refusal is delivered and handled before anything is checked: no timer is waited on.
+    await act(async () => {
+      reads.release()
+      for (let turn = 0; turn < 20; turn += 1) await Promise.resolve()
+    })
+    expect(screen.queryByTestId('launch-unread')).toBeNull()
+    expect(screen.queryByTestId('launch-surface')).toBeNull()
   })
 })
