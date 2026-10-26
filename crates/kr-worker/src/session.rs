@@ -4403,8 +4403,9 @@ impl Session {
     /// session - a caller that took the lock again to record it would be waiting for the lock it
     /// was already holding.
     pub fn collect_expired(&mut self) -> usize {
-        // Where a cleanup that failed at the enabling is retried, on the same cadence as
-        // everything else this pass does.
+        // Where a cleanup this session still owes is retried (one that failed at the enabling, or
+        // that a reopened or unresolved session owes), on the same cadence as everything else this
+        // pass does.
         if self.privacy_cleanup.owed() > 0 {
             self.retry_privacy_cleanup();
         }
