@@ -1212,7 +1212,6 @@ fn run_raw(raw: Raw, script: &Script) -> i32 {
                     mechanism: crate::priority::Mechanism::None,
                     cpu: false,
                     io: false,
-                    io_class: None,
                     why: Some("this stub applies nothing"),
                 }),
                 ceiling: crate::serve::CEILING_MECHANISM.to_owned(),

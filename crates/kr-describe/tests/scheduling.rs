@@ -9,7 +9,7 @@ mod support;
 use kr_describe::budget::{Budgets, GIB, ProcessFigures};
 use kr_describe::context::{ContextBuilder, ContextRevision, DescriptionContext};
 use kr_describe::metrics::{LatencyLedger, PUBLISHED_SESSION_COUNTS};
-use kr_describe::priority::background_current_thread;
+use kr_describe::priority::enter_background;
 use kr_describe::queue::{
     Enqueued, Freshness, NothingToDequeue, PRIORITY_RUN_LIMIT, Priority, Scheduler,
 };
@@ -477,32 +477,25 @@ fn whole_product_figures_are_reported_beside_the_model_ones() {
 /// back.
 #[test]
 fn this_host_names_the_background_mechanism_it_actually_applied() {
-    // On Windows the class is the process's, so the test puts its own process back where it found
-    // it; on Linux it is the thread's, and this thread ends.
-    #[cfg(windows)]
-    let before = kr_ipc::background::priority_class_number();
-    let applied = std::thread::spawn(background_current_thread)
-        .join()
-        .expect("the thread ends");
-    #[cfg(windows)]
-    if applied.is_qualified() {
-        kr_ipc::background::leave_process_background(before).expect("the class is left");
-    }
+    // The class is the thread's on Linux and the process's on macOS and Windows, so the test notes
+    // what it found and puts it back, on a thread of its own.
+    let applied = std::thread::spawn(|| {
+        let saved = kr_ipc::background::save();
+        let applied = enter_background();
+        saved.restore().expect("the classes are put back");
+        applied
+    })
+    .join()
+    .expect("the thread ends");
 
     // Whether the change is permitted depends on the host, so the assertion is about honesty
     // rather than about success: a class is named only when the system reports it, and a class
     // that is not applied says why.
-    if applied.is_qualified() {
-        assert_ne!(applied.mechanism.as_str(), "none");
-    } else {
-        assert_eq!(applied.mechanism.as_str(), "none");
-        assert!(applied.why.is_some());
-    }
-    assert_eq!(applied.io, applied.io_class.is_some());
-    if !applied.is_qualified() || !applied.io {
-        assert!(applied.why.is_some());
-    } else {
+    assert_eq!(applied.cpu, applied.mechanism.as_str() != "none");
+    if applied.cpu && applied.io {
         assert!(applied.why.is_none());
+    } else {
+        assert!(applied.why.is_some());
     }
 }
 
@@ -538,9 +531,9 @@ fn the_thermal_zones_a_platform_lists_say_how_hot_the_host_is() {
     assert!(matches!(read(&[]), Signal::Unqualified { .. }));
 }
 
-/// KR-REQ-22.13: a Windows host reads where its power comes from and, when it lists a thermal zone,
-/// how hot it is; the policy then pauses on battery and on heat, and treats a reading it could not
-/// take as the pause the policy defines.
+/// KR-REQ-22.13: a Windows host reads its power source and, when it lists a thermal zone, how hot it
+/// is; what the policy is given is what the system said, and a reading the system would not give
+/// stays unqualified.
 #[cfg(windows)]
 #[test]
 fn a_windows_host_reads_its_power_source_and_its_thermal_zones() {
@@ -548,18 +541,18 @@ fn a_windows_host_reads_its_power_source_and_its_thermal_zones() {
     use kr_describe::resource::platform::read_conditions;
 
     let conditions = read_conditions();
-    assert!(
+    let said = kr_ipc::conditions::supply();
+    assert_eq!(
         matches!(conditions.power, Signal::Qualified(_)),
-        "{:?}",
+        said.is_some(),
+        "{:?} against {said:?}",
         conditions.power
     );
-    if kr_ipc::conditions::thermal_zones().is_empty() {
-        assert!(matches!(conditions.thermal, Signal::Unqualified { .. }));
-    } else {
-        assert!(
-            matches!(conditions.thermal, Signal::Qualified(_)),
-            "{:?}",
-            conditions.thermal
-        );
-    }
+    let zones = kr_ipc::conditions::thermal_zones();
+    assert_eq!(
+        matches!(conditions.thermal, Signal::Qualified(_)),
+        !zones.is_empty(),
+        "{:?} against {zones:?}",
+        conditions.thermal
+    );
 }

@@ -176,24 +176,36 @@ reason.
 
 - **Linux:** the model thread takes `SCHED_BATCH` and the lowest niceness, and the lowest level of
   the best-effort I/O class. Threads it starts inherit all three. The I/O class is the lowest
-  best-effort level and not the idle class, because a read of the weights at load under the idle
-  class can wait as long as the disk stays busy. An I/O scheduler that ignores priorities, such as
-  the `none` scheduler of most NVMe disks, keeps the class and acts on nothing.
+  best-effort level and not the idle class, because the load reads the weights under a deadline
+  and the idle class makes each request of that read wait for a quiet disk: the deadline
+  scheduler lets an idle request wait ten seconds by default, and the budget fair queueing
+  scheduler gives it a bounded share. How far the lowest best-effort level yields depends on the
+  scheduler. The budget fair queueing scheduler gives it the smallest weight, the deadline
+  scheduler keeps no level inside a class so the class changes nothing there, and a scheduler that
+  ignores priorities, such as the `none` scheduler of most NVMe disks, keeps the class and acts on
+  nothing. What the process reports is what the system holds, not that a disk obeys it.
 - **macOS:** the model thread takes the lowest ordinary thread priority, and the process takes the
-  throttled disk policy.
+  throttled disk policy, which delays its disk requests only while other processes' requests
+  contend with them. No measurement here shows what that costs a load of the weights.
 - **Windows:** the whole process takes the idle priority class and the very low I/O priority. It is
   the process and not the thread, because a thread that another thread starts begins at the normal
   priority, and the compute threads of the model runtime are started by the thread that loads it.
-  The idle class is served only when nothing else wants the processor, so a machine that other
-  work keeps fully busy can answer the process later than the daemon waits for it, and the daemon
-  ends a process that does not acknowledge a cancellation in time. Windows also has a background
+  The idle class is served only when nothing else wants the processor, and the process's control
+  thread and watchdog are in it too. When other work keeps every core busy for longer than a few
+  seconds (Windows lifts a thread that has waited that long), the daemon can wait past its bound
+  for the process to acknowledge a cancellation and ends a process that does not acknowledge in
+  time, the process's own watchdog ends it when its control thread takes more than two seconds
+  over one request, and its answer to the daemon's first message can say that the model thread
+  did not report its class. Each ends a process that the daemon starts again after its restart
+  delay, so a machine too busy to run the process gets fewer descriptions. Windows also has a background
   mode for a process that lowers CPU, I/O and memory priority together, and this build does not
   use it. On Windows Server 2025 (build 26100) a process that enters it and writes 600 MB keeps a
   working set of 32 MB, with 683 MB committed, where a process with only the idle class, only the
   I/O priority or only the lowest memory priority keeps 694 MB. A model that must stay resident
   would fault its weights back in on every token, and the daemon's reading of the process would
   show 32 MB.
-- **Other Unix systems:** the lowest ordinary thread priority, and no I/O class.
+- **Other Unix systems:** the process asks for the lowest ordinary thread priority where the
+  thread-priority library gives one, and reports a refusal where it does not. It sets no I/O class.
 
 ## The queue
 
@@ -421,7 +433,7 @@ A page of facts is applied under privacy mode's admission at the generation it w
 
 The host reads the memory, power and thermal conditions of the machine every ten seconds, on a thread of its own, because reading the state of the platform can start a program. A reading more than a minute old says nothing: every signal is then unqualified, and the policy pauses rather than trusting the last answer.
 
-Power and heat come from the facility each platform documents. On macOS, power comes from `pmset -g ps` and heat from the processor speed limit that `pmset -g therm` reports. On Linux, power comes from the kernel's power-supply class and heat from each thermal zone against its own first trip point. On Windows, power comes from the system's power-status call, which puts a machine with no battery on mains, and heat from the passive limit of each thermal zone's performance counters, the share of the processors' top speed the platform allows because of heat. The worst zone decides there, and a machine that lists no zone says nothing about heat. A platform with no reader says nothing about either: the policy treats that as battery for power and does not pause for heat.
+Power and heat come from the facility each platform documents. On macOS, power comes from `pmset -g ps` and heat from the processor speed limit that `pmset -g therm` reports; on the Apple silicon Mac this was tried on, the command printed only notes that no warning level had been recorded and no speed limit, and the reader then says nothing about heat. On Linux, power comes from the kernel's power-supply class and heat from each thermal zone against its own first trip point. On Windows, power comes from the system's power-status call, which puts a machine with no battery on mains, and heat from the passive limit of each thermal zone's performance counters, the share of the processors' top speed the platform allows because of heat. The worst zone decides there, and a machine that lists no zone says nothing about heat. A platform with no reader says nothing about either: the policy treats that as battery for power and does not pause for heat.
 
 The description process is a child of the control daemon. It is located next to the executable of the worker. It is started when work is first due.
 

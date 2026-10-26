@@ -25,7 +25,7 @@ use kr_describe::context::{ContextBinding, ContextSignal};
 use kr_describe::environment::{EnvironmentKind, ExecutionEnvironment, build_target};
 use kr_describe::metadata::RepositoryFacts;
 use kr_describe::metrics::{Distribution, LatencyLedger, PUBLISHED_SESSION_COUNTS};
-use kr_describe::priority::{Cancellation, background_current_thread};
+use kr_describe::priority::{Cancellation, enter_background};
 use kr_describe::profile::catalogue::{Catalogue, MetGates};
 use kr_describe::profile::{Asset, ModelProfile};
 use kr_describe::queue::Priority;
@@ -288,7 +288,7 @@ fn run_outputs(profile: &ModelProfile, cache: &Path, rounds: u32) -> Result<bool
     if weights.as_os_str().is_empty() {
         return Err("the profile names no weights asset".to_owned());
     }
-    let applied = background_current_thread();
+    let applied = enter_background();
     println!(
         "background priority: {} (cpu {}, io {}) [{machine}]",
         applied.mechanism.as_str(),
@@ -416,7 +416,7 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
 
     // The class is applied on the thread that loads and runs the model, before the model starts a
     // thread of its own, as the description process applies it on its model thread.
-    let applied = background_current_thread();
+    let applied = enter_background();
     let cold = Instant::now();
     let budgets = Budgets::DEFAULTS;
     let runtime = LlamaRuntime::load(

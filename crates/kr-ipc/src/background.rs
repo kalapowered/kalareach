@@ -15,18 +15,24 @@
 //! | Linux | the caller's own (this module sets none) | the lowest best-effort level of the calling thread, which threads it starts afterwards inherit |
 //! | the remaining platforms | none | none |
 //!
-//! The Linux class is the lowest level of the best-effort class and not the idle class. The idle
-//! class is served only when nothing else wants the disk, and a model's files are read once, at
-//! load, under a deadline; a busy disk would hold that read for as long as it stayed busy. The
-//! lowest best-effort level still yields to every other process on a scheduler that honours
-//! priorities, and it cannot be starved by one.
+//! The Linux class is the lowest level of the best-effort class and not the idle class. A model's
+//! files are read once, at load, under a deadline, and the idle class makes each request of that
+//! read wait for a quiet disk: the kernel's deadline scheduler lets an idle request wait ten
+//! seconds by default before it serves it, and the budget fair queueing scheduler gives it a
+//! bounded share. A load that is a long run of faults, each held for that long, could miss its
+//! deadline on a disk that other work keeps busy. The best-effort class keeps a request in the queue
+//! of ordinary work. How far its lowest level yields depends on the scheduler: the budget fair
+//! queueing scheduler gives it the smallest weight, and the deadline scheduler keeps no level
+//! inside a class, so the class changes nothing there.
 //!
 //! Windows has a background mode for a process (`PROCESS_MODE_BACKGROUND_BEGIN`) that lowers the
 //! CPU, I/O and memory priority together, and this module does not use it: on Windows Server 2025
-//! it holds the process's working set to about 32 MB however much memory the process writes, which
-//! leaves a model that must stay resident to fault its weights back in on every token, and makes
-//! the process's resident set read as 32 MB to anything that measures it. The idle priority class
-//! and the very low I/O priority are set on their own and leave the working set alone.
+//! (build 26100) a process that begins it and then writes 600 MB keeps a working set of 32 MB with
+//! 683 MB committed, where the same process with only the idle class, only the I/O priority or only
+//! the lowest memory priority keeps 694 MB. A model that must stay resident would fault its weights
+//! back in on every token, and the process's resident set would read as 32 MB to anything that
+//! measures it. The idle priority class and the very low I/O priority are set on their own and
+//! leave the working set alone.
 //!
 //! The system applies an I/O class only through the I/O scheduler that serves the disk. A scheduler
 //! that ignores priorities (the `none` scheduler of most NVMe disks) keeps the class and acts on
@@ -59,7 +65,8 @@ impl IoClass {
 pub type Refusal = &'static str;
 
 /// Lowers the I/O class of the calling thread on Linux, where a thread starts the threads that
-/// read the model, and of the calling process on macOS, where the policy is the process's.
+/// read the model, and of the calling process on macOS and Windows, where the class is the
+/// process's.
 ///
 /// Returns the class the system reports once it was set. A system that refuses the call, or that
 /// reports something else afterwards, is a refusal.
@@ -78,27 +85,27 @@ pub fn io_class() -> Option<IoClass> {
     platform::io_class()
 }
 
-/// What the system reports of a process that entered the background class.
+/// Puts the calling process into the idle priority class, and reads the class back.
+///
+/// The class is the process's, so every thread of the process runs in it, those the process starts
+/// later included.
+///
+/// # Errors
+///
+/// Returns why the class was not applied.
 #[cfg(windows)]
+pub fn lower_priority_class() -> std::result::Result<(), Refusal> {
+    platform::lower_priority_class()
+}
+
+/// What the system reports of a process's priority class and I/O class.
+#[cfg(all(windows, any(test, feature = "testing")))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProcessClass {
     /// Whether the process's priority class is the idle class.
     pub idle_priority_class: bool,
     /// The process's I/O class, when it is one this module names.
     pub io: Option<IoClass>,
-}
-
-/// Puts the calling process into the background class: the idle priority class and the very low
-/// I/O priority, each read back from the system.
-///
-/// The process stays in the class until it ends or calls [`leave_process_background`].
-///
-/// # Errors
-///
-/// Returns why nothing was applied, or what the system reported instead.
-#[cfg(windows)]
-pub fn enter_process_background() -> std::result::Result<ProcessClass, Refusal> {
-    platform::enter_process_background()
 }
 
 /// Reads the priority class and the I/O class the system holds for the calling process.
@@ -108,7 +115,8 @@ pub fn process_class() -> Option<ProcessClass> {
     platform::process_class()
 }
 
-/// Reads the priority class and the I/O class the system holds for the process `pid`, which a parent uses to check what its child reports of itself.
+/// Reads the priority class and the I/O class the system holds for the process `pid`, which a
+/// parent uses to check what its child reports of itself.
 ///
 /// Nothing when the process is not there or the system will not tell.
 #[cfg(all(windows, any(test, feature = "testing")))]
@@ -117,23 +125,29 @@ pub fn process_class_of(pid: u32) -> Option<ProcessClass> {
     platform::process_class_of(pid)
 }
 
-/// Takes the calling process out of the background class and back to the priority class it had
-/// before [`enter_process_background`] and the normal I/O priority, which a test uses to leave its
-/// own process as it found it.
-///
-/// # Errors
-///
-/// Returns why the system refused.
-#[cfg(all(windows, any(test, feature = "testing")))]
-pub fn leave_process_background(priority_class: u32) -> std::result::Result<(), Refusal> {
-    platform::leave_process_background(priority_class)
+/// The classes a test found its process or thread in, so that it can leave them as it found them.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Debug)]
+pub struct Saved(platform::Saved);
+
+/// Notes the classes this module sets, as the calling thread (Linux) or process (macOS and Windows)
+/// has them now.
+#[cfg(any(test, feature = "testing"))]
+#[must_use]
+pub fn save() -> Saved {
+    Saved(platform::save())
 }
 
-/// Reads the priority class number of the calling process, for [`leave_process_background`].
-#[cfg(all(windows, any(test, feature = "testing")))]
-#[must_use]
-pub fn priority_class_number() -> u32 {
-    platform::priority_class_number()
+#[cfg(any(test, feature = "testing"))]
+impl Saved {
+    /// Puts back the classes that were noted.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the system refused.
+    pub fn restore(self) -> std::result::Result<(), Refusal> {
+        platform::restore(self.0)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -167,10 +181,36 @@ mod platform {
     }
 
     pub(super) fn io_class() -> Option<IoClass> {
+        (raw() == libc::c_long::from(LOWEST)).then_some(IoClass::BestEffortLowest)
+    }
+
+    /// The I/O priority of the calling thread as the system numbers it, or -1.
+    fn raw() -> libc::c_long {
         // SAFETY: the call takes two integers and reads the I/O priority of the calling thread; it
         // reads no memory of this process.
-        let held = unsafe { libc::syscall(libc::SYS_ioprio_get, WHO_PROCESS, 0) };
-        (held == libc::c_long::from(LOWEST)).then_some(IoClass::BestEffortLowest)
+        unsafe { libc::syscall(libc::SYS_ioprio_get, WHO_PROCESS, 0) }
+    }
+
+    /// The I/O priority of the calling thread when it was noted.
+    #[cfg(any(test, feature = "testing"))]
+    #[derive(Debug)]
+    pub(super) struct Saved(libc::c_long);
+
+    #[cfg(any(test, feature = "testing"))]
+    pub(super) fn save() -> Saved {
+        Saved(raw())
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub(super) fn restore(saved: Saved) -> std::result::Result<(), Refusal> {
+        // SAFETY: the call takes three integers and changes the I/O priority of the calling
+        // thread; it reads no memory of this process.
+        let set = unsafe { libc::syscall(libc::SYS_ioprio_set, WHO_PROCESS, 0, saved.0) };
+        if set == 0 {
+            Ok(())
+        } else {
+            Err("this host refused to put the I/O level back")
+        }
     }
 }
 
@@ -222,13 +262,26 @@ mod platform {
         unsafe { getiopolicy_np(TYPE_DISK, SCOPE_PROCESS) }
     }
 
-    /// Puts the disk policy of the calling process back to `policy`, which a test uses to leave
-    /// its own process as it found it.
-    #[cfg(test)]
-    pub(super) fn set_policy(policy: libc::c_int) -> bool {
+    /// The disk policy of the calling process when it was noted.
+    #[cfg(any(test, feature = "testing"))]
+    #[derive(Debug)]
+    pub(super) struct Saved(libc::c_int);
+
+    #[cfg(any(test, feature = "testing"))]
+    pub(super) fn save() -> Saved {
+        Saved(policy())
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub(super) fn restore(saved: Saved) -> std::result::Result<(), Refusal> {
         // SAFETY: the call takes three integers and changes the disk I/O policy of the calling
         // process; it reads no memory of this process.
-        unsafe { setiopolicy_np(TYPE_DISK, SCOPE_PROCESS, policy) == 0 }
+        let set = unsafe { setiopolicy_np(TYPE_DISK, SCOPE_PROCESS, saved.0) };
+        if set == 0 {
+            Ok(())
+        } else {
+            Err("this host refused to put the disk policy back")
+        }
     }
 }
 
@@ -239,7 +292,7 @@ mod platform {
         reason = "the priority class and I/O priority of a process have no safe interface"
     )]
 
-    use super::{IoClass, ProcessClass, Refusal};
+    use super::{IoClass, Refusal};
     use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessIoPriority};
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::System::Threading::{
@@ -259,34 +312,33 @@ mod platform {
 
     /// The I/O priority of a process that has been asked to stay out of the way.
     const IO_VERY_LOW: u32 = 0;
-    /// The I/O priority of an ordinary process.
-    #[cfg(any(test, feature = "testing"))]
-    const IO_NORMAL: u32 = 2;
 
     pub(super) fn lower_io_class() -> std::result::Result<IoClass, Refusal> {
-        Err("on this platform the I/O class is the whole process's, set with its priority class")
+        set_io_priority(IO_VERY_LOW).map_err(|()| "this host refused the very low I/O priority")?;
+        io_class().ok_or("this host did not report the I/O priority it was given")
     }
 
     pub(super) fn io_class() -> Option<IoClass> {
-        process_class().and_then(|class| class.io)
+        // SAFETY: the call takes no argument and returns the pseudo-handle of the calling process,
+        // which needs no closing.
+        let io = io_priority_of(unsafe { GetCurrentProcess() })?;
+        (io == IO_VERY_LOW).then_some(IoClass::VeryLow)
     }
 
-    pub(super) fn enter_process_background() -> std::result::Result<ProcessClass, Refusal> {
+    pub(super) fn lower_priority_class() -> std::result::Result<(), Refusal> {
         // SAFETY: the call takes the pseudo-handle of the calling process and a class, and reads
         // no memory of this process.
-        let idle = unsafe { SetPriorityClass(GetCurrentProcess(), IDLE_PRIORITY_CLASS) };
-        if idle == 0 {
+        let set = unsafe { SetPriorityClass(GetCurrentProcess(), IDLE_PRIORITY_CLASS) };
+        if set == 0 {
             return Err("this host refused the idle priority class");
         }
-        set_io_priority(IO_VERY_LOW).map_err(|()| "this host refused the very low I/O priority")?;
-        let class = process_class().ok_or("this host did not report the class it was given")?;
-        if !class.idle_priority_class {
-            return Err("this host reports a priority class that is not the idle class");
+        // SAFETY: the call takes the pseudo-handle of the calling process and reads no memory of
+        // this process.
+        if unsafe { GetPriorityClass(GetCurrentProcess()) } == IDLE_PRIORITY_CLASS {
+            Ok(())
+        } else {
+            Err("this host reports a priority class that is not the idle class")
         }
-        if class.io != Some(IoClass::VeryLow) {
-            return Err("this host reports an I/O priority that is not the very low one");
-        }
-        Ok(class)
     }
 
     /// Sets the I/O priority of the calling process.
@@ -304,6 +356,26 @@ mod platform {
         if status < 0 { Err(()) } else { Ok(()) }
     }
 
+    /// Reads the I/O priority of the process a handle names, which needs query access.
+    fn io_priority_of(process: HANDLE) -> Option<u32> {
+        let mut io = 0_u32;
+        // SAFETY: the call writes one 32-bit value through a pointer to a live local of that size.
+        let queried = unsafe {
+            NtQueryInformationProcess(
+                process,
+                ProcessIoPriority,
+                (&raw mut io).cast(),
+                4,
+                std::ptr::null_mut(),
+            )
+        };
+        (queried >= 0).then_some(io)
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    use super::ProcessClass;
+
+    #[cfg(any(test, feature = "testing"))]
     pub(super) fn process_class() -> Option<ProcessClass> {
         // SAFETY: the call takes no argument and returns the pseudo-handle of the calling process,
         // which needs no closing.
@@ -332,49 +404,50 @@ mod platform {
         class
     }
 
-    /// Reads the class of the process a handle names, which needs query access.
+    #[cfg(any(test, feature = "testing"))]
     fn class_of(process: HANDLE) -> Option<ProcessClass> {
         // SAFETY: the call takes a handle and reads no memory of this process.
         let priority_class = unsafe { GetPriorityClass(process) };
-        let mut io = 0_u32;
-        // SAFETY: the call writes one 32-bit value through a pointer to a live local of that size.
-        let queried = unsafe {
-            NtQueryInformationProcess(
-                process,
-                ProcessIoPriority,
-                (&raw mut io).cast(),
-                4,
-                std::ptr::null_mut(),
-            )
-        };
-        if queried < 0 {
-            return None;
-        }
+        let io = io_priority_of(process)?;
         Some(ProcessClass {
             idle_priority_class: priority_class == IDLE_PRIORITY_CLASS,
             io: (io == IO_VERY_LOW).then_some(IoClass::VeryLow),
         })
     }
 
+    /// The priority class and the I/O priority of the calling process when they were noted.
     #[cfg(any(test, feature = "testing"))]
-    pub(super) fn leave_process_background(
+    #[derive(Debug)]
+    pub(super) struct Saved {
         priority_class: u32,
-    ) -> std::result::Result<(), Refusal> {
-        set_io_priority(IO_NORMAL).map_err(|()| "this host refused the normal I/O priority")?;
-        // SAFETY: the call takes the pseudo-handle of the calling process and a class, and reads
-        // no memory of this process.
-        let restored = unsafe { SetPriorityClass(GetCurrentProcess(), priority_class) };
-        if restored == 0 {
-            return Err("this host refused to restore the priority class");
-        }
-        Ok(())
+        io_priority: Option<u32>,
     }
 
     #[cfg(any(test, feature = "testing"))]
-    pub(super) fn priority_class_number() -> u32 {
-        // SAFETY: the call takes the pseudo-handle of the calling process and reads no memory of
-        // this process.
-        unsafe { GetPriorityClass(GetCurrentProcess()) }
+    pub(super) fn save() -> Saved {
+        // SAFETY: the call takes no argument and returns the pseudo-handle of the calling process,
+        // which needs no closing.
+        let process = unsafe { GetCurrentProcess() };
+        // SAFETY: the call takes a handle and reads no memory of this process.
+        let priority_class = unsafe { GetPriorityClass(process) };
+        Saved {
+            priority_class,
+            io_priority: io_priority_of(process),
+        }
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub(super) fn restore(saved: Saved) -> std::result::Result<(), Refusal> {
+        if let Some(io) = saved.io_priority {
+            set_io_priority(io).map_err(|()| "this host refused to put the I/O priority back")?;
+        }
+        // SAFETY: the call takes the pseudo-handle of the calling process and a class, and reads
+        // no memory of this process.
+        let restored = unsafe { SetPriorityClass(GetCurrentProcess(), saved.priority_class) };
+        if restored == 0 {
+            return Err("this host refused to put the priority class back");
+        }
+        Ok(())
     }
 }
 
@@ -389,12 +462,26 @@ mod platform {
     pub(super) const fn io_class() -> Option<IoClass> {
         None
     }
+
+    #[cfg(any(test, feature = "testing"))]
+    #[derive(Debug)]
+    pub(super) struct Saved;
+
+    #[cfg(any(test, feature = "testing"))]
+    pub(super) const fn save() -> Saved {
+        Saved
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub(super) const fn restore(_saved: Saved) -> std::result::Result<(), Refusal> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    use super::{IoClass, io_class, lower_io_class};
+    use super::{IoClass, io_class, lower_io_class, save};
 
     /// A thread that lowers its I/O class finds the system holding it, and a thread that did not
     /// is still at the class it started with: the class is the calling thread's on Linux, so the
@@ -407,11 +494,17 @@ mod tests {
             .expect("the thread ends");
         assert_eq!(untouched, None, "a thread that lowered nothing");
 
-        let lowered = std::thread::spawn(|| (lower_io_class(), io_class()))
-            .join()
-            .expect("the thread ends");
-        assert_eq!(lowered.0, Ok(IoClass::BestEffortLowest));
-        assert_eq!(lowered.1, Some(IoClass::BestEffortLowest));
+        let lowered = std::thread::spawn(|| {
+            let saved = save();
+            let lowered = (lower_io_class(), io_class());
+            assert_eq!(saved.restore(), Ok(()));
+            (lowered, io_class())
+        })
+        .join()
+        .expect("the thread ends");
+        assert_eq!(lowered.0.0, Ok(IoClass::BestEffortLowest));
+        assert_eq!(lowered.0.1, Some(IoClass::BestEffortLowest));
+        assert_eq!(lowered.1, None, "and the class is put back");
 
         // A thread started by a thread that lowered its class has the class it was started with.
         let inherited = std::thread::spawn(|| {
@@ -430,54 +523,50 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn the_disk_policy_of_this_process_is_set_read_back_and_put_back() {
-        use super::platform::{policy, set_policy};
-
-        let before = policy();
-        assert!(
-            before >= 0,
-            "the policy this process started with is readable"
-        );
         assert_eq!(
             io_class(),
             None,
             "the policy at the start is not the throttled one"
         );
+        let saved = save();
 
         let lowered = lower_io_class();
         let held = io_class();
-        assert!(set_policy(before), "the policy is put back");
+        assert_eq!(saved.restore(), Ok(()), "the policy is put back");
 
         assert_eq!(lowered, Ok(IoClass::Throttled));
         assert_eq!(held, Some(IoClass::Throttled));
         assert_eq!(io_class(), None, "and the read-back follows it back");
     }
 
-    /// The process enters the background class, and the system reports the idle priority class,
-    /// the very low I/O priority, both to the process itself and to
-    /// a handle opened on it by its identifier. The process is put back as it was found, so the
-    /// tests that run beside this one are not left in the class.
+    /// The process enters the background class, and the system reports the idle priority class and
+    /// the very low I/O priority, both to the process itself and to a handle opened on it by its
+    /// identifier. The process is put back as it was found, so the tests that run beside this one
+    /// are not left in the class.
     #[cfg(windows)]
     #[test]
     fn the_background_class_of_this_process_is_set_read_back_and_left() {
         use super::{
-            IoClass, ProcessClass, enter_process_background, leave_process_background,
-            priority_class_number, process_class, process_class_of,
+            IoClass, ProcessClass, lower_io_class, lower_priority_class, process_class,
+            process_class_of, save,
         };
 
         let before = process_class().expect("the class this process started with is readable");
         assert!(!before.idle_priority_class);
         assert_eq!(before.io, None);
-        let number = priority_class_number();
+        let saved = save();
 
-        let entered = enter_process_background();
+        let priority = lower_priority_class();
+        let io = lower_io_class();
         let seen_from_outside = process_class_of(std::process::id());
-        let left = leave_process_background(number);
+        let left = saved.restore();
 
         let in_the_class = ProcessClass {
             idle_priority_class: true,
             io: Some(IoClass::VeryLow),
         };
-        assert_eq!(entered, Ok(in_the_class));
+        assert_eq!(priority, Ok(()));
+        assert_eq!(io, Ok(IoClass::VeryLow));
         assert_eq!(seen_from_outside, Some(in_the_class));
         assert_eq!(left, Ok(()));
         assert_eq!(process_class(), Some(before), "and the class is left");
