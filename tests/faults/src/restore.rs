@@ -30,8 +30,9 @@
 //! * **Continuity.** A terminal being handed the stream holds the session's whole screen: both
 //!   buffers, the cursor with its pending wrap, the saved cursors, the modes, the keyboard
 //!   protocol, the character sets, the margins, the titles, the links and the palette. A terminal
-//!   the painter is drawing holds the rows it shows and the cursor, and the painter's own account
-//!   of what it could not carry is read apart. A projection holds the session's screen.
+//!   the painter is drawing holds the rows it shows, the cursor, and the `modifyOtherKeys` level
+//!   and Kitty flags of the buffer in view, and the painter's own account of what it could not
+//!   carry is read apart. A projection holds the session's screen.
 //! * **The restored screen.** Directly after a restoration, before anything later is drawn, the
 //!   terminal holds the whole screen, the buffer that is not showing included.
 //! * **Through a buffer switch.** A client attached before a switch, told to begin again or reset
@@ -48,7 +49,9 @@ use kr_cli::render::ProjectedDisplay;
 use kr_client::projection::{Applied, Projection};
 use kr_protocol::attachment::{AttachMode, AttachmentCapability, SessionAttachParams};
 use kr_protocol::ids::{AttachmentId, ConnectionId, SessionId};
-use kr_protocol::projection::{KittyKeyboardState, ProjectedBuffer, ProjectionEvent};
+use kr_protocol::projection::{
+    KittyKeyboardState, ProjectedBuffer, ProjectedKeyboard, ProjectionEvent,
+};
 use kr_protocol::scalars::{CanonicalSet, Nullable};
 use kr_protocol::session::Dimensions;
 use kr_term::budget::GridSize;
@@ -377,7 +380,8 @@ impl Client {
 
 /// Where a client differs from the session's screen, by what it holds: a projection holds the
 /// whole screen; a terminal being handed the stream holds all of it but the wrap marks; a painted
-/// terminal holds the rows it shows and the cursor, and then its projection is read as well.
+/// terminal holds the rows it shows, the cursor, and the `modifyOtherKeys` level and Kitty flags of
+/// the buffer in view, and then its projection is read as well.
 fn compare(client: &mut Client, expected: &View) -> Result<Vec<String>, String> {
     let mut found = Vec::new();
     match client.form {
@@ -408,8 +412,9 @@ fn compare(client: &mut Client, expected: &View) -> Result<Vec<String>, String> 
                 if parts == Parts::Painted && waiting_to_wrap {
                     differences.retain(|line| !line.starts_with("cursor at"));
                 }
-                // A painter installs the flags and the level in force, whichever buffer it
-                // draws, so the terminal then encodes the next key as the session expects.
+                // A painter installs the level and the flags of the buffer in view, whichever
+                // buffer the terminal showed before, so the terminal then encodes keys by the
+                // level and the flags the session expects.
                 if parts == Parts::Painted {
                     differences.extend(got.encoding_differences(expected));
                 }
@@ -1425,21 +1430,33 @@ pub fn without_the_buffer_not_showing(bytes: &[u8]) -> Vec<u8> {
 }
 
 /// A projection event with the keyboard negotiation of the buffer that is not showing left out of
-/// the snapshot it is, flags and stack both. Any other event is returned unchanged.
+/// the snapshot it is, and out of the update that carries a change of it: flags and stack both.
+/// Any other event is returned unchanged.
 #[must_use]
 pub fn without_the_keyboard_of_the_buffer_not_showing(event: ProjectionEvent) -> ProjectionEvent {
-    let ProjectionEvent::Snapshot(mut snapshot) = event else {
-        return event;
-    };
-    let none = KittyKeyboardState {
-        flags: Nullable::null(),
-        stack: Vec::new(),
-    };
-    match snapshot.active_buffer {
-        ProjectedBuffer::Primary => snapshot.keyboard.alternate = none,
-        ProjectedBuffer::Alternate => snapshot.keyboard.primary = none,
+    fn leave_out(keyboard: &mut ProjectedKeyboard, showing: ProjectedBuffer) {
+        let none = KittyKeyboardState {
+            flags: Nullable::null(),
+            stack: Vec::new(),
+        };
+        match showing {
+            ProjectedBuffer::Primary => keyboard.alternate = none,
+            ProjectedBuffer::Alternate => keyboard.primary = none,
+        }
     }
-    ProjectionEvent::Snapshot(snapshot)
+    match event {
+        ProjectionEvent::Snapshot(mut snapshot) => {
+            leave_out(&mut snapshot.keyboard, snapshot.active_buffer);
+            ProjectionEvent::Snapshot(snapshot)
+        }
+        ProjectionEvent::Delta(mut delta) => {
+            if let Some(keyboard) = delta.keyboard.0.as_mut() {
+                leave_out(keyboard, delta.buffer);
+            }
+            ProjectionEvent::Delta(delta)
+        }
+        other => other,
+    }
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {

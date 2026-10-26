@@ -283,9 +283,9 @@ impl View {
             .ok_or_else(|| "the installation did not complete a screen".to_owned())
     }
 
-    /// Where the keys this view's terminal would encode differ from `expected`'s: the
-    /// `modifyOtherKeys` level and the Kitty flags of the buffer each view shows. Nothing else of the
-    /// keyboard protocol decides how the next key is written.
+    /// Where the keyboard encoding in force differs from `expected`'s: the `modifyOtherKeys` level
+    /// and the Kitty flags of the buffer each view shows. The cursor-key and keypad modes, which
+    /// also change what a key sends, are read with the modes of a whole screen.
     #[must_use]
     pub fn encoding_differences(&self, expected: &Self) -> Vec<String> {
         let in_force = |view: &Self| {

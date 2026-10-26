@@ -154,7 +154,7 @@ fn a_client_arriving_across_a_switch_holds_the_keyboard_flags_of_both_screens() 
             (Primary, (Some(5), vec![]), (Some(11), vec![3])),
             (Primary, (Some(1), vec![]), (Some(11), vec![3])),
         ],
-        "the corpus puts flags on each screen, with the shell's in force while the application \
+        "the corpus puts flags on each screen, with the shell's kept while the application \
          shows and the application's left behind when it leaves"
     );
     let outcome = restored("keyboard-flags");
