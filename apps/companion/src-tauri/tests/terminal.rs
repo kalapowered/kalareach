@@ -4036,17 +4036,16 @@ async fn a_worker_that_does_not_serve_the_launch_surface_is_not_asked_or_is_told
 
     let mut silent = ScriptedWorker::start_not_stating_the_launch_surface();
     let page = Page::new(silent.paths());
-    let (view, mut link) = showing(&page, &mut silent, 3).await;
+    let (view, mut link) = panned(&page, &mut silent, 3, &reporting(Mouse::Sgr)).await;
     let told = page
         .invoke_later("terminal_view_launch_surface", json!({ "view": view }))
         .await
         .expect("joins")
         .expect("an answer");
     assert_eq!(told, json!({ "state": "not_served" }));
-    assert!(
-        link.quiet_for(QUIET).await,
-        "a worker that did not state the read was not asked for it"
-    );
+    // The next call on the link is the one the person's take makes: the read was not asked.
+    page.take(&view, 1);
+    link.expect(Method::InputAcquire).await;
 }
 
 /// KR-REQ-13.11: a launch is pressed on the view's own link, for the view's own session, quoting the
@@ -4141,7 +4140,9 @@ async fn a_press_that_names_more_than_the_command_and_its_quote_is_refused_unrea
         .expect("joins")
         .expect_err("refused");
     assert_eq!(refused["code"], "INVALID_ARGUMENT", "{refused}");
-    assert!(link.quiet_for(QUIET).await, "nothing reached the session");
+    // The next call on the link is the person's own input: no launch went out before it.
+    page.paste(&view, 1, "ok").expect("taken");
+    next_write(&mut link, &mut lease).await;
 }
 
 /// KR-REQ-13.11: a launch the session has not answered when the view ends may have been installed,
