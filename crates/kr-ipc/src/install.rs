@@ -100,19 +100,18 @@ mod windows;
 #[cfg(windows)]
 pub use windows::{free_space, seal_directory, seal_file, unseal_directory, windows_version};
 
-/// What a test needs to meet a removal at the moment another process of the account changes the
-/// directory it works in.
+/// What a test needs to meet a removal at the moment another process of the account changes
+/// something it works in.
 #[cfg(all(windows, feature = "testing"))]
 pub mod removal_race {
     use std::path::Path;
 
-    /// What runs, with the directory's path, when a removal has pinned a directory.
-    pub type Hook = super::windows::PinHook;
+    pub use super::windows::{Hook, Moment};
 
-    /// Sets what runs when a removal has pinned a directory and checked that it is a plain one,
-    /// before it reads the names in it; `None` takes it away.
-    pub fn after_pin(hook: Option<Hook>) {
-        *super::windows::AFTER_PIN
+    /// Sets what runs at each moment of a removal, with the path the removal is at; `None` takes it
+    /// away.
+    pub fn hook(hook: Option<Hook>) {
+        *super::windows::HOOK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
     }
@@ -2137,22 +2136,25 @@ impl Store {
                 std::io::Error::other(error),
             )
         })?;
-        let removed = self
-            .trash()
-            .join(format!("{release}-{}", crate::new_uuid()));
-        match std::fs::rename(&directory, &removed) {
+        // The trash is opened once, as a plain directory and without following a link, and the
+        // release is moved into it and removed from it through that handle.
+        windows::at(windows::Moment::TrashChecked, &self.trash());
+        let trash = windows::Trash::open(&self.trash())
+            .map_err(|error| InstallError::io("open", self.trash(), error))?;
+        let name = std::ffi::OsString::from(format!("{release}-{}", crate::new_uuid()));
+        match trash.take(&directory, &name) {
             Ok(()) => {}
             Err(error) if windows::is_in_use(&error) => return Ok(false),
             Err(error) => return Err(InstallError::io("move", &directory, error)),
         }
         sync_directory(&self.versions())?;
         // What a running program keeps from being deleted stays in the trash for the next sweep.
-        if let Err(InstallError::Io { source, .. }) = remove_tree(&removed)
-            && !windows::is_in_use(&source)
-        {
-            return Err(InstallError::io("remove", &removed, source));
+        match trash.remove(&name) {
+            Err(source) if !windows::is_in_use(&source) => {
+                Err(InstallError::io("remove", self.trash().join(&name), source))
+            }
+            _ => Ok(true),
         }
-        Ok(true)
     }
 
     /// Deletes what earlier removals left in `trash/` because a program was running from it, and
@@ -2165,42 +2167,18 @@ impl Store {
     /// Returns [`InstallError::Io`] when the directory cannot be read, and the first refusal that no
     /// running program caused, after everything else that could be deleted was.
     pub fn sweep_trash(&self, _held: &StoreLock) -> Result<()> {
-        let trash = self.trash();
-        let entries = match std::fs::read_dir(&trash) {
-            Ok(entries) => entries,
+        let path = self.trash();
+        // Opened once, as a plain directory and without following a link: a junction in its place
+        // is refused, and what it names is never listed.
+        let trash = match windows::Trash::open(&path) {
+            Ok(trash) => trash,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(InstallError::io("read", &trash, error)),
+            Err(error) => return Err(InstallError::io("open", &path, error)),
         };
-        sweep_entries(&trash, entries.map(|entry| entry.map(|entry| entry.path())))
+        trash
+            .sweep()
+            .map_err(|source| InstallError::io("remove", path, source))
     }
-}
-
-/// Removes each of `entries`, the paths found in `trash`, and goes on after one that cannot be
-/// removed or read. Returns the first refusal that no running program caused, or the first failure
-/// of the listing, after everything else that could be removed was.
-#[cfg(windows)]
-fn sweep_entries(
-    trash: &Path,
-    entries: impl IntoIterator<Item = std::io::Result<PathBuf>>,
-) -> Result<()> {
-    let mut refused = None;
-    for entry in entries {
-        match entry {
-            // Whatever is in the trash that is not a plain directory is taken away as a name: a
-            // junction there would otherwise lead the removal into the directory it names.
-            Ok(path) => {
-                if let Err(InstallError::Io { source, .. }) = remove_tree(&path)
-                    && !windows::is_in_use(&source)
-                {
-                    refused.get_or_insert(InstallError::io("remove", path, source));
-                }
-            }
-            Err(error) => {
-                refused.get_or_insert(InstallError::io("read", trash, error));
-            }
-        }
-    }
-    refused.map_or(Ok(()), Err)
 }
 
 #[cfg(windows)]
@@ -2288,42 +2266,9 @@ pub fn remove_sealed_tree(directory: &Path) -> std::io::Result<()> {
 }
 
 /// Deletes a release that was moved out of `versions/`.
+#[cfg(unix)]
 fn remove_tree(directory: &Path) -> Result<()> {
     remove_sealed_tree(directory).map_err(|error| InstallError::io("remove", directory, error))
-}
-
-#[cfg(all(test, windows))]
-mod windows_tests {
-    use super::*;
-
-    /// KR-REQ-26.06: a failure of the listing of the trash reaches the result of the sweep, and what
-    /// the listing did give is swept all the same.
-    #[test]
-    fn a_failure_to_list_the_trash_is_returned_after_the_rest_is_swept() {
-        let root = std::env::temp_dir().join(format!("kr-sweep-{}", crate::new_uuid()));
-        let leftover = root.join("leftover");
-        std::fs::create_dir_all(leftover.join("inner")).expect("a leftover");
-        std::fs::write(leftover.join("inner").join("file"), b"left").expect("written");
-
-        let answer = sweep_entries(
-            &root,
-            [
-                Err(std::io::Error::other("the listing failed")),
-                Ok(leftover.clone()),
-            ],
-        );
-        let swept = !leftover.exists();
-        let _ = remove_tree(&root);
-
-        let Err(InstallError::Io { source, .. }) = answer else {
-            panic!("the failure is returned: {answer:?}");
-        };
-        assert!(
-            source.to_string().contains("the listing failed"),
-            "{source}"
-        );
-        assert!(swept, "the entry the listing gave is swept");
-    }
 }
 
 #[cfg(all(test, unix))]
