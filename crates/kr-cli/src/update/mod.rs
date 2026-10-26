@@ -1158,72 +1158,67 @@ pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Up
         reason: shown!("{}: {}", Shown::root(&staging), Shown::io(&error)),
     });
     // Whatever the rest of the run decides, the directory that could not be removed is told: beside
-    // the result, or beside the failure.
-    let outcome = async {
-        let target = staged?;
-        if target.release == source {
-            // The release that is current is not an update to go on past a failed one with: the
-            // daemons it left unstarted are owed their start from it. An archive of any other
-            // release is staged and checked before anything is started, so that a daemon of the
-            // release that failed, which may hold its environment and never answer, is not started
-            // again by every run that would move the host off it.
-            let mut restarted = Vec::new();
-            if let (Some(_), Some(failed)) = (left, record.update.clone()) {
-                match start_recorded(&store, &failed, true).await {
-                    Ok(started) => {
-                        settle(&store, &mut record)?;
-                        restarted = started;
-                    }
-                    Err(still) => {
-                        let back = goes_back_to(&failed);
-                        let goes_back =
-                            older_than(&store, &current_manifest, &back).then_some(&back);
-                        return Err(left_part_way(&still.said(), true, goes_back));
-                    }
+    // the result, or beside the failure. The steps below return their failure through the first
+    // closure, and no step is awaited inside another future: the whole command runs on the main
+    // thread, whose stack the futures of every command share.
+    let also = |error: CliError| with_staging_left(error, staging_left.as_ref());
+    let target = staged.map_err(also)?;
+    if target.release == source {
+        // The release that is current is not an update to go on past a failed one with: the daemons
+        // it left unstarted are owed their start from it. An archive of any other release is
+        // staged and checked before anything is started, so that a daemon of the release that
+        // failed, which may hold its environment and never answer, is not started again by every
+        // run that would move the host off it.
+        let mut restarted = Vec::new();
+        if let (Some(_), Some(failed)) = (left, record.update.clone()) {
+            match start_recorded(&store, &failed, true).await {
+                Ok(started) => {
+                    settle(&store, &mut record).map_err(also)?;
+                    restarted = started;
+                }
+                Err(still) => {
+                    let back = goes_back_to(&failed);
+                    let goes_back = older_than(&store, &current_manifest, &back).then_some(&back);
+                    return Err(also(left_part_way(&still.said(), true, goes_back)));
                 }
             }
-            return Ok(Updated {
-                target: source.clone(),
-                source,
-                restarted,
-                removed: Vec::new(),
-                not_removed: Vec::new(),
-                carried: Vec::new(),
-                unreached: Vec::new(),
-                checked_only: check,
-                rolled_back: false,
-            });
         }
-        // The release is in the store now, and stays there, staged, whatever the rest of this run
-        // decides: an update that waits uses it again.
-        if !check {
-            record.staged = Some(target.release.clone());
-            record.write(&store)?;
-        }
-        carry_out(
-            &store,
-            &update_lock,
-            &mut record,
+        return Ok(Updated {
+            target: source.clone(),
             source,
-            target,
-            check,
-            false,
-        )
-        .await
+            restarted,
+            removed: Vec::new(),
+            not_removed: staging_left.into_iter().collect(),
+            carried: Vec::new(),
+            unreached: Vec::new(),
+            checked_only: check,
+            rolled_back: false,
+        });
     }
-    .await;
-    match outcome {
-        Ok(mut updated) => {
-            updated.not_removed.extend(staging_left);
-            Ok(updated)
-        }
-        Err(error) => Err(with_staging_left(error, staging_left)),
+    // The release is in the store now, and stays there, staged, whatever the rest of this run
+    // decides: an update that waits uses it again.
+    if !check {
+        record.staged = Some(target.release.clone());
+        record.write(&store).map_err(also)?;
     }
+    let mut updated = carry_out(
+        &store,
+        &update_lock,
+        &mut record,
+        source,
+        target,
+        check,
+        false,
+    )
+    .await
+    .map_err(also)?;
+    updated.not_removed.extend(staging_left);
+    Ok(updated)
 }
 
 /// A failed update's error, with the directory the update could not remove said after it, if there
 /// is one.
-fn with_staging_left(error: CliError, left: Option<NotRemoved>) -> CliError {
+fn with_staging_left(error: CliError, left: Option<&NotRemoved>) -> CliError {
     let notes = left
         .map(|left| {
             shown!(
@@ -2995,7 +2990,7 @@ mod failed_updates {
         for (failed, stayed) in failures().into_iter().zip(failures()) {
             let (exit, code) = (stayed.exit_code(), stayed.code());
             let first = stayed.to_string();
-            let both = with_staging_left(failed, left());
+            let both = with_staging_left(failed, left().as_ref());
             assert_eq!((both.exit_code(), both.code()), (exit, code));
             let text = both.to_string();
             assert!(text.starts_with(&first), "{text}");
