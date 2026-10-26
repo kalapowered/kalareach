@@ -214,7 +214,9 @@ empty-prompt Ctrl-D, fenced `shell.launch` or authoritative editor-buffer observ
 
 `managed` launches a KalaReach-qualified shell package, and claims all three, except that the
 PowerShell package on Windows reports no end-of-file gesture and so claims no empty-prompt Ctrl-D
-(`kr detach --attachment <id>` detaches there). A shell no installed
+(`kr detach --attachment <id>` detaches there), and that in the package's Vi edit mode the module
+takes the empty-prompt Ctrl-D and reads the worker's requests only from the insert table (in the
+command table Ctrl-D ends the shell at an empty line). A shell no installed
 package qualifies returns `SHELL_INTEGRATION_UNSUPPORTED` naming that shell; `native_compat` is
 never substituted for it.
 
