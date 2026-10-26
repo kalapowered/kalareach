@@ -865,13 +865,15 @@ prefix of a chain verifies on its own, so the head statement is what says the ch
 
 `PolicyAuthority::check_structure` makes every check that needs neither a signature nor the clock:
 ordering, succession, activation times, that the head names the last revision, and that it was not
-issued before that revision took over. Accepting a chain is that check, then matching the pinned
-link against the pin itself (organisation, revision and public key), rather than verifying its
-signature, which belongs to its predecessor at every revision after the first, then the signature
-of each later link under the key of the revision it names as its predecessor, then the head under
-the key of the revision the head names, then that the head is valid at the current time, then
-refusing a head below the highest revision this host has already accepted, and only then
-recording the new highest revision.
+issued before that revision took over. A host that enrols accepts a chain by that check, then the
+signature of the first link under its own key, then each later link under the key of the revision it
+names as its predecessor, then the head under the key of the revision the head names, then that the
+head is valid at the current time. An enrolled host reads the head's revision first: a head at the
+revision it holds changes nothing, and one below it is answered as stale. Only a head above it is
+checked: the structure check, then that the chain carries the host's anchor link, equal in every
+byte to the link the host holds, then each later link under the key of its predecessor, then the
+head and its time, and only then does the host record the new highest revision and the links that
+followed its anchor.
 
 A chain authenticates forward. `PolicyAuthority::authenticated_from` returns the links a host may
 verify anything against, given the revision it pinned: the pin and everything after it. A lease
