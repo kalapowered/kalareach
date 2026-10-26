@@ -519,7 +519,7 @@ pub(super) fn read(gsettings: &Gsettings, spec: Spec, wrote: &SettingsWrote) -> 
     let target = format!("{}:{}", wrote.schema, wrote.path);
     let unused = format!("{}:{}", wrote.schema, unused_path(&spec));
     let in_list = profiles(gsettings, &spec)
-        .map(|list| list.iter().any(|existing| *existing == wrote.list.member))
+        .map(|list| list.contains(&wrote.list.member))
         .unwrap_or(false);
     let Ok(keys) = gsettings.keys(&wrote.schema) else {
         return Reading::Changed;

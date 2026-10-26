@@ -172,6 +172,12 @@ fn say_place(place: Place<'_>) {
             Asked::text(Request::TerminalProfile, schema),
             Asked::text(Request::TerminalProfile, path)
         )),
+        Place::Preferences { domain, key, entry } => output::line(&stdout_line!(
+            "  where: the {} entry {} of the preferences of {}",
+            Asked::text(Request::TerminalProfile, key),
+            Asked::text(Request::TerminalProfile, entry),
+            Asked::text(Request::TerminalProfile, domain)
+        )),
     }
 }
 
@@ -184,6 +190,13 @@ fn json_place(document: Document, place: Place<'_>) -> Document {
             Document::new()
                 .with("schema", Asked::text(Request::TerminalProfile, schema))
                 .with("path", Asked::text(Request::TerminalProfile, path)),
+        ),
+        Place::Preferences { domain, key, entry } => document.with(
+            "preferences",
+            Document::new()
+                .with("domain", Asked::text(Request::TerminalProfile, domain))
+                .with("key", Asked::text(Request::TerminalProfile, key))
+                .with("entry", Asked::text(Request::TerminalProfile, entry)),
         ),
     }
 }
@@ -355,7 +368,13 @@ fn status(paths: &HostPaths, record: &ProfileRecord, json: bool) -> Result<()> {
                 Asked::text(Request::TerminalProfile, &wrote.schema),
                 Asked::text(Request::TerminalProfile, &wrote.path)
             )),
-            Some(Wrote::Preferences(_)) | None => {}
+            Some(Wrote::Preferences(wrote)) => output::line(&stdout_line!(
+                "  preferences: the {} entry {} of {}",
+                Asked::text(Request::TerminalProfile, &wrote.key),
+                Asked::text(Request::TerminalProfile, &wrote.entry),
+                Asked::text(Request::TerminalProfile, &wrote.domain)
+            )),
+            None => {}
         }
     }
     output::say(&shown!(
@@ -417,7 +436,16 @@ fn status_json(status: &terminal_profile::Status) -> Document {
                     )
                     .with("path", Asked::text(Request::TerminalProfile, &wrote.path)),
             ),
-            Wrote::Preferences(_) => {}
+            Wrote::Preferences(wrote) => document.set(
+                "preferences",
+                Document::new()
+                    .with(
+                        "domain",
+                        Asked::text(Request::TerminalProfile, &wrote.domain),
+                    )
+                    .with("key", Asked::text(Request::TerminalProfile, &wrote.key))
+                    .with("entry", Asked::text(Request::TerminalProfile, &wrote.entry)),
+            ),
         }
     }
     document
@@ -464,6 +492,12 @@ fn install_profile(
     // An application that is not there is refused before anything is held or written.
     if !terminal_profile::is_present(terminal, home) {
         return Err(failure(&ProfileError::NotInstalled(terminal), home));
+    }
+    // The person's own Terminal rewrites its preferences when it ends, and what an outside write
+    // does while it runs is not known: a dry run says what it would write, and a real install waits
+    // until Terminal is not running.
+    if !arguments.dry_run && terminal_profile::is_running(terminal) {
+        return Err(failure(&ProfileError::Running(terminal), home));
     }
     let plan = if arguments.dry_run {
         let recorded = record
@@ -577,10 +611,12 @@ fn remove_profiles(
             .iter()
             .filter(|profile| only.is_none_or(|only| only == profile.terminal))
             .map(|profile| {
-                (
-                    profile.terminal,
-                    terminal_profile::remove(&held, profile.terminal, home).map(RemovalReport::Did),
-                )
+                let removed = if terminal_profile::is_running(profile.terminal) {
+                    Err(ProfileError::Running(profile.terminal))
+                } else {
+                    terminal_profile::remove(&held, profile.terminal, home)
+                };
+                (profile.terminal, removed.map(RemovalReport::Did))
             })
             .collect()
     } else {
@@ -777,6 +813,19 @@ fn failure(error: &ProfileError, home: &ProfileHome) -> CliError {
         ProfileError::RecordedOtherwise(terminal) => CliError::Usage(shown!(
             "the record names {}'s profile as another kind of write than this platform makes; \
              run kr host terminal-profile remove first",
+            Shown::said(terminal.name())
+        )),
+        ProfileError::Running(terminal) => CliError::Usage(shown!(
+            "{} is running, and what an outside change to its preferences does while it runs is \
+             not known; quit {}, and run this from another application, an SSH session or the \
+             setup assistant. Nothing was written",
+            Shown::said(terminal.name()),
+            Shown::said(terminal.name())
+        )),
+        ProfileError::NoProfiles(terminal) => CliError::Usage(shown!(
+            "{}'s preferences hold no profile to copy, so there is nothing to base the KalaReach \
+             profile on; open {} once and run this again. Nothing was written",
+            Shown::said(terminal.name()),
             Shown::said(terminal.name())
         )),
         ProfileError::ToolMissing(terminal) => CliError::Usage(shown!(
