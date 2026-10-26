@@ -914,6 +914,98 @@ pub fn a_cancelled_key_sequence_is_not_the_gesture_on_a_terminal_whose_eof_byte_
 const LENGTH_FUNCTION: &str =
     "function global:kr-length { Write-Output ('kr-' + 'length-' + $args[0].Length) }\n";
 
+/// KR-REQ-07.73: a key the editor binds nothing to is left to the editor when the gesture sits on
+/// it, and what the editor does with such a key is to put the character it carries in the line.
+///
+/// PSReadLine's Windows edit mode binds no end-of-file chord, which is the platform's; here the
+/// person has taken the binding off the key the terminal names, which leaves the editor with no
+/// operation for it. The module's decision is on that key all the same, and a key outside the
+/// detach condition (here a line with text in it) is what it passes on.
+pub fn an_unbound_gesture_key_does_what_the_editor_does_with_an_unbound_key(kind: ShellKind) {
+    let package = Package::built(kind);
+    let mut session = Session::start_with_profile(
+        &package,
+        Profile {
+            after_configuration: &format!(
+                "Remove-PSReadLineKeyHandler -Chord Ctrl+d\n{LENGTH_FUNCTION}"
+            ),
+            ..Profile::ORDINARY
+        },
+    );
+    session.first_prompt();
+    session.forget_events();
+    assert!(
+        session.answered("kr-ready"),
+        "the shell did not answer:\n{}",
+        session.terminal_output()
+    );
+
+    assert!(session.wait_for_prompt());
+    assert!(session.wait_for_editor_reading());
+    let start = session.written();
+    session.type_bytes(b"kr-length abc");
+    assert!(session.wait_for_editor(start));
+    // The cursor goes back one place, in front of the last character.
+    session.type_bytes(b"\x1b[D");
+    session.type_bytes(CTRL_D);
+    let before_return = session.written();
+    session.type_bytes(b"\r");
+    // What the editor does with an unbound key is to insert the character the key carries, so the
+    // line runs with four characters. The operation the module used to run in its place deleted
+    // the last one, which left two.
+    assert!(
+        session
+            .drew_after(before_return, "kr-length-4", REPLY)
+            .was_drawn(),
+        "the gesture key did not do what the editor does with an unbound key:\n{}",
+        session.terminal_output()
+    );
+    assert!(session.alive());
+}
+
+/// KR-REQ-07.73: the key that moves the gesture still does what it was bound to.
+///
+/// A person whose terminal has another end-of-file character than the worker was told of has
+/// changed the gesture before the first prompt, and the change takes effect at the first key the
+/// module's decision sees afterwards, which is the old one. The decision moves to the new key
+/// before the old key's press has run, and the press runs what stood on the old key, whatever
+/// stood on the new one.
+pub fn the_key_that_promotes_a_changed_gesture_runs_what_was_bound_to_it(kind: ShellKind) {
+    let package = Package::built(kind);
+    let mut session = Session::start_with_profile(
+        &package,
+        Profile {
+            after_configuration: LENGTH_FUNCTION,
+            terminal_eof: Some("^e"),
+            ..Profile::ORDINARY
+        },
+    );
+    session.first_prompt();
+
+    // Nothing is typed before the key itself: the change takes effect at the prompt's first key,
+    // and a command run first would have the next prompt take it on entry.
+    assert!(session.wait_for_prompt());
+    assert!(session.wait_for_editor_reading());
+    let start = session.written();
+    session.type_bytes(b"kr-length abc");
+    assert!(session.wait_for_editor(start));
+    session.type_bytes(b"\x1b[D");
+    // The old gesture key, which the editor binds to deleting the character under the cursor, so
+    // the line runs with two characters. The new one is bound to going to the end of the line,
+    // which would leave three.
+    session.type_bytes(CTRL_D);
+    let before_return = session.written();
+    session.type_bytes(b"\r");
+    assert!(
+        session
+            .drew_after(before_return, "kr-length-2", REPLY)
+            .was_drawn(),
+        "the key that moved the gesture did not run what stood on it:\n{}",
+        session.terminal_output()
+    );
+    assert!(session.alive());
+}
+
 /// `detach-condition-exclusions`: outside the condition the editor keeps the key.
 pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
     let package = Package::built(kind);

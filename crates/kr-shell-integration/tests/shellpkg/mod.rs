@@ -389,6 +389,10 @@ pub struct Profile<'a> {
     /// What the person keeps in the PowerShell profile that every host reads, which runs before the
     /// profile its own host reads. Nothing for the other shells.
     pub all_hosts: &'a str,
+    /// The end-of-file character the person's terminal has when the shell starts, as `stty` spells
+    /// it. A terminal setting the person changes from inside the shell does not outlast the
+    /// command that changed it in every editor, so this is set before the shell is started.
+    pub terminal_eof: Option<&'a str>,
 }
 
 impl Profile<'_> {
@@ -398,6 +402,7 @@ impl Profile<'_> {
         entry: true,
         after_entry: "",
         all_hosts: "",
+        terminal_eof: None,
     };
 }
 
@@ -912,7 +917,16 @@ impl Session {
             })
             .expect("a pseudo-terminal");
 
-        let mut command = CommandBuilder::new(&package.executable);
+        let mut command = if let Some(eof) = profile.terminal_eof {
+            // The terminal is set up first, by the program that sets terminals up, and the shell
+            // takes over its place: what it finds is the person's terminal as it was.
+            let mut command = CommandBuilder::new("/bin/sh");
+            command.args(["-c", "stty eof \"$1\" && shift && exec \"$@\"", "sh", eof]);
+            command.arg(&package.executable);
+            command
+        } else {
+            CommandBuilder::new(&package.executable)
+        };
         match package.kind {
             ShellKind::PowerShell => {
                 // The host reads its profile and drops into its own read loop; nothing else about
