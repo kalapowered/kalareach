@@ -499,9 +499,9 @@ async fn a_submitted_file_follows_its_sessions_retention_on_a_clock_the_host_can
     );
 }
 
-/// KR-REQ-20.21: a pass of the collection that waits for a blocking thread keeps nothing of the
-/// daemon, and with it the environment's lock, once the daemon's owner has let it go. When its turn
-/// comes it finds the daemon gone and does nothing.
+/// A pass of the collection that waits for a blocking thread keeps nothing of the daemon, and with
+/// it the environment's lock, once the daemon's owner has let it go. When its turn comes it finds
+/// the daemon gone and does nothing.
 ///
 /// The runtime here has one blocking thread, which the case takes once the daemon's own first pass
 /// has ended. A pass is queued as it is asked for, so from then on it waits for that thread.
