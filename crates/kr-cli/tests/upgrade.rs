@@ -4021,7 +4021,6 @@ async fn a_rollback_leaves_the_record_of_a_restored_policy_and_an_update_again_w
         kr_protocol::scalars::TimestampMs::new(1_000),
     );
     restored::write(&file, &found).expect("a record of a restore");
-    let written = std::fs::read(&file).expect("the record reads");
     let controller = updated.host.store.stable(Program::Controller);
     updated.host.start_daemon(&controller).await;
     let host = &updated.host;
@@ -4035,6 +4034,14 @@ async fn a_rollback_leaves_the_record_of_a_restored_policy_and_an_update_again_w
             .contains("restored from an earlier state"),
         "refused for the restored policy: {refusal}"
     );
+    // The record named another policy, so the start rewrote it to name the one the host holds and
+    // kept the moment the restore was found.
+    let Found::Record(held) = restored::read(&file) else {
+        panic!("the record stands");
+    };
+    assert_ne!(held.subject, found.subject);
+    assert_eq!(held.found_at_ms, found.found_at_ms);
+    let written = std::fs::read(&file).expect("the record reads");
 
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
@@ -4077,16 +4084,11 @@ async fn a_rollback_leaves_the_record_of_a_restored_policy_and_an_update_again_w
         format!("kr-controller/{}", updated.two.name()),
         "the daemon is this build's again"
     );
-    let Found::Record(named) = restored::read(&file) else {
-        panic!("the record stands");
-    };
-    assert_ne!(
-        named.subject, found.subject,
-        "it was written to name the policy the host holds"
-    );
     assert_eq!(
-        named.found_at_ms, found.found_at_ms,
-        "and the moment the restore was found stays"
+        std::fs::read(&file).expect("the record is still there"),
+        written,
+        "the update again finds the record as it was left, naming the policy the host holds, with \
+         the moment the restore was found"
     );
     let refusal = door
         .is_served_again()
