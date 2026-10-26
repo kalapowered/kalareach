@@ -2728,6 +2728,16 @@ fn collect(
 ) -> (Vec<ReleaseName>, Vec<NotRemoved>) {
     let mut removed = Vec::new();
     let mut not_removed = Vec::new();
+    // What an earlier removal left because a program that holds nothing ran from the release. It
+    // goes first, so that a release this run moves into the trash and cannot finish removing is
+    // told once, as that release, and not again as something left there.
+    #[cfg(windows)]
+    if let Err(error) = store.sweep_trash(update) {
+        not_removed.push(NotRemoved {
+            what: Remains::Trash,
+            reason: said(&error),
+        });
+    }
     // Without the current release no release can be judged unneeded, so none is removed.
     let (current, releases) = match store
         .current()
@@ -2757,14 +2767,6 @@ fn collect(
                 reason: said(&error),
             }),
         }
-    }
-    // What an earlier removal left because a program that holds nothing ran from the release.
-    #[cfg(windows)]
-    if let Err(error) = store.sweep_trash(update) {
-        not_removed.push(NotRemoved {
-            what: Remains::Trash,
-            reason: said(&error),
-        });
     }
     (removed, not_removed)
 }
@@ -2846,6 +2848,58 @@ mod collecting {
         }
     }
 
+    /// KR-REQ-26.06: a release that cannot be removed for no program's sake is moved into the trash
+    /// before the refusal, and is told once, as that release: the sweep of the trash does not tell
+    /// it again as something left there.
+    #[cfg(windows)]
+    #[test]
+    fn a_release_that_cannot_be_removed_is_reported_once() {
+        let temp = tempfile::tempdir().expect("a directory");
+        let (store, releases) = store_with_two_releases(temp.path());
+        // The first release's program is a second name for a read-only file elsewhere whose access
+        // list denies its owner the right to change attributes and is not the seal's: the removal
+        // leaves that list as it is and refuses to take the name.
+        let shared = temp.path().join("shared");
+        std::fs::write(&shared, b"shared").expect("a file elsewhere");
+        let mut permissions = std::fs::metadata(&shared).expect("there").permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&shared, permissions).expect("read-only");
+        let icacls = |arguments: &[&str]| {
+            let run = std::process::Command::new("icacls")
+                .arg(&shared)
+                .args(arguments)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .expect("icacls runs");
+            assert!(run.success(), "icacls {arguments:?}");
+        };
+        let directory = store.release_directory(&releases[0]);
+        std::fs::create_dir_all(directory.join("bin")).expect("a directory");
+        std::fs::hard_link(&shared, directory.join("bin").join("kr.exe")).expect("a hard link");
+        icacls(&["/deny", "*S-1-1-0:(WA)"]);
+
+        let (removed, not_removed) = collected(&store);
+
+        // Put it right, so that the test leaves nothing behind.
+        icacls(&["/remove:d", "*S-1-1-0"]);
+        for entry in std::fs::read_dir(store.trash())
+            .expect("the trash")
+            .flatten()
+        {
+            let _ = kr_ipc::install::remove_sealed_tree(&entry.path());
+        }
+        assert_eq!(removed, vec![releases[1].clone()], "the other release goes");
+        assert!(
+            matches!(
+                not_removed.as_slice(),
+                [NotRemoved { what: Remains::Release(release), .. }] if *release == releases[0]
+            ),
+            "the refusal is told once, as the release"
+        );
+    }
+
+    /// KR-REQ-26.06: a failure to list the releases reaches the update's result, as a refusal to
+    /// remove one does.
     #[test]
     fn releases_that_cannot_be_listed_are_reported_and_nothing_is_removed() {
         let temp = tempfile::tempdir().expect("a directory");
