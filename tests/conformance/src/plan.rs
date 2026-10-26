@@ -2013,7 +2013,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         cases: &[],
         runs: Runs::Command {
             file: "scripts/real-package-cases.sh",
-            line: "step cargo test -p kr-worker --test fence -- --ignored --exact a_real_qualified_package_registers_and_qualifies_on_this_hosts_endpoint a_startup_prompt_takes_its_answer_through_the_worker_and_the_session_is_ready_after_the_profile a_startup_prompt_nobody_answers_leaves_the_session_not_ready_and_it_still_closes a_real_package_asks_the_real_worker_before_each_command_and_runs_a_bypass_as_typed a_real_shell_that_ran_cd_is_described_by_its_new_directory_at_the_next_prompt a_real_shell_names_the_program_it_resolved_and_not_a_word_it_found_no_file_for a_real_readers_fence_is_invalidated_by_the_hosts_answer_and_proven_again a_moved_powershell_package_qualifies_with_its_own_module_over_a_competing_one",
+            line: "step cargo test -p kr-worker --test fence -- --ignored --exact a_real_qualified_package_registers_and_qualifies_on_this_hosts_endpoint a_startup_prompt_takes_its_answer_through_the_worker_and_the_session_is_ready_after_the_profile a_startup_prompt_nobody_answers_leaves_the_session_not_ready_and_it_still_closes a_real_package_asks_the_real_worker_before_each_command_and_runs_a_bypass_as_typed a_real_shell_that_ran_cd_is_described_by_its_new_directory_at_the_next_prompt a_real_shell_names_the_program_it_resolved_and_not_a_word_it_found_no_file_for a_real_readers_fence_is_invalidated_by_the_hosts_answer_and_proven_again kr_req_13_11_a_real_reader_is_launchable_at_its_prompt_and_not_after_a_key_until_the_next a_moved_powershell_package_qualifies_with_its_own_module_over_a_competing_one",
         },
     },
     IgnoredRun {
