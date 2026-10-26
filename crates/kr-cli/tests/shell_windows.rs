@@ -655,12 +655,17 @@ async fn install_package(
     generation_home
 }
 
-/// KR-REQ-12.07, KR-REQ-07.45: the bundled Claude Code and Qoder CLI packages (the release's own
-/// files, published in a generation of the test's own), with their integrations turned on, launch
-/// the program a person types in the managed shell through the forwarder, which adds the flags
-/// each package declares and gives the program the variables of its registration. The controls are
-/// the same program started by its path, which is not integrated and runs as typed, and a shim
-/// found first, which is never launched through the forwarder.
+/// KR-REQ-01.06, KR-REQ-12.07, KR-REQ-07.45: the bundled Claude Code and Qoder CLI packages (the
+/// release's own files, published in a generation of the test's own), with their integrations
+/// turned on, launch the program a person types in the managed shell through the forwarder, which
+/// adds the flags each package declares and gives the program the variables of its registration.
+/// The controls are the same program started by its path, which is not integrated and runs as
+/// typed, and a shim found first, which is never launched through the forwarder.
+///
+/// For KR-REQ-01.06 on Windows: an agent is started by its own name typed at the prompt, with no
+/// launcher of the person's to type first, and the words typed after the name reach the program as
+/// typed; the same program by its path and a shim found first run as typed, and the status the
+/// program ends with is the status of the line.
 ///
 /// The programs are copies of the command shell, which prints what it is given after `/c` once it
 /// has expanded the variables in it, so the launch is read from what the program printed. Each
@@ -1023,4 +1028,810 @@ impl<F: Fn() -> Option<kr_plugin_service::protocol::HostDescriptor>> Drop for Ho
             kr_ipc::identity::process_state(&process)
         );
     }
+}
+
+/// The system directory's own copy of a program, which no search path can stand in for.
+fn system32(program: &str) -> PathBuf {
+    PathBuf::from(std::env::var_os("SystemRoot").expect("the system directory"))
+        .join("System32")
+        .join(program)
+}
+
+/// Every process of the system named `image`, by its identifier.
+fn processes_named(image: &str) -> Vec<u32> {
+    let listed = Command::new(system32("tasklist.exe"))
+        .args(["/FI", &format!("IMAGENAME eq {image}"), "/FO", "CSV", "/NH"])
+        .output()
+        .expect("tasklist runs");
+    String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.trim().trim_matches('"').split("\",\"");
+            let name = fields.next()?;
+            let pid = fields.next()?;
+            name.eq_ignore_ascii_case(image).then(|| pid.parse().ok())?
+        })
+        .collect()
+}
+
+/// The programs of the product that run in login session `session`, by image name.
+fn product_programs_in(session: u32) -> Vec<String> {
+    let listed = Command::new(system32("tasklist.exe"))
+        .args(["/FI", &format!("SESSION eq {session}"), "/FO", "CSV", "/NH"])
+        .output()
+        .expect("tasklist runs");
+    String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .filter_map(|line| line.trim().trim_matches('"').split("\",\"").next())
+        .filter(|name| name.to_ascii_lowercase().starts_with("kr-"))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Holding a process still, as a signal from a terminal does: every thread of it stops, and it
+/// answers nothing until it is ended.
+mod held {
+    #![expect(
+        unsafe_code,
+        reason = "stopping a process is a native call with no safe interface: the process is opened \
+                  by its identifier and `NtSuspendProcess` is handed that handle, and nothing else"
+    )]
+
+    use kr_ipc::identity::{ProcessState, process_state};
+    use kr_protocol::identity::ProcessStartIdentity;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SUSPEND_RESUME};
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtSuspendProcess(process: HANDLE) -> i32;
+    }
+
+    /// Stops every thread of the process `identity` names, once that is shown to be the process
+    /// that was started.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the process cannot be opened, is not the one that was recorded, or is not
+    /// stopped.
+    pub fn still(identity: &ProcessStartIdentity) {
+        let pid = u32::try_from(identity.pid.get()).expect("a process identifier");
+        // SAFETY: the call takes numbers and returns a handle this function owns and closes.
+        let process = unsafe { OpenProcess(PROCESS_SUSPEND_RESUME, 0, pid) };
+        assert!(
+            !process.is_null(),
+            "process {pid} is opened to be held still: {}",
+            std::io::Error::last_os_error()
+        );
+        // An identifier is not given to another process while a handle to its process is open, so
+        // what is read now, with the handle held, is the process that was started.
+        assert_eq!(
+            process_state(identity),
+            ProcessState::Running,
+            "process {pid} is still the one that was started"
+        );
+        // SAFETY: the handle is open for the call, and was opened with the right to suspend.
+        let status = unsafe { NtSuspendProcess(process) };
+        // SAFETY: the handle was opened above and is closed once. The process stays stopped.
+        unsafe { CloseHandle(process) };
+        assert!(status >= 0, "NtSuspendProcess answered {status:#x}");
+    }
+}
+
+/// The component with a section of its own at the end, so that its digest is one no host has
+/// compiled before and a registration of it is a cold compile.
+fn a_component_of_its_own(component: &[u8]) -> Vec<u8> {
+    let name = b"kr-attempt";
+    let identity = kr_ipc::new_uuid();
+    let identity = identity.as_bytes();
+    let mut section = vec![u8::try_from(name.len()).expect("a short name")];
+    section.extend_from_slice(name);
+    section.extend_from_slice(identity);
+    let mut bytes = component.to_vec();
+    // A custom section: its identifier, its size (which one byte holds), then its contents.
+    bytes.push(0);
+    bytes.push(u8::try_from(section.len()).expect("a short section"));
+    bytes.extend_from_slice(&section);
+    bytes
+}
+
+/// Asks `check` until it answers, or the liveness deadline passes.
+async fn until<T, Fut>(what: &str, mut check: impl FnMut() -> Fut) -> T
+where
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let started = tokio::time::Instant::now();
+    loop {
+        if let Some(found) = check().await {
+            return found;
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "waited {LIVENESS_DEADLINE:?} for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Reads what the session writes until `done` says the terminal shows what it waits for, or the
+/// liveness deadline passes.
+async fn watched_until(
+    terminal: &mut WorkerTerminal,
+    what: &str,
+    done: impl Fn(&WorkerTerminal) -> bool,
+) {
+    let started = tokio::time::Instant::now();
+    while !done(terminal) {
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "waited {LIVENESS_DEADLINE:?} for {what}; the terminal shows: {}",
+            terminal.text()
+        );
+        terminal.watch(Duration::from_millis(50)).await;
+    }
+}
+
+/// The plugin host the daemon has published for `environment`, where it has.
+fn published_host(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+) -> Option<kr_plugin_service::protocol::HostDescriptor> {
+    kr_plugin_service::launcher::read_descriptor(
+        environment,
+        &kr_plugin_service::protocol::HostProtocol::THIS,
+    )
+    .ok()
+    .flatten()
+}
+
+/// The process identity the worker of `session_id` published.
+fn worker_of(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+    session_id: kr_protocol::ids::SessionId,
+) -> kr_protocol::identity::ProcessStartIdentity {
+    kr_ipc::descriptor::read_all(environment)
+        .expect("reads the runtime directory")
+        .into_iter()
+        .filter_map(|entry| entry.descriptor.ok())
+        .find(|descriptor| descriptor.session_id == session_id)
+        .expect("the worker published its descriptor")
+        .process_start_identity
+}
+
+/// Ends the process by the identity it was started under, and waits until it is read as ended.
+async fn end_by_identity(process: &kr_protocol::identity::ProcessStartIdentity) {
+    use kr_ipc::identity::{ProcessState, Stop, Stopped, process_state, stop_process};
+
+    let answer = stop_process(process, Stop::Kill);
+    if !matches!(answer, Stopped::Signalled | Stopped::Gone) {
+        eprintln!("process {} was not stopped: {answer:?}", process.pid.get());
+    }
+    until("the process to end", || async {
+        (process_state(process) == ProcessState::Ended).then_some(())
+    })
+    .await;
+}
+
+/// What a worker reports of a binding's component while the plugin host has not yet answered its
+/// registration.
+const REGISTERING: &str = "registering with the plugin runtime";
+
+/// Whether `report` says the worker has sent a binding's registration and has no answer.
+fn is_registering(report: &kr_protocol::admission::ComponentReport) -> bool {
+    report.state == ComponentState::Pending && report.reason.0.as_deref() == Some(REGISTERING)
+}
+
+/// What every worker reports of its bindings' components, after each has been asked again; or
+/// nothing, where a worker did not answer.
+async fn reported_fresh(
+    controller: &kr_controller::service::Controller,
+) -> Option<Vec<kr_protocol::admission::ComponentReport>> {
+    controller.refresh_admissions().await.then(|| {
+        controller
+            .reported_components()
+            .into_iter()
+            .map(|(_, _, report)| report)
+            .collect()
+    })
+}
+
+/// The highest number of the numbered lines the stand-in program has printed that the terminal
+/// shows.
+fn ticks(terminal: &WorkerTerminal) -> u64 {
+    terminal
+        .text()
+        .split("tick-")
+        .skip(1)
+        .filter_map(|piece| {
+            piece
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse::<u64>()
+                .ok()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// A managed session on a host whose catalogue holds a package that ships a component, with the
+/// package's integration on and a stand-in for the agent it recognises first on the shell's
+/// search path.
+struct Running {
+    /// What the session's shell is typed at, first so it goes before the host.
+    terminal: WorkerTerminal,
+    /// The host, which goes before the files its daemon and workers read.
+    managed: Managed,
+    session_id: kr_protocol::ids::SessionId,
+    environment: kr_ipc::paths::EnvironmentPaths,
+    /// The package, its published generation and the stand-in, in use as long as the host runs.
+    directories: Vec<tempfile::TempDir>,
+}
+
+impl Running {
+    /// Starts the host and the session around a package that ships `component`.
+    async fn start(component: &[u8]) -> Self {
+        let (turn, prepared) = take_a_turn();
+        let package = tempfile::tempdir().expect("a directory on the internal disk");
+        let directory = component_package(package.path(), component);
+        let published = install_package(
+            &prepared,
+            &directory,
+            "development",
+            &generations::KeySet::generate(),
+        )
+        .await;
+        let managed = Managed::start(turn, prepared).await;
+        managed.install_entries().await;
+        let enabled = managed
+            .host
+            .kr(
+                &[
+                    "--json",
+                    "plugin",
+                    "integration",
+                    "enable",
+                    "kalareach/claude-code",
+                ],
+                &[],
+            )
+            .await;
+        assert!(
+            enabled.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&enabled.stdout),
+            String::from_utf8_lossy(&enabled.stderr)
+        );
+        let programs = stand_ins();
+        stand_in(programs.path(), "claude");
+        let created = managed.host.kr_new(&[]).await;
+        let (session_id, _) = created.session();
+        let mut terminal = managed.terminal(&created).await;
+        answering(&mut terminal).await;
+        first_on_the_path(&mut terminal, programs.path()).await;
+        let environment = managed.host.tree.environment();
+        Self {
+            terminal,
+            managed,
+            session_id,
+            environment,
+            directories: vec![package, published, programs],
+        }
+    }
+}
+
+/// What an attempt at holding a registration in flight came to.
+enum Attempt {
+    /// The registration was held outstanding, the host ended with it so, and everything the claim
+    /// is about was shown.
+    Held,
+    /// The registration was answered before it could be held, which shows nothing about it.
+    Missed(String),
+}
+
+/// How many times the case tries to hold a registration in flight before it says it could not.
+const HOLD_ATTEMPTS: u32 = 3;
+
+/// One attempt: a program that prints a numbered line every moment is typed at the managed
+/// prompt, and when a worker's report first reads that its registration has been sent and is not
+/// answered, the plugin host is held still. The registration is outstanding while the host stays
+/// so; the host is then ended by the identity it was started under, and what the worker, the
+/// program, the terminal and the binding do after is read.
+async fn hold_a_registration_and_end_the_host() -> Attempt {
+    // Every attempt has a component whose digest no host has compiled, so the registration is a
+    // cold compile: the time the host takes over it is what the worker's report can be seen in.
+    let component = a_component_of_its_own(&well_behaved());
+    let mut world = Running::start(&component).await;
+    let environment = world.environment.clone();
+    let published = || published_host(&environment);
+    assert!(
+        published().is_none(),
+        "a plugin host was published before any program was typed"
+    );
+    // The plugin host is the environment's own job, which no test teardown ends: it goes when this
+    // attempt does, whichever way the attempt goes.
+    let _host_ends = HostEnding(&published);
+    let controller = world.managed.host.controller();
+
+    // The program prints the registration its launcher gave it, which the typed line cannot spell,
+    // and then a numbered line every moment; `rem` takes the flags the integration adds after what
+    // was typed, so they reach the command shell as a comment.
+    world
+        .terminal
+        .type_line(
+            "claude /c 'echo reg=%KR_REGISTRATION% & for /l %i in (1,1,100000) do \
+             @(echo tick-%i & ping -n 1 127.0.0.1 >nul) & rem'",
+        )
+        .await;
+    world
+        .terminal
+        .shown("registration.", "the program started with its registration")
+        .await;
+
+    // The worker's report is looked at as fast as the workers answer, until it reads that the
+    // registration has been sent.
+    let started = tokio::time::Instant::now();
+    loop {
+        let reports = reported_fresh(&controller).await;
+        match reports.as_deref() {
+            Some([report]) if is_registering(report) => break,
+            Some([report]) if report.state == ComponentState::Registered => {
+                return Attempt::Missed(
+                    "the registration was answered before a report of it outstanding was read"
+                        .to_owned(),
+                );
+            }
+            _ => {}
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "the registration was never reported as sent; the workers report {reports:?}; the \
+             terminal shows: {}",
+            world.terminal.text()
+        );
+        world.terminal.watch(Duration::from_millis(5)).await;
+    }
+    let host = published()
+        .expect("the plugin host is published while a worker registers with it")
+        .process_start_identity;
+    held::still(&host);
+    eprintln!("plugin host {} is held still", host.pid.get());
+
+    // Held still, the host answers nothing. The registration is outstanding if the worker's own
+    // report, asked for again after the terminal has been sent twenty more lines, still says so.
+    let mark = ticks(&world.terminal);
+    let looked_at = tokio::time::Instant::now();
+    loop {
+        world.terminal.watch(Duration::from_millis(50)).await;
+        if let Some(reports) = reported_fresh(&controller).await {
+            match reports.as_slice() {
+                [report] if is_registering(report) => {
+                    if ticks(&world.terminal) > mark + 20 {
+                        break;
+                    }
+                }
+                [report] if report.state == ComponentState::Registered => {
+                    return Attempt::Missed(
+                        "the registration was answered before the host was held still".to_owned(),
+                    );
+                }
+                other => panic!("a held host's registration is reported as {other:?}"),
+            }
+        }
+        assert!(
+            looked_at.elapsed() < LIVENESS_DEADLINE,
+            "the terminal was sent no more lines while the registration was outstanding: {}",
+            world.terminal.text()
+        );
+    }
+    assert_eq!(
+        kr_ipc::identity::process_state(&host),
+        kr_ipc::identity::ProcessState::Running,
+        "the host is held still and is not ended"
+    );
+
+    // The host ends with the registration outstanding.
+    let worker = worker_of(&environment, world.session_id);
+    end_by_identity(&host).await;
+    assert_eq!(
+        kr_ipc::identity::process_state(&worker),
+        kr_ipc::identity::ProcessState::Running,
+        "the worker ended with the plugin host"
+    );
+    let after_the_end = ticks(&world.terminal);
+    watched_until(
+        &mut world.terminal,
+        "the terminal to be sent lines after the host ended",
+        |terminal| ticks(terminal) > after_the_end + 20,
+    )
+    .await;
+
+    // A replacement is the daemon's doing, on the worker's asking: a host that is not the first,
+    // and the binding registered with it.
+    let replacement = until("a replacement plugin host to be published", || async {
+        published()
+            .map(|descriptor| descriptor.process_start_identity)
+            .filter(|started| *started != host)
+    })
+    .await;
+    let waiting = tokio::time::Instant::now();
+    loop {
+        world.terminal.watch(Duration::from_millis(50)).await;
+        let reports = reported_fresh(&controller).await;
+        if reports.as_deref().is_some_and(
+            |reports| matches!(reports, [report] if report.state == ComponentState::Registered),
+        ) {
+            break;
+        }
+        assert!(
+            waiting.elapsed() < LIVENESS_DEADLINE,
+            "the binding was not registered with the replacement; the workers report {reports:?}"
+        );
+    }
+    let client = kr_plugin_service::client::PluginClient::connect(&environment)
+        .await
+        .expect("the replacement answers");
+    let health = client
+        .health()
+        .await
+        .expect("the replacement reports its health");
+    assert_eq!(health.live_bindings, 1, "{health:?}");
+    assert_ne!(replacement, host);
+
+    // And nothing else went with the host: the worker, and the program, which goes on printing.
+    assert_eq!(
+        kr_ipc::identity::process_state(&worker),
+        kr_ipc::identity::ProcessState::Running
+    );
+    let after_the_recovery = ticks(&world.terminal);
+    watched_until(
+        &mut world.terminal,
+        "the terminal to be sent lines after the recovery",
+        |terminal| ticks(terminal) > after_the_recovery + 20,
+    )
+    .await;
+    Attempt::Held
+}
+
+/// KR-REQ-05.07: a plugin host that ends with a registration unanswered takes no worker with it,
+/// and the binding comes back, on Windows.
+///
+/// A worker is running a program a package that ships a component recognises, which prints a
+/// numbered line every moment, and registers its binding with the plugin host the daemon started.
+/// The registration is sent and the host is held still the moment the worker reports that, so that
+/// the request goes unanswered: the worker's own report, asked for again after the terminal has
+/// been sent twenty lines more, still reads that it is registering. The host is then ended by the
+/// identity it was started under with that request outstanding. The worker goes on, the terminal
+/// goes on being sent lines it had not been sent, and the daemon starts a replacement under its
+/// bound, which the worker registers the binding with again, so that the host holds the binding.
+///
+/// A host that answered before it could be held shows nothing about a request outstanding, so an
+/// attempt that finds the registration answered is made again, up to a bound, and a case that could
+/// not hold one fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = writes_profiles!()]
+async fn a_plugin_host_that_ends_with_a_registration_unanswered_takes_no_worker_with_it_on_windows()
+{
+    let mut missed = Vec::new();
+    for attempt in 1..=HOLD_ATTEMPTS {
+        match hold_a_registration_and_end_the_host().await {
+            Attempt::Held => return,
+            Attempt::Missed(why) => {
+                eprintln!("attempt {attempt} showed nothing: {why}");
+                missed.push(why);
+            }
+        }
+    }
+    panic!("could not hold a registration in flight in {HOLD_ATTEMPTS} attempts: {missed:?}");
+}
+
+/// Where the case that signs the account out leaves what the case that follows the sign-out reads:
+/// in the account's own temporary directory, which the sign-out keeps.
+fn sign_out_record() -> PathBuf {
+    std::env::temp_dir().join("kr-sign-out-record.json")
+}
+
+/// The environment's task, as the Task Scheduler exports it, or nothing where there is none.
+fn exported_task(name: &str) -> Option<String> {
+    let output = Command::new(system32("schtasks.exe"))
+        .args(["/Query", "/TN", name, "/XML"])
+        .output()
+        .expect("schtasks runs");
+    output
+        .status
+        .success()
+        .then(|| kr_controller::supervision::windows::decode_output(&output.stdout))
+}
+
+/// What the host guide says of the per-user startup entry, read from `exported`: the user's own
+/// account, logged on where the user is signed in, with the least privilege, no trigger, instances
+/// in parallel, no time limit, and one action that runs the installation's `kr-controller` as the
+/// environment's starter.
+fn assert_the_entry_is_as_documented(exported: &str) {
+    use kr_controller::supervision::windows::{LogonType, RegisteredTask};
+
+    let user = kr_ipc::starter::current_user_sid().expect("this account");
+    let task = RegisteredTask::parse(exported);
+    assert_eq!(
+        task.user, user,
+        "the entry is not this account's: {exported}"
+    );
+    assert_eq!(
+        task.logon,
+        Some(LogonType::InteractiveToken),
+        "the entry does not log on where the user is signed in: {exported}"
+    );
+    assert!(
+        task.run_level.is_empty() || task.run_level == "LeastPrivilege",
+        "the entry does not run with the least privilege: {exported}"
+    );
+    assert!(!task.triggered, "the entry has a trigger: {exported}");
+    assert_eq!(task.multiple_instances, "Parallel", "{exported}");
+    assert_eq!(task.execution_time_limit, "PT0S", "{exported}");
+    assert_eq!(task.actions, 1, "{exported}");
+    assert!(
+        task.command
+            .to_ascii_lowercase()
+            .ends_with("kr-controller.exe")
+            && task.arguments.contains("--starter"),
+        "the entry's action does not run the starter: {exported}"
+    );
+}
+
+/// KR-REQ-07.69: with a plugin host running, an account's sign-out ends the session, and what the
+/// session started is the session's: the first half runs the session as a person's would run it
+/// and signs the account out, and the half that follows reads what is left.
+///
+/// A program a package with a component recognises is typed at the managed prompt of a session on
+/// Windows, and the daemon starts the plugin host and registers the component in it. Before the
+/// sign-out, the daemon (this test's process), the worker, the shell, the program and the plugin
+/// host are each shown running, by the identity they were started under, in this login session; the
+/// startup entry is shown to be the one the product registers, and as the host guide says it is.
+/// Their identities and the entry as the Task Scheduler exports it are kept for the half that
+/// follows; the account's profiles are put back; and the account is signed out, which ends this
+/// process.
+///
+/// The case is run by a run that signs the account in again afterwards, as a temporary standard
+/// account, and runs the case that follows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = writes_profiles!()]
+async fn with_a_plugin_host_running_the_session_is_set_up_and_the_account_signed_out() {
+    let component = well_behaved();
+    let mut world = Running::start(&component).await;
+    let environment = world.environment.clone();
+    let published = || published_host(&environment);
+    assert!(
+        published().is_none(),
+        "a plugin host was published before any program was typed"
+    );
+    // A host the sign-out does not end is still ended when the sign-out does not come.
+    let _host_ends = HostEnding(&published);
+    let controller = world.managed.host.controller();
+
+    // The program prints the registration its launcher gave it, and waits for a line to be typed to
+    // it; `rem` takes the flags the integration adds after what was typed.
+    world
+        .terminal
+        .type_line("claude /c 'echo reg=%KR_REGISTRATION% & set /p kr_release=waiting & rem'")
+        .await;
+    world
+        .terminal
+        .shown("registration.", "the program started with its registration")
+        .await;
+    let started = tokio::time::Instant::now();
+    loop {
+        let reports = reported_fresh(&controller).await;
+        if reports.as_deref().is_some_and(
+            |reports| matches!(reports, [report] if report.state == ComponentState::Registered),
+        ) {
+            break;
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "the component was not registered; the workers report {reports:?}; the terminal \
+             shows: {}",
+            world.terminal.text()
+        );
+        world.terminal.watch(Duration::from_millis(250)).await;
+    }
+    let host = published().expect("the plugin host is published");
+    let client = kr_plugin_service::client::PluginClient::connect(&environment)
+        .await
+        .expect("the plugin host answers");
+    let health = client.health().await.expect("the host reports its health");
+    assert_eq!(health.live_bindings, 1, "{health:?}");
+
+    // What the sign-out is about: every process of this login session by the identity it was
+    // started under. The shell and what stands between it and the program are the program's
+    // ancestors up to the worker, which the kernel's record of who started whom names.
+    let session = kr_ipc::starter::current_session().expect("this process's login session");
+    let me = kr_ipc::identity::current_process_start_identity().expect("this process's identity");
+    let worker = worker_of(&environment, world.session_id);
+    let programs = processes_named("claude.exe");
+    assert_eq!(programs.len(), 1, "the program is running: {programs:?}");
+    let program = kr_ipc::identity::process_start_identity(programs[0]).expect("the program");
+    let mut between = Vec::new();
+    let mut at = program.clone();
+    while at != worker {
+        at = kr_worker::windows::lineage::parent_of(&at)
+            .unwrap_or_else(|error| panic!("who started process {}: {error}", at.pid.get()));
+        assert!(
+            between.len() < 8,
+            "the program is not the worker's descendant"
+        );
+        if at != worker {
+            between.push(at.clone());
+        }
+    }
+    let mut processes = vec![
+        ("the daemon (this test's process)".to_owned(), me),
+        ("the worker".to_owned(), worker),
+    ];
+    for (number, process) in between.iter().rev().enumerate() {
+        processes.push((
+            format!("what the worker started, number {}", number + 1),
+            process.clone(),
+        ));
+    }
+    processes.push(("the program".to_owned(), program));
+    processes.push((
+        "the plugin host".to_owned(),
+        host.process_start_identity.clone(),
+    ));
+    for (what, process) in &processes {
+        let facts = kr_ipc::starter::process_facts(
+            u32::try_from(process.pid.get()).expect("a process identifier"),
+        )
+        .unwrap_or_else(|error| panic!("{what} ({}) is read: {error}", process.pid.get()));
+        assert_eq!(
+            kr_ipc::identity::process_state(process),
+            kr_ipc::identity::ProcessState::Running,
+            "{what} is running"
+        );
+        assert_eq!(
+            facts.session,
+            session,
+            "{what} ({}) is in this login session",
+            process.pid.get()
+        );
+        eprintln!(
+            "before the sign-out: {what}, process {}, {}, login session {}",
+            process.pid.get(),
+            facts.image.display(),
+            facts.session
+        );
+    }
+
+    // The startup entry: the product registered it for this environment as it registers the
+    // setup step's, and it is as the host guide says.
+    let starter = kr_controller::supervision::windows::testing::built_binary("kr-controller")
+        .unwrap_or_else(|missing| panic!("{missing}"));
+    let definition =
+        kr_controller::supervision::windows::testing::definition(&environment, &starter)
+            .expect("the definition this host registers");
+    assert_eq!(
+        kr_controller::supervision::windows::standing(&definition)
+            .expect("the Task Scheduler answers"),
+        kr_controller::supervision::windows::Standing::Owned(Vec::new()),
+        "the environment's task is not the one this build registers"
+    );
+    let exported = exported_task(&definition.name).expect("the environment's task is registered");
+    assert_the_entry_is_as_documented(&exported);
+    eprintln!(
+        "before the sign-out: the entry {} is as documented",
+        definition.name
+    );
+
+    let record = serde_json::json!({
+        "session": session,
+        "task": definition.name,
+        "entry": exported,
+        "processes": processes
+            .iter()
+            .map(|(what, identity)| serde_json::json!({ "what": what, "identity": identity }))
+            .collect::<Vec<_>>(),
+        "directories": world
+            .directories
+            .iter()
+            .map(|directory| directory.path().display().to_string())
+            .chain([
+                world.managed.host.tree.root().display().to_string(),
+                world.managed.packages.path().display().to_string(),
+            ])
+            .collect::<Vec<_>>(),
+    });
+    std::fs::write(
+        sign_out_record(),
+        serde_json::to_vec_pretty(&record).expect("a record"),
+    )
+    .expect("the record of what the sign-out is about");
+
+    // The account's profiles go back as they were before the sign-out, which would not put them
+    // back: the shell has read them and does not read them again.
+    drop(world.managed._profiles);
+    eprintln!("signing out login session {session}");
+    let signed_out = Command::new(system32("logoff.exe"))
+        .status()
+        .expect("logoff runs");
+    assert!(signed_out.success(), "logoff: {signed_out}");
+    // The end of the session ends this process, and nothing after this line runs.
+    tokio::time::sleep(LIVENESS_DEADLINE).await;
+    panic!("login session {session} was not ended within {LIVENESS_DEADLINE:?} of the sign-out");
+}
+
+/// KR-REQ-07.69: after the sign-out, nothing the session started is left, the plugin host included,
+/// and the per-user startup entry stands, as the host guide says it does.
+///
+/// Run in the account's next sign-in, by the identities the half before the sign-out recorded: the
+/// daemon, the worker, the shell, the program and the plugin host are each ended, no program of the
+/// product runs in this login session, which is not the one that was signed out, and the
+/// environment's task is registered with no trigger and is exactly as it was exported before, so
+/// that nothing starts until a `kr new` after this sign-in.
+#[test]
+#[ignore = writes_profiles!()]
+fn after_a_sign_out_nothing_the_session_started_is_left_and_the_startup_entry_stands() {
+    let path = sign_out_record();
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap_or_else(|error| {
+            panic!(
+                "{}: {error}; the case that signs the account out is run first, and this one in \
+                 the account's next sign-in",
+                path.display()
+            )
+        }))
+        .expect("a record");
+
+    // Each process, by the identity it was started under.
+    let left: Vec<String> = record["processes"]
+        .as_array()
+        .expect("processes")
+        .iter()
+        .filter_map(|entry| {
+            let identity: kr_protocol::identity::ProcessStartIdentity =
+                serde_json::from_value(entry["identity"].clone()).expect("an identity");
+            (kr_ipc::identity::process_state(&identity) != kr_ipc::identity::ProcessState::Ended)
+                .then(|| {
+                    format!(
+                        "{} (process {})",
+                        entry["what"].as_str().expect("a name"),
+                        identity.pid.get()
+                    )
+                })
+        })
+        .collect();
+    assert!(
+        left.is_empty(),
+        "the sign-out left these running: {}",
+        left.join(", ")
+    );
+
+    // This is another login session, and the product has started nothing in it.
+    let before = u32::try_from(record["session"].as_u64().expect("a session")).expect("a session");
+    let now = kr_ipc::starter::current_session().expect("this process's login session");
+    assert_ne!(now, before, "this is the login session that was signed out");
+    assert_eq!(
+        product_programs_in(now),
+        Vec::<String>::new(),
+        "the product started programs in login session {now} at the sign-in"
+    );
+
+    // The entry is still registered, exactly as it was.
+    let name = record["task"].as_str().expect("a task");
+    let exported = exported_task(name).unwrap_or_else(|| panic!("the entry {name} is gone"));
+    assert_eq!(
+        exported,
+        record["entry"].as_str().expect("an entry"),
+        "the entry changed with the sign-out"
+    );
+    assert_the_entry_is_as_documented(&exported);
+
+    // What the first half left in the account's temporary directory goes, the entry with it.
+    let removed = Command::new(system32("schtasks.exe"))
+        .args(["/Delete", "/TN", name, "/F"])
+        .status()
+        .expect("schtasks runs");
+    assert!(removed.success(), "the entry {name} is removed: {removed}");
+    for directory in record["directories"].as_array().expect("directories") {
+        let _ = std::fs::remove_dir_all(directory.as_str().expect("a directory"));
+    }
+    std::fs::remove_file(&path).expect("the record is removed");
 }

@@ -1999,11 +1999,14 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         target: "--test shell_windows",
         cases: &[
             "a_default_session_is_refused_without_the_entry_and_managed_with_it",
+            "a_plugin_host_that_ends_with_a_registration_unanswered_takes_no_worker_with_it_on_windows",
             "a_program_whose_package_ships_a_component_starts_the_plugin_host_on_windows",
+            "after_a_sign_out_nothing_the_session_started_is_left_and_the_startup_entry_stands",
             "the_bundled_agents_typed_at_the_managed_prompt_are_launched_through_the_forwarder",
+            "with_a_plugin_host_running_the_session_is_set_up_and_the_account_signed_out",
         ],
         runs: Runs::ByHand {
-            why: "they write the account's PowerShell profiles and put them back, so they run on the Windows test machine under a run that records and restores the profiles",
+            why: "they write the account's PowerShell profiles and put them back, so they run on the Windows test machine under a run that records and restores the profiles; the case that signs the account out is followed by the case that reads what is left, in the account's next sign-in",
         },
     },
     IgnoredRun {
