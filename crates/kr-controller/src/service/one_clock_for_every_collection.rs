@@ -22,7 +22,9 @@ use kr_voice::seams::VoiceAuthority as _;
 use super::a_sweep_on_a_clock_in_doubt::{aged, kept, swept};
 use super::a_voice_grant_on_the_floor::authority;
 use crate::service::Controller;
-use crate::service::net::tests::{daemon_on, manual_clocks, stopped};
+use crate::service::net::tests::{
+    clocks_that_pass_with_the_boot_and_are_stepped, daemon_on, manual_clocks, stopped,
+};
 
 const DAY: u64 = 86_400_000;
 
@@ -841,7 +843,10 @@ async fn a_clock_an_earlier_build_never_trusted_holds_every_forgetting_until_the
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_platform_evidence_hold_withholds_attention_until_the_owner_confirms_the_clock() {
     let temp = kr_ipc::testing::TempHost::create();
-    let (_continuous, wall, clocks) = manual_clocks();
+    // The daemon stops and starts again in one boot, and the wall clock is stepped once, after the
+    // restart: until then it has to pass as the boot does, however long the runner takes between
+    // the two starts.
+    let (stepped, clocks) = clocks_that_pass_with_the_boot_and_are_stepped();
     let controller = daemon_on(&temp, clocks.clone()).await;
     stopped(controller).await;
     rusqlite::Connection::open(temp.environment().registry_database())
@@ -849,7 +854,7 @@ async fn the_platform_evidence_hold_withholds_attention_until_the_owner_confirms
         .execute(
             "INSERT INTO network_clock (id, observed_ms, evidence_hold_at_ms) VALUES (0, ?1, ?1)
              ON CONFLICT (id) DO UPDATE SET evidence_hold_at_ms = ?1",
-            [i64::try_from(wall.load(Ordering::SeqCst)).expect("a time")],
+            [i64::try_from(clocks.wall.now_ms()).expect("a time")],
         )
         .expect("the evidence hold is recorded");
     let controller = daemon_on(&temp, clocks).await;
@@ -873,10 +878,7 @@ async fn the_platform_evidence_hold_withholds_attention_until_the_owner_confirms
         "quiet hours are not enforced under the hold"
     );
     collections.age_one_of_each();
-    wall.store(
-        wall.load(Ordering::SeqCst) + retention + DAY,
-        Ordering::SeqCst,
-    );
+    stepped.fetch_add(retention + DAY, Ordering::SeqCst);
     collections.pass().await;
     assert_eq!(kept(&temp), 0, "the transfer sweep is not held by it");
     assert_eq!(
