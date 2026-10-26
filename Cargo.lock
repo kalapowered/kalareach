@@ -5156,6 +5156,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kr-release-matrix-check"
+version = "0.1.0"
+dependencies = [
+ "kr-client",
+ "kr-crypto",
+ "kr-protocol",
+ "kr-service-stand-in",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "kr-service-stand-in"
 version = "0.1.0"
 dependencies = [

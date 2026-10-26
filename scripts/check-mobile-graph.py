@@ -63,6 +63,7 @@ HOST_ONLY = {
     "kr-worker": "docs/host/README.md: the session worker",
     "kr-cli": "docs/cli/README.md: the kr command line",
     "kr-release": "docs/releases/manifest.md: signs and verifies a release's manifest and writes its record",
+    "kr-release-matrix-check": "docs/releases/packages.md: the check a publication job runs against the signed release matrix",
     "kr-hook": "docs/host/README.md: the forwarder an application starts beside its terminal",
     "kr-shell-integration": "docs/shell-integration/host.md: the worker's side of the root-editor contract",
     "kr-term": "docs/terminal/README.md: the terminal engine a host runs for each session",

@@ -29,6 +29,7 @@ members = [
     "crates/kr-project",
     "crates/kr-protocol",
     "crates/kr-release",
+    "crates/kr-release-matrix-check",
     "crates/kr-shell-integration",
     "crates/kr-term",
     "crates/kr-term-probe",
