@@ -563,17 +563,24 @@ Each file of a release is read-only by attribute. Each file and directory also c
 that denies its owner the rights that write it (adding a file or a subdirectory, writing,
 appending, writing extended attributes or attributes, deleting, deleting a child), because the
 read-only attribute of a directory does not stop new names. A release is removed by renaming it out of `versions\`, resetting the entries of each
-directory and deleting the tree. The deletion follows no junction. It deletes a file as a name,
-through a handle, and changes nothing else about the file: a file of the release that is a second
-name for a file outside it goes as a name, and the file outside keeps its contents, its attribute
-and its entries. The one exception is a file whose list begins with the seal's own entry, the
-denial of the owner-rights principal. Deleting a read-only file needs the right to change
-attributes, which that entry denies the owner, so the removal resets the list first; a file outside
-that is a second name for such a file has its list reset with it. A list that denies the right and
-does not begin so is somebody else's: it is left as it is, the removal reports it, and the release
-stays in `trash\`. Each directory is held open with a share mode that lets nobody rename or delete
-it while its names are removed, so a directory swapped for a junction meanwhile leads the removal
-nowhere.
+directory and deleting the tree.
+
+The deletion follows no junction. Each directory is held open with a share mode that lets nobody
+rename or delete it, and that share mode does not stop another process of the account from turning
+an empty directory into a junction. So nothing below a directory is reached by a path: its names
+are read through the open handle, and each is opened as a name inside that handle with reparse
+points not followed. A directory turned into a junction after it was checked has a listing of its
+own, which is empty, and goes as a name; a name swapped for a junction after it was listed is opened
+as the junction itself and goes as a name. What a junction names is never reached.
+
+A file is deleted as a name, through a handle, and nothing else about it changes: a file of the
+release that is a second name for a file outside it goes as a name, and the file outside keeps its
+contents, its attribute and its entries. The one exception is a file whose list begins with the
+seal's own entry, the denial of the owner-rights principal. Deleting a read-only file needs the
+right to change attributes, which that entry denies the owner, so the removal resets the list first;
+a file outside that is a second name for such a file has its list reset with it. A list that denies
+the right and does not begin so is somebody else's: it is left as it is, the removal reports it, and
+the release stays in `trash\`.
 
 A program that runs from a file keeps it: the rest of the release is deleted, and what is left
 stays in `trash\` until an update finds the program ended. A refusal that no program caused, such as
