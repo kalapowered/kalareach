@@ -231,6 +231,29 @@ where
     }
 }
 
+/// Waits for work whose length is the machine's: `look` says whether what is waited for has come
+/// and how far the work has got, and the wait ends with `None` only once the work has not got any
+/// further for [`PATIENCE`]. Work that goes on, however slowly, is not given up on; work that has
+/// stopped is.
+pub async fn until_the_work_stops<T>(mut look: impl FnMut() -> (Option<T>, usize)) -> Option<T> {
+    let mut furthest = 0;
+    let mut moved_at = tokio::time::Instant::now();
+    loop {
+        let (found, got_to) = look();
+        if found.is_some() {
+            return found;
+        }
+        if got_to > furthest {
+            furthest = got_to;
+            moved_at = tokio::time::Instant::now();
+        }
+        if moved_at.elapsed() >= PATIENCE {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Ends the plugin hosts the daemon started, and takes their jobs away, before the tree that holds
 /// them goes.
 ///
