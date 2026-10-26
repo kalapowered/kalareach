@@ -740,7 +740,8 @@ mod native {
     pub struct NativeCalls<C: Commands> {
         commands: Arc<C>,
         deadlines: Deadlines,
-        /// Where commands wait to be sent, in the order they were asked. Started with the first.
+        /// Where commands wait to be sent, in the order they were asked. The task that sends them
+        /// starts, on the runtime the first command is asked on, with that command.
         outgoing: OnceLock<mpsc::UnboundedSender<Outgoing>>,
     }
 
@@ -790,7 +791,7 @@ mod native {
             let (answer, answered) = oneshot::channel();
             let queue = self.outgoing.get_or_init(|| {
                 let (queue, outgoing) = mpsc::unbounded_channel();
-                tauri::async_runtime::spawn(send_in_order(outgoing));
+                tokio::spawn(send_in_order(outgoing));
                 queue
             });
             let command = self.commands.invoke(method, arguments);
@@ -851,6 +852,9 @@ mod native {
                     tokio::spawn(async move {
                         let _ = answer.send(command.await);
                     });
+                    // The task is polled before the next command is sent. The next send may not
+                    // return, and a task that has not been polled has no waker for its answer.
+                    tokio::task::yield_now().await;
                 }
                 Err(said) => {
                     let _ = answer.send(Err(CallFailure::new(
@@ -1343,6 +1347,98 @@ mod tests {
         assert!(failure.message.contains("did not answer"), "{failure}");
     }
 
+    /// Native code that answers the mute some time after it took it, and whose send of the stop
+    /// does not return until it is let go.
+    struct SlowThenStuck {
+        mute_answered: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+        stop_held: Arc<AtomicUsize>,
+        release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl Commands for SlowThenStuck {
+        fn channel(&self, _sink: EventSink) -> serde_json::Value {
+            serde_json::json!("__CHANNEL__:1")
+        }
+
+        fn invoke(&self, method: &'static str, _arguments: serde_json::Value) -> CommandFuture {
+            if method == "callMute" {
+                let answered = self
+                    .mute_answered
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take()
+                    .expect("the mute is taken once");
+                return Box::pin(async move {
+                    let _ = answered.await;
+                    Ok(serde_json::json!({}))
+                });
+            }
+            let (stop_held, release) = (Arc::clone(&self.stop_held), Arc::clone(&self.release));
+            Box::pin(std::future::poll_fn(move |_| {
+                stop_held.fetch_add(1, Ordering::SeqCst);
+                let (let_go, wake) = &*release;
+                let mut let_go = let_go.lock().unwrap_or_else(PoisonError::into_inner);
+                while !*let_go {
+                    let_go = wake.wait(let_go).unwrap_or_else(PoisonError::into_inner);
+                }
+                std::task::Poll::Ready(Ok(serde_json::json!({})))
+            }))
+        }
+    }
+
+    /// Native code's answer to a command reaches its caller while the send of the next command is
+    /// held: a command that waits for its answer is polled before the next is sent, so that the
+    /// answer finds a task to wake.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_answer_to_a_command_does_not_wait_for_the_send_of_the_next() {
+        let (answer_mute, mute_answered) = tokio::sync::oneshot::channel();
+        let (muted_to, muted) = tokio::sync::oneshot::channel();
+        let stop_held = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let calls = NativeCalls::new(SlowThenStuck {
+            mute_answered: Arc::new(Mutex::new(Some(mute_answered))),
+            stop_held: Arc::clone(&stop_held),
+            release: Arc::clone(&release),
+        });
+
+        let caller = tokio::spawn(async move {
+            let call = CallId("c1".to_owned());
+            let mut mute = std::pin::pin!(calls.mute(&call, Mute::Microphone, true));
+            let mut stop = std::pin::pin!(calls.stop(&call));
+            // Both are asked in one turn, so both are queued before either is sent.
+            std::future::poll_fn(|context| {
+                let _ = mute.as_mut().poll(context);
+                let _ = stop.as_mut().poll(context);
+                std::task::Poll::Ready(())
+            })
+            .await;
+            let _ = muted_to.send(mute.await);
+            stop.await
+        });
+        let watchdog = std::time::Duration::from_secs(20);
+        let held = tokio::time::timeout(watchdog, async {
+            while stop_held.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let _ = answer_mute.send(());
+        let outcome = tokio::time::timeout(watchdog, muted).await;
+        // Let the send go whatever came of the case, so that no thread stays held by it.
+        *release.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        release.1.notify_all();
+
+        held.expect("the send of the stop was reached");
+        outcome
+            .expect("the answer reached its caller while the stop's send was held")
+            .expect("the caller went on")
+            .expect("the mute is answered");
+        caller
+            .await
+            .expect("the caller ran to its end")
+            .expect("the stop is answered");
+    }
+
     /// Native code whose command panics in its first poll, as Tauri's does on Android when no
     /// activity is registered.
     struct NoActivity;
@@ -1353,8 +1449,13 @@ mod tests {
         }
 
         fn invoke(&self, _method: &'static str, _arguments: serde_json::Value) -> CommandFuture {
+            // `Option::expect` panics with a `String`, as wry's lookup of the activity does.
+            fn the_activity() -> Option<u8> {
+                None
+            }
             Box::pin(std::future::poll_fn(|_| {
-                panic!("no available activity");
+                the_activity().expect("no available activity");
+                std::task::Poll::Pending
             }))
         }
     }
