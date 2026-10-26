@@ -585,6 +585,7 @@ impl Host {
             Waits {
                 timer: Some(timer),
                 reader_shares_the_timer: true,
+                ..Waits::default()
             },
         )
         .await;
