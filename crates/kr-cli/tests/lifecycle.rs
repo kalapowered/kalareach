@@ -4965,6 +4965,8 @@ impl HeadlessEmulator {
             .env("XDG_DATA_HOME", &data)
             .env("XDG_CONFIG_HOME", &config)
             .env("XDG_RUNTIME_DIR", &runtime)
+            // GNOME Terminal's server refuses to start in a locale that is not UTF-8.
+            .env("LANG", "C.UTF-8")
             .env("QT_QPA_PLATFORM", "offscreen")
             .env("GSK_RENDERER", "cairo")
             .env("LIBGL_ALWAYS_SOFTWARE", "1")
