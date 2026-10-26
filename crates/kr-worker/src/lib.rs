@@ -21,6 +21,7 @@
 //! | [`input`] | The single input lease, its epochs and paste-delimiter framing |
 //! | [`journal`] | The private receipt journal: acceptance, dispatch markers, de-duplication and retention |
 //! | [`lifecycle`] | What a live session is watched for: the root shell's exit, its desktop, and what it owns |
+//! | [`notices`] | What the worker saw of its session's own work, queued until its journal has taken it |
 //! | [`output`] | Fan-out with bounded per-attachment queues and explicit resynchronisation |
 //! | [`output_times`] | When retained output was produced: intervals of the output's cursors and the instant each began |
 //! | [`privacy`] | Privacy mode: the generation, the four things it asks of every subsystem, and what it keeps |
@@ -60,6 +61,7 @@ pub mod journal;
 pub mod lifecycle;
 pub mod local_gate;
 pub mod metrics;
+pub mod notices;
 pub mod output;
 pub mod output_times;
 pub mod owned_writer;

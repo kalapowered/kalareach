@@ -86,14 +86,26 @@ struct Same {
     reason: &'static str,
 }
 
-const SAME: &[Same] = &[Same {
-    root: "AttentionHostRecord",
-    digest: "5e8a7b903039d58297233e2b2b1ce7f986d6d6161f058cf1bb0917ffb71e8878",
-    reason: "A member that is absent from the wire unless this build's worker recorded an agent \
+const SAME: &[Same] = &[
+    Same {
+        root: "the attention text a worker serves",
+        digest: "e93a3879ea3bcb47d54d7e68724a6f0f4381abe849272bc6a8d52bb593042edb",
+        reason: "A host event of a kind that carries a line of identifiers is answered with the \
+                 words after the line, as its page carries them, and not with the line and the \
+                 words together. The retained level answers the whole detail for every kind. A \
+                 kind it writes without such a line is answered as before; for the adapter \
+                 kinds, whose first line names the package, the answer is now the warning alone, \
+                 which is what their page has always carried.",
+    },
+    Same {
+        root: "AttentionHostRecord",
+        digest: "5e8a7b903039d58297233e2b2b1ce7f986d6d6161f058cf1bb0917ffb71e8878",
+        reason: "A member that is absent from the wire unless this build's worker recorded an agent \
              turn that ended or a command that failed. A worker of the retained level never \
              writes it, and this build reads a record without it as one that records no such \
              work, so what that level writes is read as before.",
-}];
+    },
+];
 
 /// The rules of the surface, as the roots the walker follows them from:
 ///

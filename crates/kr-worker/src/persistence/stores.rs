@@ -411,7 +411,7 @@ pub static STORES: &[StoreDescriptor] = &[
     },
     StoreDescriptor {
         name: "host_events",
-        holds: "an application notice that had no attachment to go to, and where in the stream it happened",
+        holds: "an application notice that had no attachment to go to, and where in the stream it happened; an agent turn that ended and a command that failed, each by a line of identifiers and fixed words",
         durability: Durability::CrashDurable,
         retention: Retention::SessionLifetime,
         content: ContentClass::ApplicationNotice,

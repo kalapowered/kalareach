@@ -67,6 +67,12 @@ pub const ADAPTER_REVOKED: &str = "adapter.revoked";
 /// releases any more.
 pub const ADAPTER_CLEARED: &str = "adapter.cleared";
 
+/// The host event kind that records an agent turn that ended.
+pub const TURN_COMPLETED: &str = "turn.completed";
+
+/// The host event kind that records a command that finished with a status other than nought.
+pub const COMMAND_COMPLETED: &str = "command.completed";
+
 /// One mutation being admitted.
 #[derive(Clone, Debug)]
 pub struct Submission {
@@ -1037,6 +1043,56 @@ impl Journal {
                 params![
                     kind,
                     format!("{plugin_id}\n{text}"),
+                    i64::try_from(output_cursor).unwrap_or(i64::MAX),
+                    i64::try_from(now_ms.get()).unwrap_or(i64::MAX)
+                ],
+            )
+            .map_err(|error| faulted(&self.health, error))?;
+        self.attention_changes.notify_waiters();
+        Ok(())
+    }
+
+    /// Records one piece of the session's own work, as a host event of the kind that names it:
+    /// [`TURN_COMPLETED`] for an agent turn that ended and [`COMMAND_COMPLETED`] for a command that
+    /// finished with a status other than nought. The turn or the status is the detail's first line
+    /// and the fixed words the rest, so what happened travels whether or not the words are served.
+    /// The command line is not kept: it is typed text, and the terminal's own content is not
+    /// copied here.
+    ///
+    /// The event's sequence only grows, and a worker that starts again over this journal goes on
+    /// from it. The attention store takes it as the version of a turn's result and as the identity
+    /// of a command.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the write fails.
+    pub fn record_session_event(
+        &mut self,
+        notice: &kr_protocol::attention::SessionEventNotice,
+        output_cursor: u64,
+        now_ms: TimestampMs,
+    ) -> Result<()> {
+        let (kind, detail) = match notice {
+            kr_protocol::attention::SessionEventNotice::TurnCompleted { turn_id } => (
+                TURN_COMPLETED,
+                format!("{turn_id}\nAn agent turn finished."),
+            ),
+            kr_protocol::attention::SessionEventNotice::CommandCompleted { exit_status } => (
+                COMMAND_COMPLETED,
+                format!(
+                    "{status}\nA command exited with status {status}.",
+                    status = exit_status.get()
+                ),
+            ),
+        };
+        crate::input_domain::assert_not_held("a journal commit");
+        self.connection
+            .execute(
+                "INSERT INTO host_events (kind, detail, output_cursor, recorded_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    kind,
+                    detail,
                     i64::try_from(output_cursor).unwrap_or(i64::MAX),
                     i64::try_from(now_ms.get()).unwrap_or(i64::MAX)
                 ],

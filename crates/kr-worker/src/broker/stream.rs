@@ -764,6 +764,13 @@ impl Broker {
             } else if instance.turn_id.as_ref() == Some(&turn) {
                 // Recorded while the turn is still the one running, so the entry names it.
                 instance.note("turn.ended", turn.as_str(), now);
+                // The turn's result is waiting to be reviewed. A turn dropped with its binding
+                // is not a completion and is not queued.
+                if let Some(notices) = self.session_notices.get() {
+                    notices.push(kr_protocol::attention::SessionEventNotice::TurnCompleted {
+                        turn_id: turn.clone(),
+                    });
+                }
                 instance.turn_id = None;
                 state.component_changes.notify_one();
                 state.application_changed();
