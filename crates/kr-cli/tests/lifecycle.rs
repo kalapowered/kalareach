@@ -4632,8 +4632,8 @@ fn a_window_whose_new_fails_before_a_session_stays_until_a_key_is_pressed() {
 
     // With the option the window waits, and one key ends it with the same status.
     let held = host.window_whose_new_fails("--hold-on-failure", "");
-    held.wait_for(0, HELD, "the window says it is held");
     held.wait_until_single_key(0, "new-finished-", "kr waits for a key");
+    held.wait_for(0, HELD, "the window says it is held");
     held.type_text(b"x");
     assert_eq!(
         held.exit_status_after(0, "new-finished-", "the key ends the wait"),
@@ -4651,12 +4651,12 @@ fn a_window_whose_new_fails_before_a_session_stays_until_a_key_is_pressed() {
     );
     queued.type_text(b"q");
     std::fs::write(&gate, b"go").expect("opens the gate");
-    queued.wait_for(0, HELD, "the window says it is held");
     queued.wait_until_single_key(
         0,
         "new-finished-",
         "what was typed before did not end the wait",
     );
+    queued.wait_for(0, HELD, "the window says it is held");
     queued.type_text(b"x");
     assert_eq!(
         queued.exit_status_after(0, "new-finished-", "the key ends the wait"),
@@ -4665,8 +4665,8 @@ fn a_window_whose_new_fails_before_a_session_stays_until_a_key_is_pressed() {
 
     // A terminate signal ends the wait the way the signal would, with the terminal put back.
     let signalled = host.window_whose_new_fails("--hold-on-failure", "");
-    signalled.wait_for(0, HELD, "the window says it is held");
     signalled.wait_until_single_key(0, "new-finished-", "kr waits for a key");
+    signalled.wait_for(0, HELD, "the window says it is held");
     let waiting = signalled.kr_process();
     rustix::process::kill_process(
         rustix::process::Pid::from_raw(i32::try_from(waiting.pid.get()).expect("an identifier"))
@@ -4699,8 +4699,8 @@ fn a_window_held_after_its_attachment_needs_one_key_and_one_whose_shell_exited_n
 
     let (lost, created) = host.create_in_window_with("--hold-on-failure", "IFS= read -r _");
     kill_own_child(&created.worker, "the worker");
-    lost.wait_for(0, HELD, "the window says it is held");
     lost.wait_until_single_key(0, "new-finished-", "kr waits for a key");
+    lost.wait_for(0, HELD, "the window says it is held");
     lost.type_text(b"x");
     lost.attachment_ended(
         0,
