@@ -606,8 +606,8 @@ package is honest about when it appears, which is only possible if the predicate
 
 Hiding a control the actor could not use is a courtesy, not a check. The host evaluates no
 predicate when an action is invoked. It checks the action's registration, its class's rights, the
-grant, the revision the caller saw and the resource the action names, so a predicate that lies only
-produces a control that then fails.
+grant, the revision the caller saw and the resource the action names, and an invocation that passes
+those runs whatever the control's predicate said.
 
 ## The connector table
 

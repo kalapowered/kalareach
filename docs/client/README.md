@@ -797,14 +797,16 @@ The document node union, the control model and the visibility grammar are the pa
   control whose visibility turns on that is hidden and says which fact was missing. Guessing false
   would, under a `not`, show a control the package meant to hide. A predicate outside the grammar's
   depth and width bounds is hidden and reported.
-- `controls::invoke` produces the invocation, carrying the control's revision so the host can
-  recheck the condition against the control the person actually saw. A hidden or disabled control
-  produces none.
+- `controls::invoke` produces the invocation: the control, its revision and the registered action it
+  names. A hidden or disabled control produces none.
 
-Hiding is a courtesy either way, and it is a client-side one: what `invoke` produces is a value
-carrying the control's revision, which is what section 11 requires a host to recheck the condition
-against when the invocation reaches it. Rechecking is the host's, so a control this client shows
-that it should not have is a control the host then refuses.
+Hiding is a courtesy either way, and it is a client-side one. The invocation `controls::invoke`
+produces is the client's own value, and `plugin.action.invoke` carries neither the control nor its
+revision, so this host cannot recheck the condition against the control the person saw. What it
+checks when the call arrives is the action's registration, its class's rights, the grant, the
+revision of the binding the caller saw, the draft and the resource ([the plugin
+reference](../plugins/README.md#controls)). A control this client shows that it should not
+have is a control whose action runs when those checks pass.
 
 ## Pairing
 
