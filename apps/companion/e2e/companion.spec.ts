@@ -733,7 +733,10 @@ test.describe('reading once it is listening', () => {
     await openControlledTerminal(page)
     const surface = page.getByTestId('launch-surface')
     await expect(surface.getByRole('button', { name: /Claude Code/ })).toBeEnabled()
+    // No read lands between the change and the press, which would disable the button before it is
+    // pressed: the press is what the host refuses.
     await page.evaluate(() => {
+      window.krTestHost?.hold('launchSurface')
       window.krTestHost?.changePromptGeneration()
     })
     await surface.getByRole('button', { name: /Claude Code/ }).click()
