@@ -1,11 +1,14 @@
 # The Gemini CLI bridge
 
-This host applies the Gemini CLI recipe on macOS and Linux, in `.gemini` in the account's home, for
-an installed release whose package is enabled and holds `native_bridge.install`, that its repository
-has not revoked and that any organisation allowlist names, and only where the repository's signed
-index names a qualified build of Gemini CLI's executable and that executable is on the search path
-(see "Native bridge recipes" in [the plugin
-reference](../../plugins/README.md#one-contract-for-every-application)). No signed index names one yet,
+This host applies the Gemini CLI recipe on macOS and Linux, in the `.gemini` directory of the
+account's home, which must exist already, for an installed release whose package is enabled and
+holds `native_bridge.install`, that its repository has not revoked and that any organisation
+allowlist names, and only where the installation has a `kr-hook` beside its daemon. It also needs the
+repository's signed index to name qualified builds of Gemini CLI's executable: at least one `gemini`
+must be on the search path, and every `gemini` file found in any directory of the path must be a
+build the index names at Gemini CLI 0.60.0, the one version the recipe admits, so a single other
+`gemini` on the path refuses the recipe (see "Native bridge recipes" in [the plugin
+reference](../../plugins/README.md#one-contract-for-every-application)). No signed index names a build yet,
 so no recipe is applied, the worker admits no Gemini CLI hook, and a Gemini CLI session gets no hook
 observation. The guide describes the extension the package declares and what its hooks report, as
 read from Gemini CLI 0.60.0. The command integration is separate and applies when the owner turns it
