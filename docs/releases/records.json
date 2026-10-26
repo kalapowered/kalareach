@@ -6,9 +6,9 @@
       "records": [
         {
           "repository": "https://github.com/kalapowered/kalareach-plugins",
-          "revision": "b88309d78e1a6f82060dcda685db5a535eaab9a4",
+          "revision": "2a487935bae0f6381beb216b140ec580b85c5b02",
           "path": "docs/qualification-notes.md",
-          "sha256": "7344ee023d17e1b62f08d2c579db2f2184b1253f8ce19c7af32834897dbf37ec"
+          "sha256": "2d51244477bbd741d97715ad6836360c9bc44d3f14604a1b4561b573c16f4f05"
         }
       ]
     },
