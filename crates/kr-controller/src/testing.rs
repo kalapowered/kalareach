@@ -14,6 +14,23 @@ use crate::quiet::Timer;
 
 use crate::error::{ControllerError, Result};
 
+/// Runs `body` while no task of `controller` is between its two readings of the clocks.
+///
+/// The daemon reads the continuous clock and then the wall clock to decide whether the wall clock
+/// went backwards, in tasks of its own and at moments a test does not choose. A suite that moves
+/// the clocks it gave the daemon moves them in `body`: a reading is then taken wholly before the
+/// move or wholly after it, and never pairs the continuous clock as it was with the wall clock as
+/// it is, which the host would record as a clock that went backwards.
+pub fn while_no_reader_of_the_clocks_reads<T>(
+    controller: &crate::service::Controller,
+    body: impl FnOnce() -> T,
+) -> T {
+    controller
+        .lifetimes()
+        .clock_trust()
+        .while_no_reader_reads(body)
+}
+
 tokio::task_local! {
     /// Where the account service stands for the daemon being started in this task.
     static ACCOUNT_ORIGIN: String;

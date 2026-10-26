@@ -608,7 +608,7 @@ impl ClockTrust {
     /// Holds the clock decision's lock while `body` runs, so that no reader is between its two
     /// clock readings meanwhile: a test moves its clocks here, and a reader that runs in the
     /// background takes both readings before the move or both after it.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn while_no_reader_reads<T>(&self, body: impl FnOnce() -> T) -> T {
         let _held = self.held();
         body()
