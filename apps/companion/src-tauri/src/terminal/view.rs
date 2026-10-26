@@ -38,7 +38,9 @@ use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::recovery::{EventStream, EventsSubscribeParams};
 use kr_protocol::root::{ShellLaunchResult, ShellLaunchSurfaceParams, ShellLaunchSurfaceResult};
 use kr_protocol::scalars::{Bytes, CanonicalSet, Nullable, U64};
-use kr_protocol::session::{Dimensions, SESSION_CLOSED_EVENT, SessionReadParams};
+use kr_protocol::session::{
+    Dimensions, SESSION_CLOSED_EVENT, SessionReadParams, SessionReadResult,
+};
 use kr_protocol::worker::WorkerDescriptor;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -615,6 +617,64 @@ enum LaunchReadStage {
     Probed,
     /// The read, asked once more after `session.read` was answered.
     AskedAgain,
+}
+
+/// What a launch surface read does with the answer to the question it had asked.
+///
+/// A host that does not list the read refuses it as it refuses any method it does not list,
+/// `PERMISSION_DENIED`, and a grant that has lost its right is refused the same way. The two are
+/// told apart only where the link does not say whether the worker serves the read (`serves` is
+/// none, as on a paired host's daemon), by what the same right reads, `session.read`: where that is
+/// refused too the refusal is the grant's and is the answer; where it is answered the read is asked
+/// once more, and a second refusal means the host does not serve it. A worker that stated that it
+/// serves the read is not probed: its refusal is the grant's. A worker that lists the read and is
+/// of a release that does not serve it refuses it as an unsupported capability.
+fn launch_read_step(stage: LaunchReadStage, serves: Option<bool>, outcome: Outcome) -> Step {
+    let not_served = |refusal: &ProtocolError| {
+        matches!(
+            refusal.code,
+            ErrorCode::PermissionDenied | ErrorCode::UnsupportedCapability
+        )
+    };
+    match (stage, outcome) {
+        (LaunchReadStage::Probed, Outcome::Ok(value)) => {
+            match value.to_typed::<SessionReadResult>() {
+                Ok(_) => Step::Ask(LaunchReadStage::AskedAgain),
+                Err(error) => Step::Say(Err(CommandError::local_failure(format!(
+                    "The session's answer to the check of the grant could not be read: {}",
+                    Shown::cbor(&error)
+                )))),
+            }
+        }
+        (LaunchReadStage::Probed, Outcome::Error(refusal)) => {
+            Step::Say(Err(CommandError::from(refusal)))
+        }
+        (LaunchReadStage::Asked | LaunchReadStage::AskedAgain, Outcome::Ok(value)) => Step::Say(
+            value
+                .to_typed::<ShellLaunchSurfaceResult>()
+                .map(|surface| LaunchSurfaceAnswer::Served { surface })
+                .map_err(|error| {
+                    CommandError::local_failure(format!(
+                        "The session's launch surface could not be read: {}",
+                        Shown::cbor(&error)
+                    ))
+                }),
+        ),
+        (LaunchReadStage::Asked, Outcome::Error(refusal))
+            if refusal.code == ErrorCode::PermissionDenied && serves.is_none() =>
+        {
+            Step::Ask(LaunchReadStage::Probed)
+        }
+        (LaunchReadStage::AskedAgain, Outcome::Error(refusal)) if not_served(&refusal) => {
+            Step::Say(Ok(LaunchSurfaceAnswer::NotServed))
+        }
+        (LaunchReadStage::Asked, Outcome::Error(refusal))
+            if refusal.code == ErrorCode::UnsupportedCapability =>
+        {
+            Step::Say(Ok(LaunchSurfaceAnswer::NotServed))
+        }
+        (_, Outcome::Error(refusal)) => Step::Say(Err(CommandError::from(refusal))),
+    }
 }
 
 /// One open, attached view.
@@ -1237,56 +1297,10 @@ impl View {
     }
 
     /// Takes the answer to a launch surface read, or to the read that tells a host that does not
-    /// serve it from a grant that lost its right.
-    ///
-    /// A host that does not list the read refuses it as it refuses any method it does not list,
-    /// `PERMISSION_DENIED`, and a grant that has lost its right is refused the same way. The two
-    /// are told apart by what the same right reads, `session.read`: where that is refused too the
-    /// refusal is the grant's and is the answer; where it is answered the read is asked once more,
-    /// and a second refusal means the host does not serve it. A worker that lists the read and is
-    /// of a release that does not serve it refuses it as an unsupported capability.
+    /// serve it from a grant that lost its right, and asks the next question or says the answer.
     async fn launch_surface_answered(&mut self, response: Response) -> Option<Ending> {
         let mut read = self.launch_reads.remove(&response.request_id)?;
-        let not_served = |refusal: &ProtocolError| {
-            matches!(
-                refusal.code,
-                ErrorCode::PermissionDenied | ErrorCode::UnsupportedCapability
-            )
-        };
-        let served = |value: ParamsValue| {
-            value
-                .to_typed::<ShellLaunchSurfaceResult>()
-                .map(|surface| LaunchSurfaceAnswer::Served { surface })
-                .map_err(|error| {
-                    CommandError::local_failure(format!(
-                        "The session's launch surface could not be read: {}",
-                        Shown::cbor(&error)
-                    ))
-                })
-        };
-        let step = match (read.stage, response.outcome) {
-            (LaunchReadStage::Probed, Outcome::Ok(_)) => Step::Ask(LaunchReadStage::AskedAgain),
-            (LaunchReadStage::Probed, Outcome::Error(refusal)) => {
-                Step::Say(Err(CommandError::from(refusal)))
-            }
-            (LaunchReadStage::Asked | LaunchReadStage::AskedAgain, Outcome::Ok(value)) => {
-                Step::Say(served(value))
-            }
-            (LaunchReadStage::Asked, Outcome::Error(refusal))
-                if refusal.code == ErrorCode::PermissionDenied =>
-            {
-                Step::Ask(LaunchReadStage::Probed)
-            }
-            (LaunchReadStage::AskedAgain, Outcome::Error(refusal)) if not_served(&refusal) => {
-                Step::Say(Ok(LaunchSurfaceAnswer::NotServed))
-            }
-            (LaunchReadStage::Asked, Outcome::Error(refusal))
-                if refusal.code == ErrorCode::UnsupportedCapability =>
-            {
-                Step::Say(Ok(LaunchSurfaceAnswer::NotServed))
-            }
-            (_, Outcome::Error(refusal)) => Step::Say(Err(CommandError::from(refusal))),
-        };
+        let step = launch_read_step(read.stage, self.serves_launch_surface, response.outcome);
         let stage = match step {
             Step::Say(answer) => {
                 let _ = read.reply.send(answer);
@@ -1440,8 +1454,12 @@ impl View {
 
 #[cfg(test)]
 mod tests {
-    use super::build_name;
+    use super::{LaunchReadStage, Step, build_name, launch_read_step};
+    use crate::launch::LaunchSurfaceAnswer;
+    use kr_protocol::envelope::{Outcome, ParamsValue};
+    use kr_protocol::error::{ErrorCode, ProtocolError};
     use kr_protocol::ids::BuildId;
+    use kr_protocol::scalars::Nullable;
 
     /// A build identifier is said when it is a program's name and a release, and any other text a
     /// worker states is replaced rather than repeated.
@@ -1470,6 +1488,146 @@ mod tests {
         for text in ["kr-worker/0.1.0", "kalareach-companion/0.49.0"] {
             let id = BuildId::new(text).expect("a build identifier");
             assert_eq!(build_name(&id), text);
+        }
+    }
+
+    /// The surface a worker answers with, and the answer to the read that tells a host that does
+    /// not serve the surface from a grant that lost its right.
+    fn surface() -> ParamsValue {
+        ParamsValue::from_typed(&kr_protocol::root::ShellLaunchSurfaceResult {
+            session_id: kr_protocol::ids::SessionId::new(kr_ipc::new_uuid()),
+            editor: kr_protocol::root::LaunchEditor::Unverified {
+                reason: kr_protocol::root::LaunchUnverified::StockShell,
+            },
+            input: kr_protocol::root::LaunchInput::Free,
+            shell: Nullable::some(kr_protocol::root::LaunchShell::Sh),
+            offers: Vec::new(),
+        })
+        .expect("a result")
+    }
+
+    fn session_read() -> ParamsValue {
+        ParamsValue::from_typed(&kr_protocol::session::SessionReadResult {
+            session: kr_protocol::session::SessionSummary {
+                session_id: kr_protocol::ids::SessionId::new(kr_ipc::new_uuid()),
+                session_epoch: kr_protocol::ids::SessionEpoch::V1,
+                environment_id: kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid()),
+                display_number: kr_protocol::session::DisplayNumber::new(1),
+                state: kr_protocol::session::SessionState::Live,
+                shell_mode: kr_protocol::session::ShellMode::NativeCompat,
+                shell_path: "/bin/sh".to_owned(),
+                cwd: "/".to_owned(),
+                worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+                desktop: kr_protocol::identity::DesktopBinding::none(),
+                created_at_ms: kr_protocol::scalars::TimestampMs::new(1),
+                dimensions: kr_protocol::session::Dimensions::new(80, 24),
+                attachment_count: kr_protocol::scalars::U64::ZERO,
+                application_state: Nullable::null(),
+                root_process: Nullable::null(),
+                closure: Nullable::null(),
+                environment_sources: None,
+                root: None,
+                application: None,
+            },
+            endpoint: Nullable::null(),
+            launch_profile: Nullable::null(),
+            last_command_block: Nullable::null(),
+            outstanding_launches: Nullable::null(),
+            metrics: None,
+        })
+        .expect("a result")
+    }
+
+    fn refused(code: ErrorCode) -> Outcome {
+        Outcome::Error(ProtocolError::new(code, "refused"))
+    }
+
+    /// What a step comes to, in a word the table below can read.
+    fn said(step: Step) -> String {
+        match step {
+            Step::Ask(stage) => format!("ask {stage:?}"),
+            Step::Say(Ok(LaunchSurfaceAnswer::Served { .. })) => "served".to_owned(),
+            Step::Say(Ok(LaunchSurfaceAnswer::NotServed)) => "not served".to_owned(),
+            Step::Say(Err(error)) => format!("refused {}", error.code.as_str()),
+        }
+    }
+
+    /// A paired host's daemon says nothing of whether its worker serves the launch surface, so a
+    /// refusal as an unlisted method is told from a grant that lost its right by what the same
+    /// right reads; a worker that stated that it serves the read is not asked, since its refusal is
+    /// the grant's. The probe's answer is a session read, and anything else is a failure.
+    #[test]
+    fn a_launch_surface_read_tells_an_unlisted_method_from_a_lost_right_where_the_link_does_not_say()
+     {
+        use LaunchReadStage::{Asked, AskedAgain, Probed};
+        let garbage = || Outcome::Ok(ParamsValue::from_typed(&"neither").expect("a value"));
+        let table: Vec<(LaunchReadStage, Option<bool>, Outcome, &str)> = vec![
+            (Asked, Some(true), Outcome::Ok(surface()), "served"),
+            (Asked, None, Outcome::Ok(surface()), "served"),
+            (
+                Asked,
+                None,
+                refused(ErrorCode::PermissionDenied),
+                "ask Probed",
+            ),
+            (
+                Asked,
+                Some(true),
+                refused(ErrorCode::PermissionDenied),
+                "refused PERMISSION_DENIED",
+            ),
+            (
+                Asked,
+                None,
+                refused(ErrorCode::UnsupportedCapability),
+                "not served",
+            ),
+            (
+                Asked,
+                Some(true),
+                refused(ErrorCode::UnsupportedCapability),
+                "not served",
+            ),
+            (
+                Asked,
+                None,
+                refused(ErrorCode::EditorBusy),
+                "refused EDITOR_BUSY",
+            ),
+            (Probed, None, Outcome::Ok(session_read()), "ask AskedAgain"),
+            (Probed, None, garbage(), "refused RESOURCE_UNAVAILABLE"),
+            (
+                Probed,
+                None,
+                refused(ErrorCode::PermissionDenied),
+                "refused PERMISSION_DENIED",
+            ),
+            (AskedAgain, None, Outcome::Ok(surface()), "served"),
+            (
+                AskedAgain,
+                None,
+                refused(ErrorCode::PermissionDenied),
+                "not served",
+            ),
+            (
+                AskedAgain,
+                None,
+                refused(ErrorCode::UnsupportedCapability),
+                "not served",
+            ),
+            (
+                AskedAgain,
+                None,
+                refused(ErrorCode::EditorBusy),
+                "refused EDITOR_BUSY",
+            ),
+        ];
+        for (stage, serves, outcome, expected) in table {
+            assert_eq!(
+                said(launch_read_step(stage, serves, outcome)),
+                expected,
+                "{stage:?}, serves {serves:?}"
+            );
         }
     }
 }
