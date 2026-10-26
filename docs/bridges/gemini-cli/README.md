@@ -17,8 +17,7 @@ Gemini CLI session gets no hook observation. The guide describes the extension t
 what its hooks report, as read from Gemini CLI 0.60.0. The command integration is separate and applies
 when the owner turns it on and the first `gemini` the shell finds is a program the host can read, which a
 script is not: `GEMINI_CLI_NO_RELAUNCH` is then set in the launch, with the effects under "Limits". Where
-the first hit is a script, as it is for the npm distribution, an invocation runs as typed and `kr doctor`
-says why.
+the first hit is a script, as it is for the npm distribution, an invocation runs as typed.
 
 Gemini CLI runs a hook for an event and reads what the hook answers. The Gemini CLI connector
 package installs a small extension that makes Gemini CLI start `kr-hook`, the core forwarder, for
