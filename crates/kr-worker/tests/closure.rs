@@ -1091,6 +1091,7 @@ async fn a_stubborn_shell_is_closed() -> Result<(), String> {
         "[Console]::TreatControlCAsInput = $true; \
          Write-Host -NoNewline 'kr-stubborn-ready.'; \
          try {{ \
+           Start-Sleep -Milliseconds 600; \
            while ($true) {{ \
              $key = [Console]::ReadKey($true); \
              if ($key.KeyChar -eq [char]3) {{ \
