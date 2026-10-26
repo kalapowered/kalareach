@@ -1157,57 +1157,83 @@ pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Up
         what: Remains::Staging,
         reason: shown!("{}: {}", Shown::root(&staging), Shown::io(&error)),
     });
-    let target = staged?;
-    if target.release == source {
-        // The release that is current is not an update to go on past a failed one with: the daemons
-        // it left unstarted are owed their start from it. An archive of any other release is
-        // staged and checked before anything is started, so that a daemon of the release that
-        // failed, which may hold its environment and never answer, is not started again by every
-        // run that would move the host off it.
-        let mut restarted = Vec::new();
-        if let (Some(_), Some(failed)) = (left, record.update.clone()) {
-            match start_recorded(&store, &failed, true).await {
-                Ok(started) => {
-                    settle(&store, &mut record)?;
-                    restarted = started;
-                }
-                Err(still) => {
-                    let back = goes_back_to(&failed);
-                    let goes_back = older_than(&store, &current_manifest, &back).then_some(&back);
-                    return Err(left_part_way(&still.said(), true, goes_back));
+    // Whatever the rest of the run decides, the directory that could not be removed is told: beside
+    // the result, or beside the failure.
+    let outcome = async {
+        let target = staged?;
+        if target.release == source {
+            // The release that is current is not an update to go on past a failed one with: the
+            // daemons it left unstarted are owed their start from it. An archive of any other
+            // release is staged and checked before anything is started, so that a daemon of the
+            // release that failed, which may hold its environment and never answer, is not started
+            // again by every run that would move the host off it.
+            let mut restarted = Vec::new();
+            if let (Some(_), Some(failed)) = (left, record.update.clone()) {
+                match start_recorded(&store, &failed, true).await {
+                    Ok(started) => {
+                        settle(&store, &mut record)?;
+                        restarted = started;
+                    }
+                    Err(still) => {
+                        let back = goes_back_to(&failed);
+                        let goes_back =
+                            older_than(&store, &current_manifest, &back).then_some(&back);
+                        return Err(left_part_way(&still.said(), true, goes_back));
+                    }
                 }
             }
+            return Ok(Updated {
+                target: source.clone(),
+                source,
+                restarted,
+                removed: Vec::new(),
+                not_removed: Vec::new(),
+                carried: Vec::new(),
+                unreached: Vec::new(),
+                checked_only: check,
+                rolled_back: false,
+            });
         }
-        return Ok(Updated {
-            target: source.clone(),
+        // The release is in the store now, and stays there, staged, whatever the rest of this run
+        // decides: an update that waits uses it again.
+        if !check {
+            record.staged = Some(target.release.clone());
+            record.write(&store)?;
+        }
+        carry_out(
+            &store,
+            &update_lock,
+            &mut record,
             source,
-            restarted,
-            removed: Vec::new(),
-            not_removed: staging_left.into_iter().collect(),
-            carried: Vec::new(),
-            unreached: Vec::new(),
-            checked_only: check,
-            rolled_back: false,
-        });
+            target,
+            check,
+            false,
+        )
+        .await
     }
-    // The release is in the store now, and stays there, staged, whatever the rest of this run
-    // decides: an update that waits uses it again.
-    if !check {
-        record.staged = Some(target.release.clone());
-        record.write(&store)?;
+    .await;
+    match outcome {
+        Ok(mut updated) => {
+            updated.not_removed.extend(staging_left);
+            Ok(updated)
+        }
+        Err(error) => Err(with_staging_left(error, staging_left)),
     }
-    let mut updated = carry_out(
-        &store,
-        &update_lock,
-        &mut record,
-        source,
-        target,
-        check,
-        false,
-    )
-    .await?;
-    updated.not_removed.extend(staging_left);
-    Ok(updated)
+}
+
+/// A failed update's error, with the directory the update could not remove said after it, if there
+/// is one.
+fn with_staging_left(error: CliError, left: Option<NotRemoved>) -> CliError {
+    let notes = left
+        .map(|left| {
+            shown!(
+                "The directory the update unpacked the archive into could not be removed either: {}",
+                left.reason
+            )
+        })
+        .into_iter()
+        .collect();
+    with_notes(error, notes)
 }
 
 /// `kr host rollback`: goes back to the release `to` names, or to the one this host was on before
@@ -1391,10 +1417,7 @@ struct Report {
 }
 
 impl Report {
-    /// The error with what the update had done and found said after it, of the same kind and with
-    /// the same exit code: a local IPC failure becomes [`CliError::HostUnavailable`], which exits
-    /// with 3 and carries the same stable code. An error of any other kind, which no step of an
-    /// update returns, is left as it is.
+    /// The error with what the update had done and found said after it: see [`with_notes`].
     fn annotate(&self, error: CliError) -> CliError {
         let mut notes = Vec::new();
         if let Some((first, rest)) = self.carried.split_first() {
@@ -1414,24 +1437,31 @@ impl Report {
                 unreached.said(self.check)
             ));
         }
-        let mut said = match &error {
-            CliError::UpdateDeferred(said)
-            | CliError::Other(said)
-            | CliError::HostUnavailable(said) => said.clone(),
-            CliError::Ipc(failed) => Shown::ipc(failed),
-            _ => return error,
-        };
-        if notes.is_empty() {
-            return error;
-        }
-        for note in notes {
-            said = shown!("{}. {}", said, note);
-        }
-        match error {
-            CliError::UpdateDeferred(_) => CliError::UpdateDeferred(said),
-            CliError::Other(_) => CliError::Other(said),
-            _ => CliError::HostUnavailable(said),
-        }
+        with_notes(error, notes)
+    }
+}
+
+/// The error with `notes` said after it, of the same kind and with the same exit code: a local IPC
+/// failure becomes [`CliError::HostUnavailable`], which exits with 3 and carries the same stable
+/// code. An error of any other kind, which no step of an update returns, is left as it is.
+fn with_notes(error: CliError, notes: Vec<Shown>) -> CliError {
+    let mut said = match &error {
+        CliError::UpdateDeferred(said)
+        | CliError::Other(said)
+        | CliError::HostUnavailable(said) => said.clone(),
+        CliError::Ipc(failed) => Shown::ipc(failed),
+        _ => return error,
+    };
+    if notes.is_empty() {
+        return error;
+    }
+    for note in notes {
+        said = shown!("{}. {}", said, note);
+    }
+    match error {
+        CliError::UpdateDeferred(_) => CliError::UpdateDeferred(said),
+        CliError::Other(_) => CliError::Other(said),
+        _ => CliError::HostUnavailable(said),
     }
 }
 
@@ -2934,6 +2964,48 @@ mod collecting {
             ),
             "the failure to list the releases is the result"
         );
+    }
+}
+
+#[cfg(test)]
+mod failed_updates {
+    use super::*;
+
+    /// A directory the update could not remove, as the update would tell it.
+    fn left() -> Option<NotRemoved> {
+        Some(NotRemoved {
+            what: Remains::Staging,
+            reason: Shown::said("another program holds a file in it"),
+        })
+    }
+
+    /// KR-REQ-26.06: an update that fails after it unpacked the archive names both failures, the
+    /// one that ended it and the directory it could not remove, and the failure keeps its kind and
+    /// with it its exit code; with nothing left behind the failure is told as it was. The failure
+    /// of a step is one of these four kinds, and a refusal to switch is the one that exits 9.
+    #[test]
+    fn a_failed_update_names_the_directory_it_could_not_remove_and_keeps_its_exit_code() {
+        let failures = || {
+            [
+                CliError::Other(Shown::said("the archive is refused")),
+                CliError::UpdateDeferred(Shown::said("a program holds the release")),
+                CliError::HostUnavailable(Shown::said("no host answers")),
+            ]
+        };
+        for (failed, stayed) in failures().into_iter().zip(failures()) {
+            let (exit, code) = (stayed.exit_code(), stayed.code());
+            let first = stayed.to_string();
+            let both = with_staging_left(failed, left());
+            assert_eq!((both.exit_code(), both.code()), (exit, code));
+            let text = both.to_string();
+            assert!(text.starts_with(&first), "{text}");
+            assert!(
+                text.contains("could not be removed either: another program holds a file in it"),
+                "{text}"
+            );
+            let alone = with_staging_left(stayed, None);
+            assert_eq!(alone.to_string(), first, "nothing left, nothing said");
+        }
     }
 }
 

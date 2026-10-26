@@ -600,7 +600,8 @@ release stays in `trash\`.
 A program that runs from a file keeps it: the rest of the release is deleted, and what is left
 stays in `trash\` until an update finds the program ended. A refusal that no program caused, such as
 entries the owner cannot reset, is not taken for a program: `kr host update` says it in its words
-and lists it under `not_removed` in its `--json` document.
+and lists it under `not_removed` in its `--json` document. An update that fails after it unpacked
+the archive says, after its own failure, the directory it could not remove.
 
 ### The archive
 
