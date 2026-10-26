@@ -1403,6 +1403,67 @@ fn removing_a_release_follows_no_link_and_touches_nothing_outside_it() {
     assert!(read_only(&outside.join("shared")), "its attribute is kept");
 }
 
+/// KR-REQ-26.06: a directory of a release that another process of the account turns into a junction
+/// after the removal has pinned it and checked that it is a plain directory leads the removal
+/// nowhere. The pin keeps the directory from being renamed or deleted, and does not keep it from
+/// being made a junction (the system allows that to any handle that may write attributes, whatever
+/// its share mode), so what is in the directory is read through the pinned handle and each name
+/// opened relative to it: the listing is the directory's own and empty, the directory goes as a
+/// name, and the folder the junction names keeps everything in it.
+#[cfg(windows)]
+#[test]
+fn a_directory_made_a_junction_after_it_was_checked_leads_the_removal_nowhere() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let test = TestStore::create();
+    let one = release("0.1.0+aaaaaaaaaaaa");
+    test.install(&one);
+    let directory = test.store.release_directory(&one);
+    std::fs::create_dir_all(directory.join("share/empty")).expect("an empty directory");
+    seal_tree(&directory);
+    let outside = test.root.join("outside");
+    std::fs::create_dir_all(outside.join("inner")).expect("a folder elsewhere");
+    std::fs::write(outside.join("kept"), b"kept").expect("written");
+    std::fs::write(outside.join("inner/kept"), b"kept too").expect("written");
+    let target = outside.clone();
+    let turned = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&turned);
+    kr_ipc::install::removal_race::after_pin(Some(Arc::new(move |pinned: &Path| {
+        if pinned.file_name().is_some_and(|name| name == "empty") {
+            kr_ipc::install::removal_race::make_junction_in_place(pinned, &target)
+                .expect("the pinned directory becomes a junction");
+            counted.fetch_add(1, Ordering::SeqCst);
+        }
+    })));
+    let update = test
+        .store
+        .try_lock_update()
+        .expect("locks")
+        .expect("nothing else updates");
+
+    let answer = test.store.retire(&one, &update);
+    kr_ipc::install::removal_race::after_pin(None);
+
+    assert_eq!(turned.load(Ordering::SeqCst), 1, "the race was run once");
+    assert!(
+        answer.as_ref().is_ok_and(|removed| *removed),
+        "the release is removed: {answer:?}"
+    );
+    assert_eq!(
+        std::fs::read(outside.join("kept")).ok().as_deref(),
+        Some(&b"kept"[..]),
+        "the folder the junction named keeps its file"
+    );
+    assert_eq!(
+        std::fs::read(outside.join("inner/kept")).ok().as_deref(),
+        Some(&b"kept too"[..]),
+        "and its subfolder"
+    );
+    let in_the_trash = std::fs::read_dir(test.store.trash()).map(|entries| entries.count());
+    assert_eq!(in_the_trash.ok(), Some(0), "nothing of the release is left");
+}
+
 /// KR-REQ-26.06: `current` is a junction to the release's own directory, `Store::current` reads the
 /// release it names, and it names a release of this store only: a store that was moved has a
 /// `current` that leads to the place it was made for, which is refused, and a junction a crash left
