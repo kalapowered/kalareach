@@ -567,13 +567,13 @@ async fn kr_req_10_46_a_published_request_is_retained_until_every_host_has_finis
         );
 
         // The host's own record keeps it while an enrolled host has not answered for it.
-        assert!(!held.acknowledge(published.request_id, feed.owner.device_id()));
+        assert!(!held.acknowledge(&published, feed.owner.device_id()));
         assert_eq!(
             held.retained().len(),
             1,
             "a record is retained while a second enrolled host has not acknowledged it"
         );
-        assert!(held.acknowledge(published.request_id, second_host));
+        assert!(held.acknowledge(&published, second_host));
         assert!(
             held.retained().is_empty(),
             "every enrolled host has acknowledged it"
@@ -995,7 +995,7 @@ async fn kr_req_10_46_an_unreachable_feed_is_stale_and_still_shows_the_last_ackn
             .await
             .expect("the host acknowledges it");
         assert!(state.summary.acknowledged_at.as_ref().is_some());
-        held.acknowledge(published.request_id, feed.owner.device_id());
+        held.acknowledge(&published, feed.owner.device_id());
         held.synchronised(now_ms());
         let current = held.status();
         assert!(!current.stale);
