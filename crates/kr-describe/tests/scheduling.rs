@@ -473,20 +473,36 @@ fn whole_product_figures_are_reported_beside_the_model_ones() {
     assert_eq!(figures.product_without_model_cpu_centis(), 30);
 }
 
-/// KR-REQ-22.11: this host names the background mechanism it actually applied.
+/// KR-REQ-22.11: this host names the background class it actually applied, as the system reads it
+/// back.
 #[test]
 fn this_host_names_the_background_mechanism_it_actually_applied() {
-    let applied = background_current_thread();
-    // Whether the change is permitted depends on the host, so the assertion is about honesty
-    // rather than about success: a mechanism is named only when it was applied, and the IO class
-    // is reported as not applied on every platform in this build.
-    assert!(!applied.io);
+    // On Windows the class is the process's, so the test puts its own process back where it found
+    // it; on Linux it is the thread's, and this thread ends.
+    #[cfg(windows)]
+    let before = kr_ipc::background::priority_class_number();
+    let applied = std::thread::spawn(background_current_thread)
+        .join()
+        .expect("the thread ends");
+    #[cfg(windows)]
     if applied.is_qualified() {
-        assert!(applied.why.is_none());
+        kr_ipc::background::leave_process_background(before).expect("the class is left");
+    }
+
+    // Whether the change is permitted depends on the host, so the assertion is about honesty
+    // rather than about success: a class is named only when the system reports it, and a class
+    // that is not applied says why.
+    if applied.is_qualified() {
         assert_ne!(applied.mechanism.as_str(), "none");
     } else {
-        assert!(applied.why.is_some());
         assert_eq!(applied.mechanism.as_str(), "none");
+        assert!(applied.why.is_some());
+    }
+    assert_eq!(applied.io, applied.io_class.is_some());
+    if !applied.is_qualified() || !applied.io {
+        assert!(applied.why.is_some());
+    } else {
+        assert!(applied.why.is_none());
     }
 }
 

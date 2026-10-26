@@ -238,6 +238,69 @@ fn the_process_ended(reports: &[Report]) -> bool {
         .any(|outcome| matches!(outcome, Outcome::ProcessEnded { .. }))
 }
 
+/// KR-REQ-22.11: the description process runs its model in the background class and reports what
+/// the system holds of it. Asked from outside, the system agrees where the platform lets a parent
+/// ask: on Windows the process's priority class, I/O priority and memory priority, and on Linux
+/// the scheduling policy of the process's threads.
+#[test]
+fn the_process_runs_its_model_in_the_background_class_the_system_reports() {
+    let mut rig = Rig::new(&Script::default());
+    queue(rig.service(), &session(1), Priority::Ordinary, at(0));
+    rig.until(&roomy(), at(3_000), "the process is ready", |_, driver| {
+        driver.background().is_some()
+    });
+    let reported = rig
+        .driver
+        .background()
+        .cloned()
+        .expect("a process said ready");
+    let pid = rig.driver.pid().expect("the process is running");
+
+    let mechanism = if cfg!(windows) {
+        "windows_background_mode"
+    } else if cfg!(target_os = "linux") {
+        "linux_sched_batch"
+    } else {
+        "lowest_thread_priority"
+    };
+    assert_eq!(reported.mechanism, mechanism, "{reported:?}");
+    assert!(reported.cpu, "{reported:?}");
+    assert!(reported.io, "{reported:?}");
+    assert_eq!(reported.why.0, None);
+
+    #[cfg(windows)]
+    assert_eq!(
+        kr_ipc::background::process_class_of(pid),
+        Some(kr_ipc::background::ProcessClass {
+            idle_priority_class: true,
+            io: Some(kr_ipc::background::IoClass::VeryLow),
+            memory_priority: 1,
+        }),
+        "the system's own account of the process"
+    );
+
+    #[cfg(target_os = "linux")]
+    {
+        // Field 41 of a thread's stat is its scheduling policy, and 3 is SCHED_BATCH. The name in
+        // field 2 may hold spaces and brackets, so the fields are counted from its closing one.
+        let policies: Vec<String> = std::fs::read_dir(format!("/proc/{pid}/task"))
+            .expect("the process's threads")
+            .filter_map(Result::ok)
+            .filter_map(|task| std::fs::read_to_string(task.path().join("stat")).ok())
+            .filter_map(|stat| {
+                let after_name = stat.rsplit_once(')')?.1.to_owned();
+                after_name.split_whitespace().nth(38).map(str::to_owned)
+            })
+            .collect();
+        assert!(
+            policies.iter().any(|policy| policy == "3"),
+            "no thread of the process is in the batch class: {policies:?}"
+        );
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    let _ = pid;
+}
+
 /// A description is published through the process: the driver starts it, says hello, loads the
 /// profile and sends the job, and the answer is published.
 #[test]
