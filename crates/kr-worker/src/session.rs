@@ -441,7 +441,7 @@ pub struct Session {
     /// When the terminal's foreground has been read, for this host's own tests.
     #[cfg(feature = "testing")]
     foreground_reads: std::sync::Mutex<Vec<std::time::Instant>>,
-    /// When the request to stop last returned, for this host's own tests.
+    /// When the first request to stop was made, for this host's own tests.
     #[cfg(feature = "testing")]
     stop_requested: Option<std::time::Instant>,
     /// The session's live agent instances, and how many announcements it has made about them.
@@ -4963,15 +4963,17 @@ impl Session {
             crate::ownership::request_stop(owned);
         }
         #[cfg(feature = "testing")]
-        {
+        if self.stop_requested.is_none() {
             self.stop_requested = Some(std::time::Instant::now());
         }
         outcome
     }
 
-    /// Returns when [`Session::request_stop`] last returned, for this host's own tests: a closure
-    /// counts the five seconds it allows before force from no earlier than this. It compiles to
-    /// nothing without the `testing` feature, and no shipped build enables it.
+    /// Returns when [`Session::request_stop`] first made its request, for this host's own tests:
+    /// the moment is taken once the shell and the owned processes have been asked, before the call
+    /// returns, so a closure counts the five seconds it allows before force from no earlier than
+    /// this. It compiles to nothing without the `testing` feature, and no shipped build enables
+    /// it.
     #[cfg(feature = "testing")]
     #[must_use]
     pub const fn stop_requested_at(&self) -> Option<std::time::Instant> {

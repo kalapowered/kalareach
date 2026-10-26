@@ -1024,11 +1024,11 @@ fn watch(root: kr_protocol::identity::ProcessStartIdentity) -> std::thread::Join
 /// two seconds output may drain for.
 ///
 /// The shell here is PowerShell with the console's interrupt turned into a key, which is the one
-/// request this platform makes of a shell. It is slow to read the key, as a busy shell is, and
-/// records when it did. That moment is no bound on when the worker made the request, which can
-/// come any time before it, so the grace is counted from the worker's own record of having made
-/// the request. The shell ended after the moment it was last seen running and before the moment
-/// it was first seen gone. A shell gone before five seconds after the request was forced early, and
+/// request this platform makes of a shell. It sleeps before it reads the key, as a busy shell is
+/// slow to, and records when it did. That moment shows only that the request came before it, not
+/// how long before, so the grace is counted from the worker's own record of having made the
+/// request. The shell ended after the moment it was last seen running and before the moment it
+/// was first seen gone. A shell gone before five seconds after the request was forced early, and
 /// that fails at once. A shell not seen gone well past the five seconds, a final status recorded
 /// long after the drain and a watch that could not place the moments may each be a busy machine:
 /// that close shows nothing either way and is made again, and a worker that is late in every
@@ -1071,7 +1071,8 @@ async fn a_stubborn_shell_is_closed() -> Result<(), String> {
     const RECORD_ALLOWANCE: Duration = Duration::from_secs(1);
     /// How close to a moment a sample has to be to speak for it.
     const RESOLUTION: Duration = Duration::from_millis(50);
-    /// How long the shell sleeps before it reads the key the worker wrote.
+    /// How long the shell sleeps, from its ready mark, before it reads the key. The close follows
+    /// the mark within moments, so the key is read long after the worker wrote it.
     const READ_DELAY: Duration = Duration::from_millis(600);
     /// How far past five seconds after the request the shell may be first seen gone and still be
     /// held to the grace.
