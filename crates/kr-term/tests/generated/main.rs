@@ -336,12 +336,13 @@ fn with_the_control(template: &[u8], control: u8) -> Vec<u8> {
 
 /// KR-ACC-024: the scan follows a sequence the way a terminal collects it around a control. A
 /// terminal performs a C0 control where it stands, between the escape and the bracket or in the
-/// middle of the parameters, and carries on collecting, so a question with any such control in it
-/// is still a question and the scan names it, as it names ENQ and BEL there. Only CAN, SUB and ESC
-/// end a sequence, so a question they cut short is text. The engine's own run of each stream passes.
+/// middle of the parameters, and carries on collecting, so a question or an action with any such
+/// control in it is still one and the scan names it, as it names ENQ and BEL there. Only CAN, SUB
+/// and ESC end a sequence, so a question they cut short is text. The engine's own run of each
+/// stream passes.
 #[test]
 fn the_scan_follows_a_sequence_a_terminal_collects_around_a_control() {
-    let questions: [&[u8]; 8] = [
+    let asking_or_acting: [&[u8]; 8] = [
         b"ok\x1b[6\xffn",
         b"ok\x1b[\xff6n",
         b"ok\x1b[1\xff8t",
@@ -356,7 +357,7 @@ fn the_scan_follows_a_sequence_a_terminal_collects_around_a_control() {
         .filter(|control| ![0x18, 0x1a, 0x1b].contains(control));
     let mut missed = Vec::new();
     for control in carried_on {
-        for template in questions {
+        for template in asking_or_acting {
             let input = with_the_control(template, control);
             let found = forged(&input, Vec::new(), &[(0, input.len() as u64)]);
             if !found
@@ -369,7 +370,7 @@ fn the_scan_follows_a_sequence_a_terminal_collects_around_a_control() {
     }
     assert!(
         missed.is_empty(),
-        "the scan names no question in {} sequences a terminal collects around a control: {missed:?}",
+        "the scan names neither a question nor an action in {} sequences a terminal collects around a control: {missed:?}",
         missed.len()
     );
 
