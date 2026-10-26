@@ -829,6 +829,8 @@ export interface FakeTerminalView {
   readonly inputs: readonly TerminalInput[]
   /** Whether the view controls the program, as native code would say. */
   readonly control: TerminalControl
+  /** How many reads of the launch surface the page made on this view's link. */
+  readonly launchReads: number
   /** Grants the take in force, as the session would. */
   grantControl(): void
   /** Refuses the take in force, for `reason`, as the session would. */
@@ -4007,6 +4009,7 @@ function fakeTerminalView(
     terminal_profile_id: 'kalareach-companion'
   }
   let last: TerminalViewState | null = null
+  let launchReads = 0
   const publish = (state: TerminalViewState) => {
     if (closed) return
     last = state
@@ -4050,6 +4053,9 @@ function fakeTerminalView(
     },
     get control() {
       return controlNow()
+    },
+    get launchReads() {
+      return launchReads
     },
     grantControl() {
       answerTake(true)
@@ -4187,10 +4193,12 @@ function fakeTerminalView(
       },
       // Read and pressed on this view's own link, which holds the session's input while the view
       // controls the program. A view that has ended answers nothing.
-      launchSurface: () =>
-        closed || ended
+      launchSurface: () => {
+        launchReads += 1
+        return closed || ended
           ? refused('TERMINAL_UNAVAILABLE', 'This view has ended.')
-          : launch.read(wanted && leased),
+          : launch.read(wanted && leased)
+      },
       launch: (press) =>
         closed || ended
           ? refused('LEASE_LOST', 'This view has ended, and took nothing.')

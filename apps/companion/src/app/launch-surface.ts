@@ -27,7 +27,7 @@ export interface LaunchSurfaceReads {
   readonly unread: string | null
   /**
    * Which read `reading` answers. Reads are numbered in the order they start, and the numbers only
-   * grow, across every scope the hook has read in.
+   * grow, across every view the hook has read on.
    */
   readonly number: number
   /** The number of the newest read started so far. */
@@ -37,18 +37,17 @@ export interface LaunchSurfaceReads {
 }
 
 /**
- * Reads with `read` while the caller is shown. `scope` names what is read, so an answer for another
- * session or another opening of the view is never shown under this one. A null `read` reads nothing:
- * the view it would read on is not open yet.
+ * Reads with `read` while the caller is shown. An answer belongs to the `read` that asked, which is
+ * a view's own: an answer to an earlier view of the same session is never shown under a new one. A
+ * null `read` reads nothing, since the view it would read on is not open yet.
  */
 export function useLaunchSurface(
   port: HostPort,
-  scope: string,
   read: (() => Promise<LaunchSurfaceReading>) | null,
   cadenceMs = LAUNCH_SURFACE_CADENCE_MS
 ): LaunchSurfaceReads {
   const [held, setHeld] = useState<{
-    readonly scope: string
+    readonly read: () => Promise<LaunchSurfaceReading>
     readonly number: number
     readonly reading: LaunchSurfaceReading | null
     readonly unread: string | null
@@ -66,10 +65,10 @@ export function useLaunchSurface(
       const number = started.current
       return ask(read).then(
         (reading) => {
-          if (current()) setHeld({ scope, number, reading, unread: null })
+          if (current()) setHeld({ read, number, reading, unread: null })
         },
         (failure: unknown) => {
-          if (current()) setHeld({ scope, number, reading: null, unread: failureMessage(failure) })
+          if (current()) setHeld({ read, number, reading: null, unread: failureMessage(failure) })
         }
       )
     }, cadenceMs)
@@ -81,7 +80,7 @@ export function useLaunchSurface(
       ],
       cadence.now,
       (failure) => {
-        setHeld({ scope, number: started.current, reading: null, unread: failureMessage(failure) })
+        setHeld({ read, number: started.current, reading: null, unread: failureMessage(failure) })
       }
     )
     again.current = cadence.now
@@ -91,14 +90,14 @@ export function useLaunchSurface(
       watched.stop()
       again.current = () => undefined
     }
-  }, [port, scope, read, cadenceMs])
+  }, [port, read, cadenceMs])
 
   const refresh = useCallback(() => {
     again.current()
   }, [])
   const newest = useCallback(() => started.current, [])
 
-  const own = read !== null && held?.scope === scope ? held : null
+  const own = read !== null && held?.read === read ? held : null
   return {
     reading: own?.reading ?? null,
     unread: own?.unread ?? null,
