@@ -2,7 +2,7 @@
 
 A managed root shell has to answer one question the rest of the host cannot answer for it: whose
 keystrokes reached the line editor. Ctrl-D at an empty root prompt detaches the client that typed
-it (where the terminal has an end-of-file character), a launch installs a command in the root editor and nowhere else, and neither may happen while an
+it (where the terminal has an end-of-file character, and in PowerShell's Vi edit mode from the insert table only), a launch installs a command in the root editor and nowhere else, and neither may happen while an
 application is reading the terminal. A prompt hook, a process-group check or an empty kernel queue
 cannot tell you any of that, so this contract is built on what the shell's own reader can prove.
 
@@ -14,7 +14,7 @@ against their own readers:
 | Zsh 5.9+ | `key_sequence_boundary_mailbox`: the published ZLE patch checks a mailbox at key-sequence boundaries, with immediate line acceptance and non-destructive cancellation | `native_hook`, in the same patch, immediately before ZLE's empty-EOF branch |
 | Bash 5.2+ | `idle_reader_mailbox`: the published patch to the bundled Readline runs a callback after buffered input is consumed | `native_hook`, immediately before Readline's own EOF decision, after the next character has been selected |
 | Fish 4.x | `reader_event_bridge` against the Rust reader | `named_reader_binding`: a named binding that receives the actual reader context |
-| PowerShell 7.4+ | `reader_thread_queue`: the qualified PSReadLine module's request queue and signal | `reader_state_handler` over PSReadLine's buffer and invocation state, under the terminal's end-of-file character (a Windows console has none, so there the module reports no gesture) |
+| PowerShell 7.4+ | `reader_thread_queue`: the qualified PSReadLine module's request queue and signal | `reader_state_handler` over PSReadLine's buffer and invocation state, under the terminal's end-of-file character (a Windows console has none, so there the module reports no gesture); in the Vi edit mode the module binds into the insert table only |
 
 The mechanisms are per package, and the handshake checks them that way: a declaration naming another
 shell's mailbox or pre-EOF mechanism describes a reader this package does not have.
@@ -218,7 +218,8 @@ retry is a new create request. In a live session, losing the semantic hooks or t
 it, and an unqualified root replacement makes it terminal-only. Leaving `qualified` invalidates the
 fence and cancels a launch transaction, because both rest on a reader the session can no longer
 speak for. A degraded session keeps the fail-safe answer: an eligible gesture is consumed with the
-hint rather than turned into a native empty-prompt end of file.
+hint rather than turned into a native empty-prompt end of file, except in the PowerShell module's Vi
+command table, which the module has no decision on (see [PSReadLine](#psreadline)).
 
 ### The bootstrap secret, and what a child shell inherits
 
@@ -559,6 +560,9 @@ binding, and `consume` continues the same reader call. `BridgeFenceView::decide`
 | No fence, or one from an earlier prompt or another reader revision | Consume, with at most one hint per prompt | `consume` |
 | The worker refused the detach | Consume, with at most one hint per prompt | already consumed |
 
+In the PowerShell module's Vi edit mode the table applies to the keys of the insert table only: the
+command table's Ctrl+d is the editor's own, as [PSReadLine](#psreadline) says.
+
 The three compiled bridges (Zsh, Bash and Fish) apply one more rule between the second and third
 rows: the gesture is the whole sequence that invoked the operation, so a gesture byte that ends a
 longer key sequence is the editor's own and the hook returns `native`. The PowerShell module has no
@@ -617,10 +621,11 @@ worker supplies the same default as on Unix, the terminal's end-of-file byte 4, 
 PSReadLine module puts its decision on Ctrl+d when its hooks go live. A Windows console has no line
 discipline to read an end-of-file character from, so when the first prompt begins the module reports
 the gesture as disabled, in every edit mode, effective at that prompt. It takes its decision off
-Ctrl+d when it promotes that report, which is at the first Ctrl+d pressed at the prompt or at the
-next prompt's entry, whichever comes first, and a Ctrl+d that promotes it runs `DeleteCharOrExit`
-whatever was bound to the key, which at an empty line ends the shell. From then on no key detaches
-the session there, and `kr detach --attachment <id>` is the way. The protocol also carries a gesture
+Ctrl+d when it promotes that report, which is at the first Ctrl+d that reaches the module at the
+prompt (one pressed in the Vi command table does not) or at the next prompt's entry, whichever comes
+first, and a Ctrl+d that promotes it runs `DeleteCharOrExit` whatever was bound to the key, which at
+an empty line ends the shell. From then on no key detaches the session there, and
+`kr detach --attachment <id>` is the way. The protocol also carries a gesture
 as a chord (`chord` with `keys`), which the module honours and the worker does not send.
 
 ## The fence and detach state machine
@@ -805,17 +810,24 @@ when it is removed, except where the person has since bound that key themselves.
 the key the gesture is on and for no other. The module binds its decision there in front of whatever
 was bound, the person's own script included, which it runs outside the detach condition. When the
 decision comes off that key it writes back the binding it found and does not look at what the key
-holds by then. In the Emacs and Vi edit modes the editor has an operation on Ctrl+d, which the module
-wraps like any other bound key before it binds the decision, so the binding it finds there is its own
-wrapper, and removing the module writes that wrapper back: Ctrl+d keeps calling the module's
-function and not the editor's operation. And the module moves its decision to a changed gesture's
+holds by then. In the Emacs edit mode and in the Vi insert table the editor has an operation on
+Ctrl+d, which the module wraps like any other bound key before it binds the decision, so the binding
+it finds there is its own wrapper, and removing the module writes that wrapper back: Ctrl+d keeps
+calling the module's function and not the editor's operation. And the module moves its decision to a changed gesture's
 key when it promotes the change, which is the first end-of-file decision at the prompt the change
 names or the next prompt's entry, whichever comes first, and not when it reports the change: until
 then the new key has no decision on it, and the press of the old key that promotes the change runs
 what the new key held in place of the old key's own binding. Where a key held nothing, the module
-runs `SelfInsert` for a printable key and `DeleteCharOrExit` for any other key, and the press that
+runs `SelfInsert` if the chord it has bound by then is one character long and `DeleteCharOrExit` for
+any other chord, and both run with the key information of the press that happened. The press that
 promotes a disabled gesture runs `DeleteCharOrExit` for the same reason: the promotion has already
 cleared what was saved.
+
+The Vi edit mode has two key tables, and the module binds into the insert table only: the editor
+puts a binding made without `-ViMode` there, and the module wraps none of the command table's keys,
+which the editor lists in angle brackets (`<Ctrl+d>`). In the command table, which Escape opens,
+Ctrl+d stays the editor's own `ViAcceptLineOrExit`, which ends the shell at an empty line, and no
+key of that table takes the decision or reads the mailbox.
 
 What it pins is a range rather than a release: PowerShell 7.4 or later with PSReadLine 2.3.4 up to
 3.0. The module declares the versions it found in its handshake and the worker refuses an editor
@@ -830,15 +842,16 @@ method, and that is exactly what it cannot do:
 
 - **The reader is reached when it steps.** The module's queue is serviced on the reader's own
   thread, after each of the editor's own operations has run: every chord the editor has a binding
-  for goes through the module, which runs the editor's operation and then reads the queue. The
-  read-line entry reports the reader and reads the mailbox once, before the editor's read starts,
-  and the editor clears its buffer when its read starts. The module has no check of its own that
+  for, except the keys of the Vi command table, goes through the module, which runs the editor's
+  operation and then reads the queue. The read-line entry reports the reader and reads the mailbox
+  once, before the editor's read starts, and the editor clears its buffer when its read starts. The module has no check of its own that
   holds a launch back from that one read; what keeps one from reaching it is the contract's order,
   since a launch quotes a fence the worker publishes only after the reader has acknowledged one. A
   key the person bound to a script of their own is theirs and carries no boundary, and an ordinary
   character goes straight to the editor's own insertion, so a request that arrives at a parked
-  reader is answered at its next bound key rather than immediately. Until then the reader's last
-  idle report is what the worker has to go on.
+  reader is answered at its next bound key rather than immediately, and in the Vi command table at
+  the next bound key of the insert table. Until then the reader's last idle report is what the
+  worker has to go on.
 - **A launch is installed where it is decided and accepted at the next step.** The decision, the
   state check and the installation all happen on the reader's thread, inside the fence, at a point
   where the reader is between operations: a key of the person's that has been read and not yet run
