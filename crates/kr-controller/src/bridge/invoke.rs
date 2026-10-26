@@ -2006,6 +2006,10 @@ mod tests {
         assert_eq!(messages.len(), count, "two refusals read the same");
     }
 
+    /// KR-REQ-18.11, the part about the connection diagnostic: a helper that did not start, or that
+    /// could not be ended, is reported as this host's own supervision failure, naming the process
+    /// in the second case, and not as a permission refusal, as a destination that answers as
+    /// another environment is. Not shown here: the words reaching the person.
     #[test]
     fn a_failure_to_reach_a_destination_is_not_reported_as_a_permission_refusal() {
         // A helper that did not start is this host's own failure. Reporting it as a permission
