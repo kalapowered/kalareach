@@ -23,10 +23,11 @@ use crate::error::{CliError, Result};
 /// The stores a command writes, by the name a release's manifest lists them under. An update looks
 /// for these, and only these, in a root that no control daemon of the store served and that a
 /// command alone registered.
-pub const COMMAND_WRITTEN_STORES: [&str; 6] = [
+pub const COMMAND_WRITTEN_STORES: [&str; 7] = [
     crate::doctor::configuration::WRITTEN.store,
     crate::service_manager::WRITTEN.store,
     kr_shell_integration::host::startup::ENTRY_WRITTEN.store,
+    kr_shell_integration::host::terminal_profile::record::PROFILE_WRITTEN.store,
     kr_shell_integration::host::terminal::PREFERENCE_WRITTEN.store,
     kr_client::answers::WRITTEN.store,
     crate::machine::WRITTEN.store,
