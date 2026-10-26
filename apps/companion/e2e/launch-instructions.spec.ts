@@ -3,9 +3,9 @@
  *
  * The page types nothing into a stock shell, so the command it shows is all a launch gives the
  * person, and it has to be the command for the shell they are in. A PowerShell session's is the
- * longest of the three: a call operator, a path, and quotes doubled. These cover what a component
- * test cannot: that the whole command is drawn inside the window, wrapped where it has to be, at the
- * default text size and the largest, on a wide window and on a narrow one.
+ * longest of the three: a call operator and a quoted word. These cover what a component test cannot:
+ * that the whole command is drawn inside the window, wrapped where it has to be, at the default text
+ * size and the largest, on a wide window and on a narrow one.
  *
  * Every screenshot goes under the test artefact directory and is named for the requirement row it evidences.
  */
@@ -19,11 +19,10 @@ import { overrunning } from './layout'
 /** The largest accessibility size's body text, 53 points, against 17 at the default setting. */
 const LARGEST = 53 / 17
 
-/** What a PowerShell prompt is shown for the fake host's longest saved command. */
-const POWERSHELL_COMMAND =
-  "& '/Users/rs/My Notes/open-notes' '--title' 'It’’s a draft' '--note=don''t' '--tags=a,b' '@today'"
+/** What a PowerShell prompt is shown for an offer's command. */
+const POWERSHELL_COMMAND = "& 'claude'"
 
-/** The stock shell's launch instructions, with the longest saved command chosen. */
+/** The stock shell's launch instructions, with an offer's command chosen. */
 async function openInstructions(page: Page, shell: string): Promise<void> {
   await page.goto(`/harness.html?stock_shell=${shell}`)
   await page.waitForSelector('.app-shell')
@@ -41,7 +40,7 @@ async function openInstructions(page: Page, shell: string): Promise<void> {
   const dismiss = page.getByRole('button', { name: 'Dismiss' })
   await expect(dismiss).toBeVisible()
   await dismiss.click()
-  await page.getByTestId('launch-instructions').getByRole('button', { name: /Open my notes/ }).click()
+  await page.getByTestId('launch-instructions').getByRole('button', { name: /Claude Code/ }).click()
 }
 
 for (const [width, height] of [

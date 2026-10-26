@@ -28,6 +28,7 @@ import type {
   EnvironmentCapabilitiesResult,
   EnvironmentListResult,
   HostInfoResult,
+  LaunchShell,
   PresentationReason,
   Receipt,
   SessionCreateParams,
@@ -46,7 +47,6 @@ import type {
   VoiceStopResult
 } from '@kalareach/protocol'
 
-import type { LaunchSurface, ShellKind } from '../model/pending'
 import type { AccountView, UsageView } from '../model/account'
 import type {
   ApprovedLink,
@@ -98,6 +98,8 @@ import type {
   TerminalWheel,
   VoiceAllowed,
   VoiceAllowRequest,
+  LaunchPress,
+  LaunchSurfaceReading,
   VoiceCallState,
   VoiceDelegationRow,
   VoiceEnded,
@@ -113,6 +115,7 @@ import { openedMode } from '../theme-init'
 import { scriptedHostDrafts, type BindParams, type FakeHostDrafts } from './fake-host-drafts'
 import { AGENT_DRAFT_ADD_ATTACHMENT_PARAMS, DRAFT_CREATE_PARAMS, decodeParams } from './fake-decode'
 import { FakeDraftStore } from './fake-drafts'
+import { ScriptedLaunching, type InstalledLaunch, type LaunchScenario } from './fake-launch'
 import { EVERY_RIGHT, ScriptedRecords } from './fake-state'
 import { ScriptedQuestions, type FakeQuestions } from './fake-questions'
 import { ScriptedRetained, type FakeRetained } from './fake-retained'
@@ -442,8 +445,25 @@ export interface FakeHostControls {
   readonly standings: FakeStandings
   /** The drafts this device keeps, which another window can write to. */
   readonly drafts: FakeDraftStore
-  /** Moves the prompt generation on, which disables the launch buttons. */
+  /**
+   * Moves the prompt on to a new generation, as the reader draws a new prompt: a button drawn at the
+   * old one is disabled, and a launch that quotes it is refused.
+   */
   changePromptGeneration(): void
+  /**
+   * What the host answers to a read of the launch surface: the state a view's own link would read,
+   * following what the view does (the default); one of the states a worker was recorded in; or that
+   * the host does not serve the read.
+   */
+  launchScenario(scenario: LaunchScenario): void
+  /**
+   * Has the host refuse every launch a view holding the input presses, as the reader does when it
+   * could not hold the launch (`EDITOR_BUSY`) or could not say what became of it
+   * (`OUTCOME_UNKNOWN`); null has it take them again.
+   */
+  refuseLaunches(code: string | null, message: string): void
+  /** The launches the host installed, oldest first. */
+  readonly launches: readonly InstalledLaunch[]
   /**
    * Opens the pairing records the address said were not open, as native code does at the unlock of
    * a phone that was started before it: the page is told the pairing view it would have read.
@@ -892,10 +912,10 @@ export interface HeldMutations {
 }
 
 /** The shells a fake stock session can run. */
-const STOCK_SHELLS: readonly ShellKind[] = ['sh', 'zsh', 'bash', 'fish', 'powershell']
+const STOCK_SHELLS: readonly LaunchShell[] = ['sh', 'zsh', 'bash', 'fish', 'powershell']
 
 /** Where each of them lives on the fake host. */
-const STOCK_SHELL_PATHS: Readonly<Record<ShellKind, string>> = {
+const STOCK_SHELL_PATHS: Readonly<Record<LaunchShell, string>> = {
   sh: '/bin/sh',
   zsh: '/bin/zsh',
   bash: '/bin/bash',
@@ -908,7 +928,7 @@ export type IntakeSource = 'pasteboard' | 'camera' | 'photo'
 
 /** The fake host, and the controls a test drives it with. */
 export function fakeHost(
-  options: { readonly drafts?: FakeDraftStore; readonly stockShell?: ShellKind } = {}
+  options: { readonly drafts?: FakeDraftStore; readonly stockShell?: LaunchShell } = {}
 ): {
   port: HostPort
   controls: FakeHostControls
@@ -917,9 +937,9 @@ export function fakeHost(
    * The shell a stock session runs: the option, else what the address asks for
    * (`stock_shell=powershell`), else Zsh.
    */
-  const stockShell: ShellKind =
+  const stockShell: LaunchShell =
     options.stockShell ??
-    ((): ShellKind => {
+    ((): LaunchShell => {
       if (typeof window === 'undefined') return 'zsh'
       const asked = new URLSearchParams(window.location.search).get('stock_shell')
       return STOCK_SHELLS.find((shell) => shell === asked) ?? 'zsh'
@@ -930,8 +950,7 @@ export function fakeHost(
   let connected = true
   /** Native code's words for the loss of the connection, while it is lost. */
   let lostBecause = UNREACHABLE
-  let promptGeneration = 7
-  let bufferRevision = 12
+  const launching = new ScriptedLaunching(refuse)
   let pairing: PairingView = {
     origin: { origin: 'https://reach.kala.to', host: 'reach.kala.to', is_default: true },
     device_name: 'studio-mbp',
@@ -1099,6 +1118,11 @@ export function fakeHost(
     source: 'default'
   }
   const listed = (): SessionSummaryOf[] => [...sessions().sessions, ...created]
+  /** The shell a session runs when it runs a stock one, or null for a managed session. */
+  const stockShellOf = (sessionId: string): LaunchShell | null =>
+    listed().some((each) => each.session_id === sessionId && each.shell_mode === 'native_compat')
+      ? stockShell
+      : null
   const exportedArchives: Parameters<HostPort['exportSemanticJson']>[0][] = []
   const exportedCasts: Parameters<HostPort['exportAsciicast']>[0][] = []
   const openedLinks: string[] = []
@@ -1850,34 +1874,13 @@ export function fakeHost(
       }
       return settledSetup()
     },
+    // Read on the link every agent read uses, which never holds the session's input.
     launchSurface: (params) =>
       reading('launchSurface', () => {
         requireConnection()
-        // A stock shell's editor is not the host's to see, so its prompt is never verified empty.
-        const sessionId = (params as { session_id?: string } | null)?.session_id
-        const stock = listed().some(
-          (session) => session.session_id === sessionId && session.shell_mode === 'native_compat'
-        )
-        return fakeLaunchSurface(!stock, String(promptGeneration), stock ? stockShell : 'zsh')
+        const sessionId = (params as { session_id?: string } | null)?.session_id ?? ''
+        return launching.read(sessionId, false, stockShellOf(sessionId))
       }),
-    shellLaunch: (params) => {
-      requireConnection()
-      const asked = params as { expected_prompt_generation?: string; expected_buffer_revision?: string }
-      if (asked.expected_prompt_generation !== String(promptGeneration)) {
-        refuse('DRAFT_CONFLICT', 'The prompt moved on before the launch was installed.')
-      }
-      bufferRevision += 1
-      const result: ShellLaunchResult = {
-        buffer_revision: String(bufferRevision),
-        fence_id: '00000000-0000-4000-8000-0000000000ff',
-        prompt_generation: String(promptGeneration)
-      }
-      return Promise.resolve({
-        receipt: receipt(nextActionId(), 'applied', 'shell.launch'),
-        action_id: null,
-        value: result
-      })
-    },
 
     // The agent's calls, as the session's own worker answers them.
     sessionAgents: (sessionId, opening) =>
@@ -2209,11 +2212,30 @@ export function fakeHost(
       const refusal = sizeRefusal(args.columns, args.rows)
       if (refusal !== null) return refused('INVALID_ARGUMENT', refusal)
       const size = { columns: args.columns, rows: args.rows }
-      const view = fakeTerminalView(sessionId, size, listener, terminalPresentation, {
-        holdingMoves: holdingTerminalMoves,
-        holdingControl: holdingTerminalControl,
-        wheel: terminalWheel
-      })
+      const view = fakeTerminalView(
+        sessionId,
+        size,
+        listener,
+        terminalPresentation,
+        {
+          holdingMoves: holdingTerminalMoves,
+          holdingControl: holdingTerminalControl,
+          wheel: terminalWheel
+        },
+        {
+          // Read and pressed on the view's own link, which is the one that can hold the input.
+          read: (controls) =>
+            reading('launchSurface', () => {
+              requireConnection()
+              return launching.read(sessionId, controls, stockShellOf(sessionId))
+            }),
+          press: (controls, press) =>
+            attempting(() => {
+              requireConnection()
+              return launching.press(sessionId, controls, press)
+            })
+        }
+      )
       terminalViews.push(view)
       if (!connected) {
         // Native code publishes the failure on the view's channel; the open itself answers.
@@ -3117,12 +3139,16 @@ export function fakeHost(
     },
     drafts,
     changePromptGeneration() {
-      promptGeneration += 1
-      emit({
-        stream_id: 'session_state',
-        sequence: String(promptGeneration),
-        body: { kind: 'prompt_generation', prompt_generation: String(promptGeneration) }
-      })
+      launching.changePromptGeneration()
+    },
+    launchScenario(scenario) {
+      launching.scenario = scenario
+    },
+    refuseLaunches(code, message) {
+      launching.refusal = code === null ? null : { code, message }
+    },
+    get launches() {
+      return launching.installed
     },
     openPairingRecords() {
       recordsNotOpen = null
@@ -3822,32 +3848,6 @@ function fakeVoiceContext(voiceSessionId: string, sessionId: string): VoiceConte
   }
 }
 
-/** The launch surface this host reports, read by the interface before it draws a button. */
-export function fakeLaunchSurface(
-  promptIsEmpty: boolean,
-  promptGeneration: string,
-  shellKind: ShellKind = 'zsh'
-): LaunchSurface {
-  return {
-    shell_kind: shellKind,
-    prompt_is_empty: promptIsEmpty,
-    prompt_generation: promptGeneration,
-    buffer_revision: '12',
-    profiles: [
-      { profile_id: 'codex', label: 'Codex', executable: '/usr/local/bin/codex', version: '0.48.2', user_defined: false, arguments: ['codex'] },
-      { profile_id: 'claude-code', label: 'Claude Code', executable: '/usr/local/bin/claude', version: '2.8.0', user_defined: false, arguments: ['claude'] },
-      { profile_id: 'opencode', label: 'OpenCode', executable: '/usr/local/bin/opencode', version: '1.4.0', user_defined: false, arguments: ['opencode'] },
-      { profile_id: 'gemini', label: 'Gemini', executable: '/usr/local/bin/gemini', version: '0.9.3', user_defined: false, arguments: ['gemini'] },
-      { profile_id: 'kimi', label: 'Kimi', executable: null, version: null, user_defined: false, arguments: ['kimi'] },
-      { profile_id: 'qoder', label: 'Qoder', executable: '/usr/local/bin/qoder', version: '0.6.1', user_defined: false, arguments: ['qoder'] },
-      { profile_id: 'named-1', label: 'Run the test suite', executable: '/bin/sh', version: null, user_defined: true, arguments: ['pnpm', 'test'] },
-      // A command whose words need quoting in every shell: a path with a space, a word with a quote
-      // and a word a shell would read as more than itself.
-      { profile_id: 'named-2', label: 'Open my notes', executable: '/bin/sh', version: null, user_defined: true, arguments: ['/Users/rs/My Notes/open-notes', '--title', 'It’s a draft', "--note=don't", '--tags=a,b', '@today'] }
-    ]
-  }
-}
-
 function hostInfo(): HostInfoResult {
   return {
     boot_identity: { source: 'macos_boot_session_uuid', value: 'b-1' },
@@ -3937,7 +3937,7 @@ type SessionSummaryOf = SessionListResult['sessions'][number]
 function createdSession(
   params: SessionCreateParams,
   before: number,
-  stockShell: ShellKind
+  stockShell: LaunchShell
 ): SessionSummaryOf {
   const number = 4 + before
   return {
@@ -3982,7 +3982,14 @@ function fakeTerminalView(
     readonly holdingMoves: boolean
     readonly holdingControl: boolean
     readonly wheel: TerminalWheel
-  } = { holdingMoves: false, holdingControl: false, wheel: 'reaches' }
+  } = { holdingMoves: false, holdingControl: false, wheel: 'reaches' },
+  launch: {
+    readonly read: (controls: boolean) => Promise<LaunchSurfaceReading>
+    readonly press: (controls: boolean, press: LaunchPress) => Promise<ShellLaunchResult>
+  } = {
+    read: () => Promise.resolve({ state: 'not_served' }),
+    press: () => refused('LEASE_LOST', 'This view does not control the program.')
+  }
 ): HeldTerminalView {
   terminalViewCount += 1
   const grids: TerminalGrid[] = [grid]
@@ -4198,6 +4205,16 @@ function fakeTerminalView(
             return Promise.resolve()
         }
       },
+      // Read and pressed on this view's own link, which holds the session's input while the view
+      // controls the program. A view that has ended answers nothing.
+      launchSurface: () =>
+        closed || ended
+          ? refused('TERMINAL_UNAVAILABLE', 'This view has ended.')
+          : launch.read(wanted && leased),
+      launch: (press) =>
+        closed || ended
+          ? refused('LEASE_LOST', 'This view has ended, and took nothing.')
+          : launch.press(wanted && leased, press),
       close: () => {
         closed = true
         return Promise.resolve()

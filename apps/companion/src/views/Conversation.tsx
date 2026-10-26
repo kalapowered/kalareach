@@ -36,6 +36,8 @@ import { Badge, Banner, Button, Card, CommitButton, IconButton } from '../compon
 import { useApp, useSession } from '../app/state'
 import { useSessionAgent } from '../app/agent'
 import { useHeldConnection } from '../app/rights'
+import { useLaunchSurface } from '../app/launch-surface'
+import { LaunchSurface } from './LaunchSurface'
 import { AttachmentPaths } from '../components/AttachmentPaths'
 import { AttachmentThumb } from '../components/AttachmentThumb'
 import {
@@ -114,8 +116,6 @@ import {
   wasRefused,
   type Submission
 } from '../model/receipts'
-import { commandLine } from '../model/command-line'
-import type { LaunchSurface } from '../model/pending'
 import { useBook, useSessionDraft } from '../app/drafts'
 import { useReceiptReads } from '../app/receipts'
 import { ApprovalRequests } from './Approvals'
@@ -149,19 +149,11 @@ function text(value: unknown): string {
 export function Conversation({
   sessionId,
   subject,
-  connected,
-  launch,
-  shellMode = null,
-  onLaunched
+  connected
 }: {
   readonly sessionId: string
   readonly subject: SessionSubject
   readonly connected: boolean
-  /** The launch surface as it was read, and the prompt's generation as the view knows it now. */
-  readonly launch: { readonly surface: LaunchSurface; readonly promptGeneration: string } | null
-  /** The session's shell, as the host reported it, or null before it has. */
-  readonly shellMode?: 'managed' | 'native_compat' | null
-  readonly onLaunched: () => void
 }): ReactNode {
   const { port, say, drafts: book, paths, receiptReads } = useApp()
   const { rights, paired } = useHeldConnection()
@@ -920,20 +912,7 @@ export function Conversation({
       <QuestionRequests sessionId={sessionId} onAnswered={refresh} />
       <KeptAnswers sessionId={sessionId} />
 
-      {launch !== null && shellMode === 'native_compat' ? (
-        // A stock shell's editor is not the host's to see or to type into, so its launch buttons
-        // show what to type, whatever the prompt holds.
-        <LaunchInstructions surface={launch.surface} />
-      ) : launch?.surface.prompt_is_empty ? (
-        <LaunchSurfaceView
-          surface={launch.surface}
-          promptGeneration={launch.promptGeneration}
-          subject={subject}
-          sessionId={sessionId}
-          connected={connected}
-          onLaunched={onLaunched}
-        />
-      ) : null}
+      <SessionLaunchSurface sessionId={sessionId} connected={connected} />
 
       {draftsProblem === null ? null : (
         <p className="banner warning" data-testid="drafts-not-kept">
@@ -1444,155 +1423,30 @@ function ControlButton({
 }
 
 /**
- * The launch surface at a verified empty prompt.
+ * The launch surface as the session's worker answers it on the link every agent read uses.
  *
- * Every button carries the prompt generation it was drawn at. A generation that moved disables them
- * all, because the prompt the person was looking at is not the prompt that is there now. Nothing
- * here pastes: a launch is an installed command, not typed characters.
+ * That link never holds the session's input, so no button is lit here: what a person can start is
+ * started from the terminal view, whose own link holds the input once the person takes control.
+ * Here the surface says what the terminal view will offer, or why it will not.
  */
-function LaunchSurfaceView({
-  surface,
-  promptGeneration,
-  subject,
+function SessionLaunchSurface({
   sessionId,
-  connected,
-  onLaunched
+  connected
 }: {
-  readonly surface: LaunchSurface
-  /** The prompt's generation now, which a read that answered late may already be behind. */
-  readonly promptGeneration: string
-  readonly subject: SessionSubject
   readonly sessionId: string
   readonly connected: boolean
-  readonly onLaunched: () => void
 }): ReactNode {
-  const { port, say } = useApp()
-  // The generation these buttons were drawn at. A host that moved the prompt on makes them stale,
-  // and reading the surface again is what makes them usable: a person looks at the prompt, and the
-  // refreshed proof is what re-enables the buttons.
-  const [drawnAt, setDrawnAt] = useState(surface.prompt_generation)
-  const stale = drawnAt !== promptGeneration || !connected
-
+  const { port } = useApp()
+  const { rights } = useHeldConnection()
+  const read = useCallback(() => port.launchSurface({ session_id: sessionId }), [port, sessionId])
+  const reads = useLaunchSurface(port, sessionId, read)
   return (
-    <section className="launch-surface" data-testid="launch-surface" data-stale={stale}>
-      <p className="eyebrow">Start something here</p>
-      <div className="row wrap">
-        {surface.profiles.map((profile) => {
-          const missing = profile.executable === null
-          return (
-            <CommitButton
-              key={profile.profile_id}
-              data-profile={profile.profile_id}
-              data-wraps
-              disabled={stale || missing}
-              title={
-                stale
-                  ? 'The prompt changed. Look at it before starting anything.'
-                  : missing
-                    ? `${profile.label} is not installed in this environment.`
-                    : `${profile.executable}${profile.version ? ` · ${profile.version}` : ''}`
-              }
-              onCommit={() => {
-                port
-                  .shellLaunch(
-                    {
-                      session_id: sessionId,
-                      command: { arguments: [...profile.arguments] },
-                      expected_prompt_generation: promptGeneration,
-                      expected_buffer_revision: surface.buffer_revision
-                    },
-                    subject
-                  )
-                  .then((result) => {
-                    say(outcomeMessage(`${profile.label} started`, result), outcomeTone(result))
-                    onLaunched()
-                  })
-                  .catch((error: unknown) => {
-                    say(failureMessage(error), 'danger')
-                    onLaunched()
-                  })
-              }}
-            >
-              {/* One piece of text, so that a label that has to wrap wraps as a line does. */}
-              <span>
-                {profile.label}
-                {profile.user_defined ? <span className="faint small"> · yours</span> : null}
-              </span>
-            </CommitButton>
-          )
-        })}
-      </div>
-      {stale ? (
-        <p className="small warning-text" data-testid="launch-stale">
-          {connected
-            ? 'The prompt changed since these were drawn. Nothing will be typed into it.'
-            : 'Not in contact with this host, so nothing can be started on it.'}
-          {connected ? (
-            <Button
-              data-testid="launch-refresh"
-              onClick={() => {
-                setDrawnAt(promptGeneration)
-              }}
-            >
-              I have looked at the prompt
-            </Button>
-          ) : null}
-        </p>
-      ) : (
-        <p className="small faint">
-          The prompt is empty and verified. A launch installs the command; it never pastes one.
-        </p>
-      )}
-    </section>
-  )
-}
-
-/**
- * The launch surface of a stock shell.
- *
- * The host cannot see a stock shell's editor, so nothing here types into it or starts anything: a
- * button shows the command for the person to type at the prompt themselves.
- */
-function LaunchInstructions({ surface }: { readonly surface: LaunchSurface }): ReactNode {
-  const [shown, setShown] = useState<LaunchSurface['profiles'][number] | null>(null)
-  return (
-    <section className="launch-surface" data-testid="launch-instructions">
-      <p className="eyebrow">Start something here</p>
-      <div className="row wrap">
-        {surface.profiles.map((profile) => (
-          <Button
-            key={profile.profile_id}
-            data-profile={profile.profile_id}
-            data-wraps
-            disabled={profile.executable === null}
-            aria-pressed={shown?.profile_id === profile.profile_id}
-            title={
-              profile.executable === null
-                ? `${profile.label} is not installed in this environment.`
-                : undefined
-            }
-            onClick={() => {
-              setShown(profile)
-            }}
-          >
-            {/* One piece of text, so that a label that has to wrap wraps as a line does. */}
-            <span>
-              {profile.label}
-              {profile.user_defined ? <span className="faint small"> · yours</span> : null}
-            </span>
-          </Button>
-        ))}
-      </div>
-      <p className="small faint" data-testid="launch-instruction">
-        {shown === null ? (
-          'This is a stock shell, so nothing is typed into it for you. Choose one to see what to type.'
-        ) : (
-          <>
-            Type this at the prompt: <code>{commandLine(shown.arguments, surface.shell_kind)}</code>
-          </>
-        )}
-      </p>
-    </section>
+    <LaunchSurface
+      reads={reads}
+      mayType={rights?.includes('terminal.input') === true}
+      connected={connected}
+      press={null}
+    />
   )
 }
 

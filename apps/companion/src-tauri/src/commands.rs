@@ -75,8 +75,12 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("terminal_view_move", None),
     ("terminal_view_input", None),
     ("terminal_view_close", None),
-    // The launch surface.
-    ("shell_launch", Some(Method::ShellLaunch)),
+    // The launch surface. It is read on the session's own worker, and pressed on a view's own link,
+    // which is the link that can hold the session's input: the page names a session or a view and
+    // the command to install, never a method.
+    ("launch_surface", Some(Method::ShellLaunchSurface)),
+    ("terminal_view_launch_surface", None),
+    ("terminal_view_launch", None),
     // The drafts this device keeps. They are the device's own, in a store of its own: the page
     // names a draft, the version it was shown and what to keep, never a path or a method.
     ("device_drafts", None),
@@ -288,7 +292,7 @@ pub const SESSION_BOUND_COMMANDS: &[&str] = &[
     "action_read",
     "action_cancel",
     "history_page",
-    "shell_launch",
+    "launch_surface",
     "draft_create",
     "draft_add_attachment",
     "attachment_upload",
@@ -489,6 +493,13 @@ pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
         ],
     ),
     ("terminal_view_close", &[Method::SessionDetach]),
+    // A view reads the launch surface on its own link, which tells a host that does not serve it
+    // from a grant that lost its right by what the same right reads, and presses a launch there.
+    (
+        "terminal_view_launch_surface",
+        &[Method::ShellLaunchSurface, Method::SessionRead],
+    ),
+    ("terminal_view_launch", &[Method::ShellLaunch]),
     // A hand-over of a session's control: the host describes the plan from its own records and
     // asks the owner devices to confirm exactly that, native code reads whether one has, and only
     // then sends the transfer, under the action the plan names.
@@ -581,7 +592,9 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         terminal_view_move,
         terminal_view_input,
         terminal_view_close,
-        shell_launch,
+        terminal_view_launch_surface,
+        terminal_view_launch,
+        launch_surface,
         device_drafts,
         device_draft_save,
         device_draft_retarget,
@@ -1524,32 +1537,50 @@ session_mutate_command!(
     session_close, Method::SessionClose, kr_protocol::session::SessionCloseParams
 );
 
-/// Launches an installed profile or a named command at a verified empty prompt.
+/// Reads whether a launch could be made at a session's root editor now, on the session's own
+/// worker: the editor's state, who holds the session's input, the shell's name and the commands the
+/// host offers. A host that does not serve the read is answered as `not_served`.
 ///
-/// Not offered over a host this device is paired with: the host takes a launch only from the
-/// connection that holds the session's input.
+/// The link this reads on never holds the session's input, so it never says the input is held
+/// here: the buttons that start something are drawn from the read a raw terminal view makes on its
+/// own link.
 #[tauri::command]
-pub async fn shell_launch(
+pub async fn launch_surface(
     state: State<'_, AppState>,
-    subject: Subject,
+    links: State<'_, crate::agent::WorkerLinks>,
     params: Value,
-) -> Result<Settled> {
-    not_on_a_paired_host(&state, "launching")?;
-    let typed: kr_protocol::root::ShellLaunchParams = decode(params)?;
-    let target = subject.target(state.environment_id()?)?;
-    let session = state.session()?;
-    submitted(
-        session
-            .mutate(
-                Method::ShellLaunch,
-                target,
-                None,
-                &NoPreconditions {},
-                &typed,
-                MUTATION_TTL,
-            )
-            .await,
-    )
+    opening: Option<String>,
+) -> Result<Value> {
+    let typed: kr_protocol::root::ShellLaunchSurfaceParams = decode(params)?;
+    let read = links
+        .launch_surface(&state, typed.session_id, opening.as_deref())
+        .await?;
+    encode(&crate::launch::LaunchSurfaceAnswer::from(read))
+}
+
+/// Reads the launch surface on an open view's own link, which is the link that holds the session's
+/// input once the person takes control: the answer says whether this view does.
+#[tauri::command]
+pub async fn terminal_view_launch_surface(
+    views: State<'_, crate::terminal::TerminalViews>,
+    view: String,
+) -> Result<Value> {
+    encode(&views.launch_surface(&view).await?)
+}
+
+/// Presses a launch on an open view's own link: the command to install, and the prompt generation
+/// and the buffer revision of the read its button was drawn from. The session is the view's own.
+///
+/// The session accepts a launch only from the connection whose attachment holds its input, and
+/// refuses one that quotes a prompt that has moved, with `DRAFT_CONFLICT`, before anything is typed.
+#[tauri::command]
+pub async fn terminal_view_launch(
+    views: State<'_, crate::terminal::TerminalViews>,
+    view: String,
+    press: Value,
+) -> Result<Value> {
+    let press: crate::launch::Press = decode(press)?;
+    encode(&views.launch(&view, press).await?)
 }
 
 /// Creates a draft on the host, which a file is then bound to.
@@ -3766,6 +3797,8 @@ mod tests {
         "terminal_view_move",
         "terminal_view_input",
         "terminal_view_close",
+        "terminal_view_launch_surface",
+        "terminal_view_launch",
         "device_drafts",
         "device_draft_save",
         "device_draft_retarget",
@@ -4042,12 +4075,14 @@ mod tests {
                 "settings_device_remove",
                 "settings_devices_dismiss",
                 "settings_join",
-                // The raw terminal view's five. The view attaches on the session's own worker,
+                // The raw terminal view's seven. The view attaches on the session's own worker,
                 // which the control daemon does not proxy for this computer, so the page names a
-                // session, a size, its moves and the person's input, and native code makes every
-                // call.
+                // session, a size, its moves, the person's input, and the command to install, and
+                // native code makes every call.
                 "terminal_view_close",
                 "terminal_view_input",
+                "terminal_view_launch",
+                "terminal_view_launch_surface",
                 "terminal_view_move",
                 "terminal_view_open",
                 "terminal_view_resize",
@@ -4303,7 +4338,7 @@ mod tests {
             description_setup,
             description_configure,
             description_download,
-            shell_launch,
+            launch_surface,
             draft_create,
             draft_add_attachment,
             attachment_upload,

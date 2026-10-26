@@ -1970,9 +1970,14 @@ async fn kr_req_19_08_every_command_that_reaches_a_session_goes_by_the_route_the
     .expect("the page is read on the link of the share's opening");
     assert_eq!(page["bytes"], "", "{page}");
 
+    // The launch surface is read on the share's own link, and the host forwards the read to the
+    // session's worker.
+    let surface = about("launch_surface", json!({ "session_id": session }))
+        .expect("the launch surface is read on the link of the share's opening");
+    assert_eq!(surface["state"], "served", "{surface}");
+
     // What a paired host does not serve a device is refused in words, before anything is sent.
     for (command, body) in [
-        ("shell_launch", json!({ "params": {}, "subject": {} })),
         ("draft_create", json!({ "params": {}, "subject": {} })),
         (
             "draft_add_attachment",

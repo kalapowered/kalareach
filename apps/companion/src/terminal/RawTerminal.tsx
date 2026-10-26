@@ -51,8 +51,11 @@ import { flushSync } from 'react-dom'
 import type { PaletteState } from '@kalareach/protocol'
 
 import { Badge, Button } from '../components/ui'
+import { useLaunchSurface } from '../app/launch-surface'
+import { useHeldConnection } from '../app/rights'
 import { useApp } from '../app/state'
 import type { TerminalGrid, TerminalScreen } from '../host/port'
+import { LaunchSurface } from '../views/LaunchSurface'
 import { styleOf } from './cells'
 import {
   backgroundOf,
@@ -325,8 +328,22 @@ export function RawTerminal({
     toProgram,
     controlTake,
     refuse,
-    unsent
+    unsent,
+    launch
   } = useTerminalView(port, sessionId, measure)
+
+  // What a launch could do at the session's prompt, read on this view's own link: the link that
+  // holds the session's input once the person takes control, so it is the one whose answer can
+  // light a button.
+  const { rights } = useHeldConnection()
+  const launchReads = useLaunchSurface(port, `${sessionId}:${openingKey}`, launch?.read ?? null)
+  // Taking control or giving it back changes who holds the input, which the surface says: it is
+  // read again at once rather than a cadence later.
+  const controlState = control?.state ?? null
+  const readLaunchAgain = launchReads.again
+  useEffect(() => {
+    readLaunchAgain()
+  }, [controlState, readLaunchAgain])
 
   // Each screen the view draws is what a recording of it keeps.
   useEffect(() => {
@@ -802,6 +819,14 @@ export function RawTerminal({
           </Button>
         </span>
       </footer>
+
+      {/* After the controls, so the program's keyboard is still the next stop after the mode button. */}
+      <LaunchSurface
+        reads={launchReads}
+        mayType={rights?.includes('terminal.input') === true}
+        connected={rights !== null}
+        press={launch?.press ?? null}
+      />
     </section>
   )
 }

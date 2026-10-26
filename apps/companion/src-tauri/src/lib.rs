@@ -40,6 +40,7 @@ pub mod error;
 pub mod export;
 pub mod hosts;
 pub mod inbox;
+pub mod launch;
 pub mod lease;
 pub mod links;
 pub mod mailbox;

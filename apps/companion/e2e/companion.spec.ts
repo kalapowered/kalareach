@@ -58,6 +58,17 @@ async function takeControl(page: Page): Promise<void> {
     .toBe('controlling')
 }
 
+/**
+ * Opens the raw view of the first session and takes control of it, as the person does: the launch
+ * surface on the view's own link then reads the input as held here.
+ */
+async function openControlledTerminal(page: Page): Promise<void> {
+  await openSession(page)
+  await page.getByRole('tab', { name: 'Terminal' }).click()
+  await page.getByTestId('raw-terminal').waitFor()
+  await takeControl(page)
+}
+
 /** Every wheel turn, key, text and paste the newest raw view took for the program, in order. */
 async function programInputs(page: Page) {
   return page.evaluate(() =>
@@ -583,9 +594,9 @@ test.describe('the semantic view', () => {
     expect(page.url()).toContain('/harness.html')
   })
 
-  // KR-REQ-13.11: the buttons that start something at a verified prompt name their program, and the
-  // person's own are named at any length. At the largest text size on a window as narrow as a phone's
-  // each label wraps inside its button and each button lies inside the window; none is cut off.
+  // KR-REQ-13.11: the buttons that start something at a verified prompt name their program. At the
+  // largest text size on a window as narrow as a phone's each label wraps inside its button and each
+  // button lies inside the window; none is cut off.
   for (const [width, height] of [
     [1280, 720],
     [390, 844]
@@ -599,10 +610,11 @@ test.describe('the semantic view', () => {
         await withWideFace(page)
         // The window is opened at the desktop's own size, which has the navigation the session is
         // reached through, and made the size under test once the session is on it.
-        await openSession(page)
+        await openControlledTerminal(page)
         await page.setViewportSize({ width, height })
         const surface = page.getByTestId('launch-surface')
         await expect(surface).toBeVisible()
+        await expect(surface.getByRole('button', { name: /Claude Code/ })).toBeEnabled()
         await surface.scrollIntoViewIfNeeded()
 
         const buttons = await surface.getByRole('button').evaluateAll((all) =>
@@ -617,7 +629,7 @@ test.describe('the semantic view', () => {
             }
           })
         )
-        expect(buttons.map((each) => each.name)).toContain('Run the test suite · yours')
+        expect(buttons.map((each) => each.name)).toContain('Gemini CLI')
         for (const each of buttons) {
           expect(each.right, `${each.name} ends inside the window`).toBeLessThanOrEqual(width + 0.5)
           expect(each.left, `${each.name} starts inside the window`).toBeGreaterThanOrEqual(-0.5)
@@ -635,19 +647,23 @@ test.describe('the semantic view', () => {
     }
   }
 
-  test('draws the six profiles and disables them when the prompt moves', async ({ page }) => {
-    await openSession(page)
+  test('draws the offers, lights them on the terminal view, and disables them when the prompt moves', async ({
+    page
+  }) => {
+    await openControlledTerminal(page)
     const surface = page.getByTestId('launch-surface')
-    for (const label of ['Codex', 'Claude Code', 'OpenCode', 'Gemini', 'Kimi', 'Qoder']) {
-      await expect(surface.getByRole('button', { name: new RegExp(label) })).toBeVisible()
+    for (const label of ['Claude Code', 'Codex CLI', 'Gemini CLI']) {
+      await expect(surface.getByRole('button', { name: new RegExp(label) })).toBeEnabled()
     }
     await page.screenshot({ path: shot('launch-13.11'), fullPage: true })
 
     await page.evaluate(() => {
       window.krTestHost?.changePromptGeneration()
+      // The page is shown again, which reads the surface at once instead of a cadence later.
+      document.dispatchEvent(new Event('visibilitychange'))
     })
     await expect(page.getByTestId('launch-stale')).toBeVisible()
-    await expect(surface.getByRole('button', { name: /Codex/ })).toBeDisabled()
+    await expect(surface.getByRole('button', { name: /Claude Code/ })).toBeDisabled()
   })
 
   test('stops following when the reader scrolls up, and follows again at the end', async ({
@@ -711,32 +727,21 @@ test.describe('reading once it is listening', () => {
   /** Where a screenshot for this browser goes, so each engine keeps its own. */
   const shotFor = (name: string): string => shot(`${name}-${test.info().project.name}`)
 
-  // KR-REQ-13.11: the surface is read at one prompt generation and answers after the prompt has
-  // moved on, so the buttons it draws are disabled.
-  test('draws the launch buttons disabled when the prompt moved before the surface answered', async ({
-    page
-  }) => {
-    await open(page)
-    const held = await page.evaluateHandle(() => {
-      const host = window.krTestHost
-      if (!host) throw new Error('the harness has no scripted host')
-      return host.hold('launchSurface')
-    })
-    await page.getByRole('button', { name: 'Sessions' }).click()
-    await page.getByTestId('session-row-1').click()
-    await page.getByTestId('conversation').waitFor()
-    await expect.poll(() => held.evaluate((reads) => reads.count)).toBe(1)
-
+  // KR-REQ-13.11: a button drawn at one prompt is pressed after the prompt moved. The session
+  // refuses the quote, nothing is shown as started, and the buttons are disabled.
+  test('refuses a launch whose prompt moved, and shows no success', async ({ page }) => {
+    await openControlledTerminal(page)
+    const surface = page.getByTestId('launch-surface')
+    await expect(surface.getByRole('button', { name: /Claude Code/ })).toBeEnabled()
     await page.evaluate(() => {
       window.krTestHost?.changePromptGeneration()
     })
-    await held.evaluate((reads) => {
-      reads.release()
-    })
+    await surface.getByRole('button', { name: /Claude Code/ }).click()
 
-    const surface = page.getByTestId('launch-surface')
-    await expect(page.getByTestId('launch-stale')).toBeVisible()
-    await expect(surface.getByRole('button', { name: /Codex/ })).toBeDisabled()
+    await expect(page.locator('.toast')).toContainText('The prompt changed before the launch was installed')
+    await expect(page.locator('.toast')).not.toContainText('started')
+    expect(await page.evaluate(() => window.krTestHost?.launches.length)).toBe(0)
+    await expect(surface.getByRole('button', { name: /Claude Code/ })).toBeDisabled()
     await page.screenshot({ path: shotFor('launch-13.11-overtaken'), fullPage: true })
   })
 
@@ -761,7 +766,7 @@ test.describe('reading once it is listening', () => {
       done()
     })
     await expect(page.getByText('Session 1 · Waiting for you')).toBeVisible()
-    await expect(page.getByTestId('launch-surface')).toBeVisible()
+    await expect(page.getByTestId('launch-take-control')).toBeVisible()
     await expect(page.getByText('Not in contact with this host')).toHaveCount(0)
   })
 

@@ -31,12 +31,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use kr_ipc::paths::EnvironmentPaths;
+use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::SessionId;
+use kr_protocol::root::ShellLaunchResult;
 use kr_protocol::session::Dimensions;
+
+use crate::launch::{LaunchSurfaceAnswer, Press};
 
 pub use input::{Input, Refused};
 pub use screen::TerminalViewState;
 pub use window::Move;
+
+/// What a launch surface read or a launch says when the view it was for has ended, or was never
+/// open.
+const VIEW_ENDED: &str = "This view has ended.";
 
 /// Where the host's session descriptors are, found when a view opens.
 ///
@@ -273,6 +281,70 @@ impl TerminalViews {
         }
         // A task that ends before it answers drops the answer: its view has ended and took nothing.
         answered.await.unwrap_or_else(|_| ended())
+    }
+
+    /// Reads the launch surface on a view's own link, which is the link that can hold the session's
+    /// input: whether a launch could be made at the root editor now, and whether this view is the
+    /// one that holds the input.
+    ///
+    /// # Errors
+    ///
+    /// Returns the session's own refusal, or why the view could not ask: it has ended, was never
+    /// open, or is not attached yet.
+    pub async fn launch_surface(
+        &self,
+        view: &str,
+    ) -> Result<LaunchSurfaceAnswer, crate::error::CommandError> {
+        self.asked(
+            view,
+            ErrorCode::TerminalUnavailable,
+            view::Command::LaunchSurface,
+        )
+        .await
+    }
+
+    /// Presses a launch on a view's own link. The session accepts it only while this view holds its
+    /// input, and refuses it, before anything is typed, when the prompt it quotes has moved.
+    ///
+    /// # Errors
+    ///
+    /// Returns the session's own refusal, `DRAFT_CONFLICT` for a prompt that moved, `EDITOR_BUSY`
+    /// for an editor that could not hold the launch and `OUTCOME_UNKNOWN` for one that could not
+    /// say; or why the view could not ask, which is `LEASE_LOST` once it has ended.
+    pub async fn launch(
+        &self,
+        view: &str,
+        press: Press,
+    ) -> Result<ShellLaunchResult, crate::error::CommandError> {
+        self.asked(view, ErrorCode::LeaseLost, |reply| {
+            view::Command::Launch(press, reply)
+        })
+        .await
+    }
+
+    /// Hands a view a command that is answered on a channel of its own, and waits for the answer.
+    async fn asked<T>(
+        &self,
+        view: &str,
+        ended_as: ErrorCode,
+        command: impl FnOnce(view::Reply<T>) -> view::Command,
+    ) -> Result<T, crate::error::CommandError> {
+        let ended = || crate::error::CommandError::stated(ended_as, VIEW_ENDED);
+        let Ok(id) = view.parse::<u64>() else {
+            return Err(ended());
+        };
+        let (reply, answered) = tokio::sync::oneshot::channel();
+        {
+            let held = self.lock();
+            let Some(entry) = held.get(&id) else {
+                return Err(ended());
+            };
+            if entry.commands.send(command(reply)).is_err() {
+                return Err(ended());
+            }
+        }
+        // A task that ends before it answers drops the answer: its view has ended.
+        answered.await.unwrap_or_else(|_| Err(ended()))
     }
 
     /// Closes a view and returns once its task has ended: it detaches, closes its link and publishes

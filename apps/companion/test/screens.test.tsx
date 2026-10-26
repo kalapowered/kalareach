@@ -307,35 +307,6 @@ describe('the semantic view', () => {
     expect(text).not.toMatch(/succeeded|delivered|done/i)
   })
 
-  it('draws the six installed profiles plus a named command at a verified empty prompt', async () => {
-    start({ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' })
-    const surface = await screen.findByTestId('launch-surface')
-    for (const label of ['Codex', 'Claude Code', 'OpenCode', 'Gemini', 'Kimi', 'Qoder']) {
-      expect(within(surface).getByRole('button', { name: new RegExp(label) })).toBeInTheDocument()
-    }
-    expect(within(surface).getByRole('button', { name: /Run the test suite/ })).toBeInTheDocument()
-  })
-
-  it('disables a profile the environment does not have', async () => {
-    start({ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' })
-    const surface = await screen.findByTestId('launch-surface')
-    expect(within(surface).getByRole('button', { name: /Kimi/ })).toBeDisabled()
-    expect(within(surface).getByRole('button', { name: /Codex/ })).toBeEnabled()
-  })
-
-  it('disables every launch button once the prompt generation moves', async () => {
-    const { controls } = start({ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' })
-    const surface = await screen.findByTestId('launch-surface')
-    expect(within(surface).getByRole('button', { name: /Codex/ })).toBeEnabled()
-
-    controls.changePromptGeneration()
-
-    await waitFor(() => {
-      expect(screen.getByTestId('launch-stale')).toBeInTheDocument()
-    })
-    expect(within(screen.getByTestId('launch-surface')).getByRole('button', { name: /Codex/ })).toBeDisabled()
-  })
-
   it('sends a dropped file through the transfer service and keeps it with the draft', async () => {
     const person = userEvent.setup()
     const { port, controls } = fakeHost()
@@ -551,7 +522,7 @@ describe('the semantic view', () => {
   })
 })
 
-describe('the session view reads once it is listening (KR-REQ-13.02, KR-REQ-13.11)', () => {
+describe('the session view reads once it is listening (KR-REQ-13.02)', () => {
   /** The application on the main session, against a host the test has prepared. */
   function openSession(port: HostPort): void {
     render(
@@ -582,30 +553,6 @@ describe('the session view reads once it is listening (KR-REQ-13.02, KR-REQ-13.1
     expect((await screen.findAllByText(LOST)).length).toBeGreaterThan(0)
   })
 
-  // KR-REQ-13.11: a generation that moved while the view registered is the one its surface is
-  // read at, so no button is ever drawn at the old one and a launch names the prompt that is there.
-  it('names the prompt generation that moved while its listeners registered', async () => {
-    const person = userEvent.setup()
-    const { port, controls } = fakeHost()
-    const complete = controls.holdRegistrations()
-    openSession(port)
-
-    act(() => {
-      controls.changePromptGeneration()
-    })
-    await act(async () => {
-      complete()
-      await Promise.resolve()
-    })
-
-    const codex = within(await screen.findByTestId('launch-surface')).getByRole('button', {
-      name: /Codex/
-    })
-    expect(codex).toBeEnabled()
-    await person.click(codex)
-    expect(await screen.findByText('Codex started.')).toBeInTheDocument()
-  })
-
   it('keeps a lost connection it heard over a session read that answers after it', async () => {
     const { port, controls } = fakeHost()
     const held = controls.hold('sessionRead')
@@ -628,214 +575,48 @@ describe('the session view reads once it is listening (KR-REQ-13.02, KR-REQ-13.1
     expect(screen.queryAllByText(LOST).length).toBeGreaterThan(0)
   })
 
-  // KR-REQ-13.11: the surface was read at the old generation and answers after the new one was
-  // heard, so its buttons are drawn disabled.
-  it('disables the launch buttons when the generation moves before the surface read answers', async () => {
-    const { port, controls } = fakeHost()
-    const held = controls.hold('launchSurface')
-    openSession(port)
-    await waitFor(() => {
-      expect(held.count).toBe(1)
-    })
-
-    act(() => {
-      controls.changePromptGeneration()
-    })
-    await act(async () => {
-      held.release()
-      await Promise.resolve()
-    })
-
-    const surface = await screen.findByTestId('launch-surface')
-    expect(within(surface).getByRole('button', { name: /Codex/ })).toBeDisabled()
-    expect(screen.getByTestId('launch-stale')).toBeInTheDocument()
-  })
-
-  // A launch answers after the person has moved to another session in the same view: the read it
-  // asks for belongs to the session on screen, and nothing read for the first one is shown.
-  it('shows nothing of a session it has moved away from', async () => {
-    const person = userEvent.setup()
-    const { port } = fakeHost()
-    let finishLaunch = () => {}
-    const launching: HostPort = {
-      ...port,
-      shellLaunch: (params, subject) =>
-        new Promise((resolve, reject) => {
-          finishLaunch = () => {
-            port.shellLaunch(params, subject).then(resolve, reject)
-          }
-        })
-    }
-    render(
-      <AppProvider port={launching} initialPlace={{ view: 'sessions' }}>
-        <App />
-      </AppProvider>
-    )
-    await person.click(await screen.findByTestId('session-row-1'))
-    await screen.findByText('Session 1 · Waiting for you')
-    await person.click(screen.getByRole('button', { name: 'Sessions' }))
-    await person.click(await screen.findByTestId('session-row-2'))
-    await screen.findByText('Session 2 · Working')
-    await person.click(screen.getByRole('tab', { name: 'Session 01' }))
-    await screen.findByText('Session 1 · Waiting for you')
-
-    const codex = within(await screen.findByTestId('launch-surface')).getByRole('button', {
-      name: /Codex/
-    })
-    await person.click(codex)
-    await person.click(screen.getByRole('tab', { name: 'Session 02' }))
-    await screen.findByText('Session 2 · Working')
-
-    await act(async () => {
-      finishLaunch()
-      await Promise.resolve()
-    })
-    expect(await screen.findByText('Codex started.')).toBeInTheDocument()
-    await act(async () => {
-      await Promise.resolve()
-    })
-    expect(screen.getByText('Session 2 · Working')).toBeInTheDocument()
-    expect(screen.queryByText('Session 1 · Waiting for you')).toBeNull()
-  })
-
-  // A view whose listeners could not be registered offers no launch, and trying again registers
-  // them again before it reads, so a later change of prompt is heard.
+  // A view whose listeners could not be registered says so, and trying again registers them again
+  // before it reads.
   it('registers its listeners again before it reads again', async () => {
     const person = userEvent.setup()
-    const { port, controls } = fakeHost()
+    const { port } = fakeHost()
     let refusing = true
     openSession({
       ...port,
-      subscribe: (listener) =>
+      onConnection: (listener) =>
         refusing
           ? Promise.reject({
               code: 'INTERNAL',
               message: 'The shell did not register the listener.',
               user_action: 'retry'
             })
-          : port.subscribe(listener)
+          : port.onConnection(listener)
     })
     expect((await screen.findAllByText(LOST)).length).toBeGreaterThan(0)
-    expect(screen.queryByTestId('launch-surface')).toBeNull()
 
     refusing = false
     await person.click(screen.getByRole('button', { name: 'Try again' }))
-    const codex = () =>
-      within(screen.getByTestId('launch-surface')).getByRole('button', { name: /Codex/ })
-    await waitFor(() => {
-      expect(codex()).toBeEnabled()
-    })
-
-    act(() => {
-      controls.changePromptGeneration()
-    })
-    await waitFor(() => {
-      expect(codex()).toBeDisabled()
-    })
-    expect(screen.getByTestId('launch-stale')).toBeInTheDocument()
-  })
-
-  // A surface belongs to the listeners that covered its read. Back on a session whose new
-  // listeners are still registering, the surface read before is not offered again.
-  it('offers no launch on a return to a session until its listeners are registered again', async () => {
-    const person = userEvent.setup()
-    const { port, controls } = fakeHost()
-    render(
-      <AppProvider port={port} initialPlace={{ view: 'sessions' }}>
-        <App />
-      </AppProvider>
-    )
-    await person.click(await screen.findByTestId('session-row-1'))
     await screen.findByText('Session 1 · Waiting for you')
-    await person.click(screen.getByRole('button', { name: 'Sessions' }))
-    await person.click(await screen.findByTestId('session-row-2'))
-    await screen.findByText('Session 2 · Working')
-    await person.click(screen.getByRole('tab', { name: 'Session 01' }))
-    await screen.findByTestId('launch-surface')
-
-    const complete = controls.holdRegistrations()
-    await person.click(screen.getByRole('tab', { name: 'Session 02' }))
-    await person.click(screen.getByRole('tab', { name: 'Session 01' }))
-    act(() => {
-      controls.changePromptGeneration()
-    })
-    expect(screen.queryByTestId('launch-surface')).toBeNull()
-
-    await act(async () => {
-      complete()
-      await Promise.resolve()
-    })
-    const codex = within(await screen.findByTestId('launch-surface')).getByRole('button', {
-      name: /Codex/
-    })
-    expect(codex).toBeEnabled()
-    await person.click(codex)
-    expect(await screen.findByText('Codex started.')).toBeInTheDocument()
-  })
-
-  // Trying again starts new listeners, and the surface read under the old ones is not offered
-  // while the new read is on its way, even once the session read has answered.
-  it('offers no surface from before a retry', async () => {
-    const person = userEvent.setup()
-    const { port, controls } = fakeHost()
-    openSession(port)
-    await screen.findByTestId('launch-surface')
-
-    act(() => {
-      controls.setConnected(false)
-    })
-    const complete = controls.holdRegistrations()
-    const surface = controls.hold('launchSurface')
-    await person.click(await screen.findByRole('button', { name: 'Try again' }))
-    act(() => {
-      controls.setConnected(true)
-      controls.changePromptGeneration()
-    })
-    await act(async () => {
-      complete()
-      await Promise.resolve()
-    })
     await waitFor(() => {
       expect(screen.queryAllByText(LOST)).toHaveLength(0)
     })
-    expect(screen.queryByTestId('launch-surface')).toBeNull()
-
-    await act(async () => {
-      surface.release()
-      await Promise.resolve()
-    })
-    const codex = within(await screen.findByTestId('launch-surface')).getByRole('button', {
-      name: /Codex/
-    })
-    expect(codex).toBeEnabled()
-    await person.click(codex)
-    expect(await screen.findByText('Codex started.')).toBeInTheDocument()
   })
 
   it('shows what it read when nothing changed in between', async () => {
-    const person = userEvent.setup()
     const { port, controls } = fakeHost()
     const session = controls.hold('sessionRead')
-    const surface = controls.hold('launchSurface')
     openSession(port)
     await waitFor(() => {
-      expect([session.count, surface.count]).toEqual([1, 1])
+      expect(session.count).toBe(1)
     })
 
     await act(async () => {
       session.release()
-      surface.release()
       await Promise.resolve()
     })
 
     await screen.findByText('Session 1 · Waiting for you')
     expect(screen.queryAllByText(LOST)).toHaveLength(0)
-    const codex = within(screen.getByTestId('launch-surface')).getByRole('button', {
-      name: /Codex/
-    })
-    expect(codex).toBeEnabled()
-    await person.click(codex)
-    expect(await screen.findByText('Codex started.')).toBeInTheDocument()
   })
 })
 
