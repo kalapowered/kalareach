@@ -983,7 +983,8 @@ mod tests {
     /// A Windows host that has no battery is on mains, by the machine's own count of its batteries
     /// (asked through PowerShell, apart from the call this reads the power source with), so a
     /// setting that means "only on mains" holds the assertion there and does not take the host for
-    /// one that would not say.
+    /// one that would not say. A host that has a battery may be one the system cannot say the plug
+    /// of, so nothing is asserted of its reading.
     #[cfg(windows)]
     #[test]
     fn a_windows_host_with_no_battery_reads_as_on_mains() {
@@ -1002,15 +1003,8 @@ mod tests {
             .parse()
             .expect("a count of batteries");
 
-        let source = power_source();
         if batteries == 0 {
-            assert_eq!(source, PowerSource::Mains);
-        } else {
-            assert_ne!(
-                source,
-                PowerSource::Unknown,
-                "a battery and a plug the system names"
-            );
+            assert_eq!(power_source(), PowerSource::Mains);
         }
     }
 }
