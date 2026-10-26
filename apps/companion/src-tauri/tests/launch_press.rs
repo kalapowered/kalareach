@@ -428,8 +428,13 @@ impl Page {
     }
 
     /// Calls `command` as the page does, on a thread of its own, since its answer waits for the
-    /// worker this test is driving.
-    fn call(&self, command: &str, body: Value) -> tokio::task::JoinHandle<Result<Value, Value>> {
+    /// worker this test is driving. The call is made at once; the answer is waited for within
+    /// [`SOON`], so a product that never answers fails the case and does not hang it.
+    fn call(
+        &self,
+        command: &str,
+        body: Value,
+    ) -> impl std::future::Future<Output = Result<Value, Value>> {
         assert!(
             companion_tauri::commands::NAMED_COMMANDS
                 .iter()
@@ -438,7 +443,7 @@ impl Page {
         );
         let window = self.window.clone();
         let command = command.to_owned();
-        tokio::task::spawn_blocking(move || {
+        let answered = tokio::task::spawn_blocking(move || {
             tauri::test::get_ipc_response(
                 &window,
                 tauri::webview::InvokeRequest {
@@ -452,7 +457,13 @@ impl Page {
                 },
             )
             .map(|answer| answer.deserialize().expect("an answer the page reads"))
-        })
+        });
+        async move {
+            tokio::time::timeout(SOON, answered)
+                .await
+                .expect("the page was answered within the limit")
+                .expect("joins")
+        }
     }
 
     /// Opens a view of `session`, publishing on `channel`.
@@ -468,7 +479,6 @@ impl Page {
                 }),
             )
             .await
-            .expect("joins")
             .expect("the view opens");
         answer.as_str().expect("the view's handle").to_owned()
     }
@@ -510,7 +520,6 @@ impl Page {
             json!({"view": view, "input": {"kind": "take", "number": 1}}),
         )
         .await
-        .expect("joins")
         .expect("the take is taken");
         self.newest(channel, |state| state["control"]["state"] == "controlling")
             .await;
@@ -520,7 +529,6 @@ impl Page {
     async fn surface(&self, view: &str) -> Value {
         self.call("terminal_view_launch_surface", json!({ "view": view }))
             .await
-            .expect("joins")
             .expect("the launch surface is read")
     }
 
@@ -530,7 +538,7 @@ impl Page {
         view: &str,
         prompt: u64,
         buffer: u64,
-    ) -> tokio::task::JoinHandle<Result<Value, Value>> {
+    ) -> impl std::future::Future<Output = Result<Value, Value>> {
         self.call(
             "terminal_view_launch",
             json!({ "view": view, "press": {
@@ -582,7 +590,6 @@ async fn a_press_through_the_view_is_accepted_only_from_the_view_that_holds_the_
     let stale = page
         .press(&view, PROMPT + 1, BUFFER)
         .await
-        .expect("joins")
         .expect_err("the prompt moved");
     assert_eq!(code(&stale), "DRAFT_CONFLICT", "{stale}");
 
@@ -592,7 +599,6 @@ async fn a_press_through_the_view_is_accepted_only_from_the_view_that_holds_the_
     let refused = page
         .press(&watching, PROMPT, BUFFER)
         .await
-        .expect("joins")
         .expect_err("this view holds nothing");
     assert_eq!(code(&refused), "LEASE_LOST", "{refused}");
 
@@ -612,10 +618,7 @@ async fn a_press_through_the_view_is_accepted_only_from_the_view_that_holds_the_
         EditorBufferRevision::new(BUFFER)
     );
     hosted.installs(&asked).await;
-    let installed = pressing
-        .await
-        .expect("joins")
-        .expect("the launch is installed");
+    let installed = pressing.await.expect("the launch is installed");
     assert_eq!(
         installed["prompt_generation"],
         PROMPT.to_string(),
@@ -647,7 +650,6 @@ async fn a_view_lost_after_its_press_was_sent_is_told_the_outcome_is_unknown() {
         .lose_connection(&view);
     let told = pressing
         .await
-        .expect("joins")
         .expect_err("the view was lost before the session answered");
     assert_eq!(code(&told), "OUTCOME_UNKNOWN", "{told}");
     hosted.close().await;
