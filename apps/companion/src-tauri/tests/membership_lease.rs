@@ -1164,7 +1164,8 @@ async fn a_device_that_is_signed_out_is_told_to_sign_in() {
 /// every connection the device makes, until the time it is held for has passed. The application reconnects every few seconds, and the
 /// organisation's service allows an account a hundred and twenty lease requests an hour, so a
 /// device the organisation removed would otherwise use the allowance of its account's other
-/// devices.
+/// devices. The application's own reconnect is held once the stop is told, and the case's
+/// connections are visits, so that the connections that ask are the case's own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stop_that_needs_a_person_is_not_asked_again_by_every_connection() {
     let rig = Rig::start().await;
@@ -1381,7 +1382,8 @@ async fn a_token_the_service_turns_back_is_replaced_once_and_the_keeper_goes_on(
 /// KR-REQ-17.53: the lease the device holds, and a stop it remembers, are the account's that asked.
 /// The application keeps one account object, whoever is signed in to it, so a person who signs in
 /// as another member is not served under the lease of the one before, and is not told what the one
-/// before was told.
+/// before was told. The application's own reconnect is held once the first account's stop is told,
+/// and the case's connections are visits, so that the connections that ask are the case's own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lease_and_a_stop_belong_to_the_account_that_asked() {
     let rig = Rig::start().await;
