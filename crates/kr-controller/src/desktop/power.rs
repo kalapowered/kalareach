@@ -81,6 +81,7 @@ const RELEASE_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 pub const QUERY_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How often a bounded query is asked whether it has finished.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const QUERY_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// How long an acquisition is given to be confirmed.
