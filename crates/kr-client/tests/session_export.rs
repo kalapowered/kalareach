@@ -1,6 +1,6 @@
-//! KR-REQ-18.11: the document a closed session's retained output is exported as holds its size
-//! limits while the output is read, not after: a session whose output makes a piece for every other
-//! byte cannot use more than the limits allow, and the document stays within its size.
+//! The document a closed session's retained output is exported as holds its size limits while the
+//! output is read, not after: a session whose output makes a piece for every other byte cannot use
+//! more than the limits allow, and the document stays within its size.
 //!
 //! The pages come from a buffer in memory, served the way the daemon serves a history: from a
 //! cursor, at most as many bytes as were asked, and an empty page that moves the cursor on where a
@@ -228,6 +228,10 @@ const MIB: u64 = 1024 * 1024;
 /// output is kept, the cursor the document ends at is where the kept output ends, and the file is
 /// within its size. The control: the same output under a size it fits, at the proportion of a
 /// session at the host's per-session cap to the file's size, is read whole.
+///
+/// KR-REQ-25.25, the part about declared omissions: a read stopped by the document's size keeps the
+/// start of the output, declares the output truncated, and ends at the cursor where the kept output
+/// ends.
 #[tokio::test]
 async fn a_document_that_would_pass_its_size_stops_the_read_and_says_so() {
     let output = lines(4 * MIB as usize);
@@ -386,6 +390,10 @@ async fn a_string_the_engine_lets_go_of_late_does_not_cost_the_document_its_end(
 
 /// A page can hold nothing and still move the cursor on, across a range the archive lost. Output
 /// that lies past it is output left behind.
+///
+/// KR-REQ-25.25, the part about declared omissions: a read stopped by its bound at a range the
+/// archive lost, with output lying past it, is declared truncated, and a read whose output ends at
+/// the lost range is not.
 #[tokio::test]
 async fn output_past_a_lost_range_is_output_left_behind() {
     let mut source = Memory {
@@ -457,6 +465,10 @@ async fn each_piece_of_output_carries_the_time_it_was_written_at() {
 
 /// A host with no record of when output was written says why, once; the output carries no time, the
 /// bytes are counted, and the reason is in the declaration. The control: a host with the record
+/// declares nothing of the kind.
+///
+/// KR-REQ-25.25, the part about timestamps and declared omissions: the bytes of output with no
+/// recorded time are counted and the omission carries the host's reason; a host with the record
 /// declares nothing of the kind.
 #[tokio::test]
 async fn output_a_host_has_no_times_for_is_declared_with_the_hosts_reason() {
@@ -531,6 +543,10 @@ async fn a_recording_plays_the_output_at_the_times_it_was_written() {
 
 /// A recording is made only of output that has a time: with none, there is nothing to play, and the
 /// composition says so rather than writing every event at nought.
+///
+/// KR-REQ-25.25, the part about timestamps: a recording is made only of output that has a time, so
+/// with none the composition stops and gives the host's reason rather than writing every event at
+/// nought.
 #[tokio::test]
 async fn a_recording_of_output_with_no_times_is_refused() {
     let mut source = Memory {
@@ -603,6 +619,9 @@ async fn output_timed_one_byte_at_a_time_is_held_to_the_limits_in_both_documents
 /// A recording's limit on its size leaves room for what the engine may let go of between pages
 /// before it leaves room for a page. A limit that leaves none reads nothing, and the recording says
 /// it was cut: the output has times, so it is not refused as having none.
+///
+/// KR-REQ-25.25, the part about declared omissions: a recording cut by its size limit declares the
+/// output truncated, and is not refused as having no times.
 #[tokio::test]
 async fn a_recording_whose_size_limit_leaves_no_room_for_a_page_says_it_was_cut() {
     let output = lines(60_000);

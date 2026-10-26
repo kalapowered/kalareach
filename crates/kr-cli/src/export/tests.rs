@@ -1,6 +1,6 @@
-//! KR-REQ-18.11 and KR-REQ-25.25: a closed session's retained output is exported to a file the
-//! person names, without the side effects it carries, with what it does not hold declared, and
-//! never from an environment whose privacy mode is on.
+//! A closed session's retained output is exported to a file the person names, without the side
+//! effects it carries, with what it does not hold declared, and never from an environment whose
+//! privacy mode is on.
 //!
 //! The daemon is a script: each case says which answers it gives, in the order the export asks for
 //! them, so a case also says what the export asked and what it did not.
@@ -439,6 +439,11 @@ const WITH_SIDE_EFFECTS: &[u8] = b"first line\r\n\
 /// the things: a clipboard write, a question to the terminal and a bell appear nowhere in the file,
 /// and the file counts each. The control: output that asks for nothing is carried byte for byte
 /// with no such omission.
+///
+/// KR-REQ-25.25, the part about side effects and declared omissions: a clipboard write, a question
+/// to the terminal and a bell are carried nowhere in the file and each is counted as an omission,
+/// with the bytes not carried; output that asks for nothing is carried unchanged with none of
+/// those omissions declared.
 #[tokio::test]
 async fn an_exports_output_has_no_side_effect_and_says_what_was_dropped() {
     let mut daemon = Scripted::new(vec![
@@ -515,6 +520,9 @@ async fn an_exports_output_has_no_side_effect_and_says_what_was_dropped() {
 /// A soft reset is rendering, so a recording keeps it as the program wrote it: section 8 forwards
 /// it as it came, so a file that left it out would replay a screen the program never had. The file
 /// carries one written inside the alternate buffer byte for byte, and declares nothing dropped.
+///
+/// KR-REQ-25.25, the part about safe rendering data: a soft reset written inside the alternate
+/// buffer is carried byte for byte, and no dropped bytes are declared.
 #[tokio::test]
 async fn an_exports_output_carries_a_soft_reset_from_the_alternate_buffer() {
     let written = b"shell\r\n\x1b[?1049halt\x1b[!pafter\r\n\x1b[?1049lprompt\r\n";
@@ -611,6 +619,10 @@ async fn the_file_names_the_session_its_closure_and_what_the_archive_does_not_ke
 
 /// A range the archive no longer holds is carried with its cause, the output on either side of it
 /// keeps its own cursors, and a control string cut by the gap does not swallow what comes after it.
+///
+/// KR-REQ-25.25, the part about declared omissions: a range the archive lost is declared with its
+/// cursors and its cause and counted as a history gap, and the output on either side of it keeps
+/// its own cursors.
 #[tokio::test]
 async fn a_gap_is_carried_and_what_follows_it_is_not_read_as_a_continuation() {
     // The first stretch ends inside an operating-system command that was never ended; after the gap
@@ -692,6 +704,10 @@ async fn after_a_gap(tails: &[&[u8]]) -> (Vec<u8>, Option<u64>) {
 /// whose start is gone, in any state the lexer keeps one in. It is not read until a point that ends
 /// every one of them: a string terminator that follows a byte of its own, or a cancel or a
 /// substitute. What came before is not carried, whatever it looks like, and is counted.
+///
+/// KR-REQ-25.25, the part about side effects: output that follows a lost range is read only from a
+/// point that ends every string state, so the tail of a clipboard write the gap cut is not carried,
+/// and the bytes skipped are counted.
 #[tokio::test]
 async fn output_after_a_gap_is_read_only_from_a_point_every_state_ends_at() {
     let secret = b"c2VjcmV0LXRva2Vu";
@@ -749,6 +765,9 @@ async fn output_after_a_gap_is_read_only_from_a_point_every_state_ends_at() {
 
 /// The point reading begins at can come where a page ends, or be spread over two pages: the
 /// terminator is an escape and a backslash, one on each, or the last bytes of a page.
+///
+/// KR-REQ-25.25, the part about side effects: the point after a lost range at which reading begins
+/// is found when it ends a page and when it is split over two, and nothing before it is carried.
 #[tokio::test]
 async fn the_point_reading_begins_at_can_end_a_page_or_be_split_over_two() {
     // The terminator is the last of the page; the next page is read from its first byte.
@@ -774,6 +793,10 @@ async fn the_point_reading_begins_at_can_end_a_page_or_be_split_over_two() {
 /// The head of the archive was evicted: what is retained begins inside the stream, and is read from
 /// a point that ends every state. The control: output that begins at the start of the stream is read
 /// from its first byte.
+///
+/// KR-REQ-25.25, the part about side effects: the tail of a control string whose start was evicted
+/// is not carried into the file, and a stream that begins at its start is carried from its first
+/// byte with no mid-stream start declared.
 #[tokio::test]
 async fn an_evicted_head_is_read_from_a_point_that_ends_every_state_and_a_whole_stream_from_its_start()
  {
@@ -811,6 +834,9 @@ async fn an_evicted_head_is_read_from_a_point_that_ends_every_state_and_a_whole_
 /// An archive that cannot say where its output got to reports the same gap on every page, though no
 /// page skipped anything. It is listed once, and the pages are one stretch of output: a control
 /// string that runs across two of them stays one string, and is not cut where a page ends.
+///
+/// KR-REQ-25.25, the part about declared omissions: a gap the archive repeats on every page is
+/// declared once, and a window title that ran across two pages is carried whole.
 #[tokio::test]
 async fn a_gap_every_page_repeats_is_listed_once_and_does_not_cut_a_sequence() {
     let same = |from: u64, bytes: &[u8]| {
@@ -859,6 +885,9 @@ async fn a_gap_every_page_repeats_is_listed_once_and_does_not_cut_a_sequence() {
 /// Every question a program asked is counted, however many there were: the engine that reads the
 /// output for the export answers each as a terminal would, and a bound on how fast a live terminal
 /// is answered is not a reason for the file to stop counting.
+///
+/// KR-REQ-25.25, the part about declared omissions: every question the program asked is counted in
+/// the file, however many, and none is carried.
 #[tokio::test]
 async fn every_question_the_program_asked_is_counted_however_many() {
     let questions = 1_000_u64;
@@ -880,6 +909,9 @@ async fn every_question_the_program_asked_is_counted_however_many() {
 
 /// A page that holds more questions than the engine's queue has room for the replies to is counted
 /// in full: the count is of what the program asked, not of the answers that were kept.
+///
+/// KR-REQ-25.25, the part about declared omissions: the count of questions is of what the program
+/// asked, whatever the engine's reply queue had room to keep.
 #[tokio::test]
 async fn questions_past_the_size_of_the_reply_queue_in_one_page_are_counted() {
     // Each cursor report is six bytes, and the queue holds 128 KiB, so 21,845 fit and these do not.
@@ -903,6 +935,10 @@ async fn questions_past_the_size_of_the_reply_queue_in_one_page_are_counted() {
 /// A program that asks the terminal to read the clipboard is answered by the terminal engine itself,
 /// with no side effect to count. The request is not in the file, and the file counts it as one of the
 /// questions the program asked the terminal.
+///
+/// KR-REQ-25.25, the part about side effects and declared omissions: a request to read the
+/// clipboard is not replayed into the file, and is declared among the questions the program asked
+/// the terminal.
 #[tokio::test]
 async fn a_clipboard_read_is_not_carried_and_is_counted_as_a_question() {
     let output = b"x\x1b]52;c;?\x07y\x1b[c\r\n";
@@ -972,6 +1008,10 @@ async fn a_bound_of_no_bytes_is_refused_before_anything_is_asked() {
 
 /// The read stops at the byte bound and says so, and it keeps the start of what is retained. The
 /// control: a bound that is exactly the retained output is not a truncation.
+///
+/// KR-REQ-25.25, the part about declared omissions: a read stopped at the byte bound keeps the
+/// start of the output and declares it truncated, and a bound that is exactly the output declares
+/// no truncation.
 #[tokio::test]
 async fn the_byte_bound_keeps_the_start_and_says_what_it_left() {
     let mut daemon = Scripted::new(vec![
@@ -1005,6 +1045,10 @@ async fn the_byte_bound_keeps_the_start_and_says_what_it_left() {
 
 /// A session whose own record is gone comes back from the daemon with an empty shell and a default
 /// size. The file does not state those as the session's own: it says they are not known.
+///
+/// KR-REQ-25.25, the part about dimensions and declared omissions: where the session's own record
+/// is gone the document gives no dimensions, shell or working directory, declares the record
+/// unavailable, and still carries the output.
 #[tokio::test]
 async fn a_session_whose_record_is_gone_is_not_given_a_shell_or_a_size_it_never_had() {
     let mut summary = closed(1);
@@ -1191,6 +1235,10 @@ async fn the_daemons_refusal_of_the_archive_is_the_answer() {
 
 /// The file is made new and readable by its owner alone, holds what was composed whole, and leaves
 /// no other file beside it.
+///
+/// KR-REQ-25.25, the part about the destination: the document is written whole to the file the
+/// person named, which is new and readable by its owner alone, with no other file beside it. Not
+/// shown here: that nothing is uploaded.
 #[cfg(unix)]
 #[tokio::test]
 async fn the_file_is_new_owner_only_and_whole() {
@@ -1472,6 +1520,9 @@ async fn a_grant_that_lost_its_right_is_not_read_as_a_daemon_of_an_earlier_relea
 
 /// A daemon that has the session and no record of its times says so, and the file names the host's
 /// reason beside the bytes it counts.
+///
+/// KR-REQ-25.25, the part about timestamps and declared omissions: output the daemon has no time
+/// for is declared as an omission that carries the host's reason.
 #[tokio::test]
 async fn a_daemon_with_no_record_of_a_sessions_times_gives_its_reason() {
     let mut daemon = Scripted::new(vec![
