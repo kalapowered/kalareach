@@ -83,9 +83,10 @@ pub struct LaunchMailboxRequest {
     pub expected_cwd_revision: CwdRevision,
     /// How long the reader has to decide, measured from when it receives this request.
     ///
-    /// The reader is bound by the same 250 ms as the worker: past it, the reader installs nothing
-    /// and answers `timeout`. That is what makes "install no command" true on a timeout, rather
-    /// than the worker hoping its own answer arrives first.
+    /// The worker sends the reader's own budget, 200 ms, which ends before the worker's 250 ms
+    /// hold does: past it, the reader installs nothing and answers `timeout`. That is what makes
+    /// "install no command" true on a timeout, rather than the worker hoping its own answer
+    /// arrives first. The worker sends it whole, whatever time the request waits in its own queue.
     pub deadline_ms: DurationMs,
 }
 

@@ -1678,14 +1678,11 @@ impl FenceMachine {
             expected_prompt_generation: request.params.expected_prompt_generation,
             expected_buffer_revision: request.params.expected_buffer_revision,
             expected_cwd_revision: editor.cwd_revision,
-            // The reader's own budget, which ends before the worker gives up. What is left of it
-            // rather than the whole of it, so a worker that has already spent part of its hold
-            // shortens the reader's window and never extends it.
-            deadline_ms: DurationMs::new(
-                LAUNCH_READER_BUDGET
-                    .get()
-                    .min(deadline.get().saturating_sub(at.get())),
-            ),
+            // The reader's own budget, which ends before the worker's hold does. It is sent whole:
+            // the hold starts at `at`, so all of it is still ahead, and the time the request waits
+            // in the worker's own queue does not shorten it. The reader counts it from the moment
+            // it reads the request.
+            deadline_ms: LAUNCH_READER_BUDGET,
         }));
     }
 
