@@ -1025,12 +1025,12 @@ fn a_release_that_cannot_be_removed_for_no_program_s_sake_is_reported() {
     );
 }
 
-/// KR-REQ-26.06: a file of a release that is a second name for a file outside, whose access list
-/// denies its owner the right to change attributes but is not the seal's, is not given back: the
-/// list of the file outside is as it was, the removal reports it, and the release stays in the trash.
+/// Removes a release whose program is a second name for a read-only file elsewhere that carries the
+/// access list `icacls` makes of `lists` (each a call's arguments), and checks that the list of the
+/// file outside is as it was, that the removal reports it and that the release stays in the trash.
+/// `put_right` is the call that undoes the lists, so that the test leaves nothing behind.
 #[cfg(windows)]
-#[test]
-fn a_list_that_is_not_the_seal_s_is_left_as_it_is() {
+fn removal_meets_a_list_that_is_not_the_seal_s(lists: &[&[&str]], put_right: &[&str]) {
     let test = TestStore::create();
     let one = release("0.1.0+aaaaaaaaaaaa");
     let program = test.install(&one);
@@ -1052,7 +1052,9 @@ fn a_list_that_is_not_the_seal_s_is_left_as_it_is() {
         assert!(run.status.success(), "icacls {arguments:?}");
         String::from_utf8_lossy(&run.stdout).into_owned()
     };
-    icacls(&["/deny", "*S-1-1-0:(WA)"]);
+    for list in lists {
+        icacls(list);
+    }
     let before = icacls(&[]);
     let update = test
         .store
@@ -1064,22 +1066,55 @@ fn a_list_that_is_not_the_seal_s_is_left_as_it_is() {
     let after = icacls(&[]);
 
     // Put it right, so that the test leaves nothing behind.
-    icacls(&["/remove:d", "*S-1-1-0"]);
+    icacls(put_right);
     let kept = std::fs::read_dir(test.store.trash())
         .expect("reads the trash")
         .flatten()
         .next()
-        .expect("what could not be removed is in the trash")
-        .path();
-    kr_ipc::install::remove_sealed_tree(&kept).expect("the release goes once the list is right");
+        .map(|entry| entry.path());
+    if let Some(kept) = &kept {
+        kr_ipc::install::remove_sealed_tree(kept).expect("the release goes once the list is right");
+    }
     assert!(
         answer.is_err(),
         "a list that is not the seal's is reported, not taken for a program: {answer:?}"
+    );
+    assert!(
+        kept.is_some(),
+        "what could not be removed is in the trash: {answer:?}"
     );
     assert_eq!(before, after, "the list of the file outside is as it was");
     assert_eq!(
         std::fs::read(&shared).expect("still there"),
         b"shared contents"
+    );
+}
+
+/// KR-REQ-26.06: a file of a release that is a second name for a file outside, whose access list
+/// denies its owner the right to change attributes but is not the seal's, is not given back: the
+/// list of the file outside is as it was, the removal reports it, and the release stays in the trash.
+#[cfg(windows)]
+#[test]
+fn a_list_that_is_not_the_seal_s_is_left_as_it_is() {
+    removal_meets_a_list_that_is_not_the_seal_s(
+        &[&["/deny", "*S-1-1-0:(WA)"]],
+        &["/remove:d", "*S-1-1-0"],
+    );
+}
+
+/// KR-REQ-26.06: a list that begins as the seal's does, with the denial of the owner-rights
+/// principal's right to change attributes, but is not the whole of the seal's list, is not given
+/// back either. Here the list is `D:P(D;;0x100;;;OW)(A;;FA;;;OW)`.
+#[cfg(windows)]
+#[test]
+fn a_list_that_begins_as_the_seal_s_does_and_is_not_the_seal_s_is_left_as_it_is() {
+    removal_meets_a_list_that_is_not_the_seal_s(
+        &[
+            &["/inheritance:r"],
+            &["/grant", "*S-1-3-4:(F)"],
+            &["/deny", "*S-1-3-4:(WA)"],
+        ],
+        &["/reset"],
     );
 }
 
