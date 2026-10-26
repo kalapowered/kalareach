@@ -10,6 +10,7 @@ pub mod record;
 pub mod words;
 
 mod files;
+mod gsettings;
 mod iterm2;
 mod konsole;
 mod preferences;
@@ -23,6 +24,8 @@ use record::{FileWrote, HeldProfiles, RecordError, RecordedProfile, Wrote};
 
 /// The name every profile is given.
 pub const PROFILE_NAME: &str = "KalaReach";
+
+pub use gsettings::Gsettings;
 
 /// A terminal emulator a profile can be written into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -84,7 +87,7 @@ impl ProfileTerminal {
     pub const fn on_this_platform() -> &'static [Self] {
         #[cfg(target_os = "linux")]
         {
-            &[Self::Konsole]
+            &[Self::GnomeTerminal, Self::Ptyxis, Self::Konsole]
         }
         #[cfg(target_os = "macos")]
         {
@@ -134,6 +137,8 @@ pub struct ProfileHome {
     pub applications: Vec<PathBuf>,
     /// iTerm2's preferences: the domain, or the path of a file standing in for it.
     pub iterm_preferences: String,
+    /// How the settings database is reached for the applications that keep profiles in it.
+    pub settings: gsettings::Gsettings,
 }
 
 impl ProfileHome {
@@ -156,6 +161,7 @@ impl ProfileHome {
                 .unwrap_or_default(),
             applications: vec![PathBuf::from("/Applications"), home.join("Applications")],
             iterm_preferences: "com.googlecode.iterm2".to_owned(),
+            settings: gsettings::Gsettings::of_this_session(),
             home,
         })
     }
@@ -179,6 +185,18 @@ impl ProfileHome {
                 .join("com.googlecode.iterm2")
                 .display()
                 .to_string(),
+            // A keyfile of the home's own, so nothing here reaches the person's settings.
+            settings: gsettings::Gsettings {
+                program: PathBuf::from("gsettings"),
+                environment: vec![
+                    ("GSETTINGS_BACKEND".to_owned(), "keyfile".to_owned()),
+                    (
+                        "XDG_CONFIG_HOME".to_owned(),
+                        home.join(".config").display().to_string(),
+                    ),
+                    ("HOME".to_owned(), home.display().to_string()),
+                ],
+            },
         }
     }
 
@@ -237,6 +255,32 @@ pub enum ProfileError {
     /// The record names a profile for the emulator that is not of the kind this install writes.
     #[error("the record names {}'s profile as another kind of write than this platform makes", .0.name())]
     RecordedOtherwise(ProfileTerminal),
+    /// The settings program is not there.
+    #[error("{} keeps its profiles in the settings database, and gsettings is not there", .0.name())]
+    ToolMissing(ProfileTerminal),
+    /// The settings program failed.
+    #[error("gsettings failed for {}", .terminal.name())]
+    ToolFailed {
+        /// The emulator.
+        terminal: ProfileTerminal,
+        /// The exit status, where there was one.
+        status: Option<i32>,
+    },
+    /// The schema the profile is written to is not installed.
+    #[error("{}'s settings schema is not installed", .0.name())]
+    SchemaAbsent(ProfileTerminal),
+    /// The list of profiles names no default, or its default is not in it.
+    #[error("{} has no default profile in its list of profiles", .0.name())]
+    NoDefaultProfile(ProfileTerminal),
+    /// A profile named like this one is in the list and kr did not write it.
+    #[error("{} has a profile named KalaReach that kr did not write", .0.name())]
+    ForeignProfile(ProfileTerminal),
+    /// A write did not outlast the process that made it.
+    #[error("{}'s settings did not keep a write; there is no settings service in this session", .0.name())]
+    NotPersisted(ProfileTerminal),
+    /// The list of profiles changed under every attempt to write it.
+    #[error("{}'s list of profiles kept changing while it was written", .0.name())]
+    ListBusy(ProfileTerminal),
     /// A file could not be read or written.
     #[error("{}: {source}", .place.display())]
     Io {
@@ -267,7 +311,9 @@ pub fn is_present(terminal: ProfileTerminal, home: &ProfileHome) -> bool {
         ProfileTerminal::Konsole => konsole::present(home),
         ProfileTerminal::Iterm2 => iterm2::present(home),
         ProfileTerminal::WindowsTerminal => windows_terminal::present(home),
-        _ => false,
+        ProfileTerminal::GnomeTerminal => home.has_program("gnome-terminal"),
+        ProfileTerminal::Ptyxis => home.has_program("ptyxis"),
+        ProfileTerminal::AppleTerminal => false,
     }
 }
 
@@ -289,6 +335,13 @@ pub struct Plan {
 pub enum Place<'a> {
     /// A file.
     File(&'a Path),
+    /// Keys of a settings schema, at a path.
+    Settings {
+        /// The schema.
+        schema: &'a str,
+        /// The path of the profile's keys.
+        path: &'a str,
+    },
 }
 
 impl Plan {
@@ -297,6 +350,10 @@ impl Plan {
     pub fn place(&self) -> Place<'_> {
         match &self.how {
             How::File { destination, .. } => Place::File(destination),
+            How::Settings(plan) => Place::Settings {
+                schema: &plan.wrote.schema,
+                path: &plan.wrote.path,
+            },
         }
     }
 }
@@ -312,6 +369,8 @@ enum How {
         made: Vec<PathBuf>,
         replace: bool,
     },
+    /// Keys of a settings schema, and a place in a shared list.
+    Settings(gsettings::SettingsPlan),
 }
 
 /// Works out what installing `terminal`'s profile with `command` would write, and refuses what it
@@ -381,6 +440,39 @@ pub fn plan(
                 recorded,
             )
         }
+        ProfileTerminal::GnomeTerminal | ProfileTerminal::Ptyxis => {
+            let spec = settings_spec(terminal)?;
+            let earlier = match recorded.map(|profile| &profile.wrote) {
+                Some(Wrote::Settings(wrote)) => Some(wrote),
+                Some(_) => return Err(ProfileError::RecordedOtherwise(terminal)),
+                None => None,
+            };
+            let plan =
+                gsettings::plan(&home.settings, spec, &words::shell_words(command), earlier)?;
+            // A profile that was changed after kr wrote it is not kr's to write over.
+            if let Some(earlier) = earlier
+                && gsettings::read(&home.settings, spec, earlier) == gsettings::Reading::Changed
+            {
+                return Err(ProfileError::Changed {
+                    place: PathBuf::from(&earlier.path),
+                });
+            }
+            Ok(Plan {
+                terminal,
+                command: command.to_vec(),
+                wrote: Wrote::Settings(plan.wrote.clone()),
+                how: How::Settings(plan),
+            })
+        }
+        ProfileTerminal::AppleTerminal => Err(ProfileError::NotOnThisPlatform(terminal)),
+    }
+}
+
+/// The settings layout of an application that keeps its profiles there.
+fn settings_spec(terminal: ProfileTerminal) -> Result<gsettings::Spec, ProfileError> {
+    match terminal {
+        ProfileTerminal::GnomeTerminal => Ok(gsettings::GNOME),
+        ProfileTerminal::Ptyxis => Ok(gsettings::PTYXIS),
         _ => Err(ProfileError::NotOnThisPlatform(terminal)),
     }
 }
@@ -467,18 +559,22 @@ pub fn install(held: &HeldProfiles<'_>, plan: &Plan) -> Result<(), ProfileError>
         command: plan.command.clone(),
         wrote: plan.wrote.clone(),
     })?;
-    if let Err(error) = write(plan) {
-        match before {
-            Some(profile) => held.put(profile)?,
-            None => held.forget(plan.terminal)?,
+    if let Err((error, left_over)) = write(plan) {
+        // What the write could not take back stays recorded, so that a removal can finish the job.
+        if !left_over {
+            match before {
+                Some(profile) => held.put(profile)?,
+                None => held.forget(plan.terminal)?,
+            }
         }
         return Err(error);
     }
     Ok(())
 }
 
-/// Carries out a plan.
-fn write(plan: &Plan) -> Result<(), ProfileError> {
+/// Carries out a plan. A failure says whether anything may be left that the write could not take
+/// back.
+fn write(plan: &Plan) -> Result<(), (ProfileError, bool)> {
     match &plan.how {
         How::File {
             destination,
@@ -487,7 +583,8 @@ fn write(plan: &Plan) -> Result<(), ProfileError> {
             made,
             replace,
         } => files::publish(destination, staging, text, made, *replace)
-            .map_err(|error| ProfileError::io(destination, error)),
+            .map_err(|error| (ProfileError::io(destination, error), false)),
+        How::Settings(plan) => gsettings::write(plan),
     }
 }
 
@@ -526,10 +623,13 @@ pub fn status(
     home: &ProfileHome,
     recorded: Option<RecordedProfile>,
 ) -> Status {
-    let standing = recorded.as_ref().map(standing);
+    let standing = recorded.as_ref().map(|profile| standing(profile, home));
     let foreign = recorded.is_none()
-        && profile_path(terminal, home)
-            .is_some_and(|path| files::presence(&path) != files::Presence::Missing);
+        && (profile_path(terminal, home)
+            .is_some_and(|path| files::presence(&path) != files::Presence::Missing)
+            || settings_spec(terminal).is_ok_and(|spec| {
+                is_present(terminal, home) && gsettings::foreign(&home.settings, spec)
+            }));
     let default = recorded
         .as_ref()
         .is_some_and(|profile| is_default(terminal, home, profile));
@@ -544,14 +644,22 @@ pub fn status(
 }
 
 /// Where a recorded profile stands.
-fn standing(profile: &RecordedProfile) -> Standing {
+fn standing(profile: &RecordedProfile, home: &ProfileHome) -> Standing {
     match &profile.wrote {
         Wrote::File(wrote) => match wrote.file().map(|file| files::presence(&file)) {
             Ok(files::Presence::Missing) => Standing::Missing,
             Ok(files::Presence::File(sha)) if sha == wrote.sha256 => Standing::Matches,
             _ => Standing::Changed,
         },
-        Wrote::Settings(_) | Wrote::Preferences(_) => Standing::Changed,
+        Wrote::Settings(wrote) => settings_spec(profile.terminal).map_or(
+            Standing::Changed,
+            |spec| match gsettings::read(&home.settings, spec, wrote) {
+                gsettings::Reading::Unchanged { .. } => Standing::Matches,
+                gsettings::Reading::Gone => Standing::Missing,
+                gsettings::Reading::Changed => Standing::Changed,
+            },
+        ),
+        Wrote::Preferences(_) => Standing::Changed,
     }
 }
 
@@ -579,7 +687,12 @@ fn is_default(terminal: ProfileTerminal, home: &ProfileHome, profile: &RecordedP
             _ => false,
         },
         ProfileTerminal::WindowsTerminal => windows_terminal::is_default(home),
-        _ => false,
+        ProfileTerminal::GnomeTerminal | ProfileTerminal::Ptyxis => match &profile.wrote {
+            Wrote::Settings(wrote) => settings_spec(terminal)
+                .is_ok_and(|spec| gsettings::is_default(&home.settings, spec, wrote)),
+            _ => false,
+        },
+        ProfileTerminal::AppleTerminal => false,
     }
 }
 
@@ -617,7 +730,8 @@ pub fn remove(
     let removed = match &profile.wrote {
         Wrote::File(wrote) => {
             let destination = wrote.file()?;
-            if standing(&profile) != Standing::Missing && is_default(terminal, home, &profile) {
+            if standing(&profile, home) != Standing::Missing && is_default(terminal, home, &profile)
+            {
                 return Ok(Removed::Default);
             }
             let staging = match terminal {
@@ -642,9 +756,24 @@ pub fn remove(
                 },
             }
         }
-        Wrote::Settings(_) | Wrote::Preferences(_) => {
-            return Err(ProfileError::NotOnThisPlatform(terminal));
+        Wrote::Settings(wrote) => {
+            let spec = settings_spec(terminal)?;
+            let reading = gsettings::read(&home.settings, spec, wrote);
+            if reading != gsettings::Reading::Gone && is_default(terminal, home, &profile) {
+                return Ok(Removed::Default);
+            }
+            match reading {
+                gsettings::Reading::Gone => Removed::AlreadyGone,
+                gsettings::Reading::Unchanged { .. } => {
+                    gsettings::take_out(&home.settings, spec, wrote)?;
+                    Removed::Removed
+                }
+                gsettings::Reading::Changed => Removed::Changed {
+                    left_at: wrote.path.clone(),
+                },
+            }
         }
+        Wrote::Preferences(_) => return Err(ProfileError::NotOnThisPlatform(terminal)),
     };
     held.forget(terminal)?;
     Ok(removed)
