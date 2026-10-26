@@ -571,7 +571,8 @@ that writes nothing:
   bytes its recipe names;
 - every executable the package's match rules name on the daemon's search path is read, never run,
   and each must be one a build of the release names by its SHA-256 digest, at a version inside the
-  recipe's range. A version nothing establishes refuses the recipe;
+  recipe's range. A script is refused, because the program it runs is its interpreter, and a version
+  nothing establishes refuses the recipe;
 - every path is walked from one handle on the application's directory, each directory opened without
   following a link, and a link or a non-directory on the way, or a destination that is not a regular
   file, is refused;
