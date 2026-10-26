@@ -8376,6 +8376,7 @@ async fn kr_req_13_11_what_changes_the_picture_after_the_fence_makes_the_read_un
 
     // An interrupt.
     let _ = fenced(&mut wired, 3, 1).await;
+    verified_numbers(&surface_over(&mut client, wired.session_id).await);
     let epoch = wired.runtime.session().lease().epoch.get();
     wired
         .runtime
@@ -8419,6 +8420,7 @@ async fn kr_req_13_11_what_changes_the_picture_after_the_fence_makes_the_read_un
 
     // A report that differs from what the reader acknowledged.
     let _ = fenced(&mut wired, 5, 1).await;
+    verified_numbers(&surface_over(&mut client, wired.session_id).await);
     let mut differing = idle(wired.session_id, 5, 1);
     if let BridgeEvent::ReaderIdle(report) = &mut differing {
         report.editor = editor_state(true, 2);
@@ -8464,6 +8466,45 @@ async fn kr_req_13_11_what_changes_the_picture_after_the_fence_makes_the_read_un
         ChangedSinceFence,
         "a prefix the worker accepted and holds"
     );
+    wired.close().await;
+}
+
+/// KR-REQ-13.11: an interrupt admitted while the reader is asked for its fence is one the reader's
+/// snapshot cannot be placed against, so the fence that exchange proves is not one a launch rests
+/// on. The next prompt is proved afresh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_13_11_an_interrupt_admitted_while_the_reader_is_asked_changes_the_picture() {
+    use kr_protocol::root::LaunchUnverified::ChangedSinceFence;
+    let mut wired = wired_ignoring_interrupts().await;
+    let mut client = surface_client(&wired).await;
+    let holder = holder_over(&mut client, &wired).await;
+
+    wired
+        .bridge
+        .send_event(enter(wired.session_id, 1, 1))
+        .await
+        .expect("enters");
+    let fence_id = asked_for_a_fence(&mut wired).await;
+    let epoch = wired.runtime.session().lease().epoch.get();
+    wired
+        .runtime
+        .session()
+        .interrupt(holder, epoch)
+        .expect("the interrupt is admitted while the reader is asked");
+    wired
+        .bridge
+        .answer(kr_protocol::ids::RequestId::new(0), drained(1, 1, fence_id))
+        .await
+        .expect("acknowledges");
+    until_fenced(&wired.runtime).await;
+    assert_eq!(
+        reason_of(&surface_over(&mut client, wired.session_id).await),
+        ChangedSinceFence,
+        "an interrupt admitted during the exchange"
+    );
+
+    let _ = fenced(&mut wired, 2, 1).await;
+    verified_numbers(&surface_over(&mut client, wired.session_id).await);
     wired.close().await;
 }
 
@@ -8768,9 +8809,10 @@ async fn until_launchable(
 /// KR-REQ-13.11: a real reader is launchable at its first prompt; the key a person types there makes
 /// it unlaunchable until the next prompt; and the next prompt is launchable at a later generation.
 ///
-/// This holds the plan's reading of what each reader reports against the reader's real reports: the
-/// acknowledgement's buffer state is what the worker rests on, and no report of an unchanged reader
-/// differs from it.
+/// A reader that reports an unchanged buffer differently from its acknowledgement would make the
+/// worker's flag rise with no key typed. The case waits for the first prompt that is launchable and
+/// reads the worker's own standing, so it holds what the reader reports until that prompt, not what
+/// it reports later.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs the built shell packages that KR_SHELL_PACKAGES names; it runs with --ignored in a run that has built them, as the build box's verification does"]

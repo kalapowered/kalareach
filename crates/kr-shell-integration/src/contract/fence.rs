@@ -820,6 +820,9 @@ struct Exchange {
     /// queued and not yet written when it began. The reader took its snapshot at a moment the
     /// worker cannot place against those bytes, so the acknowledgement proves nothing about them.
     reached: bool,
+    /// Whether an interrupt was admitted after the exchange began. It goes to the terminal at
+    /// once, not behind the hold, so the reader's snapshot cannot be placed against it either.
+    interrupted: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1284,8 +1287,10 @@ impl FenceMachine {
         self.fence = Some(fence.clone());
         self.acknowledged = Some(ack.editor);
         // Keys held through the exchange never reached the reader, so its snapshot does not
-        // account for them, and they go to the terminal as soon as the fence is published.
-        self.changed = !self.hold.is_empty();
+        // account for them, and they go to the terminal as soon as the fence is published. An
+        // interrupt admitted during the exchange went to the terminal at once, at a moment the
+        // snapshot cannot be placed against.
+        self.changed = !self.hold.is_empty() || exchange.interrupted;
         self.state = FenceState::Fenced;
         actions.push(Action::PublishFence(fence));
         self.release_hold(actions);
@@ -1460,6 +1465,9 @@ impl FenceMachine {
             return;
         }
         self.changed = true;
+        if let Some(exchange) = self.exchange.as_mut() {
+            exchange.interrupted = true;
+        }
         actions.push(Action::Interrupt(request.action));
     }
 
@@ -2011,6 +2019,7 @@ impl FenceMachine {
             prompt_generation: editor.prompt_generation,
             reader_revision: editor.reader_revision,
             reached: false,
+            interrupted: false,
         });
         actions.push(Action::AskFence(params));
     }
