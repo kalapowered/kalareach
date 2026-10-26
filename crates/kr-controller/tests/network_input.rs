@@ -1020,10 +1020,6 @@ const HELD_COMMITS: usize = 2;
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_key_reaches_the_application_while_a_sync_and_an_installation_of_ten_thousand_entries_hold_the_catalogue()
  {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
-
-    use kr_controller::catalogue::TestingPoint;
     use kr_plugin_catalogue::{CapabilityCeiling, Enrolment, RepositoryId, RepositoryKind};
     use kr_protocol::catalogue as wire;
     use kr_protocol::scalars::U64;
@@ -1061,34 +1057,7 @@ async fn a_key_reaches_the_application_while_a_sync_and_an_installation_of_ten_t
         .expect("the owner adopted the root");
 
     // The change stops at its commits while the budget lasts, says so, and waits to be let go.
-    let (reached, waiting) = std::sync::mpsc::channel::<()>();
-    let (go, going) = std::sync::mpsc::channel::<()>();
-    let (reached, going) = (Mutex::new(reached), Mutex::new(going));
-    let waiting = Arc::new(Mutex::new(waiting));
-    let budget = Arc::new(AtomicUsize::new(0));
-    let let_go_by_the_watchdog = Arc::new(AtomicBool::new(false));
-    {
-        let (budget, let_go) = (Arc::clone(&budget), Arc::clone(&let_go_by_the_watchdog));
-        catalogue.at_testing_point(move |point| {
-            let holding = point == TestingPoint::Commit
-                && budget
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                        left.checked_sub(1)
-                    })
-                    .is_ok();
-            if holding {
-                let _ = reached.lock().expect("the signal").send(());
-                if going
-                    .lock()
-                    .expect("the release")
-                    .recv_timeout(WATCHDOG)
-                    .is_err()
-                {
-                    let_go.store(true, Ordering::SeqCst);
-                }
-            }
-        });
-    }
+    let holds = Holds::on(catalogue);
 
     // The catalogue's changes go on a second connection of the device. A key never goes ahead of a
     // catalogue mutation sent before it on its own connection, which is the protocol's order, and
@@ -1097,12 +1066,6 @@ async fn a_key_reaches_the_application_while_a_sync_and_an_installation_of_ten_t
     let other = RawDevice::connect(&rig.host, device, record).await;
     let mut answers = Answers::default();
     let environment_id = rig.host.environment_id;
-    let holds = Holds {
-        budget,
-        waiting,
-        go,
-        let_go: let_go_by_the_watchdog,
-    };
     let synced: wire::CatalogueSyncResult = holds
         .change(
             &mut rig,
@@ -1141,10 +1104,26 @@ async fn a_key_reaches_the_application_while_a_sync_and_an_installation_of_ten_t
     rig.close().await;
 }
 
+/// Which of a change's commits are held: the first `pass` go by, and the next `held` are each held.
+#[derive(Clone, Copy)]
+struct Plan {
+    pass: usize,
+    held: usize,
+}
+
+impl Plan {
+    /// A change that nothing holds.
+    const NONE: Self = Self { pass: 0, held: 0 };
+}
+
 /// Where a catalogue change is held, and what lets it go.
 struct Holds {
+    /// How many more commits go by before the next one is held.
+    passing: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// How many more commits are held.
     budget: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// How many commits the change has reached.
+    seen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Says that the change is held at a commit.
     waiting: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
     /// Lets the change go on.
@@ -1154,6 +1133,64 @@ struct Holds {
 }
 
 impl Holds {
+    /// Holds the commits the changes of `catalogue` make, as each change's plan says.
+    fn on(catalogue: &kr_controller::catalogue::CatalogueModule) -> Self {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        use kr_controller::catalogue::TestingPoint;
+
+        let (reached, waiting) = std::sync::mpsc::channel::<()>();
+        let (go, going) = std::sync::mpsc::channel::<()>();
+        let (reached, going) = (Mutex::new(reached), Mutex::new(going));
+        let waiting = Arc::new(Mutex::new(waiting));
+        let passing = Arc::new(AtomicUsize::new(0));
+        let budget = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(AtomicUsize::new(0));
+        let let_go_by_the_watchdog = Arc::new(AtomicBool::new(false));
+        {
+            let (passing, budget, seen, let_go) = (
+                Arc::clone(&passing),
+                Arc::clone(&budget),
+                Arc::clone(&seen),
+                Arc::clone(&let_go_by_the_watchdog),
+            );
+            catalogue.at_testing_point(move |point| {
+                if point != TestingPoint::Commit {
+                    return;
+                }
+                seen.fetch_add(1, Ordering::SeqCst);
+                let takes = |count: &AtomicUsize| {
+                    count
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                            left.checked_sub(1)
+                        })
+                        .is_ok()
+                };
+                if takes(&passing) || !takes(&budget) {
+                    return;
+                }
+                let _ = reached.lock().expect("the signal").send(());
+                if going
+                    .lock()
+                    .expect("the release")
+                    .recv_timeout(WATCHDOG)
+                    .is_err()
+                {
+                    let_go.store(true, Ordering::SeqCst);
+                }
+            });
+        }
+        Self {
+            passing,
+            budget,
+            seen,
+            waiting,
+            go,
+            let_go: let_go_by_the_watchdog,
+        }
+    }
+
     /// Sends one catalogue change on `via`, a connection of the device, and at each of its first
     /// `HELD_COMMITS` commits types a key on the connection the device attached on and waits for
     /// the application to have it before the change goes on. Returns the change's result.
@@ -1165,9 +1202,48 @@ impl Holds {
         method: Method,
         params: &P,
     ) -> kr_protocol::envelope::ParamsValue {
+        let plan = Plan {
+            pass: 0,
+            held: HELD_COMMITS,
+        };
+        let (answer, _) = self
+            .hold(
+                rig,
+                via,
+                answers,
+                &format!("{method:?}"),
+                method,
+                params,
+                plan,
+            )
+            .await;
+        let Outcome::Ok(result) = answer else {
+            panic!("{method:?} was answered {answer:?}");
+        };
+        result
+    }
+
+    /// Sends one catalogue change on `via`, lets the first `plan.pass` of its commits go by, and
+    /// at each of the next `plan.held` types a key on the connection the device attached on and
+    /// waits for the application to have it before the change goes on. Returns the change's
+    /// answer and how many commits it made in all; `what` names the change where the case fails.
+    // The change, the connection it goes on and where it is held are each one argument.
+    #[allow(clippy::too_many_arguments)]
+    async fn hold<P: serde::Serialize>(
+        &self,
+        rig: &mut Rig,
+        via: &RawDevice,
+        answers: &mut Answers,
+        what: &str,
+        method: Method,
+        params: &P,
+        plan: Plan,
+    ) -> (Outcome, usize) {
         use std::sync::atomic::Ordering;
 
-        self.budget.store(HELD_COMMITS, Ordering::SeqCst);
+        self.seen.store(0, Ordering::SeqCst);
+        self.passing.store(plan.pass, Ordering::SeqCst);
+        self.budget.store(plan.held, Ordering::SeqCst);
         let change = via
             .submit(
                 method,
@@ -1176,7 +1252,7 @@ impl Holds {
                 params,
             )
             .await;
-        for held in 1..=HELD_COMMITS {
+        for held in 1..=plan.held {
             let signal = std::sync::Arc::clone(&self.waiting);
             let reached = tokio::task::spawn_blocking(move || {
                 signal
@@ -1189,7 +1265,7 @@ impl Holds {
             if reached.is_err() {
                 let answer = answers.until(via, change, Duration::from_secs(1)).await;
                 panic!(
-                    "{method:?}: the change never reached commit {held}; its answer: {answer:?}"
+                    "{what}: the change never reached held commit {held}; its answer: {answer:?}"
                 );
             }
             // A device that connects and goes while the change is inside its commit: the host
@@ -1200,15 +1276,321 @@ impl Holds {
             let arrived = rig.until_everything_typed_arrived().await;
             assert!(
                 arrived.is_some() && !self.let_go.load(Ordering::SeqCst),
-                "{method:?}: the key typed while the change was held at commit {held} did not \
-                 reach the application until the watchdog let the change go"
+                "{what}: the key typed while the change was held at commit {held} did not reach \
+                 the application until the watchdog let the change go"
             );
             self.go.send(()).expect("the change is waiting");
         }
-        let answer = answers.until(via, change, LIVENESS_DEADLINE).await;
-        let Some(Outcome::Ok(result)) = answer else {
-            panic!("{method:?} was answered {answer:?}");
+        let Some(answer) = answers.until(via, change, LIVENESS_DEADLINE).await else {
+            panic!("{what} was not answered");
         };
-        result
+        (answer, self.seen.load(Ordering::SeqCst))
     }
+}
+
+/// KR-REQ-11.14 and KR-ACC-017: a key typed in a session reaches its application while the
+/// catalogue of a repository of ten thousand entries meets a full mirror's limit, fails an update
+/// part way and refuses a rollback.
+///
+/// The daemon runs a change in a task of its own beside every session's tasks (the case above
+/// states why a key must not wait behind one). That holds for the changes that stop as much as for
+/// the ones that finish, since a person types through all of them. Each leg holds one change
+/// inside commits it makes, with its registration held, and types a key at each; a change that did
+/// its blocking work on the one worker of this runtime would keep the key out until the watchdog
+/// let it go, which fails the case. Once a change is let go the case checks by what the daemon
+/// answered that the event happened, and by what the catalogue still reads and has installed that
+/// the last usable generation and the installed release stayed usable. Nothing here decides by
+/// how long anything took.
+///
+/// 1. A full mirror whose payload budget this repository does not fit: the sync refuses with that
+///    resource limit. The commit that keeps the generation's trust goes by; the held commits are
+///    the time checkpoint the sync keeps after the limit refused the mirror and the admission
+///    revision's raise that follows a change that stopped.
+/// 2. An update whose second release signs a length shorter than its presentation's bytes: the
+///    installation caches the manifest, stops at the presentation and is unwound. The held commits
+///    are the manifest's cache write, made before the update stopped, and the admission revision's
+///    raise after it.
+/// 3. A repository that publishes an older generation again, under metadata versions newer than
+///    the ones this host accepted, so that every signature and version holds and the generation
+///    number alone refuses it. The held commits are the one that keeps the generation's trust,
+///    made before the refusal, and the admission revision's raise after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_key_reaches_the_application_while_the_catalogue_meets_a_mirror_limit_fails_an_update_and_refuses_a_rollback()
+ {
+    use kr_plugin_catalogue::{CapabilityCeiling, Enrolment, RepositoryId, RepositoryKind};
+    use kr_protocol::catalogue as wire;
+    use kr_protocol::scalars::U64;
+
+    let mut rig = Rig::start_managing().await;
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let listed = generations::synthetic_index(9_999).entries;
+    let crowded = |generation: u64, version: &str, keys: Option<generations::KeySet>| {
+        generations::GenerationSpec {
+            generation,
+            package_version: version.to_owned(),
+            keys,
+            listed_only: listed.clone(),
+            ..generations::GenerationSpec::default()
+        }
+    };
+    let first = generations::Generation::build(home.path(), crowded(1, "0.1.0", None)).await;
+    let repository = RepositoryId::new("crowded").expect("a repository identifier");
+    let package = kr_protocol::ids::PluginId::new("kalareach/example-declarative")
+        .expect("a plugin identifier");
+    rig.host
+        .controller()
+        .catalogue()
+        .catalogue()
+        .lock()
+        .await
+        .enrol(
+            Enrolment::new(
+                repository.clone(),
+                RepositoryKind::Community,
+                first.metadata_url(),
+                first.targets_url(),
+                first.root_bytes(),
+                kr_plugin_sdk::limits::RepositoryBudgets::defaults(),
+                CapabilityCeiling::default_ceiling(),
+            )
+            .expect("an enrollable repository"),
+            true,
+        )
+        .expect("the owner adopted the root");
+    let holds = Holds::on(rig.host.controller().catalogue());
+
+    // The catalogue's changes go on a second connection of the device, as in the case above.
+    let (device, record) = &rig.paired;
+    let other = RawDevice::connect(&rig.host, device, record).await;
+    let mut answers = Answers::default();
+    let environment_id = rig.host.environment_id;
+    let sync = wire::CatalogueSyncParams {
+        environment_id,
+        catalogue_id: "crowded".to_owned(),
+    };
+    let install = |version: &str, digest: String| wire::PluginInstallParams {
+        environment_id,
+        catalogue_id: "crowded".to_owned(),
+        plugin_id: package.clone(),
+        version: version.to_owned(),
+        package_digest: digest,
+        grant: Vec::new(),
+        owner_confirmation: Nullable::null(),
+    };
+
+    // The repository is synchronised and its release installed, with nothing held: the state the
+    // three events find.
+    let (answer, _) = holds
+        .hold(
+            &mut rig,
+            &other,
+            &mut answers,
+            "the first sync",
+            Method::CatalogueSync,
+            &sync,
+            Plan::NONE,
+        )
+        .await;
+    let synced: wire::CatalogueSyncResult = ok(answer).to_typed().expect("a sync result");
+    assert_eq!(synced.entries, U64::new(10_000));
+    let first_release = first.manifest_digest();
+    let (answer, _) = holds
+        .hold(
+            &mut rig,
+            &other,
+            &mut answers,
+            "the first installation",
+            Method::PluginInstall,
+            &install("0.1.0", first_release.to_string()),
+            Plan::NONE,
+        )
+        .await;
+    let _: wire::PluginInstallResult = ok(answer).to_typed().expect("an installation result");
+
+    // 1. The owner turns the full mirror on with a payload budget that no part of this repository
+    // fits.
+    set_budgets(&rig, &repository, |budgets| {
+        budgets.full_offline_mirror = true;
+        budgets.payload_cache_bytes = U64::new(64);
+    })
+    .await;
+    let (answer, commits) = holds
+        .hold(
+            &mut rig,
+            &other,
+            &mut answers,
+            "a sync past the full mirror's payload budget",
+            Method::CatalogueSync,
+            &sync,
+            Plan { pass: 1, held: 2 },
+        )
+        .await;
+    let said = stopped_on(answer, ErrorCode::QuotaExceeded);
+    assert!(
+        said.contains("payload_cache_bytes"),
+        "the refusal names the budget: {said}"
+    );
+    assert_eq!(
+        commits, 3,
+        "the held commits are the last ones the sync makes"
+    );
+    still_serves(&rig, &repository, 1, first_release).await;
+    set_budgets(&rig, &repository, |budgets| {
+        *budgets = kr_plugin_sdk::limits::RepositoryBudgets::defaults();
+    })
+    .await;
+
+    // 2. The repository publishes a second release whose signed length for its presentation is
+    // shorter than the presentation's bytes. The generation verifies; the release does not install.
+    let second = generations::Generation::build(
+        &home.path().join("second"),
+        generations::GenerationSpec {
+            asset_copy: true,
+            understated_presentation: Some(presentation_length(&first) - 10),
+            ..crowded(2, "0.2.0", Some(first.keys()))
+        },
+    )
+    .await;
+    first.replace_with(&second);
+    let (answer, _) = holds
+        .hold(
+            &mut rig,
+            &other,
+            &mut answers,
+            "the second sync",
+            Method::CatalogueSync,
+            &sync,
+            Plan::NONE,
+        )
+        .await;
+    let synced: wire::CatalogueSyncResult = ok(answer).to_typed().expect("a sync result");
+    assert_eq!(synced.entries, U64::new(10_000));
+    let (answer, commits) = holds
+        .hold(
+            &mut rig,
+            &other,
+            &mut answers,
+            "an update whose second release overruns its signed length",
+            Method::PluginInstall,
+            &install("0.2.0", second.manifest_digest().to_string()),
+            Plan { pass: 0, held: 2 },
+        )
+        .await;
+    let said = stopped_on(answer, ErrorCode::AttachmentIntegrity);
+    assert!(said.contains("longer than"), "the refusal says why: {said}");
+    assert_eq!(commits, 2, "the held commits are all the update makes");
+    still_serves(&rig, &repository, 2, first_release).await;
+
+    // 3. The repository publishes generation one again, signed under newer metadata versions than
+    // generation two was accepted at.
+    let replayed = generations::Generation::build(
+        &home.path().join("replayed"),
+        generations::GenerationSpec {
+            metadata_version: Some(3),
+            ..crowded(1, "0.1.0", Some(first.keys()))
+        },
+    )
+    .await;
+    first.replace_with(&replayed);
+    let (answer, commits) = holds
+        .hold(
+            &mut rig,
+            &other,
+            &mut answers,
+            "a sync of a generation older than the one in use",
+            Method::CatalogueSync,
+            &sync,
+            Plan { pass: 0, held: 2 },
+        )
+        .await;
+    let said = stopped_on(answer, ErrorCode::RepositoryUntrusted);
+    assert!(
+        said.contains("older than the accepted generation"),
+        "the generation number refused it: {said}"
+    );
+    assert_eq!(commits, 2, "the held commits are all the sync makes");
+    still_serves(&rig, &repository, 2, first_release).await;
+
+    other.close();
+    rig.close().await;
+}
+
+/// Changes the budgets the repository is enrolled with, as the owner at the host would.
+async fn set_budgets(
+    rig: &Rig,
+    repository: &kr_plugin_catalogue::RepositoryId,
+    edit: impl FnOnce(&mut kr_plugin_sdk::limits::RepositoryBudgets),
+) {
+    let mut catalogue = rig.host.controller().catalogue().catalogue().lock().await;
+    let mut enrolment = catalogue
+        .repository(repository)
+        .expect("readable")
+        .expect("enrolled");
+    edit(&mut enrolment.budgets);
+    catalogue
+        .update_enrolment(enrolment, false)
+        .expect("a mirror setting enlarges no trust");
+}
+
+/// The result of a change the case expects to succeed.
+fn ok(answer: Outcome) -> kr_protocol::envelope::ParamsValue {
+    match answer {
+        Outcome::Ok(result) => result,
+        Outcome::Error(error) => panic!("the change was refused: {error:?}"),
+    }
+}
+
+/// The text of the answer to a change that committed part of its work and then stopped on `code`,
+/// which is how the daemon answers it: as an action that stopped part way, naming what stopped it.
+fn stopped_on(answer: Outcome, code: ErrorCode) -> String {
+    let Outcome::Error(error) = answer else {
+        panic!("the change was answered {answer:?}, and not as one that stopped");
+    };
+    assert_eq!(error.code, ErrorCode::OutcomeUnknown, "{error:?}");
+    assert!(
+        error.message.contains(code.as_str()),
+        "the change did not stop on {}: {}",
+        code.as_str(),
+        error.message
+    );
+    error.message
+}
+
+/// What the case checks after each event: the catalogue still reads `generation` of the
+/// repository offline, in whole, and the release installed from the first generation is the one
+/// installed.
+async fn still_serves(
+    rig: &Rig,
+    repository: &kr_plugin_catalogue::RepositoryId,
+    generation: u64,
+    installed: kr_plugin_sdk::digest::PayloadDigest,
+) {
+    let catalogue = rig.host.controller().catalogue().catalogue().lock().await;
+    let index = catalogue
+        .index(repository)
+        .expect("the active generation is read offline");
+    assert_eq!(index.generation.get(), generation);
+    assert_eq!(index.entries.len(), 10_000);
+    let plugin = kr_protocol::ids::PluginId::new("kalareach/example-declarative")
+        .expect("a plugin identifier");
+    let release = catalogue
+        .installation(rig.host.environment_id, &plugin)
+        .expect("readable")
+        .expect("installed");
+    assert_eq!(release.package_digest, installed);
+}
+
+/// The length the first release declares for its presentation.
+fn presentation_length(generation: &generations::Generation) -> u64 {
+    let index: kr_plugin_sdk::catalogue::CatalogueIndex = serde_json::from_slice(
+        &std::fs::read(generation.targets_dir().join("index.json")).expect("an index"),
+    )
+    .expect("a readable index");
+    index.entries[0]
+        .payloads
+        .iter()
+        .find(|payload| payload.path.as_str() == kr_plugin_sdk::package::PRESENTATION_FILE)
+        .expect("a presentation")
+        .size_bytes
+        .get()
 }
