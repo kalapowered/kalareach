@@ -1046,7 +1046,14 @@ fn every_phone_test_file_of_the_repository_that_names_a_row_declares_the_class_o
         })
         .collect();
     assert!(!keyed.is_empty());
-    for file in keyed {
+    // The map reads the classes of a lane's files only for a lane the report reads: a lane it does
+    // not read has no tests to tell apart, so its files have no classes to check here.
+    let read = |file: &&String| {
+        plan::LANES
+            .iter()
+            .any(|lane| lane.reads.is_some() && plan::matches(lane.files, file))
+    };
+    for file in keyed.into_iter().filter(read) {
         assert!(
             map.lane_classes
                 .get(file)
