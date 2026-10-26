@@ -1,10 +1,10 @@
 //! The contact tools against a real session, spoken as an installed agent speaks them.
 //!
-//! These are the KR-ACC-018 cases this layer can reach. The tool server is not called in-process:
-//! it runs as the session's own root shell, with its standard streams on a pair of named pipes,
-//! and the test talks to it with a Model Context Protocol client. That is what makes the binding
-//! real — the helper is inside the session because the operating system says it is, not because
-//! the test said so.
+//! These are the cases of an agent's contact with a person that this layer can reach. The tool
+//! server is not called in-process: it runs as the session's own root shell, with its standard
+//! streams on a pair of named pipes, and the test talks to it with a Model Context Protocol
+//! client. That is what makes the binding real — the helper is inside the session because the
+//! operating system says it is, not because the test said so.
 //!
 //! Everything a test launches lives on the internal disk: the `kr` binary is copied there, the
 //! host's runtime and state directories are a temporary tree there, and every working directory is
@@ -391,6 +391,9 @@ async fn the_server_offers_exactly_the_four_contact_tools() {
 ///
 /// This is the scripted end-to-end run: the agent asks, a person answers `--other`, and the agent's
 /// wait returns that free text as free text.
+///
+/// KR-ACC-018, the part about select/other: a select carries "Something else" after its choices,
+/// and a person's free-text answer to it reaches the agent as free text and not as a choice.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_select_is_answered_with_free_text_and_the_agent_reads_it_as_free_text() {
     // KR-REQ-01.18: an agent asks through the tools and reads the person's answer.
@@ -467,6 +470,10 @@ async fn a_select_is_answered_with_free_text_and_the_agent_reads_it_as_free_text
 }
 
 /// Text and yes-or-no, answered from the command line.
+///
+/// KR-ACC-018, the parts about text and confirm: a text answer reaches the agent as input text, a
+/// confirm carries "Something else", and a no reaches the agent as a decision of false. Not shown
+/// here: an `other` answer to a confirm.
 #[tokio::test(flavor = "multi_thread")]
 async fn text_and_confirm_answers_reach_the_agent() {
     // KR-REQ-01.18: text and yes-or-no answers reach the agent that asked.
@@ -544,6 +551,9 @@ async fn text_and_confirm_answers_reach_the_agent() {
 }
 
 /// Two clients answering at once: one wins, and the other is told the question is resolved.
+///
+/// KR-ACC-018, the part about simultaneous answers: of two clients answering at once exactly one
+/// wins, the other is told the question is resolved, and the stored answer is the winner's.
 #[tokio::test(flavor = "multi_thread")]
 async fn exactly_one_of_two_simultaneous_answers_wins() {
     // KR-REQ-11.60: two clients answer at once through the worker; the first answer wins
@@ -662,6 +672,10 @@ async fn an_exact_retry_is_the_same_question_and_a_changed_one_is_a_conflict() {
 }
 
 /// Cancelling a question, and then cancelling it again.
+///
+/// KR-ACC-018, the part about cancellation: the agent's cancellation with its token ends the
+/// question as cancelled, a second cancellation changes nothing, and a person's answer to it is
+/// refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cancelled_question_stays_cancelled() {
     // KR-REQ-11.56: the caller token a cancellation carries is in neither the journal nor its
@@ -1111,6 +1125,9 @@ fn ledger(hosted: &Hosted) -> kr_worker::questions::store::Store {
 /// in the agent's own configuration is the one the agent runs: started from that entry inside a
 /// session, it asks the person a question, returns the answer they gave and raises an alert. The
 /// host has no account, no managed service and no entitlement configured.
+///
+/// KR-ACC-018, the part about confirm through the installed skill: a confirm asked through the
+/// server the skill's installation registers is answered yes, and the agent reads that decision.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_installed_skill_asks_returns_the_answer_and_raises_an_alert() {
     let home = tempfile::tempdir().expect("a home directory on the internal disk");
@@ -1999,6 +2016,9 @@ async fn question_once(
 /// question that call was waiting on ends as cancelled; every client reads it that way, a person's
 /// answer to it is refused, and the agent's next wait reads the cancellation rather than waiting
 /// on a question nobody will answer.
+///
+/// KR-ACC-018, the part about cancellation: the client's cancelling the wait ends the question as
+/// cancelled for every client, and the agent's next wait reads the cancellation.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_wait_whose_call_is_cancelled_upstream_cancels_its_question() {
     let hosted = hosted().await;
@@ -2065,6 +2085,9 @@ async fn a_wait_whose_call_is_cancelled_upstream_cancels_its_question() {
 /// KR-REQ-11.63: an `ask_user` whose call the client cancels while it waits for the answer cancels
 /// the question it asked, rather than leaving it in front of the person with nobody to take the
 /// answer.
+///
+/// KR-ACC-018, the part about cancellation: the client's cancelling the asking call ends the
+/// question it asked as cancelled.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_question_whose_asking_call_is_cancelled_upstream_ends_cancelled() {
     let hosted = hosted().await;
@@ -2111,6 +2134,9 @@ async fn a_question_whose_asking_call_is_cancelled_upstream_ends_cancelled() {
 /// closes while it waits, as it does when the agent exits or restarts its tool server, the helper
 /// stops without cancelling anything: no cancellation is ever recorded for the question, and it
 /// ends with the helper's process as expired.
+///
+/// KR-ACC-018, the part about cancellation: a helper whose input closes cancels nothing; no
+/// cancellation is recorded and the question ends expired with the helper's process.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_helper_whose_input_closes_leaves_its_question_to_end_as_expired() {
     let hosted = hosted().await;
@@ -2284,6 +2310,12 @@ async fn a_question_is_found_in_a_history_past_what_one_frame_holds() {
 /// for it is invalidated for every client: the answering surface reads it expired, the agent's own
 /// wait returns it expired, and a person's answer to it is refused, while the other question stays
 /// open.
+///
+/// KR-ACC-018, the part about thread-change invalidation where no qualified bridge supplies the
+/// thread: a thread switch reported by a broker that proves the agent and not the thread claims
+/// nothing and leaves the question open, and the end of the agent's instance invalidates the
+/// question asked for it for every client. Not shown here: the invalidation by a switch a qualified
+/// bridge reports, which the hook case shows.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_question_asked_for_a_launched_agent_ends_with_the_agents_instance() {
     let hosted = hosted().await;

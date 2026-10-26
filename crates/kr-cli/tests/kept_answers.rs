@@ -756,6 +756,9 @@ fn take(state: &Mutex<State>, params: &ParamsValue) -> Result<ParamsValue, Proto
 
 /// KR-REQ-11.63: an answer the worker could not take is kept on this device, the person is told,
 /// and the worker is sent nothing. The control is a worker that takes it: sent, and nothing kept.
+///
+/// KR-ACC-018, the part about offline drafts: an answer the worker could not take stays a draft on
+/// this device, the person is told so, and the worker is sent nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_answer_the_worker_could_not_take_is_kept_and_nothing_is_sent() {
     let host = Host::start(Behaviour::EndsAfterTheRead).await;
@@ -870,6 +873,10 @@ async fn an_answer_that_can_be_neither_taken_nor_kept_says_so() {
 /// KR-REQ-11.63: a kept answer whose question is still pending at the revision it answered is
 /// offered by `kr question drafts`, which sends nothing however often it runs; `kr question send`
 /// is what sends it, once, and then it is no longer kept.
+///
+/// KR-ACC-018, the part about reconnect: once the worker can be reached again a kept answer is
+/// offered however often the drafts are read, nothing is submitted by reading them, and it is sent
+/// once, by the person's send.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_kept_answer_is_offered_by_drafts_and_sent_only_by_send() {
     let host = Host::start(Behaviour::EndsAfterTheRead).await;

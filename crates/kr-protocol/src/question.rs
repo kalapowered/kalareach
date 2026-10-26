@@ -998,6 +998,11 @@ mod tests {
 
     /// KR-REQ-11.59: an answer carries at most 16 KiB of text, whichever text arm it arrives in,
     /// and the free-text arm is answerable on every `select` and `confirm` and on nothing else.
+    ///
+    /// KR-ACC-018, the parts about select/other and confirm/other: the free-text answer is accepted
+    /// on a select and on a confirm, within 16 KiB, and on no input question, and the free-text
+    /// option is never answered as a listed choice. This is the validation of the answer; no case
+    /// answers a confirm with it through the tools.
     #[test]
     fn an_answer_is_one_arm_of_the_union_and_at_most_sixteen_kibibytes() {
         let input = question(QuestionKind::Input, &[]);
