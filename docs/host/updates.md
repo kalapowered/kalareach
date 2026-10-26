@@ -558,16 +558,29 @@ next update.
 Each file of a release is read-only by attribute. Each file and directory also carries an entry
 that denies its owner the rights that write it (adding a file or a subdirectory, writing,
 appending, writing extended attributes or attributes, deleting, deleting a child), because the
-read-only attribute of a directory does not stop new names. A release is removed by renaming it out of `versions\`, resetting the entries of each
-directory and deleting the tree.
+read-only attribute of a directory does not stop new names. A release is removed by moving it into
+`trash\` and deleting the tree there.
 
-The deletion follows no junction. Each directory is held open with a share mode that lets nobody
-rename or delete it, and that share mode does not stop another process of the account from turning
-an empty directory into a junction. So nothing below a directory is reached by a path: its names
-are read through the open handle, and each is opened as a name inside that handle with reparse
-points not followed. A directory turned into a junction after it was checked has a listing of its
-own, which is empty, and goes as a name; a name swapped for a junction after it was listed is opened
-as the junction itself and goes as a name. What a junction names is never reached.
+What the removal holds. `trash\` is opened once, without following a link, and is refused unless it
+is a plain directory; the release is moved into it, and everything in it is listed and removed,
+through that open handle, so a link in the place of `trash\` is refused and what it names is never
+listed. Each directory of a release is held open with a share mode that lets nobody rename or delete
+it, its names are read through that handle, and each is opened as a name inside the handle with
+reparse points not followed. A link found inside a release, a junction above all, is opened as
+itself and deleted as a name: what it names is not followed. So is a name that another process of
+the account swaps for a link after it was listed, and an empty directory that it turns into a
+junction after it was checked, which has a listing of its own, empty. The share mode does not stop
+that change of an empty directory, and the removal does not need it stopped. A name is deleted
+through a handle that lets nobody rename or delete the name while it is open, and a file whose
+access list is reset is reset through such a handle, so neither can be moved out of the release
+between the open and the act.
+
+What it does not hold. The store does not defend a removal against the account's own programs: no
+account boundary lies between them and the store, and a program of the account can change or delete
+what the store keeps without racing anything. The removal is closed against a link it meets where it
+works, not against an account that rewrites its own store. In particular it reaches `trash\` and
+the release's place in `versions\` by their paths, as the system follows paths, so a program of the
+account that replaces a directory above them leads the removal where it likes.
 
 A file is deleted as a name, through a handle, and nothing else about it changes: a file of the
 release that is a second name for a file outside it goes as a name, and the file outside keeps its
@@ -595,9 +608,13 @@ The reader is given the archive's directory only after it has been judged here: 
 the last 22 bytes of the file, with no comment and no 64-bit form, and the directory is exactly the
 bytes before it (at most 64 MiB), holding that many entries one after another, each with a name of
 at most 1,024 bytes, at most 1,024 bytes of extra data and no comment. The checker applies the same
-rules. The directory is not searched for signatures, because a file's checksum can spell one. The
-reader is shown those bytes and zeros for the rest of the file until it has its list of entries,
-and the directory it parsed must start where the end record says, or the archive is refused. A name
+rules. No name and no extra data in it holds the signature of an end record, of its 64-bit form or
+of that form's locator: the parser falls back to an earlier end record when an entry does not parse,
+and sizes what it keeps for the entries that record counts before anything is checked. The fixed
+fields (a checksum, a size, an offset) are not searched, because a file's checksum can spell a
+signature, and an archive that does is read. The reader is shown those bytes and zeros for the rest
+of the file until it has its list of entries, and the directory it parsed must start where the end
+record says, or the archive is refused. A name
 has at most 32 parts. An archive is refused whole when it has an entry that is a link or a device,
 that is encrypted or compressed in a way a release is not, or that is named twice, or whose name
 Windows would read as another (an absolute, drive or UNC path, a `..`, a device name such as
