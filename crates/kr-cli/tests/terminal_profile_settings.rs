@@ -83,13 +83,19 @@ impl Person {
             programs,
             application,
         };
-        let schemas = person.gsettings(&["list-schemas"]);
-        let ready = schemas.as_ref().is_some_and(|schemas| {
-            schemas.lines().any(|line| line == application.list_schema)
-                && schemas
-                    .lines()
-                    .any(|line| line == application.profile_schema)
-        });
+        // A profile's keys are a relocatable schema, which `list-schemas` leaves out.
+        let schemas = [
+            person.gsettings(&["list-schemas"]),
+            person.gsettings(&["list-relocatable-schemas"]),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n");
+        let ready = schemas.lines().any(|line| line == application.list_schema)
+            && schemas
+                .lines()
+                .any(|line| line == application.profile_schema);
         if !ready {
             assert!(
                 std::env::var_os("KR_REQUIRE_LINUX_TERMINALS").is_none(),
