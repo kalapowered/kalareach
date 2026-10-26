@@ -6871,6 +6871,100 @@ async fn a_list_at_the_cap_says_it_is_full() {
     );
 }
 
+/// KR-REQ-24.15: an entry whose target the person has revoked counts neither toward the cap nor
+/// toward keeping the scan open. The next pass puts the target the cap kept out in a revoked
+/// entry's place, the scan counts as read through, the refusal names what is live and no longer
+/// says that the list is full, and revoking what is owed ends the wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revoking_what_a_full_list_names_makes_room_for_what_the_cap_kept_out() {
+    let rig = Rig::start().await;
+    let mut named = Vec::new();
+    for _ in 0..4 {
+        named.push(rig.pairs(&[ActionRight::SessionView]).await);
+    }
+    rig.until_the_carrier_is_idle().await;
+    let key = AuthorisationKeyPair::generate().expect("a key");
+    let request = rig.request_of(
+        &key,
+        DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([0x0f; 16])),
+        0xd1,
+        RevocationTarget::Devices {
+            device_ids: named
+                .iter()
+                .map(|paired| paired.1.device_id)
+                .collect::<CanonicalSet<_>>(),
+        },
+    );
+    rig.published_as(&key, &request).await;
+
+    let reads = rig.arrivals("read");
+    rig.served
+        .web()
+        .fail_with_member(AUTHORITY, "read", 1, Moment::Hold);
+    let rig = rig.restarted(false, a_restore_was_found).await;
+    rig.until_arrivals("read", reads + 1).await;
+    rig.host.controller().limit_the_owed_list_to(3).await;
+    rig.served.web().release_held();
+    rig.until_the_carrier_is_idle().await;
+
+    let listed: Vec<DeviceId> = rig
+        .what_the_record_lists()
+        .into_iter()
+        .filter_map(|target| match target {
+            restored::Target::Device(device) => Some(device),
+            restored::Target::Grant(_) => None,
+        })
+        .collect();
+    assert_eq!(listed.len(), 3, "the list holds as many as the cap allows");
+    let left_out = named
+        .iter()
+        .map(|paired| paired.1.device_id)
+        .find(|device| !listed.contains(device))
+        .expect("the cap kept one device out");
+    assert!(
+        !rig.runtime().has_read_the_feed_through(),
+        "a list the cap kept an entry out of is not the whole of what is owed"
+    );
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(refused.message.contains("is full"), "{refused:?}");
+
+    for device in &listed {
+        rig.revokes_at_the_machine(*device).await;
+    }
+    within("a pass reads the feed through", async {
+        while !rig.runtime().has_read_the_feed_through() {
+            rig.poll().await;
+        }
+    })
+    .await;
+    assert!(
+        rig.what_the_record_lists()
+            .contains(&restored::Target::Device(left_out)),
+        "the target the cap kept out took the place of a revoked entry"
+    );
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&left_out.to_string()),
+        "the refusal names what is live: {refused:?}"
+    );
+    for device in &listed {
+        assert!(
+            !refused.message.contains(&device.to_string()),
+            "and not what the person revoked: {refused:?}"
+        );
+    }
+    assert!(
+        !refused.message.contains("is full"),
+        "revoked entries leave room, so the list is not full: {refused:?}"
+    );
+
+    rig.revokes_at_the_machine(left_out).await;
+    assert!(
+        rig.the_owner_confirms().await.lifted,
+        "revoking what is owed ends the wait"
+    );
+}
+
 /// KR-REQ-24.15: a feed that removes the host after the first write of the record failed, which
 /// left the refusal for being behind up without the wait, ends that refusal and leaves the wait: the
 /// person can confirm once the record can be written, and was never left refused for a catch-up

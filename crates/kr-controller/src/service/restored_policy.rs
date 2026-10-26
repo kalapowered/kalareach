@@ -579,9 +579,12 @@ impl Controller {
             .collect();
         named.sort();
         named.dedup();
+        // An entry whose target is not live yields its place to a new one, so it does not count
+        // toward the cap.
+        let held_live = held.iter().filter(|entry| live(&entry.target)).count();
         Some(OwedNow {
             named,
-            full: full_in_memory || held.len() >= most,
+            full: full_in_memory || held_live >= most,
             every_owner,
         })
     }

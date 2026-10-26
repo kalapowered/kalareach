@@ -7101,10 +7101,11 @@ while the registry holds it unrevoked, and a share is live while an unrevoked de
 pairing grant or the grant store holds it unrevoked. A registry that cannot be read shows every
 target live. The list can hold a target whose request the host then dismissed on evidence, until the
 scan of the run that wrote the entry reads the feed through and clears it, or, when a stop came
-first, until the person revokes the target. It holds at most 512 entries, and the file at most 64 KiB. Past that the host
+first, until the person revokes the target. It holds at most 512 live entries, and the file at most 64 KiB. An entry whose
+target the person has revoked does not count toward the 512: it gives its place to a new one. With 512 live entries the host
 keeps what it holds and adds by the lowest sequence, the scan does not count as read through, and the
-refusal says that the list is full; revoking some lets the next scan find the others. A list of
-exactly 512 entries reads as full after a restart while an entry is live.
+refusal says that the list is full; revoking some lets the next scan find the others. After a restart, a list
+with 512 live entries reads as full.
 
 Each finding restarts the scan at the first record: the registry found behind the feed, put back
 again while the host runs, or found behind the feed again after a confirmation, whether or not the
