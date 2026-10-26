@@ -1073,8 +1073,7 @@ fn removal_meets_a_list_that_is_not_the_seal_s(lists: &[&[&str]], put_right: &[&
         .next()
         .map(|entry| entry.path());
     if let Some(kept) = &kept {
-        kr_ipc::install::remove_sealed_tree(kept)
-            .expect("the release goes once the list is right");
+        kr_ipc::install::remove_sealed_tree(kept).expect("the release goes once the list is right");
     }
     assert!(
         answer.is_err(),

@@ -2169,10 +2169,7 @@ impl Store {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(InstallError::io("read", &trash, error)),
         };
-        sweep_entries(
-            &trash,
-            entries.map(|entry| entry.map(|entry| entry.path())),
-        )
+        sweep_entries(&trash, entries.map(|entry| entry.map(|entry| entry.path())))
     }
 }
 
@@ -2319,7 +2316,10 @@ mod windows_tests {
         let Err(InstallError::Io { source, .. }) = answer else {
             panic!("the failure is returned: {answer:?}");
         };
-        assert!(source.to_string().contains("the listing failed"), "{source}");
+        assert!(
+            source.to_string().contains("the listing failed"),
+            "{source}"
+        );
         assert!(swept, "the entry the listing gave is swept");
     }
 }

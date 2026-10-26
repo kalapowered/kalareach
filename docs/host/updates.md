@@ -559,17 +559,24 @@ Each file of a release is read-only by attribute. Each file and directory also c
 that denies its owner the rights that write it (adding a file or a subdirectory, writing,
 appending, writing extended attributes or attributes, deleting, deleting a child), because the
 read-only attribute of a directory does not stop new names. A release is removed by renaming it out of `versions\`, resetting the entries of each
-directory and deleting the tree. The deletion follows no junction. It deletes a file as a name,
-through a handle, and changes nothing else about the file: a file of the release that is a second
-name for a file outside it goes as a name, and the file outside keeps its contents, its attribute
-and its entries. The one exception is a file whose list begins with the seal's own entry, the
-denial of the owner-rights principal. Deleting a read-only file needs the right to change
-attributes, which that entry denies the owner, so the removal resets the list first; a file outside
-that is a second name for such a file has its list reset with it. A list that denies the right and
-does not begin so is somebody else's: it is left as it is, the removal reports it, and the release
-stays in `trash\`. Each directory is held open with a share mode that lets nobody rename or delete
-it while its names are removed, so a directory swapped for a junction meanwhile leads the removal
-nowhere.
+directory and deleting the tree.
+
+The deletion follows no junction. Each directory is held open with a share mode that lets nobody
+rename or delete it, and that share mode does not stop another process of the account from turning
+an empty directory into a junction. So nothing below a directory is reached by a path: its names
+are read through the open handle, and each is opened as a name inside that handle with reparse
+points not followed. A directory turned into a junction after it was checked has a listing of its
+own, which is empty, and goes as a name; a name swapped for a junction after it was listed is opened
+as the junction itself and goes as a name. What a junction names is never reached.
+
+A file is deleted as a name, through a handle, and nothing else about it changes: a file of the
+release that is a second name for a file outside it goes as a name, and the file outside keeps its
+contents, its attribute and its entries. The one exception is a file whose whole access list is the
+seal's own, every entry of it. Deleting a read-only file needs the right to change attributes, which
+the seal's first entry denies the owner, so the removal resets the list first; a file outside that
+is a second name for such a file has its list reset with it. Any other list that denies the right,
+whatever it begins with, is somebody else's: it is left as it is, the removal reports it, and the
+release stays in `trash\`.
 
 A program that runs from a file keeps it: the rest of the release is deleted, and what is left
 stays in `trash\` until an update finds the program ended. A refusal that no program caused, such as
@@ -579,19 +586,24 @@ and lists it under `not_removed` in its `--json` document.
 ### The archive
 
 The archive is read before any signature is checked, so it is held to bounds first and nothing is
-written until every entry has been looked at: at most 50,000 entries, 8 GiB in all and 2 GiB for one
-file. The reader is given the archive's directory only after it has been judged here: the end
-record is the last 22 bytes of the file, with no comment and no 64-bit form, the directory is
-exactly the bytes before it (at most 64 MiB), holding that many entries one after another, each
-with a name of at most 1,024 bytes, at most 1,024 bytes of extra data and no comment, and no other
-end record or locator lies in it. The reader is shown those bytes and zeros for the rest of the
-file until it has its list of entries, so it has no other record to follow. The archive a release is
-packed into has this shape; any other is refused. A name has at most 32 parts. An archive is refused
-whole when it has an entry that is a link or a device, that is encrypted
-or compressed in a way a release is not, or that is named twice, or whose name Windows would read as
-another (an absolute, drive or UNC path, a `..`, a device name such as `CON`, an alternate data
-stream, a trailing dot or space, or two names that differ only in case). A file is read for no more
-than its entry says it holds. Every member is then held to the manifest, as for any archive.
+written until every entry has been looked at: at most 50,000 entries, 8 GiB of file contents in all
+and 2 GiB for one file. The archive itself is in the 32-bit zip form, which makes it under 2 GiB:
+above that the packer writes the 64-bit end record, which a host does not read, so
+`scripts/pack-release-zip.py` refuses a tree that would need it and
+`scripts/check-release-archive.py`, which gates publication, refuses an archive that ends in it.
+The reader is given the archive's directory only after it has been judged here: the end record is
+the last 22 bytes of the file, with no comment and no 64-bit form, and the directory is exactly the
+bytes before it (at most 64 MiB), holding that many entries one after another, each with a name of
+at most 1,024 bytes, at most 1,024 bytes of extra data and no comment. The checker applies the same
+rules. The directory is not searched for signatures, because a file's checksum can spell one. The
+reader is shown those bytes and zeros for the rest of the file until it has its list of entries,
+and the directory it parsed must start where the end record says, or the archive is refused. A name
+has at most 32 parts. An archive is refused whole when it has an entry that is a link or a device,
+that is encrypted or compressed in a way a release is not, or that is named twice, or whose name
+Windows would read as another (an absolute, drive or UNC path, a `..`, a device name such as
+`CON`, an alternate data stream, a trailing dot or space, or two names that differ only in case). A
+file is read for no more than its entry says it holds. Every member is then held to the manifest,
+as for any archive.
 
 ### Starting a daemon again
 

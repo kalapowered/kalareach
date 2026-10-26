@@ -2830,12 +2830,71 @@ mod collecting {
 
         assert!(removed.is_empty(), "no release is judged without current");
         assert!(
-            matches!(not_removed.as_slice(), [NotRemoved { what: Remains::Releases, .. }]),
+            matches!(
+                not_removed.as_slice(),
+                [NotRemoved {
+                    what: Remains::Releases,
+                    ..
+                }]
+            ),
             "the failure to read current is the result"
         );
         for release in &releases {
-            assert!(store.release_directory(release).is_dir(), "{release} is kept");
+            assert!(
+                store.release_directory(release).is_dir(),
+                "{release} is kept"
+            );
         }
+    }
+
+    /// A release that cannot be removed for no program's sake is moved into the trash before the
+    /// refusal, and is told once, as that release: the sweep of the trash that follows its removal
+    /// does not tell it again as something left there.
+    #[cfg(windows)]
+    #[test]
+    fn a_release_that_cannot_be_removed_is_reported_once() {
+        let temp = tempfile::tempdir().expect("a directory");
+        let (store, releases) = store_with_two_releases(temp.path());
+        // The first release's program is a second name for a read-only file elsewhere whose access
+        // list denies its owner the right to change attributes and is not the seal's: the removal
+        // leaves that list as it is and refuses to take the name.
+        let shared = temp.path().join("shared");
+        std::fs::write(&shared, b"shared").expect("a file elsewhere");
+        let mut permissions = std::fs::metadata(&shared).expect("there").permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&shared, permissions).expect("read-only");
+        let icacls = |arguments: &[&str]| {
+            let run = std::process::Command::new("icacls")
+                .arg(&shared)
+                .args(arguments)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .expect("icacls runs");
+            assert!(run.success(), "icacls {arguments:?}");
+        };
+        icacls(&["/deny", "*S-1-1-0:(WA)"]);
+        let directory = store.release_directory(&releases[0]);
+        std::fs::create_dir_all(directory.join("bin")).expect("a directory");
+        std::fs::hard_link(&shared, directory.join("bin").join("kr.exe")).expect("a hard link");
+
+        let (removed, not_removed) = collected(&store);
+
+        // Put it right, so that the test leaves nothing behind.
+        icacls(&["/remove:d", "*S-1-1-0"]);
+        for entry in std::fs::read_dir(store.trash())
+            .expect("the trash")
+            .flatten()
+        {
+            let _ = kr_ipc::install::remove_sealed_tree(&entry.path());
+        }
+        assert_eq!(removed, vec![releases[1].clone()], "the other release goes");
+        assert!(
+            matches!(
+                not_removed.as_slice(),
+                [NotRemoved { what: Remains::Release(release), .. }] if *release == releases[0]
+            ),
+            "the refusal is told once, as the release"
+        );
     }
 
     #[test]
@@ -2851,7 +2910,13 @@ mod collecting {
 
         assert!(removed.is_empty());
         assert!(
-            matches!(not_removed.as_slice(), [NotRemoved { what: Remains::Releases, .. }]),
+            matches!(
+                not_removed.as_slice(),
+                [NotRemoved {
+                    what: Remains::Releases,
+                    ..
+                }]
+            ),
             "the failure to list the releases is the result"
         );
     }
