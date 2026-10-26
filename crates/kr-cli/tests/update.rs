@@ -9469,6 +9469,7 @@ const COMMAND_WRITTEN: &[&str] = &[
     "machine-merge-plan",
     "shell-entries",
     "terminal-preference",
+    "terminal-profiles",
 ];
 
 /// The gaps that are open. The lock holds off the commands of an installed release, and what a
@@ -9479,7 +9480,7 @@ const COMMAND_WRITTEN: &[&str] = &[
 ///   command off. A `kr` of another store takes its own store's lock, which does not hold this one's
 ///   update off either.
 ///
-/// The records it leaves exposed are the five whose floor stays. The configuration document is not
+/// The records it leaves exposed are the six whose floor stays. The configuration document is not
 /// among them: the limit is accepted for it ([`ACCEPTED_FOR_CONFIGURATION`]).
 const OPEN_GAPS: [OpenGap; 1] = [OpenGap {
     what: "a kr outside an installed release takes no lock, and a state root names no store",
@@ -9489,6 +9490,7 @@ const OPEN_GAPS: [OpenGap; 1] = [OpenGap {
         "machine-merge-plan",
         "shell-entries",
         "terminal-preference",
+        "terminal-profiles",
     ],
 }];
 
@@ -9621,7 +9623,7 @@ fn broken_by_command_written_records(
 /// rollback left running can write one after it. The writers' lock holds the commands of an installed
 /// release off, and a record of the release `current` names listed at another version is not
 /// written. Each way a record gets past the lock has one ruling for each record it exposes:
-/// - a `kr` outside an installed release is open for the five records whose floor stays, and
+/// - a `kr` outside an installed release is open for the six records whose floor stays, and
 ///   accepted for the configuration document;
 /// - a root no daemon of the store recorded, and a document a daemon started later with other
 ///   variables would read, are closed for every record: a command registers the roots and the
