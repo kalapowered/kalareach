@@ -409,10 +409,21 @@ enum Waited {
 }
 
 /// Waits `duration`, or until the token is cancelled or the deadline passes, whichever is first;
-/// with no duration, until one of the other two.
-fn wait(spin: bool, duration: Option<Duration>, token: &Cancellation, deadline: Instant) -> Waited {
+/// with no duration, until one of the other two. The pages of `held` are written again at each look,
+/// so that a platform that trims the working set of memory nothing is using does not take them
+/// back: what a model in the middle of a job does with its own memory.
+fn wait(
+    spin: bool,
+    duration: Option<Duration>,
+    token: &Cancellation,
+    deadline: Instant,
+    held: &mut [u8],
+) -> Waited {
     let started = Instant::now();
     loop {
+        for page in held.chunks_mut(PAGE) {
+            page[0] = page[0].wrapping_add(1);
+        }
         if token.is_cancelled() {
             return Waited::Cancelled;
         }
@@ -429,6 +440,9 @@ fn wait(spin: bool, duration: Option<Duration>, token: &Cancellation, deadline: 
         }
     }
 }
+
+/// The size of the steps in which a stub that holds memory writes it again.
+const PAGE: usize = 4096;
 
 impl Model for StubModel {
     fn lock_held(&mut self) {
@@ -452,7 +466,7 @@ impl Model for StubModel {
         }
         let duration =
             (!self.script.load_until_cancelled).then(|| Duration::from_millis(self.script.load_ms));
-        match wait(self.script.spin, duration, token, deadline) {
+        match wait(self.script.spin, duration, token, deadline, &mut []) {
             Waited::Done => {
                 if self.script.mark_loads
                     && let Some(runtime_dir) = &self.runtime_dir
@@ -488,14 +502,14 @@ impl Model for StubModel {
             std::thread::sleep(Duration::from_millis(self.script.ignore_token_ms));
         }
         // Held to the end of the job, and written so that each page is resident.
-        let held = vec![0xA5_u8; usize::try_from(self.script.hold_bytes).unwrap_or(0)];
+        let mut held = vec![0xA5_u8; usize::try_from(self.script.hold_bytes).unwrap_or(0)];
         std::hint::black_box(&held);
         if !held.is_empty() {
             self.began("held");
         }
         let duration = (!self.script.generate_until_cancelled)
             .then(|| Duration::from_millis(self.script.generate_ms));
-        match wait(self.script.spin, duration, token, deadline) {
+        match wait(self.script.spin, duration, token, deadline, &mut held) {
             Waited::Done => {}
             Waited::Cancelled if self.script.produce_when_cancelled => {}
             Waited::Cancelled => {
@@ -551,7 +565,7 @@ impl Model for StubModel {
     ) -> Verifying {
         self.began("check");
         if self.script.verify_passes_once_cancelled {
-            return match wait(self.script.spin, None, token, deadline) {
+            return match wait(self.script.spin, None, token, deadline, &mut []) {
                 Waited::Cancelled | Waited::Done => check_file(asset, path),
                 Waited::PastDeadline => Verifying::Ended {
                     result: VerifyResult::DeadlineExceeded,
@@ -564,7 +578,7 @@ impl Model for StubModel {
         }
         let duration = (!self.script.verify_until_cancelled)
             .then(|| Duration::from_millis(self.script.verify_ms));
-        match wait(self.script.spin, duration, token, deadline) {
+        match wait(self.script.spin, duration, token, deadline, &mut []) {
             Waited::Done => check_file(asset, path),
             Waited::Cancelled => Verifying::Ended {
                 result: VerifyResult::Cancelled,
