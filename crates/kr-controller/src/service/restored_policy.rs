@@ -434,7 +434,7 @@ mod tests {
         let revision = controller.policy().authority_revision();
         let connection_id = kr_protocol::ids::ConnectionId::new(kr_ipc::new_uuid());
         let actor = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
-        controller.admitted_table().insert(
+        controller.admitted_write().insert(
             connection_id,
             crate::service::AdmittedConnection::local(
                 actor,
@@ -680,7 +680,7 @@ mod tests {
             std::future::Future::poll(confirmation.as_mut(), &mut cx).is_pending(),
             "the call waits for the lock"
         );
-        controller.admitted_table().remove(&connection);
+        controller.admitted_withdraw().remove(&connection);
         drop(held);
         let refused = confirmation.await;
         assert!(
