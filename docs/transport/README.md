@@ -229,10 +229,12 @@ configuration the failure does not carry:
 The first bidirectional stream carries four frames, in this order:
 
 1. `ClientOffer`: offered protocol versions, build identity, device identity and key revision,
-   capabilities, the client's receive limits, and a fresh 256-bit client nonce.
-2. `HelloReply`: either `Selected(HostSelection)` carrying a fresh host nonce, the connection
-   identity, the selected version, the selected capabilities, the negotiated limits, the host's
-   endpoint and device identity and its boot and clock epochs; or `Refused(ProtocolError)`. The
+   capabilities, the client's receive limits, a fresh 256-bit client nonce and the extensions it
+   offers.
+2. `HelloReply`: either `Selected(HostSelection)` carrying a fresh host nonce and the client's nonce
+   echoed, the connection identity, the selected version, the selected capabilities, the negotiated
+   limits, the extensions in force, the host's endpoint, device identity and key revision, and its
+   boot and clock epochs; or `Refused(ProtocolError)`. The
    host selects the highest version present in both lists, and supporting one minor says nothing
    about the minors below it ([Version negotiation](../protocol/README.md#version-negotiation)). An
    offer that shares no version with the host's list, a major mismatch being the usual case, is
@@ -261,7 +263,9 @@ different keys for a different purpose. A holder of one transport key cannot sub
 authorised application identity.
 
 The paired record is selected by the endpoint identity iroh authenticated, never by the device
-identity the peer claims. Verification then rejects, in order: a selected version the client did not
+identity the peer claims. Before a client signs its proof it has already applied the checks that need
+no record: a selection that does not answer its offer, one that names another endpoint, an extension
+it did not offer and limits below the floor. Verification of the transcript then rejects, in order: a selected version the client did not
 offer, a capability the client did not offer, a negotiated limit above what the client offered to
 receive, a selection that does not echo the client's nonce, a mismatched device identity, a stale
 key revision, a mismatched endpoint identity, a live endpoint that is not the paired one, and
@@ -302,8 +306,11 @@ confirmation) belongs to `kr-pairing`.
 Three host-wide bounds sit above the per-connection ones, because a per-connection budget resets
 when a peer reconnects and a host-wide one does not: at most 64 connections may be mid-handshake or
 unpaired at once, unauthorised connections are admitted at most 32 in a burst and one every 250 ms
-after that, and an unauthorised connection has 60 seconds to finish. The deadline covers the
-unauthorised phase only; an authorised session lasts as long as its peer keeps it. Every request is
+after that, and an unauthorised connection has 60 seconds to finish its handshake. A connection
+admitted unpaired has a further 60 seconds for its pairing exchange, and holds its admission slot
+throughout, so it can occupy one for up to two minutes. The deadlines cover the unauthorised phase
+only; an authorised session lasts as long as its peer keeps it, and gives its slot back when it is
+authorised. Every request is
 charged against the connection's budget, refused or not, and a connection that spends the whole
 budget is answered once and then ended.
 
@@ -437,8 +444,11 @@ clamped to this build's own codec maxima, which is how a later version raises a 
 breaking this one. Below the send-queue floor a connection could still carry smaller frames; what it
 could never carry is the full chunk size a transfer needs, which is why the floor is there.
 
-The same check is applied to a host's or client's own configured budget when it starts, so limits
-that could never carry a transfer are refused at registration rather than at the first attachment.
+A host's or client's own send budget is checked when it starts: it needs at least one bulk stream, a
+send queue of at least the `max_send_queue_bytes` floor, and a bulk share that holds one complete
+attachment frame and leaves the control reserve intact, so a budget that could never carry a
+transfer is refused at registration rather than at the first attachment. The floors on the three
+frame lengths and on outstanding mutations apply to the negotiated result only.
 
 ### Revocation
 
