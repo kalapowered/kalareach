@@ -100,7 +100,7 @@ pub fn enter_process_background() -> std::result::Result<ProcessClass, Refusal> 
 
 /// Reads the priority class, the I/O class and the memory priority the system holds for the
 /// calling process.
-#[cfg(windows)]
+#[cfg(all(windows, any(test, feature = "testing")))]
 #[must_use]
 pub fn process_class() -> Option<ProcessClass> {
     platform::process_class()
@@ -110,7 +110,7 @@ pub fn process_class() -> Option<ProcessClass> {
 /// `pid`, which a parent uses to check what its child reports of itself.
 ///
 /// Nothing when the process is not there or the system will not tell.
-#[cfg(windows)]
+#[cfg(all(windows, any(test, feature = "testing")))]
 #[must_use]
 pub fn process_class_of(pid: u32) -> Option<ProcessClass> {
     platform::process_class_of(pid)
@@ -122,13 +122,13 @@ pub fn process_class_of(pid: u32) -> Option<ProcessClass> {
 /// # Errors
 ///
 /// Returns why the system refused.
-#[cfg(windows)]
+#[cfg(all(windows, any(test, feature = "testing")))]
 pub fn leave_process_background(priority_class: u32) -> std::result::Result<(), Refusal> {
     platform::leave_process_background(priority_class)
 }
 
 /// Reads the priority class number of the calling process, for [`leave_process_background`].
-#[cfg(windows)]
+#[cfg(all(windows, any(test, feature = "testing")))]
 #[must_use]
 pub fn priority_class_number() -> u32 {
     platform::priority_class_number()
@@ -239,11 +239,10 @@ mod platform {
 
     use super::{IoClass, ProcessClass, Refusal};
     use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessIoPriority};
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::System::Threading::{
         GetCurrentProcess, GetPriorityClass, GetProcessInformation, IDLE_PRIORITY_CLASS,
-        MEMORY_PRIORITY_INFORMATION, OpenProcess, PROCESS_MODE_BACKGROUND_BEGIN,
-        PROCESS_MODE_BACKGROUND_END, PROCESS_QUERY_INFORMATION, ProcessMemoryPriority,
+        MEMORY_PRIORITY_INFORMATION, PROCESS_MODE_BACKGROUND_BEGIN, ProcessMemoryPriority,
         SetPriorityClass,
     };
 
@@ -286,17 +285,24 @@ mod platform {
         class_of(unsafe { GetCurrentProcess() })
     }
 
+    #[cfg(any(test, feature = "testing"))]
     pub(super) fn process_class_of(pid: u32) -> Option<ProcessClass> {
         // SAFETY: the call takes a process identifier and an access mask and returns a handle or
         // null; it reads no memory of this process.
-        let handle = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid) };
+        let handle = unsafe {
+            windows_sys::Win32::System::Threading::OpenProcess(
+                windows_sys::Win32::System::Threading::PROCESS_QUERY_INFORMATION,
+                0,
+                pid,
+            )
+        };
         if handle.is_null() {
             return None;
         }
         let class = class_of(handle);
         // SAFETY: the handle was opened above and is closed once, here.
         unsafe {
-            CloseHandle(handle);
+            windows_sys::Win32::Foundation::CloseHandle(handle);
         }
         class
     }
@@ -340,11 +346,17 @@ mod platform {
         })
     }
 
+    #[cfg(any(test, feature = "testing"))]
     pub(super) fn leave_process_background(
         priority_class: u32,
     ) -> std::result::Result<(), Refusal> {
         // SAFETY: as in `enter_process_background`.
-        let ended = unsafe { SetPriorityClass(GetCurrentProcess(), PROCESS_MODE_BACKGROUND_END) };
+        let ended = unsafe {
+            SetPriorityClass(
+                GetCurrentProcess(),
+                windows_sys::Win32::System::Threading::PROCESS_MODE_BACKGROUND_END,
+            )
+        };
         if ended == 0 {
             return Err("this host refused to end the background mode");
         }
@@ -356,6 +368,7 @@ mod platform {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "testing"))]
     pub(super) fn priority_class_number() -> u32 {
         // SAFETY: the call takes the pseudo-handle of the calling process and reads no memory of
         // this process.
