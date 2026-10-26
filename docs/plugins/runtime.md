@@ -510,9 +510,9 @@ runtime, and the daemon answers the same way for a worker of either release.
   the machine or a crash.
 - When none runs, which is the case after the host's crash and when a worker first needs a runtime
   after an update, the daemon starts the `kr-plugin-host` beside it, as a job of its own. It needs
-  no release store, so a host on Windows, and a tree that is not installed in one, start a host in
-  the same way. A host takes no hold on its release: after the store retires a release, a host that
-  was started from it runs on from its open program.
+  no release store, so a tree that is not installed in one starts a host in the same way. A host
+  takes no hold on its release: after the store retires a release, a host that was started from it
+  runs on from its open program.
 - A host that survives an update or a rollback serves the sessions of both releases until it ends,
   so a change to the plugin host (a fix, its engine, its bounds or its component interface) reaches
   the sessions of the other release only after that.
