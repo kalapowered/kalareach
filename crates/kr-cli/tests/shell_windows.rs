@@ -46,6 +46,10 @@ use windows_session::{Created, LIVENESS_DEADLINE, Prepared, WorkerHost, WorkerTe
 /// The switch that says a case may write the account's PowerShell profiles.
 const PROFILE_SWITCH: &str = "KR_ALLOW_PROFILE_WRITE";
 
+/// The switch that says a case may sign the account that runs it out, which is for an account that
+/// is disposable.
+const SIGN_OUT_SWITCH: &str = "KR_ALLOW_SIGN_OUT";
+
 /// Why these cases are ignored in an ordinary run.
 macro_rules! writes_profiles {
     () => {
@@ -1373,7 +1377,10 @@ async fn hold_a_registration_and_end_the_host() -> Attempt {
     loop {
         let reports = reported_fresh(&controller).await;
         match reports.as_deref() {
-            Some([report]) if is_registering(report) => break,
+            Some([report]) if is_registering(report) => {
+                eprintln!("the worker reports the registration as sent: {report:?}");
+                break;
+            }
             Some([report]) if report.state == ComponentState::Registered => {
                 return Attempt::Missed(
                     "the registration was answered before a report of it outstanding was read"
@@ -1405,7 +1412,12 @@ async fn hold_a_registration_and_end_the_host() -> Attempt {
         if let Some(reports) = reported_fresh(&controller).await {
             match reports.as_slice() {
                 [report] if is_registering(report) => {
-                    if ticks(&world.terminal) > mark + 20 {
+                    let shown = ticks(&world.terminal);
+                    if shown > mark + 20 {
+                        eprintln!(
+                            "the host is held still, the worker still reports the registration \
+                             as sent ({report:?}), and the terminal was sent lines {mark} to {shown}"
+                        );
                         break;
                     }
                 }
@@ -1437,6 +1449,11 @@ async fn hold_a_registration_and_end_the_host() -> Attempt {
         kr_ipc::identity::ProcessState::Running,
         "the worker ended with the plugin host"
     );
+    eprintln!(
+        "the host {} ended with the registration outstanding; the worker {} is running",
+        host.pid.get(),
+        worker.pid.get()
+    );
     let after_the_end = ticks(&world.terminal);
     watched_until(
         &mut world.terminal,
@@ -1453,6 +1470,10 @@ async fn hold_a_registration_and_end_the_host() -> Attempt {
             .filter(|started| *started != host)
     })
     .await;
+    eprintln!(
+        "the daemon started a replacement plugin host, process {}",
+        replacement.pid.get()
+    );
     let waiting = tokio::time::Instant::now();
     loop {
         world.terminal.watch(Duration::from_millis(50)).await;
@@ -1460,6 +1481,7 @@ async fn hold_a_registration_and_end_the_host() -> Attempt {
         if reports.as_deref().is_some_and(
             |reports| matches!(reports, [report] if report.state == ComponentState::Registered),
         ) {
+            eprintln!("the binding is registered with the replacement: {reports:?}");
             break;
         }
         assert!(
@@ -1489,6 +1511,11 @@ async fn hold_a_registration_and_end_the_host() -> Attempt {
         |terminal| ticks(terminal) > after_the_recovery + 20,
     )
     .await;
+    eprintln!(
+        "the worker {} runs, and the terminal was sent lines {after_the_recovery} to {}",
+        worker.pid.get(),
+        ticks(&world.terminal)
+    );
     Attempt::Held
 }
 
@@ -1591,10 +1618,24 @@ fn assert_the_entry_is_as_documented(exported: &str) {
 /// process.
 ///
 /// The case is run by a run that signs the account in again afterwards, as a temporary standard
-/// account, and runs the case that follows.
+/// account, and runs the case that follows. It signs out the account that runs it, so it runs only
+/// where `KR_ALLOW_SIGN_OUT=1` says that account is disposable, and never for an account in the
+/// Administrators group.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = writes_profiles!()]
 async fn with_a_plugin_host_running_the_session_is_set_up_and_the_account_signed_out() {
+    // Before anything is started: a run of every case in this file at once, or a run as an account
+    // whose session others depend on, must not end that session.
+    assert!(
+        std::env::var(SIGN_OUT_SWITCH).is_ok_and(|value| value == "1"),
+        "this case signs the account that runs it out; set {SIGN_OUT_SWITCH}=1 where that account \
+         is disposable"
+    );
+    assert!(
+        !standing().iter().any(|line| line.contains("S-1-5-32-544")),
+        "this case signs its account out, and an account in the Administrators group is not one to \
+         sign out"
+    );
     let component = well_behaved();
     let mut world = Running::start(&component).await;
     let environment = world.environment.clone();
@@ -1803,6 +1844,12 @@ fn after_a_sign_out_nothing_the_session_started_is_left_and_the_startup_entry_st
         "the sign-out left these running: {}",
         left.join(", ")
     );
+    for entry in record["processes"].as_array().expect("processes") {
+        eprintln!(
+            "after the sign-out: {} is ended",
+            entry["what"].as_str().expect("a name")
+        );
+    }
 
     // This is another login session, and the product has started nothing in it.
     let before = u32::try_from(record["session"].as_u64().expect("a session")).expect("a session");
@@ -1812,6 +1859,10 @@ fn after_a_sign_out_nothing_the_session_started_is_left_and_the_startup_entry_st
         product_programs_in(now),
         Vec::<String>::new(),
         "the product started programs in login session {now} at the sign-in"
+    );
+    eprintln!(
+        "after the sign-out: login session {now}, not login session {before}, runs no program of the \
+         product"
     );
 
     // The entry is still registered, exactly as it was.
@@ -1823,6 +1874,7 @@ fn after_a_sign_out_nothing_the_session_started_is_left_and_the_startup_entry_st
         "the entry changed with the sign-out"
     );
     assert_the_entry_is_as_documented(&exported);
+    eprintln!("after the sign-out: the entry {name} is registered, as it was and as documented");
 
     // What the first half left in the account's temporary directory goes, the entry with it.
     let removed = Command::new(system32("schtasks.exe"))

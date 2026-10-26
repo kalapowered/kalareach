@@ -2006,7 +2006,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
             "with_a_plugin_host_running_the_session_is_set_up_and_the_account_signed_out",
         ],
         runs: Runs::ByHand {
-            why: "they write the account's PowerShell profiles and put them back, so they run on the Windows test machine under a run that records and restores the profiles; the case that signs the account out is followed by the case that reads what is left, in the account's next sign-in",
+            why: "they write the account's PowerShell profiles and put them back, so they run on the Windows test machine under a run that records and restores the profiles; the case that signs the account out runs only where KR_ALLOW_SIGN_OUT=1 says the account is disposable, and is followed by the case that reads what is left, in the account's next sign-in",
         },
     },
     IgnoredRun {
