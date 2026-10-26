@@ -687,6 +687,10 @@ daemon running or a way to start one.
 `install` takes the identifiers of the platform it runs on and an application that is installed. A
 dry run shows what would be written and writes nothing.
 
+Ptyxis 50 starts a profile's command through `systemd-run --user --scope` when `systemd-run` is
+installed. Where no user systemd session answers, such as a session bus of its own with no systemd
+behind it, Ptyxis does not run the command, whatever the profile holds.
+
 `status` writes nothing. For each application of the platform it says whether the application is
 installed and what state its profile is in: `none` (no profile written), `matches` (written and
 unchanged), `changed` (altered after `kr` wrote it), `missing` (the profile `kr` wrote is gone),
