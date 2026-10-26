@@ -12,9 +12,10 @@ import org.junit.Test
 import org.junit.rules.TemporaryFolder
 
 /**
- * KR-REQ-16.15: what the receiver has put in front of the person when a preview is being opened. The
- * opening is native code in a process the system may end, so the alert goes up first and a preview
- * that opens replaces it.
+ * What the receiver has put in front of the person when a preview is being opened. The opening is
+ * native code in a process the system may end, so the alert goes up first and a preview that opens
+ * replaces it. These cases run the receiver's decisions on a JVM; the cases that run the receiver
+ * and the scheduler in the application's own process, with no screen of it, are instrumented.
  */
 class DeliveryShownTest {
     @get:Rule val folder = TemporaryFolder()

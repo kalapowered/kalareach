@@ -2246,6 +2246,14 @@ pub const LANES: &[Lane] = &[
         reason: "the iOS application's unit tests run in the macOS report, with Xcode",
         reads: Some(Tests::Xcode),
     },
+    // The Android push receiver's instrumented cases. No gate builds or runs them: the script
+    // `scripts/e2e-push-android-receiver.sh` runs them by hand on the emulator, so the report reads
+    // their keys and shows no result for them.
+    Lane {
+        files: "apps/companion/native/android/android/src/androidTest/kotlin/to/kala/reach/companion/push/PushReceiverInstrumentedTest.kt",
+        reason: "no gate builds or runs the Android push receiver's instrumented cases: `scripts/e2e-push-android-receiver.sh` runs them on the emulator",
+        reads: None,
+    },
     Lane {
         files: "apps/companion/e2e/**",
         reason: "Playwright over the built interface: `pnpm --dir apps/companion run e2e` runs it, in the landing workflow's companion job",
