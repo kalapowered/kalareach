@@ -444,11 +444,10 @@ async fn a_skewed_host_is_refused_new_leases_keeps_its_working_route_and_gets_ne
     assert_eq!(rig.requests_for(&other), 0);
 
     // The paired device's connection is as before.
-    let served_to_the_device = session
+    let doctor: HostDoctorResult = session
         .read(Method::HostDoctor, &())
         .await
         .expect("the device is still served");
-    let doctor: HostDoctorResult = served_to_the_device.to_typed().expect("a doctor");
     assert!(!doctor.checks.is_empty());
 
     // A revision that lists the build opens the gate again.
