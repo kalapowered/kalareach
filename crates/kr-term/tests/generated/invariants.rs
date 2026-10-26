@@ -488,6 +488,15 @@ pub fn read_split_changes_nothing(whole: &Seen, split: &Seen, how: u64) -> Vec<V
     found
 }
 
+/// Invariants 5 and 7 of a run read in pieces: it shows what the same run read at once shows, and
+/// the engine ends it on ground, with the grid library silent and the lane inside its bound, as
+/// it ends the run read at once.
+pub fn a_read_in_pieces_holds(whole: &Seen, split: &Seen, how: u64) -> Vec<Violation> {
+    let mut found = read_split_changes_nothing(whole, split, how);
+    found.extend(the_engine_is_in_its_bounds(split));
+    found
+}
+
 /// The length of the empty tmux envelope at the start of `bytes`, if one is there: an envelope
 /// whose payload, with its doubled escapes undone, is nothing or only empty envelopes within the
 /// nesting bound, so that it makes no event.
@@ -710,7 +719,7 @@ pub fn check_stream(stream: &Stream, size: GridSize) -> (Vec<Violation>, Framed)
             continue;
         }
         let split = observe::feed_in(bytes, &cuts(stream.seed, bytes.len(), how), size);
-        found.extend(read_split_changes_nothing(&whole, &split, how));
+        found.extend(a_read_in_pieces_holds(&whole, &split, how));
     }
     (found, framed)
 }

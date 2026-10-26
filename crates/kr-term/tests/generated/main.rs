@@ -15,9 +15,9 @@ mod observe;
 
 use generator::{End, Family, Mark, Shape, Stream, Tag, cuts, flood, oversized};
 use invariants::{
-    Framed, Invariant, Violation, a_flood_is_bounded_and_forwards_only_its_text, check_stream,
-    events_cover_the_stream, forwarded_set_is_safe, nothing_past_the_bound_acts,
-    read_split_changes_nothing, the_engine_is_in_its_bounds,
+    Framed, Invariant, Violation, a_flood_is_bounded_and_forwards_only_its_text,
+    a_read_in_pieces_holds, check_stream, events_cover_the_stream, forwarded_set_is_safe,
+    nothing_past_the_bound_acts, the_engine_is_in_its_bounds,
 };
 use kr_term::budget::GridSize;
 use observe::{SIZES, feed_in, feed_whole, lex};
@@ -127,7 +127,7 @@ fn nothing_past_the_bound_of_a_control_string_acts() {
                         continue;
                     }
                     let split = feed_in(bytes, &cuts(seed, bytes.len(), how), size);
-                    found.extend(read_split_changes_nothing(&whole, &split, how));
+                    found.extend(a_read_in_pieces_holds(&whole, &split, how));
                     found.extend(nothing_past_the_bound_acts(&case, &split));
                 }
                 if !found.is_empty() {
@@ -473,4 +473,33 @@ fn the_scan_passes_a_question_mark_that_is_only_text() {
         &invariants::forward_is_safe_for_a_terminal(b"ok\x1b]10;?\x07"),
         &[Invariant::ByteSafety],
     );
+}
+
+/// KR-ACC-024: the bounds a run keeps hold of a run read in pieces as they hold of one read at once.
+/// A run that ends off ground, with the grid library having written, or with the lane past its
+/// bound is named however the read was cut; the engine's own run of the stream passes.
+#[test]
+fn the_checks_name_a_run_read_in_pieces_that_ends_outside_its_bounds() {
+    let size = size_of(SIZES[0]);
+    let input: &[u8] = b"ok\x1b[6nmore\x1b]2;a title\x07";
+    let whole = feed_whole(input, size);
+    for how in 1..generator::SPLITS {
+        let split = feed_in(input, &cuts(1, input.len(), how), size);
+        assert!(
+            a_read_in_pieces_holds(&whole, &split, how).is_empty(),
+            "the engine's own run read in pieces of kind {how} passes"
+        );
+        let mut off_ground = split.clone();
+        off_ground.ground = false;
+        let mut written = split.clone();
+        written.grid_writes = 1;
+        let mut flooded = split;
+        flooded.queue_peak = observe::QUEUE_BOUND + 1;
+        for planted in [off_ground, written, flooded] {
+            names(
+                &a_read_in_pieces_holds(&whole, &planted, how),
+                &[Invariant::Bounds],
+            );
+        }
+    }
 }
