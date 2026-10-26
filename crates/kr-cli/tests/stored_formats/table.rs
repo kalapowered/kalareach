@@ -571,6 +571,41 @@ pub fn table() -> Vec<Store> {
                 &["Recorded", "RecordedEntry"],
             )],
         },
+        // The terminal profiles an install wrote, which a removal works from.
+        Store {
+            levels: None,
+            writers: Writers::Barred(
+                &kr_shell_integration::host::terminal_profile::record::PROFILE_WRITTEN,
+            ),
+            entry: entry(
+                kr_shell_integration::host::terminal_profile::record::PROFILE_WRITTEN.store,
+                StoreScope::StateRoot,
+                "terminal-profiles.json",
+                member("version", 0),
+                kr_shell_integration::host::terminal_profile::record::PROFILE_WRITTEN.version,
+                0,
+            ),
+            owned: Vec::new(),
+            kept: vec![
+                Kept::Source(
+                    "crates/kr-shell-integration/src/host/terminal_profile/record.rs",
+                    &[
+                        "Recorded",
+                        "RecordedProfile",
+                        "Wrote",
+                        "FileWrote",
+                        "SettingsWrote",
+                        "RecordedKey",
+                        "RecordedList",
+                        "PreferencesWrote",
+                    ],
+                ),
+                Kept::Source(
+                    "crates/kr-shell-integration/src/host/terminal_profile/mod.rs",
+                    &["ProfileTerminal"],
+                ),
+            ],
+        },
         // The environment's own state directory.
         Store {
             levels: None,
@@ -1495,6 +1530,11 @@ pub fn named() -> Vec<Named> {
             StoreScope::StateRoot,
             ".shell-entries.json.kalareach-lock",
             "the lock `kr shell install` and `kr shell remove` hold on the record of the startup files they changed; empty",
+        ),
+        leaf(
+            StoreScope::StateRoot,
+            ".terminal-profiles.json.kalareach-lock",
+            "the lock `kr host terminal-profile install` and `kr host terminal-profile remove` hold on the record of the terminal profiles they wrote; empty",
         ),
         leaf(
             StoreScope::Environment,
