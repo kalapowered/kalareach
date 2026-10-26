@@ -63,16 +63,30 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Read before the arguments are moved into the command: whether a failure holds the window.
+    let hold =
+        !json && matches!(&cli.command, Command::New(arguments) if arguments.hold_on_failure);
     match runtime.block_on(run(cli)) {
         Ok(Completion::Done) => ExitCode::SUCCESS,
+        // A session that ended because its shell exited is how the person ended it; its status is
+        // the command's, and a window is not held open for it.
+        Ok(Completion::Ended(error)) => ExitCode::from(error.exit_code()),
         // The command has already written its own result, which named the failure. Printing a
         // second document here would give a reader two to reconcile.
-        Ok(Completion::Reported(error)) => ExitCode::from(error.exit_code()),
+        Ok(Completion::Reported(error)) => {
+            if hold {
+                runtime.block_on(kr_cli::hold::for_a_key());
+            }
+            ExitCode::from(error.exit_code())
+        }
         Err(error) => {
             if json {
                 output::document(&report::failure(&error));
             } else {
                 report::failed(&error);
+            }
+            if hold {
+                runtime.block_on(kr_cli::hold::for_a_key());
             }
             ExitCode::from(error.exit_code())
         }
@@ -1588,9 +1602,19 @@ fn creation_report(
     }
     match (presentation_error, outcome) {
         (Some(error), _) => Completion::Reported(error),
-        (None, Some(outcome)) => outcome
-            .into_error()
-            .map_or(Completion::Done, Completion::Reported),
+        (None, Some(outcome)) => {
+            // The shell's own exit, with any status, is how the person ended the session.
+            let by_its_shell = outcome.closure().is_some_and(|record| {
+                matches!(record.reason, kr_protocol::session::ClosureReason::RootExit)
+            });
+            outcome.into_error().map_or(Completion::Done, |error| {
+                if by_its_shell {
+                    Completion::Ended(error)
+                } else {
+                    Completion::Reported(error)
+                }
+            })
+        }
         (None, None) => Completion::Done,
     }
 }
