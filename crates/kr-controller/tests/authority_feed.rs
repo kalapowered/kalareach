@@ -1132,7 +1132,8 @@ async fn a_policy_found_restored_waits_for_the_person_at_the_machine_after_the_h
 
 /// KR-REQ-24.15: the finding is on disk before anything is carried out again, so a pass that stops
 /// part way, and a restart that cannot reach the feed, still find the restored policy waiting. The
-/// registry here cannot take the write the carrying out begins with, so the pass stops there.
+/// registry here cannot take the revocation of the device the restore brought back, which is the
+/// first thing the pass carries out, so the pass stops there with the registry still behind its feed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_finding_is_written_down_before_anything_is_carried_out_again() {
     let (
@@ -1148,8 +1149,8 @@ async fn the_finding_is_written_down_before_anything_is_carried_out_again() {
             rusqlite::Connection::open(tree.environment().registry_database())
                 .expect("the registry opens")
                 .execute_batch(
-                    "CREATE TRIGGER refuse_revision BEFORE UPDATE OF authority_revision
-                         ON environment BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+                    "CREATE TRIGGER refuse_revocation BEFORE UPDATE OF revoked_at_ms
+                         ON network_devices BEGIN SELECT RAISE(ABORT, 'no room'); END;",
                 )
                 .expect("the fault is in place");
         })
