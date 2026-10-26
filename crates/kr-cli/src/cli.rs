@@ -1330,6 +1330,9 @@ pub enum HostCommand {
     ShellMode(ShellModeArguments),
     /// Show the terminal applications this host has, and which one a new window opens in.
     Terminal(TerminalArguments),
+    /// Show, add or take out the optional profile that makes each new window or tab of one
+    /// terminal application a session of its own.
+    TerminalProfile(TerminalProfileArguments),
     /// Show or choose how `kr new` starts this environment's control daemon when none is running.
     Startup(StartupArguments),
     /// Show what session descriptions offer on this host, turn them on or off, and fetch or stop
@@ -1560,6 +1563,55 @@ pub struct TerminalArguments {
     /// Go back to letting this host choose for itself.
     #[arg(long, conflicts_with = "set")]
     pub clear: bool,
+}
+
+/// `kr host terminal-profile`.
+///
+/// A profile named `KalaReach` in one terminal application's own profile mechanism, whose command
+/// is `kr new --attach --hold-on-failure`. It is offered apart from the startup entry `kr shell
+/// install` writes, the headless host `kr host startup` chooses and the desktop host's login item:
+/// installing one never installs another. A terminal application's own profiles stay as they are
+/// and the profile is not made its default.
+#[derive(Args)]
+pub struct TerminalProfileArguments {
+    /// What to do.
+    #[command(subcommand)]
+    pub command: TerminalProfileCommand,
+}
+
+/// One `kr host terminal-profile` step.
+#[derive(Subcommand)]
+pub enum TerminalProfileCommand {
+    /// Show, for each terminal application this platform has a profile for, whether it is
+    /// installed and whether the profile is, and what a window opened through it needs to find
+    /// ready. Nothing is written.
+    Status,
+    /// Write the KalaReach profile into one terminal application.
+    Install(TerminalProfileInstall),
+    /// Take out the profiles this command wrote, and only what it wrote.
+    Remove(TerminalProfileRemove),
+}
+
+/// `kr host terminal-profile install`.
+#[derive(Args)]
+pub struct TerminalProfileInstall {
+    /// The terminal application, by the identifier `kr host terminal` prints for it, or
+    /// `ptyxis`.
+    pub terminal: String,
+    /// Show what would be written and write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// `kr host terminal-profile remove`.
+#[derive(Args)]
+pub struct TerminalProfileRemove {
+    /// The terminal application whose profile is taken out. Without it, every profile this
+    /// command wrote.
+    pub terminal: Option<String>,
+    /// Show what would be taken out and take out nothing.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 /// `kr host power`.

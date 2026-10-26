@@ -210,6 +210,16 @@ fn an_ordinary_installation_is_removed() {
     std::fs::write(&zshrc, THEIRS).expect("the person's own startup file");
     setup.kr(&["shell", "install", "--shell", "zsh"], None);
     assert!(holds_an_entry(&zshrc));
+    // The startup entry is offered apart from the terminal profile: installing it writes no
+    // profile and no record of one.
+    assert!(
+        !setup.state.join("terminal-profiles.json").exists(),
+        "a startup entry install records no terminal profile"
+    );
+    assert!(
+        !setup.home.join(".local/share/konsole").exists(),
+        "and writes no profile for a terminal application"
+    );
     let said = setup.kr(&["shell", "remove", "--shell", "zsh"], None);
     assert!(said.contains("removed"), "{said}");
     assert_eq!(std::fs::read_to_string(&zshrc).expect("reads"), THEIRS);
