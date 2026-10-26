@@ -812,8 +812,10 @@ function and not the editor's operation. And the module moves its decision to a 
 key when it promotes the change, which is the first end-of-file decision at the prompt the change
 names or the next prompt's entry, whichever comes first, and not when it reports the change: until
 then the new key has no decision on it, and the press of the old key that promotes the change runs
-what the new key held, or `DeleteCharOrExit` where it held nothing, in place of the old key's own
-binding.
+what the new key held in place of the old key's own binding. Where a key held nothing, the module
+runs `SelfInsert` for a printable key and `DeleteCharOrExit` for any other key, and the press that
+promotes a disabled gesture runs `DeleteCharOrExit` for the same reason: the promotion has already
+cleared what was saved.
 
 What it pins is a range rather than a release: PowerShell 7.4 or later with PSReadLine 2.3.4 up to
 3.0. The module declares the versions it found in its handshake and the worker refuses an editor
