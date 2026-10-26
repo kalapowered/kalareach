@@ -6926,14 +6926,25 @@ terminal ends it first where it can, and otherwise the confirmation comes first.
 command. When it lapses the host refuses remote access under a personal grant until it next
 synchronises, and the bound stays. The call is refused while the host knows it is behind its feed,
 with or without a wait standing. While a wait stands it is also refused on a host that reads a feed
-until a pass of this run has read the feed through, compared its revision with the registry's, caught
-up when the registry was behind and carried out again what the feed shows completed. Until then the
-registry is the restored one, and a device an owner revoked through the feed after the copy is live
-in it; a confirmation would end the refusal that holds it back. The refusal says so, the doctor's
-`restored-policy` check says it until a pass has read the feed, and the host asks again by itself.
+until a scan of this run has read the feed through and carried out, or settled, every record it holds:
+what the feed shows complete, what it shows pending or leaves unacknowledged, which the scan puts off
+while the host is behind and carries out after the catch-up, and what is held behind a request the
+host cannot yet judge. Until then the registry is the restored one, and a device an owner revoked
+through the feed after the copy is live in it; a confirmation would end the refusal that holds it
+back. The refusal says so, the doctor's `restored-policy` check says it until the scan is done, and
+the host asks its feed again by itself. Where the scan is held behind the request of a device whose
+standing the host cannot decide because the clock lost its continuity, the refusal and the doctor name
+the device. A reboot of the machine ends the lost continuity, and revoking the device at the machine
+refuses its request; either lets the next scan finish. Establishing the clock does not, because an
+owner device's confirmation is refused while the wait stands.
 A host that cannot reach its feed is confirmed by taking `authority.origin` out of the configuration
-document and starting the daemon again; a host whose feed removed it reads no more and is confirmed
-at once. The host keeps no record of the call: asked again after a lost reply it answers that it lifted nothing. The
+document and starting the daemon again. The cost is that the host reads no feed then: it serves every
+device an owner revoked through the feed since the copy until the person has revoked it at the machine,
+and learns no remote revocation while it reads none, so the person revokes those devices at the machine
+first. A host whose feed removed it reads no more and is confirmed at once, at the same cost: a
+revocation an owner published there that the host had not applied is gone. A pass that found the registry
+behind the feed and stopped before the catch-up leaves that refusal up, and a feed that then removes the
+host ends it, since no pass will, and the wait takes its place. The host keeps no record of the call: asked again after a lost reply it answers that it lifted nothing. The
 call is asked again under the record's lock for the registration and the deadline it was accepted
 under, because it can wait there behind a finding. No owner
 device can make it, since the wait refuses every owner device, and a ceremony would need a new

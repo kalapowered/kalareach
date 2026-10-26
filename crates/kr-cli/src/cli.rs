@@ -1353,9 +1353,12 @@ pub struct PolicyArguments {
     /// wait refuses, or the terminal's when no owner device is left whose grant could confirm, so
     /// it comes after this command unless the terminal can end it. A host that is exclusively
     /// organisation-managed cannot withdraw its last enrolment until exclusive management has
-    /// ended. A host that reads an authority feed refuses the confirmation until a pass since it
-    /// started has read the feed and carried out again what it shows completed; run the command
-    /// again once `kr doctor` no longer says so.
+    /// ended. A host that reads an authority feed refuses the confirmation until a scan of this run
+    /// has read the feed through and carried out, or settled, every record it holds; run the
+    /// command again once `kr doctor` no longer says so. A host that cannot reach its feed is
+    /// confirmed by taking `authority.origin` out of the configuration document and starting the
+    /// daemon again, but it then serves every device an owner revoked through the feed since the
+    /// copy until you have revoked it at this machine: revoke those first.
     #[arg(long, required = true)]
     pub confirm: bool,
     /// The environment.

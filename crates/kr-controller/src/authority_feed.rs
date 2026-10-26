@@ -191,6 +191,10 @@ struct Observed {
     /// and that a withdrawal this host cannot verify names: revoking one of them refuses its
     /// request.
     waiting_named: Vec<DeviceId>,
+    /// The devices that made the requests a scan that read the feed through held records behind,
+    /// because this host could not yet decide who may manage it. The records wait for a scan that
+    /// can, so the comparison with the feed is not done until one has.
+    held_behind: Option<Vec<DeviceId>>,
 }
 
 /// What the carrier shares with the daemon.
@@ -218,10 +222,12 @@ struct Shared {
     #[cfg(feature = "testing")]
     wakes: AtomicU64,
     removed: AtomicBool,
-    /// Whether a pass of this run has read the feed through, compared its revision with the
-    /// registry's, caught up when the registry was behind and carried out again what the feed shows
-    /// completed. Held in memory only: a start begins without it.
-    compared: AtomicBool,
+    /// Whether a scan of this run has read the feed through since the registry was last found
+    /// behind it, and has carried out, or settled, every record the feed holds: what it shows
+    /// completed, and what it did not show completed that was put off while the host was behind or
+    /// held behind a request it could not judge. Held in memory only: a start begins without it,
+    /// and a finding that the registry is behind the feed clears it.
+    comparison_done: AtomicBool,
     /// The highest sequence of the feed up to which everything is settled, where a scan starts.
     settled_through: AtomicU64,
     /// Where a scan that stopped at the page limit goes on, or 0 when none is under way.
@@ -244,6 +250,19 @@ impl Shared {
     fn observed(&self) -> std::sync::MutexGuard<'_, Observed> {
         self.observed.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// What the comparison of the registry with the feed still waits for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ComparisonOwed {
+    /// No scan of this run has read the feed through, carried out what it shows and settled every
+    /// record, since the host started or found the registry behind the feed.
+    AScanThrough,
+    /// A scan read the feed through, but the records behind the requests of these devices are not
+    /// carried out: this host cannot yet decide who may manage it, so it cannot judge them. A
+    /// later scan can, once the clock is decided, or once the person at this machine has revoked
+    /// the devices, which refuses their requests.
+    RequestsItCannotJudge(Vec<DeviceId>),
 }
 
 /// The carrier of the host's authority feed.
@@ -295,7 +314,7 @@ impl FeedRuntime {
                 #[cfg(feature = "testing")]
                 wakes: AtomicU64::new(0),
                 removed: AtomicBool::new(false),
-                compared: AtomicBool::new(false),
+                comparison_done: AtomicBool::new(false),
                 settled_through: AtomicU64::new(0),
                 scan_cursor: AtomicU64::new(0),
                 scan_unfinished: AtomicBool::new(false),
@@ -317,13 +336,27 @@ impl FeedRuntime {
         self.shared.removed.store(true, Ordering::SeqCst);
     }
 
-    /// Whether this host has nothing left to learn from its feed in this run: a pass has read it
-    /// through, compared its revision with the registry's and carried out again what it shows
-    /// completed, or the feed removed this host and is read no more. A host that has not cannot
-    /// tell whether the registry it started on is behind the feed.
+    /// Whether this host has nothing left to learn from its feed in this run: a scan has read it
+    /// through, compared its revision with the registry's and carried out, or settled, every record
+    /// it holds, or the feed removed this host and is read no more. A host that has not cannot tell
+    /// whether the registry it started on still holds live a device an owner revoked through the
+    /// feed.
     #[must_use]
     pub fn has_compared_in_this_run(&self) -> bool {
-        self.shared.compared.load(Ordering::SeqCst) || self.shared.removed.load(Ordering::SeqCst)
+        self.shared.comparison_done.load(Ordering::SeqCst)
+            || self.shared.removed.load(Ordering::SeqCst)
+    }
+
+    /// What the comparison with the feed still waits for, none when it is done.
+    #[must_use]
+    pub fn what_the_comparison_waits_for(&self) -> Option<ComparisonOwed> {
+        if self.has_compared_in_this_run() {
+            return None;
+        }
+        Some(match self.shared.observed().held_behind.clone() {
+            Some(devices) => ComparisonOwed::RequestsItCannotJudge(devices),
+            None => ComparisonOwed::AScanThrough,
+        })
     }
 
     /// The origin this carrier reads.
@@ -968,6 +1001,12 @@ async fn pass(
                 }
             };
             shared.observed().catching_up = behind;
+            if behind {
+                // The registry is behind the feed: nothing compared before this is the comparison
+                // of the registry as it stands now, and the records the feed holds are carried out
+                // again by the scan that follows the catch-up.
+                shared.comparison_done.store(false, Ordering::SeqCst);
+            }
         }
         for record in &state.records {
             // A request is judged by its issuer's standing, and judgment stays in the order the feed
@@ -1120,14 +1159,18 @@ async fn pass(
             // issued. This scan is no synchronisation: a connection that waits for one waits for
             // that scan, and so is not served before those requests are carried out.
             if put_off {
-                shared.compared.store(true, Ordering::SeqCst);
                 return Ok(Pass::More);
             }
         }
-        // The feed is read through, the registry is level with it, and what it shows completed has
-        // been carried out again: the policy this host holds is no longer one it cannot place.
-        shared.compared.store(true, Ordering::SeqCst);
-        if let Some(Undecided { refusal, .. }) = undecided {
+        if let Some(Undecided {
+            refusal,
+            requesters,
+            ..
+        }) = undecided
+        {
+            // The records held behind these requests are not carried out, so the comparison with
+            // the feed is not done until a scan can judge them.
+            shared.observed().held_behind = Some(requesters.iter().copied().collect());
             // The refusal and the catch-up are done, and what the feed shows complete is carried
             // out again, but for what waits. A pass that could not judge a request is no
             // synchronisation: nothing is shown as read, no key is added to the owners' list, and
@@ -1145,8 +1188,19 @@ async fn pass(
             return removed(shared, controller).await;
         }
     }
+    // The feed is read through, the registry is level with it, and every record it holds is carried
+    // out or settled: a revocation still pending in the workers is carried out, and a withdrawal
+    // this host cannot verify raises the refusal that its own wait keeps up. Nothing was put off
+    // while the host was behind, and nothing is held behind a request it could not judge.
+    {
+        let mut observed = shared.observed();
+        observed.held_behind = None;
+        observed.stopped = None;
+    }
+    if !put_off {
+        shared.comparison_done.store(true, Ordering::SeqCst);
+    }
     controller.authority_feed_synchronised();
-    shared.observed().stopped = None;
     Ok(if unfinished {
         Pass::Unfinished
     } else {
@@ -1166,12 +1220,20 @@ async fn removed(
         .await
         .map_err(Stopped::local)?;
     shared.removed.store(true, Ordering::SeqCst);
+    // A pass that found the registry behind the feed and stopped before the catch-up leaves that
+    // refusal up, and no pass will end it now. The wait for the policy found restored refuses the
+    // same grants, so it takes the refusal's place, and the person at this machine ends it.
+    let caught_up = controller.end_a_catch_up_that_a_removed_feed_leaves().await;
     // The refusal a withdrawal this host cannot verify puts on remote grants may outlive the
     // removal. A feed that is read no more leaves no request waiting for the clock.
     let unverified = !controller.unverified_withdrawals().is_empty();
     let mut observed = shared.observed();
     observed.unverified = unverified;
     observed.waiting_named.clear();
+    observed.held_behind = None;
+    if caught_up {
+        observed.catching_up = false;
+    }
     Ok(Pass::Removed)
 }
 

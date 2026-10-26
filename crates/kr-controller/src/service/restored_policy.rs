@@ -15,47 +15,108 @@ use kr_protocol::organisation::HostPolicyConfirmResult;
 
 use super::Controller;
 use crate::authority::AdmittedMutation;
+use crate::authority_feed::ComparisonOwed;
 use crate::error::{ControllerError, Result};
 use crate::grants::RemoteRefusal;
 use crate::grants::restored::{self, Found, Kept};
 
+/// What a host that reads an authority feed owes a confirmation, said once for both remedies.
+macro_rules! feed_note {
+    () => {
+        "A host that reads an authority feed refuses the confirmation until a scan of this run has \
+         read the feed through and carried out, or settled, every record it holds, so that a \
+         device an owner revoked through the feed since the copy is not served by a confirmation \
+         made earlier; this check says when that is still owed, and the host asks its feed again \
+         by itself. Where the request of a device waits for this host to decide who may manage \
+         it, reboot the machine, which ends a lost continuity of the clock, or revoke that device \
+         at this machine with `kr device revoke`, which refuses its request. A host that cannot \
+         reach its feed is confirmed by taking `authority.origin` out of the configuration \
+         document and starting the daemon again, at this cost: the host then reads no feed, so it \
+         serves every device an owner revoked through the feed since the copy until the person \
+         has revoked it at this machine, and learns no remote revocation while it reads none; \
+         revoke those devices at this machine first. "
+    };
+}
+
+/// The owner's other ways to end a restored policy's refusals, said once for both remedies.
+macro_rules! exclusive_note {
+    () => {
+        "Ending exclusive organisation management takes an owner device's confirmation, which \
+         this wait refuses, or the terminal's when no owner device is left whose grant could \
+         confirm, which the wait does not change. A host that is exclusively \
+         organisation-managed cannot withdraw its last enrolment until exclusive management has \
+         ended, so on such a host end it first where the terminal can, and otherwise confirm \
+         first."
+    };
+}
+
 /// What a person who finds the host refusing remote access for a restored policy does.
-const WAITS_REMEDY: &str = "Read what this host holds with `kr organisation list`, and end what \
-     you do not want in force with `kr organisation withdraw`, `kr device revoke` and `kr share \
-     revoke`, which need no confirmation and work while this stands. Then run `kr host policy \
-     --confirm` at this machine. Until then no remote device is served, owner devices \
-     included, and the person at this machine is not refused. The policy is the restored one: \
-     confirming changes none of it. A host that reads an authority feed refuses the \
-     confirmation until a pass since it started has read the feed and compared it with the \
-     registry, which carries out again what the feed shows completed, so that a device an \
-     owner revoked through the feed after the copy is not served by a confirmation made \
-     earlier; this check says when that is still owed, and asks again by itself. A host that \
-     cannot reach its feed is confirmed by taking `authority.origin` out of the configuration \
-     document and starting the daemon again. Ending exclusive organisation management takes an \
-     owner device's confirmation, which this wait refuses, or the terminal's when no owner \
-     device is left whose grant could confirm, which the wait does not change. A host that is \
-     exclusively organisation-managed cannot withdraw its last enrolment until exclusive \
-     management has ended, so on such a host end it first where the terminal can, and \
-     otherwise confirm first.";
+const WAITS_REMEDY: &str = concat!(
+    "Read what this host holds with `kr organisation list`, and end what you do not want in \
+     force with `kr organisation withdraw`, `kr device revoke` and `kr share revoke`, which need \
+     no confirmation and work while this stands. Then run `kr host policy --confirm` at this \
+     machine. Until then no remote device is served, owner devices included, and the person at \
+     this machine is not refused. The policy is the restored one: confirming changes none of it. ",
+    feed_note!(),
+    exclusive_note!()
+);
 
 /// As [`WAITS_REMEDY`], for a record of the restore that cannot be read.
-const UNREADABLE_REMEDY: &str = "Read what this host holds with `kr organisation list`, and end \
-     what you do not want in force with `kr organisation withdraw`, `kr device revoke` and `kr \
-     share revoke`, which need no confirmation and work while this stands. Then run `kr host \
-     policy --confirm` at this machine, which removes the record that cannot be read. Until \
-     then no remote device is served, owner devices included, and `kr host update` to a \
-     release that lists the record's store is refused when the update check cannot read the \
-     record either. A host that reads an authority feed refuses the confirmation until a pass \
-     since it started has read the feed and compared it with the registry, which carries out \
-     again what the feed shows completed, so that a device an owner revoked through the feed \
-     after the copy is not served by a confirmation made earlier; this check says when that is \
-     still owed, and asks again by itself. A host that cannot reach its feed is confirmed by \
-     taking `authority.origin` out of the configuration document and starting the daemon \
-     again. Ending exclusive organisation management takes an owner device's confirmation, \
-     which this wait refuses, or the terminal's when no owner device is left whose grant could \
-     confirm, which the wait does not change. A host that is exclusively organisation-managed \
-     cannot withdraw its last enrolment until exclusive management has ended, so on such a \
-     host end it first where the terminal can, and otherwise confirm first.";
+const UNREADABLE_REMEDY: &str = concat!(
+    "Read what this host holds with `kr organisation list`, and end what you do not want in \
+     force with `kr organisation withdraw`, `kr device revoke` and `kr share revoke`, which need \
+     no confirmation and work while this stands. Then run `kr host policy --confirm` at this \
+     machine, which removes the record that cannot be read. Until then no remote device is \
+     served, owner devices included, and `kr host update` to a release that lists the record's \
+     store is refused when the update check cannot read the record either. ",
+    feed_note!(),
+    exclusive_note!()
+);
+
+/// How many devices a refusal or the doctor names.
+const MOST_NAMED: usize = 8;
+
+/// The words of the refusal of a confirmation while the comparison with the feed is owed.
+fn the_refusal_while_the_feed_is_owed(owed: &ComparisonOwed) -> String {
+    let cost = "taking `authority.origin` out of the configuration document and starting the \
+                daemon again confirms a host that cannot reach its feed, at this cost: the host \
+                then reads no feed, so it serves every device an owner revoked through the feed \
+                since the copy until the person has revoked it at this machine with `kr device \
+                revoke`, and it learns no remote revocation while it reads none; revoke those \
+                devices first";
+    match owed {
+        ComparisonOwed::AScanThrough => format!(
+            "this host reads an authority feed, and no scan of this run has read it through and \
+             carried out what it holds, so a device an owner revoked through the feed since the \
+             copy may be live in the registry and would be served once the wait ends; ask again \
+             when `kr doctor` no longer says that a confirmation is refused until a scan has, for \
+             the host asks its feed again by itself; {cost}"
+        ),
+        ComparisonOwed::RequestsItCannotJudge(devices) => {
+            let named = devices
+                .iter()
+                .take(MOST_NAMED)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let more = devices.len().saturating_sub(MOST_NAMED);
+            let more = if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            };
+            format!(
+                "this host has read its authority feed through, but the records behind the \
+                 request of device {named}{more} are not carried out: this host cannot yet decide \
+                 who may manage it, so it cannot judge the request, and a device an owner revoked \
+                 through the feed since the copy may be live in the registry and would be served \
+                 once the wait ends; reboot the machine, which ends a lost continuity of the clock \
+                 so that the host judges the request again, or revoke the device at this machine \
+                 with `kr device revoke`, which refuses its request; {cost}"
+            )
+        }
+    }
+}
 
 impl Controller {
     /// What a start does about the record of a restore: reads it, decides whether the host waits,
@@ -195,12 +256,12 @@ impl Controller {
     /// # Errors
     ///
     /// Returns a refusal while the host is still catching up with its feed, since the policy is
-    /// not yet the one it will hold, and while a host that reads a feed has had no pass in this run
-    /// that read it through and compared it with the registry: a registry restored from an earlier
-    /// state serves the devices an owner revoked through the feed after the copy until a pass
-    /// carries that out again, and a confirmation would end the refusal that holds them back. It
-    /// returns the way the admission lapsed when it did, and an error when the record cannot be
-    /// removed: the wait stands then.
+    /// not yet the one it will hold, and while a host that reads a feed has had no scan in this run
+    /// that read it through and carried out, or settled, every record it holds: a registry
+    /// restored from an earlier state serves the devices an owner revoked through the feed after
+    /// the copy until a scan carries that out again, and a confirmation would end the refusal that
+    /// holds them back. It returns the way the admission lapsed when it did, and an error when the
+    /// record cannot be removed: the wait stands then.
     pub(super) async fn confirm_the_restored_policy(
         &self,
         carried: AdmittedMutation,
@@ -216,17 +277,9 @@ impl Controller {
                 });
             } else if !self.policy().restored_policy_waits() {
                 false
-            } else if self.owes_a_comparison_with_its_feed() {
+            } else if let Some(owed) = self.comparison_owed() {
                 return Err(ControllerError::PermissionDenied {
-                    detail: "this host reads an authority feed and has not yet read it in this \
-                             run, so it cannot tell whether the policy it holds is behind what \
-                             the feed shows, and a device an owner revoked through the feed \
-                             after the copy would be served again; ask again once `kr doctor` \
-                             no longer says that a confirmation is refused until a pass has read \
-                             the feed, or, for a host that cannot reach its feed, take \
-                             `authority.origin` out of the configuration document and start the \
-                             daemon again"
-                        .to_owned(),
+                    detail: the_refusal_while_the_feed_is_owed(&owed),
                 });
             } else {
                 {
@@ -254,11 +307,30 @@ impl Controller {
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
     }
 
-    /// Whether this host reads an authority feed that no pass of this run has read through and
-    /// compared with the registry, and that has not removed it.
-    fn owes_a_comparison_with_its_feed(&self) -> bool {
+    /// What the comparison of the registry with this host's authority feed still waits for, none
+    /// when the host reads no feed, the feed removed it, or a scan of this run has done it.
+    fn comparison_owed(&self) -> Option<ComparisonOwed> {
         self.feed_runtime()
-            .is_some_and(|feed| !feed.has_compared_in_this_run())
+            .and_then(|feed| feed.what_the_comparison_waits_for())
+    }
+
+    /// A feed that removed this host is read no more, so a pass that found the registry behind it
+    /// and stopped before the catch-up leaves that refusal up for good. The wait for the policy
+    /// found restored refuses the same grants and is ended by the person at this machine, so it
+    /// takes the refusal's place. Says whether it did.
+    pub(crate) async fn end_a_catch_up_that_a_removed_feed_leaves(&self) -> bool {
+        let _kept = self.restored_policy.lock().await;
+        if !(self.policy().behind_its_feed() && self.policy().restored_policy_waits()) {
+            return false;
+        }
+        self.move_a_feed_refusal(
+            RemoteRefusal::BEHIND_ITS_FEED,
+            false,
+            crate::grants::HostPolicy::behind_its_feed,
+            crate::grants::HostPolicy::set_behind_its_feed,
+        )
+        .await;
+        true
     }
 
     /// What the doctor says of a restored policy that waits for the person at this machine, none
@@ -297,12 +369,23 @@ impl Controller {
         if unreadable {
             detail = detail.stated("; the record of the restore cannot be read");
         }
-        if self.owes_a_comparison_with_its_feed() {
-            detail = detail.stated(
-                "; a confirmation is refused until a pass has read this host's authority feed in \
-                 this run, and none has yet",
-            );
-        }
+        detail = match self.comparison_owed() {
+            None => detail,
+            Some(ComparisonOwed::AScanThrough) => detail.stated(
+                "; a confirmation is refused until a scan of this run has read this host's \
+                 authority feed through and carried out what it holds, and none has yet",
+            ),
+            Some(ComparisonOwed::RequestsItCannotJudge(devices)) => {
+                devices.iter().take(MOST_NAMED).fold(
+                    detail.stated(
+                        "; a scan of this run has read the feed through, but the records behind \
+                         the request of each of these devices wait for this host to decide who \
+                         may manage it, and a confirmation is refused until they are carried out",
+                    ),
+                    |detail, device| detail.stated("; device ").identifier(device),
+                )
+            }
+        };
         Some(DoctorCheck::new(
             "restored-policy",
             "The policy this host holds was not found restored",

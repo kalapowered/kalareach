@@ -1292,8 +1292,8 @@ async fn a_confirmation_is_refused_until_a_pass_of_this_run_has_read_the_feed() 
         .expect_err("a confirmation before the host has read its feed in this run is refused");
     assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
     assert!(
-        refused.message.contains("authority feed"),
-        "and says why: {refused:?}"
+        refused.message.contains("authority.origin"),
+        "and says why, and how a host that cannot reach its feed is confirmed: {refused:?}"
     );
     assert!(
         matches!(rig.the_record(), Found::Record(_)),
@@ -1304,7 +1304,7 @@ async fn a_confirmation_is_refused_until_a_pass_of_this_run_has_read_the_feed() 
         .await
         .expect("the doctor says the policy waits");
     assert!(
-        check.detail().contains("until a pass has read"),
+        check.detail().contains("and none has yet"),
         "and says the confirmation is held for the feed: {}",
         check.detail()
     );
@@ -1352,9 +1352,13 @@ async fn a_confirmation_is_not_held_for_a_feed_that_removed_the_host() {
             .expect("a record");
         })
         .await;
+    let refused = rig
+        .the_owner_tries_to_confirm()
+        .await
+        .expect_err("the host has not read its feed in this run");
     assert!(
-        rig.the_owner_tries_to_confirm().await.is_err(),
-        "the host has not read its feed in this run"
+        refused.message.contains("authority.origin"),
+        "refused for the comparison it owes, and not for catching up: {refused:?}"
     );
     rig.remote
         .remove(rig.feed())
@@ -1371,6 +1375,180 @@ async fn a_confirmation_is_not_held_for_a_feed_that_removed_the_host() {
         rig.the_owner_confirms().await.lifted,
         "a feed that removed the host is read no more, so there is nothing to wait for"
     );
+}
+
+/// KR-REQ-24.15: a revocation that the feed shows pending and not complete, which this host carried
+/// out after the copy the registry was put back to, is put off while the host is behind its feed
+/// and carried out by the scan that follows the catch-up. The confirmation is refused until that
+/// scan has read the feed through: else it ends the wait while the device is live in the registry
+/// as restored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_confirmation_is_refused_until_a_pending_revocation_is_carried_out_again() {
+    let rig = Rig::start().await;
+    let target = rig.pairs(&[ActionRight::SessionView]).await;
+    let kept = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.until_the_carrier_is_idle().await;
+    // The owner revoked `target` through the feed, and an earlier run of the host carried it out
+    // under revision 1 with a worker still to confirm, so the feed shows it pending. The registry
+    // that runs now never saw it, and stands behind the feed.
+    let request = rig.signed_by(&rig.owner.authorisation, 0xa1, devices(target.1.device_id));
+    rig.published_as(&rig.owner.authorisation, &request).await;
+    rig.an_earlier_run_acknowledged(
+        &request,
+        0,
+        1,
+        RevocationCompletion::Pending {
+            pending_workers: U64::new(1),
+        },
+    )
+    .await;
+
+    // The first scan finds the host behind, writes the finding, puts the pending request off and
+    // catches up. The scan that follows reads the feed, and the feed holds that read open.
+    let reads = rig.arrivals("read");
+    rig.served
+        .web()
+        .fail_with_member(AUTHORITY, "read", 2, Moment::Hold);
+    let rig = rig.restarted(false, |_| {}).await;
+    rig.until_arrivals("read", reads + 2).await;
+    assert!(matches!(rig.the_record(), Found::Record(_)));
+    assert!(
+        !rig.runtime().has_compared_in_this_run(),
+        "the request was put off, and the scan that carries it out has not read the feed through"
+    );
+    let refused = rig
+        .the_owner_tries_to_confirm()
+        .await
+        .expect_err("the device is live in the registry, and the wait holds it back");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(
+        refused.message.contains("authority.origin"),
+        "refused for the comparison it owes: {refused:?}"
+    );
+
+    // The read ends without an answer, and a later scan carries the request out.
+    rig.served.web().release_held();
+    within("a scan reads the feed through", async {
+        while !rig.runtime().has_compared_in_this_run() {
+            rig.poll().await;
+        }
+    })
+    .await;
+    assert!(rig.the_owner_confirms().await.lifted);
+    rig.connects_while_a_revocation_is_held(&target.0, &target.1)
+        .await;
+    rig.serves(&kept.0, &kept.1)
+        .await
+        .expect("the device nothing revoked is served");
+}
+
+/// KR-REQ-24.15: a withdrawal the feed shows complete that is held behind a request the host cannot
+/// judge yet is not carried out, so the comparison with the feed is not done: the confirmation is
+/// refused, and names the device whose request waits. Once the clock is decided the scan carries
+/// the request out and then the withdrawal, and the confirmation ends the wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_confirmation_is_refused_while_a_withdrawal_is_held_behind_a_request_the_host_cannot_judge()
+ {
+    let Undecidable {
+        rig,
+        issuer,
+        target,
+        ..
+    } = a_request_whose_issuer_the_host_cannot_decide(&[Then::TheOwnersWithdrawalOfTheIssuer], 0)
+        .await;
+    // A later run starts on the record of an earlier finding, and its clock is not proven.
+    let rig = rig
+        .restarted(false, |tree| {
+            restored::write(
+                &restored::file_beside(&tree.environment().registry_database()),
+                &restored::Record::of(
+                    kr_protocol::scalars::Digest256::from_bytes([1; 32]),
+                    TimestampMs::new(1),
+                ),
+            )
+            .expect("a record");
+            let _ = std::fs::remove_file(tree.environment().utc_floor_file());
+        })
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    assert!(
+        !rig.has_revoked(issuer.1.device_id).await,
+        "the withdrawal of the issuer waits behind the issuer's request"
+    );
+    let refused = rig
+        .the_owner_tries_to_confirm()
+        .await
+        .expect_err("the withdrawal is not carried out, and the wait holds the device back");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(
+        refused.message.contains(&issuer.1.device_id.to_string()),
+        "and names the device whose request waits: {refused:?}"
+    );
+    let check = rig
+        .the_restored_policy_check()
+        .await
+        .expect("the doctor says the policy waits");
+    assert!(
+        check.detail().contains(&issuer.1.device_id.to_string()),
+        "the doctor names it too: {}",
+        check.detail()
+    );
+
+    rig.host.controller().utc_floor().establish_continuity();
+    rig.poll().await;
+    assert!(rig.has_revoked(target.1.device_id).await);
+    assert!(
+        rig.has_revoked(issuer.1.device_id).await,
+        "the scan that can judge the request carries it out, and then the withdrawal"
+    );
+    assert!(rig.the_owner_confirms().await.lifted);
+}
+
+/// KR-REQ-24.15: a pass that found the registry behind the feed and stopped before the catch-up
+/// leaves the refusal for being behind up, and a feed that then removes the host is read no more,
+/// so nothing ends it. The wait for the restored policy takes its place and the person at this
+/// machine ends it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_feed_that_removes_the_host_before_the_catch_up_leaves_the_confirmation_open() {
+    let (Restorable { rig, earlier, .. }, earlier_mirror) = a_policy_the_registry_will_lose().await;
+    let rig = rig
+        .restarted(false, |tree| {
+            put_the_registry_back(tree, &earlier);
+            put_the_mirror_back(tree, &earlier_mirror);
+            rusqlite::Connection::open(tree.environment().registry_database())
+                .expect("the registry opens")
+                .execute_batch(
+                    "CREATE TRIGGER refuse_revocation BEFORE UPDATE OF revoked_at_ms
+                         ON network_devices BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+                )
+                .expect("the fault is in place");
+        })
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    let refused = rig
+        .the_owner_tries_to_confirm()
+        .await
+        .expect_err("the host is still catching up");
+    assert!(
+        refused.message.contains("catching up"),
+        "refused for the catch-up it cannot finish: {refused:?}"
+    );
+
+    rig.remote
+        .remove(rig.feed())
+        .await
+        .expect("a key the host named removes the feed");
+    within("a pass finds the feed removed the host", async {
+        while !rig.runtime().has_compared_in_this_run() {
+            rig.poll().await;
+        }
+    })
+    .await;
+    assert!(
+        rig.the_owner_confirms().await.lifted,
+        "a feed that removed the host is read no more, so no catch-up can end"
+    );
+    assert_eq!(rig.the_record(), Found::Missing);
 }
 
 /// KR-REQ-24.15: a host that cannot write the record of a restore does not carry anything out or
@@ -2977,6 +3155,19 @@ impl Rig {
         previous: u64,
         number: u64,
     ) {
+        self.an_earlier_run_acknowledged(request, previous, number, RevocationCompletion::Complete)
+            .await;
+    }
+
+    /// As [`Self::an_earlier_run_carried_out`], with the request acknowledged as `completion`
+    /// says: a revocation whose barrier did not hold for every worker is shown pending.
+    async fn an_earlier_run_acknowledged(
+        &self,
+        request: &RevocationRequest,
+        previous: u64,
+        number: u64,
+        completion: RevocationCompletion,
+    ) {
         let gateway = GatewayOrigin::new(self.served.origin()).expect("an origin");
         let http: Arc<dyn ServiceHttp> = Arc::new(
             HttpService::with(
@@ -3016,7 +3207,7 @@ impl Rig {
                     request_id: request.request_id,
                     host_device_id: self.host_device(),
                     authority_revision: AuthorityRevision::new(number),
-                    completion: RevocationCompletion::Complete,
+                    completion,
                     acknowledged_at_ms: TimestampMs::new(kr_ipc::now_ms().get()),
                 },
                 None,
