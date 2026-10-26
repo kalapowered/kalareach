@@ -1175,12 +1175,13 @@ async fn a_stop_that_needs_a_person_is_not_asked_again_by_every_connection() {
     rig.fixture.pass_wall(Duration::from_millis(5 * MINUTE_MS));
     rig.waits.passes();
     rig.down_because("not a member").await;
+    rig.holds_the_application_back().await;
     let requests = rig.lease_requests();
 
     let mut said = Vec::new();
     for _ in 0..3 {
         let refused = rig
-            .dials()
+            .visits()
             .await
             .expect_err("a device the organisation removed gets no connection");
         said.push(refused.to_string());
@@ -1202,7 +1203,7 @@ async fn a_stop_that_needs_a_person_is_not_asked_again_by_every_connection() {
     // took the member back.
     rig.signing.admits(ACCOUNT);
     rig.waits.time_passes(Duration::from_secs(5 * 60 + 1));
-    rig.dials().await.expect("the member is a member again");
+    rig.visits().await.expect("the member is a member again");
     assert!(rig.lease_requests() > requests, "the service was asked");
 }
 
