@@ -212,7 +212,9 @@ source, and it applies to the sessions created afterwards.
 create, attach, detach, close, transfer and terminal presentation. It does **not** claim managed
 empty-prompt Ctrl-D, fenced `shell.launch` or authoritative editor-buffer observation.
 
-`managed` launches a KalaReach-qualified shell package, and claims all three. A shell no installed
+`managed` launches a KalaReach-qualified shell package, and claims all three, except that the
+PowerShell package on Windows reports no end-of-file gesture and so claims no empty-prompt Ctrl-D
+(`kr detach --attachment <id>` detaches there). A shell no installed
 package qualifies returns `SHELL_INTEGRATION_UNSUPPORTED` naming that shell; `native_compat` is
 never substituted for it.
 
