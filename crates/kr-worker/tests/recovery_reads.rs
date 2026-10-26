@@ -1413,23 +1413,28 @@ async fn kr_req_13_11_a_device_that_cannot_see_the_screen_is_told_neither_the_ed
         session_id: host.session_id,
     };
 
-    let blind: ShellLaunchSurfaceResult = forwarded(
-        &mut daemon,
-        Some(without_the_live_screen(3_000)),
-        Method::ShellLaunchSurface,
-        &params,
-    )
-    .await
-    .expect("the read is answered")
-    .to_typed()
-    .expect("decodes");
-    assert_eq!(
-        blind.editor,
-        LaunchEditor::Unverified {
-            reason: LaunchUnverified::NotShown
-        }
-    );
-    assert_eq!(blind.input, LaunchInput::Withheld);
+    // A grant that reaches retained output from a time on, or from the beginning, and not the
+    // live screen, is told neither.
+    for lower_bound_ms in [3_000, 0] {
+        let blind: ShellLaunchSurfaceResult = forwarded(
+            &mut daemon,
+            Some(without_the_live_screen(lower_bound_ms)),
+            Method::ShellLaunchSurface,
+            &params,
+        )
+        .await
+        .expect("the read is answered")
+        .to_typed()
+        .expect("decodes");
+        assert_eq!(
+            blind.editor,
+            LaunchEditor::Unverified {
+                reason: LaunchUnverified::NotShown
+            },
+            "a grant from {lower_bound_ms} ms without the live screen"
+        );
+        assert_eq!(blind.input, LaunchInput::Withheld);
+    }
 
     let seeing: ShellLaunchSurfaceResult = forwarded(
         &mut daemon,
