@@ -408,6 +408,17 @@ that synthesises inode numbers would refuse one that should have been made. Two 
 do not prove the numbers are stable, so a filesystem that happens to answer alike twice can still
 produce a refusal the contents check would not have made.
 
+`kr host terminal-profile install` adds a terminal application's profile, and it is a separate offer
+from these entries. The profile's command is `kr new --attach --hold-on-failure`: it makes each
+window or tab a session of its own and writes no startup file and no `exec kr` line, so nothing in
+the person's shell startup changes and a shell started outside the profile is not affected. A
+managed session created through the profile is still refused under `SHELL_INTEGRATION_UNSUPPORTED`
+when the shell has no entry that opens the bridge, as described above, and `kr shell install` is
+what adds it. `kr host terminal-profile status` shows whether the entry of the person's shell is
+installed. `kr shell install` and `kr shell remove` read and write `shell-entries.json` alone and
+never touch a profile, and the profile's own record is `terminal-profiles.json` in the same state
+directory.
+
 ## The command hooks
 
 Two of the integration's hooks ask the session rather than the fence machine, and the session
