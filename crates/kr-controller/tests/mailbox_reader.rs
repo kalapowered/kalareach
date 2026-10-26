@@ -527,6 +527,10 @@ async fn an_announcement_in_the_hosts_mailbox_has_the_feed_read_at_once() {
 /// An announcement is a nudge beside a change that is the record: one the service will not place
 /// because it outlives the service's hour is declined and reported, and the change it came with
 /// stands in the host's feed.
+///
+/// KR-REQ-10.46, the part about a revocation record not sharing the mailbox's expiry: the request
+/// is in the host's feed though its announcement was declined, the feed says the mailbox declined
+/// it, and nothing was placed in the host's mailbox.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_announcement_the_service_will_not_place_costs_the_change_nothing() {
     let rig = Rig::start().await;
