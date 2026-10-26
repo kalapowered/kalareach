@@ -272,6 +272,8 @@ type RequestKey = (u64, RevocationRequestId);
 struct RunNames {
     /// Each target a request at or below the cutoff named, with those requests.
     named: std::collections::BTreeMap<Target, std::collections::BTreeSet<RequestKey>>,
+    /// The requests in `named`, so that settling one does not look through every target.
+    keys: std::collections::BTreeSet<RequestKey>,
     /// The requests a scan settled since the last finding, of those that named a target.
     settled: std::collections::BTreeSet<RequestKey>,
     /// The targets a write of this run added to the list.
@@ -284,12 +286,15 @@ impl RunNames {
         for target in targets {
             self.named.entry(*target).or_default().insert(key);
         }
+        if !targets.is_empty() {
+            self.keys.insert(key);
+        }
     }
 
     /// The request `key` is settled. Only a request that named a target is kept, so the run holds
     /// nothing for the requests of a host that waits for nothing.
     fn settle(&mut self, key: RequestKey) {
-        if self.named.values().any(|keys| keys.contains(&key)) {
+        if self.keys.contains(&key) {
             self.settled.insert(key);
         }
     }
@@ -316,9 +321,8 @@ impl RunNames {
             self.added.remove(target);
             self.named.remove(target);
         }
-        let named: std::collections::BTreeSet<RequestKey> =
-            self.named.values().flatten().copied().collect();
-        self.settled.retain(|key| named.contains(key));
+        self.keys = self.named.values().flatten().copied().collect();
+        self.settled.retain(|key| self.keys.contains(key));
     }
 }
 
@@ -476,12 +480,6 @@ async fn write_ahead(
             }
             run.name(key, &named);
             owing.add(record.sequence.get(), named);
-            // A request this run settled already is read again by every scan while a held one
-            // stands before it. Its targets are for the reconcile to clear and are not written
-            // ahead a second time.
-            if run.settled.contains(&key) {
-                owing.settle(record.sequence.get());
-            }
         }
         owing.unsettled_in_order()
     };
@@ -643,6 +641,12 @@ impl FeedRuntime {
     pub fn has_read_the_feed_through(&self) -> bool {
         self.shared.read_through.load(Ordering::SeqCst)
             || self.shared.removed.load(Ordering::SeqCst)
+    }
+
+    /// Whether the feed removed this host, so that no scan will ask it for more.
+    #[must_use]
+    pub fn is_read_no_more(&self) -> bool {
+        self.shared.removed.load(Ordering::SeqCst)
     }
 
     /// The devices and grants the scan in hand owes and has not yet written to the record, with
@@ -2172,15 +2176,20 @@ mod tests {
         // A target an earlier run wrote is not added by this one, and is never cleared.
         run.added.remove(&d1);
         assert_eq!(run.clearable(&[d1]), Vec::<Target>::new());
-        run.forget(&[d2]);
-        assert!(!run.named.contains_key(&d2) && !run.added.contains(&d2));
+        // A target that left the list leaves with the requests that only it named.
+        let d3 = target(3);
+        run.name((5, request(5)), &[d3]);
+        run.added.insert(d3);
+        run.settle((5, request(5)));
+        run.forget(&[d3]);
+        assert!(!run.named.contains_key(&d3) && !run.added.contains(&d3));
         assert!(
-            !run.settled.contains(&(2, request(2)))
-                || run
-                    .named
-                    .values()
-                    .flatten()
-                    .any(|key| *key == (2, request(2)))
+            !run.settled.contains(&(5, request(5))) && !run.keys.contains(&(5, request(5))),
+            "the run keeps nothing for a request no target names"
+        );
+        assert!(
+            run.settled.contains(&(2, request(2))),
+            "and keeps a settled request that another target still names"
         );
     }
 

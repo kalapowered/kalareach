@@ -6218,6 +6218,54 @@ async fn a_second_restore_brings_back_a_revoked_target_that_the_list_still_owes(
     assert!(rig.the_owner_confirms().await.lifted);
 }
 
+/// KR-REQ-24.15: a request the host carried out again after the restore does not take its target
+/// off the list either: the device is revoked now, but a registry put back again brings it back,
+/// and by then the feed may have dropped the request that revoked it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_the_host_revoked_after_a_restore_stays_owed_when_the_registry_is_put_back_again()
+{
+    let Restorable {
+        rig,
+        revoked,
+        earlier,
+        ..
+    } = a_revocation_the_registry_will_lose().await;
+    // The request `a_revocation_the_registry_will_lose` published, by its identifier.
+    let request_id = RevocationRequestId::new(kr_protocol::scalars::Uuid::from_bytes([0xb1; 16]));
+    let target = restored::Target::Device(revoked.1.device_id);
+
+    // The first restore: the host carries the request out again, so the device is revoked.
+    let rig = rig
+        .restarted(false, |tree| put_the_registry_back(tree, &earlier))
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    rig.until_the_carrier_is_idle().await;
+    assert!(
+        rig.has_revoked(revoked.1.device_id).await,
+        "the host carried the request out again"
+    );
+    assert!(
+        rig.what_the_record_lists().contains(&target),
+        "and the device it revoked stays on the list while the wait stands"
+    );
+
+    // The feed's retention ends the request, and the registry is put back again.
+    rig.served.web().the_feeds_drop(request_id);
+    rig.poll().await;
+    let rig = rig
+        .restarted(false, |tree| put_the_registry_back(tree, &earlier))
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    rig.until_the_carrier_is_idle().await;
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&revoked.1.device_id.to_string()),
+        "the device the second restore brought back is owed: {refused:?}"
+    );
+    rig.revokes_at_the_machine(revoked.1.device_id).await;
+    assert!(rig.the_owner_confirms().await.lifted);
+}
+
 /// KR-REQ-24.15: a record of the restore that cannot be read is not written over by a finding
 /// either: the registry is behind the feed, the host catches up, and the record stays what it was,
 /// so the doctor still says that it cannot be read and the confirmation removes it.
@@ -6862,7 +6910,15 @@ async fn a_list_at_the_cap_says_it_is_full() {
         refused.message.contains("is full"),
         "a list at its cap reads as full after a start: {refused:?}"
     );
-    for device in &listed {
+    // A host that reads no feed has nothing to make room for, so a revocation does not clear the
+    // warning: the target the cap kept out may be live.
+    rig.revokes_at_the_machine(listed[0]).await;
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains("is full"),
+        "and still does when one listed target is revoked: {refused:?}"
+    );
+    for device in &listed[1..] {
         rig.revokes_at_the_machine(*device).await;
     }
     assert!(

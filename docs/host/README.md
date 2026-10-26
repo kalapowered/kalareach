@@ -7087,25 +7087,29 @@ The record holds what the wait owes as a sorted list of devices and shares, each
 it, with a digest of the origin of the feed it came from. The host writes what a page of the feed
 names to the record before it acts on any record of the page, so a stop, an error, an abort of the
 carrier or the feed's removal part way through a scan keeps it. A write that fails stops the pass
-before the host acts on the page, and the next pass writes again. An entry leaves the list when a scan of the run that wrote it,
-having read the feed through, settled every request of that run that named it. It never leaves
-because a scan did not meet a request: a request the feed dropped after its retention leaves its
-entry where it was, even when a request left on the feed names the same target and is settled. It
-does not leave because its target was revoked either, since a registry put back again brings the
-target back, after the request that owed it may be gone; it yields its place only when the list is
-full. An entry an earlier run wrote is not cleared by a scan, because nothing in the record says
-which request wrote it, and a request the feed has since dropped may have. The wait ends with the
+before the host acts on the page, and the next pass writes again. An entry leaves the list when a
+scan of the run that wrote it, having read the feed through, settled every request of that run that
+named it and the target is live. It never leaves because a scan did not meet a request: a request
+the feed dropped after its retention leaves its entry where it was, even when a request left on the
+feed names the same target and is settled. It does not leave because its target was revoked
+either, by the person or by the host carrying a request out, since a registry put back again
+brings the target back, after the request that owed it may be gone; such an entry yields its place
+only when the list is full. An entry an earlier run wrote is not cleared by a scan, because
+nothing in the record says which request wrote it, and a request the feed has since dropped may
+have. The wait ends with the
 confirmation, which removes the record. A scan of another feed clears only entries of its own
 origin, so pointing the host at a feed that holds nothing for it clears nothing. A device is live
 while the registry holds it unrevoked, and a share is live while an unrevoked device holds it as its
 pairing grant or the grant store holds it unrevoked. A registry that cannot be read shows every
 target live. The list can hold a target whose request the host then dismissed on evidence, until the
 scan of the run that wrote the entry reads the feed through and clears it, or, when a stop came
-first, until the person revokes the target. It holds at most 512 live entries, and the file at most 64 KiB. An entry whose
-target the person has revoked does not count toward the 512: it gives its place to a new one. With 512 live entries the host
-keeps what it holds and adds by the lowest sequence, the scan does not count as read through, and the
-refusal says that the list is full; revoking some lets the next scan find the others. After a restart, a list
-with 512 live entries reads as full.
+first, until the wait ends; it holds the confirmation back only while the target is live. The list
+holds at most 512 entries, and the file at most 64 KiB. For a host that reads its feed, an entry
+whose target is not live does not count toward the 512: it gives its place to a new one. When 512
+entries are live and a request names one more live target, the host keeps what it holds and adds
+by the lowest sequence, the scan does not count as read through, and the refusal says that the list
+is full; revoking some lets the next scan find the others. A host that reads no feed, or whose feed
+removed it, reads a list of 512 entries as full, whichever of them are live.
 
 Each finding restarts the scan at the first record: the registry found behind the feed, put back
 again while the host runs, or found behind the feed again after a confirmation, whether or not the
@@ -7148,7 +7152,7 @@ with or without a wait standing. While a wait stands it is also refused while a 
 the list of what the wait owes, or one that the scan in hand has met and not yet written, is live in
 the registry. The refusal names up to eight of them, a share as a share, counts the rest, and says
 when the list is full. The host reads liveness as the call runs, so `kr device revoke` and
-`kr share revoke` at the machine clear an entry at once. A host that reads a feed also refuses until
+`kr share revoke` at the machine end an entry's hold on the confirmation at once. A host that reads a feed also refuses until
 a scan of this run has read the feed through and written what it owes: what the feed shows
 complete, what it shows pending or leaves unacknowledged, which the scan puts off while the host is
 behind and carries out after the catch-up, and what is held behind a request the host cannot yet
@@ -7203,15 +7207,16 @@ The list has limits of its own. A device the owner revoked at the machine after 
 the feed, so the host cannot know it: the person reads what the host holds with
 `kr organisation list` and revokes again what the restore brought back. A request the feed dropped
 before any scan of this host read it can be neither carried out nor owed, and one a scan read and
-wrote down stays owed after the feed drops it. An owner who publishes again a completed request the
+wrote down stays owed after the feed drops it, unless the host dismissed it on evidence while its
+target was live. An owner who publishes again a completed request the
 feed dropped after its retention, from a device the restored registry lacks, is refused as a request
 above the bound, and its target stays live at the lift: the person revokes the target at the
 machine, or publishes again from an owner device the registry holds. More than 512 owed targets, or
 a list write that failed or an abort before it followed by a restart with the feed removed or
 absent, leave the host knowing only what the record holds. A record that cannot be read has lost
 its list: no scan writes over it, the run's own memory of what it owes is checked at the
-confirmation, which removes the record, and the person compares `kr device list` and
-`kr share list` with what the feed's owners intended. A record that describes no policy row is
+confirmation, which removes the record (a restart before then forgets what the run learned), and
+the person compares `kr device list` and `kr share list` with what the feed's owners intended. A record that describes no policy row is
 removed at a start with its list. A second restore, or a rollback and an update again, within the
 week the feed keeps a refused record, after a wait ended in which the host refused a request it
 could not verify, has the feed's refusal read as a request the host never applied; inside one wait

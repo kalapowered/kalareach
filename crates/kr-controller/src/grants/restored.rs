@@ -29,8 +29,10 @@
 //! feed after the copy is not served again by the lift, whatever became of the scan that was to
 //! carry the request out: the list outlives a stop, a feed that removed the host and a start that
 //! reads no feed. It names the identifiers a request states, with a digest of the feed's origin,
-//! and is checked against the registry's own record of what is live when it is used. It holds at
-//! most [`MOST_OWED`] entries, and a list of exactly that length reads as full.
+//! and is checked against the registry's own record of what is live when it is used. An entry whose
+//! target is not live stays while the wait stands and gives its place to a live one when the list
+//! holds [`MOST_OWED`] entries; a host that reads no feed reads a list of exactly that length as
+//! full.
 //!
 //! An earlier release does not name this store, so it neither reads nor writes the file, and a host
 //! that goes back to it serves the restored row to remote devices as that release always did. The
@@ -75,9 +77,9 @@ pub struct Record {
     pub subject: Digest256,
     /// When the host first found the restore, in UTC milliseconds.
     pub found_at_ms: TimestampMs,
-    /// What the requests the authority feed holds name and the host has not settled: sorted, with
-    /// no entry twice, and at most [`MOST_OWED`] long. A confirmation is refused while a target in
-    /// it is live in the registry.
+    /// What the requests the authority feed holds name, until a scan dismisses them on evidence
+    /// while the target is live: sorted, with no entry twice, and at most [`MOST_OWED`] long. A
+    /// confirmation is refused while a target in it is live in the registry.
     pub owed: Vec<Owed>,
 }
 
@@ -129,8 +131,8 @@ pub struct Change<'a> {
     pub origin: Digest256,
     /// Targets to add, lowest feed sequence first.
     pub add: &'a [Target],
-    /// Targets of this origin to take out: each was named only by requests this scan settled on
-    /// evidence.
+    /// Targets of this origin to take out: each was named only by requests this scan settled. One
+    /// that is not live stays.
     pub clear: &'a [Target],
 }
 
@@ -145,13 +147,13 @@ pub struct Merged {
 
 /// The list `held` becomes under `change`.
 ///
-/// An entry leaves it when `change` clears it, and never because no request names it now (a request
-/// the feed dropped after its retention left its entry where it was) or because its target is not
-/// live now: a registry put back again brings a revoked target back, and the request that owed it
-/// may be gone by then. An entry whose target is not live yields its place to an added one when the
-/// list holds `most` entries. A target not live is not added, and one that cannot be shown not to be
-/// live is. The entries held stay, new ones are added in order until `most` entries are held, and
-/// the rest are left out and `full` is set.
+/// An entry leaves it when `change` clears it and its target is live, and never because no request
+/// names it now (a request the feed dropped after its retention left its entry where it was) or
+/// because its target is not live now, whoever revoked it: a registry put back again brings the
+/// target back, and the request that owed it may be gone by then. An entry whose target is not live
+/// yields its place to an added one when the list holds `most` entries. A target not live is not
+/// added, and one that cannot be shown not to be live is. The entries held stay, new ones are added
+/// in order until `most` entries are held, and the rest are left out and `full` is set.
 #[must_use]
 pub fn merged(
     held: &[Owed],
@@ -161,7 +163,11 @@ pub fn merged(
 ) -> Merged {
     let mut owed: BTreeSet<Owed> = held
         .iter()
-        .filter(|entry| !(entry.origin == change.origin && change.clear.contains(&entry.target)))
+        .filter(|entry| {
+            !(entry.origin == change.origin
+                && change.clear.contains(&entry.target)
+                && live(&entry.target))
+        })
         .copied()
         .collect();
     let mut full = false;
@@ -1022,6 +1028,28 @@ mod tests {
              request names now stays too"
         );
         assert!(!merged.full);
+    }
+
+    #[test]
+    fn a_clear_takes_out_an_entry_only_while_its_target_is_live() {
+        let origin = Digest256::from_bytes([1; 32]);
+        let held = vec![entry(1, device(1)), entry(1, device(2))];
+        let merged = merged(
+            &held,
+            &Change {
+                origin,
+                add: &[],
+                clear: &[device(1), device(2)],
+            },
+            MOST_OWED,
+            |target| *target != device(2),
+        );
+        assert_eq!(
+            merged.owed,
+            vec![entry(1, device(2))],
+            "device 2 was revoked, so a registry put back again can bring it back when the request \
+             that owed it is gone"
+        );
     }
 
     #[test]

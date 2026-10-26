@@ -359,10 +359,11 @@ impl Controller {
     }
 
     /// Changes the list of what the wait owes: adds the targets of `origin`'s requests that `add`
-    /// names and takes out those `clear` names, in one write through the durable gate. An entry
-    /// whose target is no longer live stays, since a registry put back again can bring the target
-    /// back, and yields its place only when the list is full. The record's lock is taken here, so a write and a
-    /// confirmation wait for each other, and nothing is written once no wait stands.
+    /// names and takes out those `clear` names whose targets are live, in one write through the
+    /// durable gate. An entry whose target is no longer live stays, since a registry put back again
+    /// can bring the target back, and yields its place only when the list is full. The record's
+    /// lock is taken here, so a write and a confirmation wait for each other, and nothing is
+    /// written once no wait stands.
     ///
     /// # Errors
     ///
@@ -533,6 +534,12 @@ impl Controller {
         let (in_memory, full_in_memory) = self
             .feed_runtime()
             .map_or((Vec::new(), false), |feed| feed.what_the_scan_owes());
+        // A host that reads its feed asks it again once room is made, so an entry whose target is
+        // not live does not count toward the cap. A host that reads none has nothing to make room
+        // for, and a list of the cap's length may have kept a target out.
+        let reads_a_feed = self
+            .feed_runtime()
+            .is_some_and(|feed| !feed.is_read_no_more());
         let live = self.target_liveness();
         let mut targets: Vec<Target> = held
             .iter()
@@ -579,12 +586,14 @@ impl Controller {
             .collect();
         named.sort();
         named.dedup();
-        // An entry whose target is not live yields its place to a new one, so it does not count
-        // toward the cap.
-        let held_live = held.iter().filter(|entry| live(&entry.target)).count();
+        let held_count = if reads_a_feed {
+            held.iter().filter(|entry| live(&entry.target)).count()
+        } else {
+            held.len()
+        };
         Some(OwedNow {
             named,
-            full: full_in_memory || held_live >= most,
+            full: full_in_memory || held_count >= most,
             every_owner,
         })
     }
