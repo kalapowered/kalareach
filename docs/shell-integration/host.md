@@ -81,6 +81,10 @@ Section 7 separates authentication from qualification, and the difference decide
 | `degraded` | yes | no | no | no | consumed with the hint | no |
 | `terminal_only` | yes | no | no | no | the shell's own | no |
 
+The Ctrl-D column describes a key the bridge has a decision on. The PowerShell module has none on the
+Vi command table's Ctrl+d, which stays the editor's own whatever the phase (see
+[PSReadLine](README.md#psreadline) in the contract).
+
 A session is `authenticated` from the moment its bridge registers and `qualified` from the moment
 the integration reports its hooks live, which is after the user's startup files have run. The input
 column is enforced where input is accepted: an `unauthenticated` managed session refuses a client's
