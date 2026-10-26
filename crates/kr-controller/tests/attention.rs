@@ -4116,6 +4116,32 @@ mod session_work {
         }
     }
 
+    /// The conversation the stand-in's server makes first, and so the one every terminal of a case
+    /// is in.
+    const CONVERSATION: &str = "thread-1";
+
+    /// Waits until the worker's broker has let go of the conversation a terminal that has ended
+    /// was in.
+    ///
+    /// The broker sees a program end when it next looks at it. A terminal that starts in the
+    /// conversation before then is told that another execution still runs in it, so it is bound
+    /// to none and no turn it ends is reviewed.
+    async fn conversation_left(worker: &Worker) {
+        let deadline = Instant::now() + PATIENCE;
+        while worker
+            .service
+            .broker()
+            .conversation_owner(CONVERSATION)
+            .is_some()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the broker still holds the conversation of the terminal that ended"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// The review state of `subject` once `holds` says it is the one waited for.
     async fn review_when(
         control: &mut LocalClient,
@@ -4366,6 +4392,7 @@ mod session_work {
         let mut terminal = gateway.run_a_turn("private");
         terminal.prints("TUI: turn/completed").await;
         terminal.ends().await;
+        conversation_left(&worker).await;
         let subject = the_turn(&worker);
         let state = review_when(&mut control, &subject, |_| true).await;
         assert!(
