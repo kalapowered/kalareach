@@ -66,10 +66,15 @@ $script:HostAdvisories = @(
     }
 )
 
+# How the editor describes the binding this module puts on the gesture key, which is what tells it
+# from a binding of the person's when the key is put back.
+$script:GestureDescription = 'KalaReach: detach at an empty root prompt'
+
 $script:Hooks = @{
     Activated          = $false
     GestureChord       = $null
     GestureBefore      = $null
+    GestureBeforeDescribed = $null
     Wrapped            = [System.Collections.Generic.List[hashtable]]::new()
     InnerReadLine      = $null
     InnerIsEditors     = $true
@@ -883,15 +888,25 @@ function Install-KrObservedHandlers {
     $wrapped
 }
 
+# The binding the editor holds on a chord in the mode it is in, or nothing. The Vi editor lists the
+# chord's command-mode binding beside it, spelled in angle brackets, and that one is not the key
+# this module binds.
+function Get-KrBindingOn {
+    param([string]$Chord)
+    $found = try { @(Get-PSReadLineKeyHandler -Chord $Chord -ErrorAction SilentlyContinue) } catch { @() }
+    $own = @($found | Where-Object { "$($_.Key)" -ceq $Chord })
+    if ($own.Count -gt 0) { return $own[0] }
+    if ($found.Count -gt 0) { return $found[0] }
+    $null
+}
+
 # Puts back every operation of the editor's own that this module went in front of.
 #
 # Only the ones it still owns: a chord the person has bound since is theirs, and it stays as they
 # left it.
 function Restore-KrObservedHandlers {
     foreach ($entry in @($script:Hooks.Wrapped)) {
-        $current = try {
-            Get-PSReadLineKeyHandler -Chord $entry.Chord -ErrorAction SilentlyContinue
-        } catch { $null }
+        $current = Get-KrBindingOn $entry.Chord
         if ($null -eq $current -or "$($current.Description)" -ne "KalaReach: $($entry.Function)") {
             continue
         }
@@ -920,7 +935,7 @@ function Install-KrGestureHandler {
                   Detail = "the configured gesture's chord $chord is stored by the editor as another key" }
     }
 
-    $previous = try { Get-PSReadLineKeyHandler -Chord $chord -ErrorAction SilentlyContinue } catch { $null }
+    $previous = Get-KrBindingOn $chord
     # A script of the person's is theirs whatever it is called, so it is read from the editor's own
     # table rather than from the description the binding carries.
     $before = Get-KrCustomHandler $chord
@@ -932,10 +947,21 @@ function Install-KrGestureHandler {
         $before = $previous.Function
     }
     $script:Hooks.GestureBefore = $before
+    # A script on the key goes back as the editor described it, which is also how this module's own
+    # wrapper of the editor's operation on that key is told from a handler of the person's.
+    $script:Hooks.GestureBeforeDescribed = @{}
+    if ($before -is [scriptblock] -and $null -ne $previous) {
+        if (-not [string]::IsNullOrEmpty("$($previous.Function)")) {
+            $script:Hooks.GestureBeforeDescribed.BriefDescription = "$($previous.Function)"
+        }
+        if (-not [string]::IsNullOrEmpty("$($previous.Description)")) {
+            $script:Hooks.GestureBeforeDescribed.Description = "$($previous.Description)"
+        }
+    }
     $script:Hooks.GestureChord = $chord
     try {
         Set-PSReadLineKeyHandler -Chord $chord -ScriptBlock { param($key, $arg) Invoke-KalaReachGesture -Key $key -Argument $arg } `
-            -BriefDescription 'KalaReachDetach' -Description 'KalaReach: detach at an empty root prompt'
+            -BriefDescription 'KalaReachDetach' -Description $script:GestureDescription
     } catch {
         return @{ Ok = $false; Reason = 'gesture_bind_failed'; Detail = "$($_.Exception.Message)" }
     }
@@ -993,21 +1019,29 @@ function Sync-KrGestureHandler {
     }
 }
 
+# Puts back what was on the gesture key, when the key is still this module's: one the person has
+# bound since is theirs, and it stays as they left it.
 function Restore-KrGestureHandler {
     $chord = $script:Hooks.GestureChord
     if ($null -eq $chord) { return }
     $before = $script:Hooks.GestureBefore
-    try {
-        if ($null -eq $before) {
-            Remove-PSReadLineKeyHandler -Chord $chord -ErrorAction SilentlyContinue
-        } elseif ($before -is [scriptblock]) {
-            Set-PSReadLineKeyHandler -Chord $chord -ScriptBlock $before
-        } else {
-            Set-PSReadLineKeyHandler -Chord $chord -Function $before
-        }
-    } catch { }
+    $described = $script:Hooks.GestureBeforeDescribed
+    if ($null -eq $described) { $described = @{} }
+    $current = Get-KrBindingOn $chord
+    if ($null -ne $current -and "$($current.Description)" -eq $script:GestureDescription) {
+        try {
+            if ($null -eq $before) {
+                Remove-PSReadLineKeyHandler -Chord $chord -ErrorAction SilentlyContinue
+            } elseif ($before -is [scriptblock]) {
+                Set-PSReadLineKeyHandler -Chord $chord -ScriptBlock $before @described
+            } else {
+                Set-PSReadLineKeyHandler -Chord $chord -Function $before
+            }
+        } catch { }
+    }
     $script:Hooks.GestureChord = $null
     $script:Hooks.GestureBefore = $null
+    $script:Hooks.GestureBeforeDescribed = $null
 }
 
 # ---- what the reader calls ---------------------------------------------------------------------------

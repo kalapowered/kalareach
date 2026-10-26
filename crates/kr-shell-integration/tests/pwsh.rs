@@ -740,6 +740,82 @@ fn a_chord_the_editor_spells_as_another_key_never_takes_that_key_over() {
     );
 }
 
+/// KR-REQ-07.37: what the module put on the gesture key comes off again, and a key the person has
+/// bound since is theirs.
+///
+/// The module goes in front of every operation the editor binds, the gesture key's included, and
+/// then puts its decision on that key over the wrapper it finds there. What goes back is the
+/// editor's own operation, in the Emacs and in the Vi edit mode alike, and not the wrapper. A
+/// binding the person made on the key after the decision went on is theirs, and taking the hooks off
+/// leaves it as it is. Each case is a host of its own, because what one binds is what the next
+/// reads.
+#[test]
+#[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_gesture_key_goes_back_to_the_editors_own_operation_and_a_later_binding_stays_the_persons() {
+    let own = in_the_package_host(
+        r#"foreach ($mode in 'Emacs', 'Vi') {
+               Set-PSReadLineOption -EditMode $mode;
+               & $module { $script:Hooks.Wrapped = Install-KrObservedHandlers;
+                           $script:Kr.GestureChord = 'Ctrl+d'; $script:Kr.GestureDisabled = $false;
+                           $null = Install-KrGestureHandler };
+               $during = Get-PSReadLineKeyHandler -Chord 'Ctrl+d' | Where-Object { $_.Key -ceq 'Ctrl+d' };
+               Write-Output "kr-key[$mode-during]=[$($during.Description)]";
+               & $module { Restore-KrGestureHandler; Restore-KrObservedHandlers };
+               $held = Get-PSReadLineKeyHandler -Chord 'Ctrl+d' | Where-Object { $_.Key -ceq 'Ctrl+d' };
+               Write-Output "kr-key[$mode]=[$($held.Function)|$($held.Description -like 'KalaReach*')]"
+           }"#,
+    );
+    assert_eq!(
+        said(&own, "Emacs-during"),
+        "KalaReach: detach at an empty root prompt",
+        "the decision was not on the gesture key while it was installed:\n{own}"
+    );
+    assert_eq!(
+        said(&own, "Emacs"),
+        "DeleteCharOrExit|False",
+        "the key did not go back to the editor's own operation in Emacs mode:\n{own}"
+    );
+    assert_eq!(
+        said(&own, "Vi-during"),
+        "KalaReach: detach at an empty root prompt",
+        "the decision was not on the gesture key while it was installed:\n{own}"
+    );
+    assert_eq!(
+        said(&own, "Vi"),
+        "ViAcceptLineOrExit|False",
+        "the key did not go back to the editor's own operation in Vi mode:\n{own}"
+    );
+
+    let later = in_the_package_host(
+        r#"& $module { $script:Kr.GestureChord = 'Ctrl+d'; $script:Kr.GestureDisabled = $false;
+                       $null = Install-KrGestureHandler };
+           Set-PSReadLineKeyHandler -Chord 'Ctrl+d' -Function BackwardDeleteChar;
+           & $module { Restore-KrGestureHandler };
+           $held = Get-PSReadLineKeyHandler -Chord 'Ctrl+d';
+           Write-Output "kr-key[later]=[$($held.Function)]""#,
+    );
+    assert_eq!(
+        said(&later, "later"),
+        "BackwardDeleteChar",
+        "a binding the person made after the decision went on was written over:\n{later}"
+    );
+
+    let script = in_the_package_host(
+        r#"& $module { $script:Kr.GestureChord = 'Ctrl+d'; $script:Kr.GestureDisabled = $false;
+                       $null = Install-KrGestureHandler };
+           Set-PSReadLineKeyHandler -Chord 'Ctrl+d' -ScriptBlock { param($key, $arg) } `
+               -BriefDescription 'theirs' -Description 'the person wrote this';
+           & $module { Restore-KrGestureHandler };
+           $held = Get-PSReadLineKeyHandler -Chord 'Ctrl+d';
+           Write-Output "kr-key[script]=[$($held.Function)|$($held.Description)]""#,
+    );
+    assert_eq!(
+        said(&script, "script"),
+        "theirs|the person wrote this",
+        "a script the person bound after the decision went on was written over:\n{script}"
+    );
+}
+
 /// KR-REQ-07.85: the module can read how the editor spells a chord, or it is not the editor the
 /// package was qualified against.
 ///
