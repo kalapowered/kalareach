@@ -560,11 +560,12 @@ that writes nothing:
   walk the directory from one handle without following a link and check what a replacement keeps,
   as the steps below describe;
 - the application is one whose directory this host knows: Claude Code's is `.claude` in the
-  account's home, the directory it reads when `CLAUDE_CONFIG_DIR` is not set;
+  account's home, the directory it reads when `CLAUDE_CONFIG_DIR` is not set, and Gemini CLI's is
+  `.gemini` in the account's home, where it reads `extensions/`;
 - the forwarder the registration is expected to start is the `kr-hook` beside the daemon, and it
   starts it for the application the recipe declares: a package of any publisher and any name
   places a bridge for an application this host names a bridge for and knows the directory of
-  (today Claude Code), and a registration for an application other than the one the recipe
+  (today Claude Code and Gemini CLI), and a registration for an application other than the one the recipe
   declares is refused;
 - every step the recipe installs has the removal that undoes it, and every file it installs is the
   bytes its recipe names;
@@ -683,7 +684,10 @@ A removal takes out each file only while it is the file the host installed and s
 installed: a copy with the same bytes put in its place is somebody's own, and is left. The key goes
 only while it holds the value written, and a settings document the host created goes with it only
 while it is still that document: one put in its place keeps its file and loses only the key. Then
-the directories the host made go, once they hold nothing else. Whatever changed since is left in
+the directories the host made go, once they hold nothing else. A Gemini CLI extension's install
+record goes last of all, and only once nothing else is left in the extension's directory; while it
+waits the removal is unfinished and the package is not applied again ([the Gemini CLI
+guide](../bridges/gemini-cli/README.md)). Whatever changed since is left in
 place and named in the journal. A release applied in a directory the host no longer keeps the
 application's plugins in is taken out of it before the release is applied in the new one. The
 journal also says what an applied release yields for the sessions that launch its application: the
