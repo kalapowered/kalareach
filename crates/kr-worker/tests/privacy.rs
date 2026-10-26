@@ -12,10 +12,13 @@
 //! The test that matters most is the one section 24 names by name: privacy is enabled while
 //! upload, notification and inference work is in flight.
 
+use kr_protocol::action::{ActionObservation, ObservationProvenance, ObservedResult};
+use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::identity::{DesktopBinding, WorkerProfile};
-use kr_protocol::ids::{ActorId, SessionEpoch, SessionId};
+use kr_protocol::ids::{ActionId, ActorId, SessionEpoch, SessionId};
 use kr_protocol::method::{Method, MethodVersion};
-use kr_protocol::scalars::{Digest256, TimestampMs};
+use kr_protocol::receipt::ReceiptState;
+use kr_protocol::scalars::{Digest256, Nullable, TimestampMs};
 use kr_protocol::session::{Dimensions, DisplayNumber, ShellMode};
 use kr_worker::journal::Submission;
 use kr_worker::privacy::subsystems::Recording;
@@ -582,60 +585,119 @@ fn a_restarted_session_reads_its_generation_back_and_keeps_refusing_what_it_refu
     assert!(restarted.privacy().accepts_result(generation));
 }
 
-#[test]
-fn content_that_settles_while_privacy_is_on_is_taken_when_privacy_is_turned_off() {
-    // Privacy mode is prospective: an action admitted after it was enabled settles later, and the
-    // content its receipt carries is content this host was asked not to keep. Waiting for a
-    // maintenance tick would leave it there for anybody who turned privacy mode off first.
-    let (_temp, mut session) = session_on_disk();
-    session
-        .enable_privacy(PrivacyGeneration::new(1), &mut [])
-        .expect("enables");
-    {
-        let journal = session.journal_mut().expect("a journal");
-        journal.accept(&submission(3)).expect("an action");
-        journal
-            .mark_dispatching(
-                actor(),
-                kr_worker::journal::action_id_from([3; 16]),
-                kr_ipc::now_ms(),
-            )
-            .expect("marks");
-        journal
-            .settle(
-                actor(),
-                kr_worker::journal::action_id_from([3; 16]),
-                kr_protocol::receipt::ReceiptState::Applied,
-                Some(b"what the action answered"),
-                None,
-                kr_ipc::now_ms(),
-            )
-            .expect("settles");
-        assert!(
-            journal
-                .read_result(&actor(), kr_worker::journal::action_id_from([3; 16]))
-                .expect("reads")
-                .is_some(),
-            "it is there until something takes it"
-        );
+/// Every way a receipt settles, one action each, in a journal that already holds the receipts the
+/// settlements move.
+///
+/// Returns each action with the state it ends in and whether it carries a result when nothing
+/// withholds content.
+fn settle_every_way(
+    journal: &mut kr_worker::journal::Journal,
+) -> Vec<(&'static str, ActionId, ReceiptState, bool)> {
+    let now = kr_ipc::now_ms();
+    let id = |byte: u8| kr_worker::journal::action_id_from([byte; 16]);
+    for byte in 1..=5 {
+        journal.accept(&submission(byte)).expect("an action");
     }
-    session
-        .disable_privacy(PrivacyGeneration::new(2))
-        .expect("disables");
-    let journal = session.journal_mut().expect("a journal");
-    assert!(
+    for byte in 1..=4 {
         journal
-            .read_result(&actor(), kr_worker::journal::action_id_from([3; 16]))
-            .expect("reads")
-            .is_none(),
-        "the private interval's content is taken before privacy mode ends"
-    );
-    assert!(
-        journal
-            .read_intent(&actor(), kr_worker::journal::action_id_from([3; 16]))
-            .expect("reads")
-            .is_none()
-    );
+            .mark_dispatching(actor(), id(byte), now)
+            .expect("marks");
+    }
+    // An outcome the action produced, and a refusal the upstream proved.
+    journal
+        .settle(
+            actor(),
+            id(1),
+            ReceiptState::Applied,
+            Some(b"what the action answered"),
+            None,
+            now,
+        )
+        .expect("settles");
+    journal
+        .settle(
+            actor(),
+            id(2),
+            ReceiptState::Refused,
+            None,
+            Some(ProtocolError::new(ErrorCode::PermissionDenied, "refused")),
+            now,
+        )
+        .expect("refuses");
+    // An outcome nobody can establish, which a later authoritative answer then settles with a
+    // result of its own.
+    journal
+        .settle(actor(), id(4), ReceiptState::Unknown, None, None, now)
+        .expect("settles unknown");
+    journal
+        .record_observation_settling(
+            &actor(),
+            &ActionObservation {
+                action_id: id(4),
+                provenance: ObservationProvenance::AuthoritativeInterface,
+                subject: "agent.approval:upstream-request".to_owned(),
+                subject_revision: Nullable::null(),
+                source_cursor: Nullable::null(),
+                claimed_result: ObservedResult::Applied,
+                observed_at_ms: now,
+            },
+            Some(b"what the upstream answered late"),
+            None,
+        )
+        .expect("a late answer settles it");
+    // A marker with no outcome, which recovery takes to unknown, and an intent never dispatched,
+    // which is cancelled.
+    journal
+        .resolve_unfinished_dispatches(now)
+        .expect("recovers the marker");
+    journal.cancel(actor(), id(5), now).expect("cancels");
+    vec![
+        ("an outcome", id(1), ReceiptState::Applied, true),
+        ("a refusal", id(2), ReceiptState::Refused, false),
+        ("a recovered marker", id(3), ReceiptState::Unknown, false),
+        ("a late answer", id(4), ReceiptState::Applied, true),
+        ("a cancellation", id(5), ReceiptState::Rejected, false),
+    ]
+}
+
+/// KR-REQ-24.27: every transition that settles a receipt commits it without the result its action
+/// produced and the envelope its caller sent while privacy mode is on, and keeps its metadata. A
+/// crash after the commit therefore leaves nothing for anyone to remove. The control is the same
+/// transitions with privacy mode off, which keep what privacy mode withholds.
+#[test]
+fn a_receipt_that_settles_while_privacy_is_on_is_committed_without_its_content() {
+    for private in [true, false] {
+        let (_temp, mut session) = session_on_disk();
+        if private {
+            session
+                .enable_privacy(PrivacyGeneration::new(1), &mut [])
+                .expect("enables");
+        }
+        let journal = session.journal_mut().expect("a journal");
+        for (how, action, state, has_result) in settle_every_way(journal) {
+            let receipt = journal
+                .read(actor(), action)
+                .expect("reads")
+                .expect("the receipt is kept");
+            assert_eq!(receipt.state, state, "{how}: the metadata is kept");
+            let result = journal.read_result(&actor(), action).expect("reads");
+            let intent = journal.read_intent(&actor(), action).expect("reads");
+            if private {
+                assert!(result.is_none(), "{how}: no result is committed");
+                assert!(intent.is_none(), "{how}: no envelope is committed");
+            } else {
+                assert_eq!(
+                    result.is_some(),
+                    has_result,
+                    "{how}: with privacy mode off the result is kept"
+                );
+                assert!(
+                    intent.is_some(),
+                    "{how}: with privacy mode off the envelope is kept"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -865,59 +927,6 @@ fn a_generation_the_environment_recorded_is_taken_only_when_it_is_newer() {
     );
     assert!(!session.privacy().is_enabled());
     assert!(!session.privacy().accepts_result(PrivacyGeneration::new(3)));
-}
-
-#[test]
-fn content_settled_under_privacy_is_taken_where_it_settles_rather_than_at_the_next_tick() {
-    // A crash between a settlement and the next maintenance pass would leave the content for the
-    // archive to serve, so it goes in the settlement's own wake rather than later.
-    let (_temp, mut session) = session_on_disk();
-    session
-        .enable_privacy(PrivacyGeneration::new(1), &mut [])
-        .expect("enables");
-    let action = kr_worker::journal::action_id_from([9; 16]);
-    {
-        let journal = session.journal_mut().expect("a journal");
-        journal.accept(&submission(9)).expect("an action");
-        journal
-            .mark_dispatching(actor(), action, kr_ipc::now_ms())
-            .expect("marks");
-        journal
-            .settle(
-                actor(),
-                action,
-                kr_protocol::receipt::ReceiptState::Applied,
-                Some(b"what the action answered"),
-                None,
-                kr_ipc::now_ms(),
-            )
-            .expect("settles");
-    }
-    // What the dispatch path does the moment the outcome is committed, with no tick in between.
-    session.redact_settled_action(&actor(), action);
-    let journal = session.journal_mut().expect("a journal");
-    assert!(
-        journal
-            .read_result(&actor(), action)
-            .expect("reads")
-            .is_none(),
-        "the content went where the action settled"
-    );
-    assert!(
-        journal
-            .read_intent(&actor(), action)
-            .expect("reads")
-            .is_none()
-    );
-    assert_eq!(
-        journal
-            .read(actor(), action)
-            .expect("reads")
-            .expect("the receipt is still there")
-            .state,
-        kr_protocol::receipt::ReceiptState::Applied,
-        "the metadata is kept"
-    );
 }
 
 #[test]

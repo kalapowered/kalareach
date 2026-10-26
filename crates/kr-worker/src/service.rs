@@ -5387,18 +5387,13 @@ impl WorkerService {
                 now,
             ),
         };
-        let state = match &settled {
+        match &settled {
             Ok(receipt) => Some(receipt.state),
             Err(failure) => {
                 session.note_journal_failure(failure);
                 None
             }
-        };
-        // Privacy mode is prospective: the content this receipt carries goes where it settles.
-        if session.privacy().is_enabled() {
-            session.redact_settled_action(actor_id, action_id);
         }
-        state
     }
 
     /// Waits for the upstream's answer to an operation whose receipt says unknown, and records it
@@ -5491,11 +5486,7 @@ impl WorkerService {
             result.as_deref(),
             refusal,
         ) {
-            Ok(_) => {
-                if session.privacy().is_enabled() {
-                    session.redact_settled_action(&operation.actor_id, operation.action_id);
-                }
-            }
+            Ok(_) => {}
             Err(failure) => session.note_journal_failure(&failure),
         }
     }
@@ -5543,10 +5534,6 @@ impl WorkerService {
         };
         if let Err(failure) = settled {
             session.note_journal_failure(&failure);
-        }
-        // Privacy mode is prospective: the content this receipt carries goes where it settles.
-        if session.privacy().is_enabled() {
-            session.redact_settled_action(actor_id, action_id);
         }
     }
 
@@ -6205,17 +6192,6 @@ impl WorkerService {
                 }
             }
             (_, None) => {}
-        }
-        // Privacy mode is prospective, and this is where an action admitted under it settles. The
-        // content its receipt carries goes here rather than on the next maintenance pass, which
-        // narrows the window in which it is on the disk. It does not close it: this is a second
-        // transaction after the one that wrote the outcome, so a crash between the two leaves the
-        // content for the archive to serve, and the early rejection path does not reach here at
-        // all. Closing it needs the content policy inside the journal transition itself. A failure
-        // is recorded as cleanup this host still owes rather than turned into a refusal of an
-        // effect that has already happened.
-        if session.privacy().is_enabled() {
-            session.redact_settled_action(&caller.actor_id, mutation.action_id);
         }
         drop(session);
         // The record of the hold ends where the hold does, and not with the result's processing.
