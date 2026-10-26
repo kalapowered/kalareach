@@ -311,8 +311,9 @@ impl TerminalViews {
     /// Returns the session's own refusal, `DRAFT_CONFLICT` for a prompt that moved, `EDITOR_BUSY`
     /// for an editor that could not hold the launch and `OUTCOME_UNKNOWN` for one that could not
     /// say. A launch the session had not answered when the view ended is `OUTCOME_UNKNOWN` too:
-    /// it may have been installed. `LEASE_LOST` is only for one that never reached the session,
-    /// because the view had ended or was never open.
+    /// it may have been installed. This view answers `LEASE_LOST` itself only for one it never
+    /// sent, because the view had ended or was never open; the session's own `LEASE_LOST` for a
+    /// view that holds no input is given as it is.
     pub async fn launch(
         &self,
         view: &str,
