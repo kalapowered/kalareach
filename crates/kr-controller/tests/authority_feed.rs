@@ -472,6 +472,17 @@ impl Rig {
     /// Waits until the host has carried the revocation out and acknowledged it, which a connection
     /// that ended first does not wait for: the pass that withdrew it may still be writing.
     async fn until_the_revocation_is_acknowledged(&self, request: &RevocationRequest) {
+        self.until_the_revocation_is_acknowledged_to(&self.owner.authorisation, request)
+            .await;
+    }
+
+    /// As [`Self::until_the_revocation_is_acknowledged`], for a request the holder of `key`
+    /// published, which only its publisher reads from the feed.
+    async fn until_the_revocation_is_acknowledged_to(
+        &self,
+        key: &AuthorisationKeyPair,
+        request: &RevocationRequest,
+    ) {
         let mut passes = self.runtime().passes();
         within(
             "the host carries the revocation out and acknowledges it",
@@ -486,9 +497,10 @@ impl Rig {
                         .expect("a revision")
                         .get()
                         > 0;
-                    let acknowledged = self
-                        .feed_as_the_owner_sees_it()
+                    let acknowledged = client_for(self.served.origin(), key.clone())
+                        .read(self.feed(), None, false)
                         .await
+                        .expect("the feed answers its publisher")
                         .record(request.request_id)
                         .is_some_and(|held| held.acknowledgement.0.is_some());
                     if taken && acknowledged {
@@ -6106,17 +6118,27 @@ async fn a_scan_clears_the_entries_of_the_records_it_settled() {
 async fn the_issuer_of_a_complete_request_revoked_after_the_restore_does_not_dismiss_it() {
     let rig = Rig::start().await;
     let victim = rig.pairs(&[ActionRight::SessionView]).await;
+    let other = rig.pairs(&[ActionRight::SessionView]).await;
     let issuer = rig
         .pairs(&[ActionRight::HostManage, ActionRight::SessionView])
         .await;
     rig.until_the_carrier_is_idle().await;
     let earlier = a_copy_of_the_registry(&rig.host, "registry-with-the-issuer.sqlite3");
     let key = issuer.0.keys().authorisation.clone();
+    // Two withdrawals, so that the feed is ahead of the registry by more than the person's own
+    // revocation of the issuer will move it.
     let request = rig.request_of(&key, issuer.1.device_id, 0xa1, devices(victim.1.device_id));
     rig.published_as(&key, &request).await;
     rig.poll().await;
-    rig.until_the_revocation_is_acknowledged(&request).await;
+    rig.until_the_revocation_is_acknowledged_to(&key, &request)
+        .await;
+    let second = rig.request_of(&key, issuer.1.device_id, 0xa2, devices(other.1.device_id));
+    rig.published_as(&key, &second).await;
+    rig.poll().await;
+    rig.until_the_revocation_is_acknowledged_to(&key, &second)
+        .await;
     assert!(rig.has_revoked(victim.1.device_id).await);
+    assert!(rig.has_revoked(other.1.device_id).await);
 
     // The registry is put back, and the feed holds the first read while the person revokes the
     // issuer, as a lost phone is revoked.
@@ -6133,16 +6155,21 @@ async fn the_issuer_of_a_complete_request_revoked_after_the_restore_does_not_dis
     rig.poll().await;
     rig.until_the_carrier_is_idle().await;
 
-    assert!(
-        !rig.has_revoked(victim.1.device_id).await,
-        "the request of a revoked issuer is not carried out again"
-    );
+    for device in [victim.1.device_id, other.1.device_id] {
+        assert!(
+            !rig.has_revoked(device).await,
+            "the requests of a revoked issuer are not carried out again"
+        );
+    }
     let refused = rig.the_confirmation_is_refused().await;
-    assert!(
-        refused.message.contains(&victim.1.device_id.to_string()),
-        "and what it names is owed: {refused:?}"
-    );
+    for device in [victim.1.device_id, other.1.device_id] {
+        assert!(
+            refused.message.contains(&device.to_string()),
+            "and what they name is owed: {refused:?}"
+        );
+    }
     rig.revokes_at_the_machine(victim.1.device_id).await;
+    rig.revokes_at_the_machine(other.1.device_id).await;
     assert!(rig.the_owner_confirms().await.lifted);
 }
 
@@ -6408,5 +6435,287 @@ async fn an_acknowledged_pending_request_carried_out_again_is_acknowledged_compl
         rig.arrivals("acknowledge"),
         acknowledgements,
         "a request the feed shows complete is not acknowledged again"
+    );
+}
+
+impl Rig {
+    /// The registry as an earlier state of it would be, while the daemon runs: the revision counter
+    /// back at nothing and `device` not revoked.
+    fn the_registry_loses_a_withdrawal(&self, device: DeviceId) {
+        let registry =
+            rusqlite::Connection::open(self.host.tree().environment().registry_database())
+                .expect("the registry opens");
+        registry
+            .execute("UPDATE environment SET authority_revision = 0", [])
+            .expect("the counter is put back");
+        registry
+            .execute(
+                "UPDATE network_devices SET revoked_at_ms = NULL WHERE device_id = ?1",
+                [device.get().as_bytes().to_vec()],
+            )
+            .expect("the device is not revoked");
+    }
+
+    /// Publishes `count` requests that name nothing the host holds, from the owner's key and two
+    /// strangers', so that the feed holds more than a page of 64: it keeps a publisher to 32 of
+    /// what the host has not finished with.
+    async fn publishes_filler(&self, count: u8) {
+        let strangers = [
+            AuthorisationKeyPair::generate().expect("a key"),
+            AuthorisationKeyPair::generate().expect("a key"),
+        ];
+        for id in 1..=count {
+            let (key, client) = match id {
+                1..=30 => (&self.owner.authorisation, &self.remote),
+                31..=62 => (
+                    &strangers[0],
+                    &client_for(self.served.origin(), strangers[0].clone()),
+                ),
+                _ => (
+                    &strangers[1],
+                    &client_for(self.served.origin(), strangers[1].clone()),
+                ),
+            };
+            let nothing = DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([id; 16]));
+            client
+                .publish(
+                    self.feed(),
+                    &self.signed_by(key, id, devices(nothing)),
+                    None,
+                )
+                .await
+                .expect("the feed stores the request");
+        }
+    }
+}
+
+/// KR-REQ-24.15: a registry put back again while the host runs is a second finding, and the scan
+/// that follows starts at the first record: the request the first scan settled is carried out
+/// again on a registry that has lost it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_finding_after_a_scan_restarts_it_at_the_first_record() {
+    let Restorable {
+        rig,
+        revoked,
+        earlier,
+        ..
+    } = a_revocation_the_registry_will_lose().await;
+    let rig = rig
+        .restarted(false, |tree| put_the_registry_back(tree, &earlier))
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    assert!(
+        rig.has_revoked(revoked.1.device_id).await,
+        "the first scan carries the request out again"
+    );
+
+    rig.the_registry_loses_a_withdrawal(revoked.1.device_id);
+    assert!(!rig.has_revoked(revoked.1.device_id).await);
+    rig.poll().await;
+    assert!(
+        rig.has_revoked(revoked.1.device_id).await,
+        "the second finding starts the scan over, so what the first settled is carried out again"
+    );
+}
+
+/// KR-REQ-24.15: a registry put back again between two passes of one scan restarts that scan: the
+/// pass that finds it does not act on its page, and the next begins at the first record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_finding_between_two_passes_of_a_scan_restarts_it() {
+    let Restorable { rig, revoked, .. } = a_revocation_the_registry_will_lose().await;
+    rig.until_the_carrier_is_idle().await;
+    rig.runtime().read_at_most_pages(1);
+    rig.publishes_filler(65).await;
+
+    // The registry is found behind the feed, and the feed holds the second read of the scan.
+    rig.the_registry_loses_a_withdrawal(revoked.1.device_id);
+    // The first read finds it and is not acted on, the second is the scan's first pass, and the
+    // feed holds the third, which is the scan's second.
+    let reads = rig.arrivals("read");
+    rig.served
+        .web()
+        .fail_with_member(AUTHORITY, "read", 3, Moment::Hold);
+    rig.runtime().wake();
+    rig.until_arrivals("read", reads + 3).await;
+    assert!(
+        rig.has_revoked(revoked.1.device_id).await,
+        "the first pass of the scan carried the request on the first page out"
+    );
+
+    // The registry is put back again before the second pass has looked at its page.
+    rig.the_registry_loses_a_withdrawal(revoked.1.device_id);
+    rig.served.web().release_held();
+    rig.poll().await;
+    assert!(
+        rig.has_revoked(revoked.1.device_id).await,
+        "the second finding restarts the scan at the first record"
+    );
+}
+
+/// KR-REQ-24.15: a second finding whose record cannot be written is still a finding: the pass that
+/// could not write it stops with nothing carried out, and the pass that writes it starts at the
+/// first record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_finding_whose_record_was_not_written_still_restarts_the_scan() {
+    let Restorable {
+        rig,
+        revoked,
+        earlier,
+        ..
+    } = a_revocation_the_registry_will_lose().await;
+    let rig = rig
+        .restarted(false, |tree| put_the_registry_back(tree, &earlier))
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    assert!(rig.has_revoked(revoked.1.device_id).await);
+    assert!(rig.the_owner_confirms().await.lifted);
+    assert_eq!(rig.the_record(), Found::Missing);
+
+    // The registry loses the withdrawal again, and something that is not a file stands where the
+    // record of the finding goes.
+    let record = restored::file_beside(&rig.host.tree().environment().registry_database());
+    std::fs::create_dir(&record).expect("an obstacle");
+    rig.the_registry_loses_a_withdrawal(revoked.1.device_id);
+    rig.poll().await;
+    assert!(
+        !rig.has_revoked(revoked.1.device_id).await,
+        "nothing is carried out while the finding cannot be written down"
+    );
+
+    std::fs::remove_dir(&record).expect("the obstacle goes");
+    rig.poll().await;
+    assert!(matches!(rig.the_record(), Found::Record(_)));
+    assert!(
+        rig.has_revoked(revoked.1.device_id).await,
+        "the pass that writes the finding carries out what the first scan had settled"
+    );
+}
+
+/// KR-REQ-24.15: a catch-up that takes several passes goes on where it stopped: no pass of it
+/// restarts the scan, and what the first page names is in the record when it has ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_catch_up_across_several_passes_goes_on_and_keeps_what_the_first_met() {
+    let Restorable {
+        rig, revoked, kept, ..
+    } = a_revocation_the_registry_will_lose().await;
+    rig.until_the_carrier_is_idle().await;
+    rig.runtime().read_at_most_pages(1);
+    // A request by a key the host does not know, naming the device nothing else names, on the first
+    // page with the one the host carries out again; more than a page follows.
+    let key = AuthorisationKeyPair::generate().expect("a key");
+    let request = rig.request_of(
+        &key,
+        DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([0x0f; 16])),
+        0xd1,
+        devices(kept.1.device_id),
+    );
+    rig.published_as(&key, &request).await;
+    rig.publishes_filler(65).await;
+
+    rig.the_registry_loses_a_withdrawal(revoked.1.device_id);
+    let before = rig.served.web().arrived().len();
+    rig.poll().await;
+    // The first read finds the registry behind the feed and is not acted on; the scan then starts
+    // at the first record, and its second pass goes on where the first stopped.
+    let asked: Vec<Option<String>> = rig.served.web().arrived()[before..]
+        .iter()
+        .filter_map(|arrived| arrived.body.get("read"))
+        .map(|read| {
+            read.get("after_sequence")
+                .and_then(|after| after.as_str())
+                .map(str::to_owned)
+        })
+        .collect();
+    assert_eq!(
+        asked.get(..3),
+        Some(&[Some("1".to_owned()), None, Some("64".to_owned())][..]),
+        "no pass of the catch-up starts the scan over: {asked:?}"
+    );
+    assert!(rig.has_revoked(revoked.1.device_id).await);
+    assert!(
+        rig.what_the_record_lists()
+            .contains(&restored::Target::Device(kept.1.device_id)),
+        "what the first page names is in the record"
+    );
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&kept.1.device_id.to_string()),
+        "and the confirmation is refused for it: {refused:?}"
+    );
+}
+
+/// KR-REQ-24.15: a list at its cap says it is full: the confirmation names what the host knows and
+/// says that more may be owed, a start with no feed reads the list as full, and the confirmation is
+/// accepted once every listed target is revoked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_list_at_the_cap_says_it_is_full() {
+    let rig = Rig::start().await;
+    let mut named = Vec::new();
+    for _ in 0..4 {
+        named.push(rig.pairs(&[ActionRight::SessionView]).await);
+    }
+    rig.until_the_carrier_is_idle().await;
+    let key = AuthorisationKeyPair::generate().expect("a key");
+    let request = rig.request_of(
+        &key,
+        DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([0x0f; 16])),
+        0xd1,
+        RevocationTarget::Devices {
+            device_ids: named
+                .iter()
+                .map(|paired| paired.1.device_id)
+                .collect::<CanonicalSet<_>>(),
+        },
+    );
+    rig.published_as(&key, &request).await;
+
+    // The cap is lowered once the run has started and before its first read is answered.
+    let reads = rig.arrivals("read");
+    rig.served
+        .web()
+        .fail_with_member(AUTHORITY, "read", 1, Moment::Hold);
+    let rig = rig.restarted(false, a_restore_was_found).await;
+    rig.until_arrivals("read", reads + 1).await;
+    rig.host.controller().limit_the_owed_list_to(3).await;
+    rig.served.web().release_held();
+    rig.until_the_carrier_is_idle().await;
+
+    let listed: Vec<DeviceId> = rig
+        .what_the_record_lists()
+        .into_iter()
+        .filter_map(|target| match target {
+            restored::Target::Device(device) => Some(device),
+            restored::Target::Grant(_) => None,
+        })
+        .collect();
+    assert_eq!(listed.len(), 3, "the list holds as many as the cap allows");
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains("is full"),
+        "the refusal says that more may be owed than it names: {refused:?}"
+    );
+    for paired in &named {
+        assert!(
+            refused.message.contains(&paired.1.device_id.to_string()),
+            "the run still names what it met: {refused:?}"
+        );
+    }
+
+    // A start with no feed knows only the list, and reads it as full.
+    let rig = rig
+        .restarted(false, |tree| net_support::write_feed_document(tree, None))
+        .await;
+    rig.host.controller().limit_the_owed_list_to(3).await;
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains("is full"),
+        "a list at its cap reads as full after a start: {refused:?}"
+    );
+    for device in &listed {
+        rig.revokes_at_the_machine(*device).await;
+    }
+    assert!(
+        rig.the_owner_confirms().await.lifted,
+        "the confirmation is accepted once every listed target is revoked"
     );
 }
