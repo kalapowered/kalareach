@@ -66,7 +66,11 @@ and every file of the PowerShell package that runs: the five module scripts and
 with an all-signed execution policy, so they are signed together or not at all. The update channel's release
 keys sign `release.json`, which lists every other file with its length and digest, so the files that carry no
 Authenticode signature (the licences, the package manifest, the record, the channel's root, the terminal's
-capability manifest and its terminfo database) are held by that one. `scripts/stage-windows-signing.py` is what says which files are which. When the release tool
+capability manifest and its terminfo database) are held by that one wherever it is checked. A Windows
+host keeps no store, and `kr host update` there only says that its installer replaces the release, so
+no Windows host checks it today; on Windows the archive's `SHA256SUMS` and the package manager's
+digest are what hold those files.
+`scripts/stage-windows-signing.py` is what says which files are which. When the release tool
 writes the manifest of a signed tree it holds each script to the checkout's text without the block of
 comment lines Authenticode appends; a script with anything but comment lines after the block's first
 line is not signed, and differs.
