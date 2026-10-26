@@ -3267,10 +3267,15 @@ pub(crate) mod tests {
     /// renewal whose policy write fails leaves the cell publishing the lease before it, and one
     /// written down publishes itself through the same cell. A withdrawal of the enrolment ends the
     /// snapshot, so a reader holding the cell finds the lease ended without anything else.
+    ///
+    /// The daemon starts once its first passes are over, so that the sweep and the maintenance pass
+    /// it makes as it starts do not read the clock after the fault is in place. A pass that does
+    /// fails its write and owes the floor, and the renewal that follows is then refused for the
+    /// floor, not installed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_lease_reaches_its_cell_only_once_its_policy_is_written_down() {
         let temp = kr_ipc::testing::TempHost::create();
-        let controller = daemon(&temp).await;
+        let controller = daemon_after_its_first_passes(&temp).await;
         let now = kr_ipc::now_ms().get();
         let organisation =
             crate::grants::organisation::testing::TestOrganisation::new(0x23, now - 60 * 60 * 1000);
@@ -3573,10 +3578,15 @@ pub(crate) mod tests {
     /// The same for a workflow's dispatch under a member device's organisation grant: while the
     /// floor a lapsed lease was found on cannot be written, authority is unavailable, and once it
     /// is written the lapse is answered.
+    ///
+    /// The daemon starts once its first passes are over, so that the sweep and the maintenance pass
+    /// it makes as it starts do not read the clock after the fault is in place. A pass that does
+    /// fails its write and owes a floor below the lapse, and the floor written once storage takes
+    /// it then leaves the lease standing at the control's reading.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_workflow_under_a_lapsed_lease_is_answered_only_once_its_floor_is_written() {
         let temp = kr_ipc::testing::TempHost::create();
-        let controller = daemon(&temp).await;
+        let controller = daemon_after_its_first_passes(&temp).await;
         let now = kr_ipc::now_ms().get();
         let organisation =
             crate::grants::organisation::testing::TestOrganisation::new(0x22, now - 60 * 60 * 1000);
