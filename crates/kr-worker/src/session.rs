@@ -4408,11 +4408,9 @@ impl Session {
     /// session - a caller that took the lock again to record it would be waiting for the lock it
     /// was already holding.
     pub fn collect_expired(&mut self) -> usize {
-        // Privacy mode is prospective as well as retrospective. An action admitted after it was
-        // enabled settles later, and the content its receipt carries is content this host was
-        // asked not to keep, so the redaction runs on the same cadence rather than only once. It
-        // is also where a redaction that failed at the enabling is retried.
-        if self.privacy.is_enabled() || self.privacy_cleanup.owed() > 0 {
+        // Where a cleanup that failed at the enabling is retried, on the same cadence as
+        // everything else this pass does.
+        if self.privacy_cleanup.owed() > 0 {
             self.retry_privacy_cleanup();
         }
         let permitted = self.time.may_collect_expired();
@@ -4604,9 +4602,8 @@ impl Session {
         generation: crate::privacy::PrivacyGeneration,
     ) -> Result<Option<crate::privacy::Resumed>> {
         let now = kr_ipc::now_ms();
-        // Everything admitted while privacy mode was on settles under it, and some of it settles
-        // between the last maintenance tick and this call. Taking its content now is what stops
-        // turning privacy mode off from being a way of keeping the private interval's content.
+        // A cleanup this host still owes is tried once more before privacy mode is turned off: a
+        // cleanup that finishes now is one fewer reason to refuse.
         self.retry_privacy_cleanup();
         let mut privacy = self.privacy;
         let (standing, resumed) = privacy.leave(generation, now);
@@ -4677,34 +4674,11 @@ impl Session {
             .and_then(|journal| journal.recover(now).ok().flatten())
     }
 
-    /// Removes the content one action's receipt carries, where it settles.
-    ///
-    /// Privacy mode is prospective, and an action admitted under it settles later. Taking its
-    /// content here rather than waiting for the next maintenance pass narrows the window in which
-    /// it is on the disk. It does not close it: this is a second transaction after the one that
-    /// wrote the outcome, so a crash between the two leaves the content for the archive to serve,
-    /// and the early rejection path does not reach here at all. Closing that needs the content
-    /// policy inside the journal transition itself. A failure becomes cleanup this session still
-    /// owes.
-    pub fn redact_settled_action(
-        &mut self,
-        actor_id: &kr_protocol::ids::ActorId,
-        action_id: kr_protocol::ids::ActionId,
-    ) {
-        let Some(journal) = self.journal.as_mut() else {
-            return;
-        };
-        if let Err(error) = journal.redact_action_content(actor_id, action_id) {
-            self.privacy_cleanup.receipts = Some(error.to_string());
-        }
-    }
-
     /// Retries whatever this session's own privacy cleanup still owes.
     ///
-    /// Each obligation is cleared only by its own success. It also runs while privacy mode is
-    /// *on* and owes nothing, because privacy mode is prospective: an action admitted after it
-    /// was enabled settles later, and the content its receipt carries is content this host was
-    /// asked not to keep.
+    /// Each obligation is cleared only by its own success. A receipt that settles while privacy
+    /// mode is on is committed without its content ([`crate::journal::Journal::settle`]), so
+    /// nothing is owed for it: what is owed is the removal from receipts that settled before.
     fn retry_privacy_cleanup(&mut self) {
         // The state first, because what the other two owe depends on it. A journal this host
         // still cannot open leaves every obligation where it is rather than clearing one of them
@@ -4736,7 +4710,7 @@ impl Session {
             let discarded = self.history.discard_retained();
             self.privacy_cleanup.history = discarded.left_behind;
         }
-        if self.privacy.is_enabled() || self.privacy_cleanup.receipts.is_some() {
+        if self.privacy_cleanup.receipts.is_some() {
             match self
                 .journal
                 .as_mut()

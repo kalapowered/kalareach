@@ -236,6 +236,11 @@ pub struct Journal {
     /// shipped build.
     #[cfg(feature = "testing")]
     marker_stall: crate::testing::Stall,
+    /// Where this host's own tests stop a worker the moment after a settlement or a rejection has
+    /// committed, which is where a crash leaves exactly what the commit holds. Compiled away in
+    /// every shipped build.
+    #[cfg(feature = "testing")]
+    settlement_stall: crate::testing::Stall,
     /// Where this host's own tests stop the commit of a prune. Compiled away in every shipped
     /// build.
     #[cfg(feature = "testing")]
@@ -382,6 +387,8 @@ impl Journal {
             attention_changes: std::sync::Arc::new(tokio::sync::Notify::new()),
             #[cfg(feature = "testing")]
             marker_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            settlement_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
             prune_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
@@ -1551,6 +1558,10 @@ impl Journal {
     /// The three describe one thing. Writing them separately is what lets a crash leave a receipt
     /// that says `applied` beside a result nobody can read, or an outcome nothing was notified of.
     ///
+    /// Privacy mode is decided in the same transaction, from the privacy record this store holds:
+    /// where it says privacy mode is on, the receipt settles without its result and without the
+    /// intent envelope, so no committed state holds content the mode withholds.
+    ///
     /// # Errors
     ///
     /// Returns an error when the transition is not permitted or the write fails.
@@ -1577,19 +1588,6 @@ impl Journal {
             .connection
             .transaction()
             .map_err(|error| faulted(&self.health, error))?;
-        if let Some(result) = result {
-            transaction
-                .execute(
-                    "INSERT INTO results (actor_id, action_id, result) VALUES (?1, ?2, ?3)
-                     ON CONFLICT (actor_id, action_id) DO UPDATE SET result = excluded.result",
-                    params![
-                        receipt.actor_id.as_str(),
-                        receipt.action_id.get().as_bytes().as_slice(),
-                        result
-                    ],
-                )
-                .map_err(|error| faulted(&self.health, error))?;
-        }
         transaction
             .execute(
                 "UPDATE receipts SET revision = ?3, state = ?4, reason = ?5, error_code = ?6,
@@ -1610,12 +1608,32 @@ impl Journal {
                 ],
             )
             .map_err(|error| faulted(&self.health, error))?;
+        // Read once the write lock is held, so the record is the one this settlement commits
+        // against. The record is written before a session says privacy mode is on, and a session
+        // writes both under its own lock, so it never says less than the session does.
+        if withholds_content(&self.health, &transaction, receipt.state)? {
+            withhold_content(&self.health, &transaction, &receipt)?;
+        } else if let Some(result) = result {
+            transaction
+                .execute(
+                    "INSERT INTO results (actor_id, action_id, result) VALUES (?1, ?2, ?3)
+                     ON CONFLICT (actor_id, action_id) DO UPDATE SET result = excluded.result",
+                    params![
+                        receipt.actor_id.as_str(),
+                        receipt.action_id.get().as_bytes().as_slice(),
+                        result
+                    ],
+                )
+                .map_err(|error| faulted(&self.health, error))?;
+        }
         let sequence = append_event_at(&self.health, &transaction, &receipt, now_ms)?;
         crate::input_domain::assert_not_held("a journal commit");
         transaction
             .commit()
             .map_err(|error| faulted(&self.health, error))?;
         self.health.note_durable_through(sequence);
+        #[cfg(feature = "testing")]
+        self.settlement_stall.stand();
         Ok(receipt)
     }
 
@@ -1761,6 +1779,111 @@ fn append_event_at(
     Ok(sequence)
 }
 
+/// The receipt states whose content privacy mode withholds: the receipts that will never be
+/// dispatched again.
+///
+/// [`Journal::redact_settled_content`] says why `unknown` is among them and why a receipt still
+/// `accepted` or `dispatching` is not.
+const CONTENT_WITHHELD_STATES: [ReceiptState; 4] = [
+    ReceiptState::Applied,
+    ReceiptState::Refused,
+    ReceiptState::Rejected,
+    ReceiptState::Unknown,
+];
+
+/// [`CONTENT_WITHHELD_STATES`] as the list a SQL `IN` takes.
+fn content_withheld_list() -> String {
+    CONTENT_WITHHELD_STATES
+        .iter()
+        .map(|state| format!("'{}'", state.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Whether the privacy record in this store says privacy mode is on.
+///
+/// A store with no record has never had privacy mode on.
+fn privacy_mode_is_on(
+    health: &crate::persistence::fault::JournalHealth,
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<bool> {
+    transaction
+        .query_row("SELECT enabled FROM privacy WHERE id = 1", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .optional()
+        .map(|enabled| enabled.is_some_and(|enabled| enabled != 0))
+        .map_err(|error| faulted(health, error))
+}
+
+/// Whether a receipt that reaches `state` in this transaction is committed without its content.
+///
+/// This is the content policy of a single transition. It is read from the privacy record the
+/// transaction sees, so the answer is the one the transition commits against.
+fn withholds_content(
+    health: &crate::persistence::fault::JournalHealth,
+    transaction: &rusqlite::Transaction<'_>,
+    state: ReceiptState,
+) -> Result<bool> {
+    Ok(CONTENT_WITHHELD_STATES.contains(&state) && privacy_mode_is_on(health, transaction)?)
+}
+
+/// Removes the content one receipt carries, keeping its metadata.
+fn withhold_content(
+    health: &crate::persistence::fault::JournalHealth,
+    transaction: &rusqlite::Transaction<'_>,
+    receipt: &Receipt,
+) -> Result<()> {
+    transaction
+        .execute(
+            "DELETE FROM results WHERE actor_id = ?1 AND action_id = ?2",
+            params![
+                receipt.actor_id.as_str(),
+                receipt.action_id.get().as_bytes().as_slice()
+            ],
+        )
+        .map_err(|error| faulted(health, error))?;
+    transaction
+        .execute(
+            "UPDATE receipts SET intent = NULL
+             WHERE actor_id = ?1 AND action_id = ?2 AND intent IS NOT NULL",
+            params![
+                receipt.actor_id.as_str(),
+                receipt.action_id.get().as_bytes().as_slice()
+            ],
+        )
+        .map_err(|error| faulted(health, error))?;
+    Ok(())
+}
+
+/// Removes the content of every receipt that has settled, keeping the metadata, and returns how
+/// many records lost content.
+fn withhold_settled_content(
+    health: &crate::persistence::fault::JournalHealth,
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<u64> {
+    let settled = content_withheld_list();
+    let results = transaction
+        .execute(
+            &format!(
+                "DELETE FROM results WHERE (actor_id, action_id) IN
+                 (SELECT actor_id, action_id FROM receipts WHERE state IN ({settled}))"
+            ),
+            [],
+        )
+        .map_err(|error| faulted(health, error))?;
+    let intents = transaction
+        .execute(
+            &format!(
+                "UPDATE receipts SET intent = NULL
+                 WHERE intent IS NOT NULL AND state IN ({settled})"
+            ),
+            [],
+        )
+        .map_err(|error| faulted(health, error))?;
+    Ok(results as u64 + intents as u64)
+}
+
 impl Journal {
     /// Commits the dispatch marker before the external effect.
     ///
@@ -1862,6 +1985,11 @@ impl Journal {
             .transaction()
             .map_err(|error| faulted(&self.health, error))?;
         write_state(&self.health, &transaction, &receipt)?;
+        // A rejection is a settlement: what the caller sent is committed with the receipt only
+        // where privacy mode does not withhold it. Read once the write lock is held.
+        if withholds_content(&self.health, &transaction, state)? {
+            withhold_content(&self.health, &transaction, &receipt)?;
+        }
         let sequence = append_event(&self.health, &transaction, &receipt)?;
         let named = match fenced_for {
             Some(revocation) => name_evidence(
@@ -1887,6 +2015,10 @@ impl Journal {
             .commit()
             .map_err(|error| faulted(&self.health, error))?;
         self.health.note_durable_through(sequence);
+        #[cfg(feature = "testing")]
+        if CONTENT_WITHHELD_STATES.contains(&state) {
+            self.settlement_stall.stand();
+        }
         Ok((receipt, named))
     }
 
@@ -2776,10 +2908,15 @@ impl Journal {
                 WorkerError::InvalidArgument(format!("receipt transition refused: {error}"))
             })?;
             receipt.updated_at_ms = observation.observed_at_ms;
+            // The observation's insert holds the write lock, so the privacy record read here is
+            // the one this settlement commits against.
+            let withheld = withholds_content(&self.health, &transaction, state)?;
             match state {
                 ReceiptState::Applied => {
                     receipt.error = Nullable::null();
-                    if let Some(result) = result {
+                    if let Some(result) = result
+                        && !withheld
+                    {
                         transaction
                             .execute(
                                 "INSERT INTO results (actor_id, action_id, result)
@@ -2801,6 +2938,9 @@ impl Journal {
                 _ => {}
             }
             write_state(&self.health, &transaction, &receipt)?;
+            if withheld {
+                withhold_content(&self.health, &transaction, &receipt)?;
+            }
             advanced = Some(append_event(&self.health, &transaction, &receipt)?);
         }
         crate::input_domain::assert_not_held("a journal commit");
@@ -2809,6 +2949,8 @@ impl Journal {
             .map_err(|error| faulted(&self.health, error))?;
         if let Some(sequence) = advanced {
             self.health.note_durable_through(sequence);
+            #[cfg(feature = "testing")]
+            self.settlement_stall.stand();
         }
         Ok(receipt)
     }
@@ -2960,6 +3102,10 @@ impl Journal {
                 ],
             )
             .map_err(|error| faulted(&self.health, error))?;
+        // A recovered receipt settles here, so what it holds beyond its metadata goes with it
+        // where privacy mode is on. The update holds the write lock, so the record read here is
+        // the one this commit is made against.
+        let withheld = withholds_content(&self.health, &transaction, to)?;
         let mut sequence = 0;
         for (actor_id, action_id) in &moving {
             let revision: i64 = transaction
@@ -2994,6 +3140,9 @@ impl Journal {
                 error_withheld: false,
                 updated_at_ms: now_ms,
             };
+            if withheld {
+                withhold_content(&self.health, &transaction, &receipt)?;
+            }
             sequence = append_event_at(&self.health, &transaction, &receipt, now_ms)?;
         }
         crate::input_domain::assert_not_held("a journal commit");
@@ -3191,6 +3340,23 @@ impl Journal {
         self.marker_stall.arm_blocking()
     }
 
+    /// Stops the worker once the next settlement or rejection has committed, for this host's own
+    /// tests: the receipt is on disk as the commit left it, and nothing that would have followed
+    /// the commit has run. A crash there leaves exactly this.
+    ///
+    /// Returns the end that says the commit has happened, and the end that lets the worker go. The
+    /// stop fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stall_after_next_settlement(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.settlement_stall.arm()
+    }
+
     /// Stops the commit of the next batch of host events, for this host's own tests.
     ///
     /// Returns the end that says the commit has arrived, and the end that lets it go. The stop
@@ -3336,6 +3502,8 @@ impl Journal {
             attention_changes: std::sync::Arc::new(tokio::sync::Notify::new()),
             #[cfg(feature = "testing")]
             marker_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            settlement_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
             prune_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
@@ -3520,68 +3688,16 @@ impl Journal {
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the write fails.
     pub fn redact_settled_content(&mut self) -> Result<u64> {
-        const SETTLED: &str = "state IN ('applied', 'refused', 'rejected', 'unknown')";
         let transaction = self
             .connection
             .transaction()
             .map_err(|error| faulted(&self.health, error))?;
-        let results = transaction
-            .execute(
-                &format!(
-                    "DELETE FROM results WHERE (actor_id, action_id) IN
-                     (SELECT actor_id, action_id FROM receipts WHERE {SETTLED})"
-                ),
-                [],
-            )
-            .map_err(|error| faulted(&self.health, error))?;
-        let intents = transaction
-            .execute(
-                &format!(
-                    "UPDATE receipts SET intent = NULL WHERE intent IS NOT NULL AND {SETTLED}"
-                ),
-                [],
-            )
-            .map_err(|error| faulted(&self.health, error))?;
+        let records = withhold_settled_content(&self.health, &transaction)?;
         crate::input_domain::assert_not_held("a journal commit");
         transaction
             .commit()
             .map_err(|error| faulted(&self.health, error))?;
-        Ok(results as u64 + intents as u64)
-    }
-
-    /// Removes the content one settled receipt carries, keeping its metadata.
-    ///
-    /// The same policy as [`Self::redact_settled_content`], applied to one action where it
-    /// settles. Privacy mode is prospective, and waiting for a maintenance pass would leave the
-    /// content of everything that settled in between for a crash to preserve.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WorkerError::JournalUnavailable`] when the write fails.
-    pub fn redact_action_content(&mut self, actor_id: &ActorId, action_id: ActionId) -> Result<()> {
-        let transaction = self
-            .connection
-            .transaction()
-            .map_err(|error| faulted(&self.health, error))?;
-        transaction
-            .execute(
-                "DELETE FROM results WHERE actor_id = ?1 AND action_id = ?2",
-                params![actor_id.as_str(), action_id.get().as_bytes().as_slice()],
-            )
-            .map_err(|error| faulted(&self.health, error))?;
-        transaction
-            .execute(
-                "UPDATE receipts SET intent = NULL
-                 WHERE actor_id = ?1 AND action_id = ?2
-                   AND state IN ('applied', 'refused', 'rejected', 'unknown')",
-                params![actor_id.as_str(), action_id.get().as_bytes().as_slice()],
-            )
-            .map_err(|error| faulted(&self.health, error))?;
-        crate::input_domain::assert_not_held("a journal commit");
-        transaction
-            .commit()
-            .map_err(|error| faulted(&self.health, error))?;
-        Ok(())
+        Ok(records)
     }
 
     /// Returns the schema version this store records.
