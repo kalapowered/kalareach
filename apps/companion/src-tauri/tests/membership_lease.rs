@@ -516,7 +516,8 @@ impl Rig {
         );
         let waits = HeldWaits::new();
         let control = LinkControl::new();
-        let (phone, tokens) = signed_in_phone(&fixture, &served, &waits, &control, None).await;
+        let (phone, tokens) =
+            signed_in_phone(&fixture, &served, &waits, &control, None, Arc::new(NoOwner)).await;
         let changes = {
             let (heard, changes) = watch::channel(0_u64);
             phone.companion.app.listen_any(CONNECTION_EVENT, move |_| {
@@ -881,6 +882,7 @@ async fn signed_in_phone(
     waits: &Arc<HeldWaits>,
     control: &Arc<LinkControl>,
     keys: Option<&DeviceKeys>,
+    ceremony: Arc<dyn Ceremony>,
 ) -> (Phone, Arc<SignedInAccount>) {
     let origin = kr_protocol::service::GatewayOrigin::new(served.origin()).expect("an origin");
     let http = HttpService::with(
@@ -935,7 +937,7 @@ async fn signed_in_phone(
     let companion = Companion::start_with_voice(
         data.path(),
         device,
-        Arc::new(NoOwner),
+        ceremony,
         Arc::clone(&paste) as Arc<dyn companion_tauri::pairing::IntakePlatform>,
         companion_tauri::voice::Calls::absent(),
         AccountSlot::ready(account),
@@ -2402,7 +2404,8 @@ struct OwnerDevice {
 }
 
 impl OwnerDevice {
-    async fn of(rig: &Rig) -> Self {
+    /// The owner as a device whose application asks its person through `ceremony`.
+    async fn of(rig: &Rig, ceremony: Arc<dyn Ceremony>) -> Self {
         let control = LinkControl::new();
         control.ignore_presentation();
         let (phone, tokens) = signed_in_phone(
@@ -2411,6 +2414,7 @@ impl OwnerDevice {
             &rig.waits,
             &control,
             Some(&rig.fixture.owner),
+            ceremony,
         )
         .await;
         let pairings = {
@@ -2437,6 +2441,22 @@ impl OwnerDevice {
             tokens,
             pairings,
         }
+    }
+
+    /// The watcher of the hosts this device owns, which the application started with the device. A
+    /// second watcher over the device would visit the host beside it through the one keeper of the
+    /// host's lease. The host refuses the owner's lease, and the keeper then holds that refusal
+    /// against every connection that has not presented one, so a connection that opens after the
+    /// first visit has been refused is ended at its first request, and its watcher is out of
+    /// contact for as long as the device's clock stands still.
+    fn watcher(&self) -> Arc<Owner> {
+        use tauri::Manager as _;
+        self.phone
+            .companion
+            .app
+            .state::<companion_tauri::AppState>()
+            .owner()
+            .expect("the application watches the hosts its device owns")
     }
 
     /// Waits until the pairing screen's row for the host is one `wanted` accepts.
@@ -2468,7 +2488,7 @@ impl OwnerDevice {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_owner_watcher_lets_its_session_go_when_the_account_signs_out() {
     let rig = Rig::start().await;
-    let owner = OwnerDevice::of(&rig).await;
+    let owner = OwnerDevice::of(&rig, Arc::new(NoOwner)).await;
     let mut client = rig.fixture.host.client().await;
     net_support::pairing::request(
         rig.fixture.host.environment_id,
@@ -2477,9 +2497,7 @@ async fn an_owner_watcher_lets_its_session_go_when_the_account_signs_out() {
     )
     .await
     .expect("the host asks its owner");
-    let watcher = Owner::new(owner.phone.companion.device(), Arc::new(NoOwner), || {});
-    watcher.start();
-    support::listed(&watcher, |request| request.checkable).await;
+    support::listed(&owner.watcher(), |request| request.checkable).await;
 
     let _ = owner.tokens.sign_out().await;
     let row = owner.row_where(asks_to_sign_in_row).await;
@@ -2499,10 +2517,9 @@ fn asks_to_sign_in_row(row: &serde_json::Value) -> bool {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_confirmation_in_the_ceremony_when_the_account_signs_out_is_not_completed() {
     let rig = Rig::start().await;
-    let owner = OwnerDevice::of(&rig).await;
     let ceremony = GatedCeremony::new();
-    let watcher = Owner::new(owner.phone.companion.device(), ceremony.clone(), || {});
-    watcher.start();
+    let owner = OwnerDevice::of(&rig, ceremony.clone()).await;
+    let watcher = owner.watcher();
     let mut client = rig.fixture.host.client().await;
     let asked = net_support::pairing::request(
         rig.fixture.host.environment_id,
