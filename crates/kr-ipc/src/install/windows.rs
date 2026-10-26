@@ -24,35 +24,42 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
-use std::os::windows::io::AsRawHandle as _;
+use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+use windows_sys::Wdk::Storage::FileSystem::{
+    FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtOpenFile,
+};
 use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_SHARING_VIOLATION, LocalFree,
+    ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_FILES, ERROR_SHARING_VIOLATION,
+    HANDLE, LocalFree, OBJ_DONT_REPARSE, RtlNtStatusToDosError, STATUS_DELETE_PENDING,
+    STATUS_SUCCESS, UNICODE_STRING,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
     SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    ACCESS_DENIED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce,
+    ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, GetSecurityDescriptorDacl,
     PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SetKernelObjectSecurity,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_FLAG_DELETE,
     FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
     FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_TYPE_DISK, FILE_WRITE_ATTRIBUTES, FileDispositionInfoEx, FileIdInfo,
-    FileRenameInfoEx, GetDiskFreeSpaceExW, GetFileInformationByHandleEx, GetFileType,
-    GetVolumeInformationW, GetVolumePathNameW, READ_CONTROL, SetFileInformationByHandle, WRITE_DAC,
+    FILE_ID_BOTH_DIR_INFO, FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+    FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK,
+    FILE_WRITE_ATTRIBUTES, FileDispositionInfoEx, FileIdBothDirectoryInfo,
+    FileIdBothDirectoryRestartInfo, FileIdInfo, FileRenameInfoEx, GetDiskFreeSpaceExW,
+    GetFileInformationByHandleEx, GetFileType, GetVolumeInformationW, GetVolumePathNameW,
+    READ_CONTROL, SYNCHRONIZE, SetFileInformationByHandle, WRITE_DAC,
 };
-use windows_sys::Win32::System::IO::DeviceIoControl;
+use windows_sys::Win32::System::IO::{DeviceIoControl, IO_STATUS_BLOCK};
 use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
 use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
-use windows_sys::Win32::System::SystemServices::ACCESS_DENIED_ACE_TYPE;
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, PROCESS_NAME_WIN32, QueryFullProcessImageNameW,
 };
@@ -690,7 +697,7 @@ fn refused(what: &str, path: &Path, error: &io::Error) -> io::Error {
 /// A link, a junction above all, is a name like a file: it is taken away and what it leads to is
 /// neither followed nor changed. A file that is a second name for a file outside the tree goes as a
 /// name; the file keeps its contents, its attributes and its access list, unless that list is the
-/// seal's, which [`remove_name`] gives back to its owner.
+/// seal's own, which [`remove_name`] gives back to its owner.
 ///
 /// # Errors
 ///
@@ -698,34 +705,60 @@ fn refused(what: &str, path: &Path, error: &io::Error) -> io::Error {
 /// ([`is_in_use`] holds for it), and otherwise the first refusal, which no program caused.
 pub(super) fn remove_tree(root: &Path) -> io::Result<()> {
     if !std::fs::symlink_metadata(root)?.file_type().is_dir() {
-        return remove_name(root);
+        return remove_name(Reach::Path(root), root);
     }
     let mut left = Left::default();
-    remove_directory(root, &mut left);
+    remove_directory(Reach::Path(root), root, &mut left);
     left.into_result()
 }
 
-/// Deletes what is in `directory` and then the directory. Returns whether the directory is gone.
+/// How a name to remove is reached: by its path, which only the root of a walk is, or as a name
+/// directly inside a directory held open, which is every other name.
+#[derive(Clone, Copy)]
+enum Reach<'a> {
+    Path(&'a Path),
+    Inside(&'a File, &'a [u16]),
+}
+
+impl Reach<'_> {
+    /// Opens the name itself, never what a link there leads to.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating system's error, [`io::ErrorKind::NotFound`] among them for a name that
+    /// is not there or whose removal is already pending.
+    fn open(self, access: u32, share: u32) -> io::Result<File> {
+        match self {
+            Self::Path(path) => open_name(path, access, share),
+            Self::Inside(directory, name) => open_inside(directory, name, access, share),
+        }
+    }
+}
+
+/// Deletes what is in the directory `reach` names and then the directory. `shown` is the path to
+/// say in a refusal. Returns whether the directory is gone.
 ///
 /// The directory is pinned first: it is opened with a share mode that lets nobody rename or delete
-/// it, which holds the directory and every one above it where they are while the handle is open. A
-/// name below it then reaches what this handle is and nothing else, so a directory that another
-/// process swaps for a junction between the look at its type and the work in it cannot lead the
-/// removal anywhere: the swap is refused, or it happened before the open and the open finds the
-/// junction itself, which is then taken away as a name.
-fn remove_directory(directory: &Path, left: &mut Left) -> bool {
-    let pin = match open_name(
-        directory,
+/// it, which holds the directory and every one above it where they are while the handle is open.
+/// Nothing is then done by a path. The names in it are read through the pinned handle and each is
+/// opened as a name inside that handle, with reparse points not followed, so a directory that
+/// another process of the account turns into a junction after it was checked (the share mode does
+/// not stop that) has a listing of its own, which is empty, and goes as a name; a name that is
+/// swapped for a junction after it was listed is opened as the junction itself and goes as a name.
+/// What a junction leads to is never reached.
+fn remove_directory(reach: Reach<'_>, shown: &Path, left: &mut Left) -> bool {
+    let pin = match reach.open(
         FILE_LIST_DIRECTORY | READ_CONTROL | WRITE_DAC | DELETE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
     ) {
         Ok(pin) => pin,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return true,
         Err(error) if is_sharing_violation(&error) => {
             left.add(error);
             return false;
         }
         Err(error) => {
-            left.add(refused("cannot open", directory, &error));
+            left.add(refused("cannot open", shown, &error));
             return false;
         }
     };
@@ -740,42 +773,39 @@ fn remove_directory(directory: &Path, left: &mut Left) -> bool {
                 .is_ok();
         }
         Err(error) => {
-            left.add(refused("cannot read", directory, &error));
+            left.add(refused("cannot read", shown, &error));
             return false;
         }
     }
     // Given back to its owner before its names are read: a sealed directory refuses to lose one.
     if let Err(error) = set_list_on(&pin, OWNER_ONLY) {
-        left.add(refused("cannot give back", directory, &error));
+        left.add(refused("cannot give back", shown, &error));
         return false;
     }
-    after_pin(directory);
-    let entries = match std::fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(error) => {
-            left.add(refused("cannot read", directory, &error));
-            return false;
-        }
-    };
+    after_pin(shown);
     let mut emptied = true;
-    for entry in entries {
-        let removed = match entry {
+    let mut restart = true;
+    loop {
+        let names = match list_next(&pin, restart) {
+            Ok(Some(names)) => names,
+            Ok(None) => break,
             Err(error) => {
-                left.add(refused("cannot read", directory, &error));
-                false
+                left.add(refused("cannot read", shown, &error));
+                return false;
             }
-            Ok(entry) => match entry.file_type() {
-                Ok(kind) if kind.is_dir() => remove_directory(&entry.path(), left),
-                Ok(_) => remove_name(&entry.path())
-                    .map_err(|error| left.add(error))
-                    .is_ok(),
-                Err(error) => {
-                    left.add(refused("cannot read", &entry.path(), &error));
-                    false
-                }
-            },
         };
-        emptied &= removed;
+        restart = false;
+        for listed in names {
+            let inside = shown.join(OsString::from_wide(&listed.name));
+            let reach = Reach::Inside(&pin, &listed.name);
+            emptied &= if listed.directory {
+                remove_directory(reach, &inside, left)
+            } else {
+                remove_name(reach, &inside)
+                    .map_err(|error| left.add(error))
+                    .is_ok()
+            };
+        }
     }
     if !emptied {
         return false;
@@ -785,15 +815,105 @@ fn remove_directory(directory: &Path, left: &mut Left) -> bool {
         .is_ok()
 }
 
-/// Deletes the name `path`: a file, or a link, whose target is neither followed nor changed. The
-/// file's own attributes are not cleared; a read-only file is deleted by the system's rule for a
-/// handle that asks for it, so that a name of a file that other names share leaves the file as it
-/// was.
+/// A name found in a directory, and whether it is a plain directory: not a link of any kind.
+struct Listed {
+    name: Vec<u16>,
+    directory: bool,
+}
+
+/// The bytes of one listing of a directory.
+const LISTING_BYTES: usize = 16 * 1024;
+
+/// Reads the next names in the directory `handle` is open on, as many as one listing holds, or
+/// from its start when `restart` is set. Returns `None` at the end. The directory's own entries
+/// `.` and `..` are left out.
+fn list_next(handle: &File, restart: bool) -> io::Result<Option<Vec<Listed>>> {
+    // A buffer of 64-bit words is aligned for the records.
+    let mut buffer = vec![0_u64; LISTING_BYTES / size_of::<u64>()];
+    let class = if restart {
+        FileIdBothDirectoryRestartInfo
+    } else {
+        FileIdBothDirectoryInfo
+    };
+    // SAFETY: the handle is the open directory's own, opened to list it, and `buffer` holds the
+    // number of bytes the call is told.
+    let read = unsafe {
+        GetFileInformationByHandleEx(
+            handle.as_raw_handle(),
+            class,
+            buffer.as_mut_ptr().cast(),
+            u32::try_from(LISTING_BYTES).unwrap_or(0),
+        )
+    };
+    if read == 0 {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(ERROR_NO_MORE_FILES.cast_signed()) {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    let bytes = buffer.as_ptr().cast::<u8>();
+    let name_at = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
+    let mut names = Vec::new();
+    let mut at = 0_usize;
+    loop {
+        if at + name_at > LISTING_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the system listed a name beyond its own buffer",
+            ));
+        }
+        // SAFETY: the record starts inside `buffer`, which the system filled with whole records,
+        // and only fields before the name are read, each as it lies and without a reference.
+        let (next, attributes, length) = unsafe {
+            let record = bytes.add(at).cast::<FILE_ID_BOTH_DIR_INFO>();
+            (
+                (&raw const (*record).NextEntryOffset).read_unaligned() as usize,
+                (&raw const (*record).FileAttributes).read_unaligned(),
+                (&raw const (*record).FileNameLength).read_unaligned() as usize,
+            )
+        };
+        if at + name_at + length > LISTING_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the system listed a name beyond its own buffer",
+            ));
+        }
+        let mut name = vec![0_u16; length / 2];
+        // SAFETY: the name's `length` bytes lie inside `buffer`, as checked above, and `name`
+        // holds as many.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.add(at + name_at),
+                name.as_mut_ptr().cast::<u8>(),
+                name.len() * 2,
+            );
+        }
+        let dots = |count: usize| name.len() == count && name.iter().all(|unit| *unit == 0x2e);
+        if !dots(1) && !dots(2) {
+            names.push(Listed {
+                name,
+                directory: attributes & FILE_ATTRIBUTE_DIRECTORY != 0
+                    && attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+            });
+        }
+        if next == 0 {
+            return Ok(Some(names));
+        }
+        at += next;
+    }
+}
+
+/// Deletes the name `reach` reaches: a file, or a link, whose target is neither followed nor
+/// changed. `shown` is the path to say in a refusal. The file's own attributes are not cleared; a
+/// read-only file is deleted by the system's rule for a handle that asks for it, so that a name of
+/// a file that other names share leaves the file as it was.
 ///
 /// Deleting a read-only file asks for the right to change attributes, and the entries the seal puts
 /// on a file deny its owner that right. A refusal is therefore either the seal or a program that
-/// runs from the file, and the right is asked for to tell which. When the list denies it and begins
-/// with the seal's own entry, the file is given back to its owner, the one change to a file's
+/// runs from the file, and the right is asked for to tell which. When the file's list is the
+/// seal's own, the whole of it, the file is given back to its owner, the one change to a file's
 /// access list a removal makes, and the delete is tried again. A list that denies the right and is
 /// not the seal's is somebody else's, and it is left as it is and reported.
 ///
@@ -801,84 +921,199 @@ fn remove_directory(directory: &Path, left: &mut Left) -> bool {
 ///
 /// Returns the operating system's error for a program that runs from the file, which
 /// [`is_in_use`] knows, and an error without that code for any other refusal.
-fn remove_name(path: &Path) -> io::Result<()> {
+fn remove_name(reach: Reach<'_>, shown: &Path) -> io::Result<()> {
     let denied =
         |error: &io::Error| error.raw_os_error() == Some(ERROR_ACCESS_DENIED.cast_signed());
-    match delete_name(path) {
+    match delete_name(reach) {
         Err(error) if denied(&error) => {
-            match open_name(path, FILE_WRITE_ATTRIBUTES, SHARE_ALL) {
+            match reach.open(FILE_WRITE_ATTRIBUTES, SHARE_ALL) {
                 Ok(_) => return Err(error),
                 Err(not_allowed) if denied(&not_allowed) => {}
-                Err(other) => return Err(refused("cannot reach", path, &other)),
+                Err(other) => return Err(refused("cannot reach", shown, &other)),
             }
-            let sealed = open_name(path, READ_CONTROL | WRITE_DAC, SHARE_ALL)
-                .map_err(|error| refused("cannot give back", path, &error))?;
-            if !begins_with_the_seals_entry(&sealed)
-                .map_err(|error| refused("cannot read the list of", path, &error))?
+            let sealed = reach
+                .open(READ_CONTROL | WRITE_DAC, SHARE_ALL)
+                .map_err(|error| refused("cannot give back", shown, &error))?;
+            if !has_the_seals_list(&sealed)
+                .map_err(|error| refused("cannot read the list of", shown, &error))?
             {
                 return Err(refused(
                     "its list denies the right to delete and is not the seal's:",
-                    path,
+                    shown,
                     &error,
                 ));
             }
             set_list_on(&sealed, OWNER_ONLY)
-                .map_err(|error| refused("cannot give back", path, &error))?;
-            delete_name(path)
+                .map_err(|error| refused("cannot give back", shown, &error))?;
+            delete_name(reach)
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         done => done,
     }
 }
 
-/// The SID of the owner-rights principal, `S-1-3-4`, as the bytes an entry carries it in.
-const OWNER_RIGHTS_SID: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 3, 4, 0, 0, 0];
+/// The entries of the access list at `list`, each as the bytes it is stored in, in order.
+///
+/// # Safety
+///
+/// `list` is null or points at a list that lives for the call.
+unsafe fn entries_of(list: *mut ACL) -> Vec<Vec<u8>> {
+    let mut entries = Vec::new();
+    if list.is_null() {
+        return entries;
+    }
+    // SAFETY: the list is valid, as the caller says.
+    for index in 0..u32::from(unsafe { (*list).AceCount }) {
+        let mut entry: *mut std::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: the list is valid, `index` is below its count, and `entry` is a live out
+        // parameter; the entry is read only as far as its own header says it reaches.
+        let stored = unsafe {
+            if GetAce(list, index, &raw mut entry) == 0 {
+                break;
+            }
+            std::slice::from_raw_parts(
+                entry.cast::<u8>(),
+                usize::from((*entry.cast::<ACE_HEADER>()).AceSize),
+            )
+            .to_vec()
+        };
+        entries.push(stored);
+    }
+    entries
+}
 
-/// Whether the access list of the open file begins with the entry the seal puts first: one that
-/// denies the owner-rights principal the right to write attributes. The handle was opened with the
-/// right to read the list.
-fn begins_with_the_seals_entry(file: &File) -> io::Result<bool> {
-    let mut list: *mut ACL = std::ptr::null_mut();
-    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-    // SAFETY: the handle is the open file's own, and `list` and `descriptor` are live out
-    // parameters; the descriptor owns the list and is freed after its last use below.
-    let status = unsafe {
-        GetSecurityInfo(
-            file.as_raw_handle(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
+/// Whether the access list of the open file is the seal's own, every entry of it: the list
+/// [`sealed_list`] writes for a file, nothing added and nothing missing. The handle was opened with
+/// the right to read the list.
+fn has_the_seals_list(file: &File) -> io::Result<bool> {
+    let wide: Vec<u16> = sealed_list(false).encode_utf16().chain([0]).collect();
+    let mut sealed: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: `wide` is null-terminated and outlives the call, and `sealed` is a live out
+    // parameter; the size is not asked for.
+    let parsed = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wide.as_ptr(),
+            SDDL_REVISION_1,
+            &raw mut sealed,
             std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &raw mut list,
-            std::ptr::null_mut(),
-            &raw mut descriptor,
         )
     };
-    if status != 0 {
-        return Err(io::Error::from_raw_os_error(status.cast_signed()));
+    if parsed == 0 {
+        return Err(io::Error::last_os_error());
     }
-    let mut first: *mut std::ffi::c_void = std::ptr::null_mut();
-    // SAFETY: `list` is the file's list, which `descriptor` keeps alive, and the entry is read
-    // only after the call says it exists and only as far as its own header says it reaches.
-    let sealed = !list.is_null()
-        && unsafe { GetAce(list, 0, &raw mut first) } != 0
-        && unsafe {
-            let header = first.cast::<ACE_HEADER>();
-            let entry = first.cast::<ACCESS_DENIED_ACE>();
-            let sid_at = std::mem::offset_of!(ACCESS_DENIED_ACE, SidStart);
-            u8::try_from(ACCESS_DENIED_ACE_TYPE).is_ok_and(|kind| (*header).AceType == kind)
-                && usize::from((*header).AceSize) >= sid_at + OWNER_RIGHTS_SID.len()
-                && (*entry).Mask & FILE_WRITE_ATTRIBUTES != 0
-                && std::slice::from_raw_parts(
-                    (&raw const (*entry).SidStart).cast::<u8>(),
-                    OWNER_RIGHTS_SID.len(),
-                ) == OWNER_RIGHTS_SID
+    let mut present = 0;
+    let mut defaulted = 0;
+    let mut seal: *mut ACL = std::ptr::null_mut();
+    // SAFETY: `sealed` is the descriptor just built, and the three outputs are live.
+    let found = unsafe {
+        GetSecurityDescriptorDacl(sealed, &raw mut present, &raw mut seal, &raw mut defaulted)
+    };
+    let result = if found == 0 || present == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        let mut list: *mut ACL = std::ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: the handle is the open file's own, and `list` and `descriptor` are live out
+        // parameters; the descriptor owns the list and is freed after its last use below.
+        let status = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &raw mut list,
+                std::ptr::null_mut(),
+                &raw mut descriptor,
+            )
         };
-    // SAFETY: `descriptor` was allocated by the call above and is freed exactly once.
+        if status == 0 {
+            // SAFETY: both lists are valid until their descriptors are freed, which is below.
+            let same = unsafe { entries_of(list) == entries_of(seal) };
+            // SAFETY: `descriptor` was allocated by the call above and is freed exactly once.
+            unsafe {
+                LocalFree(descriptor);
+            }
+            Ok(same)
+        } else {
+            Err(io::Error::from_raw_os_error(status.cast_signed()))
+        }
+    };
+    // SAFETY: `sealed` was allocated by the conversion above and is freed exactly once.
     unsafe {
-        LocalFree(descriptor);
+        LocalFree(sealed);
     }
-    Ok(sealed)
+    result
+}
+
+/// Opens the one name `name` inside the directory `directory` is open on, never what a link there
+/// leads to, with the given access and share mode.
+///
+/// The name is resolved against the handle by the system, in one step and without a path, which is
+/// what `openat` is where it exists: nothing above the handle is consulted, so nothing that is
+/// changed above it, or in the directory since the handle was opened, can send the open elsewhere.
+/// A link is opened as itself, and a caller who needs to know checks the attributes of what it got.
+///
+/// # Errors
+///
+/// Returns the operating system's error, and [`io::ErrorKind::NotFound`] for a name whose removal
+/// is already pending, which nothing can open and which is going.
+fn open_inside(directory: &File, name: &[u16], access: u32, share: u32) -> io::Result<File> {
+    // One component: a separator would leave the directory, and the whole-path forms the native
+    // call reads would too.
+    if name.is_empty()
+        || name
+            .iter()
+            .any(|unit| *unit == 0 || *unit == u16::from(b'\\') || *unit == u16::from(b'/'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a name opened inside a directory is one component",
+        ));
+    }
+    let length = u16::try_from(name.len() * 2)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the name is too long"))?;
+    let mut text = name.to_vec();
+    let object_name = UNICODE_STRING {
+        Length: length,
+        MaximumLength: length,
+        Buffer: text.as_mut_ptr(),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: u32::try_from(size_of::<OBJECT_ATTRIBUTES>()).unwrap_or(0),
+        RootDirectory: directory.as_raw_handle(),
+        ObjectName: &raw const object_name,
+        Attributes: OBJ_DONT_REPARSE,
+        SecurityDescriptor: std::ptr::null(),
+        SecurityQualityOfService: std::ptr::null(),
+    };
+    let mut handle: HANDLE = std::ptr::null_mut();
+    let mut status_block = IO_STATUS_BLOCK::default();
+    // SAFETY: `handle` and `status_block` are live out parameters; `attributes` points at
+    // `object_name`, whose buffer is `text`, and all three live to the end of this function, past
+    // the call. `directory` is a handle borrowed for the call, used as the root the name resolves
+    // against. The options open an existing name only, so nothing is created. As `CreateFileW`
+    // does, the access carries the right to wait on the handle and to read its attributes.
+    let status = unsafe {
+        NtOpenFile(
+            &raw mut handle,
+            access | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
+            &raw const attributes,
+            &raw mut status_block,
+            share,
+            FILE_OPEN_REPARSE_POINT | FILE_OPEN_FOR_BACKUP_INTENT | FILE_SYNCHRONOUS_IO_NONALERT,
+        )
+    };
+    if status == STATUS_SUCCESS {
+        // SAFETY: the call above filled `handle` with a file handle this owns and closes once.
+        return Ok(unsafe { File::from_raw_handle(handle) });
+    }
+    if status == STATUS_DELETE_PENDING {
+        return Err(io::Error::from(io::ErrorKind::NotFound));
+    }
+    // SAFETY: the status is the one the call returned; this only maps it to a Win32 code.
+    let code = unsafe { RtlNtStatusToDosError(status) };
+    Err(io::Error::from_raw_os_error(code.cast_signed()))
 }
 
 /// Opens `path` itself, never what a link there leads to, with the given access and share mode.
@@ -890,11 +1125,11 @@ fn open_name(path: &Path, access: u32, share: u32) -> io::Result<File> {
         .open(path)
 }
 
-/// Deletes the name `path` through a handle opened for the purpose, so that a file other names
-/// share is not changed in any way, and a name goes at once even while a program has the file
+/// Deletes the name `reach` reaches through a handle opened for the purpose, so that a file other
+/// names share is not changed in any way, and a name goes at once even while a program has the file
 /// open with its delete shared.
-fn delete_name(path: &Path) -> io::Result<()> {
-    mark_for_deletion(&open_name(path, DELETE, SHARE_ALL)?)
+fn delete_name(reach: Reach<'_>) -> io::Result<()> {
+    mark_for_deletion(&reach.open(DELETE, SHARE_ALL)?)
 }
 
 /// Marks the object `file` is open on for deletion, with POSIX semantics and the system's rule for
