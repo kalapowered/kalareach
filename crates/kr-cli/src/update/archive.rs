@@ -4,10 +4,11 @@
 //! So what it can make this host do is bounded first, and nothing is written until every entry has
 //! been looked at. An entry count and a size beyond what a release is are refused; so is every entry
 //! that is not a file or a directory, that is encrypted or compressed in a way a release is not, that
-//! is named twice, or whose name Windows would read as another ([`kr_ipc::install::names`]): an
-//! absolute or drive path, a parent, a device, a stream, a name that ends in a dot, two names that
-//! differ only in case. Then each file is read from the entry for no more than the entry says it
-//! holds, so an entry that lies about its size writes no more than it declared.
+//! carries extra data, that is named twice, or whose name Windows would read as another
+//! ([`kr_ipc::install::names`]): an absolute or drive path, a parent, a device, a stream, a name that
+//! ends in a dot, two names that differ only in case. Then each file is read from the entry for no
+//! more than the entry says it holds, so an entry that lies about its size writes no more than it
+//! declared.
 //!
 //! What the archive holds is then held to the manifest by [`super::release::check_files`], as the
 //! files of a `.tar.gz` are.
@@ -278,14 +279,14 @@ const DEFLATED: usize = 8;
 ///
 /// The parser follows the last end record, and when an entry it reads does not parse it falls back
 /// to an earlier end record, found by its signature anywhere in the file, and sizes what it keeps
-/// for the entries that record counts before anything here checks them. The fixed fields of an
-/// entry can spell the signatures of such a record, in a release no fault of whose, so the
-/// fallback is closed where it begins: no entry judged here fails to parse. In zip 8.6.0 an entry
-/// fails to parse by its extra data (each kind of field has lengths or content it refuses, and the
-/// Unicode path and comment fields a checksum), by its method when that is the one that needs an
-/// encryption field, and by nothing else: the other fields of its record are taken whatever they
-/// hold, and a name is decoded without failing. So an entry carries no extra data, and its method
-/// is stored or deflated, which are the two a release uses.
+/// for the entries that record counts before anything here checks them. The fixed fields of an entry
+/// can spell the signatures of such a record (a checksum is any four bytes, and no release is at
+/// fault for it), so the fallback is closed where it begins: no entry judged here fails to parse. In
+/// zip 8.6.0 an entry fails to parse by its extra data (each kind of field has lengths or content it
+/// refuses, and the Unicode path and comment fields a checksum), by its method when that is the one
+/// that needs an encryption field, and by nothing else: the other fields of its record are taken
+/// whatever they hold, and a name is decoded without failing. So an entry carries no extra data, and
+/// its method is stored or deflated, which are the two a release uses.
 ///
 /// Returns the refusal where the archive is not of this shape, or beyond the limits.
 fn read_tail(
