@@ -87,6 +87,8 @@ pub enum Request {
     /// The names of the profiles whose variables or command integrations a restore left out of
     /// the configuration it applied, so that the person can add them again: `kr backup restore`.
     Restore,
+    /// The settings schema and path a terminal profile was written to: `kr host terminal-profile`.
+    TerminalProfile,
 }
 
 /// Content the person asked to read.
