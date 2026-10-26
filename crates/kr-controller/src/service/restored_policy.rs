@@ -14,6 +14,7 @@ use kr_protocol::hostinfo::{DoctorCheck, DoctorStatus};
 use kr_protocol::organisation::HostPolicyConfirmResult;
 
 use super::Controller;
+use crate::authority::AdmittedMutation;
 use crate::error::{ControllerError, Result};
 use crate::grants::RemoteRefusal;
 use crate::grants::restored::{self, Found, Kept};
@@ -25,11 +26,16 @@ const WAITS_REMEDY: &str = "Read what this host holds with `kr organisation list
      --confirm` at this machine. Until then no remote device is served, owner devices \
      included, and the person at this machine is not refused. The policy is the restored one: \
      confirming changes none of it. A host that reads an authority feed and has not reached it \
-     since it started cannot tell whether it is behind it, so confirm once it has: the wait \
-     comes back at the first pass that reads the feed and finds the host behind. Ending \
-     exclusive organisation management takes an owner device's confirmation, which this wait \
-     refuses, or the terminal's when no owner device is left that can confirm, so confirm \
-     first and end it afterwards.";
+     since it started cannot tell whether it is behind it, so confirm once it has. A \
+     confirmation made earlier ends the wait, and the host then serves remote devices from the \
+     registry as restored, a device that an owner revoked through the feed after the copy \
+     among them, until the first pass that reads the feed finds the host behind and raises the \
+     wait again. Ending exclusive organisation management takes an owner device's \
+     confirmation, which this wait refuses, or the terminal's when no owner device is left \
+     whose grant could confirm, which the wait does not change. A host that is exclusively \
+     organisation-managed cannot withdraw its last enrolment until exclusive management has \
+     ended, so on such a host end it first where the terminal can, and otherwise confirm \
+     first.";
 
 /// As [`WAITS_REMEDY`], for a record of the restore that cannot be read.
 const UNREADABLE_REMEDY: &str = "Read what this host holds with `kr organisation list`, and end \
@@ -39,11 +45,16 @@ const UNREADABLE_REMEDY: &str = "Read what this host holds with `kr organisation
      then no remote device is served, owner devices included, and `kr host update` to a \
      release that lists the record's store is refused when the update check cannot read the \
      record either. A host that reads an authority feed and has not reached it since it \
-     started cannot tell whether it is behind it, so confirm once it has: the wait comes back \
-     at the first pass that reads the feed and finds the host behind. Ending exclusive \
-     organisation management takes an owner device's confirmation, which this wait refuses, or \
-     the terminal's when no owner device is left that can confirm, so confirm first and end it \
-     afterwards.";
+     started cannot tell whether it is behind it, so confirm once it has. A confirmation made \
+     earlier ends the wait, and the host then serves remote devices from the registry as \
+     restored, a device that an owner revoked through the feed after the copy among them, \
+     until the first pass that reads the feed finds the host behind and raises the wait \
+     again. Ending exclusive organisation management takes an owner device's confirmation, \
+     which this wait refuses, or the terminal's when no owner device is left whose grant could \
+     confirm, which the wait does not change. A host that is exclusively \
+     organisation-managed cannot withdraw its last enrolment until exclusive management has \
+     ended, so on such a host end it first where the terminal can, and otherwise confirm \
+     first.";
 
 impl Controller {
     /// What a start does about the record of a restore: reads it, decides whether the host waits,
@@ -175,25 +186,37 @@ impl Controller {
     /// `host.policy.confirm`: the person at this machine confirms the policy this host holds,
     /// which ends the wait. Nothing about the policy changes.
     ///
+    /// The admission the call was accepted under is asked again where the record is removed, under
+    /// the record's lock and the registry's guard, in the order every service takes them: the call
+    /// can wait for the lock behind a finding, which waits for the writes to the pairing records
+    /// that were under way, and the registration or the deadline can lapse meanwhile.
+    ///
     /// # Errors
     ///
     /// Returns a refusal while the host is still catching up with its feed, since the policy is
-    /// not yet the one it will hold, and an error when the record cannot be removed: the wait
-    /// stands then.
-    pub(super) async fn confirm_the_restored_policy(&self) -> Result<ParamsValue> {
+    /// not yet the one it will hold, the way the admission lapsed when it did, and an error when
+    /// the record cannot be removed: the wait stands then.
+    pub(super) async fn confirm_the_restored_policy(
+        &self,
+        carried: AdmittedMutation,
+    ) -> Result<ParamsValue> {
         let lifted = {
             let mut kept = self.restored_policy.lock().await;
-            if !self.policy().restored_policy_waits() {
-                false
-            } else if self.policy().behind_its_feed() {
+            if self.policy().behind_its_feed() {
                 return Err(ControllerError::PermissionDenied {
                     detail: "this host is still catching up with its authority feed, so the \
                              policy it holds is not yet the one it will hold; confirm it once \
                              the host has caught up"
                         .to_owned(),
                 });
+            } else if !self.policy().restored_policy_waits() {
+                false
             } else {
-                kept.lift()?;
+                {
+                    let registry = self.registry.lock().await;
+                    self.check_admission(&registry, &carried)?;
+                    kept.lift()?;
+                }
                 self.move_a_feed_refusal(
                     RemoteRefusal::RESTORED_POLICY_WAITS,
                     false,
@@ -289,6 +312,36 @@ mod tests {
         (directory, Kept::new(file))
     }
 
+    /// A client at this machine, registered at the revision in force, and the admission of a call
+    /// it makes that runs out at `deadline`, or a minute from now when none is given.
+    fn admitted(
+        controller: &Controller,
+        deadline: Option<kr_transport::clock::ContinuousInstant>,
+    ) -> (kr_protocol::ids::ConnectionId, AdmittedMutation) {
+        let revision = controller.policy().authority_revision();
+        let connection_id = kr_protocol::ids::ConnectionId::new(kr_ipc::new_uuid());
+        let actor = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
+        controller.admitted_table().insert(
+            connection_id,
+            crate::service::AdmittedConnection::local(
+                actor,
+                revision,
+                kr_protocol::local::LocalClientKind::Cli,
+            ),
+        );
+        let carried = AdmittedMutation {
+            connection_id,
+            admitted_revision: revision,
+            deadline: deadline.or_else(|| {
+                controller
+                    .clock
+                    .now()
+                    .checked_add(std::time::Duration::from_secs(60))
+            }),
+        };
+        (connection_id, carried)
+    }
+
     /// A mirror that cannot be read is a wait, and the record naming the row comes first. A record
     /// that cannot be written stops the start, so the mirror is not replaced and the only evidence
     /// of what it held is not lost.
@@ -375,7 +428,8 @@ mod tests {
         assert!(controller.restored_policy_waits());
 
         let held = controller.restored_policy.lock().await;
-        let mut confirmation = std::pin::pin!(controller.confirm_the_restored_policy());
+        let (_, carried) = admitted(&controller, None);
+        let mut confirmation = std::pin::pin!(controller.confirm_the_restored_policy(carried));
         let mut finding = std::pin::pin!(controller.find_the_policy_restored());
         let pending = |name: &'static str, polled: std::task::Poll<()>| {
             assert!(polled.is_pending(), "{name} waits for the lock");
@@ -414,6 +468,30 @@ mod tests {
 
         let temp = kr_ipc::testing::TempHost::create();
         let controller = daemon(&temp).await;
+        let (_, carried) = admitted(&controller, None);
+        controller
+            .move_a_feed_refusal(
+                RemoteRefusal::BEHIND_ITS_FEED,
+                true,
+                HostPolicy::behind_its_feed,
+                HostPolicy::set_behind_its_feed,
+            )
+            .await;
+        let refused = controller.confirm_the_restored_policy(carried).await;
+        assert!(
+            matches!(&refused, Err(ControllerError::PermissionDenied { detail }) if detail.contains("catching up")),
+            "a host that knows it is behind its feed but has not yet written the record is still \
+             catching up, and nothing waited yet to be lifted: {refused:?}"
+        );
+        controller
+            .move_a_feed_refusal(
+                RemoteRefusal::BEHIND_ITS_FEED,
+                false,
+                HostPolicy::behind_its_feed,
+                HostPolicy::set_behind_its_feed,
+            )
+            .await;
+
         controller
             .find_the_policy_restored()
             .await
@@ -426,7 +504,7 @@ mod tests {
                 HostPolicy::set_behind_its_feed,
             )
             .await;
-        let refused = controller.confirm_the_restored_policy().await;
+        let refused = controller.confirm_the_restored_policy(carried).await;
         assert!(
             matches!(&refused, Err(ControllerError::PermissionDenied { detail }) if detail.contains("catching up")),
             "{refused:?}"
@@ -451,12 +529,77 @@ mod tests {
             )
             .await;
         let confirmed: HostPolicyConfirmResult = controller
-            .confirm_the_restored_policy()
+            .confirm_the_restored_policy(carried)
             .await
             .expect("the host has caught up")
             .to_typed()
             .expect("an answer");
         assert!(confirmed.lifted);
         assert!(!controller.restored_policy_waits());
+    }
+
+    /// A confirmation can wait for the record's lock behind a finding, which waits for the writes
+    /// to the pairing records that were under way. The registration or the deadline it was
+    /// accepted under can lapse meanwhile, and then it removes nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_confirmation_whose_admission_lapses_while_it_waits_for_the_record_removes_nothing() {
+        use crate::service::a_floor_owed_its_record::daemon;
+
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = daemon(&temp).await;
+        controller
+            .find_the_policy_restored()
+            .await
+            .expect("the finding is written down");
+        let record = || {
+            restored::read(&restored::file_beside(
+                &controller.paths().registry_database(),
+            ))
+        };
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+
+        // The registration is withdrawn while the call waits for the lock.
+        let (connection, carried) = admitted(&controller, None);
+        let held = controller.restored_policy.lock().await;
+        let mut confirmation = std::pin::pin!(controller.confirm_the_restored_policy(carried));
+        assert!(
+            std::future::Future::poll(confirmation.as_mut(), &mut cx).is_pending(),
+            "the call waits for the lock"
+        );
+        controller.admitted_table().remove(&connection);
+        drop(held);
+        let refused = confirmation.await;
+        assert!(
+            matches!(&refused, Err(ControllerError::PermissionDenied { .. })),
+            "a registration withdrawn while the call waited: {refused:?}"
+        );
+        assert!(controller.restored_policy_waits(), "the wait stands");
+        assert!(matches!(record(), Found::Record(_)), "with its record");
+
+        // The deadline passes while the call waits for the lock.
+        let (_, carried) = admitted(&controller, Some(controller.clock.now()));
+        let held = controller.restored_policy.lock().await;
+        let mut confirmation = std::pin::pin!(controller.confirm_the_restored_policy(carried));
+        assert!(std::future::Future::poll(confirmation.as_mut(), &mut cx).is_pending());
+        drop(held);
+        let refused = confirmation.await;
+        assert!(
+            matches!(&refused, Err(ControllerError::WindowExpired { .. })),
+            "a deadline that passed while the call waited: {refused:?}"
+        );
+        assert!(controller.restored_policy_waits(), "the wait stands");
+        assert!(matches!(record(), Found::Record(_)), "with its record");
+
+        // The control: an admission that stands lifts it.
+        let (_, carried) = admitted(&controller, None);
+        let confirmed: HostPolicyConfirmResult = controller
+            .confirm_the_restored_policy(carried)
+            .await
+            .expect("an admission that stands")
+            .to_typed()
+            .expect("an answer");
+        assert!(confirmed.lifted);
+        assert_eq!(record(), Found::Missing);
     }
 }
