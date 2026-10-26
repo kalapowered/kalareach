@@ -812,6 +812,49 @@ pub fn a_refused_detach_is_consumed_with_the_hint(kind: ShellKind) {
         .unwrap_or_else(|why| panic!("a refused detach left nothing working: {why}"));
 }
 
+/// A cancellation is not the gesture again: a read that ends with no key resolved leaves the key
+/// before it as the last one, and a decision taken on that key would detach the next attachment.
+pub fn a_cancellation_after_a_detach_does_not_detach_the_next_attachment(kind: ShellKind) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    session.forget_events();
+    assert!(session.answered("kr-ready"));
+
+    let (enter, fence) = session.fenced_prompt(1);
+    session.type_bytes(CTRL_D);
+    let (id, event) = session.expect_event("eof_detach", |event| {
+        matches!(event, BridgeEvent::EofDetach(_))
+    });
+    let BridgeEvent::EofDetach(detach) = event else {
+        unreachable!()
+    };
+    assert_eq!(detach.fence_id, fence.fence_id);
+    session.answer_event(id, detached(attachment_id(1)));
+
+    // A second attachment takes the input at the same prompt, and the worker fences the reader for
+    // it. The exchange after the publication is answered only once the reader has read both.
+    let second = fence_for(&enter, fence_id(2), attachment_id(2), epoch(5));
+    session.publish(&second);
+    let _ = session.fence_exchange(&enter, fence_id(3));
+
+    // The second attachment cancels the line. That is its own key, and it ends this reader. The
+    // events are in the order the reader sent them, so a decision taken on the cancellation is
+    // counted before the next prompt's entry, which is what this waits for.
+    let decisions = session.events.managed_decisions();
+    session.type_bytes(CTRL_C);
+    let _ = session.next_prompt();
+    assert_eq!(
+        session.events.managed_decisions(),
+        decisions,
+        "a cancellation was decided as the end-of-file gesture the attachment before it made"
+    );
+    assert!(
+        session.alive(),
+        "the cancellation ended the shell instead of the line"
+    );
+}
+
 /// `detach-condition-exclusions`: outside the condition the editor keeps the key.
 pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
     let package = Package::built(kind);
