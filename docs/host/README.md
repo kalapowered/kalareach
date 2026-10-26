@@ -7309,9 +7309,10 @@ and before the boundary that writes its dispatch marker, with the receipt still 
 broker issues and spends the token when the action comes back with the plan in hand
 (`docs/plugins/runtime.md`, "An action a component prepares"). A plan the broker refuses rejects
 the receipt, because nothing was dispatched. An action that answers through its connector's
-decision destination does not cross into the runtime: no component prepares the answer, so no token
-is issued, and the broker writes the answer from the connector's table under the approval's own
-claim.
+decision destination is not prepared by a component, so no token is issued. The answer is written
+by whoever read the request: the broker writes it from the connector's table under the approval's
+own claim when the table read it, the component that read it is asked to encode it, outside the
+boundary, and a bridge channel's request is the host's to answer.
 
 ### Capability evidence
 
