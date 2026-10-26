@@ -2731,6 +2731,13 @@ fn collect(
     // What an earlier removal left because a program that holds nothing ran from the release. It
     // goes first, so that a release this run moves into the trash and cannot finish removing is
     // told once, as that release, and not again as something left there.
+    #[cfg(windows)]
+    if let Err(error) = store.sweep_trash(update) {
+        not_removed.push(NotRemoved {
+            what: Remains::Trash,
+            reason: said(&error),
+        });
+    }
     // Without the current release no release can be judged unneeded, so none is removed.
     let (current, releases) = match store
         .current()
@@ -2760,13 +2767,6 @@ fn collect(
                 reason: said(&error),
             }),
         }
-    }
-    #[cfg(windows)]
-    if let Err(error) = store.sweep_trash(update) {
-        not_removed.push(NotRemoved {
-            what: Remains::Trash,
-            reason: said(&error),
-        });
     }
     (removed, not_removed)
 }
