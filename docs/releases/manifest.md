@@ -217,8 +217,8 @@ must sign and how many are made, two by default): `root-key.pk8`, `snapshot-key.
 `timestamp-key.pk8` and one `targets-<n>.pk8` for each signer, with a root that names each role's own
 key. A host checks no snapshot or timestamp of the update channel, but a root has a key for each
 role, and each is a key of its own. A run that proves the pipeline
-signs with those and throws them away with the run; the channel's own keys are in hardware and on
-offline media, never in a tree, an archive or a repository.
+signs with those and throws them away with the run; the channel's own keys are to be held in
+hardware and on offline media (none exists yet), never in a tree, an archive or a repository.
 
 ## Publishing
 
@@ -255,7 +255,7 @@ search path admits its own release instead. Its first command checks the release
 channel's root as `kr host install` does and puts it in the user's store of releases. Where the
 store holds no release yet, that root is the one the release carries, so the first install rests on
 the package manager's checksum of the archive; once a release is current, a new one is checked
-against the newer of that release's root and the one the host recorded at its last switch. The
+against the newest of that release's root, the one the host recorded at its last switch and the roots of an update still recorded or one that failed. The
 command then runs as the store's copy, so the daemon, the workers and the helpers never run from the package manager's directory.
 When another release is current, the first command packs the new one as a release archive and hands
 it to the current release's `kr` as an update, which switches to it or waits for a live worker as
