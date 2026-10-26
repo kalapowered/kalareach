@@ -56,6 +56,14 @@ mod window {
     /// window on can leave the loop waiting for ever, with nothing to say so.
     const READY_BOUND: Duration = Duration::from_secs(300);
 
+    /// How long the check as a whole is given once the window loop is ready.
+    ///
+    /// Each wait inside the check has a bound of its own, and together they come to under eleven
+    /// minutes; this is for a call that has none, such as building the window or reading its
+    /// title, which a web view that never answers leaves blocked for ever. It is longer than all
+    /// of those waits together.
+    const CHECK_BOUND: Duration = Duration::from_secs(6 * LIVENESS.as_secs());
+
     /// How long the application is given to end once the check has its verdict.
     ///
     /// The check is over by then. A web view that is torn down in a session with no desktop can
@@ -118,12 +126,27 @@ mod window {
             let runtime = Arc::clone(&runtime);
             let recorded = Arc::clone(&recorded);
             std::thread::spawn(move || {
+                // A call inside the check that never returns is a failed check, not one that waits
+                // for ever: the bound runs from here to the verdict, and the waits inside the check
+                // keep their own.
+                let decided = Arc::new(AtomicBool::new(false));
+                let deciding = Arc::clone(&decided);
+                std::thread::spawn(move || {
+                    std::thread::sleep(CHECK_BOUND);
+                    if !deciding.load(Ordering::SeqCst) {
+                        eprintln!(
+                            "host_events: the check reached no verdict within {CHECK_BOUND:?}"
+                        );
+                        std::process::exit(1);
+                    }
+                });
                 // A failed expectation inside the scripted worker panics this thread; it is a
                 // failed check like any other, and must not leave the window loop running.
                 let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     check(&handle, &runtime, worker)
                 }))
                 .unwrap_or_else(|_| Err("the check panicked".to_owned()));
+                decided.store(true, Ordering::SeqCst);
                 let code = match checked {
                     Ok(()) => {
                         println!("host_events: the page heard each event as it was published");
