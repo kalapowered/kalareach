@@ -9014,20 +9014,25 @@ async fn kr_req_13_11_the_answers_recorded_for_the_page_are_the_ones_a_worker_gi
     wired.close().await;
     let _ = std::fs::remove_dir_all(&root);
 
-    let answers = serde_json::to_string_pretty(&serde_json::Value::Object(recorded))
-        .expect("serialises")
-        + "\n";
+    let recorded = serde_json::Value::Object(recorded);
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/shell-launch/answers.json");
     if std::env::var_os("KR_WRITE_FIXTURES").is_some() {
+        let answers = serde_json::to_string_pretty(&recorded).expect("serialises") + "\n";
         std::fs::create_dir_all(path.parent().expect("a directory")).expect("the directory");
         std::fs::write(&path, &answers).expect("the answers are recorded");
         return;
     }
-    let held = std::fs::read_to_string(&path).unwrap_or_default();
+    // The values are compared, not their text: the page reads values, whatever order a serialiser
+    // writes the members in.
+    let held: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or(serde_json::Value::Null);
     assert!(
-        held == answers,
+        held == recorded,
         "the page is drawn from answers a worker no longer gives; set KR_WRITE_FIXTURES=1 to record \
-         them again:\n{answers}"
+         them again:\n{}",
+        serde_json::to_string_pretty(&recorded).expect("serialises")
     );
 }
