@@ -1954,10 +1954,10 @@ type Answered = Option<
 ///
 /// Each attachment's presentation and the reason for it travel in the worker's snapshot rather
 /// than in the session read, and the launch surface is a read of its own, so each is asked on the
-/// same connection. Each is a further question, asked within [`QUESTION_BOUND`]: a worker that
-/// cannot answer one, or does not answer it in time, leaves the session read standing, and the
-/// command says that what the question was about was not read rather than failing or holding back
-/// the whole status.
+/// same connection. Each is a further question, asked within [`QUESTION_BOUND`] and only once the
+/// one before has been answered: a worker that cannot answer one, or does not answer it in time,
+/// leaves the session read standing, and the command says that what the questions were about was
+/// not read rather than failing or holding back the whole status.
 ///
 /// The worker's release is checked first, so the worker asked for the launch surface is one that
 /// serves it.
@@ -1990,18 +1990,25 @@ async fn read_session(
         ),
     )
     .await;
+    // The next question goes on the same connection, so it is asked only once this one has been
+    // answered: an answer that came late would reach it first and be taken for its own.
+    let answered = asked.is_ok();
     let attachments = attachments_read(asked.ok());
-    let asked = tokio::time::timeout(
-        QUESTION_BOUND,
-        client.request(
-            Method::ShellLaunchSurface,
-            &kr_protocol::root::ShellLaunchSurfaceParams {
-                session_id: descriptor.session_id,
-            },
-        ),
-    )
-    .await;
-    let launch_surface = answer_read(asked.ok());
+    let launch_surface = if answered {
+        let asked = tokio::time::timeout(
+            QUESTION_BOUND,
+            client.request(
+                Method::ShellLaunchSurface,
+                &kr_protocol::root::ShellLaunchSurfaceParams {
+                    session_id: descriptor.session_id,
+                },
+            ),
+        )
+        .await;
+        answer_read(asked.ok())
+    } else {
+        answer_read(None)
+    };
     Ok((
         read,
         Further {
