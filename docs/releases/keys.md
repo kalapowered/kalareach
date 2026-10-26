@@ -34,7 +34,7 @@ TUF client parsed them, so in a root the pipeline did not build, one key written
 found as one, and the key ceremony reduces those. A root that names one key under two identifiers
 in a single role is refused by `kr-release verify` and by a host, and the pipeline does not look for
 it. The channel root names a key of its own for each of its four roles, the
-snapshot and timestamp roles included, though a host verifies no signature by those two and does not require them. The release tool's and the host's comparison of a channel root look at the 32 bytes of each key, so neither finds a key's negation or a small-order shift of it; the catalogue pipeline's comparison does read the spellings of a key and finds an elliptic-curve key's negation, which a host's comparison of a catalogue root does not. A host that holds an
+snapshot and timestamp roles included, though a host verifies no signature by those two and does not require them. The release tool's and the host's comparison of a channel root look at the 32 bytes of each Ed25519 key, so neither finds a key's negation or a small-order shift of it. The catalogue pipeline's comparison reads the spellings of a key and finds the negation of an ECDSA key, which a host's comparison of a catalogue root does not; neither of those finds the negation or a small-order shift of an Ed25519 key. A host that holds an
 update channel root made by an older `kr-release dev-keys`, which gave the root key to three roles,
 is installed again in a new store.
 
