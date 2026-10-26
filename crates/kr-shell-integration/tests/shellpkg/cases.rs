@@ -2080,7 +2080,9 @@ fn worker_side(reason: LaunchRejectionReason) -> bool {
     matches!(
         reason,
         // `revoked` has its own case; the rest are the worker's answers when the reader is gone,
-        // has left, or is not the one the transaction was reserved against.
+        // has left, or is not the one the transaction was reserved against. The PowerShell reader
+        // also gives `editor_left`, for a launch it reads while its editor is not reading, and that
+        // has a case of its own.
         LaunchRejectionReason::Revoked
             | LaunchRejectionReason::ConfirmationLost
             | LaunchRejectionReason::SessionClosing

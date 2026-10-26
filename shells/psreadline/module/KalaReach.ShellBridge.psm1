@@ -1086,9 +1086,10 @@ function Invoke-KalaReachReadLine {
     $script:State.EditMode = try { "$((Get-PSReadLineOption).EditMode)" } catch { 'Emacs' }
     Send-KrEditorEnter
     # The reader is about to read and has nothing left, which is one of the three points a worker
-    # retries a withheld fence at. Only the report goes out here: the editor clears its buffer when
-    # its read starts, so a line installed before that is a line nobody would ever run, and the
-    # mailbox is read at the reader's own next boundary instead.
+    # retries a withheld fence at. The entry's own event, above, has already read the mailbox, and
+    # a launch is refused there: the editor clears its buffer when its read starts, so a line
+    # installed before that is a line nobody would ever run. The next launch is decided at the
+    # reader's next boundary instead.
     Send-KrReaderIdle
     $script:State.IdleReported = $true
 

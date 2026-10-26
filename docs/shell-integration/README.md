@@ -514,7 +514,9 @@ named. The reason decides what the caller is told:
 
 The PowerShell reader also gives `buffer_not_empty` for an argument vector whose first word names no
 application, or that names a batch program and would not reach it as named, because it has no line
-to install.
+to install. It gives `editor_left` for a launch it reads while its editor is not reading, before a
+read has started or after it has ended, because the editor clears its buffer when a read starts and
+a command installed then would never run.
 
 Section 23 lists the preconditions of `shell.launch` as `terminal.input`, the current input lease, a
 qualified root editor, an empty prompt and fence, the working-directory revision and the launch
@@ -849,10 +851,10 @@ method, and that is exactly what it cannot do:
   for, except the keys of the Vi command table, goes through the module, which runs the editor's
   operation and then reads the queue, unless the editor's own key queue still holds keys, which go
   first. The read-line entry reports the reader and reads the mailbox once, before the editor's read
-  starts, and the editor clears its buffer when its read starts. The module has no check of its own
-  that holds a launch back from that one read; what keeps one from reaching it is the contract's order,
-  since a launch quotes a fence the worker publishes only after the reader has acknowledged one. A
-  key the person bound to a script of their own is theirs and carries no boundary, and an ordinary
+  starts, and the editor clears its buffer when its read starts. A launch the module reads there is
+  refused with `editor_left`, because a line installed before the read would never run. The
+  contract's order also keeps one from reaching it, since a launch quotes a fence the worker
+  publishes only after the reader has acknowledged one. A key the person bound to a script of their own is theirs and carries no boundary, and an ordinary
   character goes straight to the editor's own insertion, so a request that arrives at a parked
   reader is answered after its next bound key that leaves the editor's queue empty rather than
   immediately; in the Vi command table that is a bound key of the insert table or the next read-line
