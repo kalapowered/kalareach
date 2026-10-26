@@ -525,6 +525,11 @@ fn a_transition_persists_the_first_answer_wins_and_cancellation_and_expiry_stay_
 /// reads its question again on a new connection after a disconnect; and a later execution under
 /// the same name and the same process identifier is refused the old question and, asking with the
 /// same request identifier, is given a new question rather than the old decision.
+///
+/// KR-ACC-018, the parts about reconnect and thread-change invalidation: the same application reads
+/// its question again with its token under a new connection identifier, a later execution inherits
+/// nothing, and with no bridge describing the application no binding revision is claimed. Not shown
+/// here: a connection that ends, or the invalidation by a switch a bridge reports.
 #[test]
 fn a_question_is_the_applications_for_a_day_and_a_later_execution_inherits_nothing() {
     let questions = Questions::open(None, session(), SessionEpoch::V1).expect("the ledger opens");
