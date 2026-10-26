@@ -303,7 +303,7 @@ account, grants the signing application the Certificate Profile Signer role on i
 `certificate-profile-name` in the workflow. If the new profile's certificate subject differs,
 `KR_SIGNING_SUBJECT` in the workflow and `$releasePublisher` in `scripts/check-windows-signature-gate.ps1`
 change with it, and so do the subject in the table at the top of this page, the description of
-`wrong-publisher` below, the release notes text the workflow writes and `WINGET_PUBLISHER` in
+`wrong-publisher` above, the release notes text the workflow writes and `WINGET_PUBLISHER` in
 `scripts/package-managers.py`. Artefacts signed under the old profile keep verifying;
 their timestamps say when they were signed and the chain is unchanged. Retire the old profile after
 the change has shipped, not before.
@@ -350,9 +350,14 @@ run is suspected, or signing access must be revoked immediately:
    - A run that could use the weakened environment could read the Apple Developer ID certificate, its
      password and the notary key (`docs/releases/keys.md`), and copying them leaves no Azure signature
      and no sign in the logs. They stay valid outside GitHub.
-   - The project owner revokes the certificate and the notary key in the Apple developer account and
-     issues new ones. No macOS release is signed until the new ones are in the new environment, and the
-     old ones are never put there.
+   - The project owner revokes the notary key in App Store Connect, which stops the copied key from
+     notarising at once. The Apple developer account cannot revoke a Developer ID certificate: the
+     owner asks Apple to revoke it by email to `product-security@apple.com`, saying that its private
+     key is compromised, and creates a new Developer ID certificate in the account. Apple's revocation
+     stops users installing any app the old certificate signed, so each macOS release it signed has to
+     be signed again with the new certificate and published under a new tag.
+   - No macOS release is signed until the new certificate and notary key are in the new environment,
+     and the old ones are never put there.
 6. Controlled restoration via identity and subject rotation (Required):
    - A GitHub Actions OIDC token assertion (`iss`, `aud`, `sub`) is bound to the repository and
      environment subject, not the Azure Client ID. Restoring under the same subject or reusing the old
@@ -366,7 +371,7 @@ run is suspected, or signing access must be revoked immediately:
         `release-tree.yml` (macOS and Linux trees), and the Apple signing and notarisation secrets and the variables with their
         identifiers are read behind it, so the new environment takes over those too: it gets the
         replacement credentials of step 5 and never the old ones, and the compromised environment is
-        deleted or archived only once both workflows name the new one.
+        deleted only once both workflows name the new one.
      2. The Entra application administrator creates a new application registration and service principal,
         configured with a federated credential scoped strictly to the new environment subject
         (`repo:kalapowered@290383971/kalareach@1371146076:environment:release-signing-v2`). The old
