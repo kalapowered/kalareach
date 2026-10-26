@@ -331,9 +331,11 @@ fn an_install_adds_a_profile_and_a_place_in_the_list_and_a_removal_takes_them_ou
         assert_eq!(person.remove(&places).expect("removes"), Removed::Removed);
         assert_eq!(person.list(), list_before, "the list is as it was");
         assert_eq!(person.default(), default_before);
+        // `list-recursively` prints every key of the schema with its default, so a profile with
+        // nothing set reads as one that was never there.
         assert_eq!(
             person.keys_of(&uuid),
-            "",
+            person.keys_of("ffffffffffffffffffffffffffffffff"),
             "none of the profile's keys is set any more"
         );
         assert!(person.record().profiles().expect("reads").is_empty());
