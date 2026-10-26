@@ -831,6 +831,8 @@ export interface FakeTerminalView {
   readonly control: TerminalControl
   /** How many reads of the launch surface the page made on this view's link. */
   readonly launchReads: number
+  /** How many of them it made before the view had published its first state. */
+  readonly launchReadsWhileOpening: number
   /** Grants the take in force, as the session would. */
   grantControl(): void
   /** Refuses the take in force, for `reason`, as the session would. */
@@ -4010,6 +4012,7 @@ function fakeTerminalView(
   }
   let last: TerminalViewState | null = null
   let launchReads = 0
+  let launchReadsWhileOpening = 0
   const publish = (state: TerminalViewState) => {
     if (closed) return
     last = state
@@ -4056,6 +4059,9 @@ function fakeTerminalView(
     },
     get launchReads() {
       return launchReads
+    },
+    get launchReadsWhileOpening() {
+      return launchReadsWhileOpening
     },
     grantControl() {
       answerTake(true)
@@ -4195,14 +4201,19 @@ function fakeTerminalView(
       // controls the program. A view that has ended answers nothing.
       launchSurface: () => {
         launchReads += 1
+        if (last === null) launchReadsWhileOpening += 1
         return closed || ended
           ? refused('TERMINAL_UNAVAILABLE', 'This view has ended.')
-          : launch.read(wanted && leased)
+          : last === null
+            ? refused('TERMINAL_UNAVAILABLE', 'This view is still opening.')
+            : launch.read(wanted && leased)
       },
       launch: (press) =>
         closed || ended
           ? refused('LEASE_LOST', 'This view has ended, and took nothing.')
-          : launch.press(wanted && leased, press),
+          : last === null
+            ? refused('TERMINAL_UNAVAILABLE', 'This view is still opening.')
+            : launch.press(wanted && leased, press),
       close: () => {
         closed = true
         return Promise.resolve()
