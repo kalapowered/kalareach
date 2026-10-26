@@ -1437,7 +1437,8 @@ application's executable by digest: a build the release's entry in the repositor
 names for this host's platform. Qualified builds arrive with a synchronisation, so the bridges are
 brought up to date after every sync as well. A recipe is refused, and the journal says why, when the
 signed index names no qualified build of an executable of the application, when no such executable
-is on the search path, when an executable there is not one a qualified build names, and when the
+is on the search path, when an executable there is a script, when an executable there is not one a
+qualified build names, and when the
 version a qualified build names is outside the range the recipe is written for. `docs/plugins/catalogue.md` has what is checked before anything is
 written and what a removal leaves.
 
