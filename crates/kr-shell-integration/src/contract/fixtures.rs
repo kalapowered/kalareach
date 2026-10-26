@@ -3645,9 +3645,10 @@ fn psreadline_chord_gesture() -> Scenario {
     };
     Scenario {
         id: "psreadline-chord-gesture".to_owned(),
-        purpose: "Windows uses the configured PSReadLine gesture, which is a chord rather than a \
-                  byte: the configured chord carries the detach and any other chord is the \
-                  editor's own."
+        purpose: "A gesture that is a chord rather than a byte, which the contract allows an \
+                  editor with no line-discipline character: the configured chord carries the \
+                  detach and any other chord is the editor's own. The worker's accept names the \
+                  default byte today, and the module reports no gesture on Windows."
             .to_owned(),
         covers: covers(&["KR-REQ-07.73", "KR-REQ-07.74"]),
         shells: vec![ShellKind::PowerShell],

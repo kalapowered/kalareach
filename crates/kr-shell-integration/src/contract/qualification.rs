@@ -604,7 +604,11 @@ pub enum DetachExclusion {
 }
 
 impl DetachExclusion {
-    /// The ten states that exclude the detach condition, in evaluation order.
+    /// The ten states that exclude the detach condition, in the order the specification lists them.
+    ///
+    /// [`detach_eligibility`] does not evaluate them in this order: it judges where the character
+    /// came from before it looks at the buffer, so a character from a macro or a paste is
+    /// [`Self::MacroInput`] or [`Self::Paste`] whatever the buffer holds.
     ///
     /// [`Self::NotManagedRootEditor`] is not among them: it is the requirement that the contract
     /// applies at all, and a reader that fails it is not a managed root editor being excluded.

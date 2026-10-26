@@ -860,7 +860,7 @@ cargo run -p kr-shell-integration --bin kr-shell-fixtures -- --check
 | `eof-stale-fence`, `eof-missing-fence` | A detach the worker refuses, and a gesture the bridge consumes with one hint per prompt |
 | `eof-repeated-after-detach` | A repeated gesture that cannot adopt the next attachment's identity, and the hint a refused detach prints |
 | `eof-after-detach-succession` | No new fence until the old queues drain, and the next attachment's own fence when they do |
-| `veof-change`, `veof-disabled`, `psreadline-chord-gesture` | A reassigned gesture taking effect at the next prompt, a terminal with no gesture, and the configured Windows chord |
+| `veof-change`, `veof-disabled`, `psreadline-chord-gesture` | A reassigned gesture taking effect at the next prompt, a terminal with no gesture, and a gesture that is a chord rather than a byte |
 | `acceptance-mixed-context` | A recorded origin, a mixed one and an unverifiable one, what `kr detach` resolves to in each case, and a lease change that does not move it |
 | `editor-leave-boundaries` | The five reader boundaries a leave is reported at, and a stale leave that is ignored |
 | `retry-at-entry-and-leave` | A retry at the reader's next entry, and a leave that releases what was held |
