@@ -65,6 +65,7 @@ pub mod doctor;
 pub mod error;
 pub mod export;
 pub mod helper;
+pub mod hold;
 pub mod import;
 pub mod machine;
 pub mod network;

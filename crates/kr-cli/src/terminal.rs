@@ -698,6 +698,22 @@ mod unix {
             })
         }
 
+        /// Throws away what has been typed and not yet read.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error when the terminal will not do it.
+        pub fn discard_input(&self) -> Result<()> {
+            rustix::termios::tcflush(&self.handle, rustix::termios::QueueSelector::IFlush).map_err(
+                |error| {
+                    CliError::Terminal(shown!(
+                        "discard the terminal's queued input: {}",
+                        crate::shown::errno(error)
+                    ))
+                },
+            )
+        }
+
         /// Puts the terminal into raw mode and returns the modes that were replaced.
         ///
         /// # Errors

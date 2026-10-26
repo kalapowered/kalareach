@@ -465,10 +465,15 @@ impl Host {
     /// to `kr new` itself, whose environment is the one the session's shell starts from: a
     /// window's shell is not interactive, and does not pass a prompt on.
     fn create_in_window(&self, then: &str) -> (Window, Created) {
+        self.create_in_window_with("", then)
+    }
+
+    /// [`Self::create_in_window`] with more options for `kr new`.
+    fn create_in_window_with(&self, options: &str, then: &str) -> (Window, Created) {
         let window = Window::open(
             self,
             &format!(
-                "env 'PS1={PROMPT}' {} new --attach --headless --shell /bin/sh \
+                "env 'PS1={PROMPT}' {} new --attach {options} --headless --shell /bin/sh \
                  --shell-mode native_compat --startup interactive --cwd {}; printf '\\nnew-%s-%s\\n' finished \"$?\"; {then}",
                 quoted(&kr()),
                 quoted(&self.work)
@@ -505,6 +510,33 @@ impl Host {
                 worker,
                 root,
             },
+        )
+    }
+
+    /// Opens a window whose shell runs `kr new --attach` against a host that is not there and has
+    /// no startup chosen, so the command fails before a session exists, then prints how `kr`
+    /// ended and waits for a line.
+    ///
+    /// `before` runs first in the window's shell.
+    fn window_whose_new_fails(&self, options: &str, before: &str) -> Window {
+        let (runtime, state) = (
+            self.root().join("no-host-run"),
+            self.root().join("no-host-state"),
+        );
+        for directory in [&runtime, &state] {
+            std::fs::create_dir_all(directory).expect("a directory");
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+                .expect("makes it the owner's alone");
+        }
+        Window::open(
+            self,
+            &format!(
+                "{before}env KR_RUNTIME_DIR={} KR_STATE_DIR={} {} new --attach {options}; \
+                 printf '\\nnew-%s-%s\\n' finished \"$?\"; IFS= read -r _",
+                quoted(&runtime),
+                quoted(&state),
+                quoted(&kr()),
+            ),
         )
     }
 
@@ -1667,6 +1699,38 @@ impl Window {
         until(what, || {
             (rustix::io::ioctl_fionread(&terminal).expect("reads what is waiting to be read") == 0)
                 .then_some(())
+        });
+    }
+
+    /// Waits until the terminal is in single-key mode, which is how `kr` waits for a key.
+    ///
+    /// The modes are the kernel's, read from the terminal device itself. `ended` is what the
+    /// window's shell prints once `kr` has ended: seeing it first means `kr` never waited, and the
+    /// wait fails there instead of running out its deadline. Start the wait after the line that
+    /// says the window is held, because an attachment leaves line mode too.
+    fn wait_until_single_key(&self, mark: usize, ended: &str, what: &str) {
+        let device = self
+            ._terminal
+            .master
+            .tty_name()
+            .expect("the terminal has a device");
+        let terminal = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
+            .open(&device)
+            .unwrap_or_else(|error| panic!("opens {}: {error}", device.display()));
+        until(what, || {
+            let shown = self.screen.since(mark);
+            assert!(
+                !contains(&shown, ended.as_bytes()),
+                "{what}: kr ended without waiting for a key: {}",
+                String::from_utf8_lossy(&shown).escape_debug()
+            );
+            let modes = rustix::termios::tcgetattr(&terminal).expect("reads the terminal's modes");
+            (!modes
+                .local_modes
+                .contains(rustix::termios::LocalModes::ICANON))
+            .then_some(())
         });
     }
 
@@ -4541,4 +4605,126 @@ fn the_question_commands_say_which_worker_they_did_not_read_and_who_does() {
         "nothing of the session was read or closed: {:?}",
         worker.asked()
     );
+}
+
+/// What a held window says once it waits.
+const HELD: &[u8] = b"press any key to close it";
+
+/// KR-REQ-01.21, KR-REQ-07.42: a window whose `kr new --attach --hold-on-failure` fails before a
+/// session exists stays open, in single-key mode, until a key is pressed, then ends with the
+/// status the same failure has without the option and puts its terminal back. What was typed
+/// before the failure is not that key, a terminate signal ends the wait with the terminal put
+/// back, and a `--json` run never waits.
+#[test]
+fn a_window_whose_new_fails_before_a_session_stays_until_a_key_is_pressed() {
+    let host = Host::start();
+
+    // The control: without the option the failure ends the command at once, with its status.
+    let plain = host.window_whose_new_fails("", "");
+    let without = plain.exit_status_after(0, "new-finished-", "kr new without the option ends");
+    assert_ne!(without, 0, "the host is not there, so the command fails");
+    assert!(
+        !contains(&plain.screen.since(0), HELD),
+        "a window without the option is not held"
+    );
+
+    // With the option the window waits, and one key ends it with the same status.
+    let held = host.window_whose_new_fails("--hold-on-failure", "");
+    held.wait_for(0, HELD, "the window says it is held");
+    held.wait_until_single_key(0, "new-finished-", "kr waits for a key");
+    held.type_text(b"x");
+    assert_eq!(
+        held.exit_status_after(0, "new-finished-", "the key ends the wait"),
+        without,
+        "the failure's status is the same with the option"
+    );
+    held.wait_until_put_back("the terminal came back when the key ended the wait");
+
+    // What was typed before the failure is thrown away: it is not the key. The gate keeps the
+    // window's shell from starting `kr` until the line is typed.
+    let gate = host.work.join("go-on");
+    let queued = host.window_whose_new_fails(
+        "--hold-on-failure",
+        &format!("cat {} >/dev/null; ", quoted(&gate)),
+    );
+    queued.type_text(b"q");
+    std::fs::write(&gate, b"go").expect("opens the gate");
+    queued.wait_for(0, HELD, "the window says it is held");
+    queued.wait_until_single_key(
+        0,
+        "new-finished-",
+        "what was typed before did not end the wait",
+    );
+    queued.type_text(b"x");
+    assert_eq!(
+        queued.exit_status_after(0, "new-finished-", "the key ends the wait"),
+        without
+    );
+
+    // A terminate signal ends the wait the way the signal would, with the terminal put back.
+    let signalled = host.window_whose_new_fails("--hold-on-failure", "");
+    signalled.wait_for(0, HELD, "the window says it is held");
+    signalled.wait_until_single_key(0, "new-finished-", "kr waits for a key");
+    let waiting = signalled.kr_process();
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(i32::try_from(waiting.pid.get()).expect("an identifier"))
+            .expect("an identifier"),
+        rustix::process::Signal::TERM,
+    )
+    .expect("signals the kr that waits");
+    assert_eq!(
+        signalled.exit_status_after(0, "new-finished-", "the signal ends the wait"),
+        128 + libc::SIGTERM,
+        "the window's shell sees kr ended by the signal"
+    );
+    signalled.wait_until_put_back("the terminal came back when the signal ended the wait");
+
+    // A run that asks for a document never waits.
+    let machine = host.window_whose_new_fails("--hold-on-failure --json", "");
+    machine.exit_status_after(0, "new-finished-", "a json run ends at once");
+    assert!(
+        !contains(&machine.screen.since(0), HELD),
+        "a json run is not held"
+    );
+}
+
+/// KR-REQ-01.21, KR-REQ-07.42: a window whose attachment is lost after the session was made waits
+/// for one key, not two, and ends with the status a lost connection has; a window whose session
+/// ends because its shell exited, with any status, closes with no key.
+#[test]
+fn a_window_held_after_its_attachment_needs_one_key_and_one_whose_shell_exited_none() {
+    let host = Host::start();
+
+    let (lost, created) = host.create_in_window_with("--hold-on-failure", "IFS= read -r _");
+    kill_own_child(&created.worker, "the worker");
+    lost.wait_for(0, HELD, "the window says it is held");
+    lost.wait_until_single_key(0, "new-finished-", "kr waits for a key");
+    lost.type_text(b"x");
+    lost.attachment_ended(
+        0,
+        "new-finished-",
+        CONNECTION_LOST,
+        CONNECTION_ENDED,
+        "the attachment whose connection was lost, ended by one key",
+    );
+    lost.wait_until_put_back("the terminal came back when the key ended the wait");
+    worker_killed(&created.worker);
+    host.wait_until_closed(&created.session_id.to_string());
+
+    let (alone, exited) = host.create_in_window_with("--hold-on-failure", "IFS= read -r _");
+    let exiting = alone.mark();
+    alone.type_text(b"exit 3\r");
+    alone.attachment_ended(
+        exiting,
+        "new-finished-",
+        NOT_CLEAN,
+        &exited_with(3),
+        "the only attachment of a session whose shell exited with status 3",
+    );
+    assert!(
+        !contains(&alone.screen.since(exiting), HELD),
+        "a shell's own exit is not held for"
+    );
+    alone.wait_until_put_back("the terminal came back when the session closed");
+    ended(&exited.root, "the shell that exited");
 }
