@@ -1024,15 +1024,15 @@ fn watch(root: kr_protocol::identity::ProcessStartIdentity) -> std::thread::Join
 /// two seconds output may drain for.
 ///
 /// The shell here is PowerShell with the console's interrupt turned into a key, which is the one
-/// request this platform makes of a shell. It reads the key, records when it did and goes on, so
-/// the grace is counted from the request the worker made and not from the close being asked for;
-/// where it records nothing the grace is counted from the close being asked for, which is no
-/// later than the request, and the case says so. The shell ended after the moment
-/// it was last seen running and before the moment it was first seen gone. A shell gone before
-/// five seconds after the request was forced early, and that fails at once. A shell not seen gone
-/// well past the five seconds, a final status recorded long after the drain and a watch that could
-/// not place the moments may each be a busy machine: that close shows nothing either way and is
-/// made again, and a worker that is late in every close fails.
+/// request this platform makes of a shell. It is slow to read the key, as a busy shell is, and
+/// records when it did. That moment is no bound on when the worker made the request, which can
+/// come any time before it, so the grace is counted from the worker's own record of having made
+/// the request. The shell ended after the moment it was last seen running and before the moment
+/// it was first seen gone. A shell gone before five seconds after the request was forced early, and
+/// that fails at once. A shell not seen gone well past the five seconds, a final status recorded
+/// long after the drain and a watch that could not place the moments may each be a busy machine:
+/// that close shows nothing either way and is made again, and a worker that is late in every
+/// close fails.
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_close_forces_what_ignores_it_only_after_five_seconds_and_records_the_final_status() {
@@ -1060,7 +1060,7 @@ async fn a_close_forces_what_ignores_it_only_after_five_seconds_and_records_the_
 #[cfg(windows)]
 async fn a_stubborn_shell_is_closed() -> Result<(), String> {
     use kr_ipc::identity::{ProcessState, process_state};
-    use std::time::{Instant, SystemTime};
+    use std::time::SystemTime;
 
     /// The grace section 7 gives an owned process between the request to stop and force, and the
     /// time it lets output drain after the owned processes have stopped. They are the specification's
@@ -1071,26 +1071,26 @@ async fn a_stubborn_shell_is_closed() -> Result<(), String> {
     const RECORD_ALLOWANCE: Duration = Duration::from_secs(1);
     /// How close to a moment a sample has to be to speak for it.
     const RESOLUTION: Duration = Duration::from_millis(50);
-    /// How long the request may take from the worker writing it to the shell reading the key.
-    const REQUEST_LATENCY: Duration = Duration::from_millis(250);
+    /// How long the shell sleeps before it reads the key the worker wrote.
+    const READ_DELAY: Duration = Duration::from_millis(600);
     /// How far past five seconds after the request the shell may be first seen gone and still be
     /// held to the grace.
     ///
-    /// The worker looks for survivors every 50 ms and then forces; where the shell records no
-    /// request it also takes the close up some moments after the close was asked for. A shell not
-    /// seen gone later than that shows nothing either way: a grace that ran on for seconds and a
-    /// watch that was late look the same from here.
+    /// The worker looks for survivors every 50 ms and then forces. A shell not seen gone later
+    /// than that shows nothing either way: a grace that ran on for seconds and a watch that was
+    /// late look the same from here.
     const GRACE_TOLERANCE: Duration = Duration::from_secs(2);
 
-    // The shell ignores the interrupt as a signal and reads it as a key, records the time it read
-    // it at, which is the request as the worker made it, and goes on sleeping. A shell that cannot
-    // read keys sleeps from the start and records nothing.
+    // The shell ignores the interrupt as a signal and reads it as a key, late, records the time it
+    // read it at and goes on sleeping. A shell that cannot read keys sleeps from the start and
+    // records nothing.
     let marks = tempfile::tempdir().expect("a directory on the internal disk");
     let asked_file = marks.path().join("asked");
     let shell = format!(
         "[Console]::TreatControlCAsInput = $true; \
          Write-Host -NoNewline 'kr-stubborn-ready.'; \
          try {{ \
+           Start-Sleep -Milliseconds {}; \
            while ($true) {{ \
              $key = [Console]::ReadKey($true); \
              if ($key.KeyChar -eq [char]3) {{ \
@@ -1101,6 +1101,7 @@ async fn a_stubborn_shell_is_closed() -> Result<(), String> {
            }} \
          }} catch {{ }}; \
          Start-Sleep -Seconds 300",
+        READ_DELAY.as_millis(),
         asked_file.display()
     );
     let host = host_running(kr_worker::testing::powershell_command(&shell)).await;
@@ -1115,7 +1116,6 @@ async fn a_stubborn_shell_is_closed() -> Result<(), String> {
     let shell_watch = watch(root.clone());
 
     // Closing is set at once, whatever the shell does about the request.
-    let requested = Instant::now();
     let requested_at = SystemTime::now();
     let (acceptance, gate) = host.runtime.close(ClosureReason::CloseRequested);
     assert_eq!(
@@ -1136,37 +1136,37 @@ async fn a_stubborn_shell_is_closed() -> Result<(), String> {
 
     // The shell ignores the request, so it is there until the five seconds are over, and is forced
     // then. It ended after how long past the request it was last seen running, and before how long
-    // past the request it was first seen gone. The request is when the shell read the key, which
-    // is no earlier than the worker wrote it; with no record of that it is when the close was
-    // asked for, which is no later than the worker wrote it.
+    // past the request it was first seen gone. The request is when the worker's own record says it
+    // had made it: the five seconds are counted from after that, so a shell gone sooner was forced
+    // early however late the shell read the key.
     let seen = tokio::task::spawn_blocking(move || shell_watch.join().expect("the watch ends"))
         .await
         .expect("the watch is waited for");
-    let asked = std::fs::read_to_string(&asked_file)
+    let read = std::fs::read_to_string(&asked_file)
         .ok()
         .and_then(|text| text.trim().parse::<u64>().ok())
         .map(|ms| SystemTime::UNIX_EPOCH + Duration::from_millis(ms))
         .and_then(|read_at| read_at.duration_since(requested_at).ok());
-    match asked {
+    match read {
         Some(after) => {
             eprintln!("the shell read the request {after:?} after the close was asked for")
         }
-        None => eprintln!(
-            "the shell recorded no request: the grace is counted from the close being asked for"
-        ),
+        None => eprintln!("the shell recorded no read of the request"),
     }
-    let (since, slack) = match asked {
-        Some(after) => (after, RESOLUTION + REQUEST_LATENCY),
-        None => (Duration::ZERO, RESOLUTION),
-    };
-    let at_most = seen.gone.duration_since(requested).saturating_sub(since);
+    let request = host
+        .runtime
+        .session()
+        .stop_requested_at()
+        .expect("the worker made its request to stop before it forced anything");
+    let at_most = seen.gone.saturating_duration_since(request);
     assert!(
-        at_most + slack >= GRACE_PERIOD,
-        "the shell was gone at most {at_most:?} after the request, before the five seconds were up"
+        at_most >= GRACE_PERIOD,
+        "the shell was gone at most {at_most:?} after the worker's request, before the five \
+         seconds were up"
     );
-    let at_least = seen.running.duration_since(requested).saturating_sub(since);
+    let at_least = seen.running.saturating_duration_since(request);
     let mut missed = Vec::new();
-    if at_least + slack < GRACE_PERIOD || at_most > GRACE_PERIOD + GRACE_TOLERANCE {
+    if at_least + RESOLUTION < GRACE_PERIOD || at_most > GRACE_PERIOD + GRACE_TOLERANCE {
         missed.push(format!(
             "the shell ended between {at_least:?} and {at_most:?} after the request, which the \
              five seconds cannot be held to"

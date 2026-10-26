@@ -441,6 +441,9 @@ pub struct Session {
     /// When the terminal's foreground has been read, for this host's own tests.
     #[cfg(feature = "testing")]
     foreground_reads: std::sync::Mutex<Vec<std::time::Instant>>,
+    /// When the request to stop last returned, for this host's own tests.
+    #[cfg(feature = "testing")]
+    stop_requested: Option<std::time::Instant>,
     /// The session's live agent instances, and how many announcements it has made about them.
     agent_instances: AgentInstances,
     /// Why the last interrupt this session tried did not reach the foreground group.
@@ -746,6 +749,8 @@ impl Session {
             idle_sweep: crate::lifecycle::IDLE_SWEEP_INTERVAL,
             #[cfg(feature = "testing")]
             foreground_reads: std::sync::Mutex::new(Vec::new()),
+            #[cfg(feature = "testing")]
+            stop_requested: None,
             agent_instances: AgentInstances::default(),
             interrupt_failed: None,
             reconsidered_at: (0, 0),
@@ -4957,7 +4962,20 @@ impl Session {
         if let Some(owned) = self.owned.as_ref() {
             crate::ownership::request_stop(owned);
         }
+        #[cfg(feature = "testing")]
+        {
+            self.stop_requested = Some(std::time::Instant::now());
+        }
         outcome
+    }
+
+    /// Returns when [`Session::request_stop`] last returned, for this host's own tests: a closure
+    /// counts the five seconds it allows before force from no earlier than this. It compiles to
+    /// nothing without the `testing` feature, and no shipped build enables it.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub const fn stop_requested_at(&self) -> Option<std::time::Instant> {
+        self.stop_requested
     }
 
     /// Forces whatever is left of the owned group to stop.
