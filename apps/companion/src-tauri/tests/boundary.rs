@@ -329,10 +329,9 @@ const GENERAL_STEMS: [&str; 7] = [
 /// The first command in `table` whose name carries a general stem, with that stem.
 ///
 /// A command is exempt only where the table maps it to a protocol method and the name spells that
-/// method's wire name (`shell_launch` and `shell.launch`, `plugin_action_invoke` and
-/// `plugin.action.invoke`). The daemon serves such a method only under its own preconditions: a
-/// launch at a verified empty prompt, an action that is registered, under the actor's grant, its
-/// effect class, the revisions and the input, draft and request preconditions. A name that merely
+/// method's wire name (`plugin_action_invoke` and `plugin.action.invoke`). The daemon serves such a
+/// method only under its own preconditions: an action that is registered, under the actor's grant,
+/// its effect class, the revisions and the input, draft and request preconditions. A name that merely
 /// resembles an exempt one, or a command that performs no such method, is refused.
 fn first_general_command<'a>(
     table: &[(&'a str, Option<kr_protocol::method::Method>)],
