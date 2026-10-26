@@ -131,8 +131,8 @@ struct HostScript {
     windows: Mutex<Vec<String>>,
     /// Answer this many of the next reads with this error instead of a result.
     refuse_reads_with: Mutex<Option<(ErrorCode, u32)>>,
-    /// Answer every read of this method with this error instead of a result, as a host that does
-    /// not list the method does.
+    /// Answer every read of this method with this error instead of a result: as a host that does
+    /// not list the method does, or one whose worker does not serve it.
     refuse_method_with: Mutex<Option<(kr_protocol::method::Method, ErrorCode)>>,
     /// Answer every mutation with a correlated protocol error instead of a receipt.
     refuse_mutations_with: Mutex<Option<ErrorCode>>,
@@ -1289,6 +1289,40 @@ async fn a_launch_surface_refused_once_and_then_answered_is_served() {
             .await
             .expect("the read is answered"),
         kr_client::LaunchSurfaceRead::Served(launch_surface())
+    );
+    assert!(
+        tokio::time::timeout(Duration::ZERO, session.denied())
+            .await
+            .is_err(),
+        "nothing was raised"
+    );
+
+    session.close();
+    serving.abort();
+}
+
+/// KR-REQ-13.11: a host that refuses the launch surface once as not permitted, answers the probe,
+/// and then refuses it as an unsupported capability is a host whose worker does not serve the read:
+/// not served, and nothing is raised.
+#[tokio::test]
+async fn a_launch_surface_refused_as_not_permitted_and_then_as_unsupported_is_not_served() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    *script.refuse_reads_with.lock().await = Some((ErrorCode::PermissionDenied, 1));
+    *script.refuse_method_with.lock().await = Some((
+        kr_protocol::method::Method::ShellLaunchSurface,
+        ErrorCode::UnsupportedCapability,
+    ));
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+
+    assert_eq!(
+        session
+            .read_launch_surface(SessionId::new(Uuid::from_bytes([5; 16])))
+            .await
+            .expect("the read is answered"),
+        kr_client::LaunchSurfaceRead::NotServed
     );
     assert!(
         tokio::time::timeout(Duration::ZERO, session.denied())

@@ -7846,9 +7846,9 @@ impl WorkerService {
         let params: kr_protocol::root::ShellLaunchSurfaceParams = parse(params)?;
         let session = self.runtime.session();
         Self::check_session(&session, params.session_id)?;
-        // The editor and the input lease are what the live screen shows, and the control daemon
-        // refuses a grant the live screen to every read of it that does not reach it, whatever
-        // history it reaches.
+        // The editor and the input lease are what the live screen shows. The control daemon
+        // refuses every read of that screen to a grant whose scope leaves it out, whatever history
+        // the grant reaches, and this read keeps the same rule.
         let shown = caller
             .history_filter(Method::ShellLaunchSurface.entry())
             .is_some_and(|filter| {
