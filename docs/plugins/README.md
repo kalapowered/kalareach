@@ -523,9 +523,9 @@ A control may narrow its action's parameters but never widen them. It may omit a
 shorten a text limit, tighten a range, offer a subset of the choices, and require what the action
 treats as optional. It may not introduce a parameter the action does not declare, accept values the
 action would reject, treat a required parameter as optional, or omit one. A form's fields are
-checked the same way against its submit action. The host checks every invocation against the
-action's schema, so a control that promises otherwise is a control that fails when somebody uses
-it.
+checked the same way against its submit action. The host checks each invocation against the
+action's schema, except one of a `presentation` action, whose arguments this host reads and checks
+not at all, so a control that promises otherwise is a control that fails when somebody uses it.
 
 The bound is what makes the parameter hash in the action token mean something. A callback is bound
 to the actor, the grant, the application and thread revision, the declared action and the hash of
