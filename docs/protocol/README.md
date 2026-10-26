@@ -773,7 +773,9 @@ acknowledged an operation in progress; or input, an interrupt, a refused launch 
 changed the worker's picture after the fence was proved. `verified` carries the prompt generation,
 the acknowledged buffer revision and the working-directory revision; a launch does not quote the
 last. The reader checks the real buffer when the launch arrives, so a read can say `verified` while
-a key waits in the terminal's queue, and the launch is then refused with `DRAFT_CONFLICT`.
+a key waits in the terminal's queue, and the launch is then refused with `EDITOR_BUSY`, since the
+queued key is input the reader has not read; an editor whose own state had moved (the buffer, its
+revision, the prompt or the working directory) is `DRAFT_CONFLICT`.
 
 `input` is `held_here` when an attachment of the asking connection holds the input lease,
 `held_elsewhere` when another connection holds it, `free` when nobody does, and `withheld` when the
@@ -807,7 +809,9 @@ fence acknowledgement that arrives after its hold expired publishes nothing.
 worker's hold because the two measure on their own clocks. The decision between installing and
 cancelling belongs to the reader, in the step where it reads its mailbox: the frames on the bridge
 endpoint are ordered, the worker revokes the transaction when its hold expires, and the reader
-checks for that revocation in the same atomic step in which it would install. The caller's answer
+checks for a revocation that has reached it in the same atomic step in which it would install. One
+still in transit is not seen, and the reader's acceptance that follows is recorded as a late
+installation. The caller's answer
 then waits for the reader's word: `EDITOR_BUSY` when it installed nothing, the installed result when
 it had already installed, and `OUTCOME_UNKNOWN` when the reader can no longer answer at all. The
 host installs no command by any other means.
