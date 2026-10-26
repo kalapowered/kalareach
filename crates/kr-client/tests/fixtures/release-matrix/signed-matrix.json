@@ -1,0 +1,58 @@
+{
+  "web_commit": "344b69882b484a7b97033dffe66f0b362fc64347",
+  "public_key": "lOhDFfwmeoqNasWggWcMkjONZPzFN_wWPJb_d_HYZEo",
+  "signing_input_hex": "a1736b722d72656c656173652d6d61747269782f31a665746965727382a562696472323032362d31302d636f6d70617469626c656572656c6179a2676d6178696d756d66312e322e3939676d696e696d756d65312e322e3066636c69656e74a2676d6178696d756d67302e37392e3939676d696e696d756d66302e37372e3069646973636f76657279a2676d6178696d756d66312e322e3939676d696e696d756d65312e322e306a636f6d70617469626c65f5a56269646f323032362d31302d63757272656e746572656c6179a2676d6178696d756d66312e332e3939676d696e696d756d65312e332e3066636c69656e74a2676d6178696d756d68302e37382e393920676d696e696d756d6720302e37382e3069646973636f76657279a2676d6178696d756d66312e332e3939676d696e696d756d65312e322e306a636f6d70617469626c65f4687265766973696f6e6132696973737565645f61746a323032362d31302d32376c616c7465726e61746976657383666469726563747173656c662d686f737465642d72656c61797573656c662d686f737465642d646973636f766572796e736368656d615f76657273696f6e01781c696e7374616c6c65645f636c69656e745f77696e646f775f64617973185a",
+  "published": {
+    "matrix": {
+      "schemaVersion": 1,
+      "revision": "2",
+      "issuedAt": "2026-10-27",
+      "note": "Prose the signature does not cover.",
+      "installedClientWindowDays": 90,
+      "alternatives": [
+        "direct",
+        "self-hosted-relay",
+        "self-hosted-discovery"
+      ],
+      "tiers": [
+        {
+          "id": "2026-10-compatible",
+          "compatible": true,
+          "note": "The tier every supported client can reach.",
+          "client": {
+            "minimum": "0.77.0",
+            "maximum": "0.79.99"
+          },
+          "relay": {
+            "minimum": "1.2.0",
+            "maximum": "1.2.99"
+          },
+          "discovery": {
+            "minimum": "1.2.0",
+            "maximum": "1.2.99"
+          }
+        },
+        {
+          "id": "2026-10-current",
+          "compatible": false,
+          "note": "What a current client is served by.",
+          "client": {
+            "minimum": " 0.78.0",
+            "maximum": "0.78.99 "
+          },
+          "relay": {
+            "minimum": "1.3.0",
+            "maximum": "1.3.99"
+          },
+          "discovery": {
+            "minimum": "1.2.0",
+            "maximum": "1.3.99"
+          }
+        }
+      ]
+    },
+    "signature": "2vZZMSm_mNiQ9vpfpqUJRXkKjoIQ5Me_rxtLl0q4UhtWSkphKWQwIasmp3tlridBLVNBF-KBefh0qlukWgmPCQ",
+    "signing_key": "lOhDFfwmeoqNasWggWcMkjONZPzFN_wWPJb_d_HYZEo",
+    "serve": null
+  }
+}

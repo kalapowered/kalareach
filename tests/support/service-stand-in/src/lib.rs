@@ -120,6 +120,7 @@
 mod feed;
 mod http;
 mod mailbox;
+mod matrix;
 mod organisation;
 mod relay;
 mod settings;
@@ -127,6 +128,7 @@ mod sync;
 mod web;
 
 pub use http::{Served, serve};
+pub use matrix::signed as signed_release_matrix;
 pub use organisation::{
     LEASE_SCOPE as ORGANISATION_LEASE_SCOPE, OrganisationAuthority,
     REFRESH_AFTER_SECONDS as ORGANISATION_REFRESH_AFTER_SECONDS,

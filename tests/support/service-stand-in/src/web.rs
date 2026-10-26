@@ -278,6 +278,8 @@ struct State {
     /// The status the token endpoint answers a refresh with instead of looking at it, when a test
     /// has the account system fail.
     token_endpoint_down: Option<u16>,
+    /// The reply the release matrix route publishes, as the text a test gave it.
+    release_matrix: Option<Vec<u8>>,
 }
 
 /// What the service did with one request.
@@ -885,6 +887,19 @@ impl ServiceWeb {
         self.arrived.lock().expect("what arrived").clone()
     }
 
+    /// Publishes `reply` at the release matrix route, exactly as given: a test that signs it with
+    /// [`signed_release_matrix`](crate::signed_release_matrix) serves a matrix a client accepts, and
+    /// one that alters the text serves what a client refuses.
+    pub fn publish_release_matrix(&self, reply: &[u8]) {
+        self.state.lock().expect("the state").release_matrix = Some(reply.to_vec());
+    }
+
+    /// Stops publishing: the route answers `501 NOT_CONFIGURED`, as the Worker does while it holds
+    /// no signing key.
+    pub fn withdraw_release_matrix(&self) {
+        self.state.lock().expect("the state").release_matrix = None;
+    }
+
     /// How many requests went to `path`, reaching the service or not.
     #[must_use]
     pub fn requests_to(&self, path: &str) -> usize {
@@ -1159,6 +1174,10 @@ impl ServiceWeb {
             let mut state = self.state.lock().expect("the state");
             return crate::relay::admit(&mut state.relay, &self.origin, document, self.now());
         }
+        if path == crate::matrix::PATH {
+            let state = self.state.lock().expect("the state");
+            return crate::matrix::answer(state.release_matrix.as_deref());
+        }
         if path == "/api/relay/payer-authorisation/sign-in" {
             let mut state = self.state.lock().expect("the state");
             let State { relay, tokens, .. } = &mut *state;
@@ -1379,6 +1398,23 @@ impl ServiceHttp for ServiceWeb {
             self.path_of(url),
             &document,
             bearer(headers).as_deref(),
+            None,
+        );
+        let answer = Self::delivered(handled);
+        Box::pin(async move { answer })
+    }
+
+    fn get_json<'a>(
+        &'a self,
+        url: &'a str,
+        _headers: &'a [(&'a str, &'a str)],
+    ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+        // The only read the service has is the release matrix, which is public: no body, no
+        // credential and no account.
+        let handled = self.handle(
+            self.path_of(url),
+            &serde_json::json!({ "body": null }),
+            None,
             None,
         );
         let answer = Self::delivered(handled);
