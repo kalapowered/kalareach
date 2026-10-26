@@ -459,15 +459,16 @@ async fn try_to_start(host: &kr_ipc::testing::TempHost) -> kr_controller::Result
 /// copy as it was. Going on would replace the copy and lose the only evidence of what it held.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_start_that_cannot_write_the_record_leaves_a_copy_it_cannot_read_as_it_was() {
-    let host = kr_ipc::testing::TempHost::create();
-    drop(try_to_start(&host).await.expect("a first start"));
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let stopped = Host::start(&owner).await.shut_down().await;
+    let host = stopped.tree();
     let registry = host.environment().registry_database();
     let copy = mirror::file_beside(&registry);
     std::fs::write(&copy, b"not a copy").expect("junk");
     std::fs::create_dir(restored::file_beside(&registry))
         .expect("something that is no file is in the record's place");
 
-    let error = try_to_start(&host)
+    let error = try_to_start(host)
         .await
         .expect_err("the start stops where the record cannot be written");
     assert!(
