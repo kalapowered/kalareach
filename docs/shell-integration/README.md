@@ -270,7 +270,7 @@ was typed unless that handler asks about it.
 | `command_accepted` | At acceptance, inside the fenced context, before the reader leaves | `session_id`, `fence_id`, `prompt_generation`, `origin` |
 | `command_resolve` | In front of an interactive invocation, before the command starts | `session_id`, `prompt_generation`, `argv`, `executable` (the absolute path the shell's own search resolved the name to), `interactive`, `cwd`, `cwd_revision` |
 | `command_block` | When a command starts and again when it ends | `session_id`, `prompt_generation`, `command`, `started_at_ms`, `duration_ms`, `exit_status`, `cwd`, `cwd_revision` |
-| `gesture_changed` | The line discipline's `VEOF` changed, or the configured PSReadLine gesture did | `session_id`, `gesture`, `effective_at` |
+| `gesture_changed` | The line discipline's `VEOF` changed or was disabled (the PowerShell module reports a Windows console's lack of one at its first prompt) | `session_id`, `gesture`, `effective_at` |
 | `pre_eof_consumed` | An eligible gesture was consumed because it could not be attributed | `session_id`, `prompt_generation`, `reason`, `hint_printed` |
 | `hooks_activated` | Once, after the user's startup files have run and before the first primary reader | `session_id`, `prompt_generation`, `modules` (each dynamic module the shell holds: `name`, `path`, and `imports`, which is `bound`, `{missing: <name>}` or `{not_read: <why>}`; empty for a shell that lists none) |
 | `integration_lost` | The hooks, the reader or the root shell have gone | `session_id`, `loss` (`post_startup_failure`, `semantic_hook_loss`, `bridge_disconnected`, `unqualified_root_replacement`), `detail` |
@@ -301,7 +301,8 @@ The nested objects those fields carry:
 Three ordering rules apply. Leaving invalidates the fence, so `command_accepted` is sent first, from
 the reader, inside the fence; a record sent after the leave could only ever say `unverifiable`. A
 `VEOF` reassignment takes effect at the prompt it names rather than mid-reader, because the
-character the reader is holding was typed under the gesture that was in force when it was typed. And
+character the reader is holding was typed under the gesture that was in force when it was typed (the
+PowerShell module moves its key binding a little later: see PSReadLine below). And
 a leave from a reader that has already been replaced is ignored: the worker compares the prompt
 generation and reader revision before it deregisters anything.
 
@@ -417,15 +418,20 @@ Three requests, each answered on the reader's own thread:
 | Request | Fields | The reader must | Answer |
 | --- | --- | --- | --- |
 | `fence` | `session_id`, `fence_id`, `prompt_generation`, `reader_revision`, `deadline_ms`, `cause` (`editor_entry`, `lease_change`, `retry`) | Read its key queues atomically under its own lock, and say which of the tty/typeahead, macro and partial-key queues are clear | `acknowledged` with `fence_id`, `reader_context`, `prompt_generation`, `reader_revision`, `queues`, `snapshot`, `editor`, `cwd_revision`; or `refused` with `reader_busy`, `queues_not_drained`, `reader_moved` or `cancellation_unavailable` |
-| `launch` | `session_id`, `transaction`, `fence_id`, `command`, `expected_prompt_generation`, `expected_buffer_revision`, `expected_cwd_revision`, `deadline_ms` | Check its actual state against every expectation and its own deadline, then install and submit or refuse, atomically | `accepted` with `transaction`, `fence_id`, `prompt_generation`, `buffer_revision`, `reader_revision`; or `rejected` with `transaction`, `fence_id`, `reason`, `prompt_generation`, `buffer_revision` |
+| `launch` | `session_id`, `transaction`, `fence_id`, `command`, `expected_prompt_generation`, `expected_buffer_revision`, `expected_cwd_revision`, `deadline_ms` | Check its actual state against every expectation and its own deadline, then install and submit or refuse, atomically | `accepted` with `transaction`, `installed` (the command exactly as the request carried it), `fence_id`, `prompt_generation`, `buffer_revision`, `reader_revision`; or `rejected` with `transaction`, `fence_id`, `reason`, `prompt_generation`, `buffer_revision` |
 | `cancel` | `session_id`, `sequence`, `epoch`, `prompt_generation`, `reader_revision` | End the pending key wait and keep the edit buffer | `cancelled` (which operations ended), `buffer_preserved`, `discarded_bytes`, echoing `sequence`, `epoch`, `prompt_generation` and `reader_revision` |
 
-A report or an answer that names a reader the worker did not ask is ignored rather than acted on,
-and so is a cancellation report whose `sequence` is not the one the worker is waiting on: the worker
-matches a cancellation report on that sequence alone. Two takeovers can happen at one prompt in one
-reader, and a departure can happen at the epoch a takeover just produced, which is why the
-cancellation carries a sequence of its own beside its epoch: neither the reader's identity nor the
-epoch tells one cancellation from the next.
+The worker matches what comes back to what it asked, and each kind is matched on its own key. A
+fence answer is matched on its fence identifier: one for an exchange the worker is no longer waiting
+on is ignored, and one for the current exchange that names another prompt generation or reader
+revision than the exchange was asked at is acted on, as a reader that has moved: the fence is
+withheld, the held input is released and `EDITOR_BUSY` is sent. A launch answer is matched on its
+transaction alone, and a cancellation report on its `sequence` alone, so a report whose `sequence`
+is not the one the worker is waiting on is ignored. A leave or an idle report from a reader the
+worker has already replaced is ignored. Two takeovers can happen at one prompt in one reader, and a
+departure can happen at the epoch a takeover just produced, which is why the cancellation carries a
+sequence of its own beside its epoch: neither the reader's identity nor the epoch tells one
+cancellation from the next.
 
 The takeover receipt waits on that report, and only for the hold. The lease change is acknowledged
 the moment it happens, because it stands whatever the reader says, and its acknowledgement says
@@ -454,9 +460,9 @@ Two clocks, so the decision between installing and cancelling belongs to one of 
 the reader, in the step where it reads its mailbox:
 
 - The worker holds input for 250 ms from the moment it reserves the fence. The reader's own budget is
-  200 ms from the moment it receives the request, and the request carries what is left of that
-  budget rather than the whole of it, so a worker that has already spent part of its hold shortens
-  the reader's window and never extends it.
+  200 ms, which the request carries and the reader counts from the moment it reads the request. The
+  worker sends 200 ms whatever time the request waits in its own queue: it does not shorten the
+  budget for that time.
 - When the hold expires the worker releases the held input, because that is what the hold was for,
   and sends `launch_revoked`. The frames on this endpoint are ordered, so a revocation the worker
   sent before the reader's atomic step and received by it is one that step sees, and the reader then
@@ -466,8 +472,11 @@ the reader, in the step where it reads its mailbox:
 - The caller's answer waits for the reader's word, not for the worker's timer. A rejection carries
   its own reason's code, which is `EDITOR_BUSY` for `revoked` and for every transition failure, and
   `DRAFT_CONFLICT` where the editor's own state had moved. It is then a fact rather than a guess.
-  An acceptance means the reader had already installed before it saw the revocation: the command is
-  in the editor, so the caller is told what happened and the session records the late installation.
+  An acceptance means the reader had installed the command when it answered, before it saw the
+  revocation: the caller is told what happened and the session records the late installation. A
+  reader can still read the revocation after it has answered and before the line is accepted, and
+  the Zsh, Bash and Fish readers then take the text back out and send no second answer, so the
+  caller can be told a command was installed that never ran.
 - Every cancellation works the same way, not just the timeout. A reader leave, a lease change, a
   detach or a lost integration all revoke a dispatched transaction and wait for the reader's word,
   because a refusal that claimed nothing was installed would be claiming something the worker cannot
@@ -543,8 +552,8 @@ binding, and `consume` continues the same reader call. `BridgeFenceView::decide`
 
 | The reader's situation | Decision | The hook returns |
 | --- | --- | --- |
-| The character is not the configured gesture | `native`, reason `not_the_gesture` | `native` |
 | `VEOF` is disabled | `native`, reason `gesture_disabled` | `native` |
+| The character is not the configured gesture | `native`, reason `not_the_gesture` | `native` |
 | The detach condition does not hold | `native`, with the named exclusion | `native` |
 | A fence is published for this exact reader | `eof_detach(fence_id, prompt_generation, input_epoch)` | `consume` |
 | No fence, or one from an earlier prompt or another reader revision | Consume, with at most one hint per prompt | `consume` |
@@ -563,7 +572,9 @@ the next attachment's identity.
 
 KR does not force `IGNORE_EOF` globally, and it preserves an existing user setting for native cases
 outside the detach condition. Explicit `exit`, a real read error and a genuine end of stream keep
-their normal closure behaviour.
+their normal closure behaviour, with one exception in the Bash bridge: it compares the character it
+is handed as a byte, and Readline hands it an end of stream as -1, so where `VEOF` is set to byte 255
+the hook takes each end of stream for the gesture.
 
 ### The detach condition
 
@@ -604,10 +615,13 @@ character typed at the current prompt is still judged by the gesture that was in
 typed. Disabled `VEOF` leaves the terminal with no gesture, so no character is one. On Windows the
 worker supplies the same default as on Unix, the terminal's end-of-file byte 4, in the accept, and the
 PSReadLine module puts its decision on Ctrl+d when its hooks go live. A Windows console has no line
-discipline to read an end-of-file character from, so at the first prompt the module reports the
-gesture as disabled, in every edit mode, and takes its decision off Ctrl+d again. From then on no key
-detaches the session there, and `kr detach --attachment <id>` is the way. The protocol also carries a
-gesture as a chord (`chord` with `keys`), which the module honours and the worker does not send.
+discipline to read an end-of-file character from, so when the first prompt begins the module reports
+the gesture as disabled, in every edit mode, effective at that prompt. It takes its decision off
+Ctrl+d when it promotes that report, which is at the first Ctrl+d pressed at the prompt or at the
+next prompt's entry, whichever comes first, and a Ctrl+d that promotes it runs `DeleteCharOrExit`
+whatever was bound to the key, which at an empty line ends the shell. From then on no key detaches
+the session there, and `kr detach --attachment <id>` is the way. The protocol also carries a gesture
+as a chord (`chord` with `keys`), which the module honours and the worker does not send.
 
 ## The fence and detach state machine
 
@@ -662,9 +676,9 @@ indefinitely.
 | Launch request in any other state | unchanged | Refuse with `EDITOR_BUSY` or, for a prompt that has moved, `DRAFT_CONFLICT`. Install nothing |
 | Launch answered | `fenced` | Answer the caller, release the held input in order. An acceptance records the requesting attachment as the origin of the line it installs |
 | Launch hold expiry | `fenced` | Revoke the transaction and release the held input in order. The caller's answer waits for the reader's confirmation |
-| The reader's confirmation after a revocation | unchanged | `revoked` is `EDITOR_BUSY`; an acceptance means the command is in the editor, so the caller is told that and the late installation is recorded |
+| The reader's confirmation after a revocation | unchanged | `revoked` is `EDITOR_BUSY`; an acceptance means the command was in the editor when the reader answered, so the caller is told that and the late installation is recorded (a reader that then reads the revocation before it accepts the line takes the text out again, and says nothing more) |
 | The bridge ends with a confirmation outstanding | `unfenced` or `outside` | Answer `OUTCOME_UNKNOWN`: nothing left can say whether the command reached the editor |
-| An acceptance for a transaction nobody is waiting for | unchanged | Record the installation: the editor holds a command whose transaction is over. It shows no breach by the package, because the answer may have crossed the revocation |
+| An acceptance for a transaction nobody is waiting for | unchanged | Record the installation: the editor held a command whose transaction is over. It shows no breach by the package, because the answer may have crossed the revocation |
 | Interrupt under the current epoch | unchanged | Interrupt. It bypasses the hold and accepts only the configured native action |
 | Command accepted | unchanged | Record the origin through the fenced context, which for an installed launch is the client that asked for it |
 | The integration lost its hooks or its bridge | `unfenced` | Invalidate the fence, cancel a launch, release the hold: nothing left can answer for the reader |
@@ -787,11 +801,19 @@ editor's own operations so the reader has a boundary to answer at and the states
 observable, and puts its end-of-file decision on the configured gesture in front of whatever was
 bound there. A handler the person wrote themselves is left exactly as it is, identified by what the
 editor holds rather than by the name a handler carries, and what the module installed is put back
-when it is removed, except where the person has since bound that key themselves. Two things hold for
-the key the gesture is on and for no other: the module binds its decision there in front of whatever
-was bound, the person's own script included, which it runs outside the detach condition, and when the
+when it is removed, except where the person has since bound that key themselves. Four things hold for
+the key the gesture is on and for no other. The module binds its decision there in front of whatever
+was bound, the person's own script included, which it runs outside the detach condition. When the
 decision comes off that key it writes back the binding it found and does not look at what the key
-holds by then.
+holds by then. In the Emacs and Vi edit modes the editor has an operation on Ctrl+d, which the module
+wraps like any other bound key before it binds the decision, so the binding it finds there is its own
+wrapper, and removing the module writes that wrapper back: Ctrl+d keeps calling the module's
+function and not the editor's operation. And the module moves its decision to a changed gesture's
+key when it promotes the change, which is the first end-of-file decision at the prompt the change
+names or the next prompt's entry, whichever comes first, and not when it reports the change: until
+then the new key has no decision on it, and the press of the old key that promotes the change runs
+what the new key held, or `DeleteCharOrExit` where it held nothing, in place of the old key's own
+binding.
 
 What it pins is a range rather than a release: PowerShell 7.4 or later with PSReadLine 2.3.4 up to
 3.0. The module declares the versions it found in its handshake and the worker refuses an editor
