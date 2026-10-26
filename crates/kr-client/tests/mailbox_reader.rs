@@ -395,6 +395,10 @@ async fn kr_req_20_05_an_item_accepted_once_is_refused_when_it_is_offered_again(
 /// dropped and the service is told it may remove it, whether it comes first or last on its page,
 /// and the paired sender's item between two of them, which the service holds after the first, is
 /// taken in the same pass.
+///
+/// KR-REQ-20.04, the part about the removed authority payload: an item whose routing record claims
+/// the kind `signed_authority_object` is not taken by this reader, first on its page or last, and
+/// does not stop the item the paired sender placed between them.
 #[tokio::test]
 async fn kr_req_20_05_an_item_whose_routing_names_an_unknown_kind_is_dropped_and_the_next_is_taken()
 {
@@ -424,6 +428,10 @@ async fn kr_req_20_05_an_item_whose_routing_names_an_unknown_kind_is_dropped_and
 
 /// KR-REQ-20.05: a page whose every item the reader cannot open is dropped and acknowledged, so
 /// the items the service holds after it are not kept behind it.
+///
+/// KR-REQ-20.04, the part about the removed authority payload: a page whose only item claims the
+/// kind `signed_authority_object` is read through, nothing on it is accepted, and the service is
+/// told it may remove the item.
 #[tokio::test]
 async fn kr_req_20_05_a_page_of_items_the_reader_cannot_open_is_dropped_and_acknowledged() {
     let rig = Rig::start();
