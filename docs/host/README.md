@@ -5664,8 +5664,11 @@ again, even under the same turn identifier, is a later version and new review wo
 commands that read alike are two failures. Each failed command is an item of its own, so two
 failures are never counted as one repeat, however close together they come. A session that closes
 writes what it has queued before it commits its closure. When the journal refuses a record, the
-worker keeps it queued and writes it once the journal takes writes again; if the worker ends
-first the record is lost, and the closure says it is not durable. A command can be recorded
+worker keeps it queued and writes it once the journal takes writes again. A session that closes
+while the journal still refuses it loses the record with the worker, and the closure the worker
+writes says it is not durable. A worker that ends first, in a crash, loses it too, and the closure
+the daemon writes over that death says it is durable: the field says that the closure itself was
+written durably, and the daemon cannot see what the worker held queued. A command can be recorded
 twice if its report is repeated after sixty-four later commands have pushed its block out of
 the blocks the session holds, or after the worker started again, and a report that a command
 ended is missed when it has no start and reuses the prompt generation of a block the session
