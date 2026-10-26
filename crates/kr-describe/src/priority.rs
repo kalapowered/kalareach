@@ -10,18 +10,29 @@
 //! that quietly succeeded on every platform would let a report claim a mechanism that does not
 //! exist on the host the report came from.
 //!
+//! So a class counts as applied only when the system says it holds it. Each class is set and then
+//! read back from the system, and what is reported is the read-back: a call that succeeded and left
+//! the class unchanged is a class that was not applied.
+//!
 //! # What this build applies
 //!
 //! | Platform | CPU | IO |
 //! | --- | --- | --- |
-//! | Linux | `SCHED_BATCH`, which is the scheduler class for non-interactive work | not applied |
-//! | macOS, Windows and the rest | the lowest ordinary thread priority | not applied |
+//! | Linux | `SCHED_BATCH` with the lowest niceness, on the calling thread and the threads it starts, which is the scheduler class for non-interactive work | the lowest level of the best-effort class, on the calling thread and the threads it starts |
+//! | macOS and the other Unix systems | the lowest ordinary thread priority | the throttled disk policy of the process on macOS; none elsewhere |
+//! | Windows | the idle priority class of the whole process, inside the process's background mode | very low, which the background mode sets for the whole process |
 //!
-//! IO priority is not applied anywhere in this build, and [`Applied::io`] says so on every
-//! platform. Inference reads its weights once at load and then does no IO at all, so what an IO
-//! class would change here is one sequential read of a file the host is about to keep mapped.
-//! Recording the gap is the honest half of the requirement, and the qualification matrix carries
-//! it as an open item rather than as a claim.
+//! Windows lowers the class of the whole process, because a thread started by another thread there
+//! begins at the normal priority, and the compute threads of the model runtime are started by the
+//! thread that loads it. The idle class is served only when no other work on the machine wants the
+//! processor, and the process's control thread is in it too: a machine that keeps every core busy
+//! with other work can answer the process later than the daemon waits for it, and the daemon ends
+//! a process that does not answer a cancellation in time.
+//!
+//! An IO class that a platform does not give is reported as not applied, with the reason, and the
+//! qualification matrix carries it as an open item rather than as a claim. Inference reads its
+//! weights once at load and then does no IO at all, so what an IO class changes here is one
+//! sequential read of a file the host is about to keep mapped.
 
 /// The mechanism a platform offers for running work in the background.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,6 +41,8 @@ pub enum Mechanism {
     LinuxSchedBatch,
     /// The lowest ordinary thread priority this platform has.
     LowestThreadPriority,
+    /// The idle priority class inside Windows' background mode.
+    WindowsBackgroundMode,
     /// This build applies nothing on this platform.
     None,
 }
@@ -41,21 +54,24 @@ impl Mechanism {
         match self {
             Self::LinuxSchedBatch => "linux_sched_batch",
             Self::LowestThreadPriority => "lowest_thread_priority",
+            Self::WindowsBackgroundMode => "windows_background_mode",
             Self::None => "none",
         }
     }
 }
 
-/// What applying background priority to the calling thread did.
+/// What applying background priority did, as the system reads it back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Applied {
-    /// The mechanism that was used.
+    /// The mechanism that was used for the processor class.
     pub mechanism: Mechanism,
-    /// Whether the processor class was actually changed.
+    /// Whether the system reports the processor class this build asked for.
     pub cpu: bool,
-    /// Whether an IO class was actually changed. It is false in this build on every platform.
+    /// Whether the system reports the IO class this build asked for.
     pub io: bool,
-    /// Why, when nothing was applied.
+    /// The IO class the system reports, by its stable name, when it reports one.
+    pub io_class: Option<&'static str>,
+    /// Why a class was not applied, when one was not: the processor class's reason first.
     pub why: Option<&'static str>,
 }
 
@@ -66,61 +82,99 @@ impl Applied {
         self.cpu
     }
 
+    #[cfg(windows)]
     fn unqualified(why: &'static str) -> Self {
         Self {
             mechanism: Mechanism::None,
             cpu: false,
             io: false,
+            io_class: None,
             why: Some(why),
+        }
+    }
+
+    /// Joins what the processor class and the IO class each came to.
+    #[cfg(not(windows))]
+    fn of(
+        cpu: std::result::Result<Mechanism, &'static str>,
+        io: std::result::Result<kr_ipc::background::IoClass, &'static str>,
+    ) -> Self {
+        Self {
+            mechanism: cpu.unwrap_or(Mechanism::None),
+            cpu: cpu.is_ok(),
+            io: io.is_ok(),
+            io_class: io.ok().map(kr_ipc::background::IoClass::as_str),
+            why: cpu.err().or(io.err()),
         }
     }
 }
 
-/// Puts the calling thread into the background class this platform offers.
+/// Puts the calling thread, and on the platforms that hold the class for a process the calling
+/// process, into the background class this platform offers.
 ///
-/// It is called by the inference thread and by nothing else. A failure is reported rather than
-/// propagated: a host whose scheduler refuses the change still runs descriptions, at ordinary
-/// priority, and says so.
+/// It is called by the inference thread and by nothing else, before the model starts a thread of its
+/// own. A failure is reported rather than propagated: a host whose scheduler refuses the change
+/// still runs descriptions, at ordinary priority, and says so.
 #[must_use]
 pub fn background_current_thread() -> Applied {
     apply()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(windows)]
 fn apply() -> Applied {
-    use thread_priority::unix::{NormalThreadSchedulePolicy, ThreadSchedulePolicy};
+    match kr_ipc::background::enter_process_background() {
+        Ok(class) => Applied {
+            mechanism: Mechanism::WindowsBackgroundMode,
+            cpu: class.idle_priority_class,
+            io: class.io.is_some(),
+            io_class: class.io.map(kr_ipc::background::IoClass::as_str),
+            why: None,
+        },
+        Err(why) => Applied::unqualified(why),
+    }
+}
+
+#[cfg(not(windows))]
+fn apply() -> Applied {
+    Applied::of(apply_cpu(), kr_ipc::background::lower_io_class())
+}
+
+#[cfg(target_os = "linux")]
+fn apply_cpu() -> std::result::Result<Mechanism, &'static str> {
+    use thread_priority::unix::{
+        NormalThreadSchedulePolicy, ThreadSchedulePolicy, thread_schedule_policy,
+    };
     use thread_priority::{ThreadPriority, set_thread_priority_and_policy, thread_native_id};
 
     // SCHED_BATCH is the class Linux documents for non-interactive work: the scheduler stops
     // treating the thread as latency sensitive and gives it a longer effective time slice, which
     // is what keeps a description from interleaving with the terminal.
-    match set_thread_priority_and_policy(
-        thread_native_id(),
-        ThreadPriority::Min,
-        ThreadSchedulePolicy::Normal(NormalThreadSchedulePolicy::Batch),
-    ) {
-        Ok(()) => Applied {
-            mechanism: Mechanism::LinuxSchedBatch,
-            cpu: true,
-            io: false,
-            why: None,
-        },
-        Err(_) => Applied::unqualified("this host refused the batch scheduling class"),
+    let batch = ThreadSchedulePolicy::Normal(NormalThreadSchedulePolicy::Batch);
+    set_thread_priority_and_policy(thread_native_id(), ThreadPriority::Min, batch)
+        .map_err(|_| "this host refused the batch scheduling class")?;
+    if thread_schedule_policy().ok() == Some(batch) {
+        Ok(Mechanism::LinuxSchedBatch)
+    } else {
+        Err("this host does not report the batch scheduling class it was given")
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-fn apply() -> Applied {
-    use thread_priority::{ThreadPriority, set_current_thread_priority};
+#[cfg(all(unix, not(target_os = "linux")))]
+fn apply_cpu() -> std::result::Result<Mechanism, &'static str> {
+    use thread_priority::unix::thread_schedule_policy_param;
+    use thread_priority::{ThreadPriority, set_current_thread_priority, thread_native_id};
 
-    match set_current_thread_priority(ThreadPriority::Min) {
-        Ok(()) => Applied {
-            mechanism: Mechanism::LowestThreadPriority,
-            cpu: true,
-            io: false,
-            why: None,
-        },
-        Err(_) => Applied::unqualified("this host refused the lowest thread priority"),
+    set_current_thread_priority(ThreadPriority::Min)
+        .map_err(|_| "this host refused the lowest thread priority")?;
+    let held = thread_schedule_policy_param(thread_native_id()).ok();
+    let wanted = held
+        .as_ref()
+        .and_then(|(policy, _)| ThreadPriority::Min.to_posix(*policy).ok());
+    match (held, wanted) {
+        (Some((_, params)), Some(wanted)) if params.sched_priority == wanted => {
+            Ok(Mechanism::LowestThreadPriority)
+        }
+        _ => Err("this host does not report the thread priority it was given"),
     }
 }
 

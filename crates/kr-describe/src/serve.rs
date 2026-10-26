@@ -347,6 +347,7 @@ pub fn run<M: Model>(
                                 mechanism: crate::priority::Mechanism::None,
                                 cpu: false,
                                 io: false,
+                                io_class: None,
                                 why: Some("the model thread did not say what it applied"),
                             })
                     })
