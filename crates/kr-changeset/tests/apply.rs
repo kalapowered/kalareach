@@ -433,6 +433,10 @@ fn a_versioned_reference_moves_to_the_named_object_while_it_holds_the_expected_v
 /// set it. Another value there is a conflict. The very object the request names is an unknown
 /// outcome, because Git can exit non-zero after it wrote the reference and this host cannot tell
 /// its own update from the other writer's.
+///
+/// KR-REQ-14.04, the part about an apply checking concurrent changes: a reference another writer
+/// moved after the comparison is left as that writer set it, and the apply is refused as a
+/// conflict.
 #[cfg(not(windows))]
 #[test]
 fn a_reference_that_moves_after_the_comparison_stays_as_the_other_writer_set_it() {
@@ -1267,6 +1271,10 @@ fn a_direct_apply_is_refused_until_its_limitation_has_been_shown() {
 /// The apply is stopped exactly where a daemon that died would stop it: after one path has landed
 /// and been recorded, and before anything settles the apply. A replacement service on the same
 /// journal then reads what is there.
+///
+/// KR-REQ-14.28, the part about a crash between file installations: a direct apply to
+/// `shared_existing` stopped after one path is settled by recovery as an interrupted apply that
+/// names the path that landed as changed and the other as unresolved.
 #[cfg(not(windows))]
 #[test]
 fn a_crash_after_one_file_never_yields_an_atomic_success_receipt() {
@@ -3023,6 +3031,10 @@ fn a_staged_name_on_another_filesystem_is_left_where_it_is_whatever_its_numbers(
 ///
 /// The claim is taken under an authority that holds, the authority is then withdrawn, and the
 /// apply that follows opens no journal and writes nothing into the destination's working tree.
+///
+/// KR-REQ-14.04, the part about an apply checking grants: an apply whose authority was withdrawn
+/// after its claim asks for its authority again, is refused as `PermissionDenied`, and leaves the
+/// destination's file as it was.
 #[cfg(not(windows))]
 #[test]
 fn an_authority_withdrawn_after_the_claim_opens_no_apply() {
