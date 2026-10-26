@@ -4784,8 +4784,8 @@ stands, `history.page`, `history.times` and `action.read` of that session are re
 removed they answer a gap with no bytes, and the journal's record keeps its text out of the store
 whether privacy mode is on or has been turned off again. A page that was
 read before privacy mode was turned on, and has not yet been written to the reader when it is, is
-written without its bytes, as a range that is gone. `privacy.set` runs the removal before it
-answers, so the answer says where it stands.
+written without its bytes, as a range that is gone. A `privacy.set` that turns privacy mode on runs
+the removal before it answers, so the answer says where it stands.
 
 Creating a new session in privacy mode doesn't wait for a tick. The daemon records the new session's
 obligation before it asks for the worker. That write waits for whatever holds the record, a change
@@ -5075,7 +5075,7 @@ what it removes is exactly the thing a person cannot check for themselves.
   reports it could not start after it claimed its reservation, or that ended before it said its
   cleanup was complete, is taken for ended. Its obligation is preserved until the archive has
   removed whatever it kept, or found nothing of it on the disk, and the report names the archive
-  as what holds it until then. Differently, a launch that fails before any claim is forgotten,
+  as what holds it until then, or the reason of a removal that left something. Differently, a launch that fails before any claim is forgotten,
   since it ran no shell.
 * **Change sets are not stopped.** A change set is the person's own capture of repository work
   under file grants, and stopping it would stop the completion, test and review workflow under
@@ -5093,9 +5093,6 @@ what it removes is exactly the thing a person cannot check for themselves.
   its receipt content removed where it settles, which is after the transaction that wrote the
   outcome; a crash between the two leaves it, and the early rejection path does not reach that step
   at all.
-* **The archive does not enforce any of this.** A session read after its worker has gone is served
-  from the store as it stands: the archive neither finishes an unfinished cleanup nor holds a read
-  while one is owed.
 
 ## Session names and descriptions
 
