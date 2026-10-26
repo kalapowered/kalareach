@@ -140,7 +140,7 @@ geometry claim.
 
 **Root editor.** The line editor of a session's root shell, which a managed shell package connects
 to the worker so that Ctrl-D at an empty prompt detaches (PowerShell on Windows reports no such
-gesture) and a launch installs a command through
+gesture, and in its Vi command mode Ctrl-D ends the shell instead) and a launch installs a command through
 the editor rather than through the terminal.
 
 **Root shell, session root shell.** A session's initial interactive shell, started by its worker
