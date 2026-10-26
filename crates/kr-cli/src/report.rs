@@ -16,6 +16,7 @@ use kr_protocol::desktop::{
     SleepInhibitionSetting, SleepInhibitionState,
 };
 use kr_protocol::hostinfo::HostInfoResult;
+use kr_protocol::root::{LaunchCommand, LaunchEditor, LaunchInput, ShellLaunchSurfaceResult};
 use kr_protocol::session::{ClosureRecord, SessionState, SessionSummary};
 
 use crate::doctor::content::Preview;
@@ -818,6 +819,103 @@ pub fn terminal_attachment_lines(attachments: &[AttachmentSummary]) -> Vec<Shown
         .collect()
 }
 
+/// Renders a session's launch surface as the worker answered it: whether a launch could be made
+/// at the session's editor now, who holds its input, the shell's name and what the host offers.
+///
+/// The editor, the input and the shell are words of the protocol and counters, written as it
+/// encodes them. An offer's package and label are content the person asked to read, and so are the
+/// words of its command.
+#[must_use]
+pub fn launch_surface(surface: &ShellLaunchSurfaceResult) -> Document {
+    Document::new()
+        .with("session_id", output::closed(&surface.session_id))
+        .with("editor", output::closed(&surface.editor))
+        .with("input", output::closed(&surface.input))
+        .with("shell", output::closed(&surface.shell))
+        .with(
+            "offers",
+            surface
+                .offers
+                .iter()
+                .map(|offer| {
+                    Document::new()
+                        .with(
+                            "plugin_id",
+                            Asked::text(Request::Sessions, offer.plugin_id.as_str()),
+                        )
+                        .with("label", Asked::text(Request::Sessions, &offer.label))
+                        .with("command", launch_command(&offer.command))
+                })
+                .collect::<Vec<_>>(),
+        )
+}
+
+/// What a launch offer sends, in the shape the protocol gives it.
+fn launch_command(command: &LaunchCommand) -> Document {
+    match command {
+        LaunchCommand::Arguments(words) => Document::new().with(
+            "arguments",
+            words
+                .iter()
+                .map(|word| Asked::text(Request::Sessions, word))
+                .collect::<Vec<_>>(),
+        ),
+        LaunchCommand::QuotedCommand(text) => {
+            Document::new().with("quoted_command", Asked::text(Request::Sessions, text))
+        }
+    }
+}
+
+/// Renders a session's launch surface as a line for a person: whether the editor is verified, who
+/// holds the input, and the commands the host offers.
+///
+/// A verified editor is named by the prompt and the revisions a launch would quote; one that is not
+/// is named by the protocol's word for why. An input no connection holds is free, and the line
+/// never says it is held here: `kr status` holds no attachment.
+#[must_use]
+pub fn launch_surface_line(surface: &ShellLaunchSurfaceResult) -> Line {
+    let editor = match &surface.editor {
+        LaunchEditor::Verified {
+            prompt_generation,
+            buffer_revision,
+            cwd_revision,
+        } => shown!(
+            "verified at prompt {} (buffer {}, directory {})",
+            output::closed_word(&prompt_generation.0),
+            output::closed_word(&buffer_revision.0),
+            output::closed_word(&cwd_revision.0)
+        ),
+        LaunchEditor::Unverified { reason } => {
+            shown!("not verified ({})", output::closed_word(reason))
+        }
+    };
+    let input = Shown::said(match surface.input {
+        LaunchInput::HeldHere => "held here",
+        LaunchInput::HeldElsewhere => "held elsewhere",
+        LaunchInput::Free => "free",
+        LaunchInput::Withheld => "withheld from this connection",
+    });
+    let offered: Vec<&str> = surface
+        .offers
+        .iter()
+        .map(|offer| match &offer.command {
+            LaunchCommand::Arguments(words) => words.first().map_or("", String::as_str),
+            LaunchCommand::QuotedCommand(text) => text.as_str(),
+        })
+        .collect();
+    let offers = if offered.is_empty() {
+        stdout_line!("none")
+    } else {
+        stdout_line!("{}", Asked::text(Request::Sessions, &offered.join(", ")))
+    };
+    stdout_line!(
+        "launch surface: {}; input {}; offers {}",
+        editor,
+        input,
+        offers
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use kr_client::shown::Said as _;
@@ -1153,6 +1251,28 @@ mod tests {
             assert!(
                 shown.contains(asked),
                 "{asked} shows what the session holds"
+            );
+        }
+    }
+
+    /// KR-REQ-23.25: text planted in every leaf of a launch surface reaches its document and its
+    /// line only as content the person asked for: an offer's package, label and command.
+    #[test]
+    fn planted_text_in_a_launch_surface_shows_only_where_it_was_asked_for() {
+        let mut shown = std::collections::BTreeSet::new();
+        for surface in planted::<ShellLaunchSurfaceResult>() {
+            shown.extend(only_asked("kr status", &launch_surface(&surface)));
+            only_asked_lines("kr status", &[launch_surface_line(&surface)]);
+        }
+        for asked in [
+            "offers[].plugin_id",
+            "offers[].label",
+            "offers[].command.arguments[]",
+            "offers[].command.quoted_command",
+        ] {
+            assert!(
+                shown.contains(asked),
+                "{asked} shows what the surface holds: {shown:?}"
             );
         }
     }

@@ -2297,6 +2297,52 @@ attached under a grant is shown the live screen alone, so it never has such a sc
 rows of the other buffer are always left out: its restoration stays incomplete, and its attach says
 `restoration_incomplete` unless an earlier reason in the list above holds.
 
+`kr status` also asks the session's worker whether a launch could be made at the session's root
+editor now, and prints one line for the answer:
+
+```text
+launch surface: verified at prompt 12 (buffer 3, directory 5); input held elsewhere; offers claude, gemini, qodercli
+launch surface: not verified (no_fence); input free; offers claude, gemini, qodercli
+```
+
+A verified editor is named by the prompt generation, the buffer revision and the working-directory
+revision the worker holds for it. One that is not verified is named by the first reason that holds,
+in the protocol's words (`LaunchUnverified` in the protocol reference). `kr status` holds no
+attachment, so it never reads the input as held here: it is `held elsewhere` when another
+connection's attachment holds the session's input and `free` when none does. The offers are the
+commands the host has an admitted package for, in the order of the command; nothing says the
+program is installed.
+
+`kr status --json` carries the worker's answer as `launch_surface`, with `session_id`, `editor`,
+`input`, `shell` and `offers` as the worker wrote them. Like `terminal_attachments`, it is null for
+a session read from the control daemon. When the worker answered the session read and not this
+question within 10 seconds of being asked, `launch_surface_unread` says why, and the text form says
+the launch surface was not read from the session's worker. The question is asked only of a worker of
+this release: `kr status` refuses a worker of another release before it asks anything.
+
+```json
+{
+  "launch_surface": {
+    "session_id": "6f1c1d0e-2b0a-4a5e-9d0f-3d1f7a2b8c44",
+    "editor": {
+      "state": "verified",
+      "prompt_generation": "12",
+      "buffer_revision": "3",
+      "cwd_revision": "5"
+    },
+    "input": "held_elsewhere",
+    "shell": "zsh",
+    "offers": [
+      {
+        "plugin_id": "kalareach/claude-code",
+        "label": "Claude Code",
+        "command": { "arguments": ["claude"] }
+      }
+    ]
+  }
+}
+```
+
 A closed session carries its record instead of a null: whose it is, how it closed, the owned
 processes the closure terminated and anything that survived it.
 

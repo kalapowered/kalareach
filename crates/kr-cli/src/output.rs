@@ -695,6 +695,10 @@ impl claim::Claimed for kr_protocol::project::WorkspaceKind {}
 impl claim::Claimed for kr_protocol::project::WorkspaceState {}
 impl claim::Claimed for kr_protocol::error::RetryCategory {}
 impl claim::Claimed for kr_protocol::identity::ProcessStartSource {}
+impl claim::Claimed for kr_protocol::root::LaunchEditor {}
+impl claim::Claimed for kr_protocol::root::LaunchInput {}
+impl claim::Claimed for kr_protocol::root::LaunchShell {}
+impl claim::Claimed for kr_protocol::root::LaunchUnverified {}
 
 /// One `--json` document: keys of this program's own, each holding a [`Held`] value.
 #[derive(Default)]
@@ -1411,6 +1415,10 @@ mod tests {
         assert_closed::<kr_protocol::describe::DescriptionDownload>();
         assert_closed::<kr_protocol::describe::DescriptionPause>();
         assert_closed::<kr_protocol::describe::DescriptionState>();
+        assert_closed::<kr_protocol::root::LaunchEditor>();
+        assert_closed::<kr_protocol::root::LaunchInput>();
+        assert_closed::<kr_protocol::root::LaunchShell>();
+        assert_closed::<kr_protocol::root::LaunchUnverified>();
     }
 
     /// Every type this file claims closed is one the planted test above checks: the claims and the
