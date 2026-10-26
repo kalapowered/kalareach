@@ -30,7 +30,8 @@ use std::time::{Duration, Instant};
 
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
-    FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtOpenFile,
+    FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION,
+    FILE_SYNCHRONOUS_IO_NONALERT, FileRenameInformation, NtOpenFile, NtSetInformationFile,
 };
 use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
 use windows_sys::Win32::Foundation::{
@@ -47,12 +48,13 @@ use windows_sys::Win32::Security::{
     PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SetKernelObjectSecurity,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_FLAG_DELETE,
+    DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_FLAG_DELETE,
     FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
     FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_ID_BOTH_DIR_INFO, FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
-    FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK,
-    FILE_WRITE_ATTRIBUTES, FileDispositionInfoEx, FileIdBothDirectoryInfo,
+    FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
+    FILE_TYPE_DISK, FILE_WRITE_ATTRIBUTES, FileDispositionInfoEx, FileIdBothDirectoryInfo,
     FileIdBothDirectoryRestartInfo, FileIdInfo, FileRenameInfoEx, GetDiskFreeSpaceExW,
     GetFileInformationByHandleEx, GetFileType, GetVolumeInformationW, GetVolumePathNameW,
     READ_CONTROL, SYNCHRONIZE, SetFileInformationByHandle, WRITE_DAC,
@@ -72,6 +74,11 @@ const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
 
 /// The share mode of a handle that lets every other handle read, write and delete.
 const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+
+/// The share mode of a handle that lets every other handle read and write but not rename or delete
+/// the name, which then stays where it is for as long as this handle is open: the one a removal
+/// acts through, from the open to the last thing it does.
+const KEPT_WHERE_IT_IS: u32 = SHARE_ALL;
 
 /// Reads this process's own image from the kernel: the file the process was created from, with
 /// every junction and link on the way it was started through resolved.
@@ -661,6 +668,12 @@ impl Left {
     fn into_result(self) -> io::Result<()> {
         self.refused.or(self.held).map_or(Ok(()), Err)
     }
+
+    /// The first refusal that no program caused, for a caller to whom a program that holds a file
+    /// is no fault.
+    fn into_refusal(self) -> io::Result<()> {
+        self.refused.map_or(Ok(()), Err)
+    }
 }
 
 /// The moments of a removal at which another process of the account can act, and at which a test
@@ -726,6 +739,130 @@ pub(super) fn remove_tree(root: &Path) -> io::Result<()> {
     let mut left = Left::default();
     remove_directory(Reach::Path(root), root, &mut left);
     left.into_result()
+}
+
+/// The store's trash, held open: a plain directory, opened once without following a reparse point,
+/// that releases are moved into and removed from through this handle and never by a path through
+/// it. A trash that another process of the account turns into a junction, before the open or after
+/// it, leads nowhere: before, the open refuses it; after, what is done through the handle is done
+/// to the directory the handle was opened on, whose own listing is empty.
+pub(super) struct Trash {
+    handle: File,
+    path: PathBuf,
+}
+
+impl Trash {
+    /// Opens the trash directory at `path`, refusing what is not a plain directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating system's error, [`io::ErrorKind::NotFound`] among them, and an error of
+    /// kind `InvalidData` for a link of any kind and for anything but a directory.
+    pub(super) fn open(path: &Path) -> io::Result<Self> {
+        let handle = open_name(
+            path,
+            FILE_LIST_DIRECTORY | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_TRAVERSE,
+            KEPT_WHERE_IT_IS,
+        )?;
+        let attributes = handle.metadata()?.file_attributes();
+        if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || attributes & FILE_ATTRIBUTE_DIRECTORY == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} is not a plain directory", path.display()),
+            ));
+        }
+        Ok(Self {
+            handle,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// Moves the directory `from` into the trash under `name`, which must not be there.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating system's error when `from` cannot be opened or moved: access denied or
+    /// a sharing violation when a program holds something inside it ([`is_in_use`]).
+    pub(super) fn take(&self, from: &Path, name: &OsStr) -> io::Result<()> {
+        let source = open_name(from, DELETE, SHARE_ALL)?;
+        let wide: Vec<u16> = name.encode_wide().collect();
+        if wide.is_empty()
+            || wide
+                .iter()
+                .any(|unit| *unit == u16::from(b'\\') || *unit == u16::from(b'/'))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a name moved into the trash is one component",
+            ));
+        }
+        let name_at = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName);
+        let total = name_at + wide.len() * 2;
+        // A buffer of 64-bit words is aligned for the record.
+        let mut buffer = vec![0_u64; total.div_ceil(8)];
+        let record = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+        // SAFETY: `buffer` is zeroed, aligned for the record and at least `total` bytes long, so
+        // the fixed fields are inside it and the name's bytes end inside it; nothing else reads it
+        // until the call below. The flags stay zero: nothing is replaced.
+        unsafe {
+            (*record).RootDirectory = self.handle.as_raw_handle();
+            (*record).FileNameLength = u32::try_from(wide.len() * 2)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the name is too long"))?;
+            std::ptr::copy_nonoverlapping(
+                wide.as_ptr().cast::<u8>(),
+                buffer.as_mut_ptr().cast::<u8>().add(name_at),
+                wide.len() * 2,
+            );
+        }
+        let mut status_block = IO_STATUS_BLOCK::default();
+        // SAFETY: the source handle is the open directory's own, opened with the right to delete
+        // (which a rename needs), `buffer` holds a rename record of `total` bytes whose root is the
+        // trash's open handle, and `status_block` is a live out parameter.
+        let status = unsafe {
+            NtSetInformationFile(
+                source.as_raw_handle(),
+                &raw mut status_block,
+                buffer.as_ptr().cast(),
+                u32::try_from(total).unwrap_or(0),
+                FileRenameInformation,
+            )
+        };
+        if status < 0 {
+            // SAFETY: the status is the one the call returned; this only maps it to a Win32 code.
+            let code = unsafe { RtlNtStatusToDosError(status) };
+            return Err(io::Error::from_raw_os_error(code.cast_signed()));
+        }
+        Ok(())
+    }
+
+    /// Removes what was moved into the trash as `name`, as [`remove_tree`] removes a tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating system's error when a program has a file open or runs from it
+    /// ([`is_in_use`] holds for it), and otherwise the first refusal, which no program caused.
+    pub(super) fn remove(&self, name: &OsStr) -> io::Result<()> {
+        let wide: Vec<u16> = name.encode_wide().collect();
+        let shown = self.path.join(name);
+        let mut left = Left::default();
+        remove_directory(Reach::Inside(&self.handle, &wide), &shown, &mut left);
+        left.into_result()
+    }
+
+    /// Removes everything in the trash, each name as a name inside the open handle, and leaves what
+    /// a program still runs from.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first refusal that no program caused, after everything else that could be
+    /// removed was, and a failure to list the trash among them.
+    pub(super) fn sweep(&self) -> io::Result<()> {
+        let mut left = Left::default();
+        remove_entries(&self.handle, &self.path, &mut left);
+        left.into_refusal()
+    }
 }
 
 /// How a name to remove is reached: by its path, which only the root of a walk is, or as a name
@@ -799,10 +936,22 @@ fn remove_directory(reach: Reach<'_>, shown: &Path, left: &mut Left) -> bool {
         return false;
     }
     at(Moment::Pinned, shown);
+    if !remove_entries(&pin, shown, left) {
+        return false;
+    }
+    mark_for_deletion(&pin)
+        .map_err(|error| left.add(error))
+        .is_ok()
+}
+
+/// Removes every name in the directory `pin` is open on, each as a name inside that handle. `shown`
+/// is the path to say in a refusal. Returns whether the directory is empty now. A name that cannot
+/// be listed or removed is told to `left`, and the rest is removed all the same.
+fn remove_entries(pin: &File, shown: &Path, left: &mut Left) -> bool {
     let mut emptied = true;
     let mut restart = true;
     loop {
-        let names = match list_next(&pin, restart) {
+        let names = match list_next(pin, restart) {
             Ok(Some(names)) => names,
             Ok(None) => break,
             Err(error) => {
@@ -813,7 +962,7 @@ fn remove_directory(reach: Reach<'_>, shown: &Path, left: &mut Left) -> bool {
         restart = false;
         for listed in names {
             let inside = shown.join(OsString::from_wide(&listed.name));
-            let reach = Reach::Inside(&pin, &listed.name);
+            let reach = Reach::Inside(pin, &listed.name);
             emptied &= if listed.directory {
                 remove_directory(reach, &inside, left)
             } else {
@@ -823,12 +972,7 @@ fn remove_directory(reach: Reach<'_>, shown: &Path, left: &mut Left) -> bool {
             };
         }
     }
-    if !emptied {
-        return false;
-    }
-    mark_for_deletion(&pin)
-        .map_err(|error| left.add(error))
-        .is_ok()
+    emptied
 }
 
 /// A name found in a directory, and whether it is a plain directory: not a link of any kind.
@@ -948,7 +1092,7 @@ fn remove_name(reach: Reach<'_>, shown: &Path) -> io::Result<()> {
                 Err(other) => return Err(refused("cannot reach", shown, &other)),
             }
             let sealed = reach
-                .open(READ_CONTROL | WRITE_DAC, SHARE_ALL)
+                .open(READ_CONTROL | WRITE_DAC, KEPT_WHERE_IT_IS)
                 .map_err(|error| refused("cannot give back", shown, &error))?;
             at(Moment::AboutToGiveBack, shown);
             if !has_the_seals_list(&sealed)
@@ -1146,7 +1290,7 @@ fn open_name(path: &Path, access: u32, share: u32) -> io::Result<File> {
 /// names share is not changed in any way, and a name goes at once even while a program has the file
 /// open with its delete shared.
 fn delete_name(reach: Reach<'_>, shown: &Path) -> io::Result<()> {
-    let name = reach.open(DELETE, SHARE_ALL)?;
+    let name = reach.open(DELETE, KEPT_WHERE_IT_IS)?;
     at(Moment::Opened, shown);
     mark_for_deletion(&name)
 }
@@ -1220,4 +1364,34 @@ pub fn free_space(path: &Path) -> io::Result<u64> {
         return Err(io::Error::last_os_error());
     }
     Ok(available)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// KR-REQ-26.06: a failure to list a directory is a refusal that reaches the result of the
+    /// removal that was listing it, never a directory that is taken for empty. A handle on a file
+    /// cannot be listed, which stands for any failure of the listing.
+    #[test]
+    fn a_directory_that_cannot_be_listed_is_a_refusal_and_not_an_empty_one() {
+        let path = std::env::temp_dir().join(format!("kr-listing-{}", crate::new_uuid()));
+        std::fs::write(&path, b"not a directory").expect("a file");
+        let handle = open_name(&path, FILE_LIST_DIRECTORY, KEPT_WHERE_IT_IS).expect("opens");
+        let mut left = Left::default();
+
+        let emptied = remove_entries(&handle, &path, &mut left);
+
+        drop(handle);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            !emptied,
+            "a directory that could not be listed is not empty"
+        );
+        let refusal = left.into_refusal().expect_err("the failure is a refusal");
+        assert!(
+            refusal.to_string().contains("cannot read"),
+            "the refusal says what failed: {refusal}"
+        );
+    }
 }

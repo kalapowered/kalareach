@@ -1452,6 +1452,9 @@ fn a_directory_made_a_junction_after_it_was_checked_leads_the_removal_nowhere() 
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    let _alone = HOOKED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let test = TestStore::create();
     let one = release("0.1.0+aaaaaaaaaaaa");
     test.install(&one);
@@ -1463,11 +1466,13 @@ fn a_directory_made_a_junction_after_it_was_checked_leads_the_removal_nowhere() 
     std::fs::write(outside.join("kept"), b"kept").expect("written");
     std::fs::write(outside.join("inner/kept"), b"kept too").expect("written");
     let target = outside.clone();
+    let root = test.root.clone();
     let turned = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&turned);
     removal_race::hook(Some(Arc::new(move |moment, pinned: &Path| {
         if moment == removal_race::Moment::Pinned
             && pinned.file_name().is_some_and(|name| name == "empty")
+            && pinned.starts_with(&root)
         {
             removal_race::make_junction_in_place(pinned, &target)
                 .expect("the pinned directory becomes a junction");
@@ -1501,6 +1506,11 @@ fn a_directory_made_a_junction_after_it_was_checked_leads_the_removal_nowhere() 
     let in_the_trash = std::fs::read_dir(test.store.trash()).map(|entries| entries.count());
     assert_eq!(in_the_trash.ok(), Some(0), "nothing of the release is left");
 }
+
+/// Held by each case that sets the removal hook: the hook is the process's, and the cases of this
+/// binary run side by side.
+#[cfg(windows)]
+static HOOKED: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A store whose trash is a junction to a folder with a directory and a file of its own in it, as
 /// another process of the account can leave it. Returns the folder.
@@ -1560,6 +1570,9 @@ fn a_trash_made_a_junction_after_it_was_checked_takes_no_release_out_of_the_stor
     use kr_ipc::install::removal_race;
     use std::sync::Arc;
 
+    let _alone = HOOKED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let test = TestStore::create();
     let one = release("0.1.0+aaaaaaaaaaaa");
     test.install(&one);
@@ -1567,8 +1580,8 @@ fn a_trash_made_a_junction_after_it_was_checked_takes_no_release_out_of_the_stor
     std::fs::create_dir_all(&outside).expect("a folder elsewhere");
     let trash = test.store.trash();
     let target = outside.clone();
-    removal_race::hook(Some(Arc::new(move |moment, _: &Path| {
-        if moment == removal_race::Moment::TrashChecked {
+    removal_race::hook(Some(Arc::new(move |moment, at: &Path| {
+        if moment == removal_race::Moment::TrashChecked && at == trash {
             std::fs::remove_dir(&trash).expect("the trash is empty");
             let made = std::process::Command::new("cmd")
                 .args(["/C", "mklink", "/J"])
@@ -1617,6 +1630,9 @@ fn a_name_cannot_be_moved_out_of_a_release_between_its_open_and_its_removal() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    let _alone = HOOKED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let test = TestStore::create();
     let one = release("0.1.0+aaaaaaaaaaaa");
     test.install(&one);
@@ -1628,6 +1644,7 @@ fn a_name_cannot_be_moved_out_of_a_release_between_its_open_and_its_removal() {
     std::fs::create_dir_all(&outside).expect("a folder elsewhere");
     let moved = Arc::new(AtomicUsize::new(0));
     let refused = Arc::new(AtomicUsize::new(0));
+    let root = test.root.clone();
     let (to, kept, turned) = (outside.clone(), Arc::clone(&moved), Arc::clone(&refused));
     removal_race::hook(Some(Arc::new(move |moment, at: &Path| {
         let name = at.file_name().and_then(|name| name.to_str()).unwrap_or("");
@@ -1636,7 +1653,7 @@ fn a_name_cannot_be_moved_out_of_a_release_between_its_open_and_its_removal() {
             (removal_race::Moment::Opened, "plain")
                 | (removal_race::Moment::AboutToGiveBack, "sealed")
         );
-        if acts {
+        if acts && at.starts_with(&root) {
             match std::fs::rename(at, to.join(name)) {
                 Ok(()) => kept.fetch_add(1, Ordering::SeqCst),
                 Err(_) => turned.fetch_add(1, Ordering::SeqCst),
