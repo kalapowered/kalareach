@@ -10,8 +10,8 @@
 //! holds the request, and show where the key is meanwhile.
 //!
 //! The cases decide by what reached the application and in what order, never by how long anything
-//! took. The one that records how long a key takes is `remote_input_forwarding_latency`, which is a
-//! measurement run by name.
+//! took. `remote_input_forwarding_latency` is the measurement: it records how long a key takes, and
+//! is run by name.
 
 #![cfg(unix)]
 

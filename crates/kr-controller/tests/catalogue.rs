@@ -5980,7 +5980,8 @@ mod off_the_executor {
     ///
     /// KR-ACC-017, the part about syncing ten thousand definitions: the sync answers with all ten
     /// thousand entries and the installation from it succeeds. Not shown here: browsing offline,
-    /// cached and uncached activation, mirror quotas or interrupted generations.
+    /// cached and uncached activation, mirror quotas, delegation, interrupted generations or pinned
+    /// bindings.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn kr_ac_017_a_sync_and_an_installation_of_ten_thousand_entries_leave_the_input_task_running()
      {

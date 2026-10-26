@@ -687,9 +687,9 @@ async fn install_package(
 /// has expanded the variables in it, so the launch is read from what the program printed. Each
 /// marker the case waits for is one the typed line cannot spell, since the terminal echoes the line.
 ///
-/// KR-REQ-01.06, the part about agent names the integration does not take: with both integrations
-/// on, a program started by its path is given no registration and no flags, a shim found first on
-/// the search path runs as typed, and the status a launched program ends with is the line's.
+/// KR-REQ-01.06, the part about agent names that run as typed: with both integrations on, a
+/// program started by its path is given no registration and no flags, a shim found first on the
+/// search path runs as typed, and the status a launched program ends with is the line's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = writes_profiles!()]
 async fn the_bundled_agents_typed_at_the_managed_prompt_are_launched_through_the_forwarder() {
