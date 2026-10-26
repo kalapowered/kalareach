@@ -6,8 +6,10 @@
 # module binds into it: it wraps the host's read-line entry point for the reader's own boundaries,
 # it wraps the editor's own functions to observe the operations that wait for another key, and it
 # puts its end-of-file decision on the configured gesture in front of whatever was bound there.
-# A handler the person wrote themselves is never replaced, and everything this module installs
-# comes off again with it.
+# A handler the person wrote themselves is left as it is, except on the gesture key: there this
+# module's decision stands in front of it, and it runs when the key is outside the detach
+# condition. Everything this module installs comes off again with it, and a key the person has
+# bound since is left to them.
 #
 # The reader thread is where all of it runs, and only where the reader is between operations: at
 # the read-line entry, after each of the editor's own operations has run, and in the gesture
@@ -815,9 +817,9 @@ function Enable-KalaReachHooks {
 
 # Puts this module in front of every key the editor has a binding for.
 #
-# This is where the reader reaches its own queue: the wrapper reads the mailbox and then runs the
-# editor's own function, so a request the worker sent is answered at the reader's next key, on the
-# reader's own thread, with the editor between operations. The few operations that run an inner
+# This is where the reader reaches its own queue: the wrapper runs the editor's own function and
+# then reads the mailbox, so a request the worker sent is answered after the next key has run, on
+# the reader's own thread, with the editor between operations. The few operations that run an inner
 # read loop also record the state they wait in. A handler the person wrote themselves is left
 # exactly as it is.
 # How the editor stores a binding made with this chord, or nothing when it does not say.
