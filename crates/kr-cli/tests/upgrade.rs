@@ -1739,11 +1739,102 @@ async fn a_rollback_to_a_release_that_reads_the_organisation_store_goes_on_with_
 #[derive(serde::Serialize)]
 struct Empty {}
 
-/// KR-REQ-26.06, KR-REQ-23.34, KR-REQ-20.23, KR-ACC-035: a device paired with the updated host's
-/// daemon over the network, as a phone is, meets the worker of the release before through the new
-/// daemon. The daemon lists the session, reads it, its description, and its attention inbox at the
-/// worker's level, and closes it for the device, answering with what the worker answered; the
-/// worker is the process it was throughout.
+/// Adds host events to a session's journal through a connection of the test's own, as a worker's
+/// other writer would, and leaves the worker to find them.
+fn insert_host_events(journal: &Path, rows: &[(String, String)]) {
+    let connection = rusqlite::Connection::open(journal).expect("opens the session's journal");
+    let at = i64::try_from(kr_ipc::now_ms().get()).expect("a time that fits");
+    for (kind, detail) in rows {
+        connection
+            .execute(
+                "INSERT INTO host_events (kind, detail, output_cursor, recorded_at_ms) \
+                 VALUES (?1, ?2, 0, ?3)",
+                rusqlite::params![kind, detail, at],
+            )
+            .expect("the journal takes the row");
+    }
+}
+
+/// The attention inbox of one session as a paired device reads it, when it can be read.
+async fn read_inbox_through(
+    session: &kr_client::session::Session,
+    session_id: SessionId,
+) -> Option<kr_protocol::attention::AttentionReadResult> {
+    session
+        .read(
+            Method::AttentionRead,
+            &kr_protocol::attention::AttentionReadParams {
+                session_id: Nullable::some(session_id),
+                include_acknowledged: true,
+                max_items: U64::new(50),
+                after: Nullable::null(),
+            },
+        )
+        .await
+        .ok()
+}
+
+/// The attention inbox of one session as the owner at this machine reads it, when it can be read.
+async fn read_inbox_here(
+    endpoint: &kr_ipc::paths::Endpoint,
+    session_id: SessionId,
+) -> Option<kr_protocol::attention::AttentionReadResult> {
+    let mut client = LocalClient::connect(endpoint, LocalClientKind::Cli, build())
+        .await
+        .ok()?;
+    client
+        .request(
+            Method::AttentionRead,
+            &kr_protocol::attention::AttentionReadParams {
+                session_id: Nullable::some(session_id),
+                include_acknowledged: true,
+                max_items: U64::new(50),
+                after: Nullable::null(),
+            },
+        )
+        .await
+        .ok()?
+        .ok()?
+        .to_typed()
+        .ok()
+}
+
+/// The host events a worker of this release records for an agent turn that ended and a command that
+/// failed, as (kind, detail), written by this release's own journal.
+fn rows_this_release_records_of_a_session_s_work() -> Vec<(String, String)> {
+    let mut journal = kr_worker::journal::Journal::in_memory().expect("a journal");
+    journal
+        .record_session_event(
+            &kr_protocol::attention::SessionEventNotice::TurnCompleted {
+                turn_id: kr_protocol::ids::AgentTurnId::new("turn-1").expect("an identifier"),
+            },
+            0,
+            kr_protocol::scalars::TimestampMs::new(1),
+        )
+        .expect("the turn is recorded");
+    journal
+        .record_session_event(
+            &kr_protocol::attention::SessionEventNotice::CommandCompleted {
+                exit_status: U64::new(3),
+            },
+            0,
+            kr_protocol::scalars::TimestampMs::new(1),
+        )
+        .expect("the command is recorded");
+    journal
+        .host_events()
+        .expect("the rows read")
+        .into_iter()
+        .map(|event| (event.kind, event.detail))
+        .collect()
+}
+
+/// KR-REQ-26.06, KR-REQ-23.34, KR-REQ-20.23, KR-ACC-035, KR-REQ-18.01: a device paired with the
+/// updated host's daemon over the network, as a phone is, meets the worker of the release before
+/// through the new daemon. The daemon lists the session, reads it, its description, and its
+/// attention inbox at the worker's level, which holds a notification that worker recorded after
+/// rows of kinds only this release writes, and closes it for the device, answering with what the
+/// worker answered; the worker is the process it was throughout.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_at_the_door_of_the_updated_host_meets_the_worker_of_the_release_before() {
     use kr_protocol::describe::{SessionDescribeParams, SessionDescribeResult};
@@ -1799,19 +1890,49 @@ async fn a_device_at_the_door_of_the_updated_host_meets_the_worker_of_the_releas
     assert_eq!(described.session_id, session_id, "{described:?}");
 
     // The attention inbox the daemon keeps for the session, built from what the worker reported.
-    let attention: kr_protocol::attention::AttentionReadResult = session
-        .read(
-            Method::AttentionRead,
-            &kr_protocol::attention::AttentionReadParams {
-                session_id: Nullable::some(session_id),
-                include_acknowledged: true,
-                max_items: U64::new(50),
-                after: Nullable::null(),
-            },
-        )
+    // The worker's journal then holds what a worker of this release records of a session's own
+    // work, which the worker of the release before reads as host events of kinds it does not know,
+    // and a notification as that release records it, after them. The inbox gains the notification
+    // and nothing for the work, and has no gap: the page of the worker of the release before
+    // carries no member this release added, and the rows it carries are read through.
+    let notices = |inbox: &kr_protocol::attention::AttentionReadResult| {
+        inbox
+            .items
+            .iter()
+            .filter(|item| item.rule == kr_protocol::attention::AttentionRule::ApplicationNotice)
+            .count()
+    };
+    let before = read_inbox_through(session, session_id)
         .await
         .expect("the device reads the attention inbox");
+    assert_eq!(
+        notices(&before),
+        0,
+        "the control: the inbox holds no notification before the worker records one"
+    );
+    let mut rows = rows_this_release_records_of_a_session_s_work();
+    rows.push((
+        "notification".to_owned(),
+        "Normal: the build finished".to_owned(),
+    ));
+    insert_host_events(&host.tree.environment().journal_database(session_id), &rows);
+    let attention = until(
+        "the inbox to hold the notification the worker of the release before recorded",
+        || async {
+            let inbox = read_inbox_through(session, session_id).await?;
+            (notices(&inbox) > 0).then_some(inbox)
+        },
+    )
+    .await;
     assert!(attention.gaps.is_empty(), "{attention:?}");
+    assert!(
+        attention.items.iter().all(|item| !matches!(
+            item.rule,
+            kr_protocol::attention::AttentionRule::ReviewReady
+                | kr_protocol::attention::AttentionRule::CommandFailed
+        )),
+        "the work this release records is no item of a worker that does not report it: {attention:?}"
+    );
 
     // The launch surface is read of the worker, and the worker of the release before has no row for
     // it: it would refuse it as it refuses any method it does not serve, which reads as a missing
@@ -3347,19 +3468,43 @@ async fn a_share_with_the_live_screen_of_the_session_of_the_release_before_is_is
 /// this release. The journal of a closed session whose root was a command holds the session's
 /// summary in the form the release before reads, so the shell and the directory it recorded are
 /// what that release shows; the word that says the root was a command is kept in a
-/// row of its own, which that release does not read.
+/// row of its own, which that release does not read. The host events this release records for an
+/// agent turn that ended and a command that failed are in the same journal: this release raised
+/// an item for each while the session was live, and after the rollback the release before lists
+/// them, with no gap, and serves what it reads of them.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_release_before_reads_the_journal_of_a_command_session_this_release_wrote() {
     let updated = Updated::new().await;
     let host = &updated.host;
 
-    // A session of this release, closed, whose journal is then written as a command session's is:
-    // by this release's own writer, from the summary the worker recorded with the marker set.
+    // A session of this release, live, whose journal takes what a worker of this release records of
+    // the session's own work. The daemon of this release raises an item for each before the
+    // session closes.
     let (display, session_now) = host.new_session(&updated.kr_now());
     let worker_now = host.worker_process(session_now);
+    let path = host.tree.environment().journal_database(session_now);
+    insert_host_events(&path, &rows_this_release_records_of_a_session_s_work());
+    let endpoint = host
+        .tree
+        .environment()
+        .controller_endpoint()
+        .expect("an endpoint");
+    let raised = |inbox: &kr_protocol::attention::AttentionReadResult,
+                  rule: kr_protocol::attention::AttentionRule| {
+        inbox.items.iter().any(|item| item.rule == rule)
+    };
+    until("the daemon of this release to raise the work", || async {
+        let inbox = read_inbox_here(&endpoint, session_now).await?;
+        (raised(&inbox, kr_protocol::attention::AttentionRule::ReviewReady)
+            && raised(&inbox, kr_protocol::attention::AttentionRule::CommandFailed))
+        .then_some(())
+    })
+    .await;
+
+    // The session closes, and its journal is then written as a command session's is: by this
+    // release's own writer, from the summary the worker recorded with the marker set.
     host.close(&updated.kr_now(), &display);
     host.worker_ended(&worker_now).await;
-    let path = host.tree.environment().journal_database(session_now);
     let recorded = {
         let mut journal = kr_worker::journal::Journal::open(&path).expect("opens the journal");
         let mut summary = journal
@@ -3408,6 +3553,37 @@ async fn the_release_before_reads_the_journal_of_a_command_session_this_release_
     assert_eq!(
         read["cwd"], recorded.cwd,
         "the directory the journal recorded is shown, not a summary rebuilt from the closure: {read}"
+    );
+
+    // The release before's daemon lists what this release raised from the rows it does not know,
+    // with no gap, and serves what it reads of them: the line of identifiers, then the words.
+    let inbox = until(
+        "the daemon of the release before to list the work this release raised",
+        || async {
+            let inbox = read_inbox_here(&endpoint, session_now).await?;
+            (raised(&inbox, kr_protocol::attention::AttentionRule::ReviewReady)
+                && raised(&inbox, kr_protocol::attention::AttentionRule::CommandFailed)
+                && inbox.items.iter().all(|item| item.summary.0.is_some()))
+            .then_some(inbox)
+        },
+    )
+    .await;
+    assert!(inbox.gaps.is_empty(), "{inbox:?}");
+    let words = |rule: kr_protocol::attention::AttentionRule| {
+        inbox
+            .items
+            .iter()
+            .find(|item| item.rule == rule)
+            .and_then(|item| item.summary.0.clone())
+            .unwrap_or_default()
+    };
+    assert!(
+        words(kr_protocol::attention::AttentionRule::ReviewReady).starts_with("turn-1\n"),
+        "{inbox:?}"
+    );
+    assert!(
+        words(kr_protocol::attention::AttentionRule::CommandFailed).starts_with("3\n"),
+        "{inbox:?}"
     );
 
     host.close(&updated.kr_before(), &updated.display);
