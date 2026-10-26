@@ -6165,6 +6165,103 @@ async fn a_request_the_feed_dropped_keeps_its_target_owed_when_another_that_name
     assert!(rig.the_owner_confirms().await.lifted);
 }
 
+/// KR-REQ-24.15: an entry whose target the person revoked stays on the list while the wait stands,
+/// because a registry put back again brings the target back: when the feed has dropped the request
+/// that owed it by then, the list is all that is left to say the host owes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_restore_brings_back_a_revoked_target_that_the_list_still_owes() {
+    let rig = Rig::start().await;
+    let victim = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.until_the_carrier_is_idle().await;
+    let earlier = a_copy_of_the_registry(&rig.host, "registry-before-the-owner.sqlite3");
+    let owner = rig
+        .pairs(&[ActionRight::HostManage, ActionRight::SessionView])
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    let key = owner.0.keys().authorisation.clone();
+    let withdrawal = rig.request_of(&key, owner.1.device_id, 0xc1, devices(victim.1.device_id));
+    rig.published_as(&key, &withdrawal).await;
+    rig.poll().await;
+    rig.until_the_revocation_is_acknowledged_to(&key, &withdrawal)
+        .await;
+
+    // The first restore: the owner is unknown to the registry, and the device is owed.
+    let rig = rig
+        .restarted(false, |tree| put_the_registry_back(tree, &earlier))
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    rig.until_the_carrier_is_idle().await;
+    let target = restored::Target::Device(victim.1.device_id);
+    assert!(rig.what_the_record_lists().contains(&target));
+
+    // The person revokes it as the refusal says, and the feed's retention ends the request.
+    rig.revokes_at_the_machine(victim.1.device_id).await;
+    rig.served.web().the_feeds_drop(withdrawal.request_id);
+    rig.poll().await;
+    assert!(
+        rig.what_the_record_lists().contains(&target),
+        "an entry whose target is not live stays on the list while the wait stands"
+    );
+
+    // The registry is put back again before the person confirmed.
+    let rig = rig
+        .restarted(false, |tree| put_the_registry_back(tree, &earlier))
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    rig.until_the_carrier_is_idle().await;
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&victim.1.device_id.to_string()),
+        "the device the second restore brought back is owed: {refused:?}"
+    );
+    rig.revokes_at_the_machine(victim.1.device_id).await;
+    assert!(rig.the_owner_confirms().await.lifted);
+}
+
+/// KR-REQ-24.15: a record of the restore that cannot be read is not written over by a finding
+/// either: the registry is behind the feed, the host catches up, and the record stays what it was,
+/// so the doctor still says that it cannot be read and the confirmation removes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_finding_does_not_write_over_a_record_that_cannot_be_read() {
+    let Restorable {
+        rig,
+        revoked,
+        earlier,
+        ..
+    } = a_revocation_the_registry_will_lose().await;
+    let rig = rig
+        .restarted(false, |tree| {
+            put_the_registry_back(tree, &earlier);
+            std::fs::write(
+                restored::file_beside(&tree.environment().registry_database()),
+                b"junk",
+            )
+            .expect("junk");
+        })
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    rig.until_the_carrier_is_idle().await;
+    assert!(
+        rig.has_revoked(revoked.1.device_id).await,
+        "the host caught up with its feed"
+    );
+    assert!(
+        matches!(rig.the_record(), Found::Unreadable(_)),
+        "and the record that cannot be read is still there"
+    );
+    let check = rig
+        .the_restored_policy_check()
+        .await
+        .expect("the doctor says the host waits");
+    assert!(
+        check.detail().contains("cannot be read"),
+        "and says it: {}",
+        check.detail()
+    );
+    assert!(rig.the_owner_confirms().await.lifted);
+    assert_eq!(rig.the_record(), Found::Missing);
+}
+
 /// KR-REQ-24.15: a completed request whose issuer the person revoked at the machine after the
 /// restore, before the scan reached it, is not dismissed for that: the registry's revocation may be
 /// the person's act and not the issuer's, so what the request names stays owed.

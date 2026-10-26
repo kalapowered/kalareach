@@ -7087,13 +7087,15 @@ The record holds what the wait owes as a sorted list of devices and shares, each
 it, with a digest of the origin of the feed it came from. The host writes what a page of the feed
 names to the record before it acts on any record of the page, so a stop, an error, an abort of the
 carrier or the feed's removal part way through a scan keeps it. A write that fails stops the pass
-before the host acts on the page, and the next pass writes again. An entry leaves the list when its
-target is no longer live, or when a scan of the run that wrote it, having read the feed through,
-settled every request of that run that named it. It never leaves because a scan did not meet a
-request: a request the feed dropped after its retention leaves its entry where it was, even when a
-request left on the feed names the same target and is settled. An entry an earlier run wrote leaves
-only when its target is no longer live, because nothing in the record says which request wrote it,
-and a request the feed has since dropped may have. A scan of another feed clears only entries of its own
+before the host acts on the page, and the next pass writes again. An entry leaves the list when a scan of the run that wrote it,
+having read the feed through, settled every request of that run that named it. It never leaves
+because a scan did not meet a request: a request the feed dropped after its retention leaves its
+entry where it was, even when a request left on the feed names the same target and is settled. It
+does not leave because its target was revoked either, since a registry put back again brings the
+target back, after the request that owed it may be gone; it yields its place only when the list is
+full. An entry an earlier run wrote is not cleared by a scan, because nothing in the record says
+which request wrote it, and a request the feed has since dropped may have. The wait ends with the
+confirmation, which removes the record. A scan of another feed clears only entries of its own
 origin, so pointing the host at a feed that holds nothing for it clears nothing. A device is live
 while the registry holds it unrevoked, and a share is live while an unrevoked device holds it as its
 pairing grant or the grant store holds it unrevoked. A registry that cannot be read shows every

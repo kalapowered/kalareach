@@ -256,6 +256,10 @@ impl Owing {
     }
 }
 
+/// A request as a run knows it: its place in the feed and its identifier together, so that a feed
+/// put back to an earlier state, which can use a place again, does not make two requests one.
+type RequestKey = (u64, RevocationRequestId);
+
 /// What this run has learned of which requests named which targets, kept for the life of the
 /// carrier and not emptied when a scan writes its list.
 ///
@@ -263,22 +267,30 @@ impl Owing {
 /// feed has since dropped is no longer there to be met, so the scan that meets only the requests
 /// left cannot tell that a dropped one named the same target; this keeps what the run met. An entry
 /// an earlier run wrote is never cleared by a scan at all, because nothing here says which requests
-/// wrote it: it leaves the list when its target is no longer live.
+/// wrote it: it leaves the list only when the wait ends.
 #[derive(Debug, Default)]
 struct RunNames {
-    /// Each target a request at or below the cutoff named, with the sequences of those requests.
-    named: std::collections::BTreeMap<Target, std::collections::BTreeSet<u64>>,
-    /// The sequences a scan settled since the last finding.
-    settled: std::collections::BTreeSet<u64>,
+    /// Each target a request at or below the cutoff named, with those requests.
+    named: std::collections::BTreeMap<Target, std::collections::BTreeSet<RequestKey>>,
+    /// The requests a scan settled since the last finding, of those that named a target.
+    settled: std::collections::BTreeSet<RequestKey>,
     /// The targets a write of this run added to the list.
     added: std::collections::BTreeSet<Target>,
 }
 
 impl RunNames {
-    /// The requests at `sequence` name `targets`.
-    fn name(&mut self, sequence: u64, targets: &[Target]) {
+    /// The request `key` names `targets`.
+    fn name(&mut self, key: RequestKey, targets: &[Target]) {
         for target in targets {
-            self.named.entry(*target).or_default().insert(sequence);
+            self.named.entry(*target).or_default().insert(key);
+        }
+    }
+
+    /// The request `key` is settled. Only a request that named a target is kept, so the run holds
+    /// nothing for the requests of a host that waits for nothing.
+    fn settle(&mut self, key: RequestKey) {
+        if self.named.values().any(|keys| keys.contains(&key)) {
+            self.settled.insert(key);
         }
     }
 
@@ -292,7 +304,7 @@ impl RunNames {
                     && self
                         .named
                         .get(target)
-                        .is_some_and(|sequences| sequences.is_subset(&self.settled))
+                        .is_some_and(|keys| keys.is_subset(&self.settled))
             })
             .copied()
             .collect()
@@ -304,6 +316,9 @@ impl RunNames {
             self.added.remove(target);
             self.named.remove(target);
         }
+        let named: std::collections::BTreeSet<RequestKey> =
+            self.named.values().flatten().copied().collect();
+        self.settled.retain(|key| named.contains(key));
     }
 }
 
@@ -386,10 +401,11 @@ impl Shared {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The record at `sequence` is settled: what only it named is no longer owed by this scan.
-    fn settle(&self, sequence: u64) {
+    /// The request `id` at `sequence` is settled: what only it named is no longer owed by this
+    /// scan.
+    fn settle(&self, sequence: u64, id: RevocationRequestId) {
         self.owing().settle(sequence);
-        self.run_names().settled.insert(sequence);
+        self.run_names().settle((sequence, id));
     }
 
     /// Whether a record at `sequence` is one the host holds and does not refuse for a ground a
@@ -453,10 +469,18 @@ async fn write_ahead(
             .iter()
             .filter(|record| record.sequence.get() <= cutoff)
         {
+            let key = (record.sequence.get(), record.request.request_id);
             let named = controller.named_targets_of(&record.request);
-            if !named.is_empty() {
-                run.name(record.sequence.get(), &named);
-                owing.add(record.sequence.get(), named);
+            if named.is_empty() {
+                continue;
+            }
+            run.name(key, &named);
+            owing.add(record.sequence.get(), named);
+            // A request this run settled already is read again by every scan while a held one
+            // stands before it. Its targets are for the reconcile to clear and are not written
+            // ahead a second time.
+            if run.settled.contains(&key) {
+                owing.settle(record.sequence.get());
             }
         }
         owing.unsettled_in_order()
@@ -1327,7 +1351,7 @@ async fn pass(
             }
             match settle(shared, controller, record, &mut now).await? {
                 Settled::Done => {
-                    shared.settle(record.sequence.get());
+                    shared.settle(record.sequence.get(), record.request.request_id);
                     if contiguous {
                         through = record.sequence.get();
                     }
@@ -1910,7 +1934,7 @@ async fn settle_request(
                     return Ok(Settled::Held);
                 }
                 // The obligation ends with the decision, whatever becomes of the delivery.
-                shared.settle(place);
+                shared.settle(place, id);
                 return refuse(shared, controller, request, reason, latest).await;
             }
             Judged::Apply(plan) => plan,
@@ -2109,6 +2133,56 @@ fn revision_record(
 mod tests {
     use super::*;
     use futures_util::FutureExt as _;
+
+    /// KR-REQ-24.15: a scan takes a target out of the list only when this run added it and every
+    /// request of this run that named it is settled, a request is known by its place in the feed
+    /// and its identifier together, and the run keeps nothing for a request that named nothing.
+    #[test]
+    fn a_scan_clears_a_target_only_when_every_request_of_the_run_that_named_it_is_settled() {
+        let target = |byte: u8| {
+            Target::Device(DeviceId::new(kr_protocol::scalars::Uuid::from_bytes(
+                [byte; 16],
+            )))
+        };
+        let request =
+            |byte: u8| RevocationRequestId::new(kr_protocol::scalars::Uuid::from_bytes([byte; 16]));
+        let (d1, d2) = (target(1), target(2));
+        let mut run = RunNames::default();
+        run.name((1, request(1)), &[d1]);
+        run.name((2, request(2)), &[d1, d2]);
+        run.added.insert(d1);
+        run.added.insert(d2);
+        run.settle((2, request(2)));
+        run.settle((9, request(9)));
+        assert!(
+            run.settled.len() == 1,
+            "a request that named nothing is not kept: {:?}",
+            run.settled
+        );
+        assert_eq!(
+            run.clearable(&[d1, d2]),
+            vec![d2],
+            "the first request is not settled, so the target it names stays"
+        );
+        // The feed put back to an earlier state uses place 1 again for another request.
+        run.settle((1, request(7)));
+        assert_eq!(run.clearable(&[d1]), Vec::<Target>::new());
+        run.settle((1, request(1)));
+        assert_eq!(run.clearable(&[d1, d2]), vec![d1, d2]);
+        // A target an earlier run wrote is not added by this one, and is never cleared.
+        run.added.remove(&d1);
+        assert_eq!(run.clearable(&[d1]), Vec::<Target>::new());
+        run.forget(&[d2]);
+        assert!(!run.named.contains_key(&d2) && !run.added.contains(&d2));
+        assert!(
+            !run.settled.contains(&(2, request(2)))
+                || run
+                    .named
+                    .values()
+                    .flatten()
+                    .any(|key| *key == (2, request(2)))
+        );
+    }
 
     /// KR-REQ-24.15: a request this host acknowledged is carried out again before the registry's own
     /// note of it is asked, also when the feed shows it refused: the acknowledgement says the host

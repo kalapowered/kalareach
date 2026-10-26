@@ -145,11 +145,13 @@ pub struct Merged {
 
 /// The list `held` becomes under `change`.
 ///
-/// An entry leaves it when `change` clears it, or when its target is no longer live, and never
-/// because no request names it now: a request the feed dropped after its retention left its entry
-/// where it was. A target not live is not added, and one that cannot be shown not to be live is.
-/// The entries held stay, new ones are added in order until `most` entries are held, and the rest
-/// are left out and `full` is set.
+/// An entry leaves it when `change` clears it, and never because no request names it now (a request
+/// the feed dropped after its retention left its entry where it was) or because its target is not
+/// live now: a registry put back again brings a revoked target back, and the request that owed it
+/// may be gone by then. An entry whose target is not live yields its place to an added one when the
+/// list holds `most` entries. A target not live is not added, and one that cannot be shown not to be
+/// live is. The entries held stay, new ones are added in order until `most` entries are held, and
+/// the rest are left out and `full` is set.
 #[must_use]
 pub fn merged(
     held: &[Owed],
@@ -159,10 +161,7 @@ pub fn merged(
 ) -> Merged {
     let mut owed: BTreeSet<Owed> = held
         .iter()
-        .filter(|entry| {
-            !(entry.origin == change.origin && change.clear.contains(&entry.target))
-                && live(&entry.target)
-        })
+        .filter(|entry| !(entry.origin == change.origin && change.clear.contains(&entry.target)))
         .copied()
         .collect();
     let mut full = false;
@@ -175,8 +174,12 @@ pub fn merged(
             continue;
         }
         if owed.len() >= most {
-            full = true;
-            continue;
+            let spent = owed.iter().find(|held| !live(&held.target)).copied();
+            let Some(spent) = spent else {
+                full = true;
+                continue;
+            };
+            owed.remove(&spent);
         }
         owed.insert(entry);
     }
@@ -335,6 +338,9 @@ pub struct Kept {
     known: Option<Record>,
     durable: bool,
     most: usize,
+    /// Whether the start found a file here that it could not read. Nothing is written over it: the
+    /// list in it is lost, and the confirmation removes it.
+    unreadable: bool,
 }
 
 impl Kept {
@@ -346,6 +352,7 @@ impl Kept {
             known: None,
             durable: false,
             most: MOST_OWED,
+            unreadable: false,
         }
     }
 
@@ -365,6 +372,20 @@ impl Kept {
     #[cfg(any(test, feature = "testing"))]
     pub const fn limit_the_list_to(&mut self, most: usize) {
         self.most = most;
+    }
+
+    /// Whether the file here could not be read at the start and is still there: the list in it is
+    /// lost.
+    #[must_use]
+    pub const fn is_unreadable(&self) -> bool {
+        self.unreadable
+    }
+
+    /// Notes that the start found a file here that it could not read, so that no write goes over it.
+    pub fn found_unreadable(&mut self) {
+        // Something that is not a file here is an obstacle and not a record: writing over it fails
+        // and stops the pass, which is what keeps a host that cannot write its record from going on.
+        self.unreadable = self.file.is_file();
     }
 
     /// Takes a record a start read from disk as durable once the directory it is in is flushed.
@@ -413,6 +434,9 @@ impl Kept {
         now_ms: u64,
         publish: impl FnOnce(&Path, &[u8]) -> Result<()>,
     ) -> Result<()> {
+        if self.unreadable {
+            return Ok(());
+        }
         if self.durable
             && self
                 .known
@@ -495,6 +519,7 @@ impl Kept {
         unlink(&self.file)?;
         self.known = None;
         self.durable = false;
+        self.unreadable = false;
         flush_after_removal(&self.file)
     }
 }
@@ -1000,7 +1025,7 @@ mod tests {
     }
 
     #[test]
-    fn an_entry_that_is_not_live_leaves_the_list_and_is_not_added() {
+    fn an_entry_that_is_not_live_stays_and_a_target_that_is_not_live_is_not_added() {
         let held = vec![entry(1, device(1)), entry(2, device(2))];
         let origin = Digest256::from_bytes([1; 32]);
         let merged = merged(
@@ -1013,7 +1038,43 @@ mod tests {
             MOST_OWED,
             |target| *target != device(2) && *target != device(3),
         );
-        assert_eq!(merged.owed, vec![entry(1, device(1)), entry(1, device(4))]);
+        assert_eq!(
+            merged.owed,
+            vec![
+                entry(1, device(1)),
+                entry(1, device(4)),
+                entry(2, device(2))
+            ],
+            "a registry put back again can bring device 2 back, with the request that owed it gone"
+        );
+    }
+
+    #[test]
+    fn an_entry_that_is_not_live_yields_its_place_at_the_cap_and_a_live_one_does_not() {
+        let origin = Digest256::from_bytes([1; 32]);
+        let held = vec![
+            entry(1, device(1)),
+            entry(1, device(2)),
+            entry(1, device(3)),
+        ];
+        let change = Change {
+            origin,
+            add: &[device(4)],
+            clear: &[],
+        };
+        let spent = merged(&held, &change, 3, |target| *target != device(2));
+        assert_eq!(
+            spent.owed,
+            vec![
+                entry(1, device(1)),
+                entry(1, device(3)),
+                entry(1, device(4))
+            ]
+        );
+        assert!(!spent.full);
+        let kept = merged(&held, &change, 3, |_| true);
+        assert_eq!(kept.owed, held);
+        assert!(kept.full);
     }
 
     #[test]
@@ -1135,5 +1196,20 @@ mod tests {
         )
         .expect("nothing to do");
         assert_eq!(std::fs::read(&file).expect("the file"), b"junk");
+
+        // The record of a finding is not written over it either, and the confirmation that removes
+        // the file leaves the daemon free to write again.
+        kept.found_unreadable();
+        assert!(kept.is_unreadable());
+        kept.ensure_by(subject_of(&row()), 9, |_, _| {
+            panic!("nothing is written over a file that could not be read")
+        })
+        .expect("nothing to do");
+        assert_eq!(std::fs::read(&file).expect("the file"), b"junk");
+        kept.lift().expect("the file is removed");
+        assert!(!kept.is_unreadable());
+        kept.ensure(subject_of(&row()), 9)
+            .expect("a record is written");
+        assert!(matches!(read(&file), Found::Record(_)));
     }
 }

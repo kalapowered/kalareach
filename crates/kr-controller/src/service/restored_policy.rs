@@ -65,9 +65,11 @@ const UNREADABLE_REMEDY: &str = concat!(
     "Read what this host holds with `kr organisation list`, and end what you do not want in \
      force with `kr organisation withdraw`, `kr device revoke` and `kr share revoke`, which need \
      no confirmation and work while this stands. Then run `kr host policy --confirm` at this \
-     machine, which removes the record that cannot be read. Until then no remote device is \
-     served, owner devices included, and `kr host update` to a release that lists the record's \
-     store is refused when the update check cannot read the record either. ",
+     machine, which removes the record that cannot be read. The list of what the wait owes was in \
+     it and is lost: read `kr device list` and `kr share list` against what the owners of the \
+     feed intended, and revoke what they did not. Until then no remote device is served, owner \
+     devices included, and `kr host update` to a release that lists the record's store is \
+     refused when the update check cannot read the record either. ",
     feed_note!(),
     exclusive_note!()
 );
@@ -142,7 +144,11 @@ fn the_way_that_keeps_an_owner(file: &std::path::Path) -> String {
 }
 
 /// The words of the refusal of a confirmation while the wait owes something.
-fn the_refusal_while_the_wait_is_owed(owing: &Owing, file: &std::path::Path) -> String {
+fn the_refusal_while_the_wait_is_owed(
+    owing: &Owing,
+    file: &std::path::Path,
+    list_lost: bool,
+) -> String {
     let cost = "taking `authority.origin` out of the configuration document and starting the \
                 daemon again confirms a host that cannot reach its feed once no device or share \
                 its list names is live, at this cost: the host then reads no feed, so it serves \
@@ -150,7 +156,13 @@ fn the_refusal_while_the_wait_is_owed(owing: &Owing, file: &std::path::Path) -> 
                 not name until the person has revoked it at this machine with `kr device \
                 revoke`, and it learns no remote revocation while it reads none; revoke those \
                 devices first";
-    match owing {
+    let lost = if list_lost {
+        "; the record of the restore cannot be read, so the list of what the wait owes is lost: \
+         read `kr device list` and `kr share list` against what the owners of the feed intended"
+    } else {
+        ""
+    };
+    let said = match owing {
         Owing::AScanThrough => format!(
             "this host reads an authority feed, and no scan of this run has read it through and \
              written what it owes, so a device an owner revoked through the feed since the \
@@ -173,8 +185,8 @@ fn the_refusal_while_the_wait_is_owed(owing: &Owing, file: &std::path::Path) -> 
                 String::new()
             };
             let mut said = format!(
-                "this host owes {names}{more}: requests its authority feed holds name them, this \
-                 host has not carried those out or set them aside on what a restore cannot \
+                "this host owes {names}{more}: requests its authority feed holds or held name them, \
+                 this host has not carried those out or set them aside on what a restore cannot \
                  change, and they are live in the registry, so ending the wait would serve them \
                  again; revoke each at this machine, with `kr device revoke` for a device and \
                  `kr share revoke` for a share, which need no confirmation and work while the \
@@ -193,7 +205,8 @@ fn the_refusal_while_the_wait_is_owed(owing: &Owing, file: &std::path::Path) -> 
             }
             said
         }
-    }
+    };
+    format!("{said}{lost}")
 }
 
 /// What a write to the list of what a restored policy's wait owes came to.
@@ -250,8 +263,10 @@ impl Controller {
         if mirror_unreadable {
             // The mirror is what a restored registry would have been compared with. Its record
             // comes first, then the start replaces the mirror with a copy of the row it holds.
-            if let Found::Record(record) = found {
-                kept.adopt(record);
+            match found {
+                Found::Record(record) => kept.adopt(record),
+                Found::Unreadable(_) => kept.found_unreadable(),
+                Found::Missing => {}
             }
             kept.ensure(subject, now_ms)?;
             eprintln!(
@@ -264,6 +279,7 @@ impl Controller {
         match found {
             Found::Missing => Ok(false),
             Found::Unreadable(why) => {
+                kept.found_unreadable();
                 eprintln!(
                     "kr-controller: the record that this host's policy was found restored cannot \
                      be read, so the host waits for the person at this machine to confirm the \
@@ -343,8 +359,9 @@ impl Controller {
     }
 
     /// Changes the list of what the wait owes: adds the targets of `origin`'s requests that `add`
-    /// names, takes out those `clear` names, and drops every entry that is no longer live, in one
-    /// write through the durable gate. The record's lock is taken here, so a write and a
+    /// names and takes out those `clear` names, in one write through the durable gate. An entry
+    /// whose target is no longer live stays, since a registry put back again can bring the target
+    /// back, and yields its place only when the list is full. The record's lock is taken here, so a write and a
     /// confirmation wait for each other, and nothing is written once no wait stands.
     ///
     /// # Errors
@@ -467,7 +484,11 @@ impl Controller {
                 kept.most(),
             ) {
                 return Err(ControllerError::PermissionDenied {
-                    detail: the_refusal_while_the_wait_is_owed(&owing, kept.file()),
+                    detail: the_refusal_while_the_wait_is_owed(
+                        &owing,
+                        kept.file(),
+                        kept.is_unreadable(),
+                    ),
                 });
             } else {
                 {
@@ -642,7 +663,10 @@ impl Controller {
         };
         let unreadable = matches!(record, Found::Unreadable(_));
         if unreadable {
-            detail = detail.stated("; the record of the restore cannot be read");
+            detail = detail.stated(
+                "; the record of the restore cannot be read, and the list in it of what the wait \
+                 owes is lost",
+            );
         }
         let held: &[Owed] = match &record {
             Found::Record(record) => &record.owed,
@@ -660,7 +684,7 @@ impl Controller {
                 let detail = owed.named.iter().take(MOST_NAMED).fold(
                     detail.stated(
                         "; a confirmation is refused while a device or share that requests the \
-                         authority feed holds name is live here, and this host owes it",
+                         authority feed holds or held name is live here, and this host owes it",
                     ),
                     |detail, target| match target {
                         Target::Device(device) => detail.stated("; device ").identifier(device),
