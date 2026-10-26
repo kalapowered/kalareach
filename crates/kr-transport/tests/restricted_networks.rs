@@ -11,20 +11,22 @@
 mod support;
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt as _;
 use iroh::address_lookup::{AddressLookup as _, PkarrResolver};
 use iroh::endpoint::Connection;
 use iroh::endpoint::RelayStatus;
+use iroh::unstable_net_report::NetReport;
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, TransportAddr, Watcher as _};
 use kr_protocol::error::ErrorCode;
-use kr_transport::config::{DiscoveryConfig, EndpointConfig, PublishedAddresses, PublisherPolicy};
+use kr_transport::config::{
+    DiscoveryConfig, EndpointConfig, ProxyUrl, PublishedAddresses, PublisherPolicy,
+};
 use kr_transport::{ALPN, TransportError};
 use support::front::RelayFront;
 use support::pkarr::PkarrRelay;
-use support::proxy::{HttpProxy, authority};
+use support::proxy::{Asked, HttpProxy, authority};
 use support::{LocalRelay, Side};
 use tokio::task::JoinHandle;
 
@@ -484,6 +486,55 @@ async fn eventually(what: &str, mut check: impl FnMut() -> bool) {
     }
 }
 
+/// A relay that hangs up: it accepts each connection and closes it at once, and holds its port for
+/// as long as it lives, so no other test can take the port and answer for it.
+struct HangsUp {
+    url: RelayUrl,
+    accepting: JoinHandle<()>,
+}
+
+impl HangsUp {
+    async fn spawn() -> Self {
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .expect("a loopback port");
+        let address = listener.local_addr().expect("an address");
+        let accepting = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        Self {
+            url: format!("https://{address}").parse().expect("a relay URL"),
+            accepting,
+        }
+    }
+}
+
+impl Drop for HangsUp {
+    fn drop(&mut self) {
+        self.accepting.abort();
+    }
+}
+
+/// The endpoint's net report, once its first measurement of its relays has ended.
+///
+/// The report is published when every probe has ended, so the case that waits for it never waits
+/// out a time: a probe that went nowhere has failed by then.
+async fn first_report(endpoint: &Endpoint) -> NetReport {
+    tokio::time::timeout(PATIENCE, endpoint.net_report().initialized())
+        .await
+        .expect("the endpoint publishes its first net report")
+}
+
+/// Whether `report` holds a latency for `relay`, which only an answered probe leaves.
+fn measured(report: &NetReport, relay: &RelayUrl) -> bool {
+    report
+        .relay_latency
+        .iter()
+        .any(|(_, measured, _)| measured == relay)
+}
+
 /// The child half of [`no_proxy_variable_moves_a_request_of_the_endpoint`].
 ///
 /// It is ignored in an ordinary run because it means nothing without the environment the other
@@ -522,6 +573,12 @@ async fn the_child_of_the_proxy_variable_test() {
         "the control went to the address the variables name: {answer:?}"
     );
     assert_eq!(pkarr.lookups(&probe.endpoint.id()), 0);
+    // The one request the proxy the variables name is expected to take, for the parent to read.
+    println!(
+        "control request: {}/{}",
+        pkarr.url,
+        probe.endpoint.id().to_z32()
+    );
     probe.endpoint.close().await;
 
     // With no proxy selected, the endpoint's publisher and resolver reach the Pkarr relay directly.
@@ -596,31 +653,80 @@ async fn the_child_of_the_proxy_variable_test() {
     }
     peer.endpoint.close().await;
     host.endpoint.close().await;
+
+    // The relay probes. A relay-only endpoint has no address discovery, so its net report rests on
+    // the relay latency probe, and on the captive-portal check when the report is not complete once
+    // every relay has answered. A second relay that hangs up keeps the report from completing on
+    // the first answer, so the check runs to its end as well.
+    let live = LocalRelay::spawn().await;
+    let silent = HangsUp::spawn().await;
+    let two_relays = |proxy_url: Option<ProxyUrl>, ca_roots: Vec<Vec<u8>>| EndpointConfig {
+        relay_urls: vec![live.url.clone(), silent.url.clone()],
+        relay_ca_roots: ca_roots,
+        relay_only: true,
+        proxy_url,
+        ..EndpointConfig::default()
+    };
+
+    // With no proxy selected, the probe and the check go to the relay itself, whatever the
+    // variables name: the report holds the relay's latency, and the proxy the variables name is
+    // left to the parent to read.
+    let alone = support::side(&two_relays(None, live.ca_roots.clone()), 5, false).await;
+    let report = first_report(&alone.endpoint).await;
+    assert!(
+        measured(&report, &live.url),
+        "with no proxy selected, the relay latency probe reached the relay: {report:?}"
+    );
+    alone.endpoint.close().await;
+
+    // With a proxy selected, the probe and the check go through it: the tunnel it intercepts
+    // carries the probe's own request, which the relay connection's does not, and the check is a
+    // plain request it forwards.
+    let selected = HttpProxy::intercepting(&live.ca_roots);
+    let through = support::side(
+        &two_relays(
+            Some(selected.url.clone()),
+            [live.ca_roots.clone(), selected.ca_roots.clone()].concat(),
+        ),
+        6,
+        false,
+    )
+    .await;
+    let report = first_report(&through.endpoint).await;
+    assert!(
+        measured(&report, &live.url),
+        "with a proxy selected, the relay latency probe reached the relay through it: {report:?}"
+    );
+    let inner = selected.inner();
+    assert!(
+        inner
+            .iter()
+            .any(|asked| asked.method == "GET" && asked.target == "/ping"),
+        "the relay latency probe went through the selected proxy: {inner:?}"
+    );
+    let asked = selected.asked();
+    assert!(
+        asked
+            .iter()
+            .any(|asked| asked.method == "GET" && asked.target == "http://127.0.0.1/generate_204"),
+        "the captive-portal check went through the selected proxy: {asked:?}"
+    );
+    through.endpoint.close().await;
 }
 
 /// KR-REQ-10.02, KR-REQ-26.14: the proxy variables other programs follow move no request of the
-/// endpoint's. In a process whose `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` name an address that
-/// counts each connection and drops it, the endpoint's Pkarr publisher and resolver go to their
-/// server directly, and with a proxy selected every client of the endpoint uses that proxy. The
-/// address the variables name is reached once, by the control: iroh's own Pkarr resolver, built
-/// the ordinary way, which is what the endpoint would otherwise have used.
+/// endpoint's. In a process whose `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` name a proxy that
+/// records what it is asked and refuses it, the endpoint's Pkarr publisher and resolver go to their
+/// server directly, its relay latency probe and captive-portal check go to the relay directly
+/// when no proxy is selected, and with a proxy selected every client of the endpoint uses that
+/// proxy. The proxy the variables name takes one request, the control's: iroh's own Pkarr resolver,
+/// built the ordinary way, which is what the endpoint would otherwise have used.
 #[tokio::test]
 async fn no_proxy_variable_moves_a_request_of_the_endpoint() {
-    let listener = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-        .await
-        .expect("a loopback port");
-    let port = listener.local_addr().expect("an address").port();
-    let reached = Arc::new(Mutex::new(0_usize));
-    let counted = Arc::clone(&reached);
-    let listening = tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
-            *counted.lock().unwrap_or_else(PoisonError::into_inner) += 1;
-            drop(stream);
-        }
-    });
+    let named = HttpProxy::refusing();
 
     // The environment belongs to a process, so the case is exercised in one of its own.
-    let proxy = format!("http://127.0.0.1:{port}");
+    let proxy = named.url.as_url().to_string();
     let binary = std::env::current_exe().expect("this test binary");
     let ran = tokio::task::spawn_blocking(move || {
         std::process::Command::new(binary)
@@ -643,22 +749,23 @@ async fn no_proxy_variable_moves_a_request_of_the_endpoint() {
     })
     .await
     .expect("the child");
-    listening.abort();
 
-    assert!(
-        ran.status.success(),
-        "{}{}",
-        String::from_utf8_lossy(&ran.stdout),
-        String::from_utf8_lossy(&ran.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&ran.stdout).contains("1 passed"),
-        "the child ran: {}",
-        String::from_utf8_lossy(&ran.stdout)
-    );
+    let stdout = String::from_utf8_lossy(&ran.stdout);
+    let output = format!("{stdout}{}", String::from_utf8_lossy(&ran.stderr));
+    // What the proxy was asked comes first, so a failed run shows where each request went.
+    let control = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("control request: "))
+        .map(|target| Asked {
+            method: "GET".to_owned(),
+            target: target.to_owned(),
+        });
     assert_eq!(
-        *reached.lock().unwrap_or_else(PoisonError::into_inner),
-        1,
-        "the control went to the address the variables name, and nothing of the endpoint's did"
+        named.asked(),
+        control.into_iter().collect::<Vec<_>>(),
+        "the proxy the variables name took the control's request and nothing of the endpoint's: \
+         {output}"
     );
+    assert!(ran.status.success(), "{output}");
+    assert!(stdout.contains("1 passed"), "the child ran: {output}");
 }

@@ -8,12 +8,11 @@
 //!
 //! The same holds for the way out. With a proxy named, the relay connection, iroh's relay latency
 //! probe and captive-portal check, and the Pkarr publisher and resolver all go through it. With
-//! none, the relay connection and the Pkarr requests go directly. The two relay probes are the
-//! exception: iroh builds their client with the environment's proxy settings when it is given no
-//! proxy, and offers no way to turn that off, so they follow `HTTP_PROXY`, `HTTPS_PROXY` and
-//! `ALL_PROXY` when those are set. Name lookups go directly either way, over plain DNS or DNS over
+//! none, all of them go directly, and no proxy variable of the environment moves any of them: iroh
+//! builds the two relay probes with no proxy when it is given none, and the Pkarr clients and the
+//! resolver are this crate's own. Name lookups go directly either way, over plain DNS or DNS over
 //! TLS: the resolver is this module's, and it has no DNS-over-HTTPS client, which would follow
-//! those variables too.
+//! those variables.
 //!
 //! [`connect`] is the dialling half: it opens a connection and, when a relay the connection needed
 //! turned this endpoint away, or the network refused the relay's WebSocket upgrade, says so rather
@@ -163,8 +162,9 @@ async fn bind(
     builder = builder.dns_resolver(resolver).ca_tls_config(ca_tls);
     // The relay client tunnels through the proxy with CONNECT, and the net report sends its relay
     // latency probe and captive-portal check through it. Nothing falls back to a direct connection
-    // when the proxy cannot be reached: the owner chose to go through it. `proxy_from_env` is never
-    // called, because the proxy is this configuration's to name.
+    // when the proxy cannot be reached: the owner chose to go through it. With none named, the
+    // net report's probes go direct. `proxy_from_env` is never called, because the proxy is this
+    // configuration's to name.
     if let Some(proxy) = &config.proxy_url {
         builder = builder.proxy_url(proxy.as_url().clone());
     }
@@ -606,8 +606,9 @@ fn published_addresses(config: &EndpointConfig) -> iroh::address_lookup::AddrFil
 fn apply_discovery(mut builder: Builder, config: &EndpointConfig) -> Result<Builder> {
     let discovery = &config.discovery;
 
-    // This crate's own Pkarr services rather than iroh's, whose HTTP client takes no proxy and
-    // follows the environment's instead: these take the configuration's proxy, or none.
+    // This crate's own Pkarr services rather than iroh's, whose HTTP client takes the endpoint's
+    // proxy but, given none, follows the environment's: these take the configuration's proxy, or
+    // none.
     if let Some(url) = &discovery.pkarr_publisher_url {
         builder = builder.address_lookup(crate::pkarr::Publisher {
             server: url.clone(),

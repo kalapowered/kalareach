@@ -3,9 +3,9 @@
 //! A Pkarr server keeps each endpoint's signed discovery record: an endpoint publishes it with
 //! `PUT <server>/<key>` and a peer reads it with `GET <server>/<key>`, the key being the endpoint
 //! identity in z-base-32. iroh has a publisher and a resolver for this, but each builds its own
-//! HTTP client with no way to name a proxy, and that client follows `HTTP_PROXY`, `HTTPS_PROXY` and
-//! `ALL_PROXY` whatever the endpoint selects. Section 26 lets no inherited variable steer a
-//! provider's traffic, so the endpoint uses these two instead.
+//! HTTP client, and that client takes the endpoint's proxy only when one is selected: with none, it
+//! follows `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`. Section 26 lets no inherited variable steer
+//! a provider's traffic, so the endpoint uses these two instead.
 //!
 //! They speak the same protocol on the same republish rules. The record is signed and verified by
 //! the same record code iroh uses, names are resolved by the endpoint's own DNS resolver and

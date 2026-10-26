@@ -116,15 +116,14 @@ interprocess = { version = "=2.4.4", features = ["tokio"] }
 jsonschema = { version = "=0.58.6", default-features = false }
 # The net report is read to see that the relay a host's leases are installed on answers before the
 # relays the owner configured are set aside. Its API is not stable across releases; the version is exact.
-iroh = { version = "=1.2.0", default-features = false, features = ["metrics", "portmapper", "tls-ring", "unstable-net-report"] }
-iroh-base = { version = "=1.2.0", default-features = false, features = ["key", "relay"] }
+iroh = { version = "=1.4.1", default-features = false, features = ["metrics", "portmapper", "tls-ring", "unstable-net-report"] }
 # The signed discovery record format, at the release iroh itself is built with. The transport
 # publishes and reads a Pkarr record over an HTTP client of its own, which takes the proxy the host
 # selected and never one from the environment, and verifies each record it reads with this code.
-iroh-dns = { version = "=1.3.0", default-features = false }
+iroh-dns = { version = "=1.4.1", default-features = false }
 iroh-mainline-address-lookup = "=0.5.0"
 iroh-mdns-address-lookup = "=0.5.0"
-iroh-relay = { version = "=1.2.0", default-features = false }
+iroh-relay = { version = "=1.4.1", default-features = false }
 # The calendar and instant types `tough` states metadata expiry in.
 jiff = { version = "=0.2.37", features = ["serde"] }
 keyring = "=4.2.0"
