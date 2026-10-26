@@ -2744,7 +2744,13 @@ fn collect(
         .and_then(|current| Ok((current, store.releases()?)))
     {
         Ok(found) => found,
-        Err(_) => return (removed, not_removed),
+        Err(error) => {
+            not_removed.push(NotRemoved {
+                what: Remains::Releases,
+                reason: said(&error),
+            });
+            return (removed, not_removed);
+        }
     };
     for release in releases {
         let needed = current.as_ref() == Some(&release)
