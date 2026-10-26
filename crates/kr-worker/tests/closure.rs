@@ -1071,8 +1071,9 @@ async fn a_stubborn_shell_is_closed() -> Result<(), String> {
     const RECORD_ALLOWANCE: Duration = Duration::from_secs(1);
     /// How close to a moment a sample has to be to speak for it.
     const RESOLUTION: Duration = Duration::from_millis(50);
-    /// How long the shell sleeps, from its ready mark, before it reads the key. The close follows
-    /// the mark within moments, so the key is read long after the worker wrote it.
+    /// How long the shell sleeps, from its ready mark, before it reads the key. The close is asked
+    /// for soon after the mark, so the key is as a rule read some while after the worker wrote it;
+    /// no decision here depends on that.
     const READ_DELAY: Duration = Duration::from_millis(600);
     /// How far past five seconds after the request the shell may be first seen gone and still be
     /// held to the grace.
