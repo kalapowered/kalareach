@@ -10,7 +10,13 @@
 //! An intercepting proxy stands for a network that inspects TLS. It answers `CONNECT` as any proxy
 //! does, then answers the client's TLS itself, with a certificate for the host the client asked
 //! for that the proxy's own authority issued, and carries what it reads over TLS of its own to that
-//! host. A client that does not trust the proxy's authority refuses the certificate.
+//! host. A client that does not trust the proxy's authority refuses the certificate. It also
+//! records the first request each tunnel carries, which is what tells the relay's latency probe
+//! from the relay connection.
+//!
+//! A refusing proxy stands for the proxy a process's environment names. It records each request
+//! and turns it away, so a test sees what a client asked it for and that nothing it asked for
+//! succeeded.
 //!
 //! It runs on a runtime of its own, so nothing about it depends on the runtime the endpoints run
 //! on. Stopping it closes its port and every connection it holds, which leaves a client that was
@@ -45,6 +51,8 @@ pub struct Asked {
 enum Mode {
     /// Splices the client to the destination.
     Forwarding,
+    /// Records the request and answers it with a refusal.
+    Refusing,
     /// Answers the client's TLS itself and reaches the destination over TLS of its own.
     Intercepting(Box<Interception>),
 }
@@ -66,6 +74,7 @@ pub struct HttpProxy {
     pub ca_roots: Vec<Vec<u8>>,
     addr: SocketAddr,
     asked: Arc<Mutex<Vec<Asked>>>,
+    inner: Arc<Mutex<Vec<Asked>>>,
     runtime: Option<tokio::runtime::Runtime>,
 }
 
@@ -73,6 +82,11 @@ impl HttpProxy {
     /// Starts a proxy that tunnels and forwards whatever it is asked to.
     pub fn forwarding() -> Self {
         Self::start(Mode::Forwarding, Vec::new())
+    }
+
+    /// Starts a proxy that records what it is asked and refuses every request.
+    pub fn refusing() -> Self {
+        Self::start(Mode::Refusing, Vec::new())
     }
 
     /// Starts a proxy that intercepts the TLS of every tunnel, and reaches each destination
@@ -100,12 +114,16 @@ impl HttpProxy {
             .build()
             .expect("the proxy's runtime");
         let asked = Arc::new(Mutex::new(Vec::new()));
-        let recording = Arc::clone(&asked);
+        let inner = Arc::new(Mutex::new(Vec::new()));
+        let recording = Records {
+            asked: Arc::clone(&asked),
+            inner: Arc::clone(&inner),
+        };
         let mode = Arc::new(mode);
         runtime.spawn(async move {
             let listener = TcpListener::from_std(listener).expect("the proxy listener");
             while let Ok((stream, _)) = listener.accept().await {
-                tokio::spawn(serve(stream, Arc::clone(&recording), Arc::clone(&mode)));
+                tokio::spawn(serve(stream, recording.clone(), Arc::clone(&mode)));
             }
         });
         Self {
@@ -113,6 +131,7 @@ impl HttpProxy {
             ca_roots,
             addr,
             asked,
+            inner,
             runtime: Some(runtime),
         }
     }
@@ -120,6 +139,15 @@ impl HttpProxy {
     /// Every request the proxy took, in the order it took them.
     pub fn asked(&self) -> Vec<Asked> {
         self.asked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The first request each intercepted tunnel carried, in the order the tunnels were opened:
+    /// its method and its path. Empty for a proxy that does not intercept.
+    pub fn inner(&self) -> Vec<Asked> {
+        self.inner
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
@@ -167,8 +195,17 @@ pub fn authority(url: &Url) -> String {
     )
 }
 
+/// Where a proxy writes down what it was asked.
+#[derive(Clone)]
+struct Records {
+    /// The request that opened each connection to the proxy.
+    asked: Arc<Mutex<Vec<Asked>>>,
+    /// The first request inside each intercepted tunnel.
+    inner: Arc<Mutex<Vec<Asked>>>,
+}
+
 /// Takes one request from `stream` and does what it asks.
-async fn serve(stream: TcpStream, asked: Arc<Mutex<Vec<Asked>>>, mode: Arc<Mode>) {
+async fn serve(stream: TcpStream, records: Records, mode: Arc<Mode>) {
     let mut client = BufReader::new(stream);
     let Some(head) = read_head(&mut client).await else {
         return;
@@ -179,7 +216,8 @@ async fn serve(stream: TcpStream, asked: Arc<Mutex<Vec<Asked>>>, mode: Arc<Mode>
     }) else {
         return;
     };
-    asked
+    records
+        .asked
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .push(Asked {
@@ -187,9 +225,12 @@ async fn serve(stream: TcpStream, asked: Arc<Mutex<Vec<Asked>>>, mode: Arc<Mode>
             target: target.clone(),
         });
     match (method.as_str(), mode.as_ref()) {
+        (_, Mode::Refusing) => {
+            let _ = client.get_mut().write_all(BAD_GATEWAY).await;
+        }
         ("CONNECT", Mode::Forwarding) => tunnel(client, &target).await,
         ("CONNECT", Mode::Intercepting(interception)) => {
-            intercept(client, &target, interception).await;
+            intercept(client, &target, interception, &records.inner).await;
         }
         _ => forward(client, &head, &target).await,
     }
@@ -220,7 +261,12 @@ async fn tunnel(mut client: BufReader<TcpStream>, target: &str) {
 
 /// Opens a tunnel to `target` whose TLS the proxy answers itself, and carries what it reads there
 /// over TLS of its own to `target`.
-async fn intercept(mut client: BufReader<TcpStream>, target: &str, interception: &Interception) {
+async fn intercept(
+    mut client: BufReader<TcpStream>,
+    target: &str,
+    interception: &Interception,
+    inner: &Mutex<Vec<Asked>>,
+) {
     let host = target
         .rsplit_once(':')
         .map_or(target, |(host, _)| host)
@@ -241,7 +287,7 @@ async fn intercept(mut client: BufReader<TcpStream>, target: &str, interception:
     // The reader is handed over whole, so the start of the client's TLS is not lost if it arrived
     // with the request.
     let acceptor = TlsAcceptor::from(interception.authority.server_config(host));
-    let Ok(mut client) = acceptor.accept(client).await else {
+    let Ok(client) = acceptor.accept(client).await else {
         return;
     };
     let Ok(mut destination) = interception
@@ -251,6 +297,30 @@ async fn intercept(mut client: BufReader<TcpStream>, target: &str, interception:
     else {
         return;
     };
+    // The first request the tunnel carries is read, written down and passed on whole.
+    let mut client = BufReader::new(client);
+    let Some(head) = read_head(&mut client).await else {
+        return;
+    };
+    if let Some((method, path)) = head.split("\r\n").next().and_then(|line| {
+        let mut parts = line.split(' ');
+        Some((parts.next()?.to_owned(), parts.next()?.to_owned()))
+    }) {
+        inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Asked {
+                method,
+                target: path,
+            });
+    }
+    let early = client.buffer().to_vec();
+    if destination.write_all(head.as_bytes()).await.is_err()
+        || destination.write_all(&early).await.is_err()
+    {
+        return;
+    }
+    let mut client = client.into_inner();
     let _ = tokio::io::copy_bidirectional(&mut client, &mut destination).await;
 }
 
