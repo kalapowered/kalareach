@@ -1053,7 +1053,7 @@ function HostStep({
   return (
     <>
       <p>
-        Three separate things, and you can take any of them without the others. Nothing on this
+        Four separate things, and you can take any of them without the others. Nothing on this
         screen installs anything: what you choose here is your answer, and the last step shows it
         back to you. Session descriptions, below them, are different: the buttons there ask this
         host to act, and say so.
