@@ -1,0 +1,17 @@
+{
+  "format": "kalareach.restore-corpus/1",
+  "name": "keyboard-flags",
+  "about": "a shell that negotiates Kitty keyboard flags, a full-screen application that negotiates its own on the alternate buffer (set, pushed and popped) and leaves, and the shell negotiating again",
+  "columns": 24,
+  "rows": 5,
+  "terminal": "xterm-kitty",
+  "writes": [
+    { "text": "$ ls\r\nfile1  file2\r\n" },
+    { "text": "\u001b[=5;1u$ vi notes\r\n" },
+    { "text": "\u001b[?1049h\u001b[H\u001b[2J" },
+    { "text": "\u001b[>3u\u001b[1;1H notes \u001b[2;1Hline one" },
+    { "text": "\u001b[=11;1u\u001b[3;1Hline two" },
+    { "text": "\u001b[<u\u001b[?1049l" },
+    { "text": "$ \u001b[=1;1u" }
+  ]
+}

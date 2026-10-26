@@ -19,8 +19,11 @@
 //!
 //! At every end of a write, which is where the application paused and the session settles its
 //! screen, each client is compared with the session's own screen, read by a client installed at
-//! that moment. A client stays attached until the check after the next buffer switch that follows
-//! it, so the switch is part of what it is checked through.
+//! that moment, and with the keyboard protocol of an engine fed the same output: the session's
+//! screen reaches every client through one installation, so a screen read from it alone would hold
+//! a client to a screen that had lost a buffer's flags. A client stays attached until the check
+//! after the next buffer switch that follows it, so the switch is part of what it is checked
+//! through.
 //!
 //! What is checked, by what each client holds:
 //!
@@ -38,29 +41,27 @@
 //!   no sequence that asks for one. Every side effect the application causes after a client
 //!   attached reaches the client holding the input lease once, and no other client.
 //!
-//! [`Strategy`] plants a defect in the direct client instead of taking what the session sends it,
-//! so a check that could not fail is not counted as one that passed.
+//! [`Strategy`] plants a defect in what the clients are given instead of taking what the session
+//! sends them, so a check that could not fail is not counted as one that passed.
 
 use kr_cli::render::ProjectedDisplay;
 use kr_client::projection::{Applied, Projection};
 use kr_protocol::attachment::{AttachMode, AttachmentCapability, SessionAttachParams};
 use kr_protocol::ids::{AttachmentId, ConnectionId, SessionId};
-use kr_protocol::projection::ProjectionEvent;
+use kr_protocol::projection::{KittyKeyboardState, ProjectedBuffer, ProjectionEvent};
 use kr_protocol::scalars::{CanonicalSet, Nullable};
 use kr_protocol::session::Dimensions;
 use kr_term::budget::GridSize;
 use kr_term::engine::{Engine, EngineConfig};
 use kr_term::sideeffect::SideEffectKind;
+use kr_term::snapshot::Viewport;
 use kr_worker::action::time::TimeSources;
 use kr_worker::output::{OutputDelivery, OutputStream};
 use kr_worker::session::{InputBatch, Session};
 
-use crate::corpus::Corpus;
+use crate::corpus::{self, Corpus};
 use crate::screen::{Parts, View};
 use crate::terminal::{Performed, Terminal};
-
-/// The terminal a client of the session's size says it is: one the session hands its stream to.
-const QUALIFIED: &str = "xterm-256color";
 
 /// How far narrower than the session the projected client is. A terminal of another size is shown
 /// a projection whatever it is, and a whole number of rows keeps its window on every row.
@@ -70,7 +71,7 @@ const NARROWER_BY: u16 = 4;
 /// pair and the probe the session's own screen is read with leave one spare.
 const PAIRS_AT_ONCE: usize = 15;
 
-/// What the direct client does with what the session sends it.
+/// What the clients do with what the session sends them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Strategy {
     /// What a person's client does: it takes the restoration and then the stream, and draws a
@@ -86,6 +87,9 @@ pub enum Strategy {
     /// A restoration whose switches into and out of the buffer that is not showing go the other
     /// way, so that buffer's rows land in the one that shows and the other way round.
     ReversedSwitch,
+    /// A projection whose snapshot carries the keyboard negotiation of the buffer that is showing
+    /// and none of the one that is not, as though only the screen in view were restored.
+    WithoutOtherKeyboard,
 }
 
 /// What a direct client's terminal is in when the restoration reaches it.
@@ -576,6 +580,13 @@ pub(crate) struct Stage {
     strategy: Strategy,
     /// What each direct client's terminal is in when its restoration reaches it.
     beforehand: Beforehand,
+    /// The terminal each direct client says it is.
+    terminal: String,
+    /// An engine of the profile fed the same output, which a corpus run reads the keyboard
+    /// protocol the screen should hold from. The session's screen reaches every client through one
+    /// installation, so a screen read from it only could never be found to have lost a buffer's
+    /// flags.
+    reference: Option<Engine>,
     session: Session,
     session_id: SessionId,
     bytes: Vec<u8>,
@@ -645,6 +656,8 @@ pub fn run_on(
             None,
         )?;
         stage.beforehand = beforehand;
+        stage.terminal.clone_from(&corpus.terminal);
+        stage.reference = Some(session_engine(corpus)?);
         for (point, leaves) in until.iter().copied().enumerate() {
             if point % stride == first {
                 stage.attach(Form::Direct, leaves, true)?;
@@ -715,6 +728,8 @@ impl Stage {
             rows,
             strategy,
             beforehand: Beforehand::Fresh,
+            terminal: corpus::TERMINAL.to_owned(),
+            reference: None,
             session,
             session_id,
             bytes,
@@ -760,7 +775,7 @@ impl Stage {
             mode: AttachMode::Terminal,
             claim_geometry: false,
             dimensions: Nullable::some(Dimensions::new(u64::from(columns), u64::from(rows))),
-            terminal_profile_id: Nullable::some(QUALIFIED.to_owned()),
+            terminal_profile_id: Nullable::some(self.terminal.clone()),
             requested: requested.clone(),
         };
         self.session
@@ -864,7 +879,9 @@ impl Stage {
             }
             Strategy::WithoutInactive => without_the_buffer_not_showing(&joined.bytes),
             Strategy::ReversedSwitch => with_the_switches_reversed(&joined.bytes),
-            Strategy::Product | Strategy::RawFromOffset => joined.bytes,
+            Strategy::Product | Strategy::RawFromOffset | Strategy::WithoutOtherKeyboard => {
+                joined.bytes
+            }
         };
         client.draw(&bytes, "the restoration");
         client.served = Served::Stream;
@@ -886,7 +903,7 @@ impl Stage {
         } else {
             Parts::Buffers
         };
-        let expected = self.canonical()?;
+        let expected = self.expected()?;
         if let Some(got) = client.terminal_view()? {
             self.outcome.restorations += 1;
             let found = got.differences(&expected, parts);
@@ -966,6 +983,11 @@ impl Stage {
     }
 
     fn projected(&mut self, client: &mut Client, event: ProjectionEvent) -> Result<(), String> {
+        let event = if self.strategy == Strategy::WithoutOtherKeyboard {
+            without_the_keyboard_of_the_buffer_not_showing(event)
+        } else {
+            event
+        };
         let refused = matches!(client.projection.apply(event.clone()), Applied::Refused(_));
         let mut again = refused;
         if client.form == Form::Direct
@@ -1039,6 +1061,24 @@ impl Stage {
             .ok_or_else(|| "the probe was not installed a whole screen".to_owned())
     }
 
+    /// The screen every client is held to: the session's own, with the keyboard protocol the
+    /// output negotiated where a reference engine says what that is.
+    fn expected(&mut self) -> Result<View, String> {
+        let view = self.canonical()?;
+        let Some(reference) = self.reference.as_mut() else {
+            return Ok(view);
+        };
+        let (rows, cols) = (u32::from(self.rows), u32::from(self.columns));
+        let viewport = Viewport {
+            top_row: 0,
+            rows,
+            left_col: 0,
+            cols,
+        };
+        let (snapshot, _) = reference.snapshot_without_rows(viewport, 0);
+        Ok(view.with_keyboard_of(&snapshot.keyboard))
+    }
+
     /// Compares every client with the session's screen at `at`, and lets go of those whose stay is
     /// over.
     fn check(&mut self, at: usize, switches: &[usize]) -> Result<(), String> {
@@ -1051,7 +1091,7 @@ impl Stage {
             self.clients = clients;
             return Ok(());
         }
-        let expected = self.canonical()?;
+        let expected = self.expected()?;
         for client in &mut clients {
             if client.ended {
                 continue;
@@ -1140,6 +1180,9 @@ impl Stage {
     /// handed these bytes as they are.
     pub(crate) fn ingest(&mut self, bytes: &[u8]) -> Result<(), String> {
         let _ = self.session.ingest_output(bytes);
+        if let Some(reference) = self.reference.as_mut() {
+            reference.feed(bytes, 0);
+        }
         let at = self.fed as u64;
         self.fed += bytes.len();
         let mut clients = std::mem::take(&mut self.clients);
@@ -1368,6 +1411,24 @@ pub fn without_the_buffer_not_showing(bytes: &[u8]) -> Vec<u8> {
     let mut cut = bytes[..first].to_vec();
     cut.extend_from_slice(&bytes[second + 8..]);
     cut
+}
+
+/// A projection event with the keyboard negotiation of the buffer that is not showing left out of
+/// the snapshot it is, flags and stack both. Any other event is returned unchanged.
+#[must_use]
+pub fn without_the_keyboard_of_the_buffer_not_showing(event: ProjectionEvent) -> ProjectionEvent {
+    let ProjectionEvent::Snapshot(mut snapshot) = event else {
+        return event;
+    };
+    let none = KittyKeyboardState {
+        flags: Nullable::null(),
+        stack: Vec::new(),
+    };
+    match snapshot.active_buffer {
+        ProjectedBuffer::Primary => snapshot.keyboard.alternate = none,
+        ProjectedBuffer::Alternate => snapshot.keyboard.primary = none,
+    }
+    ProjectionEvent::Snapshot(snapshot)
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {

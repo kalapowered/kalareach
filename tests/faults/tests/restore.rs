@@ -11,6 +11,9 @@
 
 use kr_faults::corpus::{self, Corpus};
 use kr_faults::restore::{Beforehand, Outcome, Property, Strategy, run, run_on};
+use kr_term::budget::GridSize;
+use kr_term::engine::{Engine, EngineConfig};
+use kr_term::snapshot::{ActiveBuffer, Viewport};
 
 fn corpus(name: &str) -> Corpus {
     Corpus::load(&corpus::directory().join(format!("{name}.json")))
@@ -38,6 +41,39 @@ fn restored(name: &str) -> Outcome {
             .join("\n")
     );
     outcome
+}
+
+/// What the session holds of each screen's Kitty keyboard flags at the end of every write of a
+/// corpus: the buffer that is showing, then the primary buffer's flags and the alternate buffer's.
+fn flags_after_each_write(corpus: &Corpus) -> Vec<(ActiveBuffer, Option<u8>, Option<u8>)> {
+    let size = GridSize {
+        cols: u32::from(corpus.columns),
+        rows: u32::from(corpus.rows),
+    };
+    let viewport = Viewport {
+        top_row: 0,
+        rows: size.rows,
+        left_col: 0,
+        cols: size.cols,
+    };
+    let mut engine = Engine::new(EngineConfig {
+        size,
+        ..EngineConfig::DEFAULT
+    })
+    .unwrap_or_else(|error| panic!("{error}"));
+    corpus
+        .writes
+        .iter()
+        .map(|write| {
+            engine.feed(write, 0);
+            let (snapshot, _) = engine.snapshot_without_rows(viewport, 0);
+            (
+                snapshot.active_buffer,
+                snapshot.keyboard.primary.flags,
+                snapshot.keyboard.alternate.flags,
+            )
+        })
+        .collect()
 }
 
 /// KR-REQ-27.06: a client that arrives anywhere in a command's ordinary output, between the bytes
@@ -90,6 +126,36 @@ fn a_client_arriving_around_a_reset_of_the_alternate_buffer_holds_the_screen() {
 #[test]
 fn a_client_arriving_after_a_cursor_was_saved_in_origin_mode_holds_the_screen() {
     restored("saved-origin");
+}
+
+/// KR-REQ-27.06: a client that arrives before, inside or after a full-screen application's switch
+/// into the alternate buffer holds the Kitty keyboard flags of both screens, the one that is not
+/// showing included, while the shell and the application each hold flags of their own: the shell's
+/// are the ones in force again when the application leaves, and the application's are not the
+/// shell's.
+#[test]
+fn a_client_arriving_across_a_switch_holds_the_keyboard_flags_of_both_screens() {
+    use ActiveBuffer::{Alternate, Primary};
+    let corpus = corpus("keyboard-flags");
+    assert_eq!(
+        flags_after_each_write(&corpus),
+        [
+            (Primary, None, None),
+            (Primary, Some(5), None),
+            (Alternate, Some(5), None),
+            (Alternate, Some(5), Some(3)),
+            (Alternate, Some(5), Some(11)),
+            (Primary, Some(5), Some(0)),
+            (Primary, Some(1), Some(0)),
+        ],
+        "the corpus puts flags on each screen, with the other screen's in force while the \
+         application shows"
+    );
+    let outcome = restored("keyboard-flags");
+    assert!(
+        outcome.restorations > 0,
+        "some client was handed the stream"
+    );
 }
 
 /// KR-REQ-27.06: a clipboard write, a bell, a notification or a query that happened before a
@@ -156,6 +222,7 @@ fn every_kept_corpus_is_run() {
         "alternate-1049",
         "alternate-47-1047",
         "alternate-resets",
+        "keyboard-flags",
         "mid-output",
         "saved-origin",
         "sequences",
@@ -239,4 +306,28 @@ fn a_terminal_handed_the_output_from_where_it_arrived_fails_the_check_it_is_ther
             .collect::<Vec<_>>()
             .join("\n")
     );
+}
+
+/// A restoration whose snapshot leaves out the keyboard flags of the buffer that is not showing
+/// leaves a client without the flags its session holds there, whether it draws the projection
+/// itself or has a terminal drawn from it, and the check taken while the application runs says so.
+#[test]
+fn a_restoration_without_the_keyboard_of_the_other_buffer_fails_the_check_it_is_there_for() {
+    let outcome = run(&corpus("keyboard-flags"), Strategy::WithoutOtherKeyboard)
+        .unwrap_or_else(|error| panic!("{error}"));
+    let caught = outcome.of(Property::Continuity);
+    for client in ["direct", "projected"] {
+        assert!(
+            caught.iter().any(|failure| failure.client == client
+                && failure.what.contains("the keyboard protocol")),
+            "the missing flags are caught in the {client} client; found instead:\n{}",
+            outcome
+                .failures
+                .iter()
+                .take(12)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
 }

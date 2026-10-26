@@ -14,13 +14,13 @@ use std::collections::BTreeMap;
 
 use kr_client::projection::{ProjectedModeSpelling, Projection, Screen};
 use kr_protocol::projection::{
-    CellRendition, CharsetState, MarginState, PaletteOverride, ProjectedBuffer, ProjectedCursor,
-    ProjectedHyperlink, ProjectedKeyboard, ProjectedTitle, ProjectionResetReason, Rgb,
-    SavedCursorState, SavedTitleEntry,
+    CellRendition, CharsetState, KittyKeyboardState, MarginState, PaletteOverride, ProjectedBuffer,
+    ProjectedCursor, ProjectedHyperlink, ProjectedKeyboard, ProjectedTitle, ProjectionResetReason,
+    Rgb, SavedCursorState, SavedTitleEntry,
 };
 use kr_protocol::scalars::{Nullable, U64};
 use kr_term::engine::Engine;
-use kr_term::snapshot::Viewport;
+use kr_term::snapshot::{KeyboardSnapshot, KittyKeyboard, Viewport};
 
 /// DEC private mode 1048, which saves the cursor when it is set and restores it when it is reset.
 ///
@@ -281,6 +281,28 @@ impl View {
             .screen()
             .map(Self::of)
             .ok_or_else(|| "the installation did not complete a screen".to_owned())
+    }
+
+    /// The same view with its keyboard protocol read from `keyboard`, a terminal engine's own
+    /// account of what the output negotiated, rather than from a screen that went through the
+    /// session's installation. Kitty flags nobody set read as the flags `0`, as they do in
+    /// [`View::of`].
+    #[must_use]
+    pub fn with_keyboard_of(mut self, keyboard: &KeyboardSnapshot) -> Self {
+        let buffer = |state: &KittyKeyboard| KittyKeyboardState {
+            flags: Nullable::some(U64::new(u64::from(state.flags.unwrap_or(0)))),
+            stack: state
+                .stack
+                .iter()
+                .map(|flags| U64::new(u64::from(*flags)))
+                .collect(),
+        };
+        self.keyboard = ProjectedKeyboard {
+            modify_other_keys: U64::new(u64::from(keyboard.modify_other_keys)),
+            primary: buffer(&keyboard.primary),
+            alternate: buffer(&keyboard.alternate),
+        };
+        self
     }
 
     /// The same view with the other buffer's lines replaced, padded to the screen's height.
