@@ -8,6 +8,8 @@ The tree is a directory named `kalareach-<target>-<release>` that holds `bin/`, 
 and the signed `release.json`. The archive holds that directory whole, each file once, in the order
 of its path, with the time of every entry fixed so that the same tree packs to the same bytes. A
 link, a device or an empty directory in the tree is refused, as a host refuses them in an archive.
+A tree that would need the 64-bit zip form (more than 65,535 files, or an archive of more than
+2 GiB) is refused too: a host reads the 32-bit form only.
 `SHA256SUMS` is written beside the archive with each line ended by a line feed alone, which is what
 `sha256sum -c` and `shasum -a 256 -c` read wherever they are run. An archive packed into a directory
 that already holds one adds its line to it.
@@ -64,13 +66,18 @@ def pack(tree, out):
     members = files_of(tree)
     os.makedirs(out, exist_ok=True)
     archive = os.path.join(out, top + ".zip")
-    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zipped:
-        for relative in members:
-            info = zipfile.ZipInfo(f"{top}/{relative}", FIXED_TIME)
-            info.compress_type = zipfile.ZIP_DEFLATED
-            info.external_attr = (0o755 if relative.startswith("bin/") else 0o644) << 16
-            with open(os.path.join(tree, relative), "rb") as handle:
-                zipped.writestr(info, handle.read())
+    try:
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=False) as zipped:
+            for relative in members:
+                info = zipfile.ZipInfo(f"{top}/{relative}", FIXED_TIME)
+                info.compress_type = zipfile.ZIP_DEFLATED
+                info.external_attr = (0o755 if relative.startswith("bin/") else 0o644) << 16
+                with open(os.path.join(tree, relative), "rb") as handle:
+                    zipped.writestr(info, handle.read())
+    except zipfile.LargeZipFile as error:
+        if os.path.exists(archive):
+            os.remove(archive)
+        raise Refused(f"{top} would need the 64-bit zip form, which a host does not read ({error})") from error
     digest = hashlib.sha256()
     with open(archive, "rb") as handle:
         for block in iter(lambda: handle.read(1 << 20), b""):
@@ -155,6 +162,20 @@ def self_test():
             report("an empty directory in the tree", False, "it was not refused")
         except Refused as error:
             report("an empty directory in the tree", True, f"refused: {error}")
+        os.rmdir(os.path.join(tree, "share", "empty"))
+        # More files than the 32-bit form counts would end the archive in a 64-bit record. The count
+        # that makes the library write one is lowered so that a small tree needs it.
+        limit = zipfile.ZIP_FILECOUNT_LIMIT
+        zipfile.ZIP_FILECOUNT_LIMIT = 2
+        out_many = os.path.join(scratch, "many")
+        try:
+            pack(tree, out_many)
+            report("a tree that needs the 64-bit form", False, "it was not refused")
+        except Refused as error:
+            left = os.path.exists(os.path.join(out_many, os.path.basename(tree) + ".zip"))
+            report("a tree that needs the 64-bit form", not left, f"refused: {error}" + ("; the archive was left" if left else ""))
+        finally:
+            zipfile.ZIP_FILECOUNT_LIMIT = limit
     return failures
 
 
