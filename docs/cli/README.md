@@ -23,6 +23,7 @@ worker directly for what a session owns.
 | `kr host power` | — | Show or change whether this host stays awake for work it has admitted |
 | `kr host shell-mode` | — | Show or choose the shell mode a new session is created in when none is named |
 | `kr host terminal` | — | Show the terminal applications this host has, and which one a new window opens in |
+| `kr host terminal-profile` | — | Show, add or take out the optional `KalaReach` profile in one terminal application, so each window or tab opened through it is a session of its own |
 | `kr host startup` | — | Show or choose how `kr new` starts this environment's control daemon when none is running |
 | `kr host descriptions` | — | Show what session descriptions offer on this host, turn them on or off, and fetch the model's files |
 | `kr host import-journals` | — | Bring this environment's journals that are older than this build migrates forward, once, while its daemon is stopped |
@@ -142,6 +143,31 @@ forwarding input here, so the command says how many bytes it could not deliver. 
 does not report both colours has shared no palette, and the command says so rather than recording a
 provenance nothing measured. `--invisible --palette probe` is refused for the same reason: there is
 no terminal to ask.
+
+### Holding the window open on a failure
+
+`--hold-on-failure` is for a window that exists only to run this command, such as the one a
+[terminal profile](#kr-host-terminal-profile) opens. That window closes the moment its command ends,
+so a failure would vanish with it. With the flag, a failed `kr new` prints the failure as it always
+does, then the line `kr: this window stays open so the error above can be read; press any key to
+close it`, and waits for one key. After the key it exits with the status it would have had without
+the flag.
+
+The command holds when it could not create or attach the session, and when the session closed for
+any reason except its shell exiting or a close on request: a signal ended the shell, the shell never
+started, the worker went, the desktop login ended, the host shut down, or the connection to the
+session ended ([When the session closes](#when-the-session-closes) lists them). A session whose
+shell exited, with any status, ended the way the person ended it. The command exits with that
+closure's status at once, and the window closes as its terminal application normally closes it.
+
+It waits only when standard input and standard output are terminals and the run is not `--json`.
+Anywhere else it never waits, so a script that reads the output of `kr new` does not stop for a key
+nobody will press. While it waits, the terminal is in single-key mode with its signal keys off, so
+Ctrl-C is a key like any other. What was typed before the wait began is thrown away. One key, the
+end of the input or a failed read ends the wait, and the terminal's modes are put back on every path
+out. A hangup, which is what closing the window sends, or a terminate signal ends the process as that
+signal would, after the modes are back. A terminal that cannot be put into single-key mode is left
+alone and the wait is skipped.
 
 ### When no control daemon is running
 
@@ -621,6 +647,107 @@ of a later format, or one it cannot read, leaves it as it is and says so; `--cle
 The preference is the middle step of the order a `terminal` presentation uses: `kr new
 --terminal-app` wins over it, and detection decides when neither says anything. A preference that
 names something no longer installed is not an error, because nobody asked for it just now.
+
+## `kr host terminal-profile`
+
+```text
+kr host terminal-profile status
+kr host terminal-profile install <terminal> [--dry-run]
+kr host terminal-profile remove [<terminal>] [--dry-run]
+```
+
+A terminal profile is a profile named `KalaReach` in one terminal application's own list of
+profiles. Its command is `<kr> new --attach --hold-on-failure`, so each window or tab opened through
+it creates a session and attaches to it, and each has a session of its own. `<kr>` is the `kr` that
+ran `install`, named through the store's `current` link when it belongs to a release of one, so an
+update leaves the profile pointing at the release that is current.
+
+The profile is an offer. The application's other profiles and its default stay as they were, and the
+profile is not made the default: the person chooses it in the application's menus, and the install
+output says where. A profile that is the default starts a session for every window and tab,
+including the ones the person meant as plain shells, and closing such a window leaves its session
+running. The application also decides what its window does when the command ends; `kr` changes
+none of that, and `--hold-on-failure` is what keeps an error readable whichever way it goes.
+
+The profile is separate from the other offers. `install` writes no shell startup file, no service
+definition and no login item, and `kr shell install`, `kr host startup` and the desktop installer's
+login item write no profile. A window opened through the profile creates a session only if the host
+can start one: a managed session needs the startup entry of its shell, and `kr new` needs a control
+daemon running or a way to start one.
+
+| Identifier | Application | On | What `install` writes |
+| --- | --- | --- | --- |
+| `iterm2` | iTerm2 | macOS | `KalaReach.json` in iTerm2's `DynamicProfiles` folder, which iTerm2 reloads while it runs |
+| `apple-terminal` | Terminal | macOS | a `KalaReach` entry in the `Window Settings` of Terminal's preferences, copied from the profile the person has chosen as Terminal's default |
+| `gnome-terminal` | GNOME Terminal | Linux | the keys of one profile under `/org/gnome/terminal/legacy/profiles:/`, and its identifier in the shared `list` |
+| `ptyxis` | Ptyxis | Linux | the keys of one profile under `/org/gnome/Ptyxis/Profiles/`, and its identifier in the shared `profile-uuids` |
+| `konsole` | Konsole | Linux | `KalaReach.profile` in the `konsole` folder of the user's data directory |
+| `windows-terminal` | Windows Terminal | Windows | `kalareach.json` in a `KalaReach` folder inside Windows Terminal's `Fragments` folder |
+
+`install` takes the identifiers of the platform it runs on and an application that is installed. A
+dry run shows what would be written and writes nothing.
+
+`status` writes nothing. For each application of the platform it says whether the application is
+installed and what state its profile is in: `none` (no profile written), `matches` (written and
+unchanged), `changed` (altered after `kr` wrote it), `missing` (the profile `kr` wrote is gone),
+`default` (the profile `kr` wrote is the application's default) or `foreign` (a profile named `KalaReach` that `kr` did not
+write, left alone). It names the applications `kr` writes no profile for, each with its reason:
+xfce4-terminal and xterm have no profiles; Alacritty and kitty keep one configuration file with no
+list of profiles; Ghostty's configuration is a file of the person's own, and WezTerm's a script of
+the person's own; and VS Code's terminal profiles are the editor's settings. It ends with what a
+window opened through the profile needs, as far as that can be read without a daemon: whether the
+startup entry of the person's shell is installed, and how `kr new` starts the control daemon.
+
+`install` refuses, and writes nothing, in these cases:
+
+- The application is not installed. The failure is `TERMINAL_UNAVAILABLE` (exit 7) and names what
+  is installed.
+- A file or entry for `KalaReach` is at the profile's place and `kr` did not write it, or `kr`
+  wrote it and it has changed since. Remove it with `remove`, which leaves it as it is, or move it
+  aside.
+- Konsole would expand a character of the command: it expands `$` and a leading `~` in a profile's
+  command, so a `kr` at such a path cannot be named.
+- For GNOME Terminal and Ptyxis: `gsettings` or the application's schema is missing; the
+  application's list of profiles names no default, because a profile added to such a list could
+  become the default; another profile named `KalaReach` is there that `kr` did not write; or the
+  settings backend does not keep what was written, as the `memory` backend does not. In that last
+  case what the install wrote is taken back.
+- For Terminal: Terminal is running, because it rewrites its preferences when it ends and what an
+  outside write does to them is not known. Quit it and run the command from another application
+  or over SSH. Terminal's preferences must also hold a profile to copy.
+
+These are usage failures (exit 2). A failure of `gsettings`, of the record or of a file exits 1.
+`--dry-run` skips the check for a running Terminal.
+
+`install` records what it will write in `terminal-profiles.json` in the installation's state
+directory before it writes anything: for a file its path and its SHA-256, for settings the keys and
+their values, for Terminal's preferences the entry in a canonical text form. `remove` works from
+that record and from nothing else, and takes out only what still matches it. A profile changed
+after `kr` wrote it is left as it is and named, and leaves the record. A profile that is already
+gone leaves the record. A profile that is the application's default is left, and stays in the
+record until another default is chosen. None of these is an error. `remove` without an application
+takes out every profile in the record, and `--dry-run` says what each would come to. A record of a
+later format, or one that cannot be read, is left as it is and named, and nothing is written.
+`install` and `remove` hold the writers' lock the update takes, and a release that reads the record
+at another version refuses them before anything is written.
+
+GNOME Terminal's and Ptyxis's list of profiles is shared with the application's preferences window
+and with anything else that edits it, and the settings database has no compare-and-set. `kr` reads
+the list, reads it again just before writing, writes it, and reads it back with another process. A
+change in between, or an element missing afterwards, starts the write over, up to a bound; past it
+the install fails with nothing of the profile left. One interleaving remains: another writer landing
+between the last read and the write costs the profile its entry in the list and nothing more,
+because the profile's own keys are `kr`'s and stay.
+
+With `--json`, each subcommand prints one document. `status` has `terminals` (for each, `terminal`,
+`name`, `installed`, `profile` with one of the states above, and where the profile is and its
+`command` when one is recorded), `no_profile_to_add_to` (each with `terminal` and `why`) and
+`readiness` (`shell`, `shell_entry` as `installed`, `not_installed` or `unknown`, and
+`daemon_start`). `install` has `ok`, `terminal`, `dry_run`, where the profile is (`file`,
+`settings` or `preferences`), `command` as the program and its options, `default` as `false` and
+`readiness`. `remove` has `ok`, `dry_run` and `profiles`, each with `terminal` and a `result` of
+`removed`, `already_gone`, `left_changed` (with `left`, the place it was left), `left_default`,
+`not_recorded` or `failed`; a dry run gives the profile's state in place of those.
 
 ## `kr host descriptions`
 
