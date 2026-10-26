@@ -2193,9 +2193,7 @@ fn sweep_entries(
                     refused.get_or_insert(InstallError::io("remove", path, source));
                 }
             }
-            Err(error) => {
-                refused.get_or_insert(InstallError::io("read", trash, error));
-            }
+            Err(_) => {}
         }
     }
     refused.map_or(Ok(()), Err)
