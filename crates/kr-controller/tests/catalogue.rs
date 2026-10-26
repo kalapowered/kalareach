@@ -5974,6 +5974,13 @@ mod off_the_executor {
         assert_eq!(synced.generation.get(), 1);
     }
 
+    /// KR-REQ-11.14, the part about no input delay: a sync and an installation of a repository of
+    /// ten thousand entries are answered while the input task takes its turns at each of their
+    /// checks and commits, so the change leaves the daemon's other tasks running.
+    ///
+    /// KR-ACC-017, the part about syncing ten thousand definitions: the sync answers with all ten
+    /// thousand entries and the installation from it succeeds. Not shown here: browsing offline,
+    /// cached and uncached activation, mirror quotas or interrupted generations.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn kr_ac_017_a_sync_and_an_installation_of_ten_thousand_entries_leave_the_input_task_running()
      {
@@ -6028,6 +6035,9 @@ mod off_the_executor {
         );
     }
 
+    /// KR-REQ-11.14, the part about no input delay: the reads of an installed plugin's capabilities
+    /// and of the plugin list, from a catalogue of ten thousand entries, are answered while the
+    /// input task takes its turns at the point where each read holds its thread.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn kr_ac_017_the_reads_of_a_catalogue_of_ten_thousand_entries_leave_the_input_task_running()
      {
