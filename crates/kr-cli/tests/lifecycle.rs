@@ -4895,3 +4895,240 @@ fn a_new_window_through_the_konsole_profile_creates_a_session_each_time() {
     }
     drop((first, second));
 }
+
+/// A program on this machine's search path.
+fn on_the_path(program: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|directory| directory.join(program))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Whether every program a headless emulator run needs is here. Where one is not, the case is
+/// skipped out loud, unless `KR_REQUIRE_LINUX_TERMINALS` is set, which makes it a failure: the
+/// build box sets it, so a machine that lost its emulators cannot pass for one that ran them.
+fn emulator_programs_are_here(programs: &[&str]) -> bool {
+    let missing: Vec<&&str> = programs
+        .iter()
+        .filter(|program| on_the_path(program).is_none())
+        .collect();
+    if missing.is_empty() {
+        return true;
+    }
+    assert!(
+        std::env::var_os("KR_REQUIRE_LINUX_TERMINALS").is_none(),
+        "KR_REQUIRE_LINUX_TERMINALS is set, and {missing:?} are not installed here"
+    );
+    eprintln!("skipped: {missing:?} are not installed here");
+    false
+}
+
+/// A real terminal application opened on a virtual display and a bus of their own, running a shell
+/// script, and the process group it runs in, ended by its exact identifier when this is dropped.
+struct HeadlessEmulator {
+    child: std::process::Child,
+}
+
+impl HeadlessEmulator {
+    /// Runs `script` under `xvfb-run` and `dbus-run-session`, as the person `host` describes, with
+    /// the variables the windows the application opens will run `kr` with: set before the bus
+    /// starts, because a service the bus starts has the bus's own environment.
+    fn start(host: &Host, script: &str) -> Self {
+        use std::os::unix::process::CommandExt as _;
+
+        let data = host.home.join(".local/share");
+        let config = host.home.join(".config");
+        let runtime = host.root().join("xdg-runtime");
+        std::fs::create_dir_all(&runtime).expect("a directory");
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))
+            .expect("a private directory");
+        let mut command = std::process::Command::new("xvfb-run");
+        command
+            .args([
+                "-a",
+                "-s",
+                "-screen 0 1024x768x24",
+                "dbus-run-session",
+                "--",
+            ])
+            .args(["sh", "-c", script])
+            .env_clear()
+            .envs(host.variables())
+            .env("XDG_DATA_HOME", &data)
+            .env("XDG_CONFIG_HOME", &config)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("QT_QPA_PLATFORM", "offscreen")
+            .env("GSK_RENDERER", "cairo")
+            .env("LIBGL_ALWAYS_SOFTWARE", "1")
+            .current_dir(host.root())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            // The application, its bus and its display are one group, which is ended as one.
+            .process_group(0);
+        let child = command.spawn().expect("starts the emulator");
+        Self { child }
+    }
+}
+
+impl Drop for HeadlessEmulator {
+    fn drop(&mut self) {
+        // The group is the child's own, named by the child's identifier.
+        if let Some(group) = i32::try_from(self.child.id())
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+        {
+            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+        }
+        let _ = self.child.wait();
+    }
+}
+
+/// Lets the script that waits on a FIFO go on, once it is waiting on it: a FIFO opened for writing
+/// with nothing reading it is refused, which is the condition waited for.
+fn release(gate: &Path) {
+    until("the script waits at its gate", || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(gate)
+            .ok()
+            .map(|mut open| {
+                let _ = open.write_all(b"go");
+            })
+    });
+}
+
+/// KR-REQ-01.21, KR-REQ-07.42: a real terminal application opens a window through the KalaReach
+/// profile, headless, and a session is created and attached for it, each time. The profile is
+/// written by the real `kr host terminal-profile install` in the same session bus the application
+/// reads its settings from, the application runs on a virtual display, and the decision is the
+/// session list: a new live session with one attachment for each window the profile opened. The
+/// host is set up as in the case above this one.
+fn windows_through_the_profile_create_a_session_each(
+    programs: &[&str],
+    terminal: &str,
+    open_first: &str,
+    open_second: &str,
+) {
+    if !emulator_programs_are_here(programs) {
+        return;
+    }
+    let host = Host::start();
+    host.kr_json(&["host", "shell-mode", "--set", "native_compat"]);
+    {
+        let environment = host.environment();
+        let writers =
+            kr_cli::barrier::hold_for_configuration(&environment).expect("the writers' lock");
+        let permit = kr_cli::barrier::permit(&writers, &kr_cli::doctor::configuration::WRITTEN)
+            .expect("a permit");
+        kr_cli::doctor::configuration::apply(
+            &environment,
+            &kr_protocol::hostinfo::configuration::Change::WorkerProfile(
+                kr_protocol::identity::WorkerProfile::HeadlessUser,
+            ),
+            &permit,
+        )
+        .expect("this host creates headless sessions");
+    }
+    let program_directory = host.root().join("kr dir");
+    std::fs::create_dir(&program_directory).expect("a directory");
+    for name in ["kr", "kr-attach-guard"] {
+        std::fs::copy(
+            support::command_binaries().join(name),
+            program_directory.join(name),
+        )
+        .expect("copies the program");
+    }
+    let (first, second) = (host.work.join("go-on"), host.work.join("finish"));
+    let kr = quoted(&program_directory.join("kr"));
+    let script = format!(
+        "{kr} host terminal-profile install {terminal} || exit 1\n\
+         {open_first}\n\
+         cat {first} >/dev/null\n\
+         {open_second}\n\
+         cat {second} >/dev/null\n",
+        first = quoted(&first),
+        second = quoted(&second),
+    );
+    let _emulator = HeadlessEmulator::start(&host, &script);
+    let live = |wanted: usize| -> Vec<Value> {
+        until("the sessions of the windows the application opened", || {
+            let listed = host.kr_json(&["list"]);
+            let sessions = listed["sessions"]
+                .as_array()
+                .expect("a list of sessions")
+                .clone();
+            (sessions.len() == wanted
+                && sessions
+                    .iter()
+                    .all(|session| session["state"] == "live" && session["attachments"] == 1))
+            .then_some(sessions)
+        })
+    };
+    let one = live(1);
+    release(&first);
+    let two = live(2);
+    assert_ne!(
+        two[0]["session_id"], two[1]["session_id"],
+        "each window has a session of its own"
+    );
+    assert!(
+        two.iter()
+            .any(|session| session["session_id"] == one[0]["session_id"]),
+        "the first window's session is still there"
+    );
+
+    let workers: Vec<_> = two
+        .iter()
+        .map(|session| {
+            let id: SessionId = session["session_id"]
+                .as_str()
+                .expect("an identifier")
+                .parse()
+                .expect("a session identifier");
+            (id, host.worker_of(id))
+        })
+        .collect();
+    for (id, _) in &workers {
+        let closed = host.kr(&["close", &id.to_string()]);
+        assert!(
+            closed.status.success(),
+            "kr close: {}",
+            String::from_utf8_lossy(&closed.stderr)
+        );
+        host.wait_until_closed(&id.to_string());
+    }
+    for (_, worker) in &workers {
+        assert_eq!(worker_exit_status(worker), 0);
+    }
+    release(&second);
+}
+
+/// KR-REQ-01.21, KR-REQ-07.42: a real GNOME Terminal opens a window and then a tab through the
+/// profile, and each has a session.
+#[test]
+fn a_real_gnome_terminal_opens_a_window_and_a_tab_through_the_profile_and_each_has_a_session() {
+    windows_through_the_profile_create_a_session_each(
+        &[
+            "xvfb-run",
+            "dbus-run-session",
+            "gnome-terminal",
+            "gsettings",
+        ],
+        "gnome-terminal",
+        "gnome-terminal --window --profile=KalaReach",
+        "gnome-terminal --tab --profile=KalaReach",
+    );
+}
+
+/// KR-REQ-01.21, KR-REQ-07.42: a real Konsole opens two windows through the profile, and each has a
+/// session.
+#[test]
+fn a_real_konsole_opens_two_windows_through_the_profile_and_each_has_a_session() {
+    windows_through_the_profile_create_a_session_each(
+        &["xvfb-run", "dbus-run-session", "konsole"],
+        "konsole",
+        "konsole --separate --profile KalaReach &",
+        "konsole --separate --profile KalaReach &",
+    );
+}
