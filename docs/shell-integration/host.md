@@ -219,6 +219,22 @@ entry. It writes a path unquoted when every character is an ASCII letter, an ASC
 `.,_+:@%/-`, except that PowerShell quotes a path holding `@` or `,`; any other path takes the same
 single-quote rule.
 
+## The launch surface
+
+A client reads `shell.launch.surface` before it offers a launch. The worker answers from the
+machine's state and from nothing it asks the reader: whether the editor is verified at an empty
+primary prompt, the reason it is not, how the asking connection stands to the session's input, the
+shell's name and the commands the host offers. The answer is advice. A launch quotes the prompt
+generation and the buffer revision the read named, and the worker and the reader refuse a quote
+that went stale before anything is typed.
+
+How the connection stands to the input is a fact about that connection. A connection that holds an
+attachment with the input lease reads `held_here`, which is the only connection a launch is
+accepted from. Any other reads `held_elsewhere` while somebody holds the lease and `free` while
+nobody does, and a free session is never verified, since no fence stands. `kr status` asks on a
+connection of its own that holds no attachment, so it reports `held_elsewhere` or `free` and never
+`held_here`.
+
 ## Launching the root shell
 
 Managed mode launches a KalaReach-qualified package: the exact binary its reader patch was built

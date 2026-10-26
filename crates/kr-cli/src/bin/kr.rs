@@ -545,11 +545,11 @@ async fn run(cli: Cli) -> Result<Completion> {
             // The environment the session was found in, which is not always the one this
             // installation opens by default. Reading one environment's session and another's
             // power setting would describe a machine the session is not on.
-            // The attachments are read only where the session's own worker answered: a session
-            // read from the daemon has no live worker to ask.
-            let (read, attachments, host) = match find(&paths, &selector, wanted) {
+            // The attachments and the launch surface are read only where the session's own worker
+            // answered: a session read from the daemon has no live worker to ask.
+            let (read, further, host) = match find(&paths, &selector, wanted) {
                 Ok((known, descriptor)) => match read_session(&descriptor).await {
-                    Ok((summary, attachments)) => (summary, Some(attachments), known.paths),
+                    Ok((summary, further)) => (summary, Some(further), known.paths),
                     // A descriptor that no longer answers is a hint that has gone stale. The
                     // daemon reconciles it and returns the closure record.
                     Err(CliError::HostUnavailable(_)) => {
@@ -590,15 +590,25 @@ async fn run(cli: Cli) -> Result<Completion> {
                     )
                     .with(
                         "terminal_attachments",
-                        match attachments.as_ref() {
+                        match further.as_ref().map(|further| &further.attachments) {
                             Some(Ok(attachments)) => {
                                 Some(report::terminal_attachments(attachments))
                             }
                             Some(Err(_)) | None => None,
                         },
+                    )
+                    .with(
+                        "launch_surface",
+                        match further.as_ref().map(|further| &further.launch_surface) {
+                            Some(Ok(surface)) => Some(report::launch_surface(surface)),
+                            Some(Err(_)) | None => None,
+                        },
                     );
-                if let Some(Err(why)) = attachments.as_ref() {
+                if let Some(Err(why)) = further.as_ref().map(|further| &further.attachments) {
                     document.set("terminal_attachments_unread", why.clone());
+                }
+                if let Some(Err(why)) = further.as_ref().map(|further| &further.launch_surface) {
+                    document.set("launch_surface_unread", why.clone());
                 }
                 output::document(&document);
             } else {
@@ -610,7 +620,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                 if let Some(power) = power.as_ref() {
                     output::say(&report::power_line(power));
                 }
-                match attachments.as_ref() {
+                match further.as_ref().map(|further| &further.attachments) {
                     Some(Ok(attachments)) => {
                         for line in report::terminal_attachment_lines(attachments) {
                             output::say(&line);
@@ -618,6 +628,14 @@ async fn run(cli: Cli) -> Result<Completion> {
                     }
                     Some(Err(why)) => output::say(&shown!(
                         "terminal attachments: not read from the session's worker: {}",
+                        why.clone()
+                    )),
+                    None => {}
+                }
+                match further.as_ref().map(|further| &further.launch_surface) {
+                    Some(Ok(surface)) => output::line(&report::launch_surface_line(surface)),
+                    Some(Err(why)) => output::say(&shown!(
+                        "launch surface: not read from the session's worker: {}",
                         why.clone()
                     )),
                     None => {}
@@ -1910,20 +1928,42 @@ async fn read_from_controller(
 /// be read, which says nothing the worker sent but a refusal's own message.
 type AttachmentsRead = std::result::Result<Vec<kr_protocol::attachment::AttachmentSummary>, Shown>;
 
-/// How long `kr status` waits for a worker to answer the question about its attachments, after it
-/// has already answered the session read.
-const ATTACHMENTS_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+/// What `kr status` read of a session's launch surface: what its worker answered, or why it could
+/// not be read, said as an attachments read says it.
+type LaunchSurfaceRead = std::result::Result<kr_protocol::root::ShellLaunchSurfaceResult, Shown>;
 
-/// Reads a session from its own worker, and each of its attachments with it.
+/// What `kr status` asks a session's worker besides the session read, and what each question came
+/// to.
+struct Further {
+    attachments: AttachmentsRead,
+    launch_surface: LaunchSurfaceRead,
+}
+
+/// How long `kr status` waits for a worker to answer each question it asks after the session read.
+const QUESTION_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What a worker's answer to one of those questions came to: none within [`QUESTION_BOUND`], an
+/// error of the connection, or the worker's answer, a refusal included.
+type Answered = Option<
+    kr_ipc::Result<
+        std::result::Result<kr_protocol::envelope::ParamsValue, kr_protocol::error::ProtocolError>,
+    >,
+>;
+
+/// Reads a session from its own worker, and each of its attachments and its launch surface with it.
 ///
 /// Each attachment's presentation and the reason for it travel in the worker's snapshot rather
-/// than in the session read, so the snapshot is asked on the same connection. It is a second
-/// question, asked within [`ATTACHMENTS_BOUND`]: a worker that cannot answer it, or does not answer
-/// it in time, leaves the session read standing, and the command says the attachments were not read
-/// rather than failing or holding back the whole status.
+/// than in the session read, and the launch surface is a read of its own, so each is asked on the
+/// same connection. Each is a further question, asked within [`QUESTION_BOUND`]: a worker that
+/// cannot answer one, or does not answer it in time, leaves the session read standing, and the
+/// command says that what the question was about was not read rather than failing or holding back
+/// the whole status.
+///
+/// The worker's release is checked first, so the worker asked for the launch surface is one that
+/// serves it.
 async fn read_session(
     descriptor: &kr_protocol::worker::WorkerDescriptor,
-) -> Result<(SessionReadResult, AttachmentsRead)> {
+) -> Result<(SessionReadResult, Further)> {
     let mut client = open_worker(descriptor, build_id()).await?;
     kr_cli::helper::read_only_same(
         client.acknowledgement().build.as_ref(),
@@ -1940,7 +1980,7 @@ async fn read_session(
         .await?;
     let read = read_result(outcome)?;
     let asked = tokio::time::timeout(
-        ATTACHMENTS_BOUND,
+        QUESTION_BOUND,
         client.request(
             Method::EventsSnapshot,
             &kr_protocol::recovery::EventsSnapshotParams {
@@ -1951,31 +1991,46 @@ async fn read_session(
     )
     .await;
     let attachments = attachments_read(asked.ok());
-    Ok((read, attachments))
+    let asked = tokio::time::timeout(
+        QUESTION_BOUND,
+        client.request(
+            Method::ShellLaunchSurface,
+            &kr_protocol::root::ShellLaunchSurfaceParams {
+                session_id: descriptor.session_id,
+            },
+        ),
+    )
+    .await;
+    let launch_surface = answer_read(asked.ok());
+    Ok((
+        read,
+        Further {
+            attachments,
+            launch_surface,
+        },
+    ))
 }
 
 /// What `kr status` makes of the answer to its question about a session's attachments, or of no
-/// answer within [`ATTACHMENTS_BOUND`]: the summaries the worker gave, or why they were not read.
-fn attachments_read(
-    asked: Option<
-        kr_ipc::Result<
-            std::result::Result<
-                kr_protocol::envelope::ParamsValue,
-                kr_protocol::error::ProtocolError,
-            >,
-        >,
-    >,
-) -> AttachmentsRead {
+/// answer within [`QUESTION_BOUND`]: the summaries the worker gave, or why they were not read.
+fn attachments_read(asked: Answered) -> AttachmentsRead {
+    answer_read::<kr_protocol::recovery::EventsSnapshotResult>(asked)
+        .map(|snapshot| snapshot.attachments)
+}
+
+/// What `kr status` makes of a worker's answer to one of its further questions: the answer, or why
+/// there is none, in words that are this program's own and a refusal's message, never a member of
+/// what the worker sent.
+fn answer_read<R: kr_protocol::wire::WireMessage>(
+    asked: Answered,
+) -> std::result::Result<R, Shown> {
     match asked {
-        Some(Ok(Ok(value))) => value
-            .to_typed::<kr_protocol::recovery::EventsSnapshotResult>()
-            .map(|snapshot| snapshot.attachments)
-            .map_err(|error| Shown::cbor(&error)),
+        Some(Ok(Ok(value))) => value.to_typed::<R>().map_err(|error| Shown::cbor(&error)),
         Some(Ok(Err(refusal))) => Err(shown!("{}: {}", refusal.code, Shown::protocol(&refusal))),
         Some(Err(error)) => Err(Shown::ipc(&error)),
         None => Err(shown!(
             "the session's worker did not answer within {} seconds",
-            ATTACHMENTS_BOUND.as_secs()
+            QUESTION_BOUND.as_secs()
         )),
     }
 }
