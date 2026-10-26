@@ -1,0 +1,646 @@
+//! GNOME Terminal and Ptyxis: a profile is a set of keys in the settings database, named by a
+//! uuid that is added to a list the application reads to find its profiles.
+//!
+//! Everything goes through the `gsettings` program, so the backend the person has (dconf, or a
+//! keyfile) is the one written. The profile's own keys belong to kr; the list is shared with the
+//! application's preferences window and with anything else that edits it, and the settings
+//! database has no compare-and-set. A write of the list is therefore read before, read again just
+//! before, written, and read back by another process; any change in between, and any element
+//! missing afterwards, starts it over, up to a bound. The one interleaving that remains is another
+//! writer landing between the last read and the write, which costs the profile its entry in the
+//! list and no more: the profile's keys are kr's own and survive it.
+
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use super::record::{RecordedKey, RecordedList, SettingsWrote};
+use super::{PROFILE_NAME, ProfileError, ProfileTerminal};
+
+/// How long one `gsettings` call may take. A host with no settings service can wait for one.
+const CALL_LIMIT: Duration = Duration::from_secs(15);
+
+/// How many times a write of the shared list starts over before it gives up.
+const ATTEMPTS: usize = 5;
+
+/// How `gsettings` is run: the program, and the variables set for it beyond the process's own.
+#[derive(Clone, Debug)]
+pub struct Gsettings {
+    /// The program.
+    pub program: PathBuf,
+    /// The variables it is run with, set over the process's own.
+    pub environment: Vec<(String, String)>,
+}
+
+impl Gsettings {
+    /// `gsettings` as the person's own session runs it.
+    #[must_use]
+    pub fn of_this_session() -> Self {
+        Self {
+            program: PathBuf::from("gsettings"),
+            environment: Vec::new(),
+        }
+    }
+
+    /// Runs the program with `arguments`, and returns what it printed on success, or why it did
+    /// not.
+    fn run(&self, arguments: &[&str]) -> Result<String, ToolFailure> {
+        let mut command = Command::new(&self.program);
+        command
+            .args(arguments)
+            .envs(self.environment.iter().map(|(name, value)| (name, value)))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = command.spawn().map_err(|_| ToolFailure::Missing)?;
+        let started = Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if started.elapsed() < CALL_LIMIT => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(None) | Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(ToolFailure::Failed(None));
+                }
+            }
+        };
+        let mut printed = String::new();
+        if let Some(mut stdout) = child.stdout.take() {
+            use std::io::Read as _;
+            let _ = stdout.read_to_string(&mut printed);
+        }
+        if status.success() {
+            Ok(printed.trim().to_owned())
+        } else {
+            Err(ToolFailure::Failed(status.code()))
+        }
+    }
+
+    /// One key's value, in the text `gsettings` prints it in. `target` is a schema, or a schema and
+    /// a path for a schema that is not at one place.
+    fn get(&self, target: &str, key: &str) -> Result<String, ToolFailure> {
+        self.run(&["get", target, key])
+    }
+
+    fn set(&self, target: &str, key: &str, value: &str) -> Result<(), ToolFailure> {
+        self.run(&["set", target, key, value]).map(|_| ())
+    }
+
+    fn reset(&self, target: &str, key: &str) -> Result<(), ToolFailure> {
+        self.run(&["reset", target, key]).map(|_| ())
+    }
+
+    /// The schemas the database knows.
+    fn schemas(&self) -> Result<Vec<String>, ToolFailure> {
+        Ok(self
+            .run(&["list-schemas"])?
+            .lines()
+            .map(|line| line.trim().to_owned())
+            .collect())
+    }
+
+    /// The keys of a schema.
+    fn keys(&self, schema: &str) -> Result<Vec<String>, ToolFailure> {
+        Ok(self
+            .run(&["list-keys", schema])?
+            .lines()
+            .map(|line| line.trim().to_owned())
+            .collect())
+    }
+}
+
+/// Why a call to `gsettings` came to nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolFailure {
+    /// The program is not there.
+    Missing,
+    /// It ran and failed, or ran past its limit; the exit status where it had one.
+    Failed(Option<i32>),
+}
+
+/// What differs between the two applications that keep their profiles in settings.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Spec {
+    pub terminal: ProfileTerminal,
+    /// The schema of the shared list, which also holds the application's default.
+    pub list_schema: &'static str,
+    /// The key of the list of profiles.
+    pub list_key: &'static str,
+    /// The key of the default profile.
+    pub default_key: &'static str,
+    /// The schema of one profile's keys.
+    pub profile_schema: &'static str,
+    /// The path of one profile's keys, from its identifier.
+    pub profile_path: fn(&str) -> String,
+    /// The key of the profile's name.
+    pub name_key: &'static str,
+    /// The key that makes the profile run a command.
+    pub custom_flag_key: &'static str,
+    /// The key of the command.
+    pub command_key: &'static str,
+    /// An identifier of the kind the application makes.
+    pub new_identifier: fn() -> String,
+}
+
+/// GNOME Terminal.
+pub(super) const GNOME: Spec = Spec {
+    terminal: ProfileTerminal::GnomeTerminal,
+    list_schema: "org.gnome.Terminal.ProfilesList",
+    list_key: "list",
+    default_key: "default",
+    profile_schema: "org.gnome.Terminal.Legacy.Profile",
+    profile_path: |uuid| format!("/org/gnome/terminal/legacy/profiles:/:{uuid}/"),
+    name_key: "visible-name",
+    custom_flag_key: "use-custom-command",
+    command_key: "custom-command",
+    new_identifier: || kr_ipc::new_uuid().to_string(),
+};
+
+/// Ptyxis.
+pub(super) const PTYXIS: Spec = Spec {
+    terminal: ProfileTerminal::Ptyxis,
+    list_schema: "org.gnome.Ptyxis",
+    list_key: "profile-uuids",
+    default_key: "default-profile-uuid",
+    profile_schema: "org.gnome.Ptyxis.Profile",
+    profile_path: |uuid| format!("/org/gnome/Ptyxis/Profiles/{uuid}/"),
+    name_key: "label",
+    custom_flag_key: "use-custom-command",
+    command_key: "custom-command",
+    new_identifier: || kr_ipc::new_uuid().to_string().replace('-', ""),
+};
+
+/// A path no profile is at, whose keys all read their defaults.
+fn unused_path(spec: &Spec) -> String {
+    (spec.profile_path)("00000000-0000-0000-0000-000000000000")
+}
+
+/// A string as GVariant text writes it.
+#[must_use]
+pub(super) fn variant_string(value: &str) -> String {
+    let mut text = String::with_capacity(value.len() + 2);
+    text.push('\'');
+    for character in value.chars() {
+        match character {
+            '\\' => text.push_str(r"\\"),
+            '\'' => text.push_str(r"\'"),
+            '\n' => text.push_str(r"\n"),
+            '\t' => text.push_str(r"\t"),
+            '\r' => text.push_str(r"\r"),
+            other => text.push(other),
+        }
+    }
+    text.push('\'');
+    text
+}
+
+/// The string a GVariant text of a string value holds, in either of the quotes `gsettings` prints
+/// it in, or `None` for text that is not one.
+#[must_use]
+pub(super) fn parse_string(text: &str) -> Option<String> {
+    let text = text.trim();
+    let text = text.strip_prefix("@s ").unwrap_or(text);
+    let mut characters = text.chars();
+    let quote = characters
+        .next()
+        .filter(|quote| matches!(quote, '\'' | '"'))?;
+    let mut value = String::new();
+    loop {
+        match characters.next()? {
+            character if character == quote => {
+                return characters.next().is_none().then_some(value);
+            }
+            '\\' => value.push(match characters.next()? {
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                other => other,
+            }),
+            other => value.push(other),
+        }
+    }
+}
+
+/// The strings in the text of an array of strings, or `None` for text that is not one.
+#[must_use]
+pub(super) fn parse_strings(text: &str) -> Option<Vec<String>> {
+    let text = text.trim();
+    let text = text.strip_prefix("@as ").unwrap_or(text);
+    let inner = text.strip_prefix('[')?.strip_suffix(']')?.trim();
+    if inner.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut strings = Vec::new();
+    let mut characters = inner.char_indices().peekable();
+    while characters.peek().is_some() {
+        let (start, quote) = characters.next()?;
+        if !matches!(quote, '\'' | '"') {
+            return None;
+        }
+        let mut end = None;
+        while let Some((index, character)) = characters.next() {
+            if character == '\\' {
+                characters.next();
+            } else if character == quote {
+                end = Some(index);
+                break;
+            }
+        }
+        strings.push(parse_string(&inner[start..=end?])?);
+        // Between two strings there is a comma, and nothing after the last.
+        match characters.next() {
+            None => break,
+            Some((_, ',')) => {
+                while characters
+                    .next_if(|(_, character)| *character == ' ')
+                    .is_some()
+                {}
+            }
+            Some(_) => return None,
+        }
+    }
+    Some(strings)
+}
+
+/// An array of strings as GVariant text writes it.
+fn variant_strings(strings: &[String]) -> String {
+    format!(
+        "[{}]",
+        strings
+            .iter()
+            .map(|string| variant_string(string))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// Whether two values read from `gsettings` are one value: strings by what they hold, anything
+/// else by its text.
+fn same_value(left: &str, right: &str) -> bool {
+    match (parse_string(left), parse_string(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => left.trim() == right.trim(),
+    }
+}
+
+fn tool(failure: ToolFailure, spec: &Spec) -> ProfileError {
+    match failure {
+        ToolFailure::Missing => ProfileError::ToolMissing(spec.terminal),
+        ToolFailure::Failed(status) => ProfileError::ToolFailed {
+            terminal: spec.terminal,
+            status,
+        },
+    }
+}
+
+/// The identifiers in the shared list, in order.
+fn profiles(gsettings: &Gsettings, spec: &Spec) -> Result<Vec<String>, ProfileError> {
+    let text = gsettings
+        .get(spec.list_schema, spec.list_key)
+        .map_err(|failure| tool(failure, spec))?;
+    parse_strings(&text).ok_or(ProfileError::ToolFailed {
+        terminal: spec.terminal,
+        status: None,
+    })
+}
+
+/// The application's default profile.
+fn default_profile(gsettings: &Gsettings, spec: &Spec) -> Result<String, ProfileError> {
+    let text = gsettings
+        .get(spec.list_schema, spec.default_key)
+        .map_err(|failure| tool(failure, spec))?;
+    parse_string(&text).ok_or(ProfileError::ToolFailed {
+        terminal: spec.terminal,
+        status: None,
+    })
+}
+
+/// What one profile in the list is named.
+fn name_of(gsettings: &Gsettings, spec: &Spec, uuid: &str) -> Option<String> {
+    let target = format!("{}:{}", spec.profile_schema, (spec.profile_path)(uuid));
+    gsettings
+        .get(&target, spec.name_key)
+        .ok()
+        .and_then(|text| parse_string(&text))
+}
+
+/// What installing a profile into settings would write, worked out before anything is.
+#[derive(Clone, Debug)]
+pub(super) struct SettingsPlan {
+    pub spec: Spec,
+    pub gsettings: Gsettings,
+    pub uuid: String,
+    pub wrote: SettingsWrote,
+}
+
+/// Works out the install, and refuses what it must not write beside.
+///
+/// # Errors
+///
+/// Returns why the profile is not written.
+pub(super) fn plan(
+    gsettings: &Gsettings,
+    spec: Spec,
+    command_text: &str,
+    recorded: Option<&SettingsWrote>,
+) -> Result<SettingsPlan, ProfileError> {
+    let terminal = spec.terminal;
+    let schemas = gsettings
+        .schemas()
+        .map_err(|failure| tool(failure, &spec))?;
+    if !schemas.iter().any(|schema| schema == spec.list_schema)
+        || !schemas.iter().any(|schema| schema == spec.profile_schema)
+    {
+        return Err(ProfileError::SchemaAbsent(terminal));
+    }
+    let list = profiles(gsettings, &spec)?;
+    let default = default_profile(gsettings, &spec)?;
+    // A list with no default, or a default that is not in it, is one the application settles by
+    // taking the first profile in it: ours could become the default by that alone.
+    if list.is_empty() || !list.contains(&default) {
+        return Err(ProfileError::NoDefaultProfile(terminal));
+    }
+    let uuid = recorded.map_or_else(
+        || (spec.new_identifier)(),
+        |recorded| recorded.list.member.clone(),
+    );
+    if let Some(recorded) = recorded
+        && recorded.schema != spec.profile_schema
+    {
+        return Err(ProfileError::RecordedOtherwise(terminal));
+    }
+    // A profile of the person's own with our name makes the application's own way of choosing a
+    // profile by name ambiguous.
+    for other in list.iter().filter(|other| **other != uuid) {
+        if name_of(gsettings, &spec, other).is_some_and(|name| name == PROFILE_NAME) {
+            return Err(ProfileError::ForeignProfile(terminal));
+        }
+    }
+    let wrote = SettingsWrote {
+        schema: spec.profile_schema.to_owned(),
+        path: (spec.profile_path)(&uuid),
+        keys: vec![
+            RecordedKey {
+                key: spec.name_key.to_owned(),
+                value: variant_string(PROFILE_NAME),
+            },
+            RecordedKey {
+                key: spec.custom_flag_key.to_owned(),
+                value: "true".to_owned(),
+            },
+            RecordedKey {
+                key: spec.command_key.to_owned(),
+                value: variant_string(command_text),
+            },
+        ],
+        list: RecordedList {
+            schema: spec.list_schema.to_owned(),
+            key: spec.list_key.to_owned(),
+            member: uuid.clone(),
+        },
+    };
+    Ok(SettingsPlan {
+        spec,
+        gsettings: gsettings.clone(),
+        uuid,
+        wrote,
+    })
+}
+
+/// Carries out the plan: the profile's keys first, then its place in the shared list, and a read
+/// back by another process of both. A write that does not hold takes itself back.
+///
+/// # Errors
+///
+/// Returns why the profile is not written and whether anything of it may be left in the shared
+/// list, which a failure of the cleanup itself can leave there.
+pub(super) fn write(plan: &SettingsPlan) -> Result<(), (ProfileError, bool)> {
+    let spec = &plan.spec;
+    let gsettings = &plan.gsettings;
+    let target = format!("{}:{}", plan.wrote.schema, plan.wrote.path);
+    let undo = || {
+        for key in &plan.wrote.keys {
+            let _ = gsettings.reset(&target, &key.key);
+        }
+    };
+    for key in &plan.wrote.keys {
+        if let Err(failure) = gsettings.set(&target, &key.key, &key.value) {
+            undo();
+            return Err((tool(failure, spec), false));
+        }
+    }
+    // Read back by a process of its own: a backend that keeps a write only in the process that
+    // made it (a session with no settings service) shows nothing here.
+    for key in &plan.wrote.keys {
+        let held = gsettings
+            .get(&target, &key.key)
+            .is_ok_and(|read| same_value(&read, &key.value));
+        if !held {
+            undo();
+            return Err((ProfileError::NotPersisted(spec.terminal), false));
+        }
+    }
+    if let Err(error) = change_list(gsettings, spec, &plan.uuid, true) {
+        // The write of the list may have landed before it failed to read back: the identifier is
+        // taken out again, and if that fails too the caller keeps the record's entry, so that a
+        // removal can finish the job.
+        let cleaned = change_list(gsettings, spec, &plan.uuid, false).is_ok();
+        undo();
+        return Err((error, !cleaned));
+    }
+    Ok(())
+}
+
+/// Adds `member` to the shared list, or takes it out, and checks that it held.
+///
+/// The list is read, read again just before it is written, and written; it is then read by
+/// another process. A change between the two reads, a pre-write element missing afterwards or the
+/// change itself missing starts it over, up to a bound.
+fn change_list(
+    gsettings: &Gsettings,
+    spec: &Spec,
+    member: &str,
+    adding: bool,
+) -> Result<(), ProfileError> {
+    for _ in 0..ATTEMPTS {
+        let before = profiles(gsettings, spec)?;
+        let has = before.iter().any(|existing| existing == member);
+        if has == adding {
+            // Already as wanted, as another writer's list may have it: check once more by
+            // another process that it still is.
+            let again = profiles(gsettings, spec)?;
+            if again.iter().any(|existing| existing == member) == adding {
+                return Ok(());
+            }
+            continue;
+        }
+        let just_before = profiles(gsettings, spec)?;
+        if just_before != before {
+            continue;
+        }
+        let mut after = before.clone();
+        if adding {
+            after.push(member.to_owned());
+        } else {
+            after.retain(|existing| existing != member);
+        }
+        gsettings
+            .set(spec.list_schema, spec.list_key, &variant_strings(&after))
+            .map_err(|failure| tool(failure, spec))?;
+        let read_back = profiles(gsettings, spec)?;
+        let kept = before
+            .iter()
+            .filter(|existing| existing.as_str() != member)
+            .all(|existing| read_back.contains(existing));
+        let changed = read_back.iter().any(|existing| existing == member) == adding;
+        if kept && changed {
+            return Ok(());
+        }
+    }
+    Err(ProfileError::ListBusy(spec.terminal))
+}
+
+/// Where a recorded profile stands in settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Reading {
+    /// Every key kr wrote has its value and every other key of the profile is at its default.
+    Unchanged { in_list: bool },
+    /// No key of the profile is set and it is not in the list.
+    Gone,
+    /// Something else.
+    Changed,
+}
+
+/// Reads where a recorded profile stands.
+pub(super) fn read(gsettings: &Gsettings, spec: Spec, wrote: &SettingsWrote) -> Reading {
+    let target = format!("{}:{}", wrote.schema, wrote.path);
+    let unused = format!("{}:{}", wrote.schema, unused_path(&spec));
+    let in_list = profiles(gsettings, &spec)
+        .map(|list| list.iter().any(|existing| *existing == wrote.list.member))
+        .unwrap_or(false);
+    let Ok(keys) = gsettings.keys(&wrote.schema) else {
+        return Reading::Changed;
+    };
+    let mut ours_match = true;
+    let mut ours_default = true;
+    let mut others_default = true;
+    for key in &keys {
+        let Ok(value) = gsettings.get(&target, key) else {
+            return Reading::Changed;
+        };
+        let Ok(default) = gsettings.get(&unused, key) else {
+            return Reading::Changed;
+        };
+        match wrote.keys.iter().find(|written| written.key == *key) {
+            Some(written) => {
+                ours_match &= same_value(&value, &written.value);
+                ours_default &= same_value(&value, &default);
+            }
+            None => others_default &= same_value(&value, &default),
+        }
+    }
+    if ours_default && others_default {
+        // Nothing of the profile's own is set: gone, unless its place in the list is left over,
+        // which a removal takes out.
+        if in_list {
+            Reading::Unchanged { in_list }
+        } else {
+            Reading::Gone
+        }
+    } else if ours_match && others_default {
+        Reading::Unchanged { in_list }
+    } else {
+        Reading::Changed
+    }
+}
+
+/// Whether the recorded profile is the application's default.
+pub(super) fn is_default(gsettings: &Gsettings, spec: Spec, wrote: &SettingsWrote) -> bool {
+    default_profile(gsettings, &spec).is_ok_and(|default| default == wrote.list.member)
+}
+
+/// Takes an unchanged profile out: its keys are reset and its identifier leaves the shared list.
+///
+/// # Errors
+///
+/// Returns why it could not be; what was reset stays reset, and the caller keeps the record's
+/// entry.
+pub(super) fn take_out(
+    gsettings: &Gsettings,
+    spec: Spec,
+    wrote: &SettingsWrote,
+) -> Result<(), ProfileError> {
+    let target = format!("{}:{}", wrote.schema, wrote.path);
+    // The list first: a profile out of the list and with its keys set is invisible, where one in
+    // the list with its keys reset would be shown unnamed.
+    change_list(gsettings, &spec, &wrote.list.member, false)?;
+    for key in &wrote.keys {
+        gsettings
+            .reset(&target, &key.key)
+            .map_err(|failure| tool(failure, &spec))?;
+    }
+    Ok(())
+}
+
+/// Whether a profile of the person's own is in the list under this one's name.
+pub(super) fn foreign(gsettings: &Gsettings, spec: Spec) -> bool {
+    profiles(gsettings, &spec).is_ok_and(|list| {
+        list.iter()
+            .any(|uuid| name_of(gsettings, &spec, uuid).is_some_and(|name| name == PROFILE_NAME))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// GVariant text of strings: written with a quote and a backslash escaped, and read back from
+    /// either quote `gsettings` prints.
+    #[test]
+    fn variant_text_of_a_string_round_trips() {
+        for text in [
+            "plain",
+            "it's",
+            r"a\b",
+            "two\nlines",
+            "a \"quoted\" word",
+            "caf\u{e9}",
+        ] {
+            assert_eq!(parse_string(&variant_string(text)).as_deref(), Some(text));
+        }
+        assert_eq!(parse_string(r#""it's""#).as_deref(), Some("it's"));
+        assert_eq!(parse_string("@s 'x'").as_deref(), Some("x"));
+        assert_eq!(parse_string("true"), None);
+        assert_eq!(parse_string("'unterminated"), None);
+    }
+
+    /// An array of strings, empty or not, as `gsettings` prints it.
+    #[test]
+    fn variant_text_of_an_array_of_strings_is_read() {
+        assert_eq!(parse_strings("@as []"), Some(Vec::new()));
+        assert_eq!(parse_strings("[]"), Some(Vec::new()));
+        assert_eq!(
+            parse_strings("['b1dcc9dd', 'it\\'s', \"two\"]"),
+            Some(vec![
+                "b1dcc9dd".to_owned(),
+                "it's".to_owned(),
+                "two".to_owned()
+            ])
+        );
+        assert_eq!(parse_strings("[1, 2]"), None);
+        assert_eq!(parse_strings("'x'"), None);
+        let strings = vec!["a".to_owned(), "it's".to_owned()];
+        assert_eq!(parse_strings(&variant_strings(&strings)), Some(strings));
+    }
+
+    /// Two readings of one string are one value whatever quotes they are printed in.
+    #[test]
+    fn the_same_string_in_the_two_quotes_is_one_value() {
+        assert!(same_value("'/opt/it\\'s/kr'", "\"/opt/it's/kr\""));
+        assert!(same_value("true", "true"));
+        assert!(!same_value("'a'", "'b'"));
+    }
+}

@@ -15,7 +15,7 @@ use kr_shell_integration::contract::qualification::ShellKind;
 use kr_shell_integration::host::startup::{EntryInPlace, EntryRecord};
 use kr_shell_integration::host::terminal_profile;
 use kr_shell_integration::host::terminal_profile::record::{
-    PROFILE_WRITTEN, ProfileRecord, RecordError, RecordedProfile, Wrote,
+    PROFILE_WRITTEN, ProfileRecord, RecordError, Wrote,
 };
 use kr_shell_integration::host::terminal_profile::{
     Place, ProfileError, ProfileHome, ProfileTerminal, Removed, Standing,
@@ -25,7 +25,8 @@ use crate::cli::{
     TerminalProfileArguments, TerminalProfileCommand, TerminalProfileInstall, TerminalProfileRemove,
 };
 use crate::error::{CliError, Result};
-use crate::output::{self, Document};
+use crate::output::{self, Asked, Document, Request};
+use crate::stdout_line;
 
 /// What a profile's command runs after the program: the options that make each window a session of
 /// its own and keep it open on a failure.
@@ -162,17 +163,28 @@ const fn how_to_make_default(terminal: ProfileTerminal) -> &'static str {
     }
 }
 
-/// What the profile writes, for a person.
-fn place_shown(place: Place<'_>) -> Shown {
+/// Says what the profile writes, for a person.
+fn say_place(place: Place<'_>) {
     match place {
-        Place::File(file) => Shown::root(file),
+        Place::File(file) => output::say(&shown!("  where: {}", Shown::root(file))),
+        Place::Settings { schema, path } => output::line(&stdout_line!(
+            "  where: the settings of {} at {}",
+            Asked::text(Request::TerminalProfile, schema),
+            Asked::text(Request::TerminalProfile, path)
+        )),
     }
 }
 
-/// The key a script reads the place under, and what is there.
-fn place_key(place: Place<'_>) -> (&'static str, Shown) {
+/// Adds what the profile writes to a document for a script.
+fn json_place(document: Document, place: Place<'_>) -> Document {
     match place {
-        Place::File(file) => ("file", Shown::root(file)),
+        Place::File(file) => document.with("file", Shown::root(file)),
+        Place::Settings { schema, path } => document.with(
+            "settings",
+            Document::new()
+                .with("schema", Asked::text(Request::TerminalProfile, schema))
+                .with("path", Asked::text(Request::TerminalProfile, path)),
+        ),
     }
 }
 
@@ -332,13 +344,18 @@ fn status(paths: &HostPaths, record: &ProfileRecord, json: bool) -> Result<()> {
     }
     for status in &statuses {
         output::say(&status_line(status));
-        if let Some(RecordedProfile {
-            wrote: Wrote::File(wrote),
-            ..
-        }) = &status.recorded
-            && let Ok(file) = wrote.file()
-        {
-            output::say(&shown!("  file: {}", Shown::root(&file)));
+        match status.recorded.as_ref().map(|recorded| &recorded.wrote) {
+            Some(Wrote::File(wrote)) => {
+                if let Ok(file) = wrote.file() {
+                    output::say(&shown!("  file: {}", Shown::root(&file)));
+                }
+            }
+            Some(Wrote::Settings(wrote)) => output::line(&stdout_line!(
+                "  settings: {} at {}",
+                Asked::text(Request::TerminalProfile, &wrote.schema),
+                Asked::text(Request::TerminalProfile, &wrote.path)
+            )),
+            Some(Wrote::Preferences(_)) | None => {}
         }
     }
     output::say(&shown!(
@@ -385,10 +402,22 @@ fn status_json(status: &terminal_profile::Status) -> Document {
         .with("profile", state_word(status));
     if let Some(recorded) = &status.recorded {
         document.set("command", command_words(&recorded.command));
-        if let Wrote::File(wrote) = &recorded.wrote
-            && let Ok(file) = wrote.file()
-        {
-            document.set("file", Shown::root(&file));
+        match &recorded.wrote {
+            Wrote::File(wrote) => {
+                if let Ok(file) = wrote.file() {
+                    document.set("file", Shown::root(&file));
+                }
+            }
+            Wrote::Settings(wrote) => document.set(
+                "settings",
+                Document::new()
+                    .with(
+                        "schema",
+                        Asked::text(Request::TerminalProfile, &wrote.schema),
+                    )
+                    .with("path", Asked::text(Request::TerminalProfile, &wrote.path)),
+            ),
+            Wrote::Preferences(_) => {}
         }
     }
     document
@@ -463,17 +492,18 @@ fn install_profile(
         plan
     };
     let readiness = readiness(paths);
-    let (key, place) = place_key(plan.place());
     if json {
         output::document(
-            &Document::new()
-                .with("ok", true)
-                .with("terminal", terminal.id())
-                .with("dry_run", arguments.dry_run)
-                .with(key, place)
-                .with("command", command_words(&plan.command))
-                .with("default", false)
-                .with("readiness", readiness.json()),
+            &json_place(
+                Document::new()
+                    .with("ok", true)
+                    .with("terminal", terminal.id())
+                    .with("dry_run", arguments.dry_run),
+                plan.place(),
+            )
+            .with("command", command_words(&plan.command))
+            .with("default", false)
+            .with("readiness", readiness.json()),
         );
         return Ok(());
     }
@@ -483,7 +513,7 @@ fn install_profile(
     } else {
         shown!("wrote the KalaReach profile for {}", name)
     });
-    output::say(&shown!("  where: {}", place_shown(plan.place())));
+    say_place(plan.place());
     output::say(&shown!("  command: {}", command_shown(&plan.command)));
     output::say(&shown!(
         "  unchanged: {}'s other profiles and its default, and your shell startup files",
@@ -645,10 +675,10 @@ impl RemovalReport {
             Self::Did(Removed::AlreadyGone) => {
                 shown!("{}: the profile was already gone", name)
             }
-            Self::Did(Removed::Changed { left_at }) => shown!(
-                "{}: left {}: it was changed after kr wrote it, so it is no longer kr's to remove",
-                name,
-                Shown::root(Path::new(left_at))
+            Self::Did(Removed::Changed { .. }) => shown!(
+                "{}: left the profile: it was changed after kr wrote it, so it is no longer kr's \
+                 to remove",
+                name
             ),
             Self::Did(Removed::Default) => shown!(
                 "{}: left the profile, which is the application's default; choose another default \
@@ -667,7 +697,7 @@ impl RemovalReport {
             Self::Did(Removed::AlreadyGone) => document.with("result", "already_gone"),
             Self::Did(Removed::Changed { left_at }) => document
                 .with("result", "left_changed")
-                .with("left", Shown::root(Path::new(left_at))),
+                .with("left", Asked::text(Request::TerminalProfile, left_at)),
             Self::Did(Removed::Default) => document.with("result", "left_default"),
         }
     }
@@ -747,6 +777,49 @@ fn failure(error: &ProfileError, home: &ProfileHome) -> CliError {
         ProfileError::RecordedOtherwise(terminal) => CliError::Usage(shown!(
             "the record names {}'s profile as another kind of write than this platform makes; \
              run kr host terminal-profile remove first",
+            Shown::said(terminal.name())
+        )),
+        ProfileError::ToolMissing(terminal) => CliError::Usage(shown!(
+            "{} keeps its profiles in the settings database, and gsettings is not installed; \
+             nothing was written",
+            Shown::said(terminal.name())
+        )),
+        ProfileError::ToolFailed { terminal, status } => CliError::Other(match status {
+            Some(status) => shown!(
+                "gsettings failed (exit status {}) while kr read or wrote {}'s profile",
+                *status,
+                Shown::said(terminal.name())
+            ),
+            None => shown!(
+                "gsettings failed or gave no answer while kr read or wrote {}'s profile",
+                Shown::said(terminal.name())
+            ),
+        }),
+        ProfileError::SchemaAbsent(terminal) => CliError::Usage(shown!(
+            "{}'s settings schema is not installed, so there is no profile to write; nothing was \
+             written",
+            Shown::said(terminal.name())
+        )),
+        ProfileError::NoDefaultProfile(terminal) => CliError::Usage(shown!(
+            "{} has no default profile in its list of profiles, and a profile written into a list \
+             like that could become its default; open {} once, then run this again; nothing was \
+             written",
+            Shown::said(terminal.name()),
+            Shown::said(terminal.name())
+        )),
+        ProfileError::ForeignProfile(terminal) => CliError::Usage(shown!(
+            "{} has a profile named KalaReach that kr did not write, which would make choosing it \
+             by name ambiguous; nothing was written",
+            Shown::said(terminal.name())
+        )),
+        ProfileError::NotPersisted(terminal) => CliError::Usage(shown!(
+            "{}'s settings did not keep what kr wrote, which is what a session with no settings \
+             service does; run this in a desktop session. What was written has been taken back",
+            Shown::said(terminal.name())
+        )),
+        ProfileError::ListBusy(terminal) => CliError::Other(shown!(
+            "{}'s list of profiles changed each time kr tried to write it; nothing of the profile \
+             was left, and running this again tries again",
             Shown::said(terminal.name())
         )),
         ProfileError::Io { place, source } => {
