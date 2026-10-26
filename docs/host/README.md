@@ -5587,14 +5587,15 @@ a session in privacy mode still raises what the work is about and serves none of
 record's number is the version of the turn's result and the identity of the command. It only
 goes up, and a worker started again over the journal goes on from it, so a turn that ends
 again, even under the same turn identifier, is a later version and new review work, and two
-commands that read alike are two failures. Each failed command is an item of its own, so the
-sixty-second window never merges two of them. A session that closes writes what it has queued
-before it commits its closure. A journal that refuses a record keeps it queued while the worker
-lives; if the worker ends first the record is lost, and the closure says it is not durable. A
-command can be recorded twice if its report is repeated after the session has dropped the older
-of the sixty-four command blocks it holds, or after the worker started again, and a report that
-a command ended is missed when it has no start and reuses the prompt generation of a block the
-session holds as ended. A release that does not know these kinds reads them as events that raise
+commands that read alike are two failures. Each failed command is an item of its own, so two
+failures are never counted as one repeat, however close together they come. A session that closes
+writes what it has queued before it commits its closure. When the journal refuses a record, the
+worker keeps it queued and writes it once the journal takes writes again; if the worker ends
+first the record is lost, and the closure says it is not durable. A command can be recorded
+twice if its report is repeated after sixty-four later commands have pushed its block out of
+the blocks the session holds, or after the worker started again, and a report that a command
+ended is missed when it has no start and reuses the prompt generation of a block the session
+holds as ended. A release that does not know these kinds reads them as events that raise
 nothing, and serves the text of an item this release raised from them with the line of
 identifiers before the words.
 

@@ -326,8 +326,8 @@ pub fn fingerprint(key: &[u8; 32], said: &str) -> Digest256 {
 
 /// One host event as the page carries it. `served` is whether its words are served now; an
 /// adapter transition travels with its package, and a turn or a command with its identity,
-/// whether or not they are, so a session whose words are withheld still raises and resolves what
-/// the transition is about.
+/// whether or not they are, so a session whose words are withheld still raises what the work is
+/// about, and resolves what an adapter transition is about.
 fn host_record(
     sequence: u64,
     event: &HostEvent,
