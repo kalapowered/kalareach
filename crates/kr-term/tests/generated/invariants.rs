@@ -158,49 +158,71 @@ pub fn forward_is_safe_for_a_terminal(forward: &[u8]) -> Vec<Violation> {
     let mut at = 0;
     while at < forward.len() {
         let byte = forward[at];
-        if byte == 0x05 || byte == 0x07 {
-            found.push(violation(
-                Invariant::ByteSafety,
-                format!("the control byte {byte:#04x} at {at} outside a string"),
-            ));
-            at += 1;
-            continue;
-        }
         if byte != 0x1b {
+            flag_a_control_that_acts(byte, at, &mut found);
             at += 1;
             continue;
         }
-        match forward.get(at + 1) {
+        let introducer = skip_controls(forward, at + 1, &mut found);
+        match forward.get(introducer) {
             Some(b'Z') => {
                 found.push(violation(
                     Invariant::ByteSafety,
                     format!("ESC Z, which asks the terminal to identify itself, at {at}"),
                 ));
-                at += 2;
+                at = introducer + 1;
             }
-            Some(b'[') => at = scan_csi(forward, at, &mut found),
-            Some(b']' | b'P' | b'_' | b'^' | b'X') => at = scan_string(forward, at, &mut found),
-            _ => at += 1,
+            Some(b'[') => at = scan_csi(forward, at, introducer + 1, &mut found),
+            Some(b']' | b'P' | b'_' | b'^' | b'X') => {
+                at = scan_string(forward, at, introducer, &mut found);
+            }
+            _ => at = introducer,
         }
     }
     found
 }
 
+/// Whether a terminal performs this byte where it stands inside a sequence, or discards it, and
+/// goes on collecting the sequence around it. CAN and SUB end the sequence, and ESC begins another.
+const fn is_carried_past(byte: u8) -> bool {
+    matches!(byte, 0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f)
+}
+
+/// Names ENQ and BEL, which a terminal answers or sounds on its own wherever they stand.
+fn flag_a_control_that_acts(byte: u8, at: usize, found: &mut Vec<Violation>) {
+    if byte == 0x05 || byte == 0x07 {
+        found.push(violation(
+            Invariant::ByteSafety,
+            format!("the control byte {byte:#04x} at {at} outside a string"),
+        ));
+    }
+}
+
+/// Returns where the sequence goes on from `at`, past the controls a terminal carries past.
+fn skip_controls(forward: &[u8], mut at: usize, found: &mut Vec<Violation>) -> usize {
+    while let Some(&byte) = forward.get(at).filter(|byte| is_carried_past(**byte)) {
+        flag_a_control_that_acts(byte, at, found);
+        at += 1;
+    }
+    at
+}
+
 /// Checks one control sequence for a question, and returns where it ends.
 ///
-/// NUL and DEL inside the sequence are padding a terminal discards, so the sequence goes on past
-/// them.
-fn scan_csi(forward: &[u8], at: usize, found: &mut Vec<Violation>) -> usize {
-    let mut end = at + 2;
+/// `at` is where its escape stands and `start` its first byte after the bracket. A terminal
+/// carries on collecting the sequence around the controls it performs, and around NUL and DEL,
+/// which it discards. Only CAN, SUB and ESC end it, and the scan goes on from them.
+fn scan_csi(forward: &[u8], at: usize, start: usize, found: &mut Vec<Violation>) -> usize {
+    let mut end = start;
     let mut parameters = Vec::new();
     let mut intermediates = Vec::new();
     let last = loop {
         match forward.get(end) {
-            Some(0x00 | 0x7f) => {}
+            Some(&byte) if is_carried_past(byte) => flag_a_control_that_acts(byte, end, found),
             Some(byte @ 0x30..=0x3f) if intermediates.is_empty() => parameters.push(*byte),
             Some(byte @ 0x20..=0x2f) => intermediates.push(*byte),
             Some(byte @ 0x40..=0x7e) => break *byte,
-            _ => return end.max(at + 2),
+            _ => return end,
         }
         end += 1;
     };
@@ -241,8 +263,8 @@ fn scan_csi(forward: &[u8], at: usize, found: &mut Vec<Violation>) -> usize {
 }
 
 /// Checks one control string, and returns where it ends.
-fn scan_string(forward: &[u8], at: usize, found: &mut Vec<Violation>) -> usize {
-    let family = forward[at + 1];
+fn scan_string(forward: &[u8], at: usize, introducer: usize, found: &mut Vec<Violation>) -> usize {
+    let family = forward[introducer];
     let osc = family == b']';
     if !osc {
         found.push(violation(
@@ -253,7 +275,7 @@ fn scan_string(forward: &[u8], at: usize, found: &mut Vec<Violation>) -> usize {
             ),
         ));
     }
-    let mut end = at + 2;
+    let mut end = introducer + 1;
     loop {
         match forward.get(end) {
             None => {
@@ -278,7 +300,7 @@ fn scan_string(forward: &[u8], at: usize, found: &mut Vec<Violation>) -> usize {
         }
     }
     if osc {
-        let payload = &forward[at + 2..end];
+        let payload = &forward[introducer + 1..end];
         let parts: Vec<&[u8]> = payload.split(|byte| *byte == b';').collect();
         let selector = parts
             .first()

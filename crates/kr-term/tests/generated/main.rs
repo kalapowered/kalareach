@@ -326,6 +326,87 @@ fn the_scan_names_a_forwarded_question_or_action_the_class_table_would_have_to_c
     }
 }
 
+/// The byte that stands for the control a case puts into a sequence.
+const HERE: u8 = 0xff;
+
+fn with_the_control(template: &[u8], control: u8) -> Vec<u8> {
+    template
+        .iter()
+        .map(|byte| if *byte == HERE { control } else { *byte })
+        .collect()
+}
+
+/// KR-ACC-024: the scan follows a sequence the way a terminal collects it around a control. A
+/// terminal performs a C0 control where it stands, between the escape and the bracket or in the
+/// middle of the parameters, and carries on collecting, so a question with any such control in it
+/// is still a question and the scan names it, as it names ENQ and BEL there. Only CAN, SUB and ESC
+/// end a sequence, so a question they cut short is text. The engine's own run of each stream passes.
+#[test]
+fn the_scan_follows_a_sequence_a_terminal_collects_around_a_control() {
+    let questions: [&[u8]; 7] = [
+        b"ok\x1b[6\xffn",
+        b"ok\x1b[\xff6n",
+        b"ok\x1b[1\xff8t",
+        b"ok\x1b[?7$\xffp",
+        b"ok\x1b\xff[6n",
+        b"ok\x1b\xff[c",
+        b"ok\x1b\xffZ",
+    ];
+    let carried_on = (0x00..=0x1f)
+        .chain([0x7f])
+        .filter(|control| ![0x18, 0x1a, 0x1b].contains(control));
+    let mut missed = Vec::new();
+    for control in carried_on {
+        for template in questions {
+            let input = with_the_control(template, control);
+            let found = forged(&input, Vec::new(), &[(0, input.len() as u64)]);
+            if !found
+                .iter()
+                .any(|violation| violation.invariant == Invariant::ByteSafety)
+            {
+                missed.push(format!("{control:#04x} in {input:02x?}"));
+            }
+        }
+    }
+    assert!(
+        missed.is_empty(),
+        "the scan names no question in {} sequences a terminal collects around a control: {missed:?}",
+        missed.len()
+    );
+
+    // ENQ and BEL act wherever they stand, and a sequence they stand in does not hide them.
+    for control in [0x05, 0x07] {
+        for template in [&b"ok\x1b[1\xffm"[..], b"ok\x1b\xff7"] {
+            let input = with_the_control(template, control);
+            names(
+                &forged(&input, Vec::new(), &[(0, input.len() as u64)]),
+                &[Invariant::ByteSafety],
+            );
+        }
+    }
+
+    let quiet = |template: &[u8], control: u8| {
+        let input = with_the_control(template, control);
+        let found = invariants::forward_is_safe_for_a_terminal(&input);
+        assert!(
+            found.is_empty(),
+            "{control:#04x} ends the sequence, so {input:02x?} asks nothing: {found:?}"
+        );
+    };
+    // CAN, SUB and ESC end a sequence that is collecting its parameters. Before the bracket ESC
+    // begins a sequence of its own, so only CAN and SUB end it there.
+    for control in [0x18, 0x1a, 0x1b] {
+        for template in [&b"ok\x1b[6\xffn"[..], b"ok\x1b[\xff6n", b"ok\x1b[?7$\xffp"] {
+            quiet(template, control);
+        }
+    }
+    for control in [0x18, 0x1a] {
+        for template in [&b"ok\x1b\xff[6n"[..], b"ok\x1b\xffZ"] {
+            quiet(template, control);
+        }
+    }
+}
+
 /// KR-ACC-024: the check that the events cover the stream counts an event of the outer stream as it
 /// is, so two events for the same bytes overlap, and lets bytes go unclaimed only when they are an
 /// empty tmux envelope, which makes no event.
