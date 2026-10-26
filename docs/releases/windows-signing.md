@@ -222,7 +222,7 @@ refusal, requires positive controls for signed executables and PowerShell files,
 executable, tests an untrusted signature, tests wrong-publisher refusal, tests untimestamped refusal,
 tests an altered file starting from an accepted signed executable, and tests a signed PowerShell
 module. It runs in its own job at the start of every release run, before anything is built and on a
-runner that cannot reach the signing service at all. A gate that has stopped refusing stops the
+runner that holds no token for the signing service. A gate that has stopped refusing stops the
 release.
 
 ## The identity, and what the operator set up once
@@ -246,7 +246,8 @@ a build.
 
 Together those mean a signature is possible only from a workflow run in this repository, in the
 `release-signing` environment, which a person approved, for as long as no other principal holds the
-signer role. A fork cannot get one. A stolen copy of the
+signer role and the application holds no other credential; a token minted in an approved run can also
+sign until it expires (see the incident response below). A fork cannot get one. A stolen copy of the
 repository cannot get one, because there is no private key or secret in the repository to steal.
 
 Environment protection applies to the `release` job referencing the `release-signing` environment,
@@ -347,8 +348,11 @@ run is suspected, or signing access must be revoked immediately:
      account's `Sign Transactions` resource log, and Azure writes it only where a diagnostic setting
      on the account sends it to a storage account (the container `insights-logs-signtransactions`),
      an event hub or a partner solution ([Microsoft's steps](https://learn.microsoft.com/en-us/azure/artifact-signing/how-to-sign-history)).
-     None of the four things above creates such a setting, so the account holds the record only if
-     its owner made a setting before the incident.
+     None of the four things above creates such a setting, so the record exists only where the owner
+     made one before the window began. The platform metric `SignCompleted`, a count of completed
+     signing requests per minute that Azure Monitor collects for the account without a setting, names
+     no caller, file or certificate; it can show a day on which the account signed nothing and a
+     signature made outside the times of the approved runs.
    - Review Azure Activity Logs for control-plane role, profile, or account modifications.
    - Audit GitHub Actions workflow run histories and release assets.
    - If unauthorized signatures were produced:
@@ -362,16 +366,21 @@ run is suspected, or signing access must be revoked immediately:
        time on ([Microsoft's steps](https://learn.microsoft.com/en-us/azure/artifact-signing/how-to-cert-revocation)).
        The owner enters a time no later than the first unauthorised signature under that certificate,
        which the record above gives, and not the time of the discovery, or the unauthorised files
-       signed before it stay valid. Where no record covers the window, nothing says which
-       certificates carry an unauthorised signature or when the first was made, so the owner treats
-       every certificate created since the window began as carrying one and enters the creation date
-       and time the portal lists for each as its revocation time, the earliest Microsoft accepts.
-       Every legitimate file the certificate signed after the revocation time becomes invalid too, so
-       each Windows release that carries one is released again from a new commit, under that
-       commit's tag; `share/signatures.txt` of a release names the thumbprint of the certificate that
-       signed each of its files.
+       signed before it stay valid. Every legitimate file the certificate signed after the revocation
+       time becomes invalid too, so each Windows release that carries one is released again from a
+       new commit, under that commit's tag; `share/signatures.txt` of a release names the thumbprint
+       of the certificate that signed each of its files.
      - The GitHub repository administrator deletes any compromised release draft or published release,
        purges published artefacts from distribution, and notifies downstream consumers.
+   - Where no record covers the window, or none shows that nothing was signed outside an approved
+     run, take the steps of the item above as if unauthorised signatures were produced. Nothing then
+     says which certificates carry one or when the first was made, so the owner treats every
+     certificate whose validity overlaps the window as carrying one: each certificate created before
+     the window that is still valid when it begins (a certificate is valid for 72 hours) and each
+     certificate created since. The owner revokes each of them in the portal at the creation date
+     and time it lists, the earliest Microsoft accepts, and releases again each Windows release whose
+     `share/signatures.txt` names the thumbprint of one of them. Where the start of the window is not
+     known, the owner takes the earliest time it could have begun.
 5. Treat the Apple signing credentials as leaked, whatever step 4 finds:
    - A run that could use the weakened environment could read the Apple Developer ID certificate, its
      password and the notary key (`docs/releases/keys.md`), and copying them leaves no Azure signature
