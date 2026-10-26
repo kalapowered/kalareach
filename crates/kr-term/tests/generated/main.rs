@@ -349,7 +349,7 @@ fn the_scan_follows_a_sequence_a_terminal_collects_around_a_control() {
         b"ok\x1b\xff[6n",
         b"ok\x1b\xff[c",
         b"ok\x1b\xffZ",
-        b"ok\x1b\xff]52;c;aGk=\x07",
+        b"ok\x1b\xff]52;c;aGk=\x1b\\",
     ];
     let carried_on = (0x00..=0x1f)
         .chain([0x7f])
