@@ -32,6 +32,14 @@
 //!   was asked to remove, or whose last removal failed, serves none of it from here. Afterwards
 //!   the journal's own record keeps the text from being served, whether privacy mode is on or has
 //!   been turned off again.
+//!
+//!   The same journal record is what the archive follows when no obligation stands. A worker that
+//!   acknowledged a complete cleanup owes none, and a receipt it settled afterwards holds no
+//!   content, because the journal commits a settlement or a rejection without it while its
+//!   record says privacy mode is on. A journal written by a release that removed that content in a
+//!   second transaction, and stopped between the two, still holds it. Recovery and collection
+//!   both take it out of a journal whose record says privacy mode is on, whatever the daemon's
+//!   privacy mode says now.
 //! * **A worker crash closes the session, and what it still owned is stopped first.** The closure
 //!   is recorded and nothing is rebuilt from terminal history. Taking ownership removes the
 //!   worker's published endpoint and descriptor; [`ArchiveService::fence_owned`] then stops what
@@ -822,6 +830,10 @@ impl ArchiveService {
     /// It opens the journal that is there and creates none: a session with no journal has nothing
     /// to recover, and inventing an empty one would replace an incomplete archive with a
     /// confident empty one.
+    ///
+    /// A journal whose own privacy record says privacy mode is on has the content of its settled
+    /// receipts taken out as well, which is what a worker that stopped between committing a
+    /// settlement and removing its content under an earlier release left behind.
     ///
     /// # Errors
     ///
@@ -1627,15 +1639,20 @@ fn record_privacy_state(
     journal.record_privacy(privacy.generation.get(), privacy.private, kr_ipc::now_ms())
 }
 
-/// Runs section 9's two recovery rules over a journal the archive has open under ownership.
+/// Runs section 9's two recovery rules over a journal the archive has open under ownership, and
+/// then the content policy the journal's own privacy record states.
 ///
 /// A dispatch marker with no authoritative outcome becomes `unknown` and is never dispatched
 /// again; an accepted intent with no marker is rejected, because the freshness it was admitted
-/// under cannot be revalidated after the process that issued it has gone.
+/// under cannot be revalidated after the process that issued it has gone. Both commit without
+/// content where the record says privacy mode is on. The content a receipt still carries beyond
+/// that, which a release that removed it in a second transaction can leave behind, is taken out of
+/// every settled receipt of a journal whose record says privacy mode is on.
 fn recover_open(journal: &mut Journal) -> std::result::Result<Recovered, kr_worker::WorkerError> {
     let now = kr_ipc::now_ms();
     let unknown = journal.resolve_unfinished_dispatches(now)?;
     let rejected = journal.reject_unrevalidated_intents(now)?;
+    journal.redact_if_private()?;
     Ok(Recovered {
         left_unknown: unknown as u64,
         rejected: rejected as u64,
