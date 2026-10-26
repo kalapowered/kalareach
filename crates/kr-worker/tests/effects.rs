@@ -673,3 +673,44 @@ async fn a_turn_that_ended_is_in_the_journal_when_the_closure_is() {
         "and the queue holds nothing the journal took"
     );
 }
+
+/// KR-REQ-18.01: a closure that could not carry the work the session queued says it is not
+/// durable, and the work stays queued. A journal that refuses the host event is a journal that
+/// does not hold the turn, and a reader that finds a durable closure must not take that for a
+/// closure that follows every turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_closure_that_could_not_write_the_turn_that_ended_says_it_is_volatile() {
+    let mut fixture = Fixture::new();
+    let journal = fixture
+        ._host
+        .environment()
+        .journal_database(fixture.session_id);
+    rusqlite::Connection::open(journal)
+        .expect("the session's journal")
+        .execute_batch(
+            "CREATE TRIGGER refuse_host_event BEFORE INSERT ON host_events
+             BEGIN SELECT RAISE(ABORT, 'this store refused the host event'); END;",
+        )
+        .expect("the store will refuse the host event");
+    fixture
+        .session
+        .notices()
+        .push(kr_protocol::attention::SessionEventNotice::TurnCompleted {
+            turn_id: kr_protocol::ids::AgentTurnId::new("turn-1").expect("an identifier"),
+        });
+
+    fixture
+        .session
+        .begin_close(kr_protocol::session::ClosureReason::CloseRequested);
+    let closure = fixture.session.finish_close();
+    assert_eq!(
+        closure.durability,
+        kr_protocol::session::Durability::Volatile,
+        "the closure follows a turn the journal did not take"
+    );
+    assert!(
+        !fixture.session.notices().is_empty(),
+        "and the turn stays queued"
+    );
+    assert_eq!(fixture.host_events(), vec![]);
+}
