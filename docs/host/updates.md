@@ -330,7 +330,7 @@ A companion of the release before, paired to this host, sends the old shape. For
 
 `shell.launch.surface`, the read a client makes before it offers a launch, is one a worker of the release before does not serve. A worker states `shell.launch.surface/1` in its hello answer only when it serves the read, and the daemon of this release forwards the read only to a worker that states it. When a paired device reads the launch surface of a session whose worker runs the release before, the daemon refuses with `UNSUPPORTED_CAPABILITY` and sends the worker nothing: the worker has no row for the method and would refuse it as it refuses any method it does not serve, which reads as a missing right. A client of this release takes that refusal as a read that is not served, and not as a missing right. A companion of this release against a host that is not yet updated meets a daemon that does not list the method and refuses it as it refuses any method it does not list, with `PERMISSION_DENIED`. The client asks for what the same right reads (`session.read`); if that is refused too, the refusal is the grant's and the client returns it as it is. Otherwise it asks the first read once more and takes a second refusal as a read that is not served. On the host's own machine a companion's link asks only a worker that states the read. A session created after the update has a worker of this release, which serves the read.
 
-The plugin host does not follow the level of a worker: every level the daemon retains records the host's one protocol, `kr-plugin-host/3`, so one host serves the workers of every release, and the host the release before started is neither stopped nor replaced by the update. The new daemon adopts it when it runs, and the sessions of both releases bind their components in it. When none runs, because it crashed or because a worker first needs a runtime after the update, the new daemon starts its own `kr-plugin-host`. That needs no release store, so a host with none (Windows, a build outside one) starts a host in the same way. A plugin host takes no hold on its release: one whose release the store retires runs on from its open program until it ends, with the login session or a restart. A host that survives an update or a rollback serves the sessions of both releases until it ends, so a change to the plugin host (a fix, its engine, its bounds or its component interface) reaches the sessions of the other release only after that. A rollback leaves the host running, the older daemon adopts it, and an update after it adopts it again.
+The plugin host does not follow the level of a worker: every level the daemon retains records the host's one protocol, `kr-plugin-host/3`, so one host serves the workers of every release, and the host the release before started is neither stopped nor replaced by the update. The new daemon adopts it when it runs, and the sessions of both releases bind their components in it. When none runs, because it crashed or because a worker first needs a runtime after the update, the new daemon starts its own `kr-plugin-host`. That needs no release store, so a build outside one starts a host in the same way. A plugin host takes no hold on its release: one whose release the store retires runs on from its open program until it ends, with the login session or a restart. A host that survives an update or a rollback serves the sessions of both releases until it ends, so a change to the plugin host (a fix, its engine, its bounds or its component interface) reaches the sessions of the other release only after that. A rollback leaves the host running, the older daemon adopts it, and an update after it adopts it again.
 
 The new `kr` does not read a worker of another level in the shape it has. It accesses the worker using the worker's release if that release is available in the store, and a release is kept in the store while any worker is running using it. The new `kr-hook` does the same for a worker that admits the forwarder of its own release, and talks directly to one that does not.
 
@@ -567,26 +567,28 @@ appending, writing extended attributes or attributes, deleting, deleting a child
 read-only attribute of a directory does not stop new names. A release is removed by moving it into
 `trash\` and deleting the tree there.
 
-What the removal holds. `trash\` is opened once, without following a link, and is refused unless it
-is a plain directory; the release is moved into it, and everything in it is listed and removed,
-through that open handle, so a link in the place of `trash\` is refused and what it names is never
-listed. Each directory of a release is held open with a share mode that lets nobody rename or delete
-it, its names are read through that handle, and each is opened as a name inside the handle with
-reparse points not followed. A link found inside a release, a junction above all, is opened as
-itself and deleted as a name: what it names is not followed. So is a name that another process of
-the account swaps for a link after it was listed, and an empty directory that it turns into a
-junction after it was checked, which has a listing of its own, empty. The share mode does not stop
-that change of an empty directory, and the removal does not need it stopped. A name is deleted
-through a handle that lets nobody rename or delete the name while it is open, and a file whose
-access list is reset is reset through such a handle, so neither can be moved out of the release
-between the open and the act.
+What the removal holds. Each time a release is moved into `trash\` and each time the trash is swept,
+`trash\` is opened, without following a link, and is refused unless it is a plain directory; the
+release is moved into it, and what is removed from it (that release, or everything the sweep lists)
+is listed and removed through that open handle, so a link in the place of `trash\` is refused and
+what it names is never listed. Each directory of a release is held open with a share mode that lets
+nobody rename or delete it, its names are read through that handle, and each is opened as a name
+inside the handle with reparse points not followed. A link found inside a release, a junction above
+all, is opened as itself and deleted as a name: what it names is not followed. So is a name that
+another process of the account swaps for a link after it was listed, and an empty directory that it
+turns into a junction after it was checked, which has a listing of its own, empty. The share mode
+does not stop that change of an empty directory, and the removal does not need it stopped. A name is
+deleted through a handle that lets nobody rename or delete the name while it is open, and a file
+whose access list is reset is reset through such a handle, so neither can be moved out of the
+release between the open and the act.
 
 What it does not hold. The store does not defend a removal against the account's own programs: no
 account boundary lies between them and the store, and a program of the account can change or delete
 what the store keeps without racing anything. The removal is closed against a link it meets where it
-works, not against an account that rewrites its own store. In particular it reaches `trash\` and
-the release's place in `versions\` by their paths, as the system follows paths, so a program of the
-account that replaces a directory above them leads the removal where it likes.
+works, not against an account that rewrites its own store. In particular it reaches `trash\` (to
+open it), the release's place in `versions\` and the directory an update unpacked the archive into,
+in `staging\`, by their paths, as the system follows paths, so a program of the account that
+replaces a directory above any of them leads the removal where it likes.
 
 A file is deleted as a name, through a handle, and nothing else about it changes: a file of the
 release that is a second name for a file outside it goes as a name, and the file outside keeps its
