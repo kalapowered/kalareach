@@ -639,3 +639,37 @@ async fn the_clipboard_writes_of_one_read_a_terminal_declines_are_all_recorded_i
     );
     assert_eq!(clipboard_writes(&mut stream), 0);
 }
+
+/// KR-REQ-18.01 and KR-REQ-14.35: an agent turn that ended is in the session's journal by the time
+/// the closure is, so a reader that finds the closure finds the turn. The queue holds it until the
+/// journal has taken it, and the closing session writes what the queue holds before it commits the
+/// closure, whatever the task that writes the queue has got to.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_turn_that_ended_is_in_the_journal_when_the_closure_is() {
+    let mut fixture = Fixture::new();
+    fixture
+        .session
+        .notices()
+        .push(kr_protocol::attention::SessionEventNotice::TurnCompleted {
+            turn_id: kr_protocol::ids::AgentTurnId::new("turn-1").expect("an identifier"),
+        });
+    assert_eq!(fixture.host_events(), vec![], "queued, and not written yet");
+
+    fixture
+        .session
+        .begin_close(kr_protocol::session::ClosureReason::CloseRequested);
+    let _ = fixture.session.finish_close();
+    let recorded = fixture.host_events();
+    assert_eq!(
+        recorded
+            .iter()
+            .map(|(kind, _)| kind.as_str())
+            .collect::<Vec<_>>(),
+        ["turn.completed"],
+        "the closure follows the turn: {recorded:?}"
+    );
+    assert!(
+        fixture.session.notices().is_empty(),
+        "and the queue holds nothing the journal took"
+    );
+}

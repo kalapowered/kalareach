@@ -593,6 +593,9 @@ impl WorkerService {
         // description facts as well.
         let description_facts = runtime.session().description_facts();
         broker.set_description_facts(description_facts.clone());
+        // An agent turn that ends is queued for the session's journal beside the commands that
+        // fail, which the session itself queues.
+        broker.set_session_notices(runtime.session().notices());
         // The session's terminal output is offered to the components that observe it through the
         // broker's lane, which costs the session one load per span while none does.
         runtime.session().observe_with(broker.observation());
@@ -807,16 +810,18 @@ impl WorkerService {
         self
     }
 
-    /// Writes each adapter notice the broker queues to the session's journal, in the order it was
-    /// queued, for as long as this service lives.
+    /// Writes each adapter notice the broker queues and each agent turn that ended or command that
+    /// failed to the session's journal, in the order it was queued, for as long as this service
+    /// lives.
     ///
     /// Nothing queues a transition twice, so a notice the journal refuses is kept, with every
     /// notice queued after it, and written once the journal's own recovery has made it healthy
     /// again: a lost one would leave the attention item it raises, or the one it resolves, as it
     /// was. A session with no journal has nowhere to write them, and keeps none.
-    async fn record_adapter_notices(
+    async fn record_notices(
         service: std::sync::Weak<Self>,
         broker: Arc<crate::broker::Broker>,
+        session_notices: Arc<crate::notices::SessionNotices>,
     ) {
         let mut unwritten = std::collections::VecDeque::new();
         let mut condition: Option<
@@ -825,7 +830,7 @@ impl WorkerService {
         loop {
             match condition.as_mut() {
                 // What the journal refused waits for its recovery, not for another notice.
-                Some(condition) if !unwritten.is_empty() => {
+                Some(condition) if !unwritten.is_empty() || !session_notices.is_empty() => {
                     if condition
                         .wait_for(crate::persistence::fault::JournalCondition::is_healthy)
                         .await
@@ -834,13 +839,18 @@ impl WorkerService {
                         return;
                     }
                 }
-                _ => broker.notices_waiting().await,
+                _ => {
+                    tokio::select! {
+                        () = broker.notices_waiting() => {}
+                        () = session_notices.queued() => {}
+                    }
+                }
             }
             let Some(service) = service.upgrade() else {
                 return;
             };
             unwritten.extend(broker.take_notices());
-            if unwritten.is_empty() {
+            if unwritten.is_empty() && session_notices.is_empty() {
                 continue;
             }
             let mut session = service.runtime.session();
@@ -848,6 +858,7 @@ impl WorkerService {
             let now = kr_ipc::now_ms();
             let Some(journal) = session.journal_mut() else {
                 unwritten.clear();
+                session_notices.clear();
                 continue;
             };
             if condition.is_none() {
@@ -868,6 +879,9 @@ impl WorkerService {
                     break;
                 }
                 unwritten.pop_front();
+            }
+            if unwritten.is_empty() {
+                session.write_session_notices();
             }
         }
     }
@@ -1589,11 +1603,14 @@ impl WorkerService {
         // ends and not at some later pass.
         let reclaiming = Arc::clone(&self);
         tokio::spawn(async move { reclaiming.reclaim_recoveries().await });
-        // The transitions of a package's revocation state go to the session's journal, which is
-        // where the attention source reads them from.
-        tokio::spawn(Self::record_adapter_notices(
+        // The transitions of a package's revocation state, the agent turns that ended and the
+        // commands that failed go to the session's journal, which is where the attention source
+        // reads them from.
+        let session_notices = self.runtime.session().notices();
+        tokio::spawn(Self::record_notices(
             Arc::downgrade(&self),
             Arc::clone(&self.broker),
+            session_notices,
         ));
         // The leases of callers whose authority ran out while they typed are released from here,
         // under the dispatch barrier, and not by the keystroke that found the authority gone.

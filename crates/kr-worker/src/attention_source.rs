@@ -69,6 +69,40 @@ fn adapter_event(
     Some((transition, plugin_id, text))
 }
 
+/// Reads a host event of a session-event kind: the work it records and its words.
+///
+/// The detail's first line is the turn, or the status the command exited with, and the rest is the
+/// words. A row whose first line is not what its kind says is an ordinary record.
+fn session_event(event: &HostEvent) -> Option<(kr_protocol::attention::SessionEventNotice, &str)> {
+    let (first, words) = event.detail.split_once('\n')?;
+    let notice = match event.kind.as_str() {
+        crate::journal::TURN_COMPLETED => {
+            kr_protocol::attention::SessionEventNotice::TurnCompleted {
+                turn_id: kr_protocol::ids::AgentTurnId::new(first).ok()?,
+            }
+        }
+        crate::journal::COMMAND_COMPLETED => {
+            kr_protocol::attention::SessionEventNotice::CommandCompleted {
+                exit_status: U64::new(first.parse().ok()?),
+            }
+        }
+        _ => return None,
+    };
+    Some((notice, words))
+}
+
+/// What a host event says to a person: the words after the line of identifiers for the kinds that
+/// carry one, and the whole detail for any other.
+fn words(event: &HostEvent) -> &str {
+    if let Some((_, _, words)) = adapter_event(event) {
+        words
+    } else if let Some((_, words)) = session_event(event) {
+        words
+    } else {
+        &event.detail
+    }
+}
+
 /// Whether a record's text is served now, under the privacy record read after it.
 ///
 /// Only while privacy mode is off, and only for a record that came after its source's head at the
@@ -229,7 +263,9 @@ pub fn texts(journal: &Journal, request: &AttentionTextRequest) -> Result<Attent
                 .question_event(sequence)?
                 .filter(|event| event.kind == QuestionEventKind::Created)
                 .map(|event| event.question.question),
-            AttentionSource::HostEvents => journal.host_event(sequence)?.map(|event| event.detail),
+            AttentionSource::HostEvents => journal
+                .host_event(sequence)?
+                .map(|event| words(&event).to_owned()),
             _ => None,
         };
         read.push((record.source, sequence, text));
@@ -289,8 +325,9 @@ pub fn fingerprint(key: &[u8; 32], said: &str) -> Digest256 {
 }
 
 /// One host event as the page carries it. `served` is whether its words are served now; an
-/// adapter transition travels with its package whether or not they are, so a session whose words
-/// are withheld still raises and resolves what the transition is about.
+/// adapter transition travels with its package, and a turn or a command with its identity,
+/// whether or not they are, so a session whose words are withheld still raises and resolves what
+/// the transition is about.
 fn host_record(
     sequence: u64,
     event: &HostEvent,
@@ -309,6 +346,17 @@ fn host_record(
                 transition,
             }),
             session_event: None,
+        };
+    }
+    if let Some((notice, text)) = session_event(event) {
+        return AttentionHostRecord {
+            sequence: U64::new(sequence),
+            notification: false,
+            recorded_at_ms: event.recorded_at_ms,
+            text: Nullable(served.then(|| clip(text))),
+            fingerprint: Nullable::null(),
+            adapter: Nullable::null(),
+            session_event: Some(notice),
         };
     }
     let notification = event.kind == NOTIFICATION;

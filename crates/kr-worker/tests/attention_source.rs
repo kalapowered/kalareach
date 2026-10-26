@@ -1522,6 +1522,171 @@ async fn an_adapter_transition_travels_with_its_package_whether_or_not_its_words
     assert_eq!(cleared.host_events.records[2].text.0, None);
 }
 
+// ---------------------------------------------------------------------------------------------
+// A session's own work: turns that ended and commands that failed
+// ---------------------------------------------------------------------------------------------
+
+/// Reports a command block to the session as the shell integration's hook does, for the line
+/// accepted at prompt generation `generation`.
+fn report(host: &Host, generation: u64, command: &str, status: Option<u64>) {
+    use kr_protocol::root::{CwdRevision, PromptGeneration, RootCommandBlockParams};
+    use kr_worker::fence::{CommandHook, Effects, Step};
+
+    let block = RootCommandBlockParams {
+        session_id: host.session_id,
+        prompt_generation: PromptGeneration::new(generation),
+        command: command.to_owned(),
+        started_at_ms: kr_protocol::scalars::TimestampMs::new(1),
+        duration_ms: Nullable(status.map(|_| kr_protocol::scalars::DurationMs::new(1))),
+        exit_status: Nullable(status.map(U64::new)),
+        cwd: "/tmp".to_owned(),
+        cwd_revision: CwdRevision::new(0),
+    };
+    let _ = host
+        .service
+        .runtime()
+        .session()
+        .apply_fence_effects(Effects {
+            steps: vec![Step::CommandHook(
+                RequestId::new(1),
+                Box::new(CommandHook::Block(Box::new(block))),
+            )],
+            ..Effects::default()
+        });
+}
+
+/// What the session's journal holds as host events, as (kind, detail).
+fn journalled(host: &Host) -> Vec<(String, String)> {
+    host.service
+        .runtime()
+        .session()
+        .journal()
+        .expect("the harness journals its session")
+        .host_events()
+        .expect("the host events read")
+        .into_iter()
+        .map(|event| (event.kind, event.detail))
+        .collect()
+}
+
+/// KR-REQ-18.01 and KR-REQ-14.35: a command that finishes with a status other than nought is one
+/// host event, however often the hook says so, and a page carries it with its status whether or
+/// not its words are served. The command line is not kept anywhere in the journal, and the words
+/// that are served name no identifier.
+#[tokio::test]
+async fn a_failed_command_is_one_record_with_its_status_and_never_its_line() {
+    let host = host().await;
+    let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
+    let line = "make deploy-the-secret-thing";
+
+    // It starts, and nothing is recorded; it ends with a status and is recorded once.
+    report(&host, 1, line, None);
+    assert_eq!(journalled(&host), []);
+    report(&host, 1, line, Some(3));
+    report(&host, 1, line, Some(3));
+    // Two that end well record nothing, and a line that is reported only as ended is recorded.
+    report(&host, 2, "true", None);
+    report(&host, 2, "true", Some(0));
+    report(&host, 3, line, Some(1));
+    let kept = journalled(&host);
+    assert_eq!(
+        kept.iter()
+            .map(|(kind, _)| kind.as_str())
+            .collect::<Vec<_>>(),
+        ["command.completed", "command.completed"],
+        "a repeat of an ending is one record, a success is none"
+    );
+    assert!(
+        kept.iter().all(|(_, detail)| !detail.contains("secret")),
+        "the journal holds no command line: {kept:?}"
+    );
+
+    let served = page_of(&mut link, 2).await;
+    let statuses: Vec<_> = served
+        .host_events
+        .records
+        .iter()
+        .map(|record| record.session_event.clone())
+        .collect();
+    assert_eq!(
+        statuses,
+        [
+            Some(
+                kr_protocol::attention::SessionEventNotice::CommandCompleted {
+                    exit_status: U64::new(3)
+                }
+            ),
+            Some(
+                kr_protocol::attention::SessionEventNotice::CommandCompleted {
+                    exit_status: U64::new(1)
+                }
+            ),
+        ]
+    );
+    assert!(
+        served
+            .host_events
+            .records
+            .iter()
+            .all(|record| !record.notification)
+    );
+    let words = host_texts(&served);
+    assert!(
+        words.iter().all(Option::is_some),
+        "the words are served: {words:?}"
+    );
+    assert!(
+        words.iter().flatten().all(|words| !words.contains('\n')),
+        "the words hold no line of identifiers: {words:?}"
+    );
+
+    enable_privacy(&host);
+    let withheld = page_of(&mut link, 2).await;
+    assert_eq!(
+        host_texts(&withheld),
+        [None, None],
+        "the words are withheld"
+    );
+    assert!(
+        withheld
+            .host_events
+            .records
+            .iter()
+            .all(|record| record.session_event.is_some()),
+        "and the work still travels"
+    );
+}
+
+/// KR-REQ-18.01: the words of a host event that carries a line of identifiers are what a text
+/// request answers, and not the line: an adapter's warning and a command's ending read as words.
+#[tokio::test]
+async fn a_text_request_answers_the_words_of_a_record_and_not_its_line_of_identifiers() {
+    let host = host().await;
+    let bound = bound(&host);
+    let warning = revoke(&host, &bound);
+    let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
+    // The warning is written by the task that records the broker's notices, so it is read before
+    // the command is reported: the command's record then comes second.
+    let adapter = page_of(&mut link, 1).await.host_events.records[0]
+        .sequence
+        .get();
+    let answered = text(&mut link, texts(&[(AttentionSource::HostEvents, adapter)])).await;
+    assert_eq!(
+        answered.texts[0].text.0.as_deref(),
+        Some(warning.as_str()),
+        "the adapter's warning, and not the package's line before it"
+    );
+
+    report(&host, 1, "false", Some(2));
+    let served = page_of(&mut link, 2).await;
+    let command = served.host_events.records[1].sequence.get();
+    let answered = text(&mut link, texts(&[(AttentionSource::HostEvents, command)])).await;
+    assert_eq!(
+        answered.texts[0].text.0, served.host_events.records[1].text.0,
+        "the command's words are the ones the page carried"
+    );
+}
+
 /// The journal's write lock, held by a connection of the test's own as another writer holds it,
 /// until this is dropped, which rolls its transaction back. A write the session makes meanwhile
 /// waits out the store's busy timeout and is refused.

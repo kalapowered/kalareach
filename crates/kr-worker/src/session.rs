@@ -421,6 +421,9 @@ pub struct Session {
     /// ran in memory. What a reader of this needs is what happened recently, and the durable
     /// record of a command is its own.
     command_blocks: std::collections::VecDeque<kr_protocol::root::RootCommandBlockParams>,
+    /// The agent turns that ended and the commands that failed, waiting for the journal to take
+    /// them.
+    notices: Arc<crate::notices::SessionNotices>,
     /// The bypass each executable was answered with in the latest prompt generation that asked.
     ///
     /// A program the integrated route did not launch is adopted with the reason the shell ran it
@@ -737,6 +740,7 @@ impl Session {
             command_backends: None,
             root_integration: None,
             command_blocks: std::collections::VecDeque::new(),
+            notices: Arc::new(crate::notices::SessionNotices::default()),
             answered: Answered::default(),
             activity: crate::lifecycle::Activity::new(),
             idle_sweep: crate::lifecycle::IDLE_SWEEP_INTERVAL,
@@ -1173,23 +1177,68 @@ impl Session {
     /// A block arrives twice for one command: once when it starts, with no status, and once when
     /// it ends. The second replaces the first rather than joining it, so a reader sees one entry
     /// per command.
+    ///
+    /// A command that ends with a status other than nought is the attention store's to read, once:
+    /// it is queued and written to the journal as the block that ends it replaces the block that
+    /// started it, and a block that ends a command already held as ended is a repeat.
     fn record_command_block(&mut self, block: kr_protocol::root::RootCommandBlockParams) {
         // The place a command's directory and ending are decided, and the first thing done with
         // it: the description facts take the directory and the ending and never the command line.
         let shell = self.root_identity().map(|identity| identity.pid.get());
         self.description_facts.note_command(&block, shell);
-        if let Some(existing) = self
+        let failed = block.exit_status.0.filter(|status| status.get() != 0);
+        let held = self
             .command_blocks
-            .iter_mut()
-            .find(|held| held.prompt_generation == block.prompt_generation)
-        {
-            *existing = block;
+            .iter()
+            .position(|held| held.prompt_generation == block.prompt_generation);
+        if let Some(index) = held {
+            let repeated = self.command_blocks[index].finished();
+            self.command_blocks[index] = block;
+            if let Some(exit_status) = failed.filter(|_| !repeated) {
+                self.command_failed(exit_status);
+            }
             return;
         }
         if self.command_blocks.len() == Self::RETAINED_COMMAND_BLOCKS {
             self.command_blocks.pop_front();
         }
         self.command_blocks.push_back(block);
+        if let Some(exit_status) = failed {
+            self.command_failed(exit_status);
+        }
+    }
+
+    /// Queues a command that failed and has the journal take what is queued.
+    fn command_failed(&mut self, exit_status: U64) {
+        self.notices
+            .push(kr_protocol::attention::SessionEventNotice::CommandCompleted { exit_status });
+        self.write_session_notices();
+    }
+
+    /// Returns the queue of this session's own work that its journal is to take.
+    #[must_use]
+    pub fn notices(&self) -> Arc<crate::notices::SessionNotices> {
+        Arc::clone(&self.notices)
+    }
+
+    /// Writes the queued agent turns and failed commands to the journal, oldest first, and leaves
+    /// queued the first one the journal refuses and every one after it, which a recovery of the
+    /// journal writes. Returns whether none is left queued. A session with no journal has nowhere
+    /// to write them, and keeps none.
+    pub fn write_session_notices(&mut self) -> bool {
+        let cursor = self.history.next_cursor();
+        let now = kr_ipc::now_ms();
+        let Some(journal) = self.journal.as_mut() else {
+            self.notices.clear();
+            return true;
+        };
+        while let Some(notice) = self.notices.front() {
+            if journal.record_session_event(&notice, cursor, now).is_err() {
+                return false;
+            }
+            self.notices.taken();
+        }
+        true
     }
 
     /// Returns what this session was doing, as the control daemon's descriptions read it.
@@ -5055,6 +5104,11 @@ impl Session {
         // may exit as soon as the closure is delivered. A write that fails leaves the output
         // without times, which a reader is told, and is not a failure of the closure.
         let _ = self.history.flush_times();
+        // What the session's own work queued is written before the closure is, so a reader that
+        // finds the closure finds every agent turn that ended and every command that failed. A
+        // record the journal refuses stays queued and is lost with the worker, which the closure
+        // says by being volatile.
+        let flushed = self.write_session_notices();
         // Only confirmed terminations are listed, and coverage follows the boundary this host
         // actually has rather than the outcome it would prefer. A terminal process group cannot
         // see a descendant that left it, so a host with only that never reports complete.
@@ -5085,6 +5139,9 @@ impl Session {
             closed_at_ms: kr_ipc::now_ms(),
         };
         record.durability = self.commit_closure(&record);
+        if !flushed {
+            record.durability = Durability::Volatile;
+        }
         self.input.lock().set_state(SessionState::Closed);
         self.application_state = None;
         self.application = None;

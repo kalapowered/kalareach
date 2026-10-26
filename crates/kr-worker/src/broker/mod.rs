@@ -1006,6 +1006,9 @@ pub struct Broker {
     /// Where the session's description facts take what this broker decides: the thread an
     /// application selected, the events it reported, and the prompts it admitted.
     description_facts: std::sync::OnceLock<crate::description_facts::DescriptionFacts>,
+    /// Where an agent turn that ended is queued for the session's journal, the attention store's
+    /// record of it.
+    session_notices: std::sync::OnceLock<Arc<crate::notices::SessionNotices>>,
     /// How a component is asked to prepare an action: the plugin runtime's client, once the link
     /// has one, and the bound on how many preparations are under way.
     component_calls: Arc<prepare::ComponentCalls>,
@@ -1165,6 +1168,7 @@ impl Broker {
             notices_ready: tokio::sync::Notify::new(),
             recorder: Mutex::new(recorder),
             description_facts: std::sync::OnceLock::new(),
+            session_notices: std::sync::OnceLock::new(),
             component_calls: Arc::new(prepare::ComponentCalls::new()),
             observation: Arc::new(observation::ObservationLane::new()),
             decoding,
@@ -1200,6 +1204,12 @@ impl Broker {
     /// recorded there as well.
     pub fn set_description_facts(&self, facts: crate::description_facts::DescriptionFacts) {
         let _ = self.description_facts.set(facts);
+    }
+
+    /// Hands the broker the queue of the session's own work that its journal is to take, once: a
+    /// turn that ends is queued there.
+    pub fn set_session_notices(&self, notices: Arc<crate::notices::SessionNotices>) {
+        let _ = self.session_notices.set(notices);
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, BrokerState> {
