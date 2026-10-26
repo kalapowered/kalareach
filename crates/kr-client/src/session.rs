@@ -74,7 +74,8 @@ impl std::fmt::Debug for Answer {
 pub enum LaunchSurfaceRead {
     /// The host served the read.
     Served(ShellLaunchSurfaceResult),
-    /// The host is of a release that does not serve the read.
+    /// The host does not serve the read: it is of a release that does not, or its session's worker
+    /// is.
     NotServed,
 }
 
@@ -650,7 +651,10 @@ impl Session {
     /// signals, is what raises [`Self::denied`]; where it is answered, the first read is asked once
     /// more, in case the host refused it for a reason that has passed, and a second refusal means
     /// the host does not serve the read. The first reads do not signal, since a host too old for
-    /// the method is not one that withdrew the connection. Any other failure is returned as it is.
+    /// the method is not one that withdrew the connection. A host that lists the method and whose
+    /// session's worker is of a release that does not serve it refuses it as an unsupported
+    /// capability, which is the same answer: the read is not served. Any other failure is returned
+    /// as it is.
     ///
     /// # Errors
     ///
@@ -659,11 +663,15 @@ impl Session {
     pub async fn read_launch_surface(&self, session_id: SessionId) -> Result<LaunchSurfaceRead> {
         let params = ShellLaunchSurfaceParams { session_id };
         let refused_as_unlisted = |error: &ClientError| matches!(error, ClientError::Host(refusal) if refusal.code == ErrorCode::PermissionDenied);
+        let refused_as_unsupported = |error: &ClientError| matches!(error, ClientError::Host(refusal) if refusal.code == ErrorCode::UnsupportedCapability);
         match self
             .read_unsignalled(Method::ShellLaunchSurface, &params)
             .await
         {
             Ok(surface) => return Ok(LaunchSurfaceRead::Served(surface)),
+            Err(error) if refused_as_unsupported(&error) => {
+                return Ok(LaunchSurfaceRead::NotServed);
+            }
             Err(error) if refused_as_unlisted(&error) => {}
             Err(error) => return Err(error),
         }
@@ -675,7 +683,9 @@ impl Session {
             .await
         {
             Ok(surface) => Ok(LaunchSurfaceRead::Served(surface)),
-            Err(error) if refused_as_unlisted(&error) => Ok(LaunchSurfaceRead::NotServed),
+            Err(error) if refused_as_unlisted(&error) || refused_as_unsupported(&error) => {
+                Ok(LaunchSurfaceRead::NotServed)
+            }
             Err(error) => Err(error),
         }
     }
