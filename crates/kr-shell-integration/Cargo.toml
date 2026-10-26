@@ -28,7 +28,7 @@ thiserror.workspace = true
 # A startup file is rewritten under a lock the kernel holds, so a `kr` process that dies releases
 # it rather than leaving a file every later write would wait on.
 [target.'cfg(unix)'.dependencies]
-rustix = { workspace = true, features = ["fs"] }
+rustix = { workspace = true, features = ["fs", "process"] }
 
 [dev-dependencies]
 # The tests act exactly when a held rename was refused, through the retry's own seam.

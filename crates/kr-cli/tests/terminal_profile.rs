@@ -306,12 +306,17 @@ fn an_install_adds_one_file_and_a_removal_puts_the_home_back() {
         let mut expected = before.clone();
         let file = (application.profile)(&person);
         let text = std::fs::read(&file).expect("the profile is written");
-        expected.insert(
-            file.strip_prefix(&person.home)
-                .expect("in the home")
-                .to_path_buf(),
-            Some(text),
-        );
+        let relative = file
+            .strip_prefix(&person.home)
+            .expect("in the home")
+            .to_path_buf();
+        // The directories the install made on the way to the file are new too.
+        for directory in relative.ancestors().skip(1) {
+            if !directory.as_os_str().is_empty() && !before.contains_key(directory) {
+                expected.insert(directory.to_path_buf(), None);
+            }
+        }
+        expected.insert(relative, Some(text));
         assert_eq!(
             person.home_only(),
             expected,
@@ -839,5 +844,253 @@ mod command {
         assert!(output.status.success(), "{said}");
         assert!(said.contains("no longer kr's to remove"), "{said}");
         assert!(file.is_file(), "the edited file is left");
+    }
+}
+
+/// Terminal.app, whose profile is an entry of its preferences' dictionary of profiles. These run
+/// on macOS, where `defaults` and `plutil` are, and only ever against a preferences file of the
+/// test's own, named by its path: the person's own preferences are not reachable from them.
+#[cfg(target_os = "macos")]
+mod terminal_app {
+    use super::*;
+
+    /// The preferences of a person who has Terminal's two usual profiles and chose `Pro`.
+    const PREFERENCES: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Default Window Settings</key><string>Pro</string>
+  <key>Startup Window Settings</key><string>Pro</string>
+  <key>Window Settings</key>
+  <dict>
+    <key>Basic</key><dict><key>name</key><string>Basic</string><key>type</key><string>Window Settings</string><key>ProfileCurrentVersion</key><real>2.07</real></dict>
+    <key>Pro</key><dict><key>name</key><string>Pro</string><key>type</key><string>Window Settings</string><key>ProfileCurrentVersion</key><real>2.07</real><key>BackgroundBlur</key><real>0.5</real></dict>
+  </dict>
+</dict>
+</plist>
+"#;
+
+    /// A person who has Terminal and preferences of their own.
+    fn person() -> (Person, PathBuf) {
+        let person = Person::new();
+        std::fs::create_dir_all(person.home.join("Applications/Terminal.app"))
+            .expect("the application");
+        let domain = person.home.join("Library/Preferences/com.apple.Terminal");
+        std::fs::create_dir_all(domain.parent().expect("a directory")).expect("a directory");
+        std::fs::write(domain.with_extension("plist"), PREFERENCES).expect("preferences");
+        (person, domain)
+    }
+
+    /// The preferences as JSON, as `plutil` reads the file.
+    fn preferences(domain: &Path) -> serde_json::Value {
+        let output = std::process::Command::new("/usr/bin/plutil")
+            .args(["-convert", "json", "-o", "-"])
+            .arg(domain.with_extension("plist"))
+            .output()
+            .expect("plutil runs");
+        assert!(output.status.success());
+        serde_json::from_slice(&output.stdout).expect("JSON")
+    }
+
+    /// Edits the preferences file as the person would, with `plutil`.
+    fn edit(domain: &Path, arguments: &[&str]) {
+        let status = std::process::Command::new("/usr/bin/plutil")
+            .args(arguments)
+            .arg(domain.with_extension("plist"))
+            .status()
+            .expect("plutil runs");
+        assert!(status.success(), "{arguments:?}");
+    }
+
+    /// KR-REQ-01.21: an install adds one entry to the dictionary of profiles, a copy of the profile
+    /// the person opens windows with and with a command of its own; nothing else in the preferences
+    /// moves; a removal puts the preferences back as they were.
+    #[test]
+    fn an_install_adds_one_entry_copied_from_the_default_profile_and_a_removal_takes_it_out() {
+        let (person, domain) = person();
+        let before = preferences(&domain);
+        let command = command_in(person.tree.root());
+        person
+            .install(ProfileTerminal::AppleTerminal, &command)
+            .expect("installs");
+
+        let after = preferences(&domain);
+        let entry = &after["Window Settings"]["KalaReach"];
+        assert_eq!(entry["name"], "KalaReach");
+        assert_eq!(entry["RunCommandAsShell"], true);
+        assert_eq!(
+            entry["BackgroundBlur"], 0.5,
+            "a copy of the person's default profile"
+        );
+        let command_string = entry["CommandString"].as_str().expect("a command");
+        assert!(
+            command_string.ends_with("kr dir/kr' new --attach --hold-on-failure"),
+            "the command is quoted for the shell that runs it: {command_string}"
+        );
+        let mut without = after.clone();
+        without["Window Settings"]
+            .as_object_mut()
+            .expect("an object")
+            .remove("KalaReach");
+        assert_eq!(without, before, "nothing else in the preferences moved");
+
+        assert_eq!(
+            person
+                .remove(ProfileTerminal::AppleTerminal)
+                .expect("removes"),
+            Removed::Removed
+        );
+        assert_eq!(preferences(&domain), before);
+        assert!(person.record().profiles().expect("reads").is_empty());
+    }
+
+    /// An entry of the profiles' name that kr did not write is refused and left; one the person
+    /// changed is left and forgotten; one that is gone is forgotten; the default is left.
+    #[test]
+    fn a_foreign_entry_is_refused_and_a_changed_one_is_left_and_a_default_one_is_kept() {
+        let (person, domain) = person();
+        let command = command_in(person.tree.root());
+
+        edit(
+            &domain,
+            &[
+                "-insert",
+                "Window Settings.KalaReach",
+                "-dictionary",
+                "-o",
+                &domain.with_extension("plist").display().to_string(),
+            ],
+        );
+        let refused = person.install(ProfileTerminal::AppleTerminal, &command);
+        assert!(
+            matches!(refused, Err(ProfileError::ForeignProfile(_))),
+            "{refused:?}"
+        );
+        assert!(person.record().profiles().expect("reads").is_empty());
+        edit(&domain, &["-remove", "Window Settings.KalaReach"]);
+
+        person
+            .install(ProfileTerminal::AppleTerminal, &command)
+            .expect("installs");
+        // The default: the person chooses it.
+        edit(
+            &domain,
+            &[
+                "-replace",
+                "Default Window Settings",
+                "-string",
+                "KalaReach",
+            ],
+        );
+        assert_eq!(
+            person
+                .remove(ProfileTerminal::AppleTerminal)
+                .expect("removes"),
+            Removed::Default
+        );
+        assert!(preferences(&domain)["Window Settings"]["KalaReach"].is_object());
+        assert_eq!(
+            person.record().profiles().expect("reads").len(),
+            1,
+            "the entry stays"
+        );
+        edit(
+            &domain,
+            &["-replace", "Default Window Settings", "-string", "Pro"],
+        );
+
+        // A change.
+        edit(
+            &domain,
+            &[
+                "-replace",
+                "Window Settings.KalaReach.name",
+                "-string",
+                "Mine now",
+            ],
+        );
+        let removed = person
+            .remove(ProfileTerminal::AppleTerminal)
+            .expect("removes");
+        assert!(matches!(removed, Removed::Changed { .. }), "{removed:?}");
+        assert!(preferences(&domain)["Window Settings"]["KalaReach"].is_object());
+        assert!(person.record().profiles().expect("reads").is_empty());
+        edit(&domain, &["-remove", "Window Settings.KalaReach"]);
+
+        // Gone.
+        person
+            .install(ProfileTerminal::AppleTerminal, &command)
+            .expect("installs");
+        edit(&domain, &["-remove", "Window Settings.KalaReach"]);
+        assert_eq!(
+            person
+                .remove(ProfileTerminal::AppleTerminal)
+                .expect("removes"),
+            Removed::AlreadyGone
+        );
+    }
+
+    /// Preferences with no dictionary of profiles are refused and left, so that the one entry kr
+    /// writes is not the only profile Terminal has.
+    #[test]
+    fn preferences_with_no_profiles_are_refused_with_nothing_written() {
+        let (person, domain) = person();
+        edit(&domain, &["-remove", "Window Settings"]);
+        let before = preferences(&domain);
+        let refused = person.install(
+            ProfileTerminal::AppleTerminal,
+            &command_in(person.tree.root()),
+        );
+        assert!(
+            matches!(refused, Err(ProfileError::NoProfiles(_))),
+            "{refused:?}"
+        );
+        assert_eq!(preferences(&domain), before);
+    }
+
+    /// A process called `Terminal` is the person's own Terminal running, and the command refuses a
+    /// removal while it is, keeping the record's entry; it removes once it is not.
+    #[test]
+    fn the_command_refuses_while_terminal_is_running() {
+        let (person, domain) = person();
+        person
+            .install(
+                ProfileTerminal::AppleTerminal,
+                &command_in(person.tree.root()),
+            )
+            .expect("installs");
+        // A copy of `sleep` called Terminal stands in for the application.
+        let stand_in = person.tree.root().join("running").join("Terminal");
+        std::fs::create_dir_all(stand_in.parent().expect("a directory")).expect("a directory");
+        std::fs::copy("/bin/sleep", &stand_in).expect("a program");
+        let mut running = std::process::Command::new(&stand_in)
+            .arg("600")
+            .spawn()
+            .expect("starts");
+        let ready = profile::is_running(ProfileTerminal::AppleTerminal);
+        let output = std::process::Command::new(support::kr())
+            .args(["host", "terminal-profile", "remove", "apple-terminal"])
+            .env_clear()
+            .env("HOME", &person.home)
+            .env("PATH", &person.programs)
+            .env("KR_RUNTIME_DIR", person.tree.paths().runtime_root())
+            .env("KR_STATE_DIR", person.tree.paths().state_root())
+            .output()
+            .expect("kr runs");
+        running.kill().expect("ends the stand-in by its own handle");
+        running.wait().expect("collects it");
+        assert!(ready, "a process called Terminal is a running Terminal");
+        assert!(
+            !output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("is running"));
+        assert!(preferences(&domain)["Window Settings"]["KalaReach"].is_object());
+        assert_eq!(
+            person.record().profiles().expect("reads").len(),
+            1,
+            "the entry stays"
+        );
     }
 }

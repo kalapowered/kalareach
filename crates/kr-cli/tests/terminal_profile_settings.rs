@@ -689,7 +689,7 @@ fn the_plan_names_the_settings_it_writes() {
                 assert_eq!(schema, person.application.profile_schema);
                 assert!(path.starts_with("/org/gnome/"), "{path}");
             }
-            Place::File(_) => panic!("settings, not a file"),
+            Place::File(_) | Place::Preferences { .. } => panic!("settings, not a file"),
         }
     });
 }
