@@ -451,6 +451,36 @@ document, or rolling back to a release that reads level 3, leaves the leases the
 out within fifteen minutes, and the host sends no ending. The `relay-leases` check in `kr doctor`
 indicates how many paired devices have leases, and when the next refill is due.
 
+### The release matrix
+
+A host whose `relay.origin` is the managed service reads the signed release matrix that service
+publishes: when the daemon starts, every six hours after that with up to a tenth more, after a
+failed read at fifteen minutes and then an hour, and when `kr doctor` runs and the copy it holds is
+older than fifteen minutes or there is none (that read gives up after five seconds). A host whose
+`relay.origin` is another service, or that selects none, reads no matrix and says so. The daemon
+keeps the newest accepted copy in `release-matrix.json` in its state directory, checks it against
+the build's pinned key every time it loads it, and reads a file it cannot read or verify as no copy.
+The file has no version, so a damaged one never refuses an update or a rollback, and a rollback to a
+release that does not know it leaves it alone.
+
+If the verified matrix lists no tier for the build this daemon is, the host asks the lease service
+for no new lease and no pairing admission, and the owner is told: the `release-matrix` check warns
+and names the paths that still work, and the `relay-leases` check warns that new leases are
+refused. A lease the host holds is still refilled, so a route that works stays up until its lease
+ends. Sessions, workers, grants, direct connections and the `kr host update` command are not
+touched. A copy another package version read is not acted on as a skew: after an update the held
+copy usually predates the build, and until a read for the new build succeeds the check says it has
+not been read for this build.
+
+What the host does not do is stop on a matrix it cannot trust. A reply that does not verify, one
+older than the copy held, one with the held revision and other content, and a service that does not
+answer leave the held copy deciding, or, with none held, leave the host asking nothing of the matrix.
+The check says which of these happened and that the host asks again by itself.
+
+To clear a copy that still shows a skew after the service corrected its matrix, stop the daemon,
+delete `release-matrix.json` from the state directory, and start it again. Updating the host to a
+release with another package version also clears it.
+
 ### The host's own mailbox
 
 A host whose configuration document names an authority feed (`authority.origin`) also reads its own

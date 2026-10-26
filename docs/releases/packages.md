@@ -119,6 +119,26 @@ before publishing is the other case: it leaves a draft, and once that draft is d
 can be released again by re-running the run that failed, because pushing a tag that is already on
 the remote produces no event at all.
 
+### The release matrix
+
+Every job that publishes a release first asks whether the signed release matrix the managed service
+publishes lists a tier for the package version the release carries. The package release, the Windows
+host release and the signed host trees each run `kr-release-matrix-check --origin
+https://reach.kala.to` after they build it and before they publish or sign anything. The program
+verifies the matrix under the key the commit pins, as a host's daemon does, and exits 0 when a tier
+serves the release, 1 when it is refused (in no tier, a reply that does not verify, or a service
+that publishes no matrix), and 2 when the service did not answer; the job asks again twice, a minute
+apart, only after a 2. A release served only by a later tier passes with a warning, because the
+network half of that rollout is the operator's to have deployed first.
+
+A revision covering each new level is live before any release of it. The package version moves at
+a cut, and a host built at a version no tier lists is refused new leases on the managed relay
+service, so the matrix revision that lists the next level is published, with a client range that
+reaches past it, before the release or the build that carries it. A revision number that was
+published too high cannot be lowered: the next revision has to exceed it, within 18 digits. A
+Worker rollback is not a way to correct a matrix, because hosts keep the newer revision and ignore
+the older.
+
 ## A level is one surface
 
 A compatibility level is `0.<minor>` below `1.0.0` and the major number from it, and every build at
