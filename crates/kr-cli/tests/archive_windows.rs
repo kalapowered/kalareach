@@ -352,10 +352,6 @@ fn an_archive_beyond_the_bounds_of_a_release_is_refused_before_anything_is_writt
 fn an_entry_that_is_a_link_a_duplicate_or_unreadable_is_refused_before_anything_is_written() {
     let mut encrypted = Member::stored(format!("{TOP}/bin/kr.exe"), b"x");
     encrypted.flags = 1;
-    let mut bzip = Member::stored(format!("{TOP}/bin/kr.exe"), b"x");
-    bzip.method = 12;
-    let mut unknown = Member::stored(format!("{TOP}/bin/kr.exe"), b"x");
-    unknown.method = 99;
     for (name, members) in [
         (
             "a link",
@@ -372,13 +368,26 @@ fn an_entry_that_is_a_link_a_duplicate_or_unreadable_is_refused_before_anything_
             ],
         ),
         ("an encrypted entry", vec![encrypted]),
-        ("bzip2", vec![bzip]),
-        ("an unknown method", vec![unknown]),
     ] {
         let case = Case::new();
         assert!(
             case.read(&archive_of(&members), &Limits::DEFAULT).is_err(),
             "{name} is refused"
+        );
+        assert!(case.staged().is_empty(), "{name}: nothing was written");
+    }
+    // One method that the parser reads an entry of and one that it gives up on (the method of an
+    // encrypted entry, which has no field to say how), refused for the same reason by the reader.
+    for (name, method) in [("bzip2", 12), ("an unknown method", 99)] {
+        let mut member = Member::stored(format!("{TOP}/bin/kr.exe"), b"x");
+        member.method = method;
+        let case = Case::new();
+        let error = case
+            .read(&archive_of(&[member]), &Limits::DEFAULT)
+            .expect_err("the archive is refused");
+        assert!(
+            error.contains("compressed in a way a release is not"),
+            "{name} is refused for its method: {error}"
         );
         assert!(case.staged().is_empty(), "{name}: nothing was written");
     }
@@ -630,91 +639,211 @@ fn a_release_whose_directory_spells_an_end_record_is_read() {
     assert_eq!(written.len(), 4);
 }
 
-/// How many entries the end record inside the extra data below counts: far more than the archive
-/// holds, and what the parser would size its list for before anything checked it.
-const FALLBACK_ENTRIES: u16 = 65_000;
+/// The largest single allocation a thread asks for while it is being measured.
+mod measured {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
 
-/// The extra data of an entry that makes the parser give up on the directory it is in, followed by
-/// an end record of its own: a Unicode path field too short to hold what it must, which no reader
-/// takes, and then an end record that counts [`FALLBACK_ENTRIES`] entries and names `directory_at`
-/// as where they begin, which is where the real directory does. `padding` is how many bytes of
-/// extra data there are besides.
-fn extra_data_with_a_fallback(directory_at: u32) -> Vec<u8> {
-    let mut extra = 0x7075_u16.to_le_bytes().to_vec();
-    extra.extend_from_slice(&2_u16.to_le_bytes());
-    // What the field's reader takes for its version and checksum before it finds the field too short.
-    extra.extend_from_slice(&[0; 5]);
-    extra.extend_from_slice(b"PK\x05\x06");
-    extra.extend_from_slice(&[0; 4]);
-    extra.extend_from_slice(&FALLBACK_ENTRIES.to_le_bytes());
-    extra.extend_from_slice(&FALLBACK_ENTRIES.to_le_bytes());
-    extra.extend_from_slice(&0_u32.to_le_bytes());
-    extra.extend_from_slice(&directory_at.to_le_bytes());
-    extra.extend_from_slice(&0_u16.to_le_bytes());
-    extra
+    thread_local! {
+        static LARGEST: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    fn note(size: usize) {
+        LARGEST.with(|largest| {
+            if let Some(seen) = largest.get() {
+                largest.set(Some(seen.max(size)));
+            }
+        });
+    }
+
+    struct Largest;
+
+    #[expect(
+        unsafe_code,
+        reason = "a global allocator has no safe form; this one notes the size of a request and \
+                  hands it to the system's allocator"
+    )]
+    // SAFETY: each method passes its arguments to the system allocator unchanged, which is a
+    // `GlobalAlloc`, and returns what it returns.
+    unsafe impl GlobalAlloc for Largest {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            note(layout.size());
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            note(layout.size());
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+            note(size);
+            unsafe { System.realloc(pointer, layout, size) }
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(pointer, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: Largest = Largest;
+
+    /// Runs `work` and returns what it returned and the largest single allocation this thread
+    /// asked for meanwhile.
+    pub fn largest_while<T>(work: impl FnOnce() -> T) -> (T, usize) {
+        LARGEST.with(|largest| largest.set(Some(0)));
+        let result = work();
+        let seen = LARGEST.with(|largest| largest.replace(None)).unwrap_or(0);
+        (result, seen)
+    }
 }
 
-/// KR-REQ-26.06: a name or the extra data of an entry that holds the signature of an end record, of
-/// its 64-bit form or of that form's locator is refused before the parser runs. The parser gives up
-/// on a directory whose entry it cannot read and takes an earlier end record, here one the
-/// archive's writer set inside an entry's extra data, and sizes what it keeps for the entries that
-/// record counts before anything checks them. The archive is one that the parser refuses whatever
-/// it does, so a refusal that is the reader's own, which names the signature, shows that the
-/// parser never ran. The control is extra data of the same size without a signature, which is
-/// read; a signature in a checksum is not refused (see the case that reads it).
+/// A Unicode path field (0x7075) that gives `shown` as the name of an entry, with the checksum of
+/// `of`: the parser refuses the field unless `of` is the name the entry carries.
+fn unicode_path_field(of: &[u8], shown: &str) -> Vec<u8> {
+    let mut field = 0x7075_u16.to_le_bytes().to_vec();
+    field.extend_from_slice(&u16::try_from(5 + shown.len()).expect("short").to_le_bytes());
+    field.push(1);
+    field.extend_from_slice(&crc32(of).to_le_bytes());
+    field.extend_from_slice(shown.as_bytes());
+    field
+}
+
+/// KR-REQ-26.06: an entry that carries extra data is refused before the parser reads the archive,
+/// whatever the data holds. The parser gives up on a directory with an entry whose extra data it
+/// cannot take (a Unicode path field whose checksum is not the name's, a field too short for its
+/// kind or one that runs past the data) and then reads the archive by another end record, so what
+/// it can fail on is not left to be told apart: a release carries no extra data, and the packer
+/// writes none. The control is the release without any, which is read.
 #[test]
-fn a_signature_in_a_name_or_in_extra_data_is_refused_before_the_parser_runs() {
-    let big = vec![b'a'; 70_000];
-    let with_extra = |extra: Vec<u8>| {
-        let mut members = vec![
-            Member::stored(format!("{TOP}/share/big"), &big),
-            Member::stored(format!("{TOP}/release.json"), b"{\"signed\":{}}"),
-        ];
-        members[0].extra = extra;
-        archive_of(&members)
-    };
-    let length = extra_data_with_a_fallback(0).len();
-    // Where the directory starts: after the data, which the extra data does not change.
-    let placeholder = with_extra(vec![0; length]);
-    let directory_at = placeholder
-        .windows(4)
-        .position(|window| window == b"PK\x01\x02")
-        .expect("a directory");
-    let crafted = with_extra(extra_data_with_a_fallback(
-        u32::try_from(directory_at).expect("small"),
-    ));
-    let mut harmless = 0xAAAA_u16.to_le_bytes().to_vec();
-    harmless.extend_from_slice(&u16::try_from(length - 4).expect("short").to_le_bytes());
-    harmless.extend(std::iter::repeat_n(b'x', length - 4));
-    let named = archive_of(&[
-        Member::stored(format!("{TOP}/release.json"), b"{\"signed\":{}}"),
-        Member::stored(
-            format!("{TOP}/share/PK\x05\x06"),
-            b"a name with a signature",
+fn an_entry_with_extra_data_is_refused_before_the_parser_reads_the_archive() {
+    let name = format!("{TOP}/share/big");
+    let kinds: Vec<(&str, Vec<u8>)> = vec![
+        (
+            "a Unicode path with the name's checksum",
+            unicode_path_field(name.as_bytes(), "other"),
         ),
-    ]);
-    for (name, bytes) in [
-        ("an end record set inside an entry's extra data", &crafted),
-        ("an end record in a name", &named),
-    ] {
+        (
+            "a Unicode path with another checksum",
+            unicode_path_field(b"another name", "other"),
+        ),
+        (
+            "a field too short for its kind",
+            vec![0x75, 0x70, 2, 0, 1, 0],
+        ),
+        (
+            "a field of a kind nobody uses",
+            vec![0xAA, 0xAA, 3, 0, 1, 2, 3],
+        ),
+        ("a field that runs past the data", vec![0xAA, 0xAA, 9, 0, 1]),
+        ("a 64-bit field", vec![1, 0, 0, 0]),
+    ];
+    for (what, extra) in kinds {
+        let mut members = release();
+        members.push(Member::stored(name.clone(), b"data"));
+        members[3].extra = extra;
         let case = Case::new();
         let error = case
-            .read(bytes, &Limits::DEFAULT)
+            .read(&archive_of(&members), &Limits::DEFAULT)
             .expect_err("the archive is refused");
         assert!(
-            error.contains("end record"),
-            "{name} is refused by the reader, for the signature: {error}"
+            error.contains("extra data"),
+            "{what} is refused by the reader, for the extra data: {error}"
         );
-        assert!(case.staged().is_empty(), "{name}: nothing was written");
+        assert!(case.staged().is_empty(), "{what}: nothing was written");
     }
     let case = Case::new();
-    let (directory, _) = case
-        .read(&with_extra(harmless), &Limits::DEFAULT)
-        .expect("extra data of the same size without a signature is read");
-    assert_eq!(
-        std::fs::read(directory.join("share/big")).expect("the file"),
-        big
+    assert!(
+        case.read(&archive_of(&release()), &Limits::DEFAULT).is_ok(),
+        "the release without extra data is read"
     );
+}
+
+/// How many entries the 64-bit end record that [`archive_spelling_a_64_bit_end`] spells counts.
+const SPELLED_ENTRIES: u64 = 50_000;
+
+/// The most the reader may ask for at once while it reads or refuses an archive: far below what
+/// the parser sizes its list of entries to, which is [`SPELLED_ENTRIES`] times the size of one
+/// entry's record.
+const MOST_AT_ONCE: usize = 1 << 20;
+
+/// An archive of three entries whose directory spells, in the fixed fields of its entries, the
+/// three records that the parser follows to a 64-bit archive when it gives up on the directory it
+/// first took: the 64-bit end record (counting [`SPELLED_ENTRIES`] entries), its locator, and a
+/// 32-bit end record that sends it to them. None is in a name or in extra data. The last entry
+/// carries `extra`, which is what the parser gives up on when it is a Unicode path field with a
+/// checksum that is not the name's. The directory begins far enough into the file that the 64-bit
+/// record can be taken for one whose entries lie before it.
+fn archive_spelling_a_64_bit_end(extra: &[u8]) -> Vec<u8> {
+    let start = usize::try_from(SPELLED_ENTRIES).expect("small") * 47;
+    let mut directory = vec![0_u8; 126 + 46 + 1 + extra.len()];
+    let mut put = |at: usize, bytes: &[u8]| directory[at..at + bytes.len()].copy_from_slice(bytes);
+    // The entries begin at 0, 80 and 126: the first has a name of 34 bytes, the second none, the
+    // third a name of one byte and the extra data.
+    for entry in [0, 80, 126] {
+        put(entry, b"PK\x01\x02");
+    }
+    put(28, &34_u16.to_le_bytes());
+    put(126 + 28, &1_u16.to_le_bytes());
+    put(
+        126 + 30,
+        &u16::try_from(extra.len()).expect("short").to_le_bytes(),
+    );
+    put(126 + 46, b"a");
+    put(126 + 47, extra);
+    // The 64-bit end record at 4, which ends where its locator begins (96 bytes, 12 of them its
+    // header), counts the entries at 36 and places the directory at 0 (at 52, inside the name).
+    put(4, b"PK\x06\x06");
+    put(8, &84_u64.to_le_bytes());
+    put(36, &SPELLED_ENTRIES.to_le_bytes());
+    // Its locator at 100, and the 32-bit end record at 120 whose count of 65,535 says the archive
+    // is a 64-bit one (at 130).
+    put(100, b"PK\x06\x07");
+    put(120, b"PK\x05\x06");
+    put(130, &u16::MAX.to_le_bytes());
+    let mut bytes = vec![0_u8; start];
+    bytes.extend_from_slice(&directory);
+    bytes.extend_from_slice(b"PK\x05\x06");
+    bytes.extend_from_slice(&[0; 4]);
+    bytes.extend_from_slice(&3_u16.to_le_bytes());
+    bytes.extend_from_slice(&3_u16.to_le_bytes());
+    bytes.extend_from_slice(&u32::try_from(directory.len()).expect("small").to_le_bytes());
+    bytes.extend_from_slice(&u32::try_from(start).expect("small").to_le_bytes());
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+    bytes
+}
+
+/// KR-REQ-26.06: an archive whose directory spells the records of a 64-bit archive in the fixed
+/// fields of its entries, which no check of names or extra data reaches, does not send the parser
+/// to them. The parser gives up on a directory whose entry it cannot read and follows the nearest
+/// earlier end record it finds, here this one, and sizes its list for the entries that record
+/// counts before anything else checks them, so a reader that lets the parser fail lets an archive
+/// that no signature has vouched for make it ask for gigabytes. The archive is refused for the
+/// extra data of its last entry, and the most the reader asked for at once is small. The control is
+/// the same directory without the extra data, which the parser reads as it is and the reader
+/// refuses for the first entry's data, which is not there, asking for as little.
+#[test]
+fn a_directory_that_spells_a_64_bit_end_is_not_followed_to_it_when_an_entry_fails() {
+    let crafted = archive_spelling_a_64_bit_end(&unicode_path_field(b"not the name", "a"));
+    let control = archive_spelling_a_64_bit_end(&[]);
+    for (what, bytes, reason) in [
+        ("the archive", &crafted, "extra data"),
+        ("the control", &control, "an entry this host cannot read"),
+    ] {
+        let case = Case::new();
+        let (read, largest) = measured::largest_while(|| case.read(bytes, &Limits::DEFAULT));
+        assert!(
+            largest < MOST_AT_ONCE,
+            "{what}: the reader asked for {largest} bytes at once"
+        );
+        let error = read.expect_err("the archive is refused");
+        assert!(
+            error.contains(reason),
+            "{what} is refused by the reader, for {reason}: {error}"
+        );
+        assert!(case.staged().is_empty(), "{what}: nothing was written");
+    }
 }
 
 /// Nothing is written outside the staging directory by an archive that names a place beyond it.

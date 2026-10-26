@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use kr_ipc::install::names::{NameFault, PathFault, PathRules};
-use zip::{CompressionMethod, ZipArchive};
+use zip::ZipArchive;
 
 use super::release::{
     Written, create_directories, ensure_space, refused_archive, write_failure, write_new,
@@ -115,17 +115,15 @@ pub fn unpack(
         Ok(tail) => tail,
         Err(reason) => return Err(unreadable(reason)),
     };
-    // The parser sees the directory and the end record as they were judged and zeros everywhere
-    // else, so that no other record can be found for it to follow; once it has its list of entries
-    // it reads the file itself.
+    // The parser sees the directory and the end record as they were judged and zeros before them;
+    // once it has its list of entries it reads the file itself.
     let building = Arc::new(AtomicBool::new(true));
     let (entries, start) = (tail.entries, tail.start);
     let mut zipped = ZipArchive::new(Shown::new(file, tail, Arc::clone(&building)))
         .map_err(|_| unreadable(NOT_A_ZIP))?;
     building.store(false, Ordering::Release);
-    // The parser falls back to an earlier end record when the last does not serve, and takes the
-    // directory that record names. It is held to the directory judged above: it started where the
-    // end record says, or the archive is refused.
+    // The parse cannot fail on a directory judged above, so it took the end record it was shown.
+    // It is held to that: it started where the end record says, or the archive is refused.
     if zipped.central_directory_start() != start {
         return Err(unreadable(NOT_A_ZIP));
     }
@@ -158,14 +156,6 @@ pub fn unpack(
         {
             return Err(unreadable(
                 "has an entry that is neither a file nor a directory",
-            ));
-        }
-        if !matches!(
-            member.compression(),
-            CompressionMethod::Stored | CompressionMethod::Deflated
-        ) {
-            return Err(unreadable(
-                "has an entry compressed in a way a release is not",
             ));
         }
         let name = member.name();
@@ -274,29 +264,28 @@ const NOT_A_ZIP: &str = "is not a zip archive this host reads";
 /// The signature of the end record.
 const END_RECORD: [u8; 4] = *b"PK\x05\x06";
 
-/// The signatures of the end record, of its 64-bit form and of that form's locator: what the
-/// parser looks for backwards from the end of the file, and falls back to when the last end record
-/// does not serve.
-const END_RECORDS: [[u8; 4]; 3] = [END_RECORD, *b"PK\x06\x06", *b"PK\x06\x07"];
-
-/// The most extra data an entry of the directory may carry. The packer writes none.
-const EXTRA_BYTES: usize = 1024;
+/// The two methods an entry of a release is written with.
+const STORED: usize = 0;
+const DEFLATED: usize = 8;
 
 /// Reads the directory of entries and the end record from the tail of the file, and judges them
 /// whole: the end record is the last 22 bytes of the file with no comment, names one disk and
 /// counts and sizes that fit it (so no 64-bit record), and the directory is exactly the bytes
-/// before it, which hold that many entries one after another, with a name and extra data within
-/// bounds and no comment. The archive a release is packed into has this shape; any other is
-/// refused, so the parser has one end record to follow and the bytes it will read are the bytes
-/// judged here.
+/// before it, which hold that many entries one after another, each with a name within bounds, no
+/// extra data, no comment and a method a release uses. The archive a release is packed into has
+/// this shape; any other is refused, so the parser has one end record to follow and the bytes it
+/// will read are the bytes judged here.
 ///
-/// The parser takes the last end record first and falls back to an earlier one, found by its
-/// signature anywhere in the file, when an entry it reads does not parse, and it sizes what it keeps
-/// for the entries that record counts before anything here checks them. So no name or extra data
-/// holds the signature of an end record, of its 64-bit form or of that form's locator, however the
-/// entry is made to fail. The fixed fields of an entry are not searched: a checksum, a size or an
-/// offset can spell a signature in a release no fault of whose, and such a record is held to the
-/// start and count checks after the parse and, as a 32-bit record, to at most 65,534 entries.
+/// The parser follows the last end record, and when an entry it reads does not parse it falls back
+/// to an earlier end record, found by its signature anywhere in the file, and sizes what it keeps
+/// for the entries that record counts before anything here checks them. The fixed fields of an
+/// entry can spell the signatures of such a record, in a release no fault of whose, so the
+/// fallback is closed where it begins: no entry judged here fails to parse. In zip 8.6.0 an entry
+/// fails to parse by its extra data (each kind of field has lengths or content it refuses, and the
+/// Unicode path and comment fields a checksum), by its method when that is the one that needs an
+/// encryption field, and by nothing else: the other fields of its record are taken whatever they
+/// hold, and a name is decoded without failing. So an entry carries no extra data, and its method
+/// is stored or deflated, which are the two a release uses.
 ///
 /// Returns the refusal where the archive is not of this shape, or beyond the limits.
 fn read_tail(
@@ -347,27 +336,26 @@ fn read_tail(
             return Ok(Err(NOT_A_ZIP));
         };
         let field = |from: usize| usize::from(u16::from_le_bytes([header[from], header[from + 1]]));
-        let (name, extra, comment, disk) = (field(28), field(30), field(32), field(34));
-        if header[..4] != *b"PK\x01\x02" || comment != 0 || disk != 0 || extra > EXTRA_BYTES {
+        let (method, name, extra, comment, disk) =
+            (field(10), field(28), field(30), field(32), field(34));
+        if header[..4] != *b"PK\x01\x02" || comment != 0 || disk != 0 {
             return Ok(Err(NOT_A_ZIP));
+        }
+        if extra != 0 {
+            return Ok(Err(
+                "has an entry with extra data, which a release does not carry",
+            ));
+        }
+        if !matches!(method, STORED | DEFLATED) {
+            return Ok(Err("has an entry compressed in a way a release is not"));
         }
         if name > limits.name_bytes {
             return Ok(Err("has an entry name longer than any a release has"));
         }
-        // The name and the extra data, and the last three bytes before them, which a signature can
-        // begin in: no entry of a release's has a name that begins as one ends.
-        let Some(variable) = judged.get(at + 43..at + 46 + name + extra) else {
+        if judged.len() < at + 46 + name {
             return Ok(Err(NOT_A_ZIP));
-        };
-        if variable
-            .windows(4)
-            .any(|window| END_RECORDS.iter().any(|record| record == window))
-        {
-            return Ok(Err(
-                "holds the signature of an end record in an entry's name or extra data",
-            ));
         }
-        at += 46 + name + extra;
+        at += 46 + name;
     }
     // The entries tile the directory.
     if at != directory {
