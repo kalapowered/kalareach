@@ -149,6 +149,22 @@ impl ScriptedWorker {
             host.environment_id(),
             challenge,
             Stated::ThisBuild,
+            true,
+        );
+        worker.host = Some(host);
+        worker
+    }
+
+    /// A worker that answers its challenge and states its build, as a worker of the release before
+    /// the launch surface does: it does not state that it serves the read.
+    pub fn start_not_stating_the_launch_surface() -> Self {
+        let host = TempHost::create();
+        let mut worker = Self::publish(
+            host.environment(),
+            host.environment_id(),
+            Challenge::Answered,
+            Stated::ThisBuild,
+            false,
         );
         worker.host = Some(host);
         worker
@@ -162,6 +178,7 @@ impl ScriptedWorker {
             host.environment_id(),
             Challenge::Answered,
             stated,
+            true,
         );
         worker.host = Some(host);
         worker
@@ -174,6 +191,7 @@ impl ScriptedWorker {
             beside.environment_id,
             challenge,
             Stated::ThisBuild,
+            true,
         )
     }
 
@@ -187,6 +205,7 @@ impl ScriptedWorker {
         environment_id: EnvironmentId,
         challenge: Challenge,
         stated: Stated,
+        states_launch_surface: bool,
     ) -> Self {
         let session_id = SessionId::new(kr_ipc::new_uuid());
         let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
@@ -234,6 +253,13 @@ impl ScriptedWorker {
         let (leaving, abandoned) = tokio::sync::mpsc::unbounded_channel();
         let (held, holding) = tokio::sync::mpsc::unbounded_channel();
         let endpoint_text = endpoint.as_text();
+        let mut stated_capabilities = CanonicalSet::new();
+        if states_launch_surface {
+            stated_capabilities.insert(
+                kr_protocol::ids::CapabilityId::new(kr_protocol::local::SHELL_LAUNCH_SURFACE_READ)
+                    .expect("a capability identifier"),
+            );
+        }
         let serving = tokio::spawn(async move {
             loop {
                 let Ok((connection, peer)) = listener.accept().await else {
@@ -270,7 +296,7 @@ impl ScriptedWorker {
                         issued_at_ms: TimestampMs::new(0),
                         valid_for_ms: DurationMs::new(60_000),
                     },
-                    capabilities: CanonicalSet::new(),
+                    capabilities: stated_capabilities.clone(),
                     max_receive: ReceiveLimits::default(),
                     build: stated.build(),
                 };

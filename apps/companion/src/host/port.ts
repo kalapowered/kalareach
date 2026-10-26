@@ -97,6 +97,8 @@ import type {
   RevocationResult,
   ShareOffer,
   ShellLaunchResult,
+  ShellLaunchSurfaceParams,
+  ShellLaunchSurfaceResult,
   VoiceContextResult,
   VoiceAction,
   VoiceGrantResult,
@@ -107,7 +109,6 @@ import type {
 } from '@kalareach/protocol'
 
 import type { AccountView, UsageView } from '../model/account'
-import type { LaunchSurface } from '../model/pending'
 import type { Supersession } from '../model/receipt-reads'
 
 /** A failure a command answered with. */
@@ -1642,13 +1643,12 @@ export interface HostPort {
   ): Promise<Settled<CapabilityChecks>>
 
   /**
-   * What the launch surface may draw right now.
-   *
-   * The prompt generation in the answer is the one a launch must name. A button drawn at an older
-   * generation is disabled rather than launched against a prompt the person has not seen.
+   * What the session's worker says of a launch at its root editor now, read on the link every
+   * agent read uses. That link never holds the session's input, so it never reads it as held
+   * here: the buttons that start something are drawn from the read of a terminal view's own link.
+   * A host that does not serve the read is answered as `not_served`.
    */
-  launchSurface(params: unknown): Promise<LaunchSurface>
-  shellLaunch(params: unknown, subject: SessionSubject): Promise<Settled<ShellLaunchResult>>
+  launchSurface(params: ShellLaunchSurfaceParams): Promise<LaunchSurfaceReading>
 
   /**
    * A session's live agent instances, and every request its agents' broker is still arbitrating.
@@ -2614,8 +2614,39 @@ export interface TerminalView {
    * that say why, and the view keeps control.
    */
   input(input: TerminalInput): Promise<void>
+  /**
+   * Reads the launch surface on this view's own link, the one that holds the session's input once
+   * the person takes control, so the answer says whether this view holds it. A view that has ended,
+   * or is not attached yet, refuses.
+   */
+  launchSurface(): Promise<LaunchSurfaceReading>
+  /**
+   * Presses a launch on this view's own link, for the view's own session. The session installs the
+   * command only while this view holds its input, and refuses a quote of a prompt that has moved
+   * with `DRAFT_CONFLICT` before anything is typed; it can also refuse with `EDITOR_BUSY`, and say
+   * `OUTCOME_UNKNOWN` when the editor could not confirm.
+   */
+  launch(press: LaunchPress): Promise<ShellLaunchResult>
   /** Closes the view. Resolves once it has ended: nothing it publishes arrives after. */
   close(): Promise<void>
+}
+
+/**
+ * What a read of a launch surface came to: what the session's worker answered, or that the host is
+ * of a release that does not serve the read, or so is its session's worker.
+ */
+export type LaunchSurfaceReading =
+  | { readonly state: 'served'; readonly surface: ShellLaunchSurfaceResult }
+  | { readonly state: 'not_served' }
+
+/**
+ * A launch as a button presses it: the command its offer carries and the prompt generation and
+ * buffer revision of the read the button was drawn from. The session is the view's own.
+ */
+export interface LaunchPress {
+  readonly command: ShellLaunchSurfaceResult['offers'][number]['command']
+  readonly expected_prompt_generation: string
+  readonly expected_buffer_revision: string
 }
 
 /** Whether a value is a host failure rather than an unexpected one. */

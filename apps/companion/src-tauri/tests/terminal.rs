@@ -79,6 +79,8 @@ impl Page {
                 companion_tauri::commands::terminal_view_move,
                 companion_tauri::commands::terminal_view_input,
                 companion_tauri::commands::terminal_view_close,
+                companion_tauri::commands::terminal_view_launch_surface,
+                companion_tauri::commands::terminal_view_launch,
             ]);
         let app = companion_tauri::terminal::install(
             builder,
@@ -125,6 +127,32 @@ impl Page {
             )
         })
         .map(|answer| answer.deserialize().expect("an answer the page reads"))
+    }
+
+    /// Calls a command that waits for the worker's answer, and returns at once with what it will
+    /// answer: the worker is scripted by this test, which has to answer it meanwhile.
+    fn invoke_later(
+        &self,
+        command: &str,
+        body: Value,
+    ) -> tokio::task::JoinHandle<Result<Value, Value>> {
+        let window = self.windows["main"].clone();
+        let command = command.to_owned();
+        tokio::task::spawn_blocking(move || {
+            tauri::test::get_ipc_response(
+                &window,
+                tauri::webview::InvokeRequest {
+                    cmd: command,
+                    callback: tauri::ipc::CallbackFn(0),
+                    error: tauri::ipc::CallbackFn(1),
+                    url: BUNDLE.parse().expect("the bundle's address"),
+                    body: tauri::ipc::InvokeBody::Json(body),
+                    headers: Default::default(),
+                    invoke_key: tauri::test::INVOKE_KEY.to_owned(),
+                },
+            )
+            .map(|answer| answer.deserialize().expect("an answer the page reads"))
+        })
     }
 
     /// Opens a view of `session` from the main page, publishing on `channel`.
@@ -3902,4 +3930,228 @@ async fn text_is_its_utf8_and_a_paste_is_bracketed_when_the_program_asks() {
     let longest = "x".repeat(64 * 1024 - 12);
     page_view.paste(&view, 1, &longest).expect("taken");
     assert_eq!(next_write(&mut link, &mut lease).await.1.len(), 64 * 1024);
+}
+
+/// The launch surface a worker answers when the editor is verified and this view holds the input.
+fn a_surface_held_here(
+    session_id: kr_protocol::ids::SessionId,
+) -> kr_protocol::root::ShellLaunchSurfaceResult {
+    use kr_protocol::root::{
+        CwdRevision, EditorBufferRevision, LaunchCommand, LaunchEditor, LaunchInput, LaunchOffer,
+        LaunchShell, PromptGeneration, ShellLaunchSurfaceResult,
+    };
+    ShellLaunchSurfaceResult {
+        session_id,
+        editor: LaunchEditor::Verified {
+            prompt_generation: PromptGeneration::new(12),
+            buffer_revision: EditorBufferRevision::new(3),
+            cwd_revision: CwdRevision::new(5),
+        },
+        input: LaunchInput::HeldHere,
+        shell: kr_protocol::scalars::Nullable::some(LaunchShell::Zsh),
+        offers: vec![LaunchOffer {
+            plugin_id: kr_protocol::ids::PluginId::new("kalareach/claude-code")
+                .expect("a plugin identifier"),
+            label: "Claude Code".to_owned(),
+            command: LaunchCommand::Arguments(vec!["claude".to_owned()]),
+        }],
+    }
+}
+
+/// KR-REQ-13.11: a view reads the launch surface on its own link, the link that holds the session's
+/// input once the person takes control, so the answer can say the input is held here. The page is
+/// given what the worker answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_view_reads_the_launch_surface_on_its_own_link() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let (view, mut link) = showing(&page, &mut worker, 3).await;
+    let reading = page.invoke_later("terminal_view_launch_surface", json!({ "view": view }));
+    let asked = link.expect(Method::ShellLaunchSurface).await;
+    assert_eq!(asked.kind, CallKind::Request);
+    let params: kr_protocol::root::ShellLaunchSurfaceParams = asked.params();
+    assert_eq!(params.session_id, worker.session_id);
+    let surface = a_surface_held_here(worker.session_id);
+    link.answer(&asked, &surface).await;
+    let told = reading.await.expect("joins").expect("the surface is read");
+    assert_eq!(told["state"], "served", "{told}");
+    assert_eq!(
+        told["surface"],
+        serde_json::to_value(&surface).expect("serialises"),
+        "the page is given what the worker answered"
+    );
+}
+
+/// KR-REQ-13.11: a host that does not list the read refuses it as it refuses any method it does not
+/// list, which a grant that lost its right is refused too. The view tells the two apart by what the
+/// same right reads: where `session.read` is answered, the read is asked once more, and a second
+/// refusal is a host that does not serve it; where `session.read` is refused too, the page is given
+/// that refusal.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_that_does_not_list_the_launch_surface_is_told_from_a_lost_right() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let (view, mut link) = showing(&page, &mut worker, 3).await;
+
+    let reading = page.invoke_later("terminal_view_launch_surface", json!({ "view": view }));
+    let first = link.expect(Method::ShellLaunchSurface).await;
+    link.refuse_with(
+        &first,
+        ErrorCode::PermissionDenied,
+        "not a method this host lists",
+    )
+    .await;
+    let probe = link.expect(Method::SessionRead).await;
+    link.answer(&probe, &json!({})).await;
+    let again = link.expect(Method::ShellLaunchSurface).await;
+    link.refuse_with(
+        &again,
+        ErrorCode::PermissionDenied,
+        "not a method this host lists",
+    )
+    .await;
+    let told = reading.await.expect("joins").expect("an answer");
+    assert_eq!(told, json!({ "state": "not_served" }));
+
+    let reading = page.invoke_later("terminal_view_launch_surface", json!({ "view": view }));
+    let first = link.expect(Method::ShellLaunchSurface).await;
+    link.refuse_with(&first, ErrorCode::PermissionDenied, "the right is gone")
+        .await;
+    let probe = link.expect(Method::SessionRead).await;
+    link.refuse_with(&probe, ErrorCode::PermissionDenied, "the right is gone")
+        .await;
+    let refused = reading
+        .await
+        .expect("joins")
+        .expect_err("the refusal is the grant's");
+    assert_eq!(refused["code"], "PERMISSION_DENIED", "{refused}");
+}
+
+/// KR-REQ-13.11: a worker that lists the read and is of a release that does not serve it refuses it
+/// as an unsupported capability, and a worker that does not state the capability is not asked at
+/// all. Either way the page is told the host does not serve it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worker_that_does_not_serve_the_launch_surface_is_not_asked_or_is_told_so() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let (view, mut link) = showing(&page, &mut worker, 3).await;
+    let reading = page.invoke_later("terminal_view_launch_surface", json!({ "view": view }));
+    let asked = link.expect(Method::ShellLaunchSurface).await;
+    link.refuse_with(
+        &asked,
+        ErrorCode::UnsupportedCapability,
+        "an earlier release",
+    )
+    .await;
+    let told = reading.await.expect("joins").expect("an answer");
+    assert_eq!(told, json!({ "state": "not_served" }));
+
+    let mut silent = ScriptedWorker::start_not_stating_the_launch_surface();
+    let page = Page::new(silent.paths());
+    let (view, mut link) = showing(&page, &mut silent, 3).await;
+    let told = page
+        .invoke_later("terminal_view_launch_surface", json!({ "view": view }))
+        .await
+        .expect("joins")
+        .expect("an answer");
+    assert_eq!(told, json!({ "state": "not_served" }));
+    assert!(
+        link.quiet_for(QUIET).await,
+        "a worker that did not state the read was not asked for it"
+    );
+}
+
+/// KR-REQ-13.11: a launch is pressed on the view's own link, for the view's own session, quoting the
+/// prompt generation and the buffer revision of the read the button was drawn from; the page is
+/// given what the session answered. A prompt that moved is refused by the session as `DRAFT_CONFLICT`,
+/// and the page is given that code.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_launch_is_pressed_on_the_views_link_and_a_moved_prompt_is_refused() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        controlling(&page, &mut worker, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    let press = json!({
+        "command": { "arguments": ["claude"] },
+        "expected_prompt_generation": "12",
+        "expected_buffer_revision": "3",
+    });
+
+    let pressing = page.invoke_later(
+        "terminal_view_launch",
+        json!({ "view": view, "press": press }),
+    );
+    let launch = link.expect(Method::ShellLaunch).await;
+    assert_eq!(launch.kind, CallKind::Mutation);
+    let asked: kr_protocol::root::ShellLaunchParams = launch.params();
+    assert_eq!(
+        asked.session_id, worker.session_id,
+        "the view's own session"
+    );
+    assert_eq!(
+        asked.command,
+        kr_protocol::root::LaunchCommand::Arguments(vec!["claude".to_owned()])
+    );
+    assert_eq!(asked.expected_prompt_generation.0.get(), 12);
+    assert_eq!(asked.expected_buffer_revision.0.get(), 3);
+    let installed = kr_protocol::root::ShellLaunchResult {
+        fence_id: kr_protocol::root::FenceId::new(kr_ipc::new_uuid()),
+        prompt_generation: asked.expected_prompt_generation,
+        buffer_revision: kr_protocol::root::EditorBufferRevision::new(4),
+    };
+    link.answer(&launch, &installed).await;
+    let told = pressing
+        .await
+        .expect("joins")
+        .expect("the launch is installed");
+    assert_eq!(
+        told,
+        serde_json::to_value(&installed).expect("serialises"),
+        "the page is given what the session answered"
+    );
+
+    let pressing = page.invoke_later(
+        "terminal_view_launch",
+        json!({ "view": view, "press": press }),
+    );
+    let launch = link.expect(Method::ShellLaunch).await;
+    link.refuse_with(
+        &launch,
+        ErrorCode::DraftConflict,
+        "the prompt moved on before the launch was installed",
+    )
+    .await;
+    let refused = pressing
+        .await
+        .expect("joins")
+        .expect_err("the prompt moved");
+    assert_eq!(refused["code"], "DRAFT_CONFLICT", "{refused}");
+}
+
+/// KR-REQ-13.11: the page names the command to install and the prompt it quotes, and nothing else:
+/// a press that names a session of its own, or anything the application does not read, is refused
+/// before the view is asked.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_press_that_names_more_than_the_command_and_its_quote_is_refused_unread() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        controlling(&page, &mut worker, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    let refused = page
+        .invoke_later(
+            "terminal_view_launch",
+            json!({ "view": view, "press": {
+                "session_id": kr_protocol::ids::SessionId::new(kr_ipc::new_uuid()).to_string(),
+                "command": { "arguments": ["claude"] },
+                "expected_prompt_generation": "12",
+                "expected_buffer_revision": "3",
+            }}),
+        )
+        .await
+        .expect("joins")
+        .expect_err("refused");
+    assert_eq!(refused["code"], "INVALID_ARGUMENT", "{refused}");
+    assert!(link.quiet_for(QUIET).await, "nothing reached the session");
 }

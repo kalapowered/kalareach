@@ -26,12 +26,16 @@
  * one that does.
  */
 
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+
+import type { ShellLaunchResult } from '@kalareach/protocol'
 
 import {
   failureCode,
   failureMessage,
   type HostPort,
+  type LaunchPress,
+  type LaunchSurfaceReading,
   type ProgramInput,
   type TerminalControl,
   type TerminalGrid,
@@ -107,6 +111,15 @@ export interface TerminalViewing {
    * null otherwise.
    */
   readonly unsent: string | null
+  /**
+   * The launch surface on this view's own link, the link that holds the session's input once the
+   * person takes control, and a launch pressed there; null until the view is open and once it has
+   * ended. The functions are the same for as long as this opening is open.
+   */
+  readonly launch: {
+    readonly read: () => Promise<LaunchSurfaceReading>
+    readonly press: (press: LaunchPress) => Promise<ShellLaunchResult>
+  } | null
 }
 
 /** The grid a view opens at when its surface cannot be measured yet. */
@@ -216,6 +229,12 @@ export function useTerminalView(
     readonly screen: TerminalScreen
   } | null>(null)
   const [slowStamp, setSlowStamp] = useState(0)
+  // The view of the opening that is open, once native code has answered the open.
+  const [opened, setOpened] = useState<{
+    readonly scope: string
+    readonly attempt: number
+    readonly view: TerminalView
+  } | null>(null)
   const stamps = useRef(0)
   const opening = useRef<Opening | null>(null)
   const measuring = useRef(measure)
@@ -311,6 +330,7 @@ export function useTerminalView(
             return
           }
           open.view = view
+          setOpened({ scope, attempt, view })
           if (open.owed) void view.resize(open.grid)
         },
         (failure: unknown) => {
@@ -335,6 +355,7 @@ export function useTerminalView(
       // native code closed the view that would have settled them. Its control goes too: the next
       // opening starts watching.
       setHeld(null)
+      setOpened(null)
       setWaitingMoves(null)
       setAskedControl(null)
       setUnsentInput(null)
@@ -546,6 +567,21 @@ export function useTerminalView(
     }
   }, [waitingOnAFrame, stamp])
 
+  const openView =
+    opened?.scope === scope && opened.attempt === attempt && state?.state !== 'ended'
+      ? opened.view
+      : null
+  const launch = useMemo(
+    () =>
+      openView === null
+        ? null
+        : {
+            read: () => openView.launchSurface(),
+            press: (press: LaunchPress) => openView.launch(press)
+          },
+    [openView]
+  )
+
   return {
     state,
     frame,
@@ -566,6 +602,7 @@ export function useTerminalView(
     toProgram,
     controlTake,
     refuse,
-    unsent
+    unsent,
+    launch
   }
 }

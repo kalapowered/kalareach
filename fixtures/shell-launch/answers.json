@@ -1,0 +1,272 @@
+{
+  "changed_since_fence": {
+    "editor": {
+      "reason": "changed_since_fence",
+      "state": "unverified"
+    },
+    "input": "held_here",
+    "offers": [
+      {
+        "command": {
+          "arguments": [
+            "claude"
+          ]
+        },
+        "label": "Claude Code",
+        "plugin_id": "kalareach/claude-code"
+      },
+      {
+        "command": {
+          "arguments": [
+            "codex"
+          ]
+        },
+        "label": "Codex CLI",
+        "plugin_id": "kalareach/codex"
+      },
+      {
+        "command": {
+          "arguments": [
+            "gemini"
+          ]
+        },
+        "label": "Gemini CLI",
+        "plugin_id": "kalareach/gemini-cli"
+      }
+    ],
+    "session_id": "00000000-0000-4000-8000-000000000001",
+    "shell": "zsh"
+  },
+  "free_no_fence": {
+    "editor": {
+      "reason": "no_fence",
+      "state": "unverified"
+    },
+    "input": "free",
+    "offers": [
+      {
+        "command": {
+          "arguments": [
+            "claude"
+          ]
+        },
+        "label": "Claude Code",
+        "plugin_id": "kalareach/claude-code"
+      },
+      {
+        "command": {
+          "arguments": [
+            "codex"
+          ]
+        },
+        "label": "Codex CLI",
+        "plugin_id": "kalareach/codex"
+      },
+      {
+        "command": {
+          "arguments": [
+            "gemini"
+          ]
+        },
+        "label": "Gemini CLI",
+        "plugin_id": "kalareach/gemini-cli"
+      }
+    ],
+    "session_id": "00000000-0000-4000-8000-000000000001",
+    "shell": "zsh"
+  },
+  "launch_in_progress": {
+    "editor": {
+      "reason": "launch_in_progress",
+      "state": "unverified"
+    },
+    "input": "held_elsewhere",
+    "offers": [
+      {
+        "command": {
+          "arguments": [
+            "claude"
+          ]
+        },
+        "label": "Claude Code",
+        "plugin_id": "kalareach/claude-code"
+      },
+      {
+        "command": {
+          "arguments": [
+            "codex"
+          ]
+        },
+        "label": "Codex CLI",
+        "plugin_id": "kalareach/codex"
+      },
+      {
+        "command": {
+          "arguments": [
+            "gemini"
+          ]
+        },
+        "label": "Gemini CLI",
+        "plugin_id": "kalareach/gemini-cli"
+      }
+    ],
+    "session_id": "00000000-0000-4000-8000-000000000001",
+    "shell": "zsh"
+  },
+  "not_at_prompt": {
+    "editor": {
+      "reason": "not_at_prompt",
+      "state": "unverified"
+    },
+    "input": "held_here",
+    "offers": [
+      {
+        "command": {
+          "arguments": [
+            "claude"
+          ]
+        },
+        "label": "Claude Code",
+        "plugin_id": "kalareach/claude-code"
+      },
+      {
+        "command": {
+          "arguments": [
+            "codex"
+          ]
+        },
+        "label": "Codex CLI",
+        "plugin_id": "kalareach/codex"
+      },
+      {
+        "command": {
+          "arguments": [
+            "gemini"
+          ]
+        },
+        "label": "Gemini CLI",
+        "plugin_id": "kalareach/gemini-cli"
+      }
+    ],
+    "session_id": "00000000-0000-4000-8000-000000000001",
+    "shell": "zsh"
+  },
+  "stock_shell": {
+    "editor": {
+      "reason": "stock_shell",
+      "state": "unverified"
+    },
+    "input": "free",
+    "offers": [
+      {
+        "command": {
+          "arguments": [
+            "claude"
+          ]
+        },
+        "label": "Claude Code",
+        "plugin_id": "kalareach/claude-code"
+      },
+      {
+        "command": {
+          "arguments": [
+            "codex"
+          ]
+        },
+        "label": "Codex CLI",
+        "plugin_id": "kalareach/codex"
+      },
+      {
+        "command": {
+          "arguments": [
+            "gemini"
+          ]
+        },
+        "label": "Gemini CLI",
+        "plugin_id": "kalareach/gemini-cli"
+      }
+    ],
+    "session_id": "00000000-0000-4000-8000-000000000001",
+    "shell": "sh"
+  },
+  "verified_held_elsewhere": {
+    "editor": {
+      "buffer_revision": "1",
+      "cwd_revision": "1",
+      "prompt_generation": "1",
+      "state": "verified"
+    },
+    "input": "held_elsewhere",
+    "offers": [
+      {
+        "command": {
+          "arguments": [
+            "claude"
+          ]
+        },
+        "label": "Claude Code",
+        "plugin_id": "kalareach/claude-code"
+      },
+      {
+        "command": {
+          "arguments": [
+            "codex"
+          ]
+        },
+        "label": "Codex CLI",
+        "plugin_id": "kalareach/codex"
+      },
+      {
+        "command": {
+          "arguments": [
+            "gemini"
+          ]
+        },
+        "label": "Gemini CLI",
+        "plugin_id": "kalareach/gemini-cli"
+      }
+    ],
+    "session_id": "00000000-0000-4000-8000-000000000001",
+    "shell": "zsh"
+  },
+  "verified_held_here": {
+    "editor": {
+      "buffer_revision": "1",
+      "cwd_revision": "1",
+      "prompt_generation": "1",
+      "state": "verified"
+    },
+    "input": "held_here",
+    "offers": [
+      {
+        "command": {
+          "arguments": [
+            "claude"
+          ]
+        },
+        "label": "Claude Code",
+        "plugin_id": "kalareach/claude-code"
+      },
+      {
+        "command": {
+          "arguments": [
+            "codex"
+          ]
+        },
+        "label": "Codex CLI",
+        "plugin_id": "kalareach/codex"
+      },
+      {
+        "command": {
+          "arguments": [
+            "gemini"
+          ]
+        },
+        "label": "Gemini CLI",
+        "plugin_id": "kalareach/gemini-cli"
+      }
+    ],
+    "session_id": "00000000-0000-4000-8000-000000000001",
+    "shell": "zsh"
+  }
+}

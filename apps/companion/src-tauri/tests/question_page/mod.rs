@@ -44,6 +44,7 @@ impl Page {
                 companion_tauri::commands::question_settle,
                 companion_tauri::commands::question_send_kept,
                 companion_tauri::commands::question_dismiss_kept,
+                companion_tauri::commands::launch_surface,
             ])
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .expect("an application");

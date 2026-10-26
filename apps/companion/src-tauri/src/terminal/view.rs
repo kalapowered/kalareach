@@ -17,6 +17,8 @@
 //! screen that says the program reads a form the view does not produce ends control at once. A
 //! change of control is told to the page at once.
 
+use std::collections::BTreeMap;
+
 use kr_client::encoder::{self, KeyEventKind, Modifiers};
 use kr_client::projection::{Applied, Projection, decode, is_projection_event};
 use kr_client::shown::Shown;
@@ -27,16 +29,21 @@ use kr_protocol::attachment::{
 use kr_protocol::envelope::{
     ActionTarget, ControlFrame, Notification, Outcome, ParamsValue, Request, Response,
 };
+use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::hello::PACKAGE_VERSION;
 use kr_protocol::ids::{BuildId, GrantId, RequestId, SessionId};
 use kr_protocol::input::{InputAcquireParams, InputReleaseParams, InputWriteParams};
 use kr_protocol::local::LocalBuild;
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::recovery::{EventStream, EventsSubscribeParams};
+use kr_protocol::root::{ShellLaunchResult, ShellLaunchSurfaceParams, ShellLaunchSurfaceResult};
 use kr_protocol::scalars::{Bytes, CanonicalSet, Nullable, U64};
-use kr_protocol::session::{Dimensions, SESSION_CLOSED_EVENT};
+use kr_protocol::session::{Dimensions, SESSION_CLOSED_EVENT, SessionReadParams};
 use kr_protocol::worker::WorkerDescriptor;
 use tokio::sync::mpsc::UnboundedReceiver;
+
+use crate::error::CommandError;
+use crate::launch::{LaunchSurfaceAnswer, Press};
 
 use super::input::{Input, Lease, Owed, PROFILE, Refused, wheel_reports};
 use super::keys::{self, KeyAction, Keyboard, Pressed, TypedKey};
@@ -53,6 +60,11 @@ pub(super) enum Command {
     Move(super::window::Move),
     /// The person's input, and where to say whether the view took it.
     Input(Input, Taken),
+    /// Whether a launch could be made at the session's root editor now, as this view's link reads
+    /// it: the link that can hold the session's input, so the answer says whether this view does.
+    LaunchSurface(Reply<LaunchSurfaceAnswer>),
+    /// A launch pressed on this view's link, and where to say what the session answered.
+    Launch(Press, Reply<ShellLaunchResult>),
     /// The connection ends as a lost network would end it, and the page has not asked. For a test.
     Lose,
     /// The page is done with the view.
@@ -61,6 +73,12 @@ pub(super) enum Command {
 
 /// Where a view says whether it took an input: at once, or why it did not.
 pub(super) type Taken = tokio::sync::oneshot::Sender<Result<(), Refused>>;
+
+/// Where a view says what the session answered to a launch surface read or a launch.
+pub(super) type Reply<T> = tokio::sync::oneshot::Sender<Result<T, CommandError>>;
+
+/// What a view says to a launch surface read or a launch that reaches it before it is attached.
+const STILL_OPENING: &str = "This view is still opening.";
 
 /// How many recoveries in a row may pass without a complete screen before the view ends.
 ///
@@ -86,6 +104,9 @@ struct Opened {
     wire: Wire,
     target: ActionTarget,
     attached: SessionAttachResult,
+    /// Whether the worker stated that it serves the launch surface, when a worker answered the
+    /// hello on this link: none on a link to a paired host's daemon.
+    serves_launch_surface: Option<bool>,
 }
 
 /// Where a view's session is reached.
@@ -179,6 +200,20 @@ pub(super) async fn run(
                             }
                         });
                     }
+                    // Nothing is attached yet, so there is no link that holds the input to read or
+                    // press on.
+                    Some(Command::LaunchSurface(reply)) => {
+                        let _ = reply.send(Err(CommandError::stated(
+                            ErrorCode::TerminalUnavailable,
+                            STILL_OPENING,
+                        )));
+                    }
+                    Some(Command::Launch(_, reply)) => {
+                        let _ = reply.send(Err(CommandError::stated(
+                            ErrorCode::TerminalUnavailable,
+                            STILL_OPENING,
+                        )));
+                    }
                     // A close while the view opens cancels the open. The link goes with it, and a
                     // closed connection detaches whatever the attach had made.
                     Some(Command::Close) | None => return Cause::Closed,
@@ -217,6 +252,9 @@ pub(super) async fn run(
         window,
         lease,
         resubscription: None,
+        serves_launch_surface: opened.serves_launch_surface,
+        launch_reads: BTreeMap::new(),
+        launches: BTreeMap::new(),
         replaced_stream: false,
         recoveries: 0,
         showing: false,
@@ -247,9 +285,12 @@ async fn open(
     session_id: SessionId,
     dimensions: Dimensions,
 ) -> Result<Opened, OpenFailure> {
-    let (mut wire, target) = match reach {
+    let (mut wire, target, serves_launch_surface) = match reach {
         Reach::Local(locate) => open_local(locate, session_id).await?,
-        Reach::Paired(dial, grant_id) => open_paired(dial, *grant_id, session_id).await?,
+        Reach::Paired(dial, grant_id) => {
+            let (wire, target) = open_paired(dial, *grant_id, session_id).await?;
+            (wire, target, None)
+        }
     };
     let mut requested = CanonicalSet::new();
     requested.insert(AttachmentCapability::ObserveTerminal);
@@ -305,6 +346,7 @@ async fn open(
         wire,
         target,
         attached,
+        serves_launch_surface,
     })
 }
 
@@ -312,12 +354,15 @@ async fn open(
 async fn open_local(
     locate: &Locate,
     session_id: SessionId,
-) -> Result<(Wire, ActionTarget), String> {
+) -> Result<(Wire, ActionTarget, Option<bool>), String> {
     let paths = locate()?;
     // A descriptor is data on disk. Nothing is sent until the worker behind the endpoint has signed
     // a challenge only the descriptor's key could answer.
     let crate::worker::Reached {
-        client, descriptor, ..
+        client,
+        descriptor,
+        capabilities,
+        ..
     } = crate::worker::reach(&paths, session_id)
         .await
         .map_err(crate::worker::Unreached::words)?;
@@ -325,7 +370,9 @@ async fn open_local(
     // a worker whose screens this view cannot read is refused before it is asked for anything.
     check_build(client.acknowledgement().build.as_ref())?;
     let target = target(&descriptor);
-    Ok((Wire::Local(Box::new(client)), target))
+    let serves = kr_protocol::ids::CapabilityId::new(kr_protocol::local::SHELL_LAUNCH_SURFACE_READ)
+        .is_ok_and(|read| capabilities.contains(&read));
+    Ok((Wire::Local(Box::new(client)), target, Some(serves)))
 }
 
 /// Reaches a paired host on a connection of the view's own and has it open the session for the
@@ -541,6 +588,30 @@ impl Ending {
     }
 }
 
+/// A launch surface read waiting for its answer, and how far it has come.
+struct LaunchRead {
+    stage: LaunchReadStage,
+    reply: Reply<LaunchSurfaceAnswer>,
+}
+
+/// What a launch surface read does with an answer: say what it came to, or ask the next question.
+enum Step {
+    Say(Result<LaunchSurfaceAnswer, CommandError>),
+    Ask(LaunchReadStage),
+}
+
+/// Which of the questions of a launch surface read is waiting for its answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LaunchReadStage {
+    /// The read itself.
+    Asked,
+    /// `session.read`, which tells a host that does not list the read from a grant that lost its
+    /// right.
+    Probed,
+    /// The read, asked once more after `session.read` was answered.
+    AskedAgain,
+}
+
 /// One open, attached view.
 struct View {
     wire: Wire,
@@ -555,6 +626,12 @@ struct View {
     lease: Lease,
     /// The resubscription waiting for its answer.
     resubscription: Option<RequestId>,
+    /// Whether the worker stated that it serves the launch surface, when one answered the hello.
+    serves_launch_surface: Option<bool>,
+    /// The launch surface reads waiting for their answers, and how far each has come.
+    launch_reads: BTreeMap<RequestId, LaunchRead>,
+    /// The launches waiting for the session's answer, and where each says it.
+    launches: BTreeMap<RequestId, Reply<ShellLaunchResult>>,
     /// Whether the stream a resubscription replaced is still being dropped: until the new stream's
     /// first notification, at sequence 0, everything of the old one that still arrives is stale.
     replaced_stream: bool,
@@ -610,6 +687,12 @@ impl View {
                     None
                 }
                 Next::Command(Some(Command::Input(input, taken))) => self.input(input, taken).await,
+                Next::Command(Some(Command::LaunchSurface(reply))) => {
+                    self.launch_surface(reply).await
+                }
+                Next::Command(Some(Command::Launch(press, reply))) => {
+                    self.launch(press, reply).await
+                }
                 Next::Command(Some(Command::Lose)) => Some(self.lost()),
                 Next::Command(Some(Command::Close) | None) => Some(Ending::CLOSED),
                 Next::Frame(Ok(ControlFrame::Notification(notification))) => {
@@ -685,6 +768,21 @@ impl View {
     }
 
     async fn response(&mut self, response: Response) -> Option<Ending> {
+        if self.launch_reads.contains_key(&response.request_id) {
+            return self.launch_surface_answered(response).await;
+        }
+        if let Some(reply) = self.launches.remove(&response.request_id) {
+            let _ = reply.send(match response.outcome {
+                Outcome::Ok(value) => value.to_typed::<ShellLaunchResult>().map_err(|error| {
+                    CommandError::local_failure(format!(
+                        "The session's answer to the launch could not be read: {}",
+                        Shown::cbor(&error)
+                    ))
+                }),
+                Outcome::Error(refusal) => Err(CommandError::from(refusal)),
+            });
+            return None;
+        }
         if self.lease.owns(response.request_id) {
             let outcome = match response.outcome {
                 Outcome::Ok(value) => Ok(value),
@@ -1098,6 +1196,151 @@ impl View {
         } else {
             self.publish_state();
         }
+    }
+
+    /// Reads the launch surface on this view's link, which can hold the session's input: the read
+    /// says whether this view does, and the page's buttons are lit only on that.
+    ///
+    /// A worker that did not state that it serves the read is not asked.
+    async fn launch_surface(&mut self, reply: Reply<LaunchSurfaceAnswer>) -> Option<Ending> {
+        if self.serves_launch_surface == Some(false) {
+            let _ = reply.send(Ok(LaunchSurfaceAnswer::NotServed));
+            return None;
+        }
+        match self.ask_launch_surface().await {
+            Ok(request_id) => {
+                self.launch_reads.insert(
+                    request_id,
+                    LaunchRead {
+                        stage: LaunchReadStage::Asked,
+                        reply,
+                    },
+                );
+                None
+            }
+            Err(ended) => Some(ended),
+        }
+    }
+
+    async fn ask_launch_surface(&mut self) -> Result<RequestId, Ending> {
+        let params = ShellLaunchSurfaceParams {
+            session_id: self.session_id,
+        };
+        self.ask(Method::ShellLaunchSurface, &params).await
+    }
+
+    /// Takes the answer to a launch surface read, or to the read that tells a host that does not
+    /// serve it from a grant that lost its right.
+    ///
+    /// A host that does not list the read refuses it as it refuses any method it does not list,
+    /// `PERMISSION_DENIED`, and a grant that has lost its right is refused the same way. The two
+    /// are told apart by what the same right reads, `session.read`: where that is refused too the
+    /// refusal is the grant's and is the answer; where it is answered the read is asked once more,
+    /// and a second refusal means the host does not serve it. A worker that lists the read and is
+    /// of a release that does not serve it refuses it as an unsupported capability.
+    async fn launch_surface_answered(&mut self, response: Response) -> Option<Ending> {
+        let mut read = self.launch_reads.remove(&response.request_id)?;
+        let not_served = |refusal: &ProtocolError| {
+            matches!(
+                refusal.code,
+                ErrorCode::PermissionDenied | ErrorCode::UnsupportedCapability
+            )
+        };
+        let served = |value: ParamsValue| {
+            value
+                .to_typed::<ShellLaunchSurfaceResult>()
+                .map(|surface| LaunchSurfaceAnswer::Served { surface })
+                .map_err(|error| {
+                    CommandError::local_failure(format!(
+                        "The session's launch surface could not be read: {}",
+                        Shown::cbor(&error)
+                    ))
+                })
+        };
+        let step = match (read.stage, response.outcome) {
+            (LaunchReadStage::Probed, Outcome::Ok(_)) => Step::Ask(LaunchReadStage::AskedAgain),
+            (LaunchReadStage::Probed, Outcome::Error(refusal)) => {
+                Step::Say(Err(CommandError::from(refusal)))
+            }
+            (LaunchReadStage::Asked | LaunchReadStage::AskedAgain, Outcome::Ok(value)) => {
+                Step::Say(served(value))
+            }
+            (LaunchReadStage::Asked, Outcome::Error(refusal))
+                if refusal.code == ErrorCode::PermissionDenied =>
+            {
+                Step::Ask(LaunchReadStage::Probed)
+            }
+            (LaunchReadStage::AskedAgain, Outcome::Error(refusal)) if not_served(&refusal) => {
+                Step::Say(Ok(LaunchSurfaceAnswer::NotServed))
+            }
+            (LaunchReadStage::Asked, Outcome::Error(refusal))
+                if refusal.code == ErrorCode::UnsupportedCapability =>
+            {
+                Step::Say(Ok(LaunchSurfaceAnswer::NotServed))
+            }
+            (_, Outcome::Error(refusal)) => Step::Say(Err(CommandError::from(refusal))),
+        };
+        let stage = match step {
+            Step::Say(answer) => {
+                let _ = read.reply.send(answer);
+                return None;
+            }
+            Step::Ask(stage) => stage,
+        };
+        let asked = if stage == LaunchReadStage::Probed {
+            let params = SessionReadParams {
+                session_id: self.session_id,
+            };
+            self.ask(Method::SessionRead, &params).await
+        } else {
+            self.ask_launch_surface().await
+        };
+        match asked {
+            Ok(request_id) => {
+                read.stage = stage;
+                self.launch_reads.insert(request_id, read);
+                None
+            }
+            Err(ended) => Some(ended),
+        }
+    }
+
+    /// Presses a launch on this view's link. The session accepts it only from the connection whose
+    /// attachment holds its input, and refuses a quote of a prompt that has moved before anything
+    /// is typed; this view asks and says what the session answered.
+    async fn launch(&mut self, press: Press, reply: Reply<ShellLaunchResult>) -> Option<Ending> {
+        let params = press.for_session(self.session_id);
+        let request_id = self.next_id();
+        if !self
+            .mutation(request_id, Method::ShellLaunch, &params)
+            .await
+        {
+            return Some(self.lost());
+        }
+        self.launches.insert(request_id, reply);
+        None
+    }
+
+    /// Writes one read on the link without waiting for its answer.
+    async fn ask<T: serde::Serialize>(
+        &mut self,
+        method: Method,
+        params: &T,
+    ) -> Result<RequestId, Ending> {
+        let Ok(params) = ParamsValue::from_typed(params) else {
+            return Err(Ending::ended("This view's request could not be written."));
+        };
+        let request_id = self.next_id();
+        let request = Request {
+            request_id,
+            method: method.into(),
+            method_version: MethodVersion::V1,
+            params,
+        };
+        if !self.wire.send(&ControlFrame::Request(request)).await {
+            return Err(self.lost());
+        }
+        Ok(request_id)
     }
 
     /// Writes the detach, and leaves the link to close when the view is dropped: the worker

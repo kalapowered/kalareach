@@ -8884,3 +8884,148 @@ async fn kr_req_13_11_a_real_reader_is_launchable_at_its_prompt_and_not_after_a_
         shell.close().await;
     }
 }
+
+/// The identifier every recorded answer names its session by.
+const RECORDED_SESSION: &str = "00000000-0000-4000-8000-000000000001";
+
+/// Holds the agents a worker offers to the three a person is shown, drawn from packages written the
+/// way the catalogue's store extracts one.
+fn offering_three_agents(wired: &Wired, root: &std::path::Path) {
+    use kr_worker::broker::connectors::fixture;
+    let package = |shape: &fixture::Shape| {
+        fixture::package(root, std::path::Path::new(fixture::FORWARDER), shape)
+            .expect("the package is written")
+    };
+    let refused = wired._service.connector_sources().replace(vec![
+        package(&fixture::Shape::claude_code()),
+        package(&fixture::Shape::codex_backend()),
+        package(&fixture::Shape::gemini_cli(&[])),
+    ]);
+    assert!(refused.is_empty(), "{refused:?}");
+}
+
+/// Adds the answer `surface` to `recorded` under `name`, naming the session by the recorded
+/// identifier.
+fn recorded_as(
+    recorded: &mut serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    surface: &kr_protocol::root::ShellLaunchSurfaceResult,
+) {
+    let mut answer = serde_json::to_value(surface).expect("the answer serialises");
+    answer["session_id"] = serde_json::Value::from(RECORDED_SESSION);
+    recorded.insert(name.to_owned(), answer);
+}
+
+/// KR-REQ-13.11: the answers the companion's page is drawn from are the ones a worker gives. Each
+/// state a companion can meet is reached on a real worker whose reader is scripted, and what the
+/// worker answered is held against the answers the page's host serves, so a change in what a worker
+/// says cannot reach a person's screen unseen. `KR_WRITE_FIXTURES=1` records them again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_13_11_the_answers_recorded_for_the_page_are_the_ones_a_worker_gives() {
+    let root = std::env::temp_dir().join(format!("kr-launch-answers-{}", kr_ipc::new_uuid()));
+    std::fs::create_dir_all(&root).expect("a directory for the packages");
+    let mut recorded = serde_json::Map::new();
+
+    let mut wired = wired().await;
+    offering_three_agents(&wired, &root);
+    let mut mine = surface_client(&wired).await;
+    let mut theirs = surface_client(&wired).await;
+
+    // The reader is at a prompt and nobody holds the keys, so no fence stands.
+    wired
+        .bridge
+        .send_event(enter(wired.session_id, 1, 1))
+        .await
+        .expect("enters");
+    let _ = settled(&mut wired).await;
+    recorded_as(
+        &mut recorded,
+        "free_no_fence",
+        &surface_over(&mut theirs, wired.session_id).await,
+    );
+
+    // This connection takes the keys, and the reader proves its queues at that prompt.
+    let holder = holder_over(&mut mine, &wired).await;
+    let fence_id = asked_for_a_fence(&mut wired).await;
+    wired
+        .bridge
+        .answer(kr_protocol::ids::RequestId::new(0), drained(1, 1, fence_id))
+        .await
+        .expect("acknowledges");
+    let _ = published(&mut wired).await;
+    recorded_as(
+        &mut recorded,
+        "verified_held_here",
+        &surface_over(&mut mine, wired.session_id).await,
+    );
+    recorded_as(
+        &mut recorded,
+        "verified_held_elsewhere",
+        &surface_over(&mut theirs, wired.session_id).await,
+    );
+
+    // A key typed after the fence was proved.
+    type_keys(&wired, holder, 0, b"x");
+    recorded_as(
+        &mut recorded,
+        "changed_since_fence",
+        &surface_over(&mut mine, wired.session_id).await,
+    );
+
+    // A launch the reader is deciding.
+    let _ = fenced(&mut wired, 2, 1).await;
+    let surface = surface_over(&mut mine, wired.session_id).await;
+    let (generation, revision, _) = verified_numbers(&surface);
+    let calling = pressing(
+        mine,
+        wired.target(),
+        launch_quoting(&wired, generation, revision, &["claude"]),
+    );
+    let request = the_reader_is_asked(&mut wired).await;
+    recorded_as(
+        &mut recorded,
+        "launch_in_progress",
+        &surface_over(&mut theirs, wired.session_id).await,
+    );
+    the_reader_installs(&mut wired, &request, generation, revision).await;
+    let (mut mine, outcome) = calling.await.expect("joins");
+    outcome.expect("the reader installed it");
+
+    // The reader leaves the prompt for an application.
+    the_reader_leaves(&mut wired, 2).await;
+    recorded_as(
+        &mut recorded,
+        "not_at_prompt",
+        &surface_over(&mut mine, wired.session_id).await,
+    );
+    wired.close().await;
+
+    // A session that runs a stock shell, whose editor is not the host's to see.
+    let wired = wired_with(ShellMode::NativeCompat, false).await;
+    offering_three_agents(&wired, &root);
+    let mut client = surface_client(&wired).await;
+    recorded_as(
+        &mut recorded,
+        "stock_shell",
+        &surface_over(&mut client, wired.session_id).await,
+    );
+    wired.close().await;
+    let _ = std::fs::remove_dir_all(&root);
+
+    let answers = serde_json::to_string_pretty(&serde_json::Value::Object(recorded))
+        .expect("serialises")
+        + "\n";
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/shell-launch/answers.json");
+    if std::env::var_os("KR_WRITE_FIXTURES").is_some() {
+        std::fs::create_dir_all(path.parent().expect("a directory")).expect("the directory");
+        std::fs::write(&path, &answers).expect("the answers are recorded");
+        return;
+    }
+    let held = std::fs::read_to_string(&path).unwrap_or_default();
+    assert!(
+        held == answers,
+        "the page is drawn from answers a worker no longer gives; set KR_WRITE_FIXTURES=1 to record \
+         them again:\n{answers}"
+    );
+}

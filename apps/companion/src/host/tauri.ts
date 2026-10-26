@@ -97,27 +97,6 @@ function listening<T>(event: string, listener: (payload: T) => void): Promise<()
   })
 }
 
-/**
- * The refusal for an operation this build has no agreed shape for.
- *
- * `UNSUPPORTED_SCHEMA` is the protocol's own word for two builds that do not share a contract, and
- * that is exactly the situation: the interface can draw the screen, and this build cannot state
- * the request. Refusing here keeps a half-formed request off the wire.
- */
-class NoAgreedShape extends Error {
-  readonly code = 'UNSUPPORTED_SCHEMA'
-  readonly user_action = 'update'
-
-  constructor(operation: string) {
-    super(`this host and this application do not share a contract for ${operation}`)
-    this.name = 'NoAgreedShape'
-  }
-}
-
-function noAgreedShape(operation: string): Promise<never> {
-  return Promise.reject(new NoAgreedShape(operation))
-}
-
 /** What the backend publishes for one host event. */
 interface PublishedEvent {
   /** The environment of the host it came from. */
@@ -244,8 +223,7 @@ export function tauriPort(): HostPort {
     environmentCapabilitiesCheck: (params) =>
       mutate('environment_capabilities_check', params, {}),
 
-    launchSurface: () => noAgreedShape('the launch surface'),
-    shellLaunch: (params, subject) => mutate('shell_launch', params, subject),
+    launchSurface: (params) => read('launch_surface', params),
 
     // The agent's calls go to the session's own worker, which native code reaches and which checks
     // this device's rights itself. A mutation names its session, instance and binding revision in
@@ -347,6 +325,8 @@ export function tauriPort(): HostPort {
         move: (next) => call<undefined>('terminal_view_move', { view, ...viewMoveArguments(next) }),
         // The person's input goes in the shape native code reads, and nothing else is sent.
         input: (next) => call<undefined>('terminal_view_input', { view, input: next }),
+        launchSurface: () => call('terminal_view_launch_surface', { view }),
+        launch: (press) => call('terminal_view_launch', { view, press }),
         close: () => call<undefined>('terminal_view_close', { view })
       }
     },
