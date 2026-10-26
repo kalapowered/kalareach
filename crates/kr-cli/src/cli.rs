@@ -1358,7 +1358,9 @@ pub struct PolicyArguments {
     /// wait refuses, or the terminal's when no owner device is left whose grant could confirm, so
     /// it comes after this command unless the terminal can end it. A host that is exclusively
     /// organisation-managed cannot withdraw its last enrolment until exclusive management has
-    /// ended.
+    /// ended. A host that reads an authority feed refuses the confirmation until a pass since it
+    /// started has read the feed and carried out again what it shows completed; run the command
+    /// again once `kr doctor` no longer says so.
     #[arg(long, required = true)]
     pub confirm: bool,
     /// The environment.

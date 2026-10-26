@@ -218,6 +218,10 @@ struct Shared {
     #[cfg(feature = "testing")]
     wakes: AtomicU64,
     removed: AtomicBool,
+    /// Whether a pass of this run has read the feed through, compared its revision with the
+    /// registry's, caught up when the registry was behind and carried out again what the feed shows
+    /// completed. Held in memory only: a start begins without it.
+    compared: AtomicBool,
     /// The highest sequence of the feed up to which everything is settled, where a scan starts.
     settled_through: AtomicU64,
     /// Where a scan that stopped at the page limit goes on, or 0 when none is under way.
@@ -291,6 +295,7 @@ impl FeedRuntime {
                 #[cfg(feature = "testing")]
                 wakes: AtomicU64::new(0),
                 removed: AtomicBool::new(false),
+                compared: AtomicBool::new(false),
                 settled_through: AtomicU64::new(0),
                 scan_cursor: AtomicU64::new(0),
                 scan_unfinished: AtomicBool::new(false),
@@ -310,6 +315,15 @@ impl FeedRuntime {
     /// it, so the carrier has nothing left to ask.
     pub fn found_removed(&self) {
         self.shared.removed.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether this host has nothing left to learn from its feed in this run: a pass has read it
+    /// through, compared its revision with the registry's and carried out again what it shows
+    /// completed, or the feed removed this host and is read no more. A host that has not cannot
+    /// tell whether the registry it started on is behind the feed.
+    #[must_use]
+    pub fn has_compared_in_this_run(&self) -> bool {
+        self.shared.compared.load(Ordering::SeqCst) || self.shared.removed.load(Ordering::SeqCst)
     }
 
     /// The origin this carrier reads.
@@ -1106,9 +1120,13 @@ async fn pass(
             // issued. This scan is no synchronisation: a connection that waits for one waits for
             // that scan, and so is not served before those requests are carried out.
             if put_off {
+                shared.compared.store(true, Ordering::SeqCst);
                 return Ok(Pass::More);
             }
         }
+        // The feed is read through, the registry is level with it, and what it shows completed has
+        // been carried out again: the policy this host holds is no longer one it cannot place.
+        shared.compared.store(true, Ordering::SeqCst);
         if let Some(Undecided { refusal, .. }) = undecided {
             // The refusal and the catch-up are done, and what the feed shows complete is carried
             // out again, but for what waits. A pass that could not judge a request is no

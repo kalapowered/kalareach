@@ -7057,11 +7057,15 @@ cannot withdraw its last enrolment until exclusive management has ended, so on s
 terminal ends it first where it can, and otherwise the confirmation comes first. The bound has no
 command. When it lapses the host refuses remote access under a personal grant until it next
 synchronises, and the bound stays. The call is refused while the host knows it is behind its feed,
-with or without a wait standing. A host that reads a feed and has not reached it since it started
-does not know. A confirmation then ends the wait, and the host serves remote devices from the
-registry as restored, a device that an owner revoked through the feed after the copy among them,
-until the first pass that reads the feed finds the restore again and raises the wait. The host
-keeps no record of the call: asked again after a lost reply it answers that it lifted nothing. The
+with or without a wait standing. While a wait stands it is also refused on a host that reads a feed
+until a pass of this run has read the feed through, compared its revision with the registry's, caught
+up when the registry was behind and carried out again what the feed shows completed. Until then the
+registry is the restored one, and a device an owner revoked through the feed after the copy is live
+in it; a confirmation would end the refusal that holds it back. The refusal says so, the doctor's
+`restored-policy` check says it until a pass has read the feed, and the host asks again by itself.
+A host that cannot reach its feed is confirmed by taking `authority.origin` out of the configuration
+document and starting the daemon again; a host whose feed removed it reads no more and is confirmed
+at once. The host keeps no record of the call: asked again after a lost reply it answers that it lifted nothing. The
 call is asked again under the record's lock for the registration and the deadline it was accepted
 under, because it can wait there behind a finding. No owner
 device can make it, since the wait refuses every owner device, and a ceremony would need a new
