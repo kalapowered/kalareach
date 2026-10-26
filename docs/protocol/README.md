@@ -857,10 +857,11 @@ to a device it controls. The member's client asks the service for a lease naming
 `fixtures/crypto/organisation.json` publishes a signed chain, its head and two device-bound leases,
 with the negative cases a verifier must reject.
 
-The first revision of a chain signs itself and names no predecessor, which is what a host pins.
-Every later revision names the revision whose key signed it, so a host walks forward from the
-revision it pinned without being told which key to trust. Any prefix of a chain verifies on its
-own, so the head statement is what says the chain is complete.
+The first revision of a chain signs itself and names no predecessor. A host that enrols verifies
+the whole chain once, from that first link, and pins the link of the revision signing then, which
+is its anchor. Every later revision names the revision whose key signed it, so a host walks forward
+from the anchor, and from each later anchor it keeps, without being told which key to trust. Any
+prefix of a chain verifies on its own, so the head statement is what says the chain is complete.
 
 `PolicyAuthority::check_structure` makes every check that needs neither a signature nor the clock:
 ordering, succession, activation times, that the head names the last revision, and that it was not
