@@ -325,13 +325,6 @@ pub struct Waits {
     /// waits by a timer of its own that nothing releases, so that a suite reading the order of the
     /// carriers' waits meets only theirs.
     pub reader_shares_the_timer: bool,
-    /// A socket held on the address a daemon that was shut down had bound, taken once the daemon's
-    /// own socket has closed and let go of right before the next daemon, which names the same
-    /// address, registers its network and binds it. Another socket of the machine can be given the
-    /// port in the moment before it is taken, and in the work registering does before it binds; the
-    /// hold shortens that window and does not remove it. It is left empty when the address is not
-    /// free in time.
-    pub address_held: Arc<std::sync::Mutex<Option<std::net::UdpSocket>>>,
 }
 
 impl Host {
@@ -529,7 +522,6 @@ impl Host {
             Waits {
                 timer: Some(timer),
                 reader_shares_the_timer: false,
-                ..Waits::default()
             },
         )
         .await;
@@ -577,7 +569,6 @@ impl Host {
             Waits {
                 timer: Some(timer),
                 reader_shares_the_timer: true,
-                ..Waits::default()
             },
         )
         .await;
@@ -657,7 +648,6 @@ impl Host {
             Waits {
                 timer: Some(timer),
                 reader_shares_the_timer: false,
-                ..Waits::default()
             },
         )
         .await;
@@ -765,31 +755,6 @@ impl Host {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         drop(controller);
-        // The address the daemon was bound to stays held until the next one is about to bind it.
-        // The daemon's own socket may close a moment after it is let go of, so the address is
-        // taken as soon as it is free.
-        if let Some(address) = settings
-            .endpoint
-            .bind_addr
-            .filter(|address| address.port() != 0)
-        {
-            let held = loop {
-                match std::net::UdpSocket::bind(address) {
-                    Ok(socket) => break Some(socket),
-                    Err(error)
-                        if error.kind() == std::io::ErrorKind::AddrInUse
-                            && std::time::Instant::now() < deadline =>
-                    {
-                        tokio::time::sleep(Duration::from_millis(1)).await;
-                    }
-                    Err(_) => break None,
-                }
-            };
-            *waits
-                .address_held
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = held;
-        }
         Stopped {
             temp,
             room,
@@ -881,15 +846,6 @@ impl Host {
         let endpoint = environment.controller_endpoint().expect("an endpoint");
         let listener = Listener::bind(&endpoint).expect("binds the client endpoint");
         let clients = tokio::spawn(Arc::clone(&controller).serve_clients(listener));
-        // The address held for this daemon since the one before it let go of it is let go of right
-        // before the network is registered, which binds the endpoint.
-        drop(
-            waits
-                .address_held
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take(),
-        );
         // The endpoint configuration is this suite's own, so the network is registered here rather
         // than from the environment. The device keys live in memory and go with it.
         let network = net::register(
@@ -1160,7 +1116,7 @@ impl Stopped {
             secrets,
             clocks,
             boot,
-            waits,
+            ..
         } = self;
         let mut host = Host::start_on(
             temp,
@@ -1173,7 +1129,6 @@ impl Stopped {
             Waits {
                 timer: Some(timer),
                 reader_shares_the_timer,
-                address_held: waits.address_held,
             },
         )
         .await;
