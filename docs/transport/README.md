@@ -34,6 +34,22 @@ is explicit in the signed release matrix: deploy a backward-compatible network t
 that needs its new behaviour, and retain the compatible tier for the documented installed-client
 window.
 
+A host reads that matrix from the managed service (`GET /api/release-matrix`) when its daemon
+starts, every six hours after that, and when `kr doctor` finds the copy it holds older than fifteen
+minutes. It reads it only when `relay.origin` is the managed service, and it trusts it only when the
+signature verifies under the key the build pins. The key the service publishes beside the matrix
+proves nothing. The tier that serves a build is the first one, in the signed order, whose client
+range holds the build's package version, and the compatible tier is first.
+
+A build that no tier serves is refused two requests, with `UNSUPPORTED_CAPABILITY` and the paths
+that still work (a direct connection, a relay of your own, a discovery server of your own): a
+request for a new lease, and a pairing admission. Nothing else changes. A lease the host holds is
+refilled as before, so a route that works is never cut by a new revision; a revocation always
+reaches the service; a session, a worker, a grant, a direct or self-hosted route and an update are
+not touched. A matrix that does not verify, one that is older than the copy held, and a service that
+does not answer never refuse anything: the host keeps the copy it has, or, with none, asks nothing of
+the matrix.
+
 ## Endpoint configuration
 
 An endpoint is built from `presets::Minimal`, which sets the cryptographic provider and nothing
