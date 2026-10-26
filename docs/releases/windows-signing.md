@@ -34,15 +34,16 @@ Every identifier in that table is public. None of them is a secret, none of them
 and knowing all of them gets nobody a signature: the trust is in the federated subject below, not in
 the numbers.
 
-The profile issues a fresh certificate every three days, valid for those three days and no longer.
+The profile issues a fresh certificate every day, each valid for three days and no longer.
 A signature made under it keeps verifying after that certificate has expired because it carries an RFC 3161
 timestamp proving the certificate was valid when the signature was made; a timestamp is no promise that a
 verifier accepts the signature after a later revocation or a later change of what it trusts. Which is why an executable or
 PowerShell script here is never signed without a timestamp, and why the gate refuses one that is.
 
 The certificates chain to the `Microsoft Identity Verification Root Certificate Authority 2020`,
-which is included in the Microsoft Trusted Root Certificate Program, so Windows accepts them with
-nothing installed. Timestamps come from `Microsoft Public RSA Time Stamping Authority` and chain
+which Windows trusts, so it accepts them with nothing installed (Microsoft's documentation says the
+Artifact Signing certificate authorities are no longer in its Trusted Root Program and remain on the
+Windows Platform Trust List, which a verifier that uses another list may not follow). Timestamps come from `Microsoft Public RSA Time Stamping Authority` and chain
 through `Microsoft Public RSA Timestamping CA 2020` to the same root. That is the chain observed
 when this was written, and Microsoft can change it, so each release's own record is what counts:
 `signtool verify /pa /v` prints the whole chain it walked, and `signatures.txt` records the signer
@@ -192,9 +193,10 @@ message carries the status and the reason. A chain ending in a root nobody trust
 so does a file that was altered after it was signed, because from the policy's side those are the same
 answer: this signature does not hold for this file.
 
-**wrong-publisher.** The signature is valid and trusted, but made by a publisher other than
-`CN=Kala Holdings Inc., O=Kala Holdings Inc., L=Newark, S=Delaware, C=US`. A trusted signature from
-another party has no business in this release.
+**wrong-publisher.** The signature was made by a publisher other than
+`CN=Kala Holdings Inc., O=Kala Holdings Inc., L=Newark, S=Delaware, C=US`. This is checked whether or
+not the signature is trusted, so an untrusted signature by another party is refused for both reasons.
+A trusted signature from another party has no business in this release.
 
 **untimestamped.** The file is signed and the signature is good, but nothing countersigned it. The
 certificate expires in three days and the signature dies with it. A file can be refused for this and
@@ -283,7 +285,7 @@ reference describes the format.
 
 ## Rotation and recovery
 
-The leaf certificates rotate themselves, every three days, with no human involved and nothing to do
+The leaf certificates rotate themselves, every day, with no human involved and nothing to do
 in this repository. Artefacts already signed keep verifying after the certificates expire because they are timestamped.
 
 Responsibility is divided across three roles:
@@ -343,7 +345,10 @@ run is suspected, or signing access must be revoked immediately:
    - If unauthorized signatures were produced:
      - The Azure subscription owner immediately retires the compromised certificate profile (revoking
        the profile or requesting certificate revocation from Microsoft PKI Services) and provisions a
-       replacement certificate profile on the account once identity validation is confirmed.
+       replacement certificate profile on the account once identity validation is confirmed. A
+       revocation of one certificate covers only the code signed with that certificate, which is one
+       day's, so the owner revokes in the Azure portal each day's certificate that carries an
+       unauthorised signature, and the portal lists them.
      - The GitHub repository administrator deletes any compromised release draft or published release,
        purges published artefacts from distribution, and notifies downstream consumers.
 5. Treat the Apple signing credentials as leaked, whatever step 4 finds:
@@ -354,8 +359,9 @@ run is suspected, or signing access must be revoked immediately:
      notarising at once. The Apple developer account cannot revoke a Developer ID certificate: the
      owner asks Apple to revoke it by email to `product-security@apple.com`, saying that its private
      key is compromised, and creates a new Developer ID certificate in the account. Apple's revocation
-     stops users installing any app the old certificate signed, so each macOS release it signed has to
-     be signed again with the new certificate and published under a new tag.
+     stops users installing any app the old certificate signed, so each macOS release it signed that must
+     stay installable is released again from a new commit, under that commit's tag, signed with the new
+     certificate.
    - No macOS release is signed until the new certificate and notary key are in the new environment,
      and the old ones are never put there.
 6. Controlled restoration via identity and subject rotation (Required):
