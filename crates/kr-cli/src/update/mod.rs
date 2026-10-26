@@ -2771,8 +2771,7 @@ fn collect(
     (removed, not_removed)
 }
 
-/// KR-REQ-26.06: an error that keeps an update from looking for the releases nothing needs reaches
-/// its result, as a refusal to remove one does, and nothing is removed on a guess.
+/// What an update says of the releases it could not remove or could not look for.
 #[cfg(test)]
 mod collecting {
     use super::*;
@@ -2820,6 +2819,8 @@ mod collecting {
         }
     }
 
+    /// KR-REQ-26.06: a failure to read which release is current reaches the update's result, and no
+    /// release is removed on a guess.
     #[test]
     fn a_current_release_that_cannot_be_read_is_reported_and_nothing_is_removed() {
         let temp = tempfile::tempdir().expect("a directory");
@@ -2847,9 +2848,9 @@ mod collecting {
         }
     }
 
-    /// A release that cannot be removed for no program's sake is moved into the trash before the
-    /// refusal, and is told once, as that release: the sweep of the trash that follows its removal
-    /// does not tell it again as something left there.
+    /// KR-REQ-26.06: a release that cannot be removed for no program's sake is moved into the trash
+    /// before the refusal, and is told once, as that release: the sweep of the trash does not tell
+    /// it again as something left there.
     #[cfg(windows)]
     #[test]
     fn a_release_that_cannot_be_removed_is_reported_once() {
@@ -2897,6 +2898,8 @@ mod collecting {
         );
     }
 
+    /// KR-REQ-26.06: a failure to list the releases reaches the update's result, as a refusal to
+    /// remove one does.
     #[test]
     fn releases_that_cannot_be_listed_are_reported_and_nothing_is_removed() {
         let temp = tempfile::tempdir().expect("a directory");
