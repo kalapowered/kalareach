@@ -429,7 +429,9 @@ impl Page {
 
     /// Calls `command` as the page does, on a thread of its own, since its answer waits for the
     /// worker this test is driving. The call is made at once; the answer is waited for within
-    /// [`SOON`], so a product that never answers fails the case and does not hang it.
+    /// [`SOON`], so a product that never answers fails the case and does not hang it: the thread is
+    /// not one the test's runtime waits for when the case ends, as a blocking task would be, so it
+    /// stays where it is stuck and the case ends at the limit.
     fn call(
         &self,
         command: &str,
@@ -443,8 +445,9 @@ impl Page {
         );
         let window = self.window.clone();
         let command = command.to_owned();
-        let answered = tokio::task::spawn_blocking(move || {
-            tauri::test::get_ipc_response(
+        let (reply, answered) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let answer = tauri::test::get_ipc_response(
                 &window,
                 tauri::webview::InvokeRequest {
                     cmd: command,
@@ -456,13 +459,14 @@ impl Page {
                     invoke_key: tauri::test::INVOKE_KEY.to_owned(),
                 },
             )
-            .map(|answer| answer.deserialize().expect("an answer the page reads"))
+            .map(|answer| answer.deserialize().expect("an answer the page reads"));
+            let _ = reply.send(answer);
         });
         async move {
             tokio::time::timeout(SOON, answered)
                 .await
                 .expect("the page was answered within the limit")
-                .expect("joins")
+                .expect("the page's call ended without an answer")
         }
     }
 
