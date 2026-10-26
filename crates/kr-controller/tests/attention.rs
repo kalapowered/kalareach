@@ -203,17 +203,20 @@ async fn worker_on(
     }
 }
 
-/// A shell that outlasts any case: a session whose shell ends is closed, and what a case waits for
-/// must not depend on how long the machine took to place the programs.
+/// A shell that ends only when its session does: it reads the terminal and nothing is ever typed
+/// into it. A session whose shell ends is closed, and what a case waits for must not depend on how
+/// long the machine took to place the programs, so no time decides whether the shell is still
+/// there.
 #[cfg(unix)]
-const LASTING: &str = "sleep 600";
+const LASTING: &str = "cat";
 
 #[cfg(unix)]
 impl Worker {
     /// The session's worker started again over the journal this one kept: the old one takes no
     /// more connections, and a new one, at another endpoint, reads what the journal holds and goes
     /// on from it, as a worker that is started again for a session does. The old worker's session
-    /// stays live and keeps the links it already has, so its shell is one that outlasts the case.
+    /// stays live, and a shell that ended would write its closure into the journal the new worker
+    /// reads, so the shell is one that lasts as long as the session.
     async fn restarted(self) -> Self {
         let Self {
             _temp,

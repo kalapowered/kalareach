@@ -199,11 +199,15 @@ impl Gateway {
 
 impl Drop for Gateway {
     /// A case that fails before it reaches [`Self::finish`] leaves no server running: the same
-    /// ending is made here, on the runtime the case runs on.
+    /// ending is made here, on the runtime the case runs on. Only a multi-thread runtime can wait
+    /// for it, so a case on any other runtime ends its servers by [`Self::finish`].
     fn drop(&mut self) {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
+        if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+            return;
+        }
         let backends = Arc::clone(&self.backends);
         tokio::task::block_in_place(move || {
             let _ = backends.close();
