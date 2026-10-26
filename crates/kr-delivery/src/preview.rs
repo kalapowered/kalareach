@@ -606,6 +606,9 @@ mod tests {
         );
     }
 
+    /// KR-REQ-16.12, the part about the 1,800-byte inner limit: the limit holds for the complete
+    /// plaintext that is sealed, the envelope's metadata with the body, so a body under 1,800 bytes
+    /// whose plaintext is over it is refused as too large.
     #[test]
     fn the_inner_bound_covers_the_envelope_metadata_and_not_only_the_body() {
         // A body under 1,800 bytes whose complete plaintext is over it. Checking the body alone
@@ -665,6 +668,10 @@ mod tests {
         }
     }
 
+    /// KR-REQ-16.12, the part about the complete payload: the figure measured is the provider
+    /// document the gateway builds, after encryption and base64, which is larger than the request
+    /// body and than the room reserved for the registration token, and a small preview is inside
+    /// the 3,500-byte bound.
     #[test]
     fn the_payload_bound_is_measured_on_the_provider_document_the_gateway_builds() {
         let host = NotificationPreviewKeyPair::generate().expect("a keypair");
@@ -689,6 +696,10 @@ mod tests {
         );
     }
 
+    /// KR-REQ-16.12, the part about the complete payload: a preview whose plaintext is inside the
+    /// inner limit and whose shape is valid, and that seals into the two-kibibyte bucket, is
+    /// refused as over the 3,500-byte bound, and the same notice with its detail moved to a
+    /// referenced object fits.
     #[test]
     fn a_two_kibibyte_preview_is_refused_by_the_measured_payload_bound() {
         // A preview whose plaintext needs a two-kibibyte bucket does not fit a provider payload

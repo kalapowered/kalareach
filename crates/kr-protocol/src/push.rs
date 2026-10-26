@@ -1639,6 +1639,8 @@ mod tests {
         assert_eq!(PushUrgency::Deferred.apns_priority(), "5");
     }
 
+    /// KR-REQ-16.12, the part about the figures: the inner limit is 1,800 bytes, the complete
+    /// payload bound is 3,500, and the bound is exclusive: 3,499 is within it and 3,500 is not.
     #[test]
     fn the_payload_bounds_are_the_section_sixteen_figures() {
         assert_eq!(MAX_PREVIEW_PLAINTEXT_BYTES, 1_800);
