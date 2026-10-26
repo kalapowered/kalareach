@@ -151,7 +151,14 @@ the profile's estimate. The daemon reads the process's resident set every second
 runs a job and ends it past the ceiling, and the process ends a job itself when it passes the
 ceiling between tokens. A description whose job took the process past the ceiling stays published.
 The process is ended after it, and inference pauses with `memory_pressure` until the next load may
-happen.
+happen. A job that held its process past the ceiling without ever finishing is ended by the daemon's
+reading alone, publishes nothing, is not queued again, and pauses inference the same way.
+
+The service takes an owner's ceiling below 4 GiB and never one above it, and admits a profile only
+when its itemised cost fits under whichever ceiling is in force. No configuration setting carries
+an owner's ceiling in this build. No operating-system limit backs either figure: the daemon's
+reading and the process's own check are the whole mechanism, and the process says so when it
+starts.
 
 CPU-only is two settings rather than one. Zero GPU layers keeps every layer's weights on the
 processor; turning the library's *operation* offload off keeps the arithmetic there too, because the
@@ -161,11 +168,26 @@ Metal backend in whether or not it is wanted: its manifest enables that feature 
 rather than behind an option, so what makes this build CPU-only is the two settings rather than the
 absence of the backend from the binary.
 
-The description process's model thread runs at the background scheduling class each platform
-offers (`SCHED_BATCH` on Linux, the lowest ordinary thread priority elsewhere), and the process says
-which mechanism it applied when it starts. No
-IO class is applied in this build, and the qualification matrix records that rather than claiming
-it.
+The description process runs its model in the background class each platform offers. It sets the
+class and reads it back from the system, and what it reports when it starts is what the system
+holds, not what it asked for. A class the system does not hold is reported as not applied, with the
+reason.
+
+- **Linux:** the model thread takes `SCHED_BATCH` and the lowest niceness, and the lowest level of
+  the best-effort I/O class. Threads it starts inherit all three. The I/O class is the lowest
+  best-effort level and not the idle class, because a read of the weights at load under the idle
+  class can wait as long as the disk stays busy. An I/O scheduler that ignores priorities, such as
+  the `none` scheduler of most NVMe disks, keeps the class and acts on nothing.
+- **macOS:** the model thread takes the lowest ordinary thread priority, and the process takes the
+  throttled disk policy.
+- **Windows:** the whole process takes the idle priority class inside the system's background mode,
+  which also lowers its I/O priority to very low and its memory priority to the lowest. It is the
+  process and not the thread, because a thread that another thread starts begins at the normal
+  priority, and the compute threads of the model runtime are started by the thread that loads it.
+  The idle class is served only when nothing else wants the processor, so a machine that other
+  work keeps fully busy can answer the process later than the daemon waits for it, and the daemon
+  ends a process that does not acknowledge a cancellation in time.
+- **Other Unix systems:** the lowest ordinary thread priority, and no I/O class.
 
 ## The queue
 
@@ -392,6 +414,8 @@ Each session has a link. The control daemon opens a connection to the session's 
 A page of facts is applied under privacy mode's admission at the generation it was captured under, and dropped when none admits it. A job is registered as in flight under the same admission. Either the job is sent before privacy mode is published, in which case the change finds it and cancels it, or the job is never sent. A result is published under the admission too. When privacy mode is enabled, the thread that enabled it raises the fence of each session and deletes the rows in the store at once. The memory the service holds, which is its queue, its contexts and the pages waiting for the host, is cleared by a purge the host answers within two seconds. A purge that takes longer is reported as unavailable, and privacy mode's change is not complete until it has finished. A host that does not run owes privacy mode nothing.
 
 The host reads the memory, power and thermal conditions of the machine every ten seconds, on a thread of its own, because reading the state of the platform can start a program. A reading more than a minute old says nothing: every signal is then unqualified, and the policy pauses rather than trusting the last answer.
+
+Power and heat come from the facility each platform documents. On macOS, power comes from `pmset -g ps` and heat from the processor speed limit that `pmset -g therm` reports. On Linux, power comes from the kernel's power-supply class and heat from each thermal zone against its own first trip point. On Windows, power comes from the system's power-status call, which puts a machine with no battery on mains, and heat from the passive limit of each thermal zone's performance counters, the share of the processors' top speed the platform allows because of heat. The worst zone decides there, and a machine that lists no zone says nothing about heat. A platform with no reader says nothing about either: the policy treats that as battery for power and does not pause for heat.
 
 The description process is a child of the control daemon. It is located next to the executable of the worker. It is started when work is first due.
 
