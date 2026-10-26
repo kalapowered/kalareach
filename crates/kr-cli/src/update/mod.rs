@@ -605,6 +605,9 @@ pub enum Remains {
     /// Every release: the store could not say which exist or which one is current, so none was
     /// judged.
     Releases,
+    /// The directory the update unpacked the archive into, which is left in the store's staging
+    /// area.
+    Staging,
 }
 
 impl NotRemoved {
@@ -612,7 +615,7 @@ impl NotRemoved {
     fn document(&self) -> Document {
         let release = match &self.what {
             Remains::Release(release) => Some(crate::shown::release(release)),
-            Remains::Trash | Remains::Releases => None,
+            Remains::Trash | Remains::Releases | Remains::Staging => None,
         };
         Document::new()
             .with("release", release)
@@ -632,6 +635,10 @@ impl NotRemoved {
                 self.reason
             ),
             Remains::Releases => shown!("no release was removed: {}", self.reason),
+            Remains::Staging => shown!(
+                "the directory the update unpacked the archive into could not be removed: {}",
+                self.reason
+            ),
         }
     }
 }
@@ -1146,7 +1153,10 @@ pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Up
         &staging,
         check,
     );
-    let _ = remove_staging(&staging);
+    let staging_left = remove_staging(&staging).err().map(|error| NotRemoved {
+        what: Remains::Staging,
+        reason: shown!("{}: {}", Shown::root(&staging), Shown::io(&error)),
+    });
     let target = staged?;
     if target.release == source {
         // The release that is current is not an update to go on past a failed one with: the daemons
@@ -1173,7 +1183,7 @@ pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Up
             source,
             restarted,
             removed: Vec::new(),
-            not_removed: Vec::new(),
+            not_removed: staging_left.into_iter().collect(),
             carried: Vec::new(),
             unreached: Vec::new(),
             checked_only: check,
@@ -1186,7 +1196,7 @@ pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Up
         record.staged = Some(target.release.clone());
         record.write(&store)?;
     }
-    carry_out(
+    let mut updated = carry_out(
         &store,
         &update_lock,
         &mut record,
@@ -1195,7 +1205,9 @@ pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Up
         check,
         false,
     )
-    .await
+    .await?;
+    updated.not_removed.extend(staging_left);
+    Ok(updated)
 }
 
 /// `kr host rollback`: goes back to the release `to` names, or to the one this host was on before
