@@ -402,6 +402,7 @@ async fn a_copy_of_the_policy_that_cannot_be_read_is_a_wait_recorded_before_the_
         .expect("the device is served once the person at this machine has confirmed");
 }
 
+#[derive(Debug)]
 struct NoWorkers;
 
 impl WorkerSupervisor for NoWorkers {

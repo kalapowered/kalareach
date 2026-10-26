@@ -853,6 +853,9 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         ("organisation.policy.apply", EffectClass::Write),
         ("organisation.exclusive.set", EffectClass::Write),
         ("organisation.withdraw", EffectClass::Write),
+        // The person at this machine confirms the policy a host found restored: the local socket
+        // alone, behind host management, as the rest of the group.
+        ("host.policy.confirm", EffectClass::Write),
     ];
     for (name, effect) in organisation {
         let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
@@ -875,6 +878,8 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         // exclusive management on or off is the owner's, whichever way it goes. Applying an
         // organisation's policy is the organisation's own statement, under the keys the owner
         // confirmed when enrolling, and it never enlarges what the host allows without one.
+        // Confirming a restored policy takes none: while its wait stands every owner device is
+        // refused, so none could be spent, and the case below states why that is allowed.
         let expected_confirmation =
             if matches!(name, "organisation.enrol" | "organisation.exclusive.set") {
                 ConfirmationRequirement::Always
@@ -883,7 +888,7 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
             };
         assert_eq!(
             entry.confirmation, expected_confirmation,
-            "{name} needs an owner confirmation exactly when it enlarges what the host answers to"
+            "{name} asks for an owner confirmation where the group's rule says it does"
         );
     }
 
