@@ -23,7 +23,7 @@ use crate::grants::restored::{self, Found, Kept, Owed, Target};
 macro_rules! feed_note {
     () => {
         "A host that reads an authority feed refuses the confirmation until a scan of this run has \
-         read the feed through and carried out, or settled, every record it holds, so that a \
+         read the feed through and written what it owes, so that a \
          device an owner revoked through the feed since the copy is not served by a confirmation \
          made earlier; this check says when that is still owed, and the host asks its feed again \
          by itself. Where a request waits for this host to decide who may manage it, because its \
@@ -153,7 +153,7 @@ fn the_refusal_while_the_wait_is_owed(owing: &Owing, file: &std::path::Path) -> 
     match owing {
         Owing::AScanThrough => format!(
             "this host reads an authority feed, and no scan of this run has read it through and \
-             carried out what it holds, so a device an owner revoked through the feed since the \
+             written what it owes, so a device an owner revoked through the feed since the \
              copy may be live in the registry and would be served once the wait ends; ask again \
              when `kr doctor` no longer says that a confirmation is refused until a scan has, for \
              the host asks its feed again by itself; {cost}"
@@ -183,7 +183,8 @@ fn the_refusal_while_the_wait_is_owed(owing: &Owing, file: &std::path::Path) -> 
             if owed.full {
                 said.push_str(
                     "; the list this host keeps is full, so more may be owed than it names: once \
-                     these are revoked it asks its feed again by itself and finds the rest",
+                     these are revoked a host that reads its feed asks it again by itself and finds \
+                     the rest",
                 );
             }
             if owed.every_owner {
@@ -196,13 +197,15 @@ fn the_refusal_while_the_wait_is_owed(owing: &Owing, file: &std::path::Path) -> 
 }
 
 /// What a write to the list of what a restored policy's wait owes came to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OwedWrite {
     /// The list stands as the change makes it, written or already so. `full` says that the cap
     /// kept an entry out.
     Kept {
         /// Whether the cap kept an entry out.
         full: bool,
+        /// The targets of the change's origin that the list did not hold before and holds now.
+        added: Vec<Target>,
     },
     /// No wait stands: nothing is written, so a scan that ends after a confirmation cannot bring
     /// the wait back at the next start.
@@ -374,13 +377,25 @@ impl Controller {
         if kept.known().is_none() {
             return Ok(OwedWrite::NoRecord);
         }
-        let change = restored::Change {
-            origin: restored::origin_digest(origin),
-            add,
-            clear,
+        let origin = restored::origin_digest(origin);
+        let change = restored::Change { origin, add, clear };
+        let held = |kept: &Kept| -> Vec<Target> {
+            kept.known().map_or_else(Vec::new, |known| {
+                known
+                    .owed
+                    .iter()
+                    .filter(|entry| entry.origin == origin)
+                    .map(|entry| entry.target)
+                    .collect()
+            })
         };
+        let before = held(&kept);
         let full = kept.keep(&change, liveness())?;
-        Ok(OwedWrite::Kept { full })
+        let added = held(&kept)
+            .into_iter()
+            .filter(|target| !before.contains(target))
+            .collect();
+        Ok(OwedWrite::Kept { full, added })
     }
 
     /// Lowers the most the list of what is owed holds, for a suite that fills it.
@@ -428,10 +443,9 @@ impl Controller {
     ///
     /// Returns a refusal while the host is still catching up with its feed, since the policy is
     /// not yet the one it will hold, and while a host that reads a feed has had no scan in this run
-    /// that read it through and carried out, or settled, every record it holds: a registry
-    /// restored from an earlier state serves the devices an owner revoked through the feed after
-    /// the copy until a scan carries that out again, and a confirmation would end the refusal that
-    /// holds them back. It returns the way the admission lapsed when it did, and an error when the
+    /// that read it through and wrote what it owes: a registry restored from an earlier state
+    /// serves the devices an owner revoked through the feed after the copy until a scan has found
+    /// them, and a confirmation would end the refusal that holds them back. It returns the way the admission lapsed when it did, and an error when the
     /// record cannot be removed: the wait stands then.
     pub(super) async fn confirm_the_restored_policy(
         &self,
@@ -510,31 +524,42 @@ impl Controller {
         if targets.is_empty() {
             return None;
         }
-        let owners: Vec<(kr_protocol::ids::DeviceId, kr_protocol::ids::GrantId)> = self
-            .devices
-            .devices()
-            .map(|devices| {
-                devices
-                    .into_iter()
-                    .filter(|record| {
-                        record.is_paired()
-                            && record.revoked_at_ms.is_none()
-                            && record
-                                .grant
-                                .actions
-                                .contains(&kr_protocol::rights::ActionRight::HostManage)
-                    })
-                    .map(|record| (record.device_id, record.grant.grant_id))
-                    .collect()
+        let records = self.devices.devices().unwrap_or_default();
+        let owners: Vec<(kr_protocol::ids::DeviceId, kr_protocol::ids::GrantId)> = records
+            .iter()
+            .filter(|record| {
+                record.is_paired()
+                    && record.revoked_at_ms.is_none()
+                    && record
+                        .grant
+                        .actions
+                        .contains(&kr_protocol::rights::ActionRight::HostManage)
             })
-            .unwrap_or_default();
+            .map(|record| (record.device_id, record.grant.grant_id))
+            .collect();
         let every_owner = !owners.is_empty()
             && owners.iter().all(|(device, grant)| {
                 targets.contains(&Target::Device(*device))
                     || targets.contains(&Target::Grant(*grant))
             });
+        // A pairing grant is revoked by revoking the device that holds it, and `kr share revoke`
+        // does not know it: the person is told the device.
+        let mut named: Vec<Target> = targets
+            .iter()
+            .map(|target| match target {
+                Target::Grant(grant) => records
+                    .iter()
+                    .find(|record| {
+                        record.grant.grant_id == *grant && record.revoked_at_ms.is_none()
+                    })
+                    .map_or(*target, |record| Target::Device(record.device_id)),
+                Target::Device(_) => *target,
+            })
+            .collect();
+        named.sort();
+        named.dedup();
         Some(OwedNow {
-            named: targets,
+            named,
             full: full_in_memory || held.len() >= most,
             every_owner,
         })
@@ -568,7 +593,8 @@ impl Controller {
                 self.wall_now_ms(),
             ) {
                 eprintln!(
-                    "kr-controller: could not write the record of the policy this host found                      restored: {error}"
+                    "kr-controller: could not write the record of the policy this host found restored: \
+                     {error}"
                 );
             }
         }
@@ -628,7 +654,7 @@ impl Controller {
             None => detail,
             Some(Owing::AScanThrough) => detail.stated(
                 "; a confirmation is refused until a scan of this run has read this host's \
-                 authority feed through and carried out what it holds, and none has yet",
+                 authority feed through and written what it owes, and none has yet",
             ),
             Some(Owing::Targets(owed)) => {
                 let detail = owed.named.iter().take(MOST_NAMED).fold(
@@ -656,13 +682,13 @@ impl Controller {
                     detail
                 };
                 if owed.every_owner {
-                    detail
-                        .stated(
-                            "; these are every owner device of this host, so revoking all of them \
-                         would leave no way to pair another: see the steps that keep one, \
-                         which end by removing the file of the record of the restore, named ",
-                        )
-                        .path(&restored::file_beside(&self.paths().registry_database()))
+                    detail.stated(
+                        "; these are every owner device of this host, so revoking all of them \
+                         would leave no way to pair another: the remedy gives the steps that keep \
+                         one, which remove the file `restored-policy.cbor` beside the registry \
+                         database, and the refusal of `kr host policy --confirm` gives its full \
+                         path",
+                    )
                 } else {
                     detail
                 }
@@ -891,7 +917,10 @@ mod tests {
                 .keep_the_list("feed", &[a_device(1)], &[], || |_: &Target| true)
                 .await
                 .expect("answered"),
-            OwedWrite::Kept { full: false }
+            OwedWrite::Kept {
+                full: false,
+                added: vec![a_device(1)]
+            }
         );
         let Found::Record(held) = restored::read(&file) else {
             panic!("the record is there");

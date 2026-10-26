@@ -605,6 +605,13 @@ impl Feed {
             .retain(|_, record| record.settled_at_ms.is_none());
     }
 
+    /// The retention of one finished record ends: the feed drops it and keeps the rest.
+    pub(crate) fn forget_the_finished_record(&mut self, request_id: &str) {
+        self.records.retain(|_, record| {
+            !(record.settled_at_ms.is_some() && record.request_id == request_id)
+        });
+    }
+
     fn host(&self) -> &Host {
         self.host.as_ref().expect("the host row")
     }

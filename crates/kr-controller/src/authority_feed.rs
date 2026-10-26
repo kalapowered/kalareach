@@ -256,6 +256,57 @@ impl Owing {
     }
 }
 
+/// What this run has learned of which requests named which targets, kept for the life of the
+/// carrier and not emptied when a scan writes its list.
+///
+/// A scan clears an entry of the list when it settled every request that named it. A request the
+/// feed has since dropped is no longer there to be met, so the scan that meets only the requests
+/// left cannot tell that a dropped one named the same target; this keeps what the run met. An entry
+/// an earlier run wrote is never cleared by a scan at all, because nothing here says which requests
+/// wrote it: it leaves the list when its target is no longer live.
+#[derive(Debug, Default)]
+struct RunNames {
+    /// Each target a request at or below the cutoff named, with the sequences of those requests.
+    named: std::collections::BTreeMap<Target, std::collections::BTreeSet<u64>>,
+    /// The sequences a scan settled since the last finding.
+    settled: std::collections::BTreeSet<u64>,
+    /// The targets a write of this run added to the list.
+    added: std::collections::BTreeSet<Target>,
+}
+
+impl RunNames {
+    /// The requests at `sequence` name `targets`.
+    fn name(&mut self, sequence: u64, targets: &[Target]) {
+        for target in targets {
+            self.named.entry(*target).or_default().insert(sequence);
+        }
+    }
+
+    /// Of `candidates`, the targets this run added and every request of this run that named is
+    /// settled: the only ones a scan may take out of the list.
+    fn clearable(&self, candidates: &[Target]) -> Vec<Target> {
+        candidates
+            .iter()
+            .filter(|target| {
+                self.added.contains(target)
+                    && self
+                        .named
+                        .get(target)
+                        .is_some_and(|sequences| sequences.is_subset(&self.settled))
+            })
+            .copied()
+            .collect()
+    }
+
+    /// `targets` left the list: nothing is owed for them any more.
+    fn forget(&mut self, targets: &[Target]) {
+        for target in targets {
+            self.added.remove(target);
+            self.named.remove(target);
+        }
+    }
+}
+
 /// What the carrier shares with the daemon.
 struct Shared {
     client: AuthorityFeedClient,
@@ -298,6 +349,8 @@ struct Shared {
     findings_seen: AtomicU64,
     /// What the scan in hand owes.
     owing: Mutex<Owing>,
+    /// What every scan of this run met.
+    run_names: Mutex<RunNames>,
     /// Whether the cap kept an owed target out of the record, since the last finding.
     owing_full: AtomicBool,
     /// The highest sequence of the feed up to which everything is settled, where a scan starts.
@@ -327,9 +380,16 @@ impl Shared {
         self.owing.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn run_names(&self) -> std::sync::MutexGuard<'_, RunNames> {
+        self.run_names
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// The record at `sequence` is settled: what only it named is no longer owed by this scan.
     fn settle(&self, sequence: u64) {
         self.owing().settle(sequence);
+        self.run_names().settled.insert(sequence);
     }
 
     /// Whether a record at `sequence` is one the host holds and does not refuse for a ground a
@@ -362,7 +422,11 @@ fn handle_findings(shared: &Shared, controller: &Controller) -> bool {
         .lock()
         .unwrap_or_else(PoisonError::into_inner) = None;
     shared.scan_highest.store(0, Ordering::SeqCst);
-    *shared.owing() = Owing::default();
+    // What an earlier scan settled belonged to a registry that is gone. What it still owed stays
+    // owed, in memory until a scan has written it, so a removal that answers the first read of the
+    // new scan does not lose it.
+    shared.owing().settled.clear();
+    shared.run_names().settled.clear();
     shared.owing_full.store(false, Ordering::SeqCst);
     shared.read_through.store(false, Ordering::SeqCst);
     shared.finding_through.store(u64::MAX, Ordering::SeqCst);
@@ -384,12 +448,14 @@ async fn write_ahead(
     let cutoff = shared.finding_through.load(Ordering::SeqCst);
     let ahead = {
         let mut owing = shared.owing();
+        let mut run = shared.run_names();
         for record in records
             .iter()
             .filter(|record| record.sequence.get() <= cutoff)
         {
             let named = controller.named_targets_of(&record.request);
             if !named.is_empty() {
+                run.name(record.sequence.get(), &named);
                 owing.add(record.sequence.get(), named);
             }
         }
@@ -398,12 +464,15 @@ async fn write_ahead(
     if ahead.is_empty() {
         return Ok(());
     }
-    if let OwedWrite::Kept { full: true } = controller
+    if let OwedWrite::Kept { full, added } = controller
         .keep_what_is_owed(&shared.origin, &ahead, &[])
         .await
         .map_err(Stopped::local)?
     {
-        shared.owing_full.store(true, Ordering::SeqCst);
+        shared.run_names().added.extend(added);
+        if full {
+            shared.owing_full.store(true, Ordering::SeqCst);
+        }
     }
     Ok(())
 }
@@ -415,7 +484,10 @@ async fn write_ahead(
 async fn reconcile(shared: &Shared, controller: &Controller) -> std::result::Result<(), Stopped> {
     let (add, clear) = {
         let owing = shared.owing();
-        (owing.unsettled_in_order(), owing.cleared())
+        (
+            owing.unsettled_in_order(),
+            shared.run_names().clearable(&owing.cleared()),
+        )
     };
     if !controller.restored_policy_waits() {
         *shared.owing() = Owing::default();
@@ -427,7 +499,12 @@ async fn reconcile(shared: &Shared, controller: &Controller) -> std::result::Res
         .await
         .map_err(Stopped::local)?
     {
-        OwedWrite::Kept { full } => {
+        OwedWrite::Kept { full, added } => {
+            {
+                let mut run = shared.run_names();
+                run.added.extend(added);
+                run.forget(&clear);
+            }
             // A list the cap kept an entry out of is not the whole of what is owed: the scan keeps
             // what it met, for the confirmation to name, and does not count as read through.
             if !full {
@@ -510,6 +587,7 @@ impl FeedRuntime {
                 scan_highest: AtomicU64::new(0),
                 findings_seen: AtomicU64::new(0),
                 owing: Mutex::default(),
+                run_names: Mutex::default(),
                 owing_full: AtomicBool::new(false),
                 settled_through: AtomicU64::new(0),
                 scan_cursor: AtomicU64::new(0),
@@ -1659,10 +1737,21 @@ async fn settle(
     let noted_this = controller
         .authority_feed_record(record.request.request_id)
         .is_some_and(|held| held.request == record.request);
-    if shown_complete(record) || (acknowledged_by(record, shared.host_device_id) && !noted_this) {
+    if is_replayed(record, shared.host_device_id, noted_this) {
         return replay_a_record(shared, controller, record, latest).await;
     }
     settle_request(shared, controller, record, latest).await
+}
+
+/// Whether a record is carried out again before anything else is asked of it: the feed shows it
+/// complete, or shows this host acknowledged it, which a host does only after it carried the
+/// request out. A request the registry holds a note of is left to that note, which decides as it
+/// always did, unless the feed also shows the request refused: a refusal the feed holds beside this
+/// host's acknowledgement comes from another history of the registry, and is no reason to dismiss
+/// what the acknowledgement says was carried out.
+fn is_replayed(record: &AuthorityFeedRecord, host: DeviceId, noted_this: bool) -> bool {
+    shown_complete(record)
+        || (acknowledged_by(record, host) && (!noted_this || record.rejected.0.is_some()))
 }
 
 /// Carries out again a request the feed shows this host acknowledged, and, when the feed shows it
@@ -2020,6 +2109,78 @@ fn revision_record(
 mod tests {
     use super::*;
     use futures_util::FutureExt as _;
+
+    /// KR-REQ-24.15: a request this host acknowledged is carried out again before the registry's own
+    /// note of it is asked, also when the feed shows it refused: the acknowledgement says the host
+    /// carried it out, and a refusal beside it comes from another history of the registry. A note
+    /// decides only for a request the feed shows neither complete nor acknowledged by this host,
+    /// or acknowledged and not refused.
+    #[test]
+    fn a_request_the_feed_shows_acknowledged_is_carried_out_again_whatever_a_note_and_a_refusal_say()
+     {
+        use kr_protocol::pairing::RevocationTarget;
+        use kr_protocol::scalars::{Nullable, U64};
+        let host = DeviceId::new(kr_ipc::new_uuid());
+        let key = AuthorisationKeyPair::generate().expect("a key");
+        let request = kr_pairing::grants::sign_revocation_request(
+            &key,
+            RevocationRequestId::new(kr_ipc::new_uuid()),
+            DeviceId::new(kr_ipc::new_uuid()),
+            host,
+            RevocationTarget::Devices {
+                device_ids: [DeviceId::new(kr_ipc::new_uuid())]
+                    .into_iter()
+                    .collect::<kr_protocol::scalars::CanonicalSet<_>>(),
+            },
+            TimestampMs::new(1),
+        )
+        .expect("a signed request");
+        let record = |acknowledged_by: Option<(DeviceId, RevocationCompletion)>, rejected: bool| {
+            AuthorityFeedRecord {
+                sequence: U64::new(1),
+                request: request.clone(),
+                published_by: *key.public(),
+                published_at_ms: U64::new(1),
+                acknowledgement: Nullable(acknowledged_by.map(|(by, completion)| {
+                    RevocationAcknowledgement {
+                        request_id: request.request_id,
+                        host_device_id: by,
+                        authority_revision: AuthorityRevision::new(1),
+                        completion,
+                        acknowledged_at_ms: TimestampMs::new(1),
+                    }
+                })),
+                rejected: Nullable(rejected.then_some(RejectionReason::Superseded)),
+            }
+        };
+        let pending = RevocationCompletion::Pending {
+            pending_workers: U64::new(1),
+        };
+        let other = DeviceId::new(kr_ipc::new_uuid());
+        // (what the feed shows, whether the registry holds a note of this very request, replayed)
+        let table = [
+            (record(None, false), false, false),
+            (record(None, true), false, false),
+            (record(None, false), true, false),
+            (record(Some((other, pending)), false), false, false),
+            (record(Some((host, pending)), false), false, true),
+            (record(Some((host, pending)), false), true, false),
+            (record(Some((host, pending)), true), false, true),
+            (record(Some((host, pending)), true), true, true),
+            (
+                record(Some((host, RevocationCompletion::Complete)), false),
+                true,
+                true,
+            ),
+        ];
+        for (record, noted, replayed) in table {
+            assert_eq!(
+                is_replayed(&record, host, noted),
+                replayed,
+                "{record:?}, noted {noted}"
+            );
+        }
+    }
 
     /// KR-REQ-24.15: `kr doctor` says that revoking a device refuses its request only for a device
     /// that made a request that waits. A device that made a complete record held behind it is not

@@ -993,6 +993,16 @@ impl ServiceWeb {
         }
     }
 
+    /// The retention of one request the host finished with ends in every authority feed: that
+    /// record is dropped and the others stay.
+    pub fn the_feeds_drop(&self, request_id: kr_protocol::ids::RevocationRequestId) {
+        let request_id = serde_json::to_value(request_id).expect("an identifier");
+        let request_id = request_id.as_str().expect("an identifier is text");
+        for feed in self.state.lock().expect("the state").feeds.values_mut() {
+            feed.forget_the_finished_record(request_id);
+        }
+    }
+
     /// Backup storage is turned on or off by some other client.
     pub fn set_backup(&self, on: bool) {
         let mut state = self.state.lock().expect("the state");

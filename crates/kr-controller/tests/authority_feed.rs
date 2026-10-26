@@ -6066,7 +6066,7 @@ async fn revoking_the_requester_of_a_request_the_host_cannot_judge_does_not_end_
     assert!(rig.the_owner_confirms().await.lifted);
 }
 
-/// KR-REQ-24.15: a scan clears an entry of the list when it settles on evidence the request that
+/// KR-REQ-24.15: a scan clears an entry it wrote when it settles, on evidence, every request that
 /// named it, so a device a forged request named does not stay owed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_scan_clears_the_entries_of_the_records_it_settled() {
@@ -6078,26 +6078,7 @@ async fn a_scan_clears_the_entries_of_the_records_it_settled() {
     let key = AuthorisationKeyPair::generate().expect("a key");
     let request = rig.request_of(&key, rig.owner_device(), 0xd5, devices(target.1.device_id));
     rig.published_as(&key, &request).await;
-    let origin = restored::origin_digest(rig.served.origin());
-    let target_id = target.1.device_id;
-    let rig = rig
-        .restarted(false, |tree| {
-            restored::write(
-                &restored::file_beside(&tree.environment().registry_database()),
-                &restored::Record {
-                    owed: vec![restored::Owed {
-                        origin,
-                        target: restored::Target::Device(target_id),
-                    }],
-                    ..restored::Record::of(
-                        kr_protocol::scalars::Digest256::from_bytes([1; 32]),
-                        TimestampMs::new(1),
-                    )
-                },
-            )
-            .expect("a record");
-        })
-        .await;
+    let rig = rig.restarted(false, a_restore_was_found).await;
     rig.until_the_carrier_is_idle().await;
     assert_eq!(
         rig.held_as(&key, &request).await.rejected.0,
@@ -6106,8 +6087,81 @@ async fn a_scan_clears_the_entries_of_the_records_it_settled() {
     );
     assert!(
         rig.what_the_record_lists().is_empty(),
-        "and the entry it made is cleared"
+        "and the entry the scan wrote for it is cleared"
     );
+    assert!(rig.the_owner_confirms().await.lifted);
+}
+
+/// KR-REQ-24.15: a request the feed dropped after its retention keeps its target owed when another
+/// request that names the same target is settled: an entry leaves the list only when every request
+/// this run met that named it is settled, and an entry an earlier run wrote only when its target is
+/// no longer live. Otherwise a stranger could publish a request naming a device the person must
+/// revoke, have the host refuse it, and wait for the feed to drop the request that owed the device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_the_feed_dropped_keeps_its_target_owed_when_another_that_names_it_is_settled() {
+    let rig = Rig::start().await;
+    let victim = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.until_the_carrier_is_idle().await;
+    let earlier = a_copy_of_the_registry(&rig.host, "registry-before-the-owner.sqlite3");
+    let owner = rig
+        .pairs(&[ActionRight::HostManage, ActionRight::SessionView])
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    let key = owner.0.keys().authorisation.clone();
+    let withdrawal = rig.request_of(&key, owner.1.device_id, 0xc1, devices(victim.1.device_id));
+    rig.published_as(&key, &withdrawal).await;
+    rig.poll().await;
+    rig.until_the_revocation_is_acknowledged_to(&key, &withdrawal)
+        .await;
+    // A request that names the same device under the identity of an owner the host holds, signed by
+    // another key: the host refuses it on what the issuer's own record fixes.
+    let forger = AuthorisationKeyPair::generate().expect("a key");
+    let forged = rig.request_of(
+        &forger,
+        rig.owner_device(),
+        0xc3,
+        devices(victim.1.device_id),
+    );
+    rig.published_as(&forger, &forged).await;
+    rig.poll().await;
+    assert_eq!(
+        rig.held_as(&forger, &forged).await.rejected.0,
+        Some(RejectionReason::NoOwnerAuthority)
+    );
+
+    // The registry goes back to before the owner was paired: the withdrawal is a request of an
+    // owner the host does not know, and owes the device it names.
+    let rig = rig
+        .restarted(false, |tree| put_the_registry_back(tree, &earlier))
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    rig.until_the_carrier_is_idle().await;
+    assert!(
+        rig.what_the_record_lists()
+            .contains(&restored::Target::Device(victim.1.device_id)),
+        "the withdrawal owes the device"
+    );
+
+    // The retention of the withdrawal ends and the forged request stays: a scan that meets only the
+    // forgery settles it, and does not clear what the withdrawal owed.
+    rig.served.web().the_feeds_drop(withdrawal.request_id);
+    rig.poll().await;
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&victim.1.device_id.to_string()),
+        "the device stays owed: {refused:?}"
+    );
+
+    // A start after that keeps it too: nothing in the record says which request wrote the entry.
+    let rig = rig.restarted(false, |_| {}).await;
+    rig.until_the_carrier_is_idle().await;
+    rig.until_the_carrier_is_idle().await;
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&victim.1.device_id.to_string()),
+        "and so does a later run: {refused:?}"
+    );
+    rig.revokes_at_the_machine(victim.1.device_id).await;
     assert!(rig.the_owner_confirms().await.lifted);
 }
 

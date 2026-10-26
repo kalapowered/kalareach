@@ -248,7 +248,7 @@ pub fn read(file: &Path) -> Found {
     }
     if record.owed.len() > MOST_OWED || !record.owed.windows(2).all(|pair| pair[0] < pair[1]) {
         return Found::Unreadable(
-            "the list of what is owed is longer than it can be, or not sorted, or names an entry              twice"
+            "the list of what is owed is longer than it can be, or not sorted, or names an entry twice"
                 .to_owned(),
         );
     }
