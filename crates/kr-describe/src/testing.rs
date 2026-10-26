@@ -149,6 +149,10 @@ pub struct Script {
     pub ignore_token_ms: u64,
     /// The peak resident set a job reports, in bytes, in place of the process's own.
     pub peak_rss_bytes: Option<u64>,
+    /// How many bytes a job holds, each page written, for as long as it runs: what lets a test put
+    /// the process's real resident set past a ceiling. The job leaves a mark named `held` when the
+    /// memory is in place, for a test that sets the mark to wait for.
+    pub hold_bytes: u64,
     /// Whether a job answers with its result even when it was cancelled while it ran, as a model
     /// that does not look at its token would.
     pub produce_when_cancelled: bool,
@@ -231,6 +235,7 @@ impl Script {
         number("verify-ignore-token-ms", self.verify_ignore_token_ms);
         number("generate-ms", self.generate_ms);
         number("ignore-token-ms", self.ignore_token_ms);
+        number("hold-bytes", self.hold_bytes);
         if let Some(bytes) = self.peak_rss_bytes {
             parts.push(format!("peak-rss={bytes}"));
         }
@@ -310,6 +315,7 @@ impl Script {
                 "verify-passes-once-cancelled" => script.verify_passes_once_cancelled = true,
                 "generate-ms" => script.generate_ms = number()?,
                 "ignore-token-ms" => script.ignore_token_ms = number()?,
+                "hold-bytes" => script.hold_bytes = number()?,
                 "peak-rss" => script.peak_rss_bytes = Some(number()?),
                 "wedge-input-after" => script.wedge_input_after = Some(number()?),
                 "wedge-output-from" => script.wedge_output_from = Some(number()?),
@@ -480,6 +486,12 @@ impl Model for StubModel {
         );
         if self.script.ignore_token_ms > 0 {
             std::thread::sleep(Duration::from_millis(self.script.ignore_token_ms));
+        }
+        // Held to the end of the job, and written so that each page is resident.
+        let held = vec![0xA5_u8; usize::try_from(self.script.hold_bytes).unwrap_or(0)];
+        std::hint::black_box(&held);
+        if !held.is_empty() {
+            self.began("held");
         }
         let duration = (!self.script.generate_until_cancelled)
             .then(|| Duration::from_millis(self.script.generate_ms));
