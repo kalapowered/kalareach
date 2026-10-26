@@ -1,8 +1,8 @@
-endpoint=/tmp/kr-record-tmp/kr-f4e614b8/launch/a-e41c28fa9d36.sock
-profile=lp-1792936668444-51d2935b-2e7e-468b-a661-1ab165d3e60b
-instance=6efc2f1a-e816-4784-8edd-39760c92ab60
-pid=1156700
-start=283842336
-credential=/tmp/kr-record-tmp/kr-f4e614b8/launch/credential
-release=0.77.0+3cbf09bcf55f
+endpoint=/tmp/kr-record-tmp/kr-3fa3ce3a/launch/a-8388babaf84c.sock
+profile=lp-1793006786308-9be6a3d2-feb9-470f-9a31-23400332fa1d
+instance=8d7f9033-0f4f-4157-8804-ffa52fa988d6
+pid=632752
+start=290854122
+credential=/tmp/kr-record-tmp/kr-3fa3ce3a/launch/credential
+release=0.77.0+b8c5badcd5c9
 framing=json_lines
