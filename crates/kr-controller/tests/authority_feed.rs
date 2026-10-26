@@ -1241,6 +1241,138 @@ async fn the_wait_outlives_a_restart_with_the_feed_down_up_or_unchosen() {
     drop(served);
 }
 
+/// KR-REQ-24.15: a confirmation made before any pass of this run has read the feed would serve the
+/// registry as restored, and a device an owner revoked through the feed after the copy is live in
+/// it. The host that reads a feed refuses the confirmation until a pass has read the feed through
+/// and carried out again what it shows; the device the feed revoked then stays refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_confirmation_is_refused_until_a_pass_of_this_run_has_read_the_feed() {
+    let (
+        Restorable {
+            rig,
+            revoked,
+            kept,
+            earlier,
+            ..
+        },
+        earlier_mirror,
+    ) = a_policy_the_registry_will_lose().await;
+    // The finding is written down, and the registry cannot take the revocation of the device the
+    // restore brought back, so nothing is carried out and the registry stays behind its feed.
+    let rig = rig
+        .restarted(false, |tree| {
+            put_the_registry_back(tree, &earlier);
+            put_the_mirror_back(tree, &earlier_mirror);
+            rusqlite::Connection::open(tree.environment().registry_database())
+                .expect("the registry opens")
+                .execute_batch(
+                    "CREATE TRIGGER refuse_revocation BEFORE UPDATE OF revoked_at_ms
+                         ON network_devices BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+                )
+                .expect("the fault is in place");
+        })
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    assert!(matches!(rig.the_record(), Found::Record(_)));
+
+    // The next start can write to the registry, and the feed cannot be reached: nothing in this
+    // run has compared the registry with the feed, and the device the feed revoked is live in it.
+    let rig = rig
+        .restarted(true, |tree| {
+            rusqlite::Connection::open(tree.environment().registry_database())
+                .expect("the registry opens")
+                .execute_batch("DROP TRIGGER refuse_revocation")
+                .expect("the fault is gone");
+        })
+        .await;
+    assert!(!rig.runtime().has_compared_in_this_run());
+    let refused = rig
+        .the_owner_tries_to_confirm()
+        .await
+        .expect_err("a confirmation before the host has read its feed in this run is refused");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(
+        refused.message.contains("authority feed"),
+        "and says why: {refused:?}"
+    );
+    assert!(
+        matches!(rig.the_record(), Found::Record(_)),
+        "the record stands"
+    );
+    let check = rig
+        .the_restored_policy_check()
+        .await
+        .expect("the doctor says the policy waits");
+    assert!(
+        check.detail().contains("until a pass has read"),
+        "and says the confirmation is held for the feed: {}",
+        check.detail()
+    );
+
+    // Passes go on until one reads the feed through: the feed's four refusals end, the registry
+    // takes the revocation, and the host catches up.
+    within("a pass reads the feed through", async {
+        while !rig.runtime().has_compared_in_this_run() {
+            rig.poll().await;
+        }
+    })
+    .await;
+    assert!(
+        rig.the_owner_confirms().await.lifted,
+        "once a pass has read the feed, the confirmation ends the wait"
+    );
+    assert_eq!(rig.the_record(), Found::Missing);
+    rig.serves(&kept.0, &kept.1)
+        .await
+        .expect("the device the feed did not revoke is served");
+    rig.connects_while_a_revocation_is_held(&revoked.0, &revoked.1)
+        .await;
+    assert!(
+        rig.the_restored_policy_check().await.is_none(),
+        "and the doctor no longer says the policy waits"
+    );
+}
+
+/// KR-REQ-24.15: a host whose feed removed it reads no more, so it has nothing to compare and its
+/// confirmation is not held for a pass that will not come.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_confirmation_is_not_held_for_a_feed_that_removed_the_host() {
+    let rig = Rig::start().await;
+    // A record that names no row this host holds is a wait at the next start, and the feed cannot
+    // be reached until the case says so.
+    let rig = rig
+        .restarted(true, |tree| {
+            restored::write(
+                &restored::file_beside(&tree.environment().registry_database()),
+                &restored::Record::of(
+                    kr_protocol::scalars::Digest256::from_bytes([1; 32]),
+                    TimestampMs::new(1),
+                ),
+            )
+            .expect("a record");
+        })
+        .await;
+    assert!(
+        rig.the_owner_tries_to_confirm().await.is_err(),
+        "the host has not read its feed in this run"
+    );
+    rig.remote
+        .remove(rig.feed())
+        .await
+        .expect("a key the host named removes the feed");
+    within("a pass finds the feed removed the host", async {
+        while !rig.runtime().has_compared_in_this_run() {
+            rig.poll().await;
+        }
+    })
+    .await;
+    assert!(rig.shown().await.removal_item.is_some());
+    assert!(
+        rig.the_owner_confirms().await.lifted,
+        "a feed that removed the host is read no more, so there is nothing to wait for"
+    );
+}
+
 /// KR-REQ-24.15: a host that cannot write the record of a restore does not carry anything out or
 /// move the registry; the pass ends with an error, the host stays behind its feed, and the next
 /// pass, once the file can be written, writes it and goes on.
