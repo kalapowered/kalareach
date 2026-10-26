@@ -472,6 +472,24 @@ jobs:
         shell: bash
         run: cargo build --locked --release -p kr-release
 
+      # A release is published only if the signed release matrix the managed service publishes lists a
+      # tier for the package version this commit carries: a host that runs the release reads the same
+      # matrix, and a matrix that lists no tier for it refuses that host a new lease on the managed
+      # relay service. A service that does not answer is asked again twice, a minute apart; a refusal
+      # is not asked again.
+      - name: The published release matrix lists this release
+        shell: bash
+        run: |
+          set -uo pipefail
+          cargo build --locked --release -p kr-release-matrix-check
+          for attempt in 1 2 3; do
+            target/release/kr-release-matrix-check --origin https://reach.kala.to && exit 0
+            code=$?
+            [ "$code" -eq 2 ] || exit "$code"
+            [ "$attempt" -lt 3 ] && sleep 60
+          done
+          exit 2
+
       # Each tree's files that carry a signature, set apart at the path they have in it. The
       # signing service signs these directories and nothing else of the tree.
       - name: Set apart the files each tree has signed
