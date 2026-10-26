@@ -43,6 +43,7 @@ use kr_protocol::scalars::{EndpointKey, U64};
 use kr_protocol::service::GatewayOrigin;
 use serde::{Deserialize, Serialize};
 
+use super::matrix::ReleaseGate;
 use super::relay::{ManagedRelayLeaseService, ServiceHttp, ServiceSigner};
 use super::{ServiceFuture, relay};
 use crate::error::ClientError;
@@ -257,6 +258,14 @@ impl ManagedPairingAdmission {
         }
     }
 
+    /// The same client, asking `gate` before it sends an admission request.
+    #[must_use]
+    pub fn gated_by(self, gate: Arc<ReleaseGate>) -> Self {
+        Self {
+            service: self.service.gated_by(gate),
+        }
+    }
+
     /// The origin this client addresses.
     #[must_use]
     pub const fn origin(&self) -> &GatewayOrigin {
@@ -267,6 +276,7 @@ impl ManagedPairingAdmission {
 impl PairingAdmissionService for ManagedPairingAdmission {
     fn admit<'a>(&'a self, request: &'a AdmissionRequest) -> ServiceFuture<'a, AdmissionAnswer> {
         Box::pin(async move {
+            self.service.when_the_gate_is_open()?;
             let body = RelayAdmissionIssueBody::of(request);
             let signing_input = body.signing_input()?;
             let data = self
