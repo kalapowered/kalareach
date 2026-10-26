@@ -110,8 +110,8 @@ export.
 
 A session is created from the session list, in a directory the person names, with its shell chosen
 first. A managed shell is the host's qualified package: Ctrl-D at an empty prompt detaches the view
-(PowerShell on Windows reports no such key), and the host reads the shell's editor, so it knows when
-the prompt is empty. A stock shell is the
+(PowerShell on Windows reports no such key, and in its Vi command mode Ctrl-D ends the shell
+instead), and the host reads the shell's editor, so it knows when the prompt is empty. A stock shell is the
 system's own, for compatibility: Ctrl-D does what the shell does and can close the session, and the
 editor is not read. Where the host describes a session's launch surface, a managed shell's launch
 buttons start an agent at the prompt, and a stock shell's show the command to type and start
