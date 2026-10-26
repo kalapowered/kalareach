@@ -20,21 +20,29 @@ use crate::grants::restored::{self, Found, Kept};
 
 /// What a person who finds the host refusing remote access for a restored policy does.
 const WAITS_REMEDY: &str = "Read what this host holds with `kr organisation list`, and end what \
-     you do not want in force with `kr organisation withdraw` and `kr device revoke`, which \
-     need no confirmation and work while this stands. Then run `kr host policy --confirm` at \
-     this machine. Until then no remote device is served, owner devices included, and the \
-     person at this machine is not refused. The policy is the restored one: confirming changes \
-     none of it. Ending exclusive organisation management takes an owner device's \
-     confirmation, which this wait refuses, so confirm first and end it afterwards.";
+     you do not want in force with `kr organisation withdraw`, `kr device revoke` and `kr share \
+     revoke`, which need no confirmation and work while this stands. Then run `kr host policy \
+     --confirm` at this machine. Until then no remote device is served, owner devices \
+     included, and the person at this machine is not refused. The policy is the restored one: \
+     confirming changes none of it. A host that reads an authority feed and has not reached it \
+     since it started cannot tell whether it is behind it, so confirm once it has: the wait \
+     comes back at the first pass that reads the feed and finds the host behind. Ending \
+     exclusive organisation management takes an owner device's confirmation, which this wait \
+     refuses, or the terminal's when no owner device is left that can confirm, so confirm \
+     first and end it afterwards.";
 
 /// As [`WAITS_REMEDY`], for a record of the restore that cannot be read.
 const UNREADABLE_REMEDY: &str = "Read what this host holds with `kr organisation list`, and end \
-     what you do not want in force with `kr organisation withdraw` and `kr device revoke`, \
-     which need no confirmation and work while this stands. Then run `kr host policy \
-     --confirm` at this machine, which removes the record that cannot be read. Until then no \
-     remote device is served, owner devices included, and `kr host update` to a release that \
-     lists the record's store is refused. Ending exclusive organisation management takes an \
-     owner device's confirmation, which this wait refuses, so confirm first and end it \
+     what you do not want in force with `kr organisation withdraw`, `kr device revoke` and `kr \
+     share revoke`, which need no confirmation and work while this stands. Then run `kr host \
+     policy --confirm` at this machine, which removes the record that cannot be read. Until \
+     then no remote device is served, owner devices included, and `kr host update` to a \
+     release that lists the record's store is refused when the update check cannot read the \
+     record either. A host that reads an authority feed and has not reached it since it \
+     started cannot tell whether it is behind it, so confirm once it has: the wait comes back \
+     at the first pass that reads the feed and finds the host behind. Ending exclusive \
+     organisation management takes an owner device's confirmation, which this wait refuses, or \
+     the terminal's when no owner device is left that can confirm, so confirm first and end it \
      afterwards.";
 
 impl Controller {

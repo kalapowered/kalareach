@@ -1125,13 +1125,15 @@ impl Controller {
         named_at.is_some_and(|named| place.is_none_or(|place| named < place))
     }
 
-    /// Raises or lifts one of the two refusals the feed puts on every remote grant, and when it
-    /// raises one, ends the links of the connections it reaches and waits for the writes to the
-    /// pairing records that were under way ([`Self::raise_a_feed_refusal`] and
-    /// [`Self::wait_for_the_confirmations_being_spent`]). The removal of the host is raised
-    /// without that wait ([`Self::refuse_the_grants_that_rest_on_the_feed`]).
+    /// Raises or lifts one of the refusals the feed puts on every remote grant, or the wait a
+    /// restored policy puts on them, and when it raises one, ends the links of the connections it
+    /// reaches and waits for the writes to the pairing records that were under way
+    /// ([`Self::raise_a_feed_refusal`] and [`Self::wait_for_the_confirmations_being_spent`]). The
+    /// removal of the host is raised without that wait
+    /// ([`Self::refuse_the_grants_that_rest_on_the_feed`]).
     ///
-    /// The callers are the carrier's one pass at a time.
+    /// The callers are the carrier's one pass at a time, and the confirmation of a restored
+    /// policy, which takes the record's lock first ([`super::restored_policy`]).
     pub(super) async fn move_a_feed_refusal(
         &self,
         bit: u8,
@@ -1146,7 +1148,7 @@ impl Controller {
         }
     }
 
-    /// Raises one of the two refusals the feed puts on every remote grant and ends the links of the
+    /// Raises one of the refusals the feed puts on every remote grant and ends the links of the
     /// connections it reaches, without the wait for the writes to the pairing records that were
     /// under way. Says whether it raised the refusal, which owes that wait; a refusal that already
     /// stood owes none.

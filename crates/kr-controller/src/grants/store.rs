@@ -2458,9 +2458,9 @@ impl GrantDirectory {
         }
     }
 
-    /// Whether the last read of this host's policy found the copy of it there and could not read
-    /// it. A registry put back to an earlier state is not noticed then, and the host answers by
-    /// waiting for the person at this machine ([`super::restored`]).
+    /// Whether a read of this host's policy in this run found the copy of it there and could not
+    /// read it. A registry put back to an earlier state is not noticed then, and the host answers
+    /// by waiting for the person at this machine ([`super::restored`]). Nothing clears it.
     #[must_use]
     pub fn mirror_unreadable(&self) -> bool {
         self.mirror_unreadable

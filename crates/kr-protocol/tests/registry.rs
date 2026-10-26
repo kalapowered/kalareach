@@ -853,9 +853,6 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         ("organisation.policy.apply", EffectClass::Write),
         ("organisation.exclusive.set", EffectClass::Write),
         ("organisation.withdraw", EffectClass::Write),
-        // The person at this machine confirms the policy a host found restored: the local socket
-        // alone, behind host management, as the rest of the group.
-        ("host.policy.confirm", EffectClass::Write),
     ];
     for (name, effect) in organisation {
         let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));

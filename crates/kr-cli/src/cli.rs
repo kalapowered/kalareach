@@ -1340,16 +1340,18 @@ pub enum HostCommand {
 /// `kr host policy`.
 ///
 /// A host that finds its authority feed holding a revision above its registry's knows the registry
-/// was put back to an earlier state. It carries out again what the feed shows completed, and then
-/// refuses every grant but the owner's at this machine, owner devices included, until the person at
-/// this machine confirms the policy it holds: the enrolments, the exclusive management and the
-/// bounds the restored state brought back. The command shows what the host holds and confirms it.
+/// was put back to an earlier state. From then on it refuses every grant but the owner's at this
+/// machine, owner devices included, and it carries out again what the feed shows completed.
+/// Catching up does not end the refusal. It stands until the person at this machine confirms the
+/// policy the host holds, meaning the enrolments, the exclusive management and the bounds the
+/// restored state brought back. The command shows what the host holds and confirms it.
 #[derive(Args)]
 pub struct PolicyArguments {
     /// Confirm the policy this host holds. Nothing in it changes: end what you do not want in force
-    /// first, with `kr organisation withdraw` and `kr device revoke`, which need no confirmation.
-    /// Ending exclusive management takes an owner device's confirmation, which the wait refuses, so
-    /// it comes after this command.
+    /// first, with `kr organisation withdraw`, `kr device revoke` and `kr share revoke`, which need
+    /// no confirmation. Ending exclusive management takes an owner device's confirmation, which the
+    /// wait refuses, or the terminal's when no owner device is left that can confirm, so it comes
+    /// after this command.
     #[arg(long, required = true)]
     pub confirm: bool,
     /// The environment.
