@@ -446,6 +446,8 @@ impl Host {
         vec![
             ("PATH", "/usr/bin:/bin".to_owned()),
             ("TERM", "xterm-256color".to_owned()),
+            // The shell a session starts in when its command names none.
+            ("SHELL", "/bin/sh".to_owned()),
             ("HOME", self.home.display().to_string()),
             (
                 "KR_RUNTIME_DIR",
@@ -4727,4 +4729,169 @@ fn a_window_held_after_its_attachment_needs_one_key_and_one_whose_shell_exited_n
     );
     alone.wait_until_put_back("the terminal came back when the session closed");
     ended(&exited.root, "the shell that exited");
+}
+
+/// The value of a KDE configuration file's line as the file keeps it, back to the text it holds.
+fn kconfig_unescaped(value: &str) -> String {
+    let mut text = String::new();
+    let mut characters = value.chars();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            text.push(character);
+            continue;
+        }
+        match characters.next() {
+            Some('s') => text.push(' '),
+            Some('n') => text.push('\n'),
+            Some('t') => text.push('\t'),
+            Some('r') => text.push('\r'),
+            Some(other) => text.push(other),
+            None => text.push('\\'),
+        }
+    }
+    text
+}
+
+/// KR-REQ-01.21, KR-REQ-07.42: a new window opened through the Konsole profile creates a session,
+/// each time. The profile is installed with the real command, the command is read back out of the
+/// file Konsole reads and run exactly as it is stored, twice, in a real pseudo-terminal against one
+/// real control daemon, with `kr` in a directory whose name holds a space; the session list shows
+/// two live sessions, one attachment each.
+///
+/// The host is set up as a person sets it up: the shell mode through `kr host shell-mode`, the
+/// execution context through the configuration document, and the shell through the window's
+/// `SHELL`.
+#[test]
+fn a_new_window_through_the_konsole_profile_creates_a_session_each_time() {
+    use kr_shell_integration::host::terminal_profile::record::{PROFILE_WRITTEN, ProfileRecord};
+    use kr_shell_integration::host::terminal_profile::{
+        self as profile, ProfileHome, ProfileTerminal,
+    };
+
+    let host = Host::start();
+    host.kr_json(&["host", "shell-mode", "--set", "native_compat"]);
+    {
+        let environment = host.environment();
+        let writers =
+            kr_cli::barrier::hold_for_configuration(&environment).expect("the writers' lock");
+        let permit = kr_cli::barrier::permit(&writers, &kr_cli::doctor::configuration::WRITTEN)
+            .expect("a permit");
+        kr_cli::doctor::configuration::apply(
+            &environment,
+            &kr_protocol::hostinfo::configuration::Change::WorkerProfile(
+                kr_protocol::identity::WorkerProfile::HeadlessUser,
+            ),
+            &permit,
+        )
+        .expect("this host creates headless sessions");
+    }
+
+    // A `kr` in a directory whose name holds a space, as the macOS store's is, and Konsole standing
+    // in on the path of the person who installs.
+    let program_directory = host.root().join("kr dir");
+    std::fs::create_dir(&program_directory).expect("a directory");
+    for name in ["kr", "kr-attach-guard"] {
+        std::fs::copy(
+            support::command_binaries().join(name),
+            program_directory.join(name),
+        )
+        .expect("copies the program");
+    }
+    let programs = host.root().join("programs");
+    std::fs::create_dir(&programs).expect("a directory");
+    std::fs::write(programs.join("konsole"), b"#!/bin/sh\n").expect("Konsole stands in");
+    let places = ProfileHome::under(&host.home, vec![programs]);
+    let command: Vec<String> = [
+        program_directory.join("kr").to_str().expect("text"),
+        "new",
+        "--attach",
+        "--hold-on-failure",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    {
+        let paths = host.tree().paths();
+        let writers = kr_cli::barrier::hold(paths).expect("the writers' lock");
+        let permit = kr_cli::barrier::permit(&writers, &PROFILE_WRITTEN).expect("a permit");
+        let record = ProfileRecord::in_state_directory(paths.state_root());
+        let held = record.hold(&permit).expect("holds the record");
+        let plan =
+            profile::plan(ProfileTerminal::Konsole, &places, &command, None).expect("a plan");
+        profile::install(&held, &plan).expect("installs");
+    }
+
+    // What Konsole reads from the file is what the window runs.
+    let file = host.home.join(".local/share/konsole/KalaReach.profile");
+    let written = std::fs::read_to_string(&file).expect("the profile");
+    let stored = kconfig_unescaped(
+        written
+            .lines()
+            .find_map(|line| line.strip_prefix("Command="))
+            .expect("the profile holds a command"),
+    );
+    let open = || {
+        let window = Window::open(
+            &host,
+            &format!("{stored}; printf '\\nnew-%s-%s\\n' finished \"$?\"; IFS= read -r _"),
+        );
+        window.answered(0, window.answer_capability_queries(0));
+        window
+    };
+    let sessions_attached = |wanted: usize| -> Vec<Value> {
+        until(
+            "the sessions of the windows opened through the profile",
+            || {
+                let listed = host.kr_json(&["list"]);
+                let sessions = listed["sessions"]
+                    .as_array()
+                    .expect("a list of sessions")
+                    .clone();
+                (sessions.len() == wanted
+                    && sessions
+                        .iter()
+                        .all(|session| session["state"] == "live" && session["attachments"] == 1))
+                .then_some(sessions)
+            },
+        )
+    };
+
+    let first = open();
+    let one = sessions_attached(1);
+    let second = open();
+    let two = sessions_attached(2);
+    assert_ne!(
+        two[0]["session_id"], two[1]["session_id"],
+        "each window has a session of its own"
+    );
+    assert!(
+        two.iter()
+            .any(|session| session["session_id"] == one[0]["session_id"]),
+        "the first window's session is still there"
+    );
+
+    // Each window is closed with its session.
+    let workers: Vec<_> = two
+        .iter()
+        .map(|session| {
+            let id: SessionId = session["session_id"]
+                .as_str()
+                .expect("an identifier")
+                .parse()
+                .expect("a session identifier");
+            (id, host.worker_of(id))
+        })
+        .collect();
+    for (id, _) in &workers {
+        let closed = host.kr(&["close", &id.to_string()]);
+        assert!(
+            closed.status.success(),
+            "kr close: {}",
+            String::from_utf8_lossy(&closed.stderr)
+        );
+        host.wait_until_closed(&id.to_string());
+    }
+    for (_, worker) in &workers {
+        assert_eq!(worker_exit_status(worker), 0);
+    }
+    drop((first, second));
 }
