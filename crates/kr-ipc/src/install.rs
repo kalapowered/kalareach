@@ -2138,9 +2138,9 @@ impl Store {
         })?;
         // The trash is opened once, as a plain directory and without following a link, and the
         // release is moved into it and removed from it through that handle.
+        windows::at(windows::Moment::TrashChecked, &self.trash());
         let trash = windows::Trash::open(&self.trash())
             .map_err(|error| InstallError::io("open", self.trash(), error))?;
-        windows::at(windows::Moment::TrashChecked, &self.trash());
         let name = std::ffi::OsString::from(format!("{release}-{}", crate::new_uuid()));
         match trash.take(&directory, &name) {
             Ok(()) => {}

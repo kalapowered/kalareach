@@ -1628,7 +1628,6 @@ fn a_trash_made_a_junction_after_it_was_checked_takes_no_release_out_of_the_stor
 fn a_name_cannot_be_moved_out_of_a_release_between_its_open_and_its_removal() {
     use kr_ipc::install::removal_race;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     let _alone = HOOKED
         .lock()
@@ -1642,10 +1641,9 @@ fn a_name_cannot_be_moved_out_of_a_release_between_its_open_and_its_removal() {
     kr_ipc::install::seal_file(&directory.join("bin/sealed")).expect("a file is sealed");
     let outside = test.root.join("outside");
     std::fs::create_dir_all(&outside).expect("a folder elsewhere");
-    let moved = Arc::new(AtomicUsize::new(0));
-    let refused = Arc::new(AtomicUsize::new(0));
+    let tried: Arc<std::sync::Mutex<Vec<(String, bool)>>> = Arc::default();
     let root = test.root.clone();
-    let (to, kept, turned) = (outside.clone(), Arc::clone(&moved), Arc::clone(&refused));
+    let (to, note) = (outside.clone(), Arc::clone(&tried));
     removal_race::hook(Some(Arc::new(move |moment, at: &Path| {
         let name = at.file_name().and_then(|name| name.to_str()).unwrap_or("");
         let acts = matches!(
@@ -1654,10 +1652,10 @@ fn a_name_cannot_be_moved_out_of_a_release_between_its_open_and_its_removal() {
                 | (removal_race::Moment::AboutToGiveBack, "sealed")
         );
         if acts && at.starts_with(&root) {
-            match std::fs::rename(at, to.join(name)) {
-                Ok(()) => kept.fetch_add(1, Ordering::SeqCst),
-                Err(_) => turned.fetch_add(1, Ordering::SeqCst),
-            };
+            let moved = std::fs::rename(at, to.join(name)).is_ok();
+            note.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((format!("{moment:?} {name}"), moved));
         }
     })));
     let update = test
@@ -1669,9 +1667,16 @@ fn a_name_cannot_be_moved_out_of_a_release_between_its_open_and_its_removal() {
     let answer = test.store.retire(&one, &update);
     removal_race::hook(None);
 
+    let tried = tried
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
     assert_eq!(
-        (moved.load(Ordering::SeqCst), refused.load(Ordering::SeqCst)),
-        (0, 2),
+        tried,
+        [
+            ("Opened plain".to_owned(), false),
+            ("AboutToGiveBack sealed".to_owned(), false)
+        ],
         "both moves were tried and both were refused"
     );
     assert!(
