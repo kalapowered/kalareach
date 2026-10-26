@@ -122,6 +122,9 @@ kr-describe = { workspace = true, features = ["testing"] }
 # forgetting of a host acts on.
 kr-flush = { workspace = true, features = ["testing"] }
 kr-ipc = { workspace = true, features = ["testing"] }
+# The reference reader a managed session's bridge is scripted with, so that a press through a view
+# meets a real worker whose reader this suite answers.
+kr-shell-integration.workspace = true
 # The sync service the recovery suite talks to over loopback, answering as the Worker did when it
 # was recorded.
 kr-service-stand-in = { path = "../../../tests/support/service-stand-in" }

@@ -1299,6 +1299,7 @@ dependencies = [
  "kr-pairing",
  "kr-protocol",
  "kr-service-stand-in",
+ "kr-shell-integration",
  "kr-transport",
  "kr-width",
  "kr-worker",
