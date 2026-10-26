@@ -298,6 +298,11 @@ impl Terminal {
         self.lines.lock().expect("not poisoned").clone()
     }
 
+    /// How many lines the worker has forwarded to the terminal.
+    pub fn count(&self) -> usize {
+        self.lines.lock().expect("not poisoned").len()
+    }
+
     /// Writes one frame as the native terminal, which a response to the upstream's request is.
     ///
     /// # Panics
@@ -579,6 +584,26 @@ impl Observing {
         self.sender
             .send(frame.to_string())
             .expect("the upstream is running");
+    }
+
+    /// Sends the worker one frame, as the upstream, and waits until the worker has forwarded it to
+    /// the terminal.
+    ///
+    /// A case that sends frames in bulk sends them this way. The worker queues what it forwards to
+    /// the terminal under a bound of its own ([`kr_worker::broker::MAX_QUEUED_BYTES`]) and ends
+    /// the connection of an upstream that outruns a terminal that has not yet read what it was
+    /// forwarded, as it does for any peer that has stopped reading. A case whose frames are
+    /// sent at once leaves that to however soon its own terminal reads them; sent one after the
+    /// other, the terminal never has more than one frame to take. The worker offers a frame to the
+    /// lane before it forwards it, so the lane holds a frame once the terminal has been sent it.
+    pub async fn send_and_wait_for_the_terminal(&self, frame: &serde_json::Value) {
+        let before = self.terminal.count();
+        self.send(frame);
+        until(
+            "the worker to forward the frame to the terminal",
+            || async { (self.terminal.count() > before).then_some(()) },
+        )
+        .await;
     }
 
     /// Everything the session has retained of the terminal's output, as text.

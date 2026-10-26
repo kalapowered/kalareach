@@ -210,9 +210,11 @@ async fn kr_req_11_38_a_full_lane_loses_observations_counts_them_and_never_the_r
     })
     .await;
 
-    world.send(&request(9));
+    world.send_and_wait_for_the_terminal(&request(9)).await;
     for _ in 0..40 {
-        world.send(&large_notification());
+        world
+            .send_and_wait_for_the_terminal(&large_notification())
+            .await;
     }
     until("the lane to have lost what did not fit", || async {
         (lane.account().evicted.events > 0).then_some(())
@@ -531,7 +533,9 @@ async fn kr_req_11_38_a_snapshot_that_never_returns_is_stopped_by_its_bound_and_
     })
     .await;
     for _ in 0..40 {
-        world.send(&large_notification());
+        world
+            .send_and_wait_for_the_terminal(&large_notification())
+            .await;
     }
     until("the lane to have lost what did not fit", || async {
         (lane.account().evicted.events > 0).then_some(())
