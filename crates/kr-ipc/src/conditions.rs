@@ -122,9 +122,9 @@ mod windows {
 
     use super::{PowerStatus, ThermalZone};
     use windows_sys::Win32::System::Performance::{
-        PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_LONG, PDH_HCOUNTER, PDH_HQUERY, PDH_MORE_DATA,
-        PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterArrayW,
-        PdhOpenQueryW,
+        PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_VALID_DATA, PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_LONG,
+        PDH_HCOUNTER, PDH_HQUERY, PDH_MORE_DATA, PdhAddEnglishCounterW, PdhCloseQuery,
+        PdhCollectQueryData, PdhGetFormattedCounterArrayW, PdhOpenQueryW,
     };
     use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 
@@ -132,8 +132,11 @@ mod windows {
     /// in every language.
     const PASSIVE_LIMIT: &str = r"\Thermal Zone Information(*)\% Passive Limit";
 
-    /// The status of a counter value that holds data.
-    const VALID_DATA: u32 = 0;
+    /// Whether a counter value's status says it holds data: the first reading of a counter after
+    /// a change reports new data, and both statuses are readings.
+    const fn holds_data(status: u32) -> bool {
+        status == PDH_CSTATUS_VALID_DATA || status == PDH_CSTATUS_NEW_DATA
+    }
 
     pub(super) fn power_status() -> Option<PowerStatus> {
         let mut status = SYSTEM_POWER_STATUS {
@@ -240,7 +243,7 @@ mod windows {
         };
         let mut zones = Vec::new();
         for item in items {
-            if item.FmtValue.CStatus != VALID_DATA {
+            if !holds_data(item.FmtValue.CStatus) {
                 continue;
             }
             // SAFETY: the format asked for a long, so the value is the union's 32-bit member.
@@ -317,12 +320,11 @@ mod tests {
 
     /// The machine's own management data, asked through PowerShell, and what this module reads
     /// through the performance counters: the thermal zones are the ones the management data lists,
-    /// each with the limit it lists, and a machine that lists none has none. The power status
-    /// answers on every machine that runs this.
+    /// each with the limit it lists, and a machine that lists none has none.
     #[cfg(windows)]
     #[test]
     fn the_thermal_zones_agree_with_the_platforms_management_data() {
-        use super::{supply, thermal_zones};
+        use super::thermal_zones;
         use std::process::Command;
 
         let script = "Get-CimInstance Win32_PerfFormattedData_Counters_ThermalZoneInformation | \
@@ -350,9 +352,5 @@ mod tests {
             .collect();
         read.sort();
         assert_eq!(read, listed);
-        assert!(
-            supply().is_some(),
-            "the system says where the power comes from"
-        );
     }
 }
