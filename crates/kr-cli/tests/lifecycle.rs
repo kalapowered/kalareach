@@ -109,6 +109,11 @@ const ANSWER: &str = "call it Kalareach one";
 /// on something that is not coming ends by it.
 const LIVENESS_DEADLINE: Duration = Duration::from_secs(600);
 
+/// How long a real terminal application is given to open a window through the profile and for the
+/// window's `kr` to have created and attached its session: a failure's bound, not a wait the case
+/// depends on, and long enough for a loaded machine to start an application.
+const WINDOW_DEADLINE: Duration = Duration::from_secs(240);
+
 /// How long a command a failing test runs while it cleans up is given.
 ///
 /// Shorter than a liveness bound, because what follows it is the forced end of whatever the test
@@ -5029,6 +5034,9 @@ fn release(gate: &Path) {
 /// session list: a new live session with one attachment for each window the profile opened. The
 /// host is set up as in the case above this one.
 ///
+/// `used` is shell that runs before the install, for an application that is refused until the
+/// person has used it once (Ptyxis writes its first profile when it first starts).
+///
 /// `$profile` in the two commands that open a window is the identifier of the profile `kr` wrote,
 /// for an application that is opened by it. `without_a_scope_manager` puts a stand-in for
 /// `systemd-run` first on the application's search path, for one that starts a command inside a
@@ -5037,6 +5045,7 @@ fn release(gate: &Path) {
 fn windows_through_the_profile_create_a_session_each(
     programs: &[&str],
     terminal: &str,
+    used: &str,
     without_a_scope_manager: bool,
     open_first: &str,
     open_second: &str,
@@ -5091,7 +5100,8 @@ fn windows_through_the_profile_create_a_session_each(
         String::new()
     };
     let script = format!(
-        "{kr} host terminal-profile install {terminal} || exit 1\n\
+        "{used}\n\
+         {kr} host terminal-profile install {terminal} || exit 1\n\
          {search_path}\
          profile=$({kr} host terminal-profile status --json | \
            grep -o '/org/gnome/Ptyxis/Profiles/[^/\"]*' | head -1 | sed 's|.*/||')\n\
@@ -5104,19 +5114,30 @@ fn windows_through_the_profile_create_a_session_each(
     );
     let emulator = HeadlessEmulator::start(&host, &script);
     let live = |wanted: usize| -> Vec<Value> {
-        until("the sessions of the windows the application opened", || {
+        let started = Instant::now();
+        loop {
             emulator.assert_running();
             let listed = host.kr_json(&["list"]);
             let sessions = listed["sessions"]
                 .as_array()
                 .expect("a list of sessions")
                 .clone();
-            (sessions.len() == wanted
+            if sessions.len() == wanted
                 && sessions
                     .iter()
-                    .all(|session| session["state"] == "live" && session["attachments"] == 1))
-            .then_some(sessions)
-        })
+                    .all(|session| session["state"] == "live" && session["attachments"] == 1)
+            {
+                return sessions;
+            }
+            assert!(
+                started.elapsed() < WINDOW_DEADLINE,
+                "waited {:?} for {wanted} live sessions of the windows the application opened; \
+                 the list is {listed}; the script printed:\n{}",
+                started.elapsed(),
+                std::fs::read_to_string(&emulator.log).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     };
     let one = live(1);
     release(&first);
@@ -5169,6 +5190,7 @@ fn a_real_gnome_terminal_opens_a_window_and_a_tab_through_the_profile_and_each_h
             "gsettings",
         ],
         "gnome-terminal",
+        "",
         false,
         "gnome-terminal --window --profile=KalaReach",
         "gnome-terminal --tab --profile=KalaReach",
@@ -5182,6 +5204,7 @@ fn a_real_konsole_opens_two_windows_through_the_profile_and_each_has_a_session()
     windows_through_the_profile_create_a_session_each(
         &["xvfb-run", "dbus-run-session", "konsole"],
         "konsole",
+        "",
         false,
         "konsole --separate --profile KalaReach &",
         "konsole --separate --profile KalaReach &",
@@ -5197,6 +5220,10 @@ fn a_real_ptyxis_opens_two_tabs_through_the_profile_and_each_has_a_session() {
     windows_through_the_profile_create_a_session_each(
         &["xvfb-run", "dbus-run-session", "ptyxis", "gsettings"],
         "ptyxis",
+        "mine=0123456789abcdef0123456789abcdef\n\
+         gsettings set org.gnome.Ptyxis profile-uuids \"['$mine']\"\n\
+         gsettings set org.gnome.Ptyxis default-profile-uuid \"'$mine'\"\n\
+         gsettings set org.gnome.Ptyxis.Profile:/org/gnome/Ptyxis/Profiles/$mine/ label \"'Mine'\"",
         true,
         "ptyxis --tab-with-profile=$profile &",
         "ptyxis --tab-with-profile=$profile &",
