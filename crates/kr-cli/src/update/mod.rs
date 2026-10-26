@@ -586,36 +586,52 @@ pub struct Updated {
     pub rolled_back: bool,
 }
 
-/// A release, or what an earlier removal left of one, that the update could not remove for a reason
-/// no running program gave. A release a program still holds is not one of these: it stays and is
-/// tried again at the next update.
+/// What the update could not remove, or could not look for, for a reason no running program gave. A
+/// release a program still holds is not one of these: it stays and is tried again at the next
+/// update.
 pub struct NotRemoved {
-    /// The release, or nothing for what lies in the store's trash.
-    pub release: Option<ReleaseName>,
+    /// What it was.
+    pub what: Remains,
     /// Why it could not be removed.
     pub reason: Shown,
 }
 
+/// What an update could not remove.
+pub enum Remains {
+    /// A release nothing needs.
+    Release(ReleaseName),
+    /// What an earlier removal left in the store's trash.
+    Trash,
+    /// Every release: the store could not say which exist or which one is current, so none was
+    /// judged.
+    Releases,
+}
+
 impl NotRemoved {
-    /// What `--json` says of it.
+    /// What `--json` says of it: the release, or null where it is not one release's.
     fn document(&self) -> Document {
+        let release = match &self.what {
+            Remains::Release(release) => Some(crate::shown::release(release)),
+            Remains::Trash | Remains::Releases => None,
+        };
         Document::new()
-            .with("release", self.release.as_ref().map(crate::shown::release))
+            .with("release", release)
             .with("reason", self.reason.clone())
     }
 
     /// What is said to a person.
     fn said(&self) -> Shown {
-        match &self.release {
-            Some(release) => shown!(
+        match &self.what {
+            Remains::Release(release) => shown!(
                 "release {} could not be removed: {}",
                 crate::shown::release(release),
                 self.reason
             ),
-            None => shown!(
+            Remains::Trash => shown!(
                 "something an earlier removal left in the store's trash could not be removed: {}",
                 self.reason
             ),
+            Remains::Releases => shown!("no release was removed: {}", self.reason),
         }
     }
 }
@@ -2704,18 +2720,29 @@ const MAKE_WRITABLE: &str = if cfg!(windows) {
 
 /// Removes every release nothing needs: not the current one, not the previous one, not one staged
 /// for a later update, and not one a running program holds. Returns what it removed, and what it
-/// could not remove for a reason no running program gave.
+/// could not remove or look for, for a reason no running program gave.
 fn collect(
     store: &Store,
     record: &Record,
     update: &kr_ipc::install::StoreLock,
 ) -> (Vec<ReleaseName>, Vec<NotRemoved>) {
-    let Ok(current) = store.current() else {
-        return (Vec::new(), Vec::new());
-    };
     let mut removed = Vec::new();
     let mut not_removed = Vec::new();
-    for release in store.releases().unwrap_or_default() {
+    // Without the current release no release can be judged unneeded, so none is removed.
+    let (current, releases) = match store
+        .current()
+        .and_then(|current| Ok((current, store.releases()?)))
+    {
+        Ok(found) => found,
+        Err(error) => {
+            not_removed.push(NotRemoved {
+                what: Remains::Releases,
+                reason: said(&error),
+            });
+            return (removed, not_removed);
+        }
+    };
+    for release in releases {
         let needed = current.as_ref() == Some(&release)
             || record.previous.as_ref() == Some(&release)
             || record.staged.as_ref() == Some(&release);
@@ -2726,7 +2753,7 @@ fn collect(
             Ok(true) => removed.push(release),
             Ok(false) => {}
             Err(error) => not_removed.push(NotRemoved {
-                release: Some(release),
+                what: Remains::Release(release),
                 reason: said(&error),
             }),
         }
@@ -2735,11 +2762,113 @@ fn collect(
     #[cfg(windows)]
     if let Err(error) = store.sweep_trash(update) {
         not_removed.push(NotRemoved {
-            release: None,
+            what: Remains::Trash,
             reason: said(&error),
         });
     }
     (removed, not_removed)
+}
+
+/// What an update says of the releases it could not remove or could not look for.
+#[cfg(test)]
+mod collecting {
+    use super::*;
+    use std::path::Path;
+
+    /// A store with two releases in it, and a record that names neither as needed.
+    fn store_with_two_releases(root: &Path) -> (Store, Vec<ReleaseName>) {
+        let store = Store::at(root.join("store"));
+        store.create_directories().expect("the store's directories");
+        let releases: Vec<ReleaseName> = ["0.1.0+aaaaaaaaaaaa", "0.2.0+bbbbbbbbbbbb"]
+            .into_iter()
+            .map(|name| ReleaseName::new(name).expect("a release name"))
+            .collect();
+        for release in &releases {
+            let directory = store.release_directory(release);
+            std::fs::create_dir_all(&directory).expect("a release directory");
+            std::fs::write(store.manifest(release), b"{}").expect("a manifest");
+        }
+        (store, releases)
+    }
+
+    fn collected(store: &Store) -> (Vec<ReleaseName>, Vec<NotRemoved>) {
+        let update = store
+            .try_lock_update()
+            .expect("locks")
+            .expect("nothing else updates");
+        collect(store, &Record::default(), &update)
+    }
+
+    /// A `current` that names something other than a release of the store.
+    fn point_current_elsewhere(store: &Store, elsewhere: &Path) {
+        std::fs::create_dir_all(elsewhere).expect("a directory elsewhere");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(elsewhere, store.current_link()).expect("a link");
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(store.current_link())
+                .arg(elsewhere)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .expect("mklink runs");
+            assert!(made.success(), "a junction for current");
+        }
+    }
+
+    /// KR-REQ-26.06: a failure to read which release is current reaches the update's result, and no
+    /// release is removed on a guess.
+    #[test]
+    fn a_current_release_that_cannot_be_read_is_reported_and_nothing_is_removed() {
+        let temp = tempfile::tempdir().expect("a directory");
+        let (store, releases) = store_with_two_releases(temp.path());
+        point_current_elsewhere(&store, &temp.path().join("elsewhere"));
+
+        let (removed, not_removed) = collected(&store);
+
+        assert!(removed.is_empty(), "no release is judged without current");
+        assert!(
+            matches!(
+                not_removed.as_slice(),
+                [NotRemoved {
+                    what: Remains::Releases,
+                    ..
+                }]
+            ),
+            "the failure to read current is the result"
+        );
+        for release in &releases {
+            assert!(
+                store.release_directory(release).is_dir(),
+                "{release} is kept"
+            );
+        }
+    }
+
+    #[test]
+    fn releases_that_cannot_be_listed_are_reported_and_nothing_is_removed() {
+        let temp = tempfile::tempdir().expect("a directory");
+        let store = Store::at(temp.path().join("store"));
+        store.create_directories().expect("the store's directories");
+        // A file where the directory of releases is: it cannot be listed, and is not absent.
+        std::fs::remove_dir(store.versions()).expect("the directory goes");
+        std::fs::write(store.versions(), b"not a directory").expect("a file in its place");
+
+        let (removed, not_removed) = collected(&store);
+
+        assert!(removed.is_empty());
+        assert!(
+            matches!(
+                not_removed.as_slice(),
+                [NotRemoved {
+                    what: Remains::Releases,
+                    ..
+                }]
+            ),
+            "the failure to list the releases is the result"
+        );
+    }
 }
 
 #[cfg(all(test, unix))]

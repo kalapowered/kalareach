@@ -2171,18 +2171,36 @@ impl Store {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(InstallError::io("read", &trash, error)),
         };
-        let mut refused = None;
-        for entry in entries.flatten() {
+        sweep_entries(&trash, entries.map(|entry| entry.map(|entry| entry.path())))
+    }
+}
+
+/// Removes each of `entries`, the paths found in `trash`, and goes on after one that cannot be
+/// removed or read. Returns the first refusal that no running program caused, or the first failure
+/// of the listing, after everything else that could be removed was.
+#[cfg(windows)]
+fn sweep_entries(
+    trash: &Path,
+    entries: impl IntoIterator<Item = std::io::Result<PathBuf>>,
+) -> Result<()> {
+    let mut refused = None;
+    for entry in entries {
+        match entry {
             // Whatever is in the trash that is not a plain directory is taken away as a name: a
             // junction there would otherwise lead the removal into the directory it names.
-            if let Err(InstallError::Io { source, .. }) = remove_tree(&entry.path())
-                && !windows::is_in_use(&source)
-            {
-                refused.get_or_insert(InstallError::io("remove", entry.path(), source));
+            Ok(path) => {
+                if let Err(InstallError::Io { source, .. }) = remove_tree(&path)
+                    && !windows::is_in_use(&source)
+                {
+                    refused.get_or_insert(InstallError::io("remove", path, source));
+                }
+            }
+            Err(error) => {
+                refused.get_or_insert(InstallError::io("read", trash, error));
             }
         }
-        refused.map_or(Ok(()), Err)
     }
+    refused.map_or(Ok(()), Err)
 }
 
 #[cfg(windows)]
@@ -2272,6 +2290,40 @@ pub fn remove_sealed_tree(directory: &Path) -> std::io::Result<()> {
 /// Deletes a release that was moved out of `versions/`.
 fn remove_tree(directory: &Path) -> Result<()> {
     remove_sealed_tree(directory).map_err(|error| InstallError::io("remove", directory, error))
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    /// KR-REQ-26.06: a failure of the listing of the trash reaches the result of the sweep, and what
+    /// the listing did give is swept all the same.
+    #[test]
+    fn a_failure_to_list_the_trash_is_returned_after_the_rest_is_swept() {
+        let root = std::env::temp_dir().join(format!("kr-sweep-{}", crate::new_uuid()));
+        let leftover = root.join("leftover");
+        std::fs::create_dir_all(leftover.join("inner")).expect("a leftover");
+        std::fs::write(leftover.join("inner").join("file"), b"left").expect("written");
+
+        let answer = sweep_entries(
+            &root,
+            [
+                Err(std::io::Error::other("the listing failed")),
+                Ok(leftover.clone()),
+            ],
+        );
+        let swept = !leftover.exists();
+        let _ = remove_tree(&root);
+
+        let Err(InstallError::Io { source, .. }) = answer else {
+            panic!("the failure is returned: {answer:?}");
+        };
+        assert!(
+            source.to_string().contains("the listing failed"),
+            "{source}"
+        );
+        assert!(swept, "the entry the listing gave is swept");
+    }
 }
 
 #[cfg(all(test, unix))]
