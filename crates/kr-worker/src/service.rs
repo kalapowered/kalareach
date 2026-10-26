@@ -7837,14 +7837,13 @@ impl WorkerService {
         let params: kr_protocol::root::ShellLaunchSurfaceParams = parse(params)?;
         let session = self.runtime.session();
         Self::check_session(&session, params.session_id)?;
-        // The editor is on the screen as it was drawn, whenever that was, so a grant is told of it
-        // only when it reaches the whole of the visible screen. A grant bounded to a time that does
-        // not include the live screen sees what was drawn after the bound, and the prompt was
-        // drawn before.
+        // The editor and the input lease are what the live screen shows, and the control daemon
+        // refuses a grant the live screen to every read of it that does not reach it, whatever
+        // history it reaches.
         let shown = caller
             .history_filter(Method::ShellLaunchSurface.entry())
             .is_some_and(|filter| {
-                filter.first_moment(crate::history_filter::Surface::TerminalSnapshot) == Some(0)
+                filter.scope().sees_the_session() && filter.scope().includes_the_live_screen()
             });
         let answer = crate::launch_surface::answer(
             &session,
