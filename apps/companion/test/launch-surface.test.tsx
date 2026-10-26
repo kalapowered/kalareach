@@ -256,11 +256,16 @@ describe('the buttons that start something', () => {
     })
 
     controls.refuseLaunches('OUTCOME_UNKNOWN', 'The reader could not confirm.')
+    // The surface's own line is read before the read the press asked for lands.
+    controls.hold('launchSurface')
     await person.click(within(surface).getByRole('button', { name: 'Claude Code' }))
     const said = await screen.findByText(/could not confirm whether the launch was installed/)
     expect(said).toBeInTheDocument()
     expect(said.textContent).not.toMatch(/Nothing was typed/)
     expect(screen.queryByText('Claude Code started.')).toBeNull()
+    const line = screen.getByTestId('launch-stale')
+    expect(line).toHaveTextContent('could not confirm the last launch')
+    expect(line.textContent).not.toMatch(/refused/)
   })
 
   // A button is advice from a read, and a refusal says the advice was wrong. A read that answered
