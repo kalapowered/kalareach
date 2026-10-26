@@ -1,16 +1,15 @@
 //! `diff.read`, `diff.apply` and `diff.revert`: the destination classes, the preflight and the
 //! five outcome classes.
 //!
-//! Requirement rows closed here: KR-REQ-14.04 (a diff identifies its source revision and an apply
-//! checks concurrent changes), KR-REQ-14.25 (read results carry identity, base and head, the
-//! tracked, untracked and binary changes and the content revisions), KR-REQ-14.26 (a preflight
-//! conflict returns `DRAFT_CONFLICT` with no writes), KR-REQ-14.27 (an apply defaults to an
-//! immutable proposal, and a versioned Git reference is compare-and-swap that does not update a
-//! dirty working tree), KR-REQ-14.28 (a direct apply to `shared_existing` is best-effort conflict
-//! detection with recoverable versions, and its limitation is shown first), KR-REQ-14.29
-//! (permissions and line endings preserved, per-path progress, the five outcome classes, and a
-//! crash after one file that never yields an atomic-success receipt) and KR-REQ-14.30 (review
-//! completion never triggers a commit, a push or a destructive revert).
+//! Each case names, in its own comment, the part of a requirement it shows: a diff identifies its
+//! source revision and an apply checks concurrent changes; read results carry identity, base and
+//! head, the tracked, untracked and binary changes and the content revisions; a preflight conflict
+//! returns `DRAFT_CONFLICT` with no writes; an apply defaults to an immutable proposal, and a
+//! versioned Git reference is compare-and-swap that does not update a dirty working tree; a direct
+//! apply to `shared_existing` is best-effort conflict detection with recoverable versions, and its
+//! limitation is shown first; permissions and line endings are preserved, with per-path progress,
+//! the five outcome classes, and a crash after one file that never yields an atomic-success
+//! receipt; and review completion never triggers a commit, a push or a destructive revert.
 //!
 //! Every case here needs a checkout, and this host does not run a repository tool on Windows at
 //! all: its application container cannot keep a repository from being executed from, so the
@@ -123,6 +122,9 @@ fn a_diff_read_carries_identity_base_head_and_both_content_revisions() {
 
 /// KR-REQ-14.26: a preflight conflict is `DRAFT_CONFLICT` and writes nothing, to the destination
 /// or to this host's own journal.
+///
+/// KR-REQ-14.04, the part about an apply checking concurrent changes: a destination file that
+/// somebody else wrote after the request was composed is the conflict the preflight refuses on.
 #[cfg(not(windows))]
 #[test]
 fn a_preflight_conflict_returns_draft_conflict_and_writes_nothing() {
@@ -661,6 +663,9 @@ fn a_request_that_cannot_move_a_reference_is_refused_before_anything_is_claimed(
 /// KR-REQ-14.27: an apply to a versioned Git reference is compare-and-swap on the reference; a
 /// value that does not match is `DRAFT_CONFLICT` and claims nothing, and a preflight returns the
 /// comparison and moves nothing, with or without the object it would move to.
+///
+/// KR-REQ-14.26, the part about a reference: an expectation the reference does not hold is
+/// `DRAFT_CONFLICT`, the action's claim is never taken, and the reference is as it was.
 #[cfg(not(windows))]
 #[test]
 fn a_versioned_reference_is_compare_and_swap_and_a_preflight_moves_nothing() {
@@ -1144,6 +1149,10 @@ fn a_direct_apply_preserves_an_access_control_list_on_the_destination() {
 
 /// An access-control list altered on the staged copy before rename is caught by read-back
 /// verification, leaving the result unresolved rather than claiming success under altered permissions.
+///
+/// KR-REQ-14.29, the part about results that list what is unresolved: the apply does not report
+/// `Applied`, names the path as the one unresolved, and its progress row says the file was
+/// published under permissions this host did not set on it.
 #[cfg(not(windows))]
 #[test]
 fn an_apply_detects_an_access_control_list_tampered_during_staging_and_refuses() {
