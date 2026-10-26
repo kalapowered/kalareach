@@ -99,8 +99,9 @@ with a fixed nonce. The fixture documents say so, and nothing else does it.
 `sign` has no function that signs a bare message. Signing takes a `SigningTranscript`, which is
 either built from a domain and its elements or built from bytes another module produced and then
 checked: the bytes must decode as a canonical array whose first element is the claimed domain. The
-three transcripts the specification writes as arrays reach a signature that way, and nothing else
-can. This table lists the domains that the cryptographic primitives sign or derive under. [The
+three transcripts the specification writes as arrays reach a signature that way. The one other shape
+is `SigningTranscript::keyed`, which builds `CBOR({domain: value})` under the domain
+`kr-release-matrix/1`, as the release matrix's publisher signs it; nothing else can. This table lists the domains that the cryptographic primitives sign or derive under. [The
 protocol reference](../protocol/README.md#domain-separation) lists every domain of the protocol,
 which is the longer list.
 
