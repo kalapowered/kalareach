@@ -688,7 +688,8 @@ async fn install_package(
 /// typed, before any the integration adds; an agent name no installed package recognises and an
 /// ordinary program, each typed by its name, run as typed with no registration and no flags; the
 /// same agent's program by its path and a shim found first run as typed; and the status the program
-/// ends with is the status of the line, for an agent and for an ordinary program.
+/// ends with is the status of the line, for the agent launched through the forwarder and for an
+/// ordinary program.
 ///
 /// The programs are copies of the command shell, which prints what it is given after `/c` once it
 /// has expanded the variables in it, so the launch is read from what the program printed. Each
@@ -1140,7 +1141,8 @@ fn listed_processes() -> Vec<(String, u32, u32, String)> {
         .collect()
 }
 
-/// The programs of the product that run as this account, in any login session, by image name.
+/// The programs of the product (`kr-*` and `kr`) that run as this account, in any login session,
+/// by image name.
 fn product_programs_of_this_account() -> Vec<String> {
     let account = format!(
         "{}\\{}",
@@ -1158,17 +1160,19 @@ fn product_programs_of_this_account() -> Vec<String> {
     listed
         .into_iter()
         .filter(|(image, _, _, user)| {
-            image.to_ascii_lowercase().starts_with("kr-") && user.eq_ignore_ascii_case(&account)
+            let image = image.to_ascii_lowercase();
+            (image.starts_with("kr-") || image == "kr.exe") && user.eq_ignore_ascii_case(&account)
         })
         .map(|(image, pid, session, _)| format!("{image} (process {pid}, login session {session})"))
         .collect()
 }
 
-/// Every process that descends from one of `roots`, by the parent each names, as the identity it
-/// was started under, read from the system's own list of processes.
+/// Every process that is running now and descends, through running parents, from one of `roots`, by
+/// the parent each names, as the identity it was started under, read from the system's own list of
+/// processes.
 ///
-/// A process that names a root's identifier as its parent but started before the root is not its
-/// child: the identifier was the root's predecessor's.
+/// A process that names a root's identifier as its parent but was not started by it is not its
+/// child: the identifier was another process's, which has ended.
 fn descendants_of(
     roots: &[kr_protocol::identity::ProcessStartIdentity],
 ) -> Vec<kr_protocol::identity::ProcessStartIdentity> {
@@ -1203,16 +1207,32 @@ fn descendants_of(
             .iter()
             .filter(|(_, named)| u64::from(*named) == parent.pid.get())
         {
-            // A process that ended since the list was read is not one to record.
-            let Ok(child) = kr_ipc::identity::process_start_identity(*pid) else {
-                continue;
+            // A process that ended since the list was read is not one to record; one the system
+            // will not describe is a process that cannot be shown to have ended, and stops the
+            // case.
+            let child = match kr_ipc::identity::query_process(*pid) {
+                kr_ipc::identity::ProcessQuery::Present(child) => child,
+                kr_ipc::identity::ProcessQuery::Gone => continue,
+                kr_ipc::identity::ProcessQuery::CannotEstablish(error) => {
+                    panic!(
+                        "process {pid}, which names process {} as its parent: {error}",
+                        parent.pid.get()
+                    )
+                }
             };
-            if child.start_value.get() >= parent.start_value.get()
-                && !found.contains(&child)
-                && !roots.contains(&child)
-            {
-                found.push(child.clone());
-                parents.push(child);
+            if found.contains(&child) || roots.contains(&child) {
+                continue;
+            }
+            // By the kernel's own order of starts, which a clock that moved does not change.
+            match kr_worker::windows::lineage::started_by(&child, &parent) {
+                Ok(()) => {
+                    found.push(child.clone());
+                    parents.push(child);
+                }
+                Err(why) => eprintln!(
+                    "process {pid} names process {} as its parent and is not recorded: {why}",
+                    parent.pid.get()
+                ),
             }
         }
     }
@@ -1501,10 +1521,11 @@ enum Attempt {
 const HOLD_ATTEMPTS: u32 = 3;
 
 /// One attempt: a program that prints a numbered line every moment is typed at the managed
-/// prompt, and when a worker's report first reads that its registration has been sent and is not
-/// answered, the plugin host is held still. The registration is outstanding while the host stays
-/// so; the host is then ended by the identity it was started under, and what the worker, the
-/// program, the terminal and the binding do after is read.
+/// prompt, and when a worker's report first reads that it is registering the component with the
+/// plugin host, the host is held still. The registration is outstanding while the host stays so;
+/// the host is then ended by the identity it was started under, and what the worker, the program,
+/// the terminal and the binding do after is read. The attempt shows the registration was
+/// outstanding only if the replacement host had to compile the component.
 async fn hold_a_registration_and_end_the_host() -> Attempt {
     // Every attempt has a component whose digest no host has compiled, so the registration is a
     // cold compile: the time the host takes over it is what the worker's report can be seen in.
@@ -1537,7 +1558,7 @@ async fn hold_a_registration_and_end_the_host() -> Attempt {
         .await;
 
     // The worker's report is looked at as fast as the workers answer, until it reads that the
-    // registration has been sent.
+    // registration is under way.
     let started = tokio::time::Instant::now();
     let binding = loop {
         let reports = reported_fresh(&controller).await;
@@ -1570,10 +1591,9 @@ async fn hold_a_registration_and_end_the_host() -> Attempt {
 
     // Held still, the host answers nothing. The registration is outstanding if the worker's own
     // report, asked for again after the terminal has been sent twenty more lines, still says so.
-    // An answer the host wrote before it was held would be waiting for the worker, which is
-    // running (it answers the daemon's asking and sends the terminal its lines); the worker would
-    // read it at once, and its report would then say the component is registered, which this
-    // reads as an attempt that shows nothing.
+    // An answer the host wrote before it was held, which the worker has not yet read, is not
+    // told from one it never wrote by this alone: whether the host wrote one is read below, from
+    // how the replacement came by the component.
     let mark = ticks(&world.terminal);
     let looked_at = tokio::time::Instant::now();
     loop {
@@ -1647,10 +1667,24 @@ async fn hold_a_registration_and_end_the_host() -> Attempt {
     loop {
         world.terminal.watch(Duration::from_millis(50)).await;
         let reports = reported_fresh(&controller).await;
-        if reports.as_deref().is_some_and(|reports| {
-            matches!(reports, [(id, report)] if *id == binding
-                && report.state == ComponentState::Registered)
-        }) {
+        let registered = reports.as_deref().and_then(|reports| match reports {
+            [(id, report)] if *id == binding && report.state == ComponentState::Registered => {
+                report.reason.0.as_deref()
+            }
+            _ => None,
+        });
+        // A host files the component it compiled before it answers a registration, and a
+        // replacement then loads it from there. So a replacement that compiled the component shows
+        // that the first host never answered, and one that loaded it shows nothing: the first host
+        // may have answered before it was held, however little time that left the worker.
+        if registered.is_some_and(|reason| reason.contains("loaded from the compiled-code cache")) {
+            return Attempt::Missed(format!(
+                "the replacement loaded the component from the cache ({}), so the first host had \
+                 compiled it and may have answered",
+                registered.unwrap_or_default()
+            ));
+        }
+        if registered.is_some_and(|reason| reason.contains("compiled in")) {
             eprintln!("the binding is registered with the replacement: {reports:?}");
             break;
         }
@@ -1694,16 +1728,18 @@ async fn hold_a_registration_and_end_the_host() -> Attempt {
 ///
 /// A worker is running a program a package that ships a component recognises, which prints a
 /// numbered line every moment, and registers its binding with the plugin host the daemon started.
-/// The registration is sent and the host is held still the moment the worker reports that, so that
-/// the request goes unanswered: the worker's own report, asked for again after the terminal has
-/// been sent twenty lines more, still reads that it is registering. The host is then ended by the
-/// identity it was started under with that request outstanding. The worker goes on, the terminal
-/// goes on being sent lines it had not been sent, and the daemon starts a replacement under its
-/// bound, which the worker registers the binding with again, so that the host holds the binding.
+/// The host is held still the moment the worker reports that it is registering, so that the request
+/// goes unanswered: the worker's own report, asked for again after the terminal has been sent
+/// twenty lines more, still reads that it is registering. The host is then ended by the identity it
+/// was started under with that request outstanding. The worker goes on, the terminal goes on being
+/// sent lines it had not been sent, and the daemon starts a replacement under its bound, which the
+/// worker registers the same binding with again, so that the host holds the binding.
 ///
-/// A host that answered before it could be held shows nothing about a request outstanding, so an
-/// attempt that finds the registration answered is made again, up to a bound, and a case that could
-/// not hold one fails.
+/// A host files the component it compiled before it answers, and a replacement then loads it from
+/// there. So the replacement must have compiled the component, which shows the first host never
+/// answered. A host that may have answered before it could be held shows nothing about a request
+/// outstanding, so that attempt is made again, up to a bound, and a case that could not hold one
+/// fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = writes_profiles!()]
 async fn a_plugin_host_that_ends_with_a_registration_unanswered_takes_no_worker_with_it_on_windows()
@@ -1807,6 +1843,12 @@ async fn with_a_plugin_host_running_the_session_is_set_up_and_the_account_signed
         "this case signs its account out, and an account in the Administrators group is not one to \
          sign out"
     );
+    // A record of an earlier run is not the record of this one.
+    match std::fs::remove_file(sign_out_record()) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("the record of an earlier run is not removed: {error}"),
+    }
     let component = well_behaved();
     let mut world = Running::start(&component).await;
     let environment = world.environment.clone();
@@ -1815,7 +1857,8 @@ async fn with_a_plugin_host_running_the_session_is_set_up_and_the_account_signed
         published().is_none(),
         "a plugin host was published before any program was typed"
     );
-    // A host the sign-out does not end is still ended when the sign-out does not come.
+    // A host the sign-out does not end is still ended when the sign-out does not come, up to the
+    // point where the case lets go of it so that only the sign-out ends what it started.
     let _host_ends = HostEnding(&published);
     let controller = world.managed.host.controller();
 
@@ -1852,8 +1895,9 @@ async fn with_a_plugin_host_running_the_session_is_set_up_and_the_account_signed
     let health = client.health().await.expect("the host reports its health");
     assert_eq!(health.live_bindings, 1, "{health:?}");
 
-    // What the sign-out is about: the daemon, the worker and every process either the worker or the
-    // plugin host started, by the identity each was started under, all in this login session.
+    // What the sign-out is about: the daemon, the worker, the plugin host and every running process
+    // that either of those two started, by the identity each was started under, all in this login
+    // session.
     let session = kr_ipc::starter::current_session().expect("this process's login session");
     let me = kr_ipc::identity::current_process_start_identity().expect("this process's identity");
     let worker = worker_of(&environment, world.session_id);
