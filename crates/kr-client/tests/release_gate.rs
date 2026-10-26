@@ -256,7 +256,7 @@ async fn a_skewed_build_is_refused_what_takes_a_new_lease_and_nothing_else() {
     assert_eq!(host.arrived(LEASE), asked_leases + 1, "the refill arrived");
 
     // A revocation and the payer's sign-in are sent, whatever the service answers.
-    let _ = leases.revoke(held_lease, LeaseEndReason::Released).await;
+    let _ = leases.revoke(held_lease, LeaseEndReason::Finished).await;
     assert_eq!(host.arrived(REVOKE), 1, "the revocation arrived");
     let signed_in = leases.sign_in_payer("account-one", &token()).await;
     assert!(
