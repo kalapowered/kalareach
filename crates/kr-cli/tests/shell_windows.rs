@@ -58,6 +58,23 @@ macro_rules! writes_profiles {
     };
 }
 
+/// Why the case that signs the account out is ignored in an ordinary run.
+macro_rules! signs_out {
+    () => {
+        "signs the account that runs it out, and writes the account's PowerShell profiles and puts \
+         them back; it runs with --ignored, KR_ALLOW_PROFILE_WRITE=1 and KR_ALLOW_SIGN_OUT=1 where \
+         the account is disposable and a run signs it in again for the case that follows"
+    };
+}
+
+/// Why the case that follows the sign-out is ignored in an ordinary run.
+macro_rules! follows_a_sign_out {
+    () => {
+        "reads what the case that signs the account out left, in the account's next sign-in; it runs \
+         with --ignored after that case, as a run that signs the account in again arranges"
+    };
+}
+
 /// The module's own directory in this checkout.
 fn module_directory() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -668,8 +685,10 @@ async fn install_package(
 ///
 /// For KR-REQ-01.06 on Windows: an agent is started by its own name typed at the prompt, with no
 /// launcher of the person's to type first, and the words typed after the name reach the program as
-/// typed; the same program by its path and a shim found first run as typed, and the status the
-/// program ends with is the status of the line.
+/// typed, before any the integration adds; an agent name no installed package recognises and an
+/// ordinary program, each typed by its name, run as typed with no registration and no flags; the
+/// same agent's program by its path and a shim found first run as typed; and the status the program
+/// ends with is the status of the line, for an agent and for an ordinary program.
 ///
 /// The programs are copies of the command shell, which prints what it is given after `/c` once it
 /// has expanded the variables in it, so the launch is read from what the program printed. Each
@@ -748,6 +767,11 @@ async fn the_bundled_agents_typed_at_the_managed_prompt_are_launched_through_the
             .is_some_and(|registration| registration.contains("registration.")),
         "the program was given no registration: {printed}"
     );
+    assert_eq!(
+        printed.split_whitespace().nth(1),
+        Some("claude-end"),
+        "the words typed after the name did not reach the program as typed: {printed}"
+    );
     assert!(
         printed.contains("--dangerously-load-development-channels")
             && printed.contains("plugin:kalareach-channels@skills-dir"),
@@ -769,6 +793,11 @@ async fn the_bundled_agents_typed_at_the_managed_prompt_are_launched_through_the
             .next()
             .is_some_and(|registration| registration.contains("registration.")),
         "the program was given no registration: {printed}"
+    );
+    assert_eq!(
+        printed.split_whitespace().nth(1),
+        Some("qoder-end"),
+        "the words typed after the name did not reach the program as typed: {printed}"
     );
     assert!(
         printed.contains("--settings"),
@@ -826,6 +855,47 @@ async fn the_bundled_agents_typed_at_the_managed_prompt_are_launched_through_the
         shown.contains("shim-plain") && !shown.contains("shim-registered"),
         "a shim found first was launched through the forwarder: {shown}"
     );
+
+    // An agent name no installed package recognises, and an ordinary program: each typed by its
+    // name, it runs as typed. It is given no registration and none of the integration's flags, the
+    // words after the name are its own, and the status it ends with is the line's.
+    let _gemini = stand_in(programs.path(), "gemini");
+    let _plain = stand_in(programs.path(), "kr-plain");
+    for (name, marker) in [("gemini", "gemini"), ("kr-plain", "plain")] {
+        terminal
+            .type_line(&format!(
+                "{name} /c echo {marker}-reg^=%KR_REGISTRATION% {marker}-e^nd"
+            ))
+            .await;
+        terminal
+            .shown(
+                &format!("{marker}-end"),
+                "the program typed by its name prints",
+            )
+            .await;
+        back_at_the_prompt(&mut terminal, &format!("{marker}-over")).await;
+        let printed = after(&terminal, &format!("{marker}-reg="));
+        assert_eq!(
+            printed.split_whitespace().take(2).collect::<Vec<_>>(),
+            ["%KR_REGISTRATION%".to_owned(), format!("{marker}-end")],
+            "{name} was not run as typed: {printed}"
+        );
+        assert!(
+            !printed.contains("--dangerously-load-development-channels")
+                && !printed.contains("--settings"),
+            "{name} was given the integration's flags: {printed}"
+        );
+    }
+    terminal.type_line("kr-plain /c exit 5").await;
+    terminal
+        .type_line("Write-Output (\"kr-plain-st=\" + $LASTEXITCODE + \"-end\")")
+        .await;
+    terminal
+        .shown(
+            "kr-plain-st=5-end",
+            "an ordinary program's status is the line's",
+        )
+        .await;
 
     // The status the program ends with is the line's.
     terminal.type_line("claude /c exit 7").await;
@@ -1041,35 +1111,112 @@ fn system32(program: &str) -> PathBuf {
         .join(program)
 }
 
-/// Every process of the system named `image`, by its identifier.
-fn processes_named(image: &str) -> Vec<u32> {
+/// The processes the system lists, with what it says of each: image name, identifier, login
+/// session number and the account each runs as.
+///
+/// A listing that did not come is not an empty one: it stops the case.
+fn listed_processes() -> Vec<(String, u32, u32, String)> {
     let listed = Command::new(system32("tasklist.exe"))
-        .args(["/FI", &format!("IMAGENAME eq {image}"), "/FO", "CSV", "/NH"])
+        .args(["/V", "/FO", "CSV", "/NH"])
         .output()
         .expect("tasklist runs");
+    assert!(
+        listed.status.success(),
+        "tasklist did not list the processes: {}{}",
+        String::from_utf8_lossy(&listed.stdout),
+        String::from_utf8_lossy(&listed.stderr)
+    );
     String::from_utf8_lossy(&listed.stdout)
         .lines()
         .filter_map(|line| {
             let mut fields = line.trim().trim_matches('"').split("\",\"");
-            let name = fields.next()?;
-            let pid = fields.next()?;
-            name.eq_ignore_ascii_case(image).then(|| pid.parse().ok())?
+            let image = fields.next()?.to_owned();
+            let pid = fields.next()?.parse().ok()?;
+            let _session_name = fields.next()?;
+            let session = fields.next()?.parse().ok()?;
+            let user = fields.nth(2)?.to_owned();
+            Some((image, pid, session, user))
         })
         .collect()
 }
 
-/// The programs of the product that run in login session `session`, by image name.
-fn product_programs_in(session: u32) -> Vec<String> {
-    let listed = Command::new(system32("tasklist.exe"))
-        .args(["/FI", &format!("SESSION eq {session}"), "/FO", "CSV", "/NH"])
-        .output()
-        .expect("tasklist runs");
-    String::from_utf8_lossy(&listed.stdout)
-        .lines()
-        .filter_map(|line| line.trim().trim_matches('"').split("\",\"").next())
-        .filter(|name| name.to_ascii_lowercase().starts_with("kr-"))
-        .map(str::to_owned)
+/// The programs of the product that run as this account, in any login session, by image name.
+fn product_programs_of_this_account() -> Vec<String> {
+    let account = format!(
+        "{}\\{}",
+        std::env::var("USERDOMAIN").expect("this account's domain"),
+        std::env::var("USERNAME").expect("this account's name")
+    );
+    let listed = listed_processes();
+    assert!(
+        listed
+            .iter()
+            .any(|(_, _, _, user)| user.eq_ignore_ascii_case(&account)),
+        "the listing names no process of {account}, so it cannot show that none of the product's is \
+         left"
+    );
+    listed
+        .into_iter()
+        .filter(|(image, _, _, user)| {
+            image.to_ascii_lowercase().starts_with("kr-") && user.eq_ignore_ascii_case(&account)
+        })
+        .map(|(image, pid, session, _)| format!("{image} (process {pid}, login session {session})"))
         .collect()
+}
+
+/// Every process that descends from one of `roots`, by the parent each names, as the identity it
+/// was started under, read from the system's own list of processes.
+///
+/// A process that names a root's identifier as its parent but started before the root is not its
+/// child: the identifier was the root's predecessor's.
+fn descendants_of(
+    roots: &[kr_protocol::identity::ProcessStartIdentity],
+) -> Vec<kr_protocol::identity::ProcessStartIdentity> {
+    let listed = Command::new("pwsh.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId) $($_.ParentProcessId)\" }",
+        ])
+        .output()
+        .expect("PowerShell starts");
+    assert!(
+        listed.status.success(),
+        "the processes were not listed: {}{}",
+        String::from_utf8_lossy(&listed.stdout),
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let pairs: Vec<(u32, u32)> = String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut numbers = line.split_whitespace().map(|number| number.parse().ok());
+            Some((numbers.next()??, numbers.next()??))
+        })
+        .collect();
+    assert!(!pairs.is_empty(), "the system listed no process");
+    let mut found: Vec<kr_protocol::identity::ProcessStartIdentity> = Vec::new();
+    let mut parents: Vec<kr_protocol::identity::ProcessStartIdentity> = roots.to_vec();
+    while let Some(parent) = parents.pop() {
+        for (pid, _) in pairs
+            .iter()
+            .filter(|(_, named)| u64::from(*named) == parent.pid.get())
+        {
+            // A process that ended since the list was read is not one to record.
+            let Ok(child) = kr_ipc::identity::process_start_identity(*pid) else {
+                continue;
+            };
+            if child.start_value.get() >= parent.start_value.get()
+                && !found.contains(&child)
+                && !roots.contains(&child)
+            {
+                found.push(child.clone());
+                parents.push(child);
+            }
+        }
+    }
+    found
 }
 
 /// Holding a process still, as a signal from a terminal does: every thread of it stops, and it
@@ -1081,9 +1228,11 @@ mod held {
                   by its identifier and `NtSuspendProcess` is handed that handle, and nothing else"
     )]
 
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+
     use kr_ipc::identity::{ProcessState, process_state};
     use kr_protocol::identity::ProcessStartIdentity;
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SUSPEND_RESUME};
 
     #[link(name = "ntdll")]
@@ -1100,13 +1249,16 @@ mod held {
     /// stopped.
     pub fn still(identity: &ProcessStartIdentity) {
         let pid = u32::try_from(identity.pid.get()).expect("a process identifier");
-        // SAFETY: the call takes numbers and returns a handle this function owns and closes.
-        let process = unsafe { OpenProcess(PROCESS_SUSPEND_RESUME, 0, pid) };
+        // SAFETY: the call takes numbers and returns a handle or null.
+        let opened = unsafe { OpenProcess(PROCESS_SUSPEND_RESUME, 0, pid) };
         assert!(
-            !process.is_null(),
+            !opened.is_null(),
             "process {pid} is opened to be held still: {}",
             std::io::Error::last_os_error()
         );
+        // SAFETY: the handle is a new one, which nothing else owns, and it is closed once, when
+        // this goes out of scope, however the function leaves.
+        let process = unsafe { OwnedHandle::from_raw_handle(opened.cast()) };
         // An identifier is not given to another process while a handle to its process is open, so
         // what is read now, with the handle held, is the process that was started.
         assert_eq!(
@@ -1114,10 +1266,9 @@ mod held {
             ProcessState::Running,
             "process {pid} is still the one that was started"
         );
-        // SAFETY: the handle is open for the call, and was opened with the right to suspend.
-        let status = unsafe { NtSuspendProcess(process) };
-        // SAFETY: the handle was opened above and is closed once. The process stays stopped.
-        unsafe { CloseHandle(process) };
+        // SAFETY: the handle is open for the call, and was opened with the right to suspend. The
+        // process stays stopped when the handle is closed.
+        let status = unsafe { NtSuspendProcess(process.as_raw_handle().cast()) };
         assert!(status >= 0, "NtSuspendProcess answered {status:#x}");
     }
 }
@@ -1132,9 +1283,15 @@ fn a_component_of_its_own(component: &[u8]) -> Vec<u8> {
     section.extend_from_slice(name);
     section.extend_from_slice(identity);
     let mut bytes = component.to_vec();
-    // A custom section: its identifier, its size (which one byte holds), then its contents.
+    // A custom section: its identifier, its size (one byte holds a size under 128), then its
+    // contents.
     bytes.push(0);
-    bytes.push(u8::try_from(section.len()).expect("a short section"));
+    bytes.push(
+        u8::try_from(section.len())
+            .ok()
+            .filter(|size| *size < 128)
+            .expect("a short section"),
+    );
     bytes.extend_from_slice(&section);
     bytes
 }
@@ -1215,25 +1372,33 @@ async fn end_by_identity(process: &kr_protocol::identity::ProcessStartIdentity) 
     .await;
 }
 
-/// What a worker reports of a binding's component while the plugin host has not yet answered its
-/// registration.
-const REGISTERING: &str = "registering with the plugin runtime";
-
-/// Whether `report` says the worker has sent a binding's registration and has no answer.
+/// Whether `report` says the worker is registering a binding's component with the plugin host and
+/// has no answer: the component is pending, for a reason that says it is registering and not asking
+/// the daemon for the host or connecting to it.
 fn is_registering(report: &kr_protocol::admission::ComponentReport) -> bool {
-    report.state == ComponentState::Pending && report.reason.0.as_deref() == Some(REGISTERING)
+    report.state == ComponentState::Pending
+        && report
+            .reason
+            .0
+            .as_deref()
+            .is_some_and(|reason| reason.contains("registering"))
 }
 
-/// What every worker reports of its bindings' components, after each has been asked again; or
-/// nothing, where a worker did not answer.
+/// What every worker reports of its bindings' components, with the binding each is for, after each
+/// has been asked again; or nothing, where a worker did not answer.
 async fn reported_fresh(
     controller: &kr_controller::service::Controller,
-) -> Option<Vec<kr_protocol::admission::ComponentReport>> {
+) -> Option<
+    Vec<(
+        kr_protocol::ids::BrokerBindingId,
+        kr_protocol::admission::ComponentReport,
+    )>,
+> {
     controller.refresh_admissions().await.then(|| {
         controller
             .reported_components()
             .into_iter()
-            .map(|(_, _, report)| report)
+            .map(|(_, binding, report)| (binding, report))
             .collect()
     })
 }
@@ -1374,14 +1539,14 @@ async fn hold_a_registration_and_end_the_host() -> Attempt {
     // The worker's report is looked at as fast as the workers answer, until it reads that the
     // registration has been sent.
     let started = tokio::time::Instant::now();
-    loop {
+    let binding = loop {
         let reports = reported_fresh(&controller).await;
         match reports.as_deref() {
-            Some([report]) if is_registering(report) => {
+            Some([(id, report)]) if is_registering(report) => {
                 eprintln!("the worker reports the registration as sent: {report:?}");
-                break;
+                break *id;
             }
-            Some([report]) if report.state == ComponentState::Registered => {
+            Some([(_, report)]) if report.state == ComponentState::Registered => {
                 return Attempt::Missed(
                     "the registration was answered before a report of it outstanding was read"
                         .to_owned(),
@@ -1396,7 +1561,7 @@ async fn hold_a_registration_and_end_the_host() -> Attempt {
             world.terminal.text()
         );
         world.terminal.watch(Duration::from_millis(5)).await;
-    }
+    };
     let host = published()
         .expect("the plugin host is published while a worker registers with it")
         .process_start_identity;
@@ -1405,13 +1570,17 @@ async fn hold_a_registration_and_end_the_host() -> Attempt {
 
     // Held still, the host answers nothing. The registration is outstanding if the worker's own
     // report, asked for again after the terminal has been sent twenty more lines, still says so.
+    // An answer the host wrote before it was held would be waiting for the worker, which is
+    // running (it answers the daemon's asking and sends the terminal its lines); the worker would
+    // read it at once, and its report would then say the component is registered, which this
+    // reads as an attempt that shows nothing.
     let mark = ticks(&world.terminal);
     let looked_at = tokio::time::Instant::now();
     loop {
         world.terminal.watch(Duration::from_millis(50)).await;
         if let Some(reports) = reported_fresh(&controller).await {
             match reports.as_slice() {
-                [report] if is_registering(report) => {
+                [(id, report)] if *id == binding && is_registering(report) => {
                     let shown = ticks(&world.terminal);
                     if shown > mark + 20 {
                         eprintln!(
@@ -1421,7 +1590,7 @@ async fn hold_a_registration_and_end_the_host() -> Attempt {
                         break;
                     }
                 }
-                [report] if report.state == ComponentState::Registered => {
+                [(_, report)] if report.state == ComponentState::Registered => {
                     return Attempt::Missed(
                         "the registration was answered before the host was held still".to_owned(),
                     );
@@ -1478,9 +1647,10 @@ async fn hold_a_registration_and_end_the_host() -> Attempt {
     loop {
         world.terminal.watch(Duration::from_millis(50)).await;
         let reports = reported_fresh(&controller).await;
-        if reports.as_deref().is_some_and(
-            |reports| matches!(reports, [report] if report.state == ComponentState::Registered),
-        ) {
+        if reports.as_deref().is_some_and(|reports| {
+            matches!(reports, [(id, report)] if *id == binding
+                && report.state == ComponentState::Registered)
+        }) {
             eprintln!("the binding is registered with the replacement: {reports:?}");
             break;
         }
@@ -1610,19 +1780,20 @@ fn assert_the_entry_is_as_documented(exported: &str) {
 ///
 /// A program a package with a component recognises is typed at the managed prompt of a session on
 /// Windows, and the daemon starts the plugin host and registers the component in it. Before the
-/// sign-out, the daemon (this test's process), the worker, the shell, the program and the plugin
-/// host are each shown running, by the identity they were started under, in this login session; the
-/// startup entry is shown to be the one the product registers, and as the host guide says it is.
-/// Their identities and the entry as the Task Scheduler exports it are kept for the half that
-/// follows; the account's profiles are put back; and the account is signed out, which ends this
-/// process.
+/// sign-out, the daemon (this test's process), the worker, the plugin host and every process either
+/// started, the shell and the program among them, are each shown running, by the identity they were
+/// started under, in this login session; the startup entry is shown to be the one the product
+/// registers, and as the host guide says it is. Their identities and the entry as the Task
+/// Scheduler exports it are kept for the half that follows; the account's profiles are put back;
+/// nothing this case holds is let go of, so that only the sign-out can end what it started; and the
+/// account is signed out, which ends this process.
 ///
 /// The case is run by a run that signs the account in again afterwards, as a temporary standard
 /// account, and runs the case that follows. It signs out the account that runs it, so it runs only
 /// where `KR_ALLOW_SIGN_OUT=1` says that account is disposable, and never for an account in the
 /// Administrators group.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = writes_profiles!()]
+#[ignore = signs_out!()]
 async fn with_a_plugin_host_running_the_session_is_set_up_and_the_account_signed_out() {
     // Before anything is started: a run of every case in this file at once, or a run as an account
     // whose session others depend on, must not end that session.
@@ -1662,7 +1833,7 @@ async fn with_a_plugin_host_running_the_session_is_set_up_and_the_account_signed
     loop {
         let reports = reported_fresh(&controller).await;
         if reports.as_deref().is_some_and(
-            |reports| matches!(reports, [report] if report.state == ComponentState::Registered),
+            |reports| matches!(reports, [(_, report)] if report.state == ComponentState::Registered),
         ) {
             break;
         }
@@ -1681,43 +1852,40 @@ async fn with_a_plugin_host_running_the_session_is_set_up_and_the_account_signed
     let health = client.health().await.expect("the host reports its health");
     assert_eq!(health.live_bindings, 1, "{health:?}");
 
-    // What the sign-out is about: every process of this login session by the identity it was
-    // started under. The shell and what stands between it and the program are the program's
-    // ancestors up to the worker, which the kernel's record of who started whom names.
+    // What the sign-out is about: the daemon, the worker and every process either the worker or the
+    // plugin host started, by the identity each was started under, all in this login session.
     let session = kr_ipc::starter::current_session().expect("this process's login session");
     let me = kr_ipc::identity::current_process_start_identity().expect("this process's identity");
     let worker = worker_of(&environment, world.session_id);
-    let programs = processes_named("claude.exe");
-    assert_eq!(programs.len(), 1, "the program is running: {programs:?}");
-    let program = kr_ipc::identity::process_start_identity(programs[0]).expect("the program");
-    let mut between = Vec::new();
-    let mut at = program.clone();
-    while at != worker {
-        at = kr_worker::windows::lineage::parent_of(&at)
-            .unwrap_or_else(|error| panic!("who started process {}: {error}", at.pid.get()));
-        assert!(
-            between.len() < 8,
-            "the program is not the worker's descendant"
-        );
-        if at != worker {
-            between.push(at.clone());
-        }
-    }
+    let host_identity = host.process_start_identity.clone();
+    let started = descendants_of(&[worker.clone(), host_identity.clone()]);
     let mut processes = vec![
         ("the daemon (this test's process)".to_owned(), me),
         ("the worker".to_owned(), worker),
+        ("the plugin host".to_owned(), host_identity),
     ];
-    for (number, process) in between.iter().rev().enumerate() {
-        processes.push((
-            format!("what the worker started, number {}", number + 1),
-            process.clone(),
-        ));
-    }
-    processes.push(("the program".to_owned(), program));
-    processes.push((
-        "the plugin host".to_owned(),
-        host.process_start_identity.clone(),
-    ));
+    processes.extend(started.into_iter().map(|process| {
+        let image = kr_ipc::starter::process_facts(
+            u32::try_from(process.pid.get()).expect("a process identifier"),
+        )
+        .map_or_else(
+            |error| format!("an unreadable process ({error})"),
+            |facts| facts.image.display().to_string(),
+        );
+        (format!("a process they started, {image}"), process)
+    }));
+    assert!(
+        processes
+            .iter()
+            .any(|(what, _)| what.to_ascii_lowercase().ends_with("claude.exe")),
+        "the program is not among what the worker started: {processes:?}"
+    );
+    assert!(
+        processes
+            .iter()
+            .any(|(what, _)| what.to_ascii_lowercase().ends_with("pwsh.exe")),
+        "the shell is not among what the worker started: {processes:?}"
+    );
     for (what, process) in &processes {
         let facts = kr_ipc::starter::process_facts(
             u32::try_from(process.pid.get()).expect("a process identifier"),
@@ -1762,6 +1930,15 @@ async fn with_a_plugin_host_running_the_session_is_set_up_and_the_account_signed
         definition.name
     );
 
+    let directories: Vec<String> = world
+        .directories
+        .iter()
+        .map(|directory| directory.path().display().to_string())
+        .chain([
+            world.managed.host.tree.root().display().to_string(),
+            world.managed.packages.path().display().to_string(),
+        ])
+        .collect();
     let record = serde_json::json!({
         "session": session,
         "task": definition.name,
@@ -1770,25 +1947,34 @@ async fn with_a_plugin_host_running_the_session_is_set_up_and_the_account_signed
             .iter()
             .map(|(what, identity)| serde_json::json!({ "what": what, "identity": identity }))
             .collect::<Vec<_>>(),
-        "directories": world
-            .directories
-            .iter()
-            .map(|directory| directory.path().display().to_string())
-            .chain([
-                world.managed.host.tree.root().display().to_string(),
-                world.managed.packages.path().display().to_string(),
-            ])
-            .collect::<Vec<_>>(),
+        "directories": directories,
     });
+
+    // The account's profiles go back as they were before the sign-out, which would not put them
+    // back: the shell has read them and does not read them again.
+    let Running {
+        terminal,
+        managed,
+        directories,
+        ..
+    } = world;
+    let Managed {
+        host: daemon,
+        packages,
+        _profiles: profiles,
+        _turn: turn,
+    } = managed;
+    drop(profiles);
+    // From here only the sign-out may end what the session started. Nothing this case holds is let
+    // go of, so that a sign-out that does not come leaves the processes running and the case
+    // failing, and the "after" case, which needs a record, is not run on processes this case ended
+    // itself.
+    std::mem::forget((terminal, daemon, packages, directories, turn, _host_ends));
     std::fs::write(
         sign_out_record(),
         serde_json::to_vec_pretty(&record).expect("a record"),
     )
     .expect("the record of what the sign-out is about");
-
-    // The account's profiles go back as they were before the sign-out, which would not put them
-    // back: the shell has read them and does not read them again.
-    drop(world.managed._profiles);
     eprintln!("signing out login session {session}");
     let signed_out = Command::new(system32("logoff.exe"))
         .status()
@@ -1803,12 +1989,13 @@ async fn with_a_plugin_host_running_the_session_is_set_up_and_the_account_signed
 /// and the per-user startup entry stands, as the host guide says it does.
 ///
 /// Run in the account's next sign-in, by the identities the half before the sign-out recorded: the
-/// daemon, the worker, the shell, the program and the plugin host are each ended, no program of the
-/// product runs in this login session, which is not the one that was signed out, and the
-/// environment's task is registered with no trigger and is exactly as it was exported before, so
-/// that nothing starts until a `kr new` after this sign-in.
+/// daemon (the first half's own process, which ends with the session), the worker, the plugin host
+/// and every process either started, the shell and the program among them, are each ended; no
+/// program of the product runs as this account in any login session, so nothing started at the
+/// sign-in; and the environment's task is registered with no trigger and is exactly as it was
+/// exported before, so that nothing starts until a `kr new` after this sign-in.
 #[test]
-#[ignore = writes_profiles!()]
+#[ignore = follows_a_sign_out!()]
 fn after_a_sign_out_nothing_the_session_started_is_left_and_the_startup_entry_stands() {
     let path = sign_out_record();
     let record: serde_json::Value =
@@ -1821,48 +2008,50 @@ fn after_a_sign_out_nothing_the_session_started_is_left_and_the_startup_entry_st
         }))
         .expect("a record");
 
-    // Each process, by the identity it was started under.
-    let left: Vec<String> = record["processes"]
-        .as_array()
-        .expect("processes")
-        .iter()
-        .filter_map(|entry| {
-            let identity: kr_protocol::identity::ProcessStartIdentity =
-                serde_json::from_value(entry["identity"].clone()).expect("an identity");
-            (kr_ipc::identity::process_state(&identity) != kr_ipc::identity::ProcessState::Ended)
-                .then(|| {
-                    format!(
-                        "{} (process {})",
-                        entry["what"].as_str().expect("a name"),
-                        identity.pid.get()
-                    )
-                })
-        })
-        .collect();
+    // Each process, by the identity it was started under. A process whose identifier another
+    // account's process holds now cannot be read, and is not read as ended.
+    let mut left = Vec::new();
+    let mut unread = Vec::new();
+    for entry in record["processes"].as_array().expect("processes") {
+        let identity: kr_protocol::identity::ProcessStartIdentity =
+            serde_json::from_value(entry["identity"].clone()).expect("an identity");
+        let what = format!(
+            "{} (process {})",
+            entry["what"].as_str().expect("a name"),
+            identity.pid.get()
+        );
+        match kr_ipc::identity::process_state(&identity) {
+            kr_ipc::identity::ProcessState::Ended => {
+                eprintln!("after the sign-out: {what} is ended")
+            }
+            kr_ipc::identity::ProcessState::Running => left.push(what),
+            kr_ipc::identity::ProcessState::Unknown { detail } => {
+                unread.push(format!("{what}: {detail}"));
+            }
+        }
+    }
     assert!(
         left.is_empty(),
         "the sign-out left these running: {}",
         left.join(", ")
     );
-    for entry in record["processes"].as_array().expect("processes") {
-        eprintln!(
-            "after the sign-out: {} is ended",
-            entry["what"].as_str().expect("a name")
-        );
-    }
+    assert!(
+        unread.is_empty(),
+        "these could not be read as ended or running: {}",
+        unread.join(", ")
+    );
 
-    // This is another login session, and the product has started nothing in it.
-    let before = u32::try_from(record["session"].as_u64().expect("a session")).expect("a session");
+    // The product has started nothing as this account, in this login session or any other.
+    let before = record["session"].as_u64().expect("a session");
     let now = kr_ipc::starter::current_session().expect("this process's login session");
-    assert_ne!(now, before, "this is the login session that was signed out");
     assert_eq!(
-        product_programs_in(now),
+        product_programs_of_this_account(),
         Vec::<String>::new(),
-        "the product started programs in login session {now} at the sign-in"
+        "programs of the product run as this account after the sign-out and the sign-in"
     );
     eprintln!(
-        "after the sign-out: login session {now}, not login session {before}, runs no program of the \
-         product"
+        "after the sign-out: in login session {now} (the session that was signed out was {before}) \
+         and in every other, no program of the product runs as this account"
     );
 
     // The entry is still registered, exactly as it was.
