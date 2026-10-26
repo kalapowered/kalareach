@@ -140,7 +140,7 @@ quote.workspace = true
 libc.workspace = true
 # The recovery kit is read from a pipe by waiting for it with a short poll, so a signal can end the
 # wait, and the folder a restore fills is checked for its owner.
-rustix = { workspace = true, features = ["event", "process"] }
+rustix = { workspace = true, features = ["event", "pipe", "process"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true

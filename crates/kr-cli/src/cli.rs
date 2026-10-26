@@ -1802,6 +1802,15 @@ pub struct NewArguments {
     /// person did not type into their editor.
     #[arg(long)]
     pub no_fenced_launch: bool,
+    /// Keep the window open when this command fails.
+    ///
+    /// The failure is printed as it always is, then the command waits for one key before it exits
+    /// with the failure's status, so a window opened for this command alone (a terminal profile's)
+    /// shows the error rather than closing on it. It waits only when standard input and standard
+    /// output are terminals and the output is not `--json`. A session that ends because its shell
+    /// exited, with any status, is not a failure to hold for.
+    #[arg(long)]
+    pub hold_on_failure: bool,
 }
 
 impl NewArguments {

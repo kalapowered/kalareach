@@ -38,6 +38,23 @@ pub fn ignore_background_write_signal() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Ends this process the way `signal` would have ended it had nothing handled it: the signal's
+/// default action is restored and the signal is sent to this process, so that whatever started it
+/// reads a death by that signal and not an exit status.
+///
+/// Only a process that has caught `signal` and finished what it owed calls this.
+#[cfg(unix)]
+pub fn end_by_signal(signal: std::os::raw::c_int) -> ! {
+    // SAFETY: `SIG_DFL` is a disposition, not a handler function, so nothing runs in a signal
+    // context; `raise` sends the signal to this process only.
+    unsafe {
+        libc::signal(signal, libc::SIG_DFL);
+        libc::raise(signal);
+    }
+    // The signal was blocked or ignored: the conventional status of a process it ended.
+    std::process::exit(128 + signal)
+}
+
 /// Ignores the signal that stops a background process from changing the terminal.
 ///
 /// Windows has no job-control signal: a process that is not in the foreground can still set its
@@ -49,6 +66,23 @@ pub fn ignore_background_write_signal() -> std::io::Result<()> {
 #[cfg(not(unix))]
 pub const fn ignore_background_write_signal() -> std::io::Result<()> {
     Ok(())
+}
+
+/// Ends the read `thread` is blocked in on the console, so that the thread goes on to see that it
+/// has been asked to stop.
+///
+/// A read of the console cannot be woken by anything else the thread waits on. The call is a
+/// request: the thread is not joined after it, because a console that did not honour it would
+/// hold the joiner for good.
+#[cfg(not(unix))]
+pub fn cancel_blocked_read(thread: &std::thread::JoinHandle<()>) {
+    use std::os::windows::io::AsRawHandle as _;
+
+    // SAFETY: the handle is the thread's own, kept open by the `JoinHandle` this borrows, and the
+    // call only asks the system to end that thread's pending synchronous I/O.
+    let _ = unsafe {
+        windows_sys::Win32::System::IO::CancelSynchronousIo(thread.as_raw_handle().cast())
+    };
 }
 
 #[cfg(not(unix))]
@@ -155,11 +189,29 @@ mod console {
             })
         }
 
+        /// Throws away what has been typed and not yet read.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error when the console will not do it.
+        pub fn discard_input(&self) -> Result<()> {
+            use std::os::windows::io::AsRawHandle as _;
+
+            if unsafe_free_flush_console_input(self.input.as_raw_handle()) {
+                Ok(())
+            } else {
+                Err(CliError::Terminal(Shown::said(
+                    "discard the console's queued input: the console refused",
+                )))
+            }
+        }
+
         /// Puts the console into the mode a forwarded terminal needs, and returns what it replaced.
         ///
         /// # Errors
         ///
-        /// Returns an error when the modes cannot be read or set.
+        /// Returns an error when the modes cannot be read or set. A console whose output mode
+        /// cannot be set is given its input mode back first, so a failure leaves it as it was.
         pub fn enter_raw_mode(&self) -> Result<SavedModes> {
             use windows_sys::Win32::System::Console::{
                 DISABLE_NEWLINE_AUTO_RETURN, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT,
@@ -174,7 +226,10 @@ mod console {
             let raw_output =
                 saved.output | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN;
             set_console_mode(&self.input, raw_input)?;
-            set_console_mode(&self.output, raw_output)?;
+            if let Err(error) = set_console_mode(&self.output, raw_output) {
+                let _ = set_console_mode(&self.input, saved.input);
+                return Err(error);
+            }
             Ok(saved)
         }
 
@@ -341,6 +396,11 @@ mod console {
     fn unsafe_free_set_console_mode(handle: std::os::windows::raw::HANDLE, mode: u32) -> bool {
         // SAFETY: `handle` comes from an open console file.
         unsafe { windows_sys::Win32::System::Console::SetConsoleMode(handle.cast(), mode) != 0 }
+    }
+
+    fn unsafe_free_flush_console_input(handle: std::os::windows::raw::HANDLE) -> bool {
+        // SAFETY: `handle` comes from an open console file.
+        unsafe { windows_sys::Win32::System::Console::FlushConsoleInputBuffer(handle.cast()) != 0 }
     }
 
     fn unsafe_free_get_console_screen_buffer_info(
