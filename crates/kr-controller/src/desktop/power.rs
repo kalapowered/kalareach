@@ -670,28 +670,16 @@ mod platform {
 
     /// Reads whether this host is running on mains power.
     ///
-    /// A machine that has no battery is on mains, and a query that failed says nothing at all.
-    /// Those are different answers: collapsing them would let a `mains_only` setting hold an
-    /// assertion on a laptop whose battery this host could not read.
+    /// Through the system's power-status call: a machine that has no battery is on mains, and a
+    /// machine that has one and does not say whether it is plugged in is unknown. Those are
+    /// different answers: collapsing them would let a `mains_only` setting hold an assertion on a
+    /// laptop whose power source this host could not read.
     pub(super) fn power_source() -> PowerSource {
-        let Some(printed) = super::bounded_output(
-            "powershell.exe",
-            &[
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "try { \
-                   $status = Get-CimInstance -ClassName BatteryStatus -Namespace root\\wmi \
-                     -ErrorAction Stop; \
-                   if ($null -eq $status) { 'ac power' } \
-                   elseif ($status.PowerOnline) { 'ac power' } else { 'battery' } \
-                 } catch { 'unknown' }",
-            ],
-            super::QUERY_PATIENCE,
-        ) else {
-            return PowerSource::Unknown;
-        };
-        super::power_source_of(&printed, "ac power", "battery")
+        match kr_ipc::conditions::supply() {
+            Some(kr_ipc::conditions::Supply::Mains) => PowerSource::Mains,
+            Some(kr_ipc::conditions::Supply::Battery) => PowerSource::Battery,
+            None => PowerSource::Unknown,
+        }
     }
 }
 
@@ -748,7 +736,7 @@ fn confirmed_within(
 /// The output is read after the query has finished, so a query that filled its pipe would stall;
 /// every query here prints a few kilobytes at most, and one that stalls is ended at the deadline
 /// like any other that does not answer.
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn bounded_output(
     program: &str,
     arguments: &[&str],
@@ -787,7 +775,7 @@ fn bounded_output(
 }
 
 /// Returns the power source a platform's own wording describes.
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(target_os = "macos")]
 fn power_source_of(printed: &str, mains: &str, battery: &str) -> PowerSource {
     let printed = printed.to_ascii_lowercase();
     if printed.contains(mains) {
@@ -989,5 +977,39 @@ mod tests {
             expired_at_wake(&shared, deadline),
             "an authority deadline taken before a suspension is expired on waking"
         );
+    }
+
+    /// A Windows host that has no battery is on mains, by the machine's own count of its batteries
+    /// (asked through PowerShell, apart from the call this reads the power source with), so a
+    /// setting that means "only on mains" holds the assertion there and does not take the host for
+    /// one that would not say.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_host_with_no_battery_reads_as_on_mains() {
+        let counted = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "(Get-CimInstance Win32_Battery | Measure-Object).Count",
+            ])
+            .output()
+            .expect("PowerShell runs");
+        assert!(counted.status.success(), "{counted:?}");
+        let batteries: u32 = String::from_utf8_lossy(&counted.stdout)
+            .trim()
+            .parse()
+            .expect("a count of batteries");
+
+        let source = power_source();
+        if batteries == 0 {
+            assert_eq!(source, PowerSource::Mains);
+        } else {
+            assert_ne!(
+                source,
+                PowerSource::Unknown,
+                "a battery and a plug the system names"
+            );
+        }
     }
 }

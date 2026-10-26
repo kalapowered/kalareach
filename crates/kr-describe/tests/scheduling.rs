@@ -489,3 +489,61 @@ fn this_host_names_the_background_mechanism_it_actually_applied() {
         assert_eq!(applied.mechanism.as_str(), "none");
     }
 }
+
+/// KR-REQ-22.13: what a platform's thermal zones say of the heat is the worst of them, by how far
+/// the platform is holding the processors back, and a machine that lists no zone says nothing. The
+/// first set is what the Windows test machine's performance counters returned.
+#[test]
+fn the_thermal_zones_a_platform_lists_say_how_hot_the_host_is() {
+    use kr_describe::resource::{Signal, ThermalState, platform::thermal_of_zones};
+    use kr_ipc::conditions::ThermalZone;
+
+    let zones = |limits: &[u32]| -> Vec<ThermalZone> {
+        limits
+            .iter()
+            .enumerate()
+            .map(|(index, limit)| ThermalZone {
+                name: format!(r"\_TZ.TZ{index:02}"),
+                passive_limit_percent: *limit,
+            })
+            .collect()
+    };
+    let read = |limits: &[u32]| thermal_of_zones(&zones(limits));
+
+    assert_eq!(read(&[100]), Signal::Qualified(ThermalState::Nominal));
+    assert_eq!(read(&[100, 99]), Signal::Qualified(ThermalState::Elevated));
+    assert_eq!(read(&[50]), Signal::Qualified(ThermalState::Elevated));
+    assert_eq!(read(&[49]), Signal::Qualified(ThermalState::Critical));
+    assert_eq!(
+        read(&[100, 70, 20]),
+        Signal::Qualified(ThermalState::Critical),
+        "the worst zone decides"
+    );
+    assert!(matches!(read(&[]), Signal::Unqualified { .. }));
+}
+
+/// KR-REQ-22.13: a Windows host reads where its power comes from and, when it lists a thermal zone,
+/// how hot it is; the policy then pauses on battery and on heat, and treats a reading it could not
+/// take as the pause the policy defines.
+#[cfg(windows)]
+#[test]
+fn a_windows_host_reads_its_power_source_and_its_thermal_zones() {
+    use kr_describe::resource::Signal;
+    use kr_describe::resource::platform::read_conditions;
+
+    let conditions = read_conditions();
+    assert!(
+        matches!(conditions.power, Signal::Qualified(_)),
+        "{:?}",
+        conditions.power
+    );
+    if kr_ipc::conditions::thermal_zones().is_empty() {
+        assert!(matches!(conditions.thermal, Signal::Unqualified { .. }));
+    } else {
+        assert!(
+            matches!(conditions.thermal, Signal::Qualified(_)),
+            "{:?}",
+            conditions.thermal
+        );
+    }
+}

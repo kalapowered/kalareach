@@ -398,9 +398,9 @@ pub mod platform {
 
     /// Reads what this host will tell this build.
     ///
-    /// Memory is read on every platform. Power and thermal state are read on macOS and Linux, each
-    /// through the mechanism that platform documents, and are unqualified on Windows in this
-    /// build.
+    /// Memory is read on every platform. Power and thermal state are read on macOS, Linux and
+    /// Windows, each through the mechanism that platform documents, and are unqualified on a
+    /// platform this build has no reader for.
     #[must_use]
     pub fn read_conditions() -> HostConditions {
         let (physical, available) = memory();
@@ -410,6 +410,33 @@ pub mod platform {
             power: power(),
             thermal: thermal(),
         }
+    }
+
+    /// What a processor speed limit, in percent of the top speed, says of the heat: no limit is
+    /// nominal, a limit down to half speed is elevated, and a deeper one is critical.
+    #[must_use]
+    pub const fn thermal_of_speed_limit(percent: u32) -> ThermalState {
+        match percent {
+            100.. => ThermalState::Nominal,
+            50..=99 => ThermalState::Elevated,
+            _ => ThermalState::Critical,
+        }
+    }
+
+    /// What a set of thermal zones says of the heat: the worst of them, and nothing when the
+    /// machine lists none.
+    #[must_use]
+    pub fn thermal_of_zones(zones: &[kr_ipc::conditions::ThermalZone]) -> Signal<ThermalState> {
+        zones
+            .iter()
+            .map(|zone| thermal_of_speed_limit(zone.passive_limit_percent))
+            .max()
+            .map_or(
+                Signal::Unqualified {
+                    why: "this host reported no thermal zone",
+                },
+                Signal::Qualified,
+            )
     }
 
     fn memory() -> (Signal<u64>, Signal<u64>) {
@@ -491,7 +518,21 @@ pub mod platform {
         })
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(windows)]
+    fn power() -> Signal<PowerSource> {
+        // The power-status call, which says on a machine with no battery that it is on the mains
+        // and says nothing when it does not know. A host that does not answer is unqualified,
+        // which the policy treats as battery.
+        match kr_ipc::conditions::supply() {
+            Some(kr_ipc::conditions::Supply::Mains) => Signal::Qualified(PowerSource::Mains),
+            Some(kr_ipc::conditions::Supply::Battery) => Signal::Qualified(PowerSource::Battery),
+            None => Signal::Unqualified {
+                why: "this host did not report a power source",
+            },
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     fn power() -> Signal<PowerSource> {
         Signal::Unqualified {
             why: "this build does not read a power source on this platform",
@@ -518,11 +559,7 @@ pub mod platform {
                 why: "this host did not report a processor speed limit",
             };
         };
-        Signal::Qualified(match limit {
-            100 => ThermalState::Nominal,
-            50..=99 => ThermalState::Elevated,
-            _ => ThermalState::Critical,
-        })
+        Signal::Qualified(thermal_of_speed_limit(limit))
     }
 
     #[cfg(target_os = "linux")]
@@ -572,7 +609,16 @@ pub mod platform {
         )
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(windows)]
+    fn thermal() -> Signal<ThermalState> {
+        // The passive limit of each thermal zone the platform reports: the share of the processors'
+        // top speed it allows because of heat, which is the platform saying it is holding
+        // something back. The worst zone decides. A machine with no zone to read is not thereby
+        // hot, and says nothing.
+        thermal_of_zones(&kr_ipc::conditions::thermal_zones())
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     fn thermal() -> Signal<ThermalState> {
         Signal::Unqualified {
             why: "this build does not read a thermal state on this platform",

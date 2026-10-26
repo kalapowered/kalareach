@@ -13,6 +13,7 @@
 //! | [`identity`] | The host's boot identity, its boot epoch and a process's start identity, read from the kernel |
 //! | [`install`] | The store of installed releases, which release this process runs, and the hold that keeps it on disk |
 //! | [`clock`] | The machine's own continuous clock, which two host processes can compare |
+//! | [`conditions`] | Where the machine's power comes from and how far its platform holds the processors back for heat, on Windows |
 //! | [`floor`] | The host's one reading of UTC in a boot, a word every host process maps |
 //! | [`peer`] | Peer-credential authentication of a local caller |
 //! | [`starter`] | What an environment's starter and the daemon that hands it a launch need from the platform: the launch pipe, a child checked before it runs, the start claim and the recorded login session |
@@ -61,6 +62,7 @@
 
 pub mod client;
 pub mod clock;
+pub mod conditions;
 pub mod descriptor;
 pub mod endpoint;
 pub mod error;
