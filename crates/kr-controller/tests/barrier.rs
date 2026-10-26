@@ -4716,7 +4716,7 @@ async fn a_result_that_could_not_ask_about_a_refused_revision_says_so_and_the_ne
     names_the_actions(&later, &hosted, &device, rejected, dispatched);
 }
 
-/// KR-REQ-09.12, 09.13: a worker whose fence for a revision was taken by a joined fence at a
+/// KR-REQ-09.12, 09.13, 10.45: a worker whose fence for a revision was taken by a joined fence at a
 /// higher revision does not answer for the lower one as a fence that named nothing.
 ///
 /// Both revisions are refused while the worker's dispatch boundary is held, and the worker's own
@@ -4724,6 +4724,9 @@ async fn a_result_that_could_not_ask_about_a_refused_revision_says_so_and_the_ne
 /// lower one afterwards, the worker holds no fence of its own for it: an empty page would read as
 /// a revocation that found nothing to take back, and the acknowledgement carries no evidence
 /// instead.
+///
+/// KR-REQ-10.45, the part about the status each worker returns: the worker's own answer for the
+/// lower revision is no evidence at all, and for the higher one the names its fence took.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_revision_a_joined_fence_took_is_not_answered_as_a_fence_that_named_nothing() {
     let worker = worker_apart().await;
@@ -4762,8 +4765,12 @@ async fn a_revision_a_joined_fence_took_is_not_answered_as_a_fence_that_named_no
     );
 }
 
-/// KR-REQ-09.12, 09.13: a fence that ran and named nothing is answered as an empty one, asked
-/// again and asked for a page past its names.
+/// KR-REQ-09.12, 09.13, 10.45: a fence that ran and named nothing is answered as an empty one,
+/// asked again and asked for a page past its names.
+///
+/// KR-REQ-10.45, the part about the status each worker returns: the control of the case on a
+/// revision a joined fence took, which a worker whose fence ran and named nothing answers as an
+/// empty fence, with nothing remaining.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_fence_that_named_nothing_is_still_answered_as_an_empty_one() {
     let worker = worker_apart().await;
@@ -4782,13 +4789,17 @@ async fn a_fence_that_named_nothing_is_still_answered_as_an_empty_one() {
     }
 }
 
-/// KR-REQ-09.12, 09.13: the result of the higher revision says the worker cannot say what its
-/// fence named for the lower one, and names every action the joined fence took.
+/// KR-REQ-09.12, 09.13, 10.45: the result of the higher revision says the worker cannot say what
+/// its fence named for the lower one, and names every action the joined fence took.
 ///
 /// The worker refused the first revision while its dispatch boundary was held, and was announced
 /// the second after it was let go, before its own maintenance had fenced the first. Its one fence
 /// took both revisions' actions and filed them under the second. The first revision's page is not
 /// the worker's to give, and the result does not read it as a revocation that named nothing.
+///
+/// KR-REQ-10.45, the part about the status each worker returns: the daemon's report for the worker
+/// reads acknowledged, names each intent the joined fence took back, and says the worker cannot
+/// say for the other revision.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_result_says_the_worker_cannot_say_for_a_revision_a_joined_fence_took() {
     let hosted = hosted_worker_apart().await;

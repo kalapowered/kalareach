@@ -6460,6 +6460,10 @@ fn names_a_daemon_never_took_are_bounded_and_the_page_says_how_many_went() {
 /// The counts outlive the names, and they are bounded too. Past that bound this journal cannot say
 /// how many names a revocation is missing, and what it must not do is answer as though it had
 /// named nothing: absent evidence and empty evidence are different statements.
+///
+/// KR-REQ-10.45, the part about the status each worker returns: a fence that ran and named nothing
+/// is an empty answer, the revision below it, which a joined fence took, has nothing to say, and
+/// a revocation this journal cannot count for is not answered as an empty one.
 #[test]
 fn a_revocation_this_journal_can_no_longer_count_for_is_not_answered_as_an_empty_one() {
     let temp = kr_ipc::testing::TempHost::create();
