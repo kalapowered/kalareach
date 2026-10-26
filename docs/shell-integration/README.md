@@ -622,8 +622,8 @@ PSReadLine module puts its decision on Ctrl+d when its hooks go live. A Windows 
 discipline to read an end-of-file character from, so when the first prompt begins the module reports
 the gesture as disabled, in every edit mode, effective at that prompt. It takes its decision off
 Ctrl+d when it promotes that report, which is at the first Ctrl+d that reaches the module at the
-prompt (one pressed in the Vi command table does not) or at the next prompt's entry, whichever comes
-first, and a Ctrl+d that promotes it runs `DeleteCharOrExit` whatever was bound to the key, which at
+prompt (one pressed in the Vi command table does not) or at the next prompt's entry while the bridge
+is registered, whichever comes first, and a Ctrl+d that promotes it runs `DeleteCharOrExit` whatever was bound to the key, which at
 an empty line ends the shell. From then on no key detaches the session there, and
 `kr detach --attachment <id>` is the way. The protocol also carries a gesture
 as a chord (`chord` with `keys`), which the module honours and the worker does not send.
@@ -806,17 +806,18 @@ editor's own operations so the reader has a boundary to answer at and the states
 observable, and puts its end-of-file decision on the configured gesture in front of whatever was
 bound there. A handler the person wrote themselves is left exactly as it is, identified by what the
 editor holds rather than by the name a handler carries, and what the module installed is put back
-when it is removed, except where the person has since bound that key themselves. Four things hold for
+when it is removed, except where the person has since bound that key themselves (and, in the Vi edit
+mode, a key that both tables bind: see below). Four things hold for
 the key the gesture is on and for no other. The module binds its decision there in front of whatever
 was bound, the person's own script included, which it runs outside the detach condition. When the
 decision comes off that key it writes back the binding it found and does not look at what the key
 holds by then. In the Emacs edit mode and in the Vi insert table the editor has an operation on
 Ctrl+d, which the module wraps like any other bound key before it binds the decision, so the binding
 it finds there is its own wrapper, and removing the module writes that wrapper back: Ctrl+d keeps
-calling the module's function and not the editor's operation. And the module moves its decision to a changed gesture's
-key when it promotes the change, which is the first end-of-file decision at the prompt the change
-names or the next prompt's entry, whichever comes first, and not when it reports the change: until
-then the new key has no decision on it, and the press of the old key that promotes the change runs
+calling the module's function and not the editor's operation. And the module moves its decision to a
+changed gesture's key when it promotes the change, which is the first end-of-file decision at the
+prompt the change names or the next prompt's entry while the bridge is registered, whichever comes
+first, and not when it reports the change: until then the new key has no decision on it, and the press of the old key that promotes the change runs
 what the new key held in place of the old key's own binding. Where a key held nothing, the module
 runs `SelfInsert` if the chord it has bound by then is one character long and `DeleteCharOrExit` for
 any other chord, and both run with the key information of the press that happened. The press that
@@ -827,7 +828,9 @@ The Vi edit mode has two key tables, and the module binds into the insert table 
 puts a binding made without `-ViMode` there, and the module wraps none of the command table's keys,
 which the editor lists in angle brackets (`<Ctrl+d>`). In the command table, which Escape opens,
 Ctrl+d stays the editor's own `ViAcceptLineOrExit`, which ends the shell at an empty line, and no
-key of that table takes the decision or reads the mailbox.
+key of that table takes the decision or reads the mailbox. A lookup of a key that both tables bind
+returns both entries, so removing the module takes such a key for one the person has rebound and
+leaves its wrapper on it.
 
 What it pins is a range rather than a release: PowerShell 7.4 or later with PSReadLine 2.3.4 up to
 3.0. The module declares the versions it found in its handshake and the worker refuses an editor
@@ -843,14 +846,15 @@ method, and that is exactly what it cannot do:
 - **The reader is reached when it steps.** The module's queue is serviced on the reader's own
   thread, after each of the editor's own operations has run: every chord the editor has a binding
   for, except the keys of the Vi command table, goes through the module, which runs the editor's
-  operation and then reads the queue. The read-line entry reports the reader and reads the mailbox
-  once, before the editor's read starts, and the editor clears its buffer when its read starts. The module has no check of its own that
+  operation and then reads the queue, unless the editor's own key queue still holds keys the person
+  typed, which go first. The read-line entry reports the reader and reads the mailbox once, before the editor's read starts, and the editor clears its buffer when its read starts. The module has no check of its own that
   holds a launch back from that one read; what keeps one from reaching it is the contract's order,
   since a launch quotes a fence the worker publishes only after the reader has acknowledged one. A
   key the person bound to a script of their own is theirs and carries no boundary, and an ordinary
   character goes straight to the editor's own insertion, so a request that arrives at a parked
-  reader is answered at its next bound key rather than immediately, and in the Vi command table at
-  the next bound key of the insert table. Until then the reader's last idle report is what the
+  reader is answered after its next bound key that leaves the editor's queue empty rather than
+  immediately; in the Vi command table that is a bound key of the insert table or the next read-line
+  entry. Until then the reader's last idle report is what the
   worker has to go on.
 - **A launch is installed where it is decided and accepted at the next step.** The decision, the
   state check and the installation all happen on the reader's thread, inside the fence, at a point
