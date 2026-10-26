@@ -23,6 +23,7 @@ const DEFAULTS: &str = "/usr/bin/defaults";
 const PLUTIL: &str = "/usr/bin/plutil";
 
 /// The program that finds processes by name.
+#[cfg(unix)]
 const PGREP: &str = "/usr/bin/pgrep";
 
 /// The key of the dictionary of profiles.
