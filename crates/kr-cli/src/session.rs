@@ -1208,7 +1208,7 @@ where
         .handle()
         .try_clone()
         .map_err(|error| CliError::Terminal(Shown::io(&error)))?;
-    let mut input = crate::attach::spawn_input_reader(input_handle);
+    let (mut input, input_stop) = crate::attach::spawn_input_reader(input_handle);
 
     // The terminal's size can change while the attachment runs. The session is told, so the
     // application sees the resize the way it would in any other terminal.
@@ -1241,6 +1241,9 @@ where
         options.follow_live,
     )
     .await;
+    // The reader stops before anything else reads this terminal: a command that goes on after the
+    // attachment must be the only reader of it.
+    input_stop.stop();
 
     // The terminal comes back here on every path out of the loop, and the guard is released only
     // once it has.

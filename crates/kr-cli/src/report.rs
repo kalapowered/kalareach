@@ -33,6 +33,10 @@ pub enum Completion {
     Done,
     /// The command failed and has already written the result that says so.
     Reported(CliError),
+    /// The command's session ended the way the person ended it, with a shell that exited, and the
+    /// failure carries the shell's own exit status. It has been reported; unlike
+    /// [`Self::Reported`], nothing about it is a reason to keep a window open.
+    Ended(CliError),
 }
 
 /// Renders a failure as machine-readable output.

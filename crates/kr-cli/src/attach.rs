@@ -626,10 +626,89 @@ pub async fn subscribe(
 }
 
 /// Reads the terminal in a blocking thread and hands batches to the caller.
+///
+/// The thread ends when the terminal's input does, when a batch has nowhere to go, or when the
+/// returned [`InputStop`] is used. Dropping the receiver alone does not end it: the thread sits in
+/// a read and takes the next key for itself.
+#[cfg(unix)]
 pub fn spawn_input_reader(
     terminal: std::fs::File,
-) -> tokio::sync::mpsc::UnboundedReceiver<Vec<u8>> {
+) -> (tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>, InputStop) {
+    use rustix::event::{PollFd, PollFlags, poll};
+    use rustix::io::Errno;
+
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    // The thread waits for the terminal and for this pipe at once. Nothing is ever written to the
+    // pipe: closing its write end, which `InputStop::stop` does, is what wakes the thread.
+    let (woken, wake) = match rustix::pipe::pipe() {
+        Ok(ends) => ends,
+        Err(_) => {
+            // No pipe to wait on: the thread reads as it always did and cannot be woken.
+            return (
+                receiver,
+                InputStop::unstoppable(spawn_blocking_reader(terminal, sender)),
+            );
+        }
+    };
+    let thread = std::thread::spawn(move || {
+        let mut terminal = terminal;
+        let mut buffer = vec![0_u8; 8 * 1024];
+        loop {
+            let mut waiting = [
+                PollFd::new(&terminal, PollFlags::IN),
+                PollFd::new(&woken, PollFlags::IN),
+            ];
+            match poll(&mut waiting, None) {
+                Ok(_) => {}
+                Err(Errno::INTR) => continue,
+                Err(_) => break,
+            }
+            // Asked to stop: the write end is closed.
+            if !waiting[1].revents().is_empty() {
+                break;
+            }
+            if waiting[0].revents().is_empty() {
+                continue;
+            }
+            match terminal.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    if sender.send(buffer[..read].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+    });
+    (
+        receiver,
+        InputStop {
+            wake: Some(wake),
+            thread,
+        },
+    )
+}
+
+/// Reads the terminal in a blocking thread and hands batches to the caller.
+///
+/// The thread ends when the terminal's input does, when a batch has nowhere to go, or when the
+/// returned [`InputStop`] is used to cancel its read.
+#[cfg(not(unix))]
+pub fn spawn_input_reader(
+    terminal: std::fs::File,
+) -> (tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>, InputStop) {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let thread = spawn_blocking_reader(terminal, sender);
+    (receiver, InputStop { thread })
+}
+
+/// The thread that reads `terminal` until its input ends or `sender` has no receiver.
+fn spawn_blocking_reader(
+    terminal: std::fs::File,
+    sender: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut terminal = terminal;
         let mut buffer = vec![0_u8; 8 * 1024];
@@ -645,8 +724,52 @@ pub fn spawn_input_reader(
                 Err(_) => break,
             }
         }
-    });
-    receiver
+    })
+}
+
+/// What ends the thread [`spawn_input_reader`] started.
+///
+/// A command that goes on after an attachment has ended (a window held open on a failure) reads
+/// the terminal itself, and must be the only one reading it: a reader left in its read takes the
+/// first key, and the command needs a second.
+#[cfg(unix)]
+pub struct InputStop {
+    /// The write end of the pipe the thread also waits on; closing it wakes the thread. None when
+    /// no pipe could be made and the thread cannot be woken.
+    wake: Option<std::os::fd::OwnedFd>,
+    /// The reading thread.
+    thread: std::thread::JoinHandle<()>,
+}
+
+#[cfg(unix)]
+impl InputStop {
+    /// A stop for a thread that cannot be woken.
+    const fn unstoppable(thread: std::thread::JoinHandle<()>) -> Self {
+        Self { wake: None, thread }
+    }
+
+    /// Ends the thread, which has ended when this returns.
+    pub fn stop(self) {
+        if self.wake.is_some() {
+            drop(self.wake);
+            let _ = self.thread.join();
+        }
+    }
+}
+
+/// What ends the thread [`spawn_input_reader`] started.
+#[cfg(not(unix))]
+pub struct InputStop {
+    /// The reading thread.
+    thread: std::thread::JoinHandle<()>,
+}
+
+#[cfg(not(unix))]
+impl InputStop {
+    /// Cancels the thread's read and leaves the thread to finish by itself.
+    pub fn stop(self) {
+        crate::platform::cancel_blocked_read(&self.thread);
+    }
 }
 
 /// What an attachment needs to know of the session it attaches to.
