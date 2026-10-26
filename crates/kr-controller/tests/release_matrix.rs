@@ -425,10 +425,11 @@ async fn a_skewed_host_is_refused_new_leases_keeps_its_working_route_and_gets_ne
         0,
         "no lease request left the host"
     );
-    assert_eq!(
-        rig.check("relay-leases").await.status,
-        DoctorStatus::Warning,
-        "the keeper reports the refusal and not an unreachable service"
+    let keeper = rig.check("relay-leases").await;
+    assert_eq!(keeper.status, DoctorStatus::Warning);
+    assert!(
+        keeper.detail().contains("release matrix"),
+        "the keeper names the matrix as the reason and not an unreachable service"
     );
     assert!(rig.bodies(SIGN_IN).len() >= signed_in);
 
@@ -510,10 +511,9 @@ async fn a_kept_skew_gates_the_first_lease_request_and_a_service_that_is_down_le
     let (_device, record) = rig.pairs().await;
     rig.pass().await;
     assert_eq!(rig.requests_for(&record), 0);
-    assert_eq!(
-        rig.check("relay-leases").await.status,
-        DoctorStatus::Warning
-    );
+    let keeper = rig.check("relay-leases").await;
+    assert_eq!(keeper.status, DoctorStatus::Warning);
+    assert!(keeper.detail().contains("release matrix"));
 }
 
 /// KR-REQ-17.46: a host with no copy asks nothing of the matrix, says it has not read it, and warns

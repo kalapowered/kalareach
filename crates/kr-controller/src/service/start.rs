@@ -792,7 +792,9 @@ impl Controller {
                         binding: backup.binding(),
                     }
                 }),
-                release_gate: None,
+                release_gate: release_matrix
+                    .as_ref()
+                    .map(crate::release_matrix::ReleaseMatrixRuntime::gate),
             },
         )?;
         let (backup_runtime, relay_parts, backup_production) = match storage_parts {
@@ -1509,7 +1511,9 @@ impl Controller {
         }
         // The first read of the signed release matrix runs on its own task: the daemon never waits
         // for it.
-        let _ = &controller.release_matrix;
+        if let Some(runtime) = &controller.release_matrix {
+            runtime.run(&controller);
+        }
         // The network comes up last. A paired device must not reach a daemon that has not yet
         // recovered its reservations and rebuilt its worker directory, because it would be told
         // that sessions this host is running do not exist. Registering it also lends the project

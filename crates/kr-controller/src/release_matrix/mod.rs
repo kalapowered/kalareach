@@ -198,7 +198,11 @@ impl Shared {
     /// Writes one line to standard error when what the host holds or has seen changes.
     fn log_a_change(&self) {
         let view = self.held.view(self.origin.as_str(), self.build);
-        let line = match (&view, self.observed().unread, self.observed().refused) {
+        let (unread, refused) = {
+            let observed = self.observed();
+            (observed.unread, observed.refused)
+        };
+        let line = match (&view, unread, refused) {
             (Some(view), _, _) if view.gates() => {
                 "this build is outside every tier of the signed release matrix".to_owned()
             }
