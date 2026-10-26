@@ -6897,6 +6897,9 @@ async fn enabling_privacy_fences_production_and_removes_what_it_says_it_removed(
     assert!(two.store().object(object_id).expect("held").is_some());
 }
 
+/// KR-REQ-24.27, the part about pinned labels: while privacy mode is on the settings to publish
+/// leave out the pinned labels, which the device still holds; removing the retained local state
+/// does not clear one; and clearing one is explicit and the only thing that removes it.
 #[tokio::test]
 async fn pinned_labels_stay_on_the_device_and_are_left_out_of_what_is_published_while_private() {
     let directory = tempfile::tempdir().expect("a directory");
