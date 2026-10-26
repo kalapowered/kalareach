@@ -666,8 +666,11 @@ impl Left {
 /// What a test runs at the one moment a removal can be raced: right after a directory was pinned
 /// and checked, before its names are read.
 #[cfg(feature = "testing")]
-pub(super) static AFTER_PIN: std::sync::Mutex<Option<std::sync::Arc<dyn Fn(&Path) + Send + Sync>>> =
-    std::sync::Mutex::new(None);
+pub(super) static AFTER_PIN: std::sync::Mutex<Option<PinHook>> = std::sync::Mutex::new(None);
+
+/// What a test runs, with the pinned directory's path.
+#[cfg(feature = "testing")]
+pub(super) type PinHook = std::sync::Arc<dyn Fn(&Path) + Send + Sync>;
 
 #[cfg(feature = "testing")]
 fn after_pin(directory: &Path) {
