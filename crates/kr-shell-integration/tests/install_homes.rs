@@ -582,6 +582,8 @@ struct Kr {
     _root: tempfile::TempDir,
     runtime: PathBuf,
     state: PathBuf,
+    /// A directory a terminal application's program is stood in for in, first on the `PATH`.
+    programs: PathBuf,
 }
 
 impl Kr {
@@ -609,11 +611,15 @@ impl Kr {
             kr_ipc::paths::create_private_tree(directory, directory)
                 .expect("an owner-only directory");
         }
+        let programs = root.path().join("programs");
+        std::fs::create_dir(&programs).expect("a directory");
+        std::fs::write(programs.join("konsole"), b"#!/bin/sh\n").expect("Konsole stands in");
         Self {
             binary,
             _root: root,
             runtime,
             state,
+            programs,
         }
     }
 
@@ -624,7 +630,7 @@ impl Kr {
         powershell: Option<&Path>,
         arguments: &[&str],
     ) -> String {
-        let mut path = "/usr/bin:/bin".to_owned();
+        let mut path = format!("{}:/usr/bin:/bin", self.programs.display());
         if let Some(directory) = powershell.and_then(Path::parent) {
             path = format!("{}:{path}", directory.display());
         }
@@ -661,6 +667,11 @@ struct Home {
 /// section's claims that needs no session.
 fn install_and_remove(kr: &Kr, package: &Package, home: &Home, label: &str) {
     let powershell = (home.kind == ShellKind::PowerShell).then_some(package.executable.as_path());
+    // The terminal application a profile is written for is there before the home is looked at, so
+    // it is part of the home the checks compare.
+    if cfg!(target_os = "macos") {
+        std::fs::create_dir_all(home.path.join("Applications/iTerm.app")).expect("an application");
+    }
     let before = snapshot(&home.path);
     let shell = home.kind.as_str();
 
@@ -724,6 +735,8 @@ fn install_and_remove(kr: &Kr, package: &Package, home: &Home, label: &str) {
         );
     }
 
+    profile_beside_the_entry(kr, home, powershell, &installed, label);
+
     kr.run(
         &home.environment,
         powershell,
@@ -739,6 +752,79 @@ fn install_and_remove(kr: &Kr, package: &Package, home: &Home, label: &str) {
             .chain(before.keys())
             .filter(|path| removed.get(*path) != before.get(*path))
             .collect::<Vec<_>>()
+    );
+}
+
+/// The terminal application this platform has a profile for, and the file its profile is, from the
+/// home.
+fn profile_application() -> Option<(&'static str, &'static str)> {
+    if cfg!(target_os = "linux") {
+        Some(("konsole", ".local/share/konsole/KalaReach.profile"))
+    } else if cfg!(target_os = "macos") {
+        Some((
+            "iterm2",
+            "Library/Application Support/iTerm2/DynamicProfiles/KalaReach.json",
+        ))
+    } else {
+        None
+    }
+}
+
+/// KR-REQ-26.05: the terminal profile is offered apart from the startup entry. Over a home the entry
+/// is installed in, installing the profile adds its own file and the directories made for it, changes
+/// nothing the entry installation left, and writes no line that runs `exec` on `kr`; taking it out
+/// leaves the home as the entry left it.
+fn profile_beside_the_entry(
+    kr: &Kr,
+    home: &Home,
+    powershell: Option<&Path>,
+    installed: &Snapshot,
+    label: &str,
+) {
+    let Some((application, file)) = profile_application() else {
+        return;
+    };
+    kr.run(
+        &home.environment,
+        powershell,
+        &["host", "terminal-profile", "install", application],
+    );
+    let profiled = snapshot(&home.path);
+    for (path, node) in installed {
+        assert_eq!(
+            profiled.get(path),
+            Some(node),
+            "{label}: installing the terminal profile changed {}",
+            path.display()
+        );
+    }
+    let profile = Path::new(file);
+    for path in profiled
+        .keys()
+        .filter(|path| !installed.contains_key(*path))
+    {
+        assert!(
+            profile.starts_with(path),
+            "{label}: installing the terminal profile added {}, which is not the profile or a directory made for it",
+            path.display()
+        );
+    }
+    let Some(Node::File { bytes, .. }) = profiled.get(profile) else {
+        panic!("{label}: the terminal profile is not at {file}");
+    };
+    assert!(
+        exec_of_kr(&String::from_utf8_lossy(bytes)).is_none(),
+        "{label}: the terminal profile runs exec on kr"
+    );
+    kr.run(
+        &home.environment,
+        powershell,
+        &["host", "terminal-profile", "remove", application],
+    );
+    assert_eq!(
+        &snapshot(&home.path),
+        installed,
+        "{label}: taking the terminal profile out left the home other than the entry left it"
     );
 }
 
