@@ -29163,10 +29163,10 @@
         },
         {
           "additionalProperties": false,
-          "description": "Something is in the way of its cleanup: its worker says a store refused part of it, or,\nfor a session whose worker has ended, the archive's last removal of what the worker\nretained left something behind.",
+          "description": "Something is in the way of its cleanup: its worker says a step could not be taken or it\ncannot say where its cleanup stands, or, for a session whose worker has ended, the\narchive's last attempt to remove what the worker retained did not finish.",
           "properties": {
             "reason": {
-              "description": "What its worker said, or what the archive's removal reported.",
+              "description": "What its worker said, or why the archive's last attempt did not finish.",
               "type": "string"
             },
             "state": {

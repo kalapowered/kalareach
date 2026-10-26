@@ -3705,10 +3705,12 @@ impl Journal {
     ///
     /// A transition this journal commits while the record says privacy mode is on holds no content
     /// ([`Self::settle`] and the rejections), so a store whose record says it is on and whose
-    /// settled receipts still carry content was written by a release that removed it in a second
-    /// transaction, and stopped between the two. The record is the store's own, so this decides
-    /// the same way for a journal whose worker has ended, long after the environment's privacy mode
-    /// has changed again: what settled under the record is withheld under it.
+    /// settled receipts still carry content was left so by something else: a release that removed
+    /// content in a second transaction and stopped between the two, an enabling that stopped
+    /// after it recorded privacy mode and before it removed what had settled, or a removal that
+    /// the store refused. The record is the store's own, so this decides the same way for a
+    /// journal whose worker has ended, long after the environment's privacy mode has changed
+    /// again: what settled under the record is withheld under it.
     ///
     /// # Errors
     ///
