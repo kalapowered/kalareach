@@ -32,6 +32,8 @@ const THEIRS: &str = "export EDITOR=vim\nalias ll='ls -l'\n";
 /// A home, a zsh package and the installation's directories, all of this test's own.
 struct Setup {
     _root: tempfile::TempDir,
+    /// A directory a terminal application's program is stood in for in, first on the `PATH`.
+    programs: PathBuf,
     home: PathBuf,
     packages: PathBuf,
     runtime: PathBuf,
@@ -47,6 +49,9 @@ impl Setup {
         let runtime = root.path().join("runtime");
         let state = root.path().join("state");
         std::fs::create_dir(&home).expect("a home");
+        let programs = root.path().join("programs");
+        std::fs::create_dir(&programs).expect("a directory");
+        std::fs::write(programs.join("konsole"), b"#!/bin/sh\n").expect("Konsole stands in");
         // The installation's directories are its owner's alone, as a host makes them.
         for directory in [&runtime, &state] {
             kr_ipc::paths::create_private_tree(directory, directory)
@@ -86,6 +91,7 @@ impl Setup {
             .expect("names the identity in use");
         Self {
             _root: root,
+            programs,
             home,
             packages,
             runtime,
@@ -100,7 +106,7 @@ impl Setup {
         command
             .args(arguments)
             .env_clear()
-            .env("PATH", "/usr/bin:/bin")
+            .env("PATH", format!("{}:/usr/bin:/bin", self.programs.display()))
             .env("HOME", &self.home)
             .env("KR_RUNTIME_DIR", &self.runtime)
             .env("KR_STATE_DIR", &self.state)
@@ -199,6 +205,113 @@ fn an_entry_comes_out_of_a_file_whose_name_is_not_text() {
     // Nothing was written under a name the report's text makes of it.
     let lossy = PathBuf::from(setup.home.to_string_lossy().into_owned());
     assert!(!lossy.exists(), "{} was not created", lossy.display());
+}
+
+/// KR-REQ-26.05, KR-REQ-26.04: the terminal profile is offered apart from the startup entry. Over
+/// a home that sources iTerm2's shell integration and whose startup file does not end in a line
+/// break, installing the profile adds its own file and changes nothing the entry installation left,
+/// taking it out leaves the home as the entry left it, and taking the entry out leaves the home as
+/// it was. Neither writes a line that runs `exec` on `kr`.
+#[test]
+fn a_terminal_profile_installs_beside_a_startup_entry_and_each_comes_out_alone() {
+    let setup = Setup::new(OsStr::new("home"));
+    let zshrc = setup.home.join(".zshrc");
+    let theirs = "test -e \"${HOME}/.iterm2_shell_integration.zsh\" && source \"${HOME}/.iterm2_shell_integration.zsh\"\nexport EDITOR=vim";
+    std::fs::write(&zshrc, theirs).expect("the person's own startup file");
+    std::fs::write(
+        setup.home.join(".iterm2_shell_integration.zsh"),
+        "# iTerm2 shell integration\nprecmd_functions+=(iterm2_precmd)\n",
+    )
+    .expect("iTerm2's file");
+    let (application, file) = if cfg!(target_os = "macos") {
+        // The application is in the person's own folder of applications, which the home holds.
+        std::fs::create_dir_all(setup.home.join("Applications/iTerm.app")).expect("an application");
+        (
+            "iterm2",
+            "Library/Application Support/iTerm2/DynamicProfiles/KalaReach.json",
+        )
+    } else {
+        ("konsole", ".local/share/konsole/KalaReach.profile")
+    };
+    let original = everything_under(&setup.home);
+
+    setup.kr(&["shell", "install", "--shell", "zsh"], None);
+    assert!(holds_an_entry(&zshrc));
+    let with_entry = everything_under(&setup.home);
+
+    setup.kr(&["host", "terminal-profile", "install", application], None);
+    let with_both = everything_under(&setup.home);
+    for (path, bytes) in &with_entry {
+        assert_eq!(
+            with_both.get(path),
+            Some(bytes),
+            "{} is as the entry left it",
+            path.display()
+        );
+    }
+    assert!(
+        with_both.contains_key(Path::new(file)),
+        "the profile is where it is written"
+    );
+    for path in with_both
+        .keys()
+        .filter(|path| !with_entry.contains_key(*path))
+    {
+        assert!(
+            Path::new(file).starts_with(path),
+            "{} is the profile or a directory made for it",
+            path.display()
+        );
+    }
+    for path in with_both.keys() {
+        let text = std::fs::read_to_string(setup.home.join(path)).unwrap_or_default();
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.trim_start().starts_with("exec ") && line.contains("kr")),
+            "{} runs exec on kr",
+            path.display()
+        );
+    }
+
+    setup.kr(&["host", "terminal-profile", "remove", application], None);
+    assert_eq!(
+        everything_under(&setup.home),
+        with_entry,
+        "the profile came out alone"
+    );
+    setup.kr(&["shell", "remove", "--shell", "zsh"], None);
+    assert_eq!(
+        everything_under(&setup.home),
+        original,
+        "and then the entry came out alone"
+    );
+}
+
+/// Every file and directory under `root`, by its path from it; a file with its bytes.
+fn everything_under(root: &Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+    fn walk(
+        root: &Path,
+        directory: &Path,
+        found: &mut std::collections::BTreeMap<PathBuf, Option<Vec<u8>>>,
+    ) {
+        for entry in std::fs::read_dir(directory).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(root)
+                .expect("under the root")
+                .to_path_buf();
+            if path.is_dir() {
+                found.insert(relative, None);
+                walk(root, &path, found);
+            } else {
+                found.insert(relative, Some(std::fs::read(&path).expect("a file reads")));
+            }
+        }
+    }
+    let mut found = std::collections::BTreeMap::new();
+    walk(root, root, &mut found);
+    found
 }
 
 /// The control: an ordinary installation, in a home the layout has not moved from, is removed as

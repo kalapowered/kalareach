@@ -10,7 +10,10 @@ pub mod record;
 pub mod words;
 
 mod files;
+mod iterm2;
 mod konsole;
+mod preferences;
+mod windows_terminal;
 
 use std::path::{Path, PathBuf};
 
@@ -83,7 +86,15 @@ impl ProfileTerminal {
         {
             &[Self::Konsole]
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            &[Self::Iterm2]
+        }
+        #[cfg(windows)]
+        {
+            &[Self::WindowsTerminal]
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
             &[]
         }
@@ -113,8 +124,16 @@ pub struct ProfileHome {
     pub data_home: PathBuf,
     /// The configuration home (`XDG_CONFIG_HOME`, else `~/.config`).
     pub config_home: PathBuf,
+    /// Where macOS applications keep their files (`~/Library/Application Support`).
+    pub application_support: PathBuf,
+    /// The local application data folder (`%LOCALAPPDATA%`), where there is one.
+    pub local_app_data: Option<PathBuf>,
     /// The directories programs are found in.
     pub programs: Vec<PathBuf>,
+    /// The folders macOS applications are found in.
+    pub applications: Vec<PathBuf>,
+    /// iTerm2's preferences: the domain, or the path of a file standing in for it.
+    pub iterm_preferences: String,
 }
 
 impl ProfileHome {
@@ -130,21 +149,36 @@ impl ProfileHome {
         Some(Self {
             data_home: absolute("XDG_DATA_HOME").unwrap_or_else(|| home.join(".local/share")),
             config_home: absolute("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config")),
+            application_support: home.join("Library").join("Application Support"),
+            local_app_data: absolute("LOCALAPPDATA"),
             programs: std::env::var_os("PATH")
                 .map(|path| std::env::split_paths(&path).collect())
                 .unwrap_or_default(),
+            applications: vec![PathBuf::from("/Applications"), home.join("Applications")],
+            iterm_preferences: "com.googlecode.iterm2".to_owned(),
             home,
         })
     }
 
-    /// The places under a home directory of its own, with programs found in `programs`.
+    /// The places under a home directory of its own, with programs found in `programs`. Its
+    /// applications are the ones in the home's `Applications` folder, and the preferences it names
+    /// are files in the home, so nothing here reaches the person's own.
     #[must_use]
     pub fn under(home: &Path, programs: Vec<PathBuf>) -> Self {
         Self {
             home: home.to_path_buf(),
             data_home: home.join(".local/share"),
             config_home: home.join(".config"),
+            application_support: home.join("Library").join("Application Support"),
+            local_app_data: Some(home.join("AppData").join("Local")),
             programs,
+            applications: vec![home.join("Applications")],
+            iterm_preferences: home
+                .join("Library")
+                .join("Preferences")
+                .join("com.googlecode.iterm2")
+                .display()
+                .to_string(),
         }
     }
 
@@ -154,6 +188,14 @@ impl ProfileHome {
         self.programs
             .iter()
             .any(|directory| directory.join(name).is_file())
+    }
+
+    /// Whether an application of this name is in one of the folders applications are found in.
+    #[must_use]
+    pub fn has_application(&self, name: &str) -> bool {
+        self.applications
+            .iter()
+            .any(|directory| directory.join(name).is_dir())
     }
 }
 
@@ -223,6 +265,8 @@ impl ProfileError {
 pub fn is_present(terminal: ProfileTerminal, home: &ProfileHome) -> bool {
     match terminal {
         ProfileTerminal::Konsole => konsole::present(home),
+        ProfileTerminal::Iterm2 => iterm2::present(home),
+        ProfileTerminal::WindowsTerminal => windows_terminal::present(home),
         _ => false,
     }
 }
@@ -296,6 +340,47 @@ pub fn plan(
             command,
             recorded,
         ),
+        ProfileTerminal::Iterm2 => {
+            let destination = iterm2::profile_path(home);
+            // A profile written again is the same profile to iTerm2: the identifier the file holds
+            // is kept, when it is the file kr wrote.
+            let guid = match recorded.map(|profile| &profile.wrote) {
+                Some(Wrote::File(wrote))
+                    if files::presence(&destination)
+                        == files::Presence::File(wrote.sha256.clone()) =>
+                {
+                    std::fs::read_to_string(&destination)
+                        .ok()
+                        .and_then(|text| iterm2::guid_in(&text))
+                }
+                _ => None,
+            }
+            .unwrap_or_else(iterm2::new_guid);
+            plan_file(
+                terminal,
+                &destination,
+                &iterm2::watched(home),
+                iterm2::profile_text(command, &guid),
+                command,
+                recorded,
+            )
+        }
+        ProfileTerminal::WindowsTerminal => {
+            let (Some(destination), Some(watched)) = (
+                windows_terminal::profile_path(home),
+                windows_terminal::watched(home),
+            ) else {
+                return Err(ProfileError::NotOnThisPlatform(terminal));
+            };
+            plan_file(
+                terminal,
+                &destination,
+                &watched,
+                windows_terminal::profile_text(command),
+                command,
+                recorded,
+            )
+        }
         _ => Err(ProfileError::NotOnThisPlatform(terminal)),
     }
 }
@@ -443,13 +528,11 @@ pub fn status(
 ) -> Status {
     let standing = recorded.as_ref().map(standing);
     let foreign = recorded.is_none()
-        && match terminal {
-            ProfileTerminal::Konsole => {
-                files::presence(&konsole::profile_path(home)) != files::Presence::Missing
-            }
-            _ => false,
-        };
-    let default = recorded.is_some() && is_default(terminal, home);
+        && profile_path(terminal, home)
+            .is_some_and(|path| files::presence(&path) != files::Presence::Missing);
+    let default = recorded
+        .as_ref()
+        .is_some_and(|profile| is_default(terminal, home, profile));
     Status {
         terminal,
         present: is_present(terminal, home),
@@ -472,10 +555,30 @@ fn standing(profile: &RecordedProfile) -> Standing {
     }
 }
 
-/// Whether the profile is the emulator's default.
-fn is_default(terminal: ProfileTerminal, home: &ProfileHome) -> bool {
+/// Where a terminal application's profile file is, for those whose profile is a file.
+fn profile_path(terminal: ProfileTerminal, home: &ProfileHome) -> Option<PathBuf> {
+    match terminal {
+        ProfileTerminal::Konsole => Some(konsole::profile_path(home)),
+        ProfileTerminal::Iterm2 => Some(iterm2::profile_path(home)),
+        ProfileTerminal::WindowsTerminal => windows_terminal::profile_path(home),
+        _ => None,
+    }
+}
+
+/// Whether the recorded profile is the emulator's default.
+fn is_default(terminal: ProfileTerminal, home: &ProfileHome, profile: &RecordedProfile) -> bool {
     match terminal {
         ProfileTerminal::Konsole => konsole::is_default(home),
+        ProfileTerminal::Iterm2 => match &profile.wrote {
+            Wrote::File(wrote) => wrote
+                .file()
+                .ok()
+                .and_then(|file| std::fs::read_to_string(file).ok())
+                .and_then(|text| iterm2::guid_in(&text))
+                .is_some_and(|guid| iterm2::is_default(home, &guid)),
+            _ => false,
+        },
+        ProfileTerminal::WindowsTerminal => windows_terminal::is_default(home),
         _ => false,
     }
 }
@@ -514,11 +617,13 @@ pub fn remove(
     let removed = match &profile.wrote {
         Wrote::File(wrote) => {
             let destination = wrote.file()?;
-            if standing(&profile) != Standing::Missing && is_default(terminal, home) {
+            if standing(&profile) != Standing::Missing && is_default(terminal, home, &profile) {
                 return Ok(Removed::Default);
             }
             let staging = match terminal {
                 ProfileTerminal::Konsole => konsole::staging(&destination),
+                ProfileTerminal::Iterm2 => iterm2::staging(&destination),
+                ProfileTerminal::WindowsTerminal => windows_terminal::staging(&destination),
                 _ => None,
             }
             .ok_or_else(|| ProfileError::io(&destination, std::io::ErrorKind::NotFound.into()))?;
