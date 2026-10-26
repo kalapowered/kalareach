@@ -554,10 +554,13 @@ fn bundled_package(name: &str) -> PathBuf {
         .join("0.5.0")
 }
 
-/// Publishes the package in `directory` in a signed generation of its own, enrols that repository,
+/// Publishes the package in `directory` in a generation signed with `keys`, enrols that repository,
 /// and installs and enables the package as the owner who confirmed what it may do, before any
 /// daemon opens the catalogue. Returns the directory the generation is published in, which has to
 /// stay while the daemon runs.
+///
+/// The catalogue gives a publisher's name to one root, so repositories that list the same
+/// publisher are published under the same keys.
 ///
 /// Every capability the manifest asks for is granted, as the install requires. A native bridge's is
 /// among them, and on Windows the host applies no bridge, so nothing is written into the person's
@@ -566,6 +569,7 @@ async fn install_package(
     prepared: &Prepared,
     directory: &Path,
     repository: &str,
+    keys: &generations::KeySet,
 ) -> tempfile::TempDir {
     let environment = prepared.tree.environment();
     let environment_id = environment.environment_id();
@@ -596,6 +600,7 @@ async fn install_package(
         generation_home.path(),
         generations::GenerationSpec {
             package: Some(directory.to_path_buf()),
+            keys: Some(keys.clone()),
             ..generations::GenerationSpec::default()
         },
     )
@@ -681,9 +686,12 @@ async fn the_bundled_agents_typed_at_the_managed_prompt_are_launched_through_the
     // The package's flags name the forwarder by placeholder, which the daemon and the worker have
     // to write as one path.
     let (turn, prepared) = take_a_turn_beside_the_test();
+    // Both packages are the release's own, from one publisher, so their repositories share a root.
+    let keys = generations::KeySet::generate();
     let _claude_published =
-        install_package(&prepared, &bundled_package("claude-code"), "claude").await;
-    let _qoder_published = install_package(&prepared, &bundled_package("qoder-cli"), "qoder").await;
+        install_package(&prepared, &bundled_package("claude-code"), "claude", &keys).await;
+    let _qoder_published =
+        install_package(&prepared, &bundled_package("qoder-cli"), "qoder", &keys).await;
     let managed = Managed::start(turn, prepared).await;
     managed.install_entries().await;
     for plugin in ["kalareach/claude-code", "kalareach/qoder-cli"] {
@@ -884,7 +892,13 @@ async fn a_program_whose_package_ships_a_component_starts_the_plugin_host_on_win
     let (turn, prepared) = take_a_turn();
     let package = tempfile::tempdir().expect("a directory on the internal disk");
     let directory = component_package(package.path(), &component);
-    let _published = install_package(&prepared, &directory, "development").await;
+    let _published = install_package(
+        &prepared,
+        &directory,
+        "development",
+        &generations::KeySet::generate(),
+    )
+    .await;
     let managed = Managed::start(turn, prepared).await;
     managed.install_entries().await;
     let enabled = managed
