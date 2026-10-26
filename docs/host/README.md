@@ -6912,9 +6912,12 @@ out, because the feed judges nothing and could name any request as complete. Suc
 signed with the key the registry holds for a device it has not revoked, the device's pairing grant
 holds the right to manage the host and the configured ceiling leaves it, and the host did not refuse
 the request. The clock and the policy are not asked. The request took effect when it did, so an
-owner whose grant has since run out still counts. A revoked device proves nothing: its request took
-effect before the revocation, and a registry that holds the revocation holds what the request
-withdrew. The device the request names as its issuer is judged alone. When the registry holds no
+owner whose grant has since run out still counts. When no wait for a restored policy stands, a
+revoked device proves nothing: its request took effect before the revocation, and a registry that
+holds the revocation holds what the request withdrew. While such a wait stands, the registry may hold neither the request nor the revocation, and the
+revocation may be an act of the person at the machine after the restore. The host then neither
+carries the request out nor dismisses it, and what it names is owed ("What the wait owes", below).
+The device the request names as its issuer is judged alone. When the registry holds no
 such device, the issuer is a device that is not revoked, holds the key the request names and could
 have made the request, which is how an owner paired again is found. The first device that holds the
 key is not taken for the issuer. When devices hold the key and none of them signed the request, it
@@ -6932,16 +6935,20 @@ the refusal while the feed holds the record, and nothing is stored for it. It en
 request names, which needs no confirmation. Pairing the owner again is no way to end it, because
 pairing waits for an owner device's confirmation, which is refused while the refusal stands. A
 withdrawal that names every owner device needs care. Never revoke the last owner device while the
-refusal stands: the terminal confirms nothing on an owned host and no command removes the owner, so a
-host left with no owner device cannot pair one again ("Two kinds of host have no route to establish
-the clock"). On a host that is exclusively organisation-managed the person at the terminal can end
-exclusive management and do nothing else. The route that exists keeps an owner device. The owner
-removes `authority.origin` from the configuration document and starts the daemon again. The host keeps
-nothing of the refusal and reads no feed, so the refusal ends and a device the withdrawal names
-confirms again. The owner pairs a new owner device, revokes the devices and grants the withdrawal
-names, sets `authority.origin` back and starts the daemon again. A host that also found its policy
-restored runs `kr host policy --confirm` first (below): pairing waits for an owner device's
-confirmation, which that wait refuses, and the wait stands across the restart. The cost is that the host serves the
+refusal stands: the terminal confirms nothing on an owned host and no
+command removes the owner, so a host left with no owner device cannot pair one again ("Two kinds of
+host have no route to establish the clock"). On a host that is exclusively organisation-managed the
+person at the terminal can end exclusive management and do nothing else. The route that exists keeps
+an owner device. The owner removes `authority.origin` from the configuration document and starts the
+daemon again. The host keeps nothing of the refusal and reads no feed, so the refusal ends and a
+device the withdrawal names confirms again. The owner pairs a new owner device, revokes the devices
+and grants the withdrawal names, sets `authority.origin` back and starts the daemon again. A host
+that also found its policy restored cannot confirm that policy while a device or share the
+withdrawal names is live, and pairing waits for an owner device's confirmation, which that wait
+refuses. Its list of what it owes outlives `authority.origin`, so taking the origin out does not end
+that wait. When the list names every owner device, the person follows the route that keeps one
+("What the wait owes", below) and takes `authority.origin` out as well, until the new owner device
+is paired. The cost is that the host serves the
 named devices until the owner has revoked them, and learns no remote revocation while it reads no
 feed. A host that bounds offline validity needs the route finished inside the bound: it synchronises
 with no feed meanwhile, and once the bound ends it refuses every remote request under a personal
@@ -6985,14 +6992,16 @@ owner's signature does not cover it. One consequence is a limit. A request that 
 the host was behind, and whose issuer a later withdrawal by an owner the host knows revoked, is
 refused, and what it named is not withdrawn. The same holds for a device the owner at the machine
 revoked, and for a restart that finds the issuer revoked. The request is shown refused to the owner
-who published it, who can publish it again from a device the host holds live or revoke what it
-named at the machine. Carrying it out again by itself needs a record of the host's own that
-survives the restore, which is a stored place.
+who published it, who can publish it again from a device the host holds live or revoke what it named
+at the machine. That is the limit while no wait for a restored policy stands. While one does, the host
+holds such a request and owes what it names instead ("What the wait owes", below).
 A lost clock continuity brings about the same outcome. When the host lost the continuity of its clock
 and the issuer's grant stands on the clock, the request waits and the pass ends as one the host could
 not finish. If a withdrawal the host cannot verify names that issuer, the remedy has the owner revoke
 the device, and the next scan then refuses the request, because the registry holds its issuer
-revoked; what the request named is not withdrawn. `kr doctor` names each such device and says so.
+revoked; what the request named is not withdrawn. While a wait for a restored policy stands the scan
+holds the request instead of refusing it, and what it names stays owed. `kr doctor` names each such
+device and says so.
 Establishing the clock does not end the wait, because an owner device's confirmation is refused while
 the refusal stands. A reboot of the machine ends a lost continuity, and the host then judges the
 request again with the authority its issuer holds then. It can still refuse the request: the issuer's
@@ -7019,7 +7028,8 @@ policy, so once the host has caught up the row is the restored one. The host doe
 remote devices until the person at the machine has confirmed it.
 
 The finding is a record, `restored-policy.cbor` beside the registry, in a store of its own at version 1.
-It holds the moment the host first found the restore and a digest of the policy row. The digest
+It holds the moment the host first found the restore, a digest of the policy row, and the list of
+what the wait owes ("What the wait owes", below). The digest
 covers the exclusive-management flag, the maximum of the bound, and every enrolment with its links,
 its accepted head, its enrolment revision and the devices bound to members. It leaves out the two
 floors, the moment of the last synchronisation and the lease records, which ordinary running
@@ -7045,6 +7055,77 @@ finding carries nothing out and does not move the registry, and the next pass tr
 that cannot write it again as the catch-up begins has carried out what the feed shows completed, and
 stops before the barrier, which the next pass raises.
 
+**What the wait owes.** While the wait stands, the host never discards a request the feed holds that
+it could have carried out before the restore. It carries the request out, or it owes the devices and
+shares the request names. It dismisses a request only on evidence that neither the restore nor
+anything the person did after it can change: the feed shows the request refused and the host never
+acknowledged it; the key the registry holds for the issuer did not sign it; the issuer's pairing
+grant never held the right to manage the host; the request is addressed to another host; or the
+registry holds the host's own refusal of that very request. Everything else the registry says about
+an issuer can be a fact about the restore or about what the person did after it: the issuer is
+revoked, expired or not in the registry, a withdrawal the host cannot verify withholds it from the
+feed, or the ceiling, the policy or the clock now takes the right from it; or the request names
+nothing the registry holds; or the registry holds the host's refusal of a request that the feed shows
+the host acknowledged, which comes from two different histories. On those grounds the host does not
+carry the request out, does not dismiss it, and sends the feed no refusal, because the feed keeps a
+refusal for a week and a later restore would read it as a request this host never applied. It holds
+the request. The request stays unsettled, so the settled mark of the scan does not cross it, and
+every scan judges it again. The pass still ends as a synchronisation, the feed check stays `Ok`, and
+the requests of known owners behind it are carried out. Once the wait has ended, the next scan judges
+the request as before and refuses it, so a held request leaves nothing behind in the feed.
+
+The feed takes a request from anyone who holds a key, so the hold has a bound. The first scan of a
+run that reads the feed through while a wait stands fixes the highest sequence it saw, and a request
+above it was published after the restore the wait is for. The host judges that request as before: it
+refuses it when it cannot carry it out, and owes nothing for it. A restart fixes the bound again
+from its own first reading, and so does each finding. A request on the feed when the run first read
+it is held and owed whoever published it. The cost is that a stranger's request that names a device the
+person wants to keep costs the person that device's revocation, and the host has no command that
+refuses a held request.
+
+The record holds what the wait owes as a sorted list of devices and shares, each as a request names
+it, with a digest of the origin of the feed it came from. The host writes what a page of the feed
+names to the record before it acts on any record of the page, so a stop, an error, an abort of the
+carrier or the feed's removal part way through a scan keeps it. A write that fails stops the pass
+before the host acts on the page, and the next pass writes again. An entry leaves the list when its
+target is no longer live, or when a scan that read the feed through settled the requests that named
+it. It never leaves because the scan did not meet a request: a request the feed dropped after its
+retention leaves its entry where it was. A scan of another feed clears only entries of its own
+origin, so pointing the host at a feed that holds nothing for it clears nothing. A device is live
+while the registry holds it unrevoked, and a share is live while an unrevoked device holds it as its
+pairing grant or the grant store holds it unrevoked. A registry that cannot be read shows every
+target live. The list can hold a target whose request the host then dismissed on evidence, until the
+next scan that reads the feed through clears it, or, on a host that reads no feed, until the person
+revokes the target. It holds at most 512 entries, and the file at most 64 KiB. Past that the host
+keeps what it holds and adds by the lowest sequence, the scan does not count as read through, and the
+refusal says that the list is full; revoking some lets the next scan find the others. A list of
+exactly 512 entries reads as full after a restart while an entry is live.
+
+Each finding restarts the scan at the first record: the registry found behind the feed, put back
+again while the host runs, or found behind the feed again after a confirmation, whether or not the
+record of the finding could be written. What the earlier scan settled belonged to a registry that is
+gone, so a request it settled is carried out again on the registry as it stands. A catch-up that
+takes several passes is no finding, and goes on at its cursor.
+
+A request the feed shows this host acknowledged as pending, which the host carries out again after
+a restore, is acknowledged complete once its barrier completes, under the revision the feed already
+holds for it. The feed then stops holding one of its publisher's open records for it. A request
+whose barrier never completes stays pending there.
+
+When the list names every live owner device, revoking what it names would leave a host that cannot
+pair another owner device: pairing waits for an owner device's confirmation, which the wait refuses,
+and the terminal confirms nothing on an owned host. The refusal and `kr doctor` detect this state and
+give the steps that keep one. The refusal gives the record's full path, and the doctor names the file,
+`restored-policy.cbor`. Revoke every other device and share the list names, with `kr device revoke`
+and `kr share revoke`, but not the last owner device. Stop the daemon. Remove the record's file by
+hand. Start the daemon, which then waits for nothing and checks nothing else on the list: that is
+the cost of the route. Pair a new owner device with the kept owner device's confirmation, and revoke
+the kept owner device if it must go. When a withdrawal the host cannot verify also stands, its
+refusal on remote grants outlives the record and refuses the kept owner device's confirmation too.
+Take `authority.origin` out of the configuration document before the daemon starts, and set it back
+once the new owner device is paired and what the withdrawal names is revoked, the kept owner device
+included. Until then the refusal rises again at every scan that reads the withdrawal.
+
 The person at the machine ends the wait with `kr host policy --confirm`, which shows what
 `kr organisation list` shows and calls `host.policy.confirm` on the local socket. It confirms the
 policy as it stands and changes none of it. What the restore revived (an enrolment withdrawn since,
@@ -7057,26 +7138,35 @@ cannot withdraw its last enrolment until exclusive management has ended, so on s
 terminal ends it first where it can, and otherwise the confirmation comes first. The bound has no
 command. When it lapses the host refuses remote access under a personal grant until it next
 synchronises, and the bound stays. The call is refused while the host knows it is behind its feed,
-with or without a wait standing. While a wait stands it is also refused on a host that reads a feed
-until a scan of this run has read the feed through and carried out, or settled, every record it holds:
-what the feed shows complete, what it shows pending or leaves unacknowledged, which the scan puts off
-while the host is behind and carries out after the catch-up, and what is held behind a request the
-host cannot yet judge. Until then the registry is the restored one, and a device an owner revoked
-through the feed after the copy is live in it; a confirmation would end the refusal that holds it
-back. The refusal says so, the doctor's `restored-policy` check says it until the scan is done, and
-the host asks its feed again by itself. Where the scan is held behind the request of a device whose
+with or without a wait standing. While a wait stands it is also refused while a device or share on
+the list of what the wait owes, or one that the scan in hand has met and not yet written, is live in
+the registry. The refusal names up to eight of them, a share as a share, counts the rest, and says
+when the list is full. The host reads liveness as the call runs, so `kr device revoke` and
+`kr share revoke` at the machine clear an entry at once. A host that reads a feed also refuses until
+a scan of this run has read the feed through and written what it owes: what the feed shows
+complete, what it shows pending or leaves unacknowledged, which the scan puts off while the host is
+behind and carries out after the catch-up, and what is held behind a request the host cannot yet
+judge. Until then the registry is the restored one, a device an owner revoked through the feed
+after the copy is live in it, and the list may belong to a registry that an earlier restore left
+behind; a confirmation would end the refusal that holds it back. The refusal says so, the doctor's
+`restored-policy` check says it until the scan is done, and the host asks its feed again by itself.
+Where the scan is held behind the request of a device whose
 standing the host cannot decide because the clock lost its continuity, the refusal and the doctor name
 the device. A reboot of the machine ends the lost continuity, and revoking the device at the machine
-refuses its request; either lets the next scan finish. Establishing the clock does not, because an
+holds its request, with what the request names still owed; either lets the next scan finish. Establishing the clock does not, because an
 owner device's confirmation is refused while the wait stands.
 A host that cannot reach its feed is confirmed by taking `authority.origin` out of the configuration
-document and starting the daemon again. The cost is that the host reads no feed then: it serves every
-device an owner revoked through the feed since the copy until the person has revoked it at the machine,
-and learns no remote revocation while it reads none, so the person revokes those devices at the machine
-first. A host whose feed removed it reads no more and is confirmed at once, at the same cost: a
-revocation an owner published there that the host had not applied is gone. A pass that found the registry
-behind the feed and stopped before the catch-up leaves that refusal up, and a feed that then removes the
-host ends it, since no pass will, and the wait takes its place. The host keeps no record of the call: asked again after a lost reply it answers that it lifted nothing. The
+document and starting the daemon again, once no device or share on its list is live. The list stays
+in the record, so taking the origin out does not end what the host owes. The cost is that the host
+reads no feed then: it serves every device an owner revoked through the feed since the copy that the
+list does not name until the person has revoked it at the machine, and learns no remote revocation
+while it reads none, so the person revokes those devices at the machine first. A host whose feed removed it reads no more and is confirmed once no device or share on its list is
+live, at the same cost: a revocation an owner published there that the host had not applied is gone.
+A pass that found the registry behind the feed and stopped before the catch-up leaves that refusal up,
+and a feed that then removes the host ends it, since no pass will, and the wait takes its place. When
+the record of the finding could not be written, the removal raises the wait first, in memory, and tries
+the record again before it ends the refusal. The host read nothing from the feed in that state, so the
+confirmation then serves every device the feed revoked since the copy. The host keeps no record of the call: asked again after a lost reply it answers that it lifted nothing. The
 call is asked again under the record's lock for the registration and the deadline it was accepted
 under, because it can wait there behind a finding. No owner
 device can make it, since the wait refuses every owner device, and a ceremony would need a new
@@ -7091,7 +7181,8 @@ exclusive management. A record removed by hand ends the wait at the next start, 
 
 A release from before this store does not name it and neither reads nor writes the record. A
 rollback to it drops the wait: that release serves the restored policy to remote devices as it
-always did. The record stays where it is, and the update that follows reads it and waits again. A
+always did. The record and the list in it stay where they are, and the update that follows reads
+them and waits again. A
 record that the update check cannot read as a canonical map with a whole-number version also stops
 `kr host update` to a release that lists the store, until the confirmation removes it, or by hand
 when something other than a file is at its place. A record that the check passes and this build
@@ -7100,6 +7191,24 @@ wait, and the check does not stop the update for it; the version it states must 
 target reads. The limits: a host stopped between its first finding and the write, and
 started with its feed unreachable, finds nothing to wait for; and the record is in the state
 directory, so a restore of that directory removes or replaces it.
+
+The list has limits of its own. A device the owner revoked at the machine after the copy is not on
+the feed, so the host cannot know it: the person reads what the host holds with
+`kr organisation list` and revokes again what the restore brought back. A request the feed dropped
+before any scan of this host read it can be neither carried out nor owed, and one a scan read and
+wrote down stays owed after the feed drops it. An owner who publishes again a completed request the
+feed dropped after its retention, from a device the restored registry lacks, is refused as a request
+above the bound, and its target stays live at the lift: the person revokes the target at the
+machine, or publishes again from an owner device the registry holds. More than 512 owed targets, or
+a list write that failed or an abort before it followed by a restart with the feed removed or
+absent, leave the host knowing only what the record holds. A record that cannot be read has lost
+its list: no scan writes over it, the run's own memory of what it owes is checked at the
+confirmation, which removes the record, and the person compares `kr device list` and
+`kr share list` with what the feed's owners intended. A record that describes no policy row is
+removed at a start with its list. A second restore, or a rollback and an update again, within the
+week the feed keeps a refused record, after a wait ended in which the host refused a request it
+could not verify, has the feed's refusal read as a request the host never applied; inside one wait
+the host sends no such refusal.
 
 The three refusals, being behind the feed, a restored policy that waits for the person at the machine
 and a withdrawal the host cannot verify, take a remote device's
