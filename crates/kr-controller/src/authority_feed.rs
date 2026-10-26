@@ -799,7 +799,8 @@ impl FeedRuntime {
                     detail.stated("; device ").identifier(device).stated(
                         " made a request that waits for this host's clock, which lost its \
                          continuity, and the withdrawal names it, so revoking it refuses that \
-                         request",
+                         request, unless this host also waits for a restored policy to be \
+                         confirmed, which holds the request instead",
                     )
                 });
         let detail = if observed.unissued {
@@ -895,9 +896,13 @@ macro_rules! unverified_remedy {
          `authority.origin` back and start the daemon again. If this host bounds offline \
          validity, finish this inside the bound: once it ends, the host refuses every remote \
          request under a personal grant, an owner device's included. If the doctor also says \
-         this host found the policy it holds restored, run `kr host policy --confirm` at this \
-         machine before you pair a new owner device: pairing waits for an owner device's \
-         confirmation, which that wait refuses. Until you revoke them, this host serves the \
+         this host found the policy it holds restored, that wait refuses the confirmation while \
+         a device or share the request names is live, and pairing waits for an owner device's \
+         confirmation, which the wait refuses too: revoke what the restored-policy check names, \
+         then run `kr host policy --confirm` at this machine before you pair a new owner \
+         device. When what it names is every owner device, that check gives the steps that keep \
+         one, and they also take `authority.origin` out before the daemon starts and set it \
+         back once the new owner device is paired. Until you revoke them, this host serves the \
          devices the request names, and while it reads no feed it learns no remote revocation."
     };
 }
@@ -915,16 +920,18 @@ const UNVERIFIED_REMEDY: &str = unverified_remedy!();
 const UNVERIFIED_WAITING_REMEDY: &str = concat!(
     unverified_remedy!(),
     " A request that waits for this host's clock is refused if you revoke the device that made \
-     it. A reboot of this machine ends a lost clock continuity, after which the host can decide \
-     the request."
+     it, unless this host also waits for you to confirm a restored policy: it then holds the \
+     request and what it names stays owed until you revoke that too. A reboot of this machine \
+     ends a lost clock continuity, after which the host can decide the request."
 );
 
 /// What a person who finds the host refusing remote access while it catches up with its feed does.
 const CATCHING_UP_REMEDY: &str = "This host catches up by itself and asks again. If it stays like \
      this, the registry cannot take the write, or the record that the policy this host holds was \
      found restored cannot be written: check the disk and the permissions of the state \
-     directory. Once it has caught up, `kr host policy --confirm` at this machine ends the wait \
-     that restored policy puts on remote access.";
+     directory. Once it has caught up, revoke at this machine each device or share the \
+     restored-policy check names, and `kr host policy --confirm` then ends the wait that \
+     restored policy puts on remote access.";
 
 /// What a person who finds a refusal waiting for the registry to take a write does.
 const STUCK_DRAIN_REMEDY: &str = "This host asks again by itself and goes on once the registry \

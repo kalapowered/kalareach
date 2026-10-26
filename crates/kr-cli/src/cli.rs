@@ -1360,10 +1360,14 @@ pub struct PolicyArguments {
     /// organisation-managed cannot withdraw its last enrolment until exclusive management has
     /// ended. A host that reads an authority feed refuses the confirmation until a scan of this run
     /// has read the feed through and carried out, or settled, every record it holds; run the
-    /// command again once `kr doctor` no longer says so. A host that cannot reach its feed is
+    /// command again once `kr doctor` no longer says so. It also refuses while a device or share
+    /// that a request the feed holds names is live here: the refusal names them, and you revoke
+    /// each at this machine with `kr device revoke` or `kr share revoke`. When they are every owner
+    /// device, the refusal gives the steps that keep one. A host that cannot reach its feed is
     /// confirmed by taking `authority.origin` out of the configuration document and starting the
-    /// daemon again, but it then serves every device an owner revoked through the feed since the
-    /// copy until you have revoked it at this machine: revoke those first.
+    /// daemon again once none of what its list names is live, but it then serves every device an
+    /// owner revoked through the feed since the copy that the list does not name until you have
+    /// revoked it at this machine: revoke those first.
     #[arg(long, required = true)]
     pub confirm: bool,
     /// The environment.

@@ -543,11 +543,34 @@ impl Controller {
     /// A feed that removed this host is read no more, so a pass that found the registry behind it
     /// and stopped before the catch-up leaves that refusal up for good. The wait for the policy
     /// found restored refuses the same grants and is ended by the person at this machine, so it
-    /// takes the refusal's place. Says whether it did.
+    /// takes the refusal's place. Says whether it ended the refusal.
+    ///
+    /// The refusal for being behind can stand without the wait: the finding raises it and then
+    /// writes the record, and a write that failed leaves the refusal alone. The removal then
+    /// raises the wait first, in memory, and tries the record again (a failure is said and left to
+    /// the next start), before it lowers the refusal. The host read nothing from the feed in that
+    /// state, so what the confirmation ends serves every device the feed revoked since the copy.
     pub(crate) async fn end_a_catch_up_that_a_removed_feed_leaves(&self) -> bool {
-        let _kept = self.restored_policy.lock().await;
-        if !(self.policy().behind_its_feed() && self.policy().restored_policy_waits()) {
+        let mut kept = self.restored_policy.lock().await;
+        if !self.policy().behind_its_feed() {
             return false;
+        }
+        if !self.policy().restored_policy_waits() {
+            self.move_a_feed_refusal(
+                RemoteRefusal::RESTORED_POLICY_WAITS,
+                true,
+                crate::grants::HostPolicy::restored_policy_waits,
+                crate::grants::HostPolicy::set_restored_policy_waits,
+            )
+            .await;
+            if let Err(error) = kept.ensure(
+                restored::subject_of(&self.policy().snapshot()),
+                self.wall_now_ms(),
+            ) {
+                eprintln!(
+                    "kr-controller: could not write the record of the policy this host found                      restored: {error}"
+                );
+            }
         }
         self.move_a_feed_refusal(
             RemoteRefusal::BEHIND_ITS_FEED,

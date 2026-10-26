@@ -6719,3 +6719,240 @@ async fn a_list_at_the_cap_says_it_is_full() {
         "the confirmation is accepted once every listed target is revoked"
     );
 }
+
+/// KR-REQ-24.15: a feed that removes the host after the first write of the record failed, which
+/// left the refusal for being behind up without the wait, ends that refusal and leaves the wait: the
+/// person can confirm once the record can be written, and was never left refused for a catch-up
+/// that no pass will end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_feed_that_removes_the_host_after_the_first_record_write_failed_leaves_the_person_able_to_confirm()
+ {
+    let Restorable {
+        rig, kept, earlier, ..
+    } = a_revocation_the_registry_will_lose().await;
+    // The feed holds the run's first read while something that is not a file is put where the
+    // record goes, so that the finding the read leads to cannot be written down.
+    let reads = rig.arrivals("read");
+    rig.served
+        .web()
+        .fail_with_member(AUTHORITY, "read", 1, Moment::Hold);
+    let rig = rig
+        .restarted(false, |tree| put_the_registry_back(tree, &earlier))
+        .await;
+    rig.until_arrivals("read", reads + 1).await;
+    let record = restored::file_beside(&rig.host.tree().environment().registry_database());
+    std::fs::create_dir(&record).expect("an obstacle");
+    rig.served.web().release_held();
+    rig.poll().await;
+    let refused = rig
+        .the_owner_tries_to_confirm()
+        .await
+        .expect_err("the host is still catching up");
+    assert!(
+        refused.message.contains("catching up"),
+        "refused for the catch-up it cannot begin: {refused:?}"
+    );
+
+    rig.remote
+        .remove(rig.feed())
+        .await
+        .expect("a key the host named removes the feed");
+    within("a pass finds the feed removed the host", async {
+        while !rig.runtime().has_read_the_feed_through() {
+            rig.poll().await;
+        }
+    })
+    .await;
+    assert!(
+        is_refused_for_the_restored_policy(&rig.serves(&kept.0, &kept.1).await),
+        "the refusal for being behind has ended and the wait for the restored policy stands"
+    );
+
+    std::fs::remove_dir(&record).expect("the obstacle goes");
+    assert!(
+        rig.the_owner_confirms().await.lifted,
+        "a feed that removed the host is read no more, so no catch-up can end"
+    );
+    rig.serves(&kept.0, &kept.1)
+        .await
+        .expect("the device is served once the person has confirmed");
+}
+
+/// Two owner devices and a device that is no owner's, a request by a key the host does not know
+/// that names all three, and a host that starts with a restore found: every live owner device is
+/// owed. `file` is where the record of the restore is.
+struct EveryOwnerOwed {
+    rig: Rig,
+    /// A second owner device, and a device that is no owner's: the others the request names.
+    others: [Paired; 2],
+    file: std::path::PathBuf,
+}
+
+async fn a_request_that_names_every_owner_device() -> EveryOwnerOwed {
+    let rig = Rig::start().await;
+    let second = rig
+        .pairs(&[ActionRight::HostManage, ActionRight::SessionView])
+        .await;
+    let other = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.until_the_carrier_is_idle().await;
+    let key = AuthorisationKeyPair::generate().expect("a key");
+    let kept_id = rig.owner_device();
+    let request = rig.request_of(
+        &key,
+        DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([0x0f; 16])),
+        0xd1,
+        RevocationTarget::Devices {
+            device_ids: [kept_id, second.1.device_id, other.1.device_id]
+                .into_iter()
+                .collect::<CanonicalSet<_>>(),
+        },
+    );
+    rig.published_as(&key, &request).await;
+    let rig = rig.restarted(false, a_restore_was_found).await;
+    rig.until_the_carrier_is_idle().await;
+    let file = restored::file_beside(&rig.host.tree().environment().registry_database());
+    EveryOwnerOwed {
+        rig,
+        others: [second, other],
+        file,
+    }
+}
+
+/// KR-REQ-24.15: when what the wait owes is every owner device, the refusal and the doctor say so
+/// and give the steps that keep one: the person revokes the others, stops the daemon, removes the
+/// record by hand and starts it again, and the owner device that was kept confirms the pairing of
+/// a new one, which it could not while the wait stood.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn when_every_owner_device_is_owed_the_route_in_the_refusal_keeps_an_owner() {
+    let EveryOwnerOwed {
+        rig,
+        others: [second, other],
+        file,
+    } = a_request_that_names_every_owner_device().await;
+    let kept = rig.owner_device();
+
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&file.display().to_string()),
+        "the refusal gives the full path of the record to remove: {refused:?}"
+    );
+    let check = rig
+        .the_restored_policy_check()
+        .await
+        .expect("the doctor says the host waits");
+    assert!(
+        check
+            .remedy()
+            .is_some_and(|remedy| remedy.contains("restored-policy.cbor")
+                && remedy.contains("last owner device")),
+        "the doctor gives the steps that keep an owner: {:?}",
+        check.remedy()
+    );
+
+    // Revoking the others leaves the kept owner owed, and the confirmation is refused for it.
+    rig.revokes_at_the_machine(second.1.device_id).await;
+    rig.revokes_at_the_machine(other.1.device_id).await;
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&kept.to_string()),
+        "the kept owner is still owed: {refused:?}"
+    );
+
+    let rig = rig.the_wait_is_ended_by_hand().await;
+    rig.until_the_carrier_is_idle().await;
+    assert!(
+        !rig.host.controller().restored_policy_waits(),
+        "with the record gone the host waits for nothing"
+    );
+    assert!(rig.the_restored_policy_check().await.is_none());
+    let new_owner = rig
+        .pairs(&[ActionRight::HostManage, ActionRight::SessionView])
+        .await;
+    rig.revokes_at_the_machine(kept).await;
+    rig.serves(&new_owner.0, &new_owner.1)
+        .await
+        .expect("the new owner device is served once the kept one is gone");
+}
+
+/// KR-REQ-24.15: when a withdrawal the host cannot verify also names every owner device, the
+/// record's removal is not enough: the host still refuses every remote grant, the kept owner's
+/// confirmation included, so the route also takes `authority.origin` out until the new owner device
+/// is paired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn when_a_withdrawal_the_host_cannot_verify_names_every_owner_device_the_route_takes_the_feed_out()
+ {
+    let rig = Rig::start().await;
+    let second = rig
+        .pairs(&[ActionRight::HostManage, ActionRight::SessionView])
+        .await;
+    let other = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.until_the_carrier_is_idle().await;
+    let earlier = a_copy_of_the_registry(&rig.host, "registry-before-the-issuer.sqlite3");
+    // An owner is paired after the copy and withdraws every device the registry holds that can
+    // manage, and the one that cannot.
+    let issuer = rig
+        .pairs(&[ActionRight::HostManage, ActionRight::SessionView])
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    let kept = rig.owner_device();
+    let key = issuer.0.keys().authorisation.clone();
+    let request = rig.request_of(
+        &key,
+        issuer.1.device_id,
+        0xa1,
+        RevocationTarget::Devices {
+            device_ids: [kept, second.1.device_id, other.1.device_id]
+                .into_iter()
+                .collect::<CanonicalSet<_>>(),
+        },
+    );
+    rig.published_as(&key, &request).await;
+    rig.poll().await;
+    rig.until_the_revocation_is_acknowledged_to(&key, &request)
+        .await;
+    let origin = rig.served.origin().to_owned();
+    let rig = rig
+        .restarted(false, |tree| put_the_registry_back(tree, &earlier))
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    rig.until_the_carrier_is_idle().await;
+    let file = restored::file_beside(&rig.host.tree().environment().registry_database());
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&file.display().to_string())
+            && refused.message.contains("authority.origin"),
+        "the refusal gives the record's path and says to take the feed out too: {refused:?}"
+    );
+
+    rig.revokes_at_the_machine(second.1.device_id).await;
+    rig.revokes_at_the_machine(other.1.device_id).await;
+    // The record gone and the feed still read: the host still refuses the kept owner's confirmation.
+    let rig = rig.the_wait_is_ended_by_hand().await;
+    rig.until_the_carrier_is_idle().await;
+    let mut local = rig.host.client().await;
+    let refused = rig
+        .owner_device_invites(&mut local)
+        .await
+        .expect_err("the withdrawal the host cannot verify refuses the owner's confirmation");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    drop(local);
+
+    // Taken out of the configuration, the feed is not read, and the owner's confirmation is spent.
+    let rig = rig
+        .restarted(false, |tree| net_support::write_feed_document(tree, None))
+        .await;
+    let new_owner = rig
+        .pairs(&[ActionRight::HostManage, ActionRight::SessionView])
+        .await;
+    rig.revokes_at_the_machine(kept).await;
+    // Set back, the feed names nothing that is live, and the new owner device is served.
+    let rig = rig
+        .restarted(false, |tree| {
+            net_support::write_feed_document(tree, Some(&origin));
+        })
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    rig.serves(&new_owner.0, &new_owner.1)
+        .await
+        .expect("nothing the withdrawal names is live, so no refusal rises");
+}
