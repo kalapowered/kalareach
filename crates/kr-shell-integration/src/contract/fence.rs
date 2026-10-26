@@ -904,8 +904,8 @@ pub struct FenceMachine {
     /// The moment the current hold must end, carried across a reader that replaces another inside
     /// it. The hold belongs to the input, not to the reader, so a replacement does not restart it.
     hold_deadline: Option<ContinuousMs>,
-    /// The cancellation the worker is waiting on, by its own sequence number.
-    cancellation: Option<U64>,
+    /// The cancellation the worker is waiting on: its own sequence number, and the reader it asked.
+    cancellation: Option<(U64, PromptGeneration, ReaderRevision)>,
     /// How many cancellations this session has asked for.
     cancellations: u64,
     /// The takeover receipt a lease change left open, and when it is completed whatever the reader
@@ -1310,11 +1310,17 @@ impl FenceMachine {
     }
 
     fn cancellation_reported(&mut self, report: &CancellationReport, actions: &mut Vec<Action>) {
-        let asked = self.cancellation == Some(report.sequence);
+        // The sequence is what tells one cancellation from the next: a takeover and a departure
+        // can both cancel at one prompt in one reader, and a departure can happen at the epoch a
+        // takeover just produced. The reader a report names has to be the one asked as well: a
+        // report from another says nothing about it, and the cancellation stays outstanding.
+        let asked = self.cancellation
+            == Some((
+                report.sequence,
+                report.prompt_generation,
+                report.reader_revision,
+            ));
         if !asked {
-            // A report for a cancellation the worker is not waiting on. The sequence is what tells
-            // one from the next: a takeover and a departure can both cancel at one prompt in one
-            // reader, and a departure can happen at the epoch a takeover just produced.
             actions.push(Action::IgnoreStale(StaleMessage::ReaderEvent));
             return;
         }
@@ -1529,7 +1535,7 @@ impl FenceMachine {
         let sequence = U64::new(self.cancellations);
         // One cancellation is outstanding at a time, and it is matched on its own sequence: a
         // takeover and a departure can both cancel at one prompt in one reader.
-        self.cancellation = Some(sequence);
+        self.cancellation = Some((sequence, editor.prompt_generation, editor.reader_revision));
         if opens_receipt {
             // Only a takeover has a receipt to fill. It is completed inside the hold or not at all,
             // so a reader that never answers cannot leave one open for the life of the session.
