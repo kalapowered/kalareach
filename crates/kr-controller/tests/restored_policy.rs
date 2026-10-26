@@ -17,13 +17,11 @@ use kr_controller::grants::restored::{self, Found, Record};
 use kr_controller::quiet::Timer;
 use kr_controller::service::net::devices::DeviceRecord;
 use kr_controller::service::{Controller, ControllerSetup};
-use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
 use kr_controller::testing::HeldTimer;
 use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::hostinfo::{DoctorStatus, HostDoctorResult};
-use kr_protocol::ids::BuildId;
 use kr_protocol::invitation::InviteGrantKind;
 use kr_protocol::method::Method;
 use kr_protocol::organisation::{HostPolicyConfirmParams, HostPolicyConfirmResult};
@@ -360,10 +358,11 @@ async fn an_owner_devices_confirmation_is_not_spent_while_the_policy_waits() {
 }
 
 /// KR-REQ-24.15: a copy of the policy that is there and cannot be read could have shown that the
-/// registry was put back to an earlier state, and the host cannot tell now. The start writes the
-/// record naming the row it holds before it replaces the copy, and the host waits.
+/// registry was put back to an earlier state, and the host cannot tell now. The start records the
+/// row it holds, replaces the copy and waits for the person at this machine. That the record comes
+/// before the copy is replaced is held by the case below.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_copy_of_the_policy_that_cannot_be_read_is_a_wait_recorded_before_the_copy_is_replaced() {
+async fn a_copy_of_the_policy_that_cannot_be_read_is_a_wait_and_the_start_replaces_it() {
     let Restored {
         host,
         device,
@@ -402,21 +401,6 @@ async fn a_copy_of_the_policy_that_cannot_be_read_is_a_wait_recorded_before_the_
         .expect("the device is served once the person at this machine has confirmed");
 }
 
-#[derive(Debug)]
-struct NoWorkers;
-
-impl WorkerSupervisor for NoWorkers {
-    fn start(&self, _launch: &WorkerLaunch) -> LaunchOutcome {
-        LaunchOutcome::NotStarted {
-            detail: "this test starts no workers".to_owned(),
-        }
-    }
-
-    fn describe(&self) -> &'static str {
-        "a supervisor that starts nothing"
-    }
-}
-
 /// Starts a daemon on `host`, or says why it does not.
 async fn try_to_start(host: &kr_ipc::testing::TempHost) -> kr_controller::Result<Arc<Controller>> {
     let environment = host.environment();
@@ -441,9 +425,9 @@ async fn try_to_start(host: &kr_ipc::testing::TempHost) -> kr_controller::Result
                     }),
                     secret_store: StoreSelection::File,
                     boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-                    supervisor: Box::new(NoWorkers),
+                    supervisor: Box::new(net_support::RefusingSupervisor),
                     worker_program: PathBuf::from("/nonexistent/kr-worker"),
-                    build_id: BuildId::new("kr-test/0").expect("a build identifier"),
+                    build_id: net_support::build(),
                     release: "0".to_owned(),
                     shell_packages: None,
                     terminal: Box::new(kr_controller::supervision::NoTerminal),
