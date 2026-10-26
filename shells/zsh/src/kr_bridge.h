@@ -190,7 +190,8 @@ void kr_bridge_editor_leave(int reason);
 void kr_bridge_reader_idle(void);
 void kr_bridge_command_accepted(void);
 
-/* Takes the end-of-file decision for a character the reader has selected. */
+/* Takes the end-of-file decision for a character the reader has selected. A `key` that is not a
+ * byte, such as the end of the input, is never the gesture. */
 int kr_bridge_pre_eof(int key, int source);
 
 /* Reads the mailbox and answers what is in it. Safe only at a key-sequence boundary or while the

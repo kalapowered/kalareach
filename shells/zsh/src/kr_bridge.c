@@ -12,10 +12,13 @@
  * key-sequence boundary and while it waits for a key. The one bounded wait is the handshake, which
  * happens once, before the first primary reader, where there is no reader to hold up.
  *
- * The decisions this file takes are the contract's, reproduced exactly:
- * `detach_eligibility` and `BridgeFenceView::decide` for the end-of-file gesture, and
- * `decide_activation` for whether a starting shell attempts anything at all. The launch check for
- * the mailbox is this file's own, in the order section 7 gives the reasons.
+ * The decisions this file takes follow the contract's: `detach_eligibility` and
+ * `BridgeFenceView::decide` for the end-of-file gesture, and `decide_activation` for whether a
+ * starting shell attempts anything at all. The end-of-file decision adds two rules of the reader's
+ * own that the contract's `PreEofContext` does not state: a character that ends a longer key
+ * sequence belongs to that sequence, and a value that is not a byte, such as the end of the input,
+ * is never the gesture. The launch check for the mailbox is this file's own, in the order section 7
+ * gives the reasons.
  */
 
 /* The names of the lookups the module check makes are behind this on glibc. */
@@ -1597,6 +1600,12 @@ kr_bridge_pre_eof(int key, int source)
     unsigned long long detach_id;
 
     if (!kr.managed) {
+        return KR_NATIVE;
+    }
+    /* A value that is not a byte is no key a person pressed: the end of the input is one, and
+     * reading it as the byte 0xff would make it the gesture on a terminal whose end-of-file
+     * character is that byte. */
+    if (key < 0 || key > 0xff) {
         return KR_NATIVE;
     }
     /* The mailbox has already been read through this package's own mechanism, so the fence this

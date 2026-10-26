@@ -92,6 +92,15 @@ fn a_cancellation_after_a_detach_does_not_detach_the_next_attachment() {
     shellpkg::a_cancellation_after_a_detach_does_not_detach_the_next_attachment(ZSH);
 }
 
+/// KR-REQ-07.72: the byte 0xff is the terminal's disabled character on macOS, so there it names no
+/// end-of-file character to test with.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_cancelled_key_sequence_is_not_the_gesture_on_a_terminal_whose_eof_byte_is_0xff() {
+    shellpkg::a_cancelled_key_sequence_is_not_the_gesture_on_a_terminal_whose_eof_byte_is_0xff(ZSH);
+}
+
 /// KR-REQ-07.72
 #[test]
 #[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]

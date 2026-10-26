@@ -855,6 +855,66 @@ pub fn a_cancellation_after_a_detach_does_not_detach_the_next_attachment(kind: S
     );
 }
 
+/// A key sequence a cancellation cut short is no key at all, and the value the reader holds for it
+/// is not the gesture on a terminal whose end-of-file character is the byte 0xff.
+///
+/// An escape starts a sequence the editor waits to see finished, and the cancellation ends the
+/// wait with nothing selected. What the reader is left holding is the end of the input, which is
+/// not a byte, and reading it as the byte 0xff would make it the gesture. The editor's wait for
+/// the rest of a sequence is made long, so that it is the cancellation that ends it and not the
+/// wait.
+pub fn a_cancelled_key_sequence_is_not_the_gesture_on_a_terminal_whose_eof_byte_is_0xff(
+    kind: ShellKind,
+) {
+    let package = Package::built(kind);
+    let mut session = Session::start_with_profile(
+        &package,
+        Profile {
+            after_configuration: "KEYTIMEOUT=6000\n",
+            ..Profile::ORDINARY
+        },
+    );
+    session.first_prompt();
+    session.forget_events();
+    assert!(session.answered("kr-ready"));
+    assert!(session.run(
+        "stty eof 0xff; printf '%s%s\\n' kr-veof- set",
+        "kr-veof-set"
+    ));
+    let (_, changed) = session.expect_event("gesture_changed", |event| {
+        matches!(event, BridgeEvent::GestureChanged(_))
+    });
+    let BridgeEvent::GestureChanged(changed) = changed else {
+        unreachable!()
+    };
+    assert_eq!(
+        changed.gesture,
+        EofGesture::TerminalEof {
+            byte: U64::new(0xff)
+        }
+    );
+
+    let (enter, _fence) = session.fenced_prompt(1);
+    session.type_bytes(ESCAPE);
+    // The editor has taken the escape and waits for the rest of the sequence, which is the reader's
+    // own report of it: the cancellation that follows is then one that cuts a sequence short.
+    session.until_the_reader_shows(&enter, fence_id(2), "the escape waiting", |held| {
+        held.pending.multikey_sequence
+    });
+    let decisions = session.events.managed_decisions();
+    session.type_bytes(CTRL_C);
+    let _ = session.next_prompt();
+    assert_eq!(
+        session.events.managed_decisions(),
+        decisions,
+        "a cancelled key sequence was decided as the end-of-file gesture"
+    );
+    assert!(
+        session.alive(),
+        "the cancellation ended the shell instead of the line"
+    );
+}
+
 /// `detach-condition-exclusions`: outside the condition the editor keeps the key.
 pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
     let package = Package::built(kind);

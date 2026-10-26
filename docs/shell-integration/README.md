@@ -576,9 +576,8 @@ the next attachment's identity.
 
 KR does not force `IGNORE_EOF` globally, and it preserves an existing user setting for native cases
 outside the detach condition. Explicit `exit`, a real read error and a genuine end of stream keep
-their normal closure behaviour, with one exception in the Bash bridge: it compares the character it
-is handed as a byte, and Readline hands it an end of stream as -1, so where `VEOF` is set to byte 255
-the hook takes each end of stream for the gesture.
+their normal closure behaviour, including where `VEOF` is set to byte 255: a value that is not a
+byte, such as an end of stream, is never taken for the gesture.
 
 ### The detach condition
 
