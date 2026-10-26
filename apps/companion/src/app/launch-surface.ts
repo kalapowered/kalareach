@@ -14,10 +14,24 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { readOnCadence } from './cadence'
 import { ask } from '../mobile/model/call'
-import { failureMessage, watch, type HostPort, type LaunchSurfaceReading } from '../host/port'
+import {
+  failureCode,
+  failureMessage,
+  watch,
+  type HostPort,
+  type LaunchSurfaceReading
+} from '../host/port'
 
 /** How long the view waits after a read has answered before it reads again. */
 export const LAUNCH_SURFACE_CADENCE_MS = 2000
+
+/**
+ * Why a read failed, in words, or null where it is nothing to tell: a session the host does not
+ * know, as one that has ended on this computer, has no surface to draw and none to apologise for.
+ */
+function unreadWords(failure: unknown): string | null {
+  return failureCode(failure) === 'UNKNOWN_SESSION' ? null : failureMessage(failure)
+}
 
 /** What a view has read of one launch surface. */
 export interface LaunchSurfaceReads {
@@ -68,7 +82,7 @@ export function useLaunchSurface(
           if (current()) setHeld({ read, number, reading, unread: null })
         },
         (failure: unknown) => {
-          if (current()) setHeld({ read, number, reading: null, unread: failureMessage(failure) })
+          if (current()) setHeld({ read, number, reading: null, unread: unreadWords(failure) })
         }
       )
     }, cadenceMs)

@@ -1879,6 +1879,9 @@ export function fakeHost(
       reading('launchSurface', () => {
         requireConnection()
         const sessionId = (params as { session_id?: string } | null)?.session_id ?? ''
+        if (!listed().some((session) => session.session_id === sessionId)) {
+          refuse('UNKNOWN_SESSION', 'This session is not running on this computer.')
+        }
         return launching.read(sessionId, false, stockShellOf(sessionId))
       }),
 
