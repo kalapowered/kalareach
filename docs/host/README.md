@@ -6903,8 +6903,8 @@ an earlier state than one this host issued: a state directory put back from a co
 another host's. While the feed is ahead the host refuses every grant for an ingress other than the
 owner at the machine, an organisation's and a personal one alike, with `PERMISSION_DENIED` saying
 that it is catching up with its feed, and `kr doctor` shows a warning with a remedy. Before it carries
-anything out or raises the registry, it writes the finding down and begins a second wait, which only
-the person at the machine ends (below). It carries out
+anything out or raises the registry, it writes the finding down and begins a second wait, which the
+person at the machine ends (below). It carries out
 again each request the feed shows complete and the registry does not show withdrawn, each time a
 pass reads the record and whatever the two counters say: a restore that stopped after it moved the
 counter has lost the withdrawal all the same. It does so only for a request it could have carried
@@ -7030,7 +7030,7 @@ state. Having caught up with the feed does not end the refusal. A remote owner d
 confirmation is not spent while it stands. A request on the feed is still judged and carried out,
 because the feed is how a known owner reaches the host then: it can only revoke, and the keys the
 host names to the feed can only remove the host from it. A device that the owner revoked at the machine after the copy, and
-that the restore brought back, is judged live on the feed until the owner has confirmed and revoked it
+that the restore brought back, is judged live on the feed until the owner has revoked it
 again. `kr doctor` shows a `restored-policy` warning, whether or not the host reads a feed, with the
 number of enrolments, whether exclusive management is on and the bound.
 
@@ -7040,18 +7040,24 @@ nobody confirmed the policy now held; the record is then rewritten to name the p
 the moment the restore was found), and when it cannot be read (the file stays and the doctor says so).
 It waits for nothing when there is no record, and it removes a record when it holds no policy. When
 the copy of the policy cannot be read, the start writes the record before it replaces the copy, and
-stops with an error naming the file if it cannot. A pass that cannot write the record carries nothing
-out and does not move the registry, and the next pass tries again.
+stops with an error naming the file if it cannot. A pass that cannot write the record of its first
+finding carries nothing out and does not move the registry, and the next pass tries again. A pass
+that cannot write it again as the catch-up begins has carried out what the feed shows completed, and
+stops before the barrier, which the next pass raises.
 
 The person at the machine ends the wait with `kr host policy --confirm`, which shows what
 `kr organisation list` shows and calls `host.policy.confirm` on the local socket. It confirms the
 policy as it stands and changes none of it. What the restore revived (an enrolment withdrawn since,
 exclusive management ended since, a device revoked at the machine since) stays in force until the
-command that ends it is run. `kr organisation withdraw` and `kr device revoke` need no confirmation
-and work while the wait stands. Ending exclusive management takes an owner device's confirmation,
-which the wait refuses, so it comes after the confirmation. The bound has no command, and ends by its
-own lapse. The call is refused while the host is still catching up with its feed, and the host
-keeps no record of it: asked again after a lost reply it answers that it lifted nothing. No owner
+command that ends it is run. `kr organisation withdraw`, `kr device revoke` and `kr share revoke`
+need no confirmation and work while the wait stands. Ending exclusive management takes an owner
+device's confirmation, which the wait refuses, or the terminal's when no owner device is left that
+can confirm, so it comes after the confirmation. The bound has no command. When it lapses the host
+refuses remote access under a personal grant until it next synchronises, and the bound stays. The
+call is refused while the host knows it is behind its feed. A host that reads a feed and has not
+reached it since it started does not know, so a confirmation then ends the wait until the first
+pass that reads the feed finds the restore again and raises it. The host keeps no record of the
+call: asked again after a lost reply it answers that it lifted nothing. No owner
 device can make it, since the wait refuses every owner device, and a ceremony would need a new
 subject of an owner confirmation, which changes the level of the protocol. The call is therefore an
 exception to the rule that an owner operation which enlarges what the host answers to takes the
@@ -7065,8 +7071,9 @@ exclusive management. A record removed by hand ends the wait at the next start, 
 A release from before this store does not name it and neither reads nor writes the record. A
 rollback to it drops the wait: that release serves the restored policy to remote devices as it
 always did. The record stays where it is, and the update that follows reads it and waits again. A
-record that cannot be read also stops `kr host update` to a release that lists the store, until the
-confirmation removes it. The limits: a host stopped between its first finding and the write, and
+record that the update check cannot read as a canonical map with a whole-number version also stops
+`kr host update` to a release that lists the store, until the confirmation removes it. A record that
+is such a map but lacks a member makes this build wait and stops no update. The limits: a host stopped between its first finding and the write, and
 started with its feed unreachable, finds nothing to wait for; and the record is in the state
 directory, so a restore of that directory removes or replaces it.
 
@@ -7227,9 +7234,9 @@ notice again. Setting a clock back will not make any numbers be lower than any p
   to write is reported once and does not stop a change. The protection has three limits: a registry
   and a copy put back together are one earlier state, which only the host's comparison of its
   registry with its authority feed can see ("The remote authority feed"); a copy that is missing
-  protects nothing, and a copy that is there and cannot be read makes the host wait for the person
-  at the machine to confirm the policy, as a restored policy does, before the next write replaces
-  it; and a release from before the copy writes the row without raising the
+  protects nothing, and a copy that is there and cannot be read makes a host that holds a policy
+  wait for the person at the machine to confirm it, as a restored policy does, with the record
+  written before the start replaces the copy; and a release from before the copy writes the row without raising the
   sequence, so a registry put back and then written by that release has what it wrote replaced by
   the copy's policy when this build starts again.
 
