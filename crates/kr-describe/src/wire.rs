@@ -251,13 +251,13 @@ impl Answer {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Background {
-    /// The mechanism, by its stable name.
+    /// The processor class's mechanism, by its stable name.
     pub mechanism: String,
-    /// Whether the processor class was changed.
+    /// Whether the system reports the processor class the process asked for.
     pub cpu: bool,
-    /// Whether an IO class was changed.
+    /// Whether the system reports the IO class the process asked for.
     pub io: bool,
-    /// Why nothing was applied, when nothing was.
+    /// Why a class was not applied, when one was not: the processor class's reason first.
     pub why: Nullable<String>,
 }
 

@@ -19,15 +19,26 @@
 //! | Platform | CPU | IO |
 //! | --- | --- | --- |
 //! | Linux | `SCHED_BATCH` with the lowest niceness, on the calling thread and the threads it starts, which is the scheduler class for non-interactive work | the lowest level of the best-effort class, on the calling thread and the threads it starts |
-//! | macOS and the other Unix systems | the lowest ordinary thread priority | the throttled disk policy of the process on macOS; none elsewhere |
+//! | macOS | the lowest ordinary thread priority of the calling thread | the throttled disk policy of the process |
 //! | Windows | the idle priority class of the whole process | very low, for the whole process |
+//! | the other Unix systems | the lowest ordinary thread priority, where the thread-priority library gives one, and a reported refusal where it does not | none |
 //!
 //! Windows lowers the class of the whole process, because a thread started by another thread there
 //! begins at the normal priority, and the compute threads of the model runtime are started by the
-//! thread that loads it. The idle class is served only when no other work on the machine wants the
-//! processor, and the process's control thread is in it too: a machine that keeps every core busy
-//! with other work can answer the process later than the daemon waits for it, and the daemon ends a
-//! process that does not answer a cancellation in time.
+//! thread that loads it. That puts the process's control thread and its watchdog in the idle class
+//! too, and three things follow when other work keeps every core busy for longer than a few
+//! seconds (Windows lifts a thread that has waited that long, so the wait is bounded):
+//!
+//! - the daemon can wait past its bound for the process to acknowledge a cancellation, and ends a
+//!   process that does not acknowledge in time;
+//! - the process's own watchdog ends the process when its control thread takes more than
+//!   [`crate::serve::CONTROL_BOUND_MS`] over one request, which a control thread that waits for the
+//!   model thread's write of an answer can do;
+//! - the `Ready` answer waits half the daemon's handshake bound for the model thread's report of its
+//!   class, and says it did not hear one when the wait ends.
+//!
+//! Each ends a process the daemon then starts again after its restart delay, so a machine that is
+//! too busy to run the process gets fewer descriptions, and the owner's own work is not the cost.
 //!
 //! The class is the idle priority class and the very low IO priority, set on their own. Windows
 //! also has a background mode for a process, which lowers the CPU, IO and memory priority together,
@@ -39,9 +50,9 @@
 //! own check.
 //!
 //! An IO class that a platform does not give is reported as not applied, with the reason, and the
-//! qualification matrix carries it as an open item rather than as a claim. Inference reads its
-//! weights once at load and then does no IO at all, so what an IO class changes here is one
-//! sequential read of a file the host is about to keep mapped.
+//! guide to this crate says so rather than claiming it. Inference reads its weights once at load
+//! and then does no IO at all, so what an IO class changes here is one sequential read of a file
+//! the host is about to keep mapped.
 
 /// The mechanism a platform offers for running work in the background.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,8 +89,6 @@ pub struct Applied {
     pub cpu: bool,
     /// Whether the system reports the IO class this build asked for.
     pub io: bool,
-    /// The IO class the system reports, by its stable name, when it reports one.
-    pub io_class: Option<&'static str>,
     /// Why a class was not applied, when one was not: the processor class's reason first.
     pub why: Option<&'static str>,
 }
@@ -91,19 +100,7 @@ impl Applied {
         self.cpu
     }
 
-    #[cfg(windows)]
-    fn unqualified(why: &'static str) -> Self {
-        Self {
-            mechanism: Mechanism::None,
-            cpu: false,
-            io: false,
-            io_class: None,
-            why: Some(why),
-        }
-    }
-
     /// Joins what the processor class and the IO class each came to.
-    #[cfg(not(windows))]
     fn of(
         cpu: std::result::Result<Mechanism, &'static str>,
         io: std::result::Result<kr_ipc::background::IoClass, &'static str>,
@@ -112,7 +109,6 @@ impl Applied {
             mechanism: cpu.unwrap_or(Mechanism::None),
             cpu: cpu.is_ok(),
             io: io.is_ok(),
-            io_class: io.ok().map(kr_ipc::background::IoClass::as_str),
             why: cpu.err().or(io.err()),
         }
     }
@@ -125,27 +121,13 @@ impl Applied {
 /// own. A failure is reported rather than propagated: a host whose scheduler refuses the change
 /// still runs descriptions, at ordinary priority, and says so.
 #[must_use]
-pub fn background_current_thread() -> Applied {
-    apply()
+pub fn enter_background() -> Applied {
+    Applied::of(apply_cpu(), kr_ipc::background::lower_io_class())
 }
 
 #[cfg(windows)]
-fn apply() -> Applied {
-    match kr_ipc::background::enter_process_background() {
-        Ok(class) => Applied {
-            mechanism: Mechanism::WindowsIdlePriorityClass,
-            cpu: class.idle_priority_class,
-            io: class.io.is_some(),
-            io_class: class.io.map(kr_ipc::background::IoClass::as_str),
-            why: None,
-        },
-        Err(why) => Applied::unqualified(why),
-    }
-}
-
-#[cfg(not(windows))]
-fn apply() -> Applied {
-    Applied::of(apply_cpu(), kr_ipc::background::lower_io_class())
+fn apply_cpu() -> std::result::Result<Mechanism, &'static str> {
+    kr_ipc::background::lower_priority_class().map(|()| Mechanism::WindowsIdlePriorityClass)
 }
 
 #[cfg(target_os = "linux")]
@@ -185,6 +167,11 @@ fn apply_cpu() -> std::result::Result<Mechanism, &'static str> {
         }
         _ => Err("this host does not report the thread priority it was given"),
     }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn apply_cpu() -> std::result::Result<Mechanism, &'static str> {
+    Err("this platform gives no processor class this build sets")
 }
 
 /// A token that cancels a job, and the gate its description is written through.

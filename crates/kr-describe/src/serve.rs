@@ -42,10 +42,11 @@ use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::scalars::{Bytes, Nullable, U64};
 
 use crate::environment::build_target;
-use crate::priority::{Applied, Cancellation, background_current_thread};
+use crate::priority::{Applied, Cancellation, enter_background};
 use crate::profile::catalogue::Catalogue;
 use crate::profile::{Asset, ModelProfile, SamplerSettings};
 use crate::prompt::Prompt;
+use crate::supervise::HANDSHAKE_MS;
 use crate::wire::{
     Answer, AssetFile, Background, JobEnd, JobLimits, LoadEnd, Phases, Request, VerifyResult,
     WIRE_VERSION, WireError, read_message, write_message,
@@ -339,19 +340,27 @@ pub fn run<M: Model>(
             .store(shared.stamp(), Ordering::Release);
         match request {
             Ok(Some(Request::Hello { .. })) => {
+                // The model thread says what it applied once the system has read it back, and on
+                // a machine other work keeps busy it can be a while before it runs. The control
+                // thread is waiting on nothing the watchdog bounds, so it waits the part of the
+                // daemon's handshake bound that leaves the daemon time to hear the answer, and
+                // the report it gives stays for the life of the process.
+                shared.control_since.store(0, Ordering::Release);
                 let background = applied
                     .get_or_insert_with(|| {
                         applied_heard
-                            .recv_timeout(Duration::from_millis(CONTROL_BOUND_MS / 2))
+                            .recv_timeout(Duration::from_millis(HANDSHAKE_MS / 2))
                             .unwrap_or(Applied {
                                 mechanism: crate::priority::Mechanism::None,
                                 cpu: false,
                                 io: false,
-                                io_class: None,
                                 why: Some("the model thread did not say what it applied"),
                             })
                     })
                     .to_owned();
+                shared
+                    .control_since
+                    .store(shared.stamp(), Ordering::Release);
                 shared.answer(&Answer::Ready {
                     build: options.build.clone(),
                     wire: U64::new(WIRE_VERSION),
@@ -616,7 +625,7 @@ fn model_thread<M: Model>(
 ) {
     // The class is applied on this thread, which is the one that loads and runs the model, before
     // the model starts any thread of its own.
-    let _ = applied_tell.send(background_current_thread());
+    let _ = applied_tell.send(enter_background());
     let mut lock: Option<ProcessLock> = None;
     let mut loaded: Option<ModelProfile> = None;
     while let Ok(work) = received.recv() {
