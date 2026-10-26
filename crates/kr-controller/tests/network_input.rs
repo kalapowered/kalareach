@@ -1,5 +1,5 @@
 //! A paired device's keys, through the control daemon, beside the requests it sends on its own
-//! connection (KR-PERF-002).
+//! connection.
 //!
 //! One real daemon on the loopback network, a real worker it adopts (the worker's own service over
 //! a real pseudo-terminal, with its journal), and a paired device that sends its own frames. The
@@ -9,9 +9,9 @@
 //! request's round trip to the worker. These cases stop the worker's next journal commit, which
 //! holds the request, and show where the key is meanwhile.
 //!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-PERF-002 | the cases here |
+//! The cases decide by what reached the application and in what order, never by how long anything
+//! took. The one that records how long a key takes is `remote_input_forwarding_latency`, which is a
+//! measurement run by name.
 
 #![cfg(unix)]
 
@@ -793,7 +793,7 @@ async fn a_key_that_names_another_session_keeps_its_place_behind_a_stalled_mutat
 }
 
 // ---------------------------------------------------------------------------------------------
-// KR-PERF-001: what a paired device's key costs end to end through the daemon (a measurement)
+// What a paired device's key costs end to end through the daemon (a measurement)
 // ---------------------------------------------------------------------------------------------
 
 /// How many keys each reading sends.
