@@ -657,11 +657,13 @@ pub use native::{CommandFuture, Commands, Deadlines, NativeCalls};
 mod native {
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::Arc;
+    use std::sync::{Arc, OnceLock};
+    use std::task::Poll;
     use std::time::Duration;
 
     use serde::Serialize;
     use serde::de::DeserializeOwned;
+    use tokio::sync::{mpsc, oneshot};
 
     use super::{
         AcceptRequest, AcceptResponse, Answered, CallFailure, CallFuture, CallId, CallPlatform,
@@ -725,10 +727,21 @@ mod native {
         Quick,
     }
 
+    /// What native code gave back for one command, or why it did not.
+    type Answer = Result<serde_json::Value, CallFailure>;
+
+    /// A command waiting to be sent to native code, and where its answer goes.
+    struct Outgoing {
+        command: CommandFuture,
+        answer: oneshot::Sender<Answer>,
+    }
+
     /// The voice call of a phone, reached through the platform plugin's native half.
     pub struct NativeCalls<C: Commands> {
         commands: Arc<C>,
         deadlines: Deadlines,
+        /// Where commands wait to be sent, in the order they were asked. Started with the first.
+        outgoing: OnceLock<mpsc::UnboundedSender<Outgoing>>,
     }
 
     impl<C: Commands> NativeCalls<C> {
@@ -738,6 +751,7 @@ mod native {
             Self {
                 commands: Arc::new(commands),
                 deadlines: Deadlines::default(),
+                outgoing: OnceLock::new(),
             }
         }
 
@@ -750,11 +764,15 @@ mod native {
 
         /// Sends one command and reads its answer, within the command's deadline.
         ///
-        /// The command runs in a task of its own, so that going on without its answer drops
-        /// nothing the plugin still has to answer into: Tauri's reply to a command panics when
-        /// the place it replies to is gone. A command that has not been answered by its deadline
-        /// is `Unavailable`, and what it does later is native code's: a caller that cannot tell
-        /// asks what native code holds.
+        /// Commands are sent one at a time, in the order they were asked, by a task that keeps
+        /// the queue they wait in ([`send_in_order`]). A caller therefore never waits for the
+        /// send: a command that native code does not take, as when the main thread has stopped
+        /// reading what Tauri sends it, runs out its deadline like any other, and the revocation
+        /// of a call is not held behind it. The command runs to its end in that task or one of
+        /// its own, so that going on without its answer drops nothing the plugin still has to
+        /// answer into: Tauri's reply to a command panics when the place it replies to is gone. A
+        /// command that has not been answered by its deadline is `Unavailable`, and what it does
+        /// later is native code's: a caller that cannot tell asks what native code holds.
         async fn command<T: DeserializeOwned>(
             &self,
             method: &'static str,
@@ -769,8 +787,20 @@ mod native {
             };
             let arguments = serde_json::to_value(arguments)
                 .map_err(|error| CallFailure::new(FailureKind::Unavailable, error.to_string()))?;
-            let running = tokio::spawn(self.commands.invoke(method, arguments));
-            let answered = match tokio::time::timeout(within, running).await {
+            let (answer, answered) = oneshot::channel();
+            let queue = self.outgoing.get_or_init(|| {
+                let (queue, outgoing) = mpsc::unbounded_channel();
+                tauri::async_runtime::spawn(send_in_order(outgoing));
+                queue
+            });
+            let command = self.commands.invoke(method, arguments);
+            if queue.send(Outgoing { command, answer }).is_err() {
+                return Err(CallFailure::new(
+                    FailureKind::Unavailable,
+                    "the command could not be sent",
+                ));
+            }
+            let answered = match tokio::time::timeout(within, answered).await {
                 Ok(Ok(answered)) => answered?,
                 Ok(Err(_)) => {
                     return Err(CallFailure::new(
@@ -794,6 +824,41 @@ mod native {
                     format!("native code answered with something unreadable: {error}"),
                 )
             })
+        }
+    }
+
+    /// Sends the commands in `outgoing` to native code one after another, in the order they were
+    /// queued.
+    ///
+    /// Tauri sends a command in the first poll of the future that carries it, so that poll is
+    /// made here, in the queue's order, and a command asked for later cannot reach native code
+    /// before one asked for earlier. A command that is not answered by its first poll goes on in
+    /// a task of its own, which keeps Tauri's channel until the answer comes; its caller, who may
+    /// have gone on without it, finds the answer discarded. A panic in the first poll, as Tauri's
+    /// send makes on Android when no activity is registered, is that command's failure: nothing
+    /// went out, so no answer follows.
+    async fn send_in_order(mut outgoing: mpsc::UnboundedReceiver<Outgoing>) {
+        while let Some(Outgoing {
+            mut command,
+            answer,
+        }) = outgoing.recv().await
+        {
+            match crate::first_poll(&mut command).await {
+                Ok(Poll::Ready(sent)) => {
+                    let _ = answer.send(sent);
+                }
+                Ok(Poll::Pending) => {
+                    tokio::spawn(async move {
+                        let _ = answer.send(command.await);
+                    });
+                }
+                Err(said) => {
+                    let _ = answer.send(Err(CallFailure::new(
+                        FailureKind::Unavailable,
+                        format!("the command could not be sent: {said}"),
+                    )));
+                }
+            }
         }
     }
 
@@ -1171,6 +1236,144 @@ mod tests {
         })
         .await
         .expect("the command the caller gave up on still ends");
+    }
+
+    /// Native code that notes the order its commands are sent in. Tauri sends a command in the first
+    /// poll of the future that carries it, so the first poll is what this notes.
+    struct Noting {
+        sent: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Commands for Noting {
+        fn channel(&self, _sink: EventSink) -> serde_json::Value {
+            serde_json::json!("__CHANNEL__:1")
+        }
+
+        fn invoke(&self, method: &'static str, _arguments: serde_json::Value) -> CommandFuture {
+            let sent = Arc::clone(&self.sent);
+            Box::pin(async move {
+                sent.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(method);
+                tokio::task::yield_now().await;
+                Ok(serde_json::json!({}))
+            })
+        }
+    }
+
+    /// A caller that asks two commands in one turn, as two callers at once do, finds them reach native
+    /// code in the order it asked: a command that waited for a task of its own could be run after
+    /// the one asked for later, which a worker of the runtime does when the later task is the one
+    /// it ran last.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn commands_reach_native_code_in_the_order_they_were_asked() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let calls = NativeCalls::new(Noting {
+            sent: Arc::clone(&sent),
+        });
+        let call = CallId("c1".to_owned());
+
+        tokio::spawn(async move {
+            let mute = calls.mute(&call, Mute::Microphone, true);
+            let stop = calls.stop(&call);
+            let (muted, stopped) = tokio::join!(mute, stop);
+            muted.expect("the mute is answered");
+            stopped.expect("the stop is answered");
+        })
+        .await
+        .expect("the caller ran to its end");
+
+        assert_eq!(
+            *sent.lock().unwrap_or_else(PoisonError::into_inner),
+            ["callMute", "callStop"]
+        );
+    }
+
+    /// Native code whose send does not return until it is let go, as Tauri's does on Android when
+    /// the main thread has stopped reading what is sent to it.
+    struct Stuck {
+        release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl Commands for Stuck {
+        fn channel(&self, _sink: EventSink) -> serde_json::Value {
+            serde_json::json!("__CHANNEL__:1")
+        }
+
+        fn invoke(&self, _method: &'static str, _arguments: serde_json::Value) -> CommandFuture {
+            let release = Arc::clone(&self.release);
+            Box::pin(std::future::poll_fn(move |_| {
+                let (let_go, wake) = &*release;
+                let mut let_go = let_go.lock().unwrap_or_else(PoisonError::into_inner);
+                while !*let_go {
+                    let_go = wake.wait(let_go).unwrap_or_else(PoisonError::into_inner);
+                }
+                std::task::Poll::Ready(Ok(serde_json::json!({})))
+            }))
+        }
+    }
+
+    /// A command that native code does not take is the caller's to give up on at its deadline, as
+    /// one that it does not answer is: the caller never waits for the send, so that a stop of
+    /// native code that does not return does not hold the revocation of the call behind it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_command_native_code_does_not_take_does_not_hold_its_caller() {
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let calls = Arc::new(
+            NativeCalls::new(Stuck {
+                release: Arc::clone(&release),
+            })
+            .with_deadlines(quick()),
+        );
+
+        let caller = tokio::spawn({
+            let calls = Arc::clone(&calls);
+            async move { calls.stop(&CallId("c1".to_owned())).await }
+        });
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(20), caller).await;
+        // Let the send go whatever came of the caller, so that no thread stays held by it.
+        *release.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        release.1.notify_all();
+
+        let failure = outcome
+            .expect("the caller went on at its deadline")
+            .expect("the caller ran to its end")
+            .expect_err("nothing answered in time");
+        assert_eq!(failure.kind, FailureKind::Unavailable);
+        assert!(failure.message.contains("did not answer"), "{failure}");
+    }
+
+    /// Native code whose command panics in its first poll, as Tauri's does on Android when no
+    /// activity is registered.
+    struct NoActivity;
+
+    impl Commands for NoActivity {
+        fn channel(&self, _sink: EventSink) -> serde_json::Value {
+            serde_json::json!("__CHANNEL__:1")
+        }
+
+        fn invoke(&self, _method: &'static str, _arguments: serde_json::Value) -> CommandFuture {
+            Box::pin(std::future::poll_fn(|_| {
+                panic!("no available activity");
+            }))
+        }
+    }
+
+    /// A panic in the send must not unwind through anything that waits for the command: the
+    /// command is unavailable, and the reason is said.
+    #[tokio::test]
+    async fn a_command_that_panics_when_it_is_sent_is_unavailable() {
+        let calls = NativeCalls::new(NoActivity);
+
+        let failure = calls
+            .stop(&CallId("c1".to_owned()))
+            .await
+            .expect_err("nothing went out, so nothing answers");
+        assert_eq!(failure.kind, FailureKind::Unavailable);
+        assert!(
+            failure.message.contains("no available activity"),
+            "{failure}"
+        );
     }
 
     /// Each item of news in the fixture is one Rust reads, and writes back as it is.

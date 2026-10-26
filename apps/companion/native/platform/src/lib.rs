@@ -131,25 +131,13 @@ impl<R: Runtime> Platform<R> {
 async fn to_its_end<T: Send + 'static>(
     call: impl std::future::Future<Output = T> + Send + 'static,
 ) -> Result<T, PlatformError> {
-    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::task::Poll;
 
     let mut call = Box::pin(call);
-    let first = std::future::poll_fn(|context| {
-        Poll::Ready(catch_unwind(AssertUnwindSafe(|| {
-            call.as_mut().poll(context)
-        })))
-    })
-    .await;
-    match first {
+    match first_poll(&mut call).await {
         Ok(Poll::Ready(answer)) => return Ok(answer),
         Ok(Poll::Pending) => {}
-        Err(panic) => {
-            let said = panic
-                .downcast_ref::<&str>()
-                .map(|said| (*said).to_owned())
-                .or_else(|| panic.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "it panicked".to_owned());
+        Err(said) => {
             return Err(PlatformError::new(format!(
                 "the platform's call failed: {said}"
             )));
@@ -158,6 +146,30 @@ async fn to_its_end<T: Send + 'static>(
     tauri::async_runtime::spawn(call)
         .await
         .map_err(|error| PlatformError::new(format!("the platform's call was lost: {error}")))
+}
+
+/// Polls `call` once, which is the poll that sends a native command, and says what came of it.
+///
+/// A panic in that poll is returned with the words it carried, so that whoever made the poll can
+/// answer for it: Tauri's send panics on Android when no activity is registered to send to.
+pub(crate) async fn first_poll<F: std::future::Future + ?Sized>(
+    call: &mut std::pin::Pin<Box<F>>,
+) -> Result<std::task::Poll<F::Output>, String> {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::task::Poll;
+
+    std::future::poll_fn(|context| {
+        Poll::Ready(
+            catch_unwind(AssertUnwindSafe(|| call.as_mut().poll(context))).map_err(|panic| {
+                panic
+                    .downcast_ref::<&str>()
+                    .map(|said| (*said).to_owned())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "it panicked".to_owned())
+            }),
+        )
+    })
+    .await
 }
 
 #[cfg(target_os = "ios")]
