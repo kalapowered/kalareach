@@ -48,6 +48,23 @@ function buttons(): string[] {
     .map((each) => each.textContent ?? '')
 }
 
+/** The buttons that start something. */
+function offered(): HTMLElement[] {
+  return within(screen.getByTestId('launch-surface'))
+    .getAllByRole('button')
+    .filter((each) => each.dataset.offer !== undefined)
+}
+
+/** Every button that starts something is disabled. */
+function allDisabled(): void {
+  for (const each of offered()) expect(each).toBeDisabled()
+}
+
+/** Every button that starts something is lit. */
+function allLit(): void {
+  for (const each of offered()) expect(each).toBeEnabled()
+}
+
 describe('the rows of the table that are words', () => {
   it('says the host does not serve the read, and draws no button', async () => {
     const { port, controls } = fakeHost()
@@ -181,9 +198,9 @@ describe('the buttons that start something', () => {
     expect(screen.queryByText('Claude Code started.')).toBeNull()
     expect(controls.launches).toEqual([])
     expect(await screen.findByText(/The prompt changed before the launch was installed/)).toBeInTheDocument()
-    for (const each of within(screen.getByTestId('launch-surface')).getAllByRole('button')) {
-      expect(each).toBeDisabled()
-    }
+    allDisabled()
+    expect(screen.getByTestId('launch-stale')).toHaveTextContent('The last launch was refused')
+    expect(screen.queryByTestId('launch-refresh')).toBeNull()
     // The read the refusal asked for answers: the prompt is the new one, and the buttons are
     // disabled until the person has looked at it.
     await act(async () => {
@@ -191,8 +208,10 @@ describe('the buttons that start something', () => {
       await Promise.resolve()
     })
     await waitFor(() => {
-      expect(screen.getByTestId('launch-stale')).toBeInTheDocument()
+      expect(screen.getByTestId('launch-stale')).toHaveTextContent('The prompt changed')
     })
+    expect(screen.getByTestId('launch-refresh')).toHaveTextContent('I have looked at the prompt')
+    allDisabled()
   })
 
   it('stay disabled when the prompt moves, until the person has looked at it', async () => {
@@ -239,5 +258,94 @@ describe('the buttons that start something', () => {
     expect(said).toBeInTheDocument()
     expect(said.textContent).not.toMatch(/Nothing was typed/)
     expect(screen.queryByText('Claude Code started.')).toBeNull()
+  })
+
+  // A button is advice from a read, and a refusal says the advice was wrong. A read that answered
+  // while the press waited was started before the refusal, so it says nothing of what the refusal
+  // found: the buttons stay disabled until a read that started after it has landed.
+  it('stay disabled while a launch waits, and after it is refused until a read made after it lands', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    open(port, 'terminal')
+    await takeControl(person)
+    const surface = await screen.findByTestId('launch-surface')
+    await waitFor(() => {
+      expect(within(surface).getByRole('button', { name: 'Claude Code' })).toBeEnabled()
+    })
+
+    controls.refuseLaunches('EDITOR_BUSY', 'The terminal was busy.')
+    const presses = controls.hold('launch')
+    const reads = controls.hold('launchSurface')
+    await person.click(within(surface).getByRole('button', { name: 'Claude Code' }))
+    await waitFor(() => {
+      expect(presses.count).toBe(1)
+    })
+    allDisabled()
+
+    // A read is made and answered while the press waits, at the same prompt.
+    act(() => {
+      document.dispatchEvent(new Event('visibilitychange'))
+    })
+    await waitFor(() => {
+      expect(reads.count).toBe(1)
+    })
+    await act(async () => {
+      reads.answer(0)
+      await Promise.resolve()
+    })
+    allDisabled()
+
+    await act(async () => {
+      presses.release()
+      await Promise.resolve()
+    })
+    expect(await screen.findByText(/The terminal was busy, so the launch was not installed/)).toBeInTheDocument()
+    // The read the refusal asked for is the first one made after it.
+    await waitFor(() => {
+      expect(reads.count).toBe(2)
+    })
+    allDisabled()
+    await act(async () => {
+      reads.answer(1)
+      await Promise.resolve()
+    })
+    await waitFor(allLit)
+  })
+
+  it('stay disabled after a refusal when a read that was on its way lands after it', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    open(port, 'terminal')
+    await takeControl(person)
+    const surface = await screen.findByTestId('launch-surface')
+    await waitFor(() => {
+      expect(within(surface).getByRole('button', { name: 'Claude Code' })).toBeEnabled()
+    })
+
+    const reads = controls.hold('launchSurface')
+    act(() => {
+      document.dispatchEvent(new Event('visibilitychange'))
+    })
+    await waitFor(() => {
+      expect(reads.count).toBe(1)
+    })
+    controls.refuseLaunches('EDITOR_BUSY', 'The terminal was busy.')
+    await person.click(within(surface).getByRole('button', { name: 'Claude Code' }))
+    expect(await screen.findByText(/The terminal was busy, so the launch was not installed/)).toBeInTheDocument()
+
+    // The read on its way was started before the refusal: it does not light the buttons.
+    await act(async () => {
+      reads.answer(0)
+      await Promise.resolve()
+    })
+    await waitFor(() => {
+      expect(reads.count).toBe(2)
+    })
+    allDisabled()
+    await act(async () => {
+      reads.answer(1)
+      await Promise.resolve()
+    })
+    await waitFor(allLit)
   })
 })

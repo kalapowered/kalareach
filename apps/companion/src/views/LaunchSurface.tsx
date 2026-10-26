@@ -8,9 +8,11 @@
  * one a launch could be installed at.
  *
  * Every press quotes the prompt generation and the buffer revision of the newest read. A button
- * drawn at one prompt stays disabled after the prompt moved until the person has looked at it, and
- * after a refusal until the surface has been read again. The session refuses a quote that has gone
- * stale before anything is typed, so a button lit a moment too long does no harm.
+ * drawn at one prompt stays disabled after the prompt moved until the person has looked at it. It
+ * is disabled while a press waits, and after one has settled until a read that started after it has
+ * landed: a read already on its way says nothing of what the press found. The session refuses a
+ * quote that has gone stale before anything is typed, so a button lit a moment too long does no
+ * harm.
  */
 
 import { useState, type ReactNode } from 'react'
@@ -20,7 +22,7 @@ import type { LaunchShell, ShellLaunchResult } from '@kalareach/protocol'
 import { useApp } from '../app/state'
 import type { LaunchSurfaceReads } from '../app/launch-surface'
 import { Button, CommitButton } from '../components/ui'
-import { failureCode, failureWords, type LaunchPress, type LaunchSurfaceReading } from '../host/port'
+import { failureCode, failureWords, type LaunchPress } from '../host/port'
 import { commandLine } from '../model/command-line'
 import {
   drawing,
@@ -58,10 +60,15 @@ export function LaunchSurface({
   readonly press: ((press: LaunchPress) => Promise<ShellLaunchResult>) | null
 }): ReactNode {
   const { say } = useApp()
-  const { reading, unread, again } = reads
+  const { reading, unread, number, newest, again } = reads
   const [drawnAt, setDrawnAt] = useState<string | null>(null)
-  // The read a refusal was made on: a refusal disables the buttons until the surface is read again.
-  const [refusedOn, setRefusedOn] = useState<LaunchSurfaceReading | null>(null)
+  // Whether a press waits for the session's answer.
+  const [pressing, setPressing] = useState(false)
+  // The last press that settled: the newest read started by then, which no read numbered no higher
+  // is taken to say anything of, and whether the session refused it.
+  const [settled, setSettled] = useState<{ readonly after: number; readonly refused: boolean } | null>(
+    null
+  )
   const [shown, setShown] = useState<string | null>(null)
 
   const drawn = reading === null ? null : drawing(reading, mayType)
@@ -70,7 +77,8 @@ export function LaunchSurface({
   // the buttons.
   if (generation === null && drawnAt !== null) setDrawnAt(null)
   else if (generation !== null && drawnAt === null) setDrawnAt(generation)
-  const refused = reading !== null && refusedOn === reading
+  // Whether the newest answer was read after the last press settled.
+  const readSince = settled === null || number > settled.after
 
   if (reading === null || drawn === null) {
     return unread === null ? null : (
@@ -143,7 +151,7 @@ export function LaunchSurface({
     case 'live': {
       const live = drawn.kind === 'live'
       const stale = live && drawnAt !== null && drawnAt !== drawn.promptGeneration
-      const lit = live && press !== null && connected && !stale && !refused
+      const lit = live && press !== null && connected && !stale && !pressing && readSince
       const why = !connected
         ? 'Not in contact with this host, so nothing can be started on it.'
         : drawn.kind === 'not_held_here'
@@ -154,11 +162,16 @@ export function LaunchSurface({
             ? 'Start something from the terminal view, which holds the input.'
             : stale
               ? 'The prompt changed since these were drawn. Nothing will be typed into it.'
-              : refused
+              : settled?.refused === true && !readSince
                 ? 'The last launch was refused. Reading the prompt again.'
                 : null
       return (
-        <section className="launch-surface" data-testid="launch-surface" data-stale={stale}>
+        <section
+          className="launch-surface"
+          data-testid="launch-surface"
+          data-stale={stale}
+          aria-busy={pressing}
+        >
           <p className="eyebrow">Start something here</p>
           <div className="row wrap">
             {drawn.offers.map((offer) => (
@@ -170,17 +183,21 @@ export function LaunchSurface({
                 title={why ?? typed(offer, null)}
                 onCommit={() => {
                   if (!lit || press === null || drawn.kind !== 'live') return
+                  setPressing(true)
                   press({
                     command: offer.command,
                     expected_prompt_generation: drawn.promptGeneration,
                     expected_buffer_revision: drawn.bufferRevision
                   }).then(
                     () => {
+                      setPressing(false)
+                      setSettled({ after: newest(), refused: false })
                       say(`${offer.label} started.`, 'success')
                       again()
                     },
                     (failure: unknown) => {
-                      setRefusedOn(reading)
+                      setPressing(false)
+                      setSettled({ after: newest(), refused: true })
                       say(pressRefusal(failureCode(failure), failureWords(failure)), 'danger')
                       again()
                     }
