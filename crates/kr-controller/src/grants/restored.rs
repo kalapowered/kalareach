@@ -167,26 +167,24 @@ fn flush_beside(file: &Path) -> std::io::Result<()> {
 }
 
 /// Removes the file, flushing the directory so that a stop that follows does not bring it back.
-/// A file that is not there is removed already.
+/// A file that is not there is removed already, and the directory is flushed all the same: an
+/// earlier call may have removed it and failed to flush, and this call is its retry.
 ///
 /// # Errors
 ///
 /// Returns an error when the file cannot be removed: while another program holds it, or when
-/// something other than a file is there. When the file was removed and the directory then could
-/// not be flushed, the file is gone and the error says the removal is not known to be durable.
+/// something other than a file is there. When the file is gone and the directory then could not be
+/// flushed, the error says the removal is not known to be durable.
 pub fn remove(file: &Path) -> Result<()> {
-    if unlink(file)? {
-        flush_after_removal(file)
-    } else {
-        Ok(())
-    }
+    unlink(file)?;
+    flush_after_removal(file)
 }
 
-/// Takes the file away. Says whether it was there.
-fn unlink(file: &Path) -> Result<bool> {
+/// Takes the file away. A file that is not there is gone already.
+fn unlink(file: &Path) -> Result<()> {
     match kr_flush::retry_while_held(|| std::fs::remove_file(file)) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(ControllerError::registry(format!(
             "could not remove {}: {error}",
             file.display()
@@ -288,17 +286,13 @@ impl Kept {
     /// # Errors
     ///
     /// Returns the removal's error. The file and what the daemon knows are then as they were,
-    /// except when the file was removed and the directory could not be flushed: the file is gone,
-    /// the daemon no longer holds it as on disk, and the error says the removal is not known to be
-    /// durable.
+    /// except when the file is gone and the directory could not be flushed: the daemon no longer
+    /// holds the record as on disk, the error says the removal is not known to be durable, and the
+    /// next call, which finds the file gone, flushes the directory again before it succeeds.
     pub fn lift(&mut self) -> Result<()> {
-        if unlink(&self.file)? {
-            self.durable = None;
-            flush_after_removal(&self.file)
-        } else {
-            self.durable = None;
-            Ok(())
-        }
+        unlink(&self.file)?;
+        self.durable = None;
+        flush_after_removal(&self.file)
     }
 }
 
@@ -637,5 +631,33 @@ mod tests {
         kept.ensure(subject, 200)
             .expect("a finding writes it again");
         assert!(matches!(read(&file), Found::Record(_)));
+    }
+
+    /// A confirmation whose removal could not be made durable is asked again: the file is gone
+    /// then, and the retry still flushes the directory before it succeeds, so that a crash cannot
+    /// bring the record back after the wait has been lifted.
+    #[test]
+    fn a_retry_after_a_removal_whose_directory_could_not_be_flushed_flushes_before_it_succeeds() {
+        let (_directory, file) = tree();
+        let subject = subject_of(&row());
+        let directory = file.parent().expect("a directory").to_path_buf();
+        let mut kept = Kept::new(file.clone());
+        kept.ensure(subject, 100).expect("written");
+        let refused = kr_flush::testing::refuse_flushes_of(directory);
+        assert!(
+            kept.lift().is_err(),
+            "the first removal is not known to be durable"
+        );
+        assert_eq!(read(&file), Found::Missing, "the file is gone");
+        assert!(
+            kept.lift().is_err(),
+            "the retry finds the file gone and still cannot flush the directory"
+        );
+        drop(refused);
+        kept.lift().expect("the retry that flushes succeeds");
+        assert!(
+            remove(&file).is_ok(),
+            "and so does a removal of a file that is not there"
+        );
     }
 }
