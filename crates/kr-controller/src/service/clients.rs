@@ -48,6 +48,9 @@ pub(super) struct ClientParts<'a> {
     pub host_key: &'a AuthorisationKeyPair,
     /// The storage service, when the configuration document selects one.
     pub storage: Option<StorageParts<'a>>,
+    /// What the relay lease service asks before it sends a request for a new lease, when this host
+    /// reads the signed release matrix.
+    pub release_gate: Option<Arc<kr_client::services::matrix::ReleaseGate>>,
 }
 
 /// The origin a selection of the configuration document names, or why it cannot be used.
@@ -101,6 +104,7 @@ impl Controller {
                 &origin,
                 Self::outbound_of(started)?.proxy()?,
                 Arc::new(crate::push::sender::HostSigner::new(parts.host_key.clone())),
+                parts.release_gate.clone(),
             )?);
         }
         clients.managed_inference = Self::managed_voice_provider(started, parts.account);

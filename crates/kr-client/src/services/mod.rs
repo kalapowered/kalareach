@@ -225,6 +225,7 @@ pub fn managed_response_limits() -> ResponseLimits {
             backup::BACKUP_MANIFEST_PATH,
             backup::BACKUP_ANSWER_LIMIT_BYTES,
         )
+        .for_path(matrix::PATH, matrix::MAX_ANSWER_BYTES)
 }
 
 /// How this module's rule about what is never rendered is checked.

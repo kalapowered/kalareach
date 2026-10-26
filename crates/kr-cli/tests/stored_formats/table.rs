@@ -1464,6 +1464,11 @@ pub fn named() -> Vec<Named> {
         ),
         leaf(
             StoreScope::Environment,
+            "release-matrix.json",
+            "the last accepted copy of the published release matrix; a file that cannot be read or verified is read as none and written again",
+        ),
+        leaf(
+            StoreScope::Environment,
             "capabilities",
             "the capability revision, a number as text; an environment whose record cannot be read keeps revision zero",
         ),

@@ -253,6 +253,7 @@ pub fn managed_service(
     origin: &GatewayOrigin,
     proxy: Option<&ProxyUrl>,
     signer: Arc<dyn ServiceSigner>,
+    gate: Option<Arc<kr_client::services::matrix::ReleaseGate>>,
 ) -> Result<Arc<dyn RelayLeaseService>> {
     let http: Arc<dyn ServiceHttp> = Arc::new(
         HttpService::through(
@@ -270,11 +271,11 @@ pub fn managed_service(
             ))
         })?,
     );
-    Ok(Arc::new(ManagedRelayLeaseService::new(
-        origin.clone(),
-        http,
-        signer,
-    )))
+    let service = ManagedRelayLeaseService::new(origin.clone(), http, signer);
+    Ok(Arc::new(match gate {
+        Some(gate) => service.gated_by(gate),
+        None => service,
+    }))
 }
 
 /// What the owner is told about the last answer that was not a lease.
@@ -777,6 +778,11 @@ impl RelayKeeper {
                      host cannot name an account to pay because relay.origin is not the managed \
                      account service it signs in at",
                 ),
+                Standing::Refused(ErrorCode::UnsupportedCapability) => detail.stated(
+                    "; this build is outside every tier of the signed release matrix, so this host \
+                     asks the service for no new lease, and a lease it holds is refilled as before \
+                     (see the release-matrix check)",
+                ),
                 Standing::Refused(_) => detail.stated(
                     "; the service turned this host's request back as one it does not accept",
                 ),
@@ -797,6 +803,10 @@ impl RelayKeeper {
                     "The bound the service puts on what one lease may hold for the account that \
                      pays is below what a refill needs, or the lease changed while the request \
                      was handled. This host asks the service again by itself."
+                }
+                Standing::Refused(ErrorCode::UnsupportedCapability) => {
+                    "Update KalaReach on this host, or connect the devices directly or through a \
+                     relay you run yourself. This host asks again by itself."
                 }
                 Standing::Refused(_) => {
                     "Check `relay.origin` in the configuration document and that this host is \
@@ -1014,7 +1024,9 @@ fn failure_of(error: &ClientError, quiet: &Quiet) -> Failure {
             | ErrorCode::InvalidArgument
             | ErrorCode::HostNotConfigured
             | ErrorCode::RateLimited
-            | ErrorCode::QuotaExceeded) => Failure::NotActed(code),
+            | ErrorCode::QuotaExceeded
+            // The release gate refused a request for a new lease before anything was sent.
+            | ErrorCode::UnsupportedCapability) => Failure::NotActed(code),
             _ => Failure::MayHaveActed,
         };
     }
@@ -1025,7 +1037,10 @@ fn failure_of(error: &ClientError, quiet: &Quiet) -> Failure {
 const fn needs_the_owner(code: ErrorCode) -> bool {
     matches!(
         code,
-        ErrorCode::PermissionDenied | ErrorCode::HostNotConfigured | ErrorCode::InvalidArgument
+        ErrorCode::PermissionDenied
+            | ErrorCode::HostNotConfigured
+            | ErrorCode::InvalidArgument
+            | ErrorCode::UnsupportedCapability
     )
 }
 
@@ -1631,7 +1646,10 @@ async fn end(shared: &Arc<Shared>, ending: Ending, now: u64) -> Result<Ended> {
 /// the code does not carry. The service's words are left out: a refusal of a request under another
 /// authorisation names the account and the authorisation it is billed to.
 fn log_refusal(error: &ClientError) {
-    if let ClientError::Refused { error: refused, .. } = error {
+    if let ClientError::Refused { error: refused, .. } = error
+        // The release gate's refusal is this build's own, and the release matrix says so once.
+        && refused.code != ErrorCode::UnsupportedCapability
+    {
         eprintln!(
             "kr-controller: the relay lease service turned a request back ({:?}, {})",
             refused.code,

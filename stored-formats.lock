@@ -815,6 +815,14 @@
     },
     {
       "scope": "environment",
+      "path": "release-matrix.json",
+      "reason": "the last accepted copy of the published release matrix; a file that cannot be read or verified is read as none and written again",
+      "children": [],
+      "opaque": false,
+      "databases": false
+    },
+    {
+      "scope": "environment",
       "path": "secrets",
       "reason": "the secret store's fallback files, one per name, in the secret store's own format",
       "children": [],
