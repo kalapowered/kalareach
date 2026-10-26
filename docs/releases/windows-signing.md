@@ -202,7 +202,7 @@ answer: this signature does not hold for this file.
 not the signature is trusted, so an untrusted signature by another party is refused for both reasons.
 A trusted signature from another party has no business in this release.
 
-**untimestamped.** The file is signed and the signature is good, but nothing countersigned it. The
+**untimestamped.** The file is signed, but nothing countersigned it. The
 certificate expires in three days and the signature dies with it. A file can be refused for this and
 for being untrusted or having the wrong publisher at once, and all are reported.
 
@@ -352,7 +352,14 @@ run is suspected, or signing access must be revoked immediately:
        replacement certificate profile on the account once identity validation is confirmed. A
        revocation of one certificate covers only the code signed with that certificate, which is one
        day's, so the owner revokes in the Azure portal each day's certificate that carries an
-       unauthorised signature, and the portal lists them.
+       unauthorised signature, and the portal lists them. A revocation takes a date and time within
+       the certificate's validity, and the files signed with the certificate become invalid from that
+       time on ([Microsoft's steps](https://learn.microsoft.com/en-us/azure/artifact-signing/how-to-cert-revocation)).
+       The owner enters a time no later than the first unauthorised signature under that certificate,
+       which the signing history gives, and not the time of the discovery, or the unauthorised files
+       signed before it stay valid. Every legitimate file the certificate signed after that time
+       becomes invalid too, so each Windows release that carries one is released again from a new
+       commit, under that commit's tag.
      - The GitHub repository administrator deletes any compromised release draft or published release,
        purges published artefacts from distribution, and notifies downstream consumers.
 5. Treat the Apple signing credentials as leaked, whatever step 4 finds:
