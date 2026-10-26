@@ -803,6 +803,22 @@ impl Rig {
         .expect("the visit ends one way or the other")
     }
 
+    /// The application stops reconnecting to the host: its attempts are held at the link from now
+    /// on, and this returns once one is held, so that none is under way. The application reconnects
+    /// on a backoff of its own, and an attempt of its that falls inside a connection of the case's
+    /// presents beside it and asks the service for a lease beside it, so a case that counts what the
+    /// service is asked makes its connections as visits after this, which are not held.
+    async fn holds_the_application_back(&self) {
+        self.control.hold_own();
+        tokio::time::timeout(WATCHDOG, async {
+            while self.control.held() == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the application's next attempt to reconnect is held");
+    }
+
     /// The reference the pairing screen lists the host under.
     fn the_host(&self) -> String {
         self.companion()
@@ -1376,8 +1392,9 @@ async fn a_lease_and_a_stop_belong_to_the_account_that_asked() {
     rig.fixture.pass_wall(Duration::from_millis(5 * MINUTE_MS));
     rig.waits.passes();
     rig.down_because("not a member").await;
+    rig.holds_the_application_back().await;
     let removed = rig
-        .dials()
+        .visits()
         .await
         .expect_err("the removed account is not served");
     assert!(removed.to_string().contains("not a member"), "{removed}");
@@ -1386,7 +1403,7 @@ async fn a_lease_and_a_stop_belong_to_the_account_that_asked() {
     // Another member signs in. The host has bound this device to the first account, and says so.
     rig.signs_in_as("bea").await;
     let other = rig
-        .dials()
+        .visits()
         .await
         .expect_err("the host binds the device to the first");
     assert!(
