@@ -4925,7 +4925,9 @@ fn emulator_programs_are_here(programs: &[&str]) -> bool {
 /// A real terminal application opened on a virtual display and a bus of their own, running a shell
 /// script, and the process group it runs in, ended by its exact identifier when this is dropped.
 struct HeadlessEmulator {
-    child: std::process::Child,
+    child: std::cell::RefCell<std::process::Child>,
+    /// What the script and the application printed.
+    log: PathBuf,
 }
 
 impl HeadlessEmulator {
@@ -4941,6 +4943,8 @@ impl HeadlessEmulator {
         std::fs::create_dir_all(&runtime).expect("a directory");
         std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))
             .expect("a private directory");
+        let log = host.root().join("emulator.log");
+        let printed = || std::fs::File::create(&log).expect("a log file");
         let mut command = std::process::Command::new("xvfb-run");
         command
             .args([
@@ -4961,25 +4965,45 @@ impl HeadlessEmulator {
             .env("LIBGL_ALWAYS_SOFTWARE", "1")
             .current_dir(host.root())
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdout(printed())
+            .stderr(printed())
             // The application, its bus and its display are one group, which is ended as one.
             .process_group(0);
         let child = command.spawn().expect("starts the emulator");
-        Self { child }
+        Self {
+            child: std::cell::RefCell::new(child),
+            log,
+        }
+    }
+
+    /// Fails the case, with what was printed, if the script ended: it waits at its gates until the
+    /// case lets it go, so an end before then means the profile or a window did not come up.
+    fn assert_running(&self) {
+        if let Some(status) = self
+            .child
+            .borrow_mut()
+            .try_wait()
+            .expect("the script's state")
+        {
+            panic!(
+                "the script that runs the emulator ended with {status} before the case let it go:\n{}",
+                std::fs::read_to_string(&self.log).unwrap_or_default()
+            );
+        }
     }
 }
 
 impl Drop for HeadlessEmulator {
     fn drop(&mut self) {
         // The group is the child's own, named by the child's identifier.
-        if let Some(group) = i32::try_from(self.child.id())
+        let child = self.child.get_mut();
+        if let Some(group) = i32::try_from(child.id())
             .ok()
             .and_then(rustix::process::Pid::from_raw)
         {
             let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
         }
-        let _ = self.child.wait();
+        let _ = child.wait();
     }
 }
 
@@ -5004,9 +5028,16 @@ fn release(gate: &Path) {
 /// reads its settings from, the application runs on a virtual display, and the decision is the
 /// session list: a new live session with one attachment for each window the profile opened. The
 /// host is set up as in the case above this one.
+///
+/// `$profile` in the two commands that open a window is the identifier of the profile `kr` wrote,
+/// for an application that is opened by it. `without_a_scope_manager` puts a stand-in for
+/// `systemd-run` first on the application's search path, for one that starts a command inside a
+/// systemd user scope: the session bus here is private and has no systemd behind it, so the real
+/// program refuses, and the stand-in runs the command it is given and nothing more.
 fn windows_through_the_profile_create_a_session_each(
     programs: &[&str],
     terminal: &str,
+    without_a_scope_manager: bool,
     open_first: &str,
     open_second: &str,
 ) {
@@ -5041,8 +5072,29 @@ fn windows_through_the_profile_create_a_session_each(
     }
     let (first, second) = (host.work.join("go-on"), host.work.join("finish"));
     let kr = quoted(&program_directory.join("kr"));
+    let stand_in = host.root().join("scope-stand-in");
+    let search_path = if without_a_scope_manager {
+        std::fs::create_dir(&stand_in).expect("a directory");
+        let program = stand_in.join("systemd-run");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\n\
+             [ \"$1\" = --version ] && exec /usr/bin/systemd-run --version\n\
+             while [ $# -gt 0 ]; do case \"$1\" in --*) shift ;; *) break ;; esac; done\n\
+             exec \"$@\"\n",
+        )
+        .expect("the stand-in");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("an executable");
+        format!("PATH={}:\"$PATH\"\n", quoted(&stand_in))
+    } else {
+        String::new()
+    };
     let script = format!(
         "{kr} host terminal-profile install {terminal} || exit 1\n\
+         {search_path}\
+         profile=$({kr} host terminal-profile status --json | \
+           grep -o '/org/gnome/Ptyxis/Profiles/[^/\"]*' | head -1 | sed 's|.*/||')\n\
          {open_first}\n\
          cat {first} >/dev/null\n\
          {open_second}\n\
@@ -5050,9 +5102,10 @@ fn windows_through_the_profile_create_a_session_each(
         first = quoted(&first),
         second = quoted(&second),
     );
-    let _emulator = HeadlessEmulator::start(&host, &script);
+    let emulator = HeadlessEmulator::start(&host, &script);
     let live = |wanted: usize| -> Vec<Value> {
         until("the sessions of the windows the application opened", || {
+            emulator.assert_running();
             let listed = host.kr_json(&["list"]);
             let sessions = listed["sessions"]
                 .as_array()
@@ -5116,6 +5169,7 @@ fn a_real_gnome_terminal_opens_a_window_and_a_tab_through_the_profile_and_each_h
             "gsettings",
         ],
         "gnome-terminal",
+        false,
         "gnome-terminal --window --profile=KalaReach",
         "gnome-terminal --tab --profile=KalaReach",
     );
@@ -5128,7 +5182,23 @@ fn a_real_konsole_opens_two_windows_through_the_profile_and_each_has_a_session()
     windows_through_the_profile_create_a_session_each(
         &["xvfb-run", "dbus-run-session", "konsole"],
         "konsole",
+        false,
         "konsole --separate --profile KalaReach &",
         "konsole --separate --profile KalaReach &",
+    );
+}
+
+/// KR-REQ-01.21, KR-REQ-07.42: a real Ptyxis opens a tab, and then a second one in the same
+/// application, through the profile, and each has a session. Ptyxis reads the profile `kr` wrote
+/// from the settings database and starts its command through its own agent; only the scope that
+/// agent asks systemd for is a stand-in.
+#[test]
+fn a_real_ptyxis_opens_two_tabs_through_the_profile_and_each_has_a_session() {
+    windows_through_the_profile_create_a_session_each(
+        &["xvfb-run", "dbus-run-session", "ptyxis", "gsettings"],
+        "ptyxis",
+        true,
+        "ptyxis --tab-with-profile=$profile &",
+        "ptyxis --tab-with-profile=$profile &",
     );
 }
