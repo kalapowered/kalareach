@@ -242,11 +242,11 @@ describe('what the machine can do, and how that is known', () => {
 })
 
 describe('how KalaReach runs here', () => {
-  it('offers the graphical host, the headless host and a terminal profile separately', async () => {
+  it('offers the graphical host, the headless host, a shell startup entry and a terminal profile separately', async () => {
     start()
     await screen.findByTestId('setup-identity')
     await goTo('host')
-    for (const id of ['gui_host', 'headless_host', 'terminal_profile']) {
+    for (const id of ['gui_host', 'headless_host', 'shell_startup', 'terminal_profile']) {
       const card = screen.getByTestId(`setup-install-${id}`)
       expect(within(card).getByRole('switch')).toHaveAttribute('aria-checked', 'false')
     }
@@ -657,8 +657,15 @@ describe('what a restart is asked for, and what a record is about', () => {
     expect(screen.getByTestId('setup-panel-host').textContent).toMatch(
       /Nothing on this screen installs anything/
     )
-    // The one offer with a command of its own names it; the others do not invent one.
+    // An offer with a command of its own names it, and each names its own; the others do not
+    // invent one.
+    expect(screen.getByTestId('setup-install-shell_startup').textContent).toMatch(
+      /kr shell install/
+    )
     expect(screen.getByTestId('setup-install-terminal_profile').textContent).toMatch(
+      /kr host terminal-profile install <terminal>/
+    )
+    expect(screen.getByTestId('setup-install-terminal_profile').textContent).not.toMatch(
       /kr shell install/
     )
     expect(screen.getByTestId('setup-install-gui_host').textContent).not.toMatch(/kr host install/)
@@ -667,6 +674,34 @@ describe('what a restart is asked for, and what a record is about', () => {
     const commands = screen.getByTestId('setup-commands')
     expect(commands.textContent).toMatch(/Nothing on this screen installed anything/)
     expect(commands.textContent).toMatch(/The graphical host/)
+  })
+
+  it('keeps the shell startup entry and the terminal profile apart, each with its own command', async () => {
+    start()
+    await screen.findByTestId('setup-identity')
+    await goTo('host')
+    await userEvent.click(
+      within(screen.getByTestId('setup-install-terminal_profile')).getByRole('switch')
+    )
+    expect(
+      within(screen.getByTestId('setup-install-shell_startup')).getByRole('switch')
+    ).toHaveAttribute('aria-checked', 'false')
+    await goTo('ready')
+    let commands = screen.getByTestId('setup-commands')
+    expect(commands.textContent).toMatch(/kr host terminal-profile install <terminal>/)
+    expect(commands.textContent).not.toMatch(/kr shell install/)
+
+    await goTo('host')
+    await userEvent.click(
+      within(screen.getByTestId('setup-install-terminal_profile')).getByRole('switch')
+    )
+    await userEvent.click(
+      within(screen.getByTestId('setup-install-shell_startup')).getByRole('switch')
+    )
+    await goTo('ready')
+    commands = screen.getByTestId('setup-commands')
+    expect(commands.textContent).toMatch(/kr shell install/)
+    expect(commands.textContent).not.toMatch(/kr host terminal-profile/)
   })
 
   it('shows a fetch the host was asked for on its own, with nothing else chosen', async () => {
