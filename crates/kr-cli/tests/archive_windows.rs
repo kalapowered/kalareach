@@ -90,6 +90,41 @@ fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
+/// Four bytes whose checksum is `target`. The checksum of a four-byte message takes every value
+/// exactly once, and the message is found by undoing the four steps of the checksum from its end,
+/// each step's table index being known by the top byte of the state it leaves.
+fn four_bytes_with_checksum(target: u32) -> [u8; 4] {
+    let table: Vec<u32> = (0..256_u32)
+        .map(|index| {
+            (0..8).fold(index, |crc, _| {
+                if crc & 1 == 1 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                }
+            })
+        })
+        .collect();
+    let mut state = !target;
+    let mut indexes = [0_usize; 4];
+    for step in (0..4).rev() {
+        let index = table
+            .iter()
+            .position(|entry| entry >> 24 == state >> 24)
+            .expect("every top byte is in the table");
+        indexes[step] = index;
+        state = (state ^ table[index]) << 8;
+    }
+    let mut bytes = [0_u8; 4];
+    let mut crc = u32::MAX;
+    for (byte, index) in bytes.iter_mut().zip(indexes) {
+        *byte = u8::try_from(index ^ usize::try_from(crc & 0xff).expect("a byte")).expect("a byte");
+        crc = table[index] ^ (crc >> 8);
+    }
+    assert_eq!(crc32(&bytes), target, "the bytes have the checksum asked");
+    bytes
+}
+
 /// An archive of `members`, in the order given, written as a zip is: a local header and the data of
 /// each, then the central directory, then its end.
 fn archive_of(members: &[Member]) -> Vec<u8> {
@@ -499,10 +534,9 @@ fn a_name_too_long_or_too_deep_and_a_directory_too_large_are_refused_before_they
 
 /// KR-REQ-26.06: the parser is shown one end record and the directory that record names, as a
 /// release archive has them, and an archive that gives it another record to follow is refused
-/// before it sees the archive: a comment after the end record, bytes after it, a 64-bit form, an end
-/// record inside the directory (in an entry's extra data, where a parser that falls back to an
-/// earlier record would take it), a count that the directory does not hold, a size that does not
-/// reach the end record. The control is the same archive without the fault, which is read.
+/// before it sees the archive: a comment after the end record, bytes after it, a 64-bit form, a
+/// count that the directory does not hold, a size that does not reach the end record. The control
+/// is the same archive without the fault, which is read.
 #[test]
 fn an_archive_with_more_than_one_way_to_read_its_end_is_refused_before_the_parser_sees_it() {
     let members = release();
@@ -513,15 +547,6 @@ fn an_archive_with_more_than_one_way_to_read_its_end_is_refused_before_the_parse
         change(&mut bytes);
         bytes
     };
-    // A fake end record, as a parser that falls back to an earlier one would take it: it declares
-    // far more entries than any directory here holds.
-    let mut fake = b"PK\x05\x06".to_vec();
-    fake.extend_from_slice(&[0; 4]);
-    fake.extend_from_slice(&40_000_u16.to_le_bytes());
-    fake.extend_from_slice(&40_000_u16.to_le_bytes());
-    fake.extend_from_slice(&[0; 10]);
-    let mut hiding = release();
-    hiding[0].extra = fake;
     let cases: Vec<(&str, Vec<u8>)> = vec![
         (
             "a comment after the end record",
@@ -537,10 +562,6 @@ fn an_archive_with_more_than_one_way_to_read_its_end_is_refused_before_the_parse
         (
             "a 64-bit count",
             patched(&|bytes| bytes[end + 8..end + 12].copy_from_slice(&[0xff; 4])),
-        ),
-        (
-            "an end record in an entry's extra data",
-            archive_of(&hiding),
         ),
         (
             "a count the directory does not hold",
@@ -576,6 +597,37 @@ fn an_archive_with_more_than_one_way_to_read_its_end_is_refused_before_the_parse
         case.read(&good, &Limits::DEFAULT).is_ok(),
         "the archive without the fault is read"
     );
+}
+
+/// KR-REQ-26.06: a release whose directory happens to spell the signature of an end record is read.
+/// The directory carries each file's checksum, and the checksum of a file can be the four bytes of
+/// the signature; the parser takes the last end record of the archive first, so such a release is
+/// no different from any other, and refusing it would refuse a valid release for no fault of its.
+#[test]
+fn a_release_whose_directory_spells_an_end_record_is_read() {
+    let signature = u32::from_le_bytes(*b"PK\x05\x06");
+    let spelling = four_bytes_with_checksum(signature);
+    let mut members = release();
+    members.push(Member::stored(format!("{TOP}/share/spelling"), &spelling));
+    let archive = archive_of(&members);
+    assert!(
+        archive.windows(4).any(|window| window == b"PK\x05\x06")
+            && archive
+                .windows(4)
+                .filter(|window| *window == b"PK\x05\x06")
+                .count()
+                > 1,
+        "the directory holds the signature beside the end record's own"
+    );
+    let case = Case::new();
+    let (directory, written) = case
+        .read(&archive, &Limits::DEFAULT)
+        .expect("a release whose checksum spells the signature is read");
+    assert_eq!(
+        std::fs::read(directory.join("share/spelling")).expect("the file"),
+        spelling
+    );
+    assert_eq!(written.len(), 4);
 }
 
 /// Nothing is written outside the staging directory by an archive that names a place beyond it.
