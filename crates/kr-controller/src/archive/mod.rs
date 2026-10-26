@@ -37,9 +37,10 @@
 //!   acknowledged a complete cleanup owes none, and a receipt it settled afterwards holds no
 //!   content, because the journal commits a settlement or a rejection without it while its
 //!   record says privacy mode is on. A journal written by a release that removed that content in a
-//!   second transaction, and stopped between the two, still holds it. Recovery and collection
-//!   both take it out of a journal whose record says privacy mode is on, whatever the daemon's
-//!   privacy mode says now.
+//!   second transaction, or by an enabling that stopped before its removal, can still hold it.
+//!   Recovery and collection both take it out of a journal whose record says privacy mode is on,
+//!   whatever the daemon's privacy mode says now, and a read of a receipt serves no result from
+//!   such a journal before they have.
 //! * **A worker crash closes the session, and what it still owned is stopped first.** The closure
 //!   is recorded and nothing is rebuilt from terminal history. Taking ownership removes the
 //!   worker's published endpoint and descriptor; [`ArchiveService::fence_owned`] then stops what
@@ -832,12 +833,13 @@ impl ArchiveService {
     /// confident empty one.
     ///
     /// A journal whose own privacy record says privacy mode is on has the content of its settled
-    /// receipts taken out as well, which is what a worker that stopped between committing a
-    /// settlement and removing its content under an earlier release left behind.
+    /// receipts taken out as well: a release that removed it in a second transaction, or an
+    /// enabling that stopped before its removal, can leave it there.
     ///
     /// # Errors
     ///
-    /// Returns the store's refusal when the journal is there and cannot be recovered.
+    /// Returns the store's refusal when the journal is there and cannot be recovered, or when the
+    /// content it records as withheld cannot be taken out.
     pub fn recover_journal(&self, ownership: &RecoveryOwnership) -> Result<Recovered> {
         let path = self.paths.journal_database(ownership.session_id);
         if !path.exists() {
@@ -848,8 +850,12 @@ impl ArchiveService {
         // store that would read as a session which kept nothing.
         let mut journal = Journal::open_existing(&path)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-        recover_open(&mut journal)
-            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+        let recovered = recover_open(&mut journal)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        journal
+            .redact_if_private()
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        Ok(recovered)
     }
 
     /// Applies section 20's retention to a session with no worker, under recovery ownership.
@@ -931,6 +937,12 @@ impl ArchiveService {
                 into.receipts_left_behind = Some(error.to_string());
                 return;
             }
+        }
+        // Content the journal's own record withholds is taken out wherever the pass reaches it.
+        // A refusal is reported and the pass goes on: the receipts' ending is already settled, so
+        // the prune below has what it needs, and the next pass tries the removal again.
+        if let Err(error) = journal.redact_if_private() {
+            into.receipts_left_behind = Some(error.to_string());
         }
         if into.age_permitted {
             match journal.prune(now_ms) {
@@ -1433,9 +1445,20 @@ impl ArchiveService {
             .ok_or_else(|| {
                 ControllerError::InvalidArgument(format!("no receipt for action {action_id}"))
             })?;
-        let retained = journal
-            .read_result(actor_id, action_id)
-            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        // A journal whose own record says privacy mode is on holds no result its reader may be
+        // shown, whatever the daemon's privacy mode says now: what it still holds is a remnant the
+        // next recovery or collection takes out, and it is not served in the meantime.
+        let withheld = journal
+            .read_privacy()
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?
+            .is_some_and(|record| record.enabled);
+        let retained = if withheld {
+            None
+        } else {
+            journal
+                .read_result(actor_id, action_id)
+                .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?
+        };
         Ok((receipt, retained))
     }
 
@@ -1639,20 +1662,16 @@ fn record_privacy_state(
     journal.record_privacy(privacy.generation.get(), privacy.private, kr_ipc::now_ms())
 }
 
-/// Runs section 9's two recovery rules over a journal the archive has open under ownership, and
-/// then the content policy the journal's own privacy record states.
+/// Runs section 9's two recovery rules over a journal the archive has open under ownership.
 ///
 /// A dispatch marker with no authoritative outcome becomes `unknown` and is never dispatched
 /// again; an accepted intent with no marker is rejected, because the freshness it was admitted
 /// under cannot be revalidated after the process that issued it has gone. Both commit without
-/// content where the record says privacy mode is on. The content a receipt still carries beyond
-/// that, which a release that removed it in a second transaction can leave behind, is taken out of
-/// every settled receipt of a journal whose record says privacy mode is on.
+/// content where the journal's own record says privacy mode is on.
 fn recover_open(journal: &mut Journal) -> std::result::Result<Recovered, kr_worker::WorkerError> {
     let now = kr_ipc::now_ms();
     let unknown = journal.resolve_unfinished_dispatches(now)?;
     let rejected = journal.reject_unrevalidated_intents(now)?;
-    journal.redact_if_private()?;
     Ok(Recovered {
         left_unknown: unknown as u64,
         rejected: rejected as u64,

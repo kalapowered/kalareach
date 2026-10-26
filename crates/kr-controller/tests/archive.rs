@@ -276,13 +276,13 @@ fn journal_with_a_settled_receipt_holding_content(
         .expect("records the privacy state");
 }
 
-/// KR-REQ-24.27: the archive's recovery and its collection take the content out of a journal whose
-/// own privacy record says privacy mode is on, with no obligation standing and whatever the
-/// daemon's privacy mode says now, and keep the receipt's metadata. The control is a journal whose
-/// record says privacy mode is off, which holds what it holds: content kept while privacy mode was
-/// off is the owner's.
+/// KR-REQ-24.27: a journal whose own privacy record says privacy mode is on serves no result, and
+/// the archive's recovery and its collection take the content out of it, with no obligation
+/// standing and whatever the daemon's privacy mode says now. The receipt's metadata is kept. The
+/// control is a journal whose record says privacy mode is off, which keeps what it holds: content
+/// kept while privacy mode was off is the owner's.
 #[test]
-fn recovery_and_collection_take_the_content_a_journal_that_records_privacy_mode_still_holds() {
+fn a_journal_that_records_privacy_mode_serves_no_result_and_recovery_and_collection_take_it_out() {
     let actor = ActorId::new("test:archive").expect("an actor");
     let action = kr_worker::journal::action_id_from([1; 16]);
     for entry in ["recovery", "collection"] {
@@ -296,9 +296,20 @@ fn recovery_and_collection_take_the_content_a_journal_that_records_privacy_mode_
                 .receipt(session_id, &actor, action, true)
                 .expect("reads the receipt")
         };
+        let envelope_on_disk = |session_id| {
+            Journal::open_read_only(archive.paths().journal_database(session_id))
+                .expect("reads")
+                .read_intent(&actor, action)
+                .expect("reads")
+                .is_some()
+        };
         assert!(
-            read(private).result.0.is_some(),
-            "{entry}: the control: the remnant is served as it stands"
+            envelope_on_disk(private),
+            "{entry}: the remnant is on the disk before the pass"
+        );
+        assert!(
+            read(private).result.0.is_none(),
+            "{entry}: and is not served before the pass has reached it"
         );
 
         for session_id in [private, public] {
@@ -319,18 +330,14 @@ fn recovery_and_collection_take_the_content_a_journal_that_records_privacy_mode_
             "{entry}: the metadata is kept"
         );
         assert!(taken.result.0.is_none(), "{entry}: the result is gone");
-        let journal =
-            Journal::open_read_only(archive.paths().journal_database(private)).expect("reads");
-        assert!(
-            journal
-                .read_intent(&actor, action)
-                .expect("reads")
-                .is_none(),
-            "{entry}: the envelope is gone"
-        );
+        assert!(!envelope_on_disk(private), "{entry}: the envelope is gone");
         assert!(
             read(public).result.0.is_some(),
             "{entry}: a journal that records privacy mode as off keeps what it holds"
+        );
+        assert!(
+            envelope_on_disk(public),
+            "{entry}: and its envelope, which is not served"
         );
     }
 }

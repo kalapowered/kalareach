@@ -4847,9 +4847,10 @@ transaction that settles it. That transaction reads the journal's own privacy re
 record says privacy mode is on, a receipt that settles or is rejected is committed without its
 result and its envelope, so a crash after the commit leaves nothing to remove. A journal written by
 an earlier release can still hold content under such a record, if that release stopped between the
-commit and the removal. The archive takes that content out when it recovers or collects the
-session, whether or not the session still owes cleanup and whatever the daemon's privacy mode says
-by then.
+commit and the removal, or if an enabling stopped before it removed what had already settled. The
+archive takes that content out when it recovers or collects the session, whether or not the session
+still owes cleanup and whatever the daemon's privacy mode says by then, and it serves no result from
+a journal with such a record before then.
 
 Privacy mode does not reach two stores. The canonical grid keeps its own scrollback, which a client
 can still page through, and the worker keeps a bounded log of the semantic entries that a bound
