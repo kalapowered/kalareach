@@ -53,11 +53,13 @@ export interface LaunchSurfaceReads {
 /**
  * Reads with `read` while the caller is shown. An answer belongs to the `read` that asked, which is
  * a view's own: an answer to an earlier view of the same session is never shown under a new one. A
- * null `read` reads nothing, since the view it would read on is not open yet.
+ * null `read` reads nothing, since the view it would read on is not open yet. `retried` counts the
+ * person's "Try again", which starts the watch over.
  */
 export function useLaunchSurface(
   port: HostPort,
   read: (() => Promise<LaunchSurfaceReading>) | null,
+  retried: number,
   cadenceMs = LAUNCH_SURFACE_CADENCE_MS
 ): LaunchSurfaceReads {
   const [held, setHeld] = useState<{
@@ -104,7 +106,7 @@ export function useLaunchSurface(
       watched.stop()
       again.current = () => undefined
     }
-  }, [port, read, cadenceMs])
+  }, [port, read, retried, cadenceMs])
 
   const refresh = useCallback(() => {
     again.current()

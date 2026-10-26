@@ -149,11 +149,14 @@ function text(value: unknown): string {
 export function Conversation({
   sessionId,
   subject,
-  connected
+  connected,
+  retried
 }: {
   readonly sessionId: string
   readonly subject: SessionSubject
   readonly connected: boolean
+  /** How many times the person has asked the session to try again. */
+  readonly retried: number
 }): ReactNode {
   const { port, say, drafts: book, paths, receiptReads } = useApp()
   const { rights, paired } = useHeldConnection()
@@ -912,7 +915,7 @@ export function Conversation({
       <QuestionRequests sessionId={sessionId} onAnswered={refresh} />
       <KeptAnswers sessionId={sessionId} />
 
-      <SessionLaunchSurface sessionId={sessionId} connected={connected} />
+      <SessionLaunchSurface sessionId={sessionId} connected={connected} retried={retried} />
 
       {draftsProblem === null ? null : (
         <p className="banner warning" data-testid="drafts-not-kept">
@@ -1431,15 +1434,17 @@ function ControlButton({
  */
 function SessionLaunchSurface({
   sessionId,
-  connected
+  connected,
+  retried
 }: {
   readonly sessionId: string
   readonly connected: boolean
+  readonly retried: number
 }): ReactNode {
   const { port } = useApp()
   const { rights } = useHeldConnection()
   const read = useCallback(() => port.launchSurface({ session_id: sessionId }), [port, sessionId])
-  const reads = useLaunchSurface(port, read)
+  const reads = useLaunchSurface(port, read, retried)
   return (
     <LaunchSurface
       reads={reads}

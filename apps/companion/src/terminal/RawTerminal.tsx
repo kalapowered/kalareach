@@ -268,10 +268,13 @@ function Grid({
 /** The raw view of one session. */
 export function RawTerminal({
   sessionId,
+  retried,
   onLeave,
   onFrame
 }: {
   readonly sessionId: string
+  /** How many times the person has asked the session's screen to try again. */
+  readonly retried: number
   readonly onLeave: () => void
   /** Told each screen the view draws, as a recording keeps it. */
   readonly onFrame?: (screen: TerminalScreen) => void
@@ -336,7 +339,7 @@ export function RawTerminal({
   // holds the session's input once the person takes control, so it is the one whose answer can
   // light a button.
   const { rights } = useHeldConnection()
-  const launchReads = useLaunchSurface(port, launch?.read ?? null)
+  const launchReads = useLaunchSurface(port, launch?.read ?? null, retried)
   // Taking control or giving it back changes who holds the input, which the surface says: it is
   // read again at once rather than a cadence later.
   const controlState = control?.state ?? null
