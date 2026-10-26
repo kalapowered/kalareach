@@ -703,6 +703,7 @@ jobs:
       # The update suite assembles releases from the programs built beside it, the description
       # process among them, and fails and says so when one is missing.
       - name: Build the description process the update suite assembles into releases
+        if: ${{ matrix.part == 'first' }}
         run: cargo build --locked -p kr-describe-model --bin kr-describe-inference
 
       # kr-cli's suites include the first-owner pairing tests in `crates/kr-cli/tests/pair_windows.rs`,
