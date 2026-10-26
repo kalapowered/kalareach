@@ -2594,34 +2594,6 @@ async fn start_daemon_on(
     .await
 }
 
-/// Runs the continuous clock past the end of an anchor that lasts `lasts_ms`, while UTC, which read
-/// the same as the continuous clock when the anchor was set, stops `short_ms` before that end.
-///
-/// The clocks move together in steps of a second, UTC first, so a reading of UTC that a task of the
-/// daemon takes between two moves finds it at most a step from where the continuous clock says it
-/// should be, and in the last stretch `short_ms` from it. The host distrusts a wall clock more than
-/// a few seconds behind the continuous clock and keeps that on record, so a daemon's reading that
-/// came after the continuous clock alone had run ahead would decide the next boot's answer.
-fn run_past_an_anchor_with_utc_short_of_its_end(
-    continuous: &kr_transport::clock::ManualClock,
-    wall: &std::sync::atomic::AtomicU64,
-    lasts_ms: u64,
-    short_ms: u64,
-) {
-    use std::sync::atomic::Ordering;
-
-    const STEP_MS: u64 = 1_000;
-    let utc_runs = lasts_ms - short_ms;
-    let mut moved = 0;
-    while moved < utc_runs {
-        let step = STEP_MS.min(utc_runs - moved);
-        wall.fetch_add(step, Ordering::SeqCst);
-        continuous.advance(Duration::from_millis(step));
-        moved += step;
-    }
-    continuous.advance(Duration::from_millis(short_ms + 1));
-}
-
 /// Starts a daemon over `temp` on the clocks the test gives it, in the boot `boot`.
 async fn start_daemon_in_boot(
     temp: &kr_ipc::testing::TempHost,
@@ -2991,10 +2963,11 @@ async fn an_expiring_grant_this_boot_never_anchored_is_refused_under_a_distruste
 /// it was, finds nothing on record against the grant and transfers it, which contradicts no answer
 /// this host gave.
 ///
-/// Both clocks run to the end of the anchor together, UTC stopping two seconds short of the grant's
-/// expiry. The daemon reads UTC in tasks of its own, and a reading that found UTC further behind the
-/// continuous clock than the host allows would record a clock that went backwards, for the next
-/// boot to meet, whenever such a task read after the continuous clock ran ahead.
+/// Both clocks move to the end of the anchor at once, with no reading of the clocks by the daemon
+/// between its two readings, and UTC stops two seconds short of the grant's expiry. The daemon reads
+/// the clocks in tasks of its own, and a reading that paired the continuous clock as it was with
+/// UTC as it is, or UTC only as it was with the continuous clock as it is, would record a clock
+/// that went backwards, for the next boot to meet.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_end_whose_tombstone_could_not_be_written_is_not_answered_as_an_expiry() {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -3045,12 +3018,10 @@ async fn an_end_whose_tombstone_could_not_be_written_is_not_answered_as_an_expir
     let GrantExpiry::At { expires_at_ms } = held.expiry else {
         panic!("an invitation expires");
     };
-    run_past_an_anchor_with_utc_short_of_its_end(
-        &continuous,
-        &wall,
-        expires_at_ms.get() - now,
-        2_000,
-    );
+    kr_controller::testing::while_no_reader_of_the_clocks_reads(&controller, || {
+        wall.store(expires_at_ms.get() - 2_000, Ordering::SeqCst);
+        continuous.advance(Duration::from_millis(expires_at_ms.get() - now + 1));
+    });
     let first = transfer_to_another(&controller, &held, grant_id(9)).await;
 
     // A new boot: the store recovers, and the wall clock is where it was.
