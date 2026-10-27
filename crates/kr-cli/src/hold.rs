@@ -46,7 +46,12 @@ pub async fn for_a_key() {
         return;
     }
     {
+        // What is written goes to the console's output handle on Windows: its input handle is the
+        // one a key is read from, and cannot be written to.
+        #[cfg(unix)]
         let mut screen = terminal.handle();
+        #[cfg(not(unix))]
+        let mut screen = terminal.output();
         if screen.write_all(HOLD_LINE.as_bytes()).is_err() || screen.flush().is_err() {
             return;
         }
