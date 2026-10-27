@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use super::words;
-use super::{ProfileError, ProfileHome};
+use super::{ProfileError, ProfileHome, ProfileTerminal};
 
 /// The file name of the profile.
 const FILE_NAME: &str = "KalaReach.profile";
@@ -68,10 +68,21 @@ fn kconfig_value(value: &str) -> String {
 }
 
 /// Whether Konsole's default profile is `KalaReach`.
-#[must_use]
-pub(super) fn is_default(home: &ProfileHome) -> bool {
+///
+/// # Errors
+///
+/// Returns [`ProfileError::DefaultUnknown`] when `konsolerc` is there and does not read: that is
+/// not an answer that this profile is not the default.
+pub(super) fn is_default(home: &ProfileHome) -> Result<bool, ProfileError> {
     let settings = home.config_home.join("konsolerc");
-    default_in(&std::fs::read_to_string(settings).unwrap_or_default())
+    match std::fs::read_to_string(&settings) {
+        Ok(text) => Ok(default_in(&text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(ProfileError::DefaultUnknown {
+            terminal: ProfileTerminal::Konsole,
+            place: settings,
+        }),
+    }
 }
 
 /// The default profile a `konsolerc` text names, compared with this profile's file name.

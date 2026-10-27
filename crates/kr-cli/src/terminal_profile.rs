@@ -678,8 +678,14 @@ fn remove_profiles(
                 match result {
                     Ok(report) => report.json(document),
                     Err(error) => {
-                        failed.get_or_insert_with(|| failure(error, home));
-                        document.with("result", "failed")
+                        let error = failure(error, home);
+                        let document = document
+                            .with("result", "failed")
+                            .with("code", output::said(&error.code()))
+                            .with("message", error.machine_message())
+                            .with("exit_code", error.exit_code());
+                        failed.get_or_insert(error);
+                        document
                     }
                 }
             })
@@ -730,6 +736,11 @@ impl RemovalReport {
         let name = Shown::said(terminal.name());
         match self {
             Self::Would(status) => match (status.standing, status.default) {
+                _ if !status.default_known => shown!(
+                    "{}: whether the profile is the application's default could not be read; a \
+                     removal would stop and keep the record",
+                    name
+                ),
                 (_, true) => shown!(
                     "{}: would leave the profile, which is the application's default",
                     name
@@ -907,8 +918,9 @@ fn failure(error: &ProfileError, home: &ProfileHome) -> CliError {
             Shown::said(terminal.name())
         )),
         ProfileError::SchemaAbsent(terminal) => CliError::Usage(shown!(
-            "{}'s settings schema is not installed, so there is no profile to write; nothing was \
-             written",
+            "{}'s settings schema is not installed, so its profiles cannot be read or written, and \
+             what was recorded is kept; install the application again to run this, or take the \
+             profile's settings out of the settings database by hand",
             Shown::said(terminal.name())
         )),
         ProfileError::NoDefaultProfile(terminal) => CliError::Usage(shown!(
@@ -929,8 +941,9 @@ fn failure(error: &ProfileError, home: &ProfileHome) -> CliError {
             Shown::said(terminal.name())
         )),
         ProfileError::ListBusy(terminal) => CliError::Other(shown!(
-            "{}'s list of profiles changed each time kr tried to write it; nothing was changed, and \
-             running this again tries again",
+            "{}'s list of profiles changed each time kr tried to write it, so whether the profile is \
+             in it is not known: kr host terminal-profile status says, and running this again \
+             tries again",
             Shown::said(terminal.name())
         )),
         ProfileError::Io { place, source } => {

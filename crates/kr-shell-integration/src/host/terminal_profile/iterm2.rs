@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use super::words;
-use super::{PROFILE_NAME, ProfileHome};
+use super::{PROFILE_NAME, ProfileError, ProfileHome, ProfileTerminal};
 
 /// The file name of the profile.
 const FILE_NAME: &str = "KalaReach.json";
@@ -70,10 +70,18 @@ pub(super) fn profile_text(command: &[String], guid: &str) -> String {
 }
 
 /// Whether iTerm2's default profile is this one: its preference names the profile's identifier.
-#[must_use]
-pub(super) fn is_default(home: &ProfileHome, guid: &str) -> bool {
+///
+/// # Errors
+///
+/// Returns [`ProfileError::DefaultUnknown`] when the preference cannot be read: that is not an
+/// answer that this profile is not the default.
+pub(super) fn is_default(home: &ProfileHome, guid: &str) -> Result<bool, ProfileError> {
     super::preferences::read_string(&home.iterm_preferences, "Default Bookmark Guid")
-        .is_some_and(|default| default == guid)
+        .map(|default| default.is_some_and(|default| default == guid))
+        .map_err(|_| ProfileError::DefaultUnknown {
+            terminal: ProfileTerminal::Iterm2,
+            place: PathBuf::from(&home.iterm_preferences),
+        })
 }
 
 /// The directory a removal stages a file in: the folder above the one iTerm2 watches.

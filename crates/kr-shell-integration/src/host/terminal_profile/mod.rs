@@ -575,7 +575,10 @@ fn plan_file(
     let (replace, made): (Option<String>, Vec<PathBuf>) =
         match (earlier, files::presence(destination)) {
             // Nothing the record names is there, and something is: it is not kr's.
-            (None, files::Presence::File(_) | files::Presence::Other) => {
+            (
+                None,
+                files::Presence::File(_) | files::Presence::Unreadable(_) | files::Presence::Other,
+            ) => {
                 return Err(ProfileError::Foreign { place });
             }
             (None, files::Presence::Missing) => {
@@ -593,7 +596,9 @@ fn plan_file(
                     files::Presence::File(sha) if sha == earlier.sha256 => {
                         (Some(sha), earlier.made_directories()?)
                     }
-                    files::Presence::File(_) | files::Presence::Other => {
+                    files::Presence::File(_)
+                    | files::Presence::Unreadable(_)
+                    | files::Presence::Other => {
                         return Err(ProfileError::Changed { place });
                     }
                     // Gone since: written again, and the directories it needed are made again.
@@ -631,11 +636,18 @@ fn parent_of(path: &Path) -> PathBuf {
 /// Returns the failure of the record or of the write.
 pub fn install(held: &HeldProfiles<'_>, plan: &Plan) -> Result<(), ProfileError> {
     let before = held.profile(plan.terminal)?;
-    held.put(RecordedProfile {
+    let recorded = |wrote: Wrote| RecordedProfile {
         terminal: plan.terminal,
         command: plan.command.clone(),
-        wrote: plan.wrote.clone(),
-    })?;
+        wrote,
+    };
+    // While a profile is written over one kr wrote before, it may hold either: the record says so,
+    // and says it of the new write only until the write is known to hold.
+    let while_written = match &before {
+        Some(profile) => plan.wrote.clone().over(&profile.wrote),
+        None => plan.wrote.clone(),
+    };
+    held.put(recorded(while_written.clone()))?;
     if let Err((error, left_over)) = write(plan) {
         // What the write could not take back stays recorded, so that a removal can finish the job.
         if !left_over {
@@ -645,6 +657,9 @@ pub fn install(held: &HeldProfiles<'_>, plan: &Plan) -> Result<(), ProfileError>
             }
         }
         return Err(error);
+    }
+    if while_written != plan.wrote {
+        held.put(recorded(plan.wrote.clone()))?;
     }
     Ok(())
 }
@@ -704,6 +719,9 @@ pub struct Status {
     pub foreign: bool,
     /// Whether the recorded profile is the emulator's default.
     pub default: bool,
+    /// Whether it could be read whether it is: where it could not, `default` is false and a
+    /// removal would stop.
+    pub default_known: bool,
 }
 
 /// Reads the state of `terminal`'s profile. It writes nothing and holds nothing.
@@ -721,9 +739,11 @@ pub fn status(
                 is_present(terminal, home) && gsettings::foreign(&home.settings, spec)
             })
             || (terminal == ProfileTerminal::AppleTerminal && apple::foreign(home)));
-    let default = recorded
+    let default_read = recorded
         .as_ref()
-        .is_some_and(|profile| is_default(terminal, home, profile).unwrap_or(false));
+        .map(|profile| is_default(terminal, home, profile));
+    let default = matches!(default_read, Some(Ok(true)));
+    let default_known = !matches!(default_read, Some(Err(_)));
     Status {
         terminal,
         present: is_present(terminal, home),
@@ -731,6 +751,7 @@ pub fn status(
         standing,
         foreign,
         default,
+        default_known,
     }
 }
 
@@ -740,6 +761,7 @@ fn standing(profile: &RecordedProfile, home: &ProfileHome) -> Standing {
         Wrote::File(wrote) => match wrote.file().map(|file| files::presence(&file)) {
             Ok(files::Presence::Missing) => Standing::Missing,
             Ok(files::Presence::File(sha)) if sha == wrote.sha256 => Standing::Matches,
+            Ok(files::Presence::Unreadable(_)) => Standing::Unreadable,
             _ => Standing::Changed,
         },
         Wrote::Settings(wrote) => settings_spec(profile.terminal).map_or(
@@ -783,16 +805,19 @@ fn is_default(
     profile: &RecordedProfile,
 ) -> Result<bool, ProfileError> {
     match terminal {
-        ProfileTerminal::Konsole => Ok(konsole::is_default(home)),
-        ProfileTerminal::Iterm2 => Ok(match &profile.wrote {
-            Wrote::File(wrote) => wrote
-                .file()
-                .ok()
-                .and_then(|file| std::fs::read_to_string(file).ok())
-                .and_then(|text| iterm2::guid_in(&text))
-                .is_some_and(|guid| iterm2::is_default(home, &guid)),
-            _ => false,
-        }),
+        ProfileTerminal::Konsole => konsole::is_default(home),
+        ProfileTerminal::Iterm2 => match &profile.wrote {
+            Wrote::File(wrote) => {
+                let file = wrote.file()?;
+                match std::fs::read_to_string(&file) {
+                    Ok(text) => iterm2::guid_in(&text)
+                        .map_or(Ok(false), |guid| iterm2::is_default(home, &guid)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                    Err(error) => Err(ProfileError::io(&file, error)),
+                }
+            }
+            _ => Ok(false),
+        },
         ProfileTerminal::WindowsTerminal => windows_terminal::is_default(home),
         ProfileTerminal::GnomeTerminal | ProfileTerminal::Ptyxis => match &profile.wrote {
             Wrote::Settings(wrote) => {
@@ -885,22 +910,14 @@ pub fn remove(
                 },
             }
         }
-        Wrote::Preferences(wrote) => {
-            let reading = apple::reading(&wrote.domain, wrote)?;
-            if reading != apple::Reading::Missing && is_default(terminal, home, &profile)? {
-                return Ok(Removed::Default);
-            }
-            match reading {
-                apple::Reading::Missing => Removed::AlreadyGone,
-                apple::Reading::Matches => {
-                    apple::take_out(&wrote.domain)?;
-                    Removed::Removed
-                }
-                apple::Reading::Changed => Removed::Changed {
-                    left_at: format!("{}.{}", wrote.key, wrote.entry),
-                },
-            }
-        }
+        Wrote::Preferences(wrote) => match apple::take_out(&wrote.domain, wrote)? {
+            apple::TakenOut::Default => return Ok(Removed::Default),
+            apple::TakenOut::Removed => Removed::Removed,
+            apple::TakenOut::AlreadyGone => Removed::AlreadyGone,
+            apple::TakenOut::Changed => Removed::Changed {
+                left_at: format!("{}.{}", wrote.key, wrote.entry),
+            },
+        },
     };
     held.forget(terminal)?;
     Ok(removed)
