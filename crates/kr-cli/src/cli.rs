@@ -1878,8 +1878,13 @@ pub struct NewArguments {
     /// The failure is printed as it always is, then the command waits for one key before it exits
     /// with the failure's status, so a window opened for this command alone (a terminal profile's)
     /// shows the error rather than closing on it. It waits only when standard input and standard
-    /// output are terminals and the output is not `--json`. A session that ends because its shell
-    /// exited, with any status, is not a failure to hold for.
+    /// output are terminals and the output is not `--json`.
+    ///
+    /// It holds on every ending except its shell's own exit (with any status), a close on request
+    /// and a detach. So it holds when the session could not be created or attached, when a signal
+    /// ended the shell, when the shell never started, when the worker went, when the desktop login
+    /// ended or the host shut down, when the connection to the session ended, when another
+    /// attachment took the input lease, and when input may not have reached the session.
     #[arg(long)]
     pub hold_on_failure: bool,
 }
