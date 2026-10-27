@@ -1244,8 +1244,9 @@ impl Store {
 
 #[cfg(unix)]
 impl Store {
-    /// Makes `release` current: one new link, renamed over `current`, and the store's directory
-    /// flushed so the rename survives a crash. Nothing else changes.
+    /// Makes `release` current: one new link put in the place of `current`, and the store's
+    /// directory flushed so the change survives a crash. Nothing else changes. A link that an
+    /// earlier switch left beside `current` by a crash is taken away first.
     ///
     /// `update` is the update lock, so what `current` names stays what an install or an update
     /// found it to be for as long as that holds it. `install` is the install lock, taken
@@ -1273,14 +1274,64 @@ impl Store {
                 reason: "is not a release of this store",
             });
         }
+        if let Ok(entries) = std::fs::read_dir(&self.root) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(&format!(".{CURRENT}-")))
+                    && entry.file_type().is_ok_and(|kind| kind.is_symlink())
+                {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
         let temporary = self.root.join(format!(".{CURRENT}-{}", crate::new_uuid()));
         std::os::unix::fs::symlink(Path::new(VERSIONS).join(release.as_str()), &temporary)
             .map_err(|error| InstallError::io("make the link", &temporary, error))?;
-        if let Err(error) = std::fs::rename(&temporary, self.current_link()) {
+        if let Err(error) = self.put_in_place_of_current(&temporary) {
             let _ = std::fs::remove_file(&temporary);
             return Err(InstallError::io("rename", self.current_link(), error));
         }
         sync_directory(&self.root)
+    }
+
+    /// Puts the link at `temporary` in the place of `current`, by one rename.
+    #[cfg(not(target_os = "macos"))]
+    fn put_in_place_of_current(&self, temporary: &Path) -> std::io::Result<()> {
+        std::fs::rename(temporary, self.current_link())
+    }
+
+    /// Puts the link at `temporary` in the place of `current`, by exchanging the two names when
+    /// `current` exists and by one rename when it does not.
+    ///
+    /// A rename over a name that holds a link is not one step on APFS: a reader that resolves the
+    /// name while it is replaced sometimes finds no link there (`readlink` fails with `EINVAL`, and
+    /// the program through it is missing). Three readers that read `current` while a loop renamed a
+    /// fresh link over it 2,000 times failed 1% of their reads (361 of 39,740 on one volume, 341 of
+    /// 32,138 on another), and the same loop exchanging the names with `RENAME_SWAP` failed none of
+    /// 54,498, 43,629 and 49,408. The exchange leaves the old link at `temporary`, which is removed
+    /// afterwards; a crash between the two leaves that link, and the next switch takes it away. A
+    /// file system that cannot exchange names gets the rename, as it did before.
+    #[cfg(target_os = "macos")]
+    fn put_in_place_of_current(&self, temporary: &Path) -> std::io::Result<()> {
+        use rustix::fs::{CWD, RenameFlags, renameat_with};
+        use rustix::io::Errno;
+
+        match renameat_with(
+            CWD,
+            temporary,
+            CWD,
+            self.current_link(),
+            RenameFlags::EXCHANGE,
+        ) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(temporary);
+                Ok(())
+            }
+            Err(Errno::NOENT | Errno::NOTSUP) => std::fs::rename(temporary, self.current_link()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Whether a running process holds `release`.
@@ -2982,6 +3033,41 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().starts_with('.'))
             .collect();
         assert!(leftovers.is_empty(), "no temporary link is left behind");
+    }
+
+    /// A link that a crash left beside `current` names no release `current` could take, and the next
+    /// switch takes it away.
+    #[test]
+    fn a_link_a_crashed_switch_left_beside_current_is_taken_away_by_the_next_switch() {
+        let test = test_store();
+        let one = release("0.1.0+aaaaaaaaaaaa");
+        install(&test.store, &one);
+        let update = test
+            .store
+            .try_lock_update()
+            .expect("locks")
+            .expect("nothing else updates");
+        let held = test
+            .store
+            .try_lock_install()
+            .expect("locks")
+            .expect("nothing starts a daemon");
+        let writers = test
+            .store
+            .try_lock_writers()
+            .expect("locks")
+            .expect("no command is writing");
+        let left = test.store.root().join(".current-left-by-a-crash");
+        std::os::unix::fs::symlink(Path::new(VERSIONS).join(one.as_str()), &left)
+            .expect("a link a crash left");
+        test.store
+            .switch(&one, &update, &held, &writers)
+            .expect("switches");
+        assert!(
+            std::fs::symlink_metadata(&left).is_err(),
+            "the leftover link is gone"
+        );
+        assert_eq!(test.store.current().expect("reads"), Some(one));
     }
 
     /// One update at a time: the update lock is refused while another holds it.

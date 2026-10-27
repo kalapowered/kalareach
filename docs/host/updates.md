@@ -194,9 +194,10 @@ Only the current release's `kr` updates the host. An update, in order:
    and the run then starts again what it stopped and exits with 1. A worker at a level the new
    release does not retain, a worker that does not answer its challenge and has not ended, and a
    session still being started each hold the update;
-6. switches `current` in one rename, records the switch, lets go of the locks, starts each daemon as
-   it was started before, now from the new release, and waits for each to answer as a daemon of it
-   (for a daemon of another public major than the `kr`'s, see below);
+6. switches `current` in one step (a rename, and on macOS an exchange of the new link with
+   `current`), records the switch, lets go of the locks, starts each daemon as it was started
+   before, now from the new release, and waits for each to answer as a daemon of it (for a daemon
+   of another public major than the `kr`'s, see below);
 7. removes the releases nothing needs: not the current one, not the previous one, not one staged
    for a later update, and not one a running program holds.
 
