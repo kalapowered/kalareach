@@ -661,7 +661,9 @@ A terminal profile is a profile named `KalaReach` in one terminal application's 
 profiles. Its command is `<kr> new --attach --hold-on-failure`, so each window or tab opened through
 it creates a session and attaches to it, and each has a session of its own. `<kr>` is the `kr` that
 ran `install`, named through the store's `current` link when it belongs to a release of one, so an
-update leaves the profile pointing at the release that is current.
+update leaves the profile pointing at the release that is current. A release from before the
+profile ignores the record and refuses `--hold-on-failure` as a usage error, so every window opened
+through a profile closes at once with that message: run `remove` before going back to one.
 
 The profile is an offer. The application's other profiles and its default stay as they were, and the
 profile is not made the default: the person chooses it in the application's menus, and the install
@@ -674,42 +676,57 @@ The profile is separate from the other offers. `install` writes no shell startup
 definition and no login item, and `kr shell install`, `kr host startup` and the desktop installer's
 login item write no profile. A window opened through the profile creates a session only if the host
 can start one: a managed session needs the startup entry of its shell, and `kr new` needs a control
-daemon running or a way to start one.
+daemon running or a way to start one. The command carries no `KR_STATE_DIR` or `KR_RUNTIME_DIR`, so
+a window the application opens uses the default roots. `install` says so when either is set in its
+own environment, and a later `remove` finds the record only with the same variable set.
 
 | Identifier | Application | On | What `install` writes |
 | --- | --- | --- | --- |
 | `iterm2` | iTerm2 | macOS | `KalaReach.json` in iTerm2's `DynamicProfiles` folder, which iTerm2 reloads while it runs |
-| `apple-terminal` | Terminal | macOS | a `KalaReach` entry in the `Window Settings` of Terminal's preferences, copied from the profile the person has chosen as Terminal's default |
+| `apple-terminal` | Terminal | macOS | a `KalaReach` entry in the `Window Settings` of Terminal's preferences, copied, fonts and colours included, from the profile the person has chosen as Terminal's default |
 | `gnome-terminal` | GNOME Terminal | Linux | the keys of one profile under `/org/gnome/terminal/legacy/profiles:/`, and its identifier in the shared `list` |
 | `ptyxis` | Ptyxis | Linux | the keys of one profile under `/org/gnome/Ptyxis/Profiles/`, and its identifier in the shared `profile-uuids` |
 | `konsole` | Konsole | Linux | `KalaReach.profile` in the `konsole` folder of the user's data directory |
-| `windows-terminal` | Windows Terminal | Windows | `kalareach.json` in a `KalaReach` folder inside Windows Terminal's `Fragments` folder |
+| `windows-terminal` | Windows Terminal | Windows | `kalareach.json` in a `KalaReach` folder inside Windows Terminal's `Fragments` folder, with a profile identifier of its own |
 
 `install` takes the identifiers of the platform it runs on and an application that is installed. A
-dry run shows what would be written and writes nothing.
+dry run shows what would be written and writes nothing. An application installed as a Flatpak or a
+Snap keeps its profiles elsewhere and is not found.
 
 Ptyxis 50 starts a profile's command through `systemd-run --user --scope` when `systemd-run` is
 installed. Where no user systemd session answers, such as a session bus of its own with no systemd
-behind it, Ptyxis does not run the command, whatever the profile holds.
+behind it, Ptyxis does not run the command, whatever the profile holds. A tab is opened through the
+profile with `ptyxis --tab-with-profile=<identifier>`, the identifier being the last part of the
+path `status` prints.
 
 `status` writes nothing. For each application of the platform it says whether the application is
-installed and what state its profile is in: `none` (no profile written), `matches` (written and
-unchanged), `changed` (altered after `kr` wrote it), `missing` (the profile `kr` wrote is gone),
-`default` (the profile `kr` wrote is the application's default) or `foreign` (a profile named `KalaReach` that `kr` did not
-write, left alone). It names the applications `kr` writes no profile for, each with its reason:
-xfce4-terminal and xterm have no profiles; Alacritty and kitty keep one configuration file with no
-list of profiles; Ghostty's configuration is a file of the person's own, and WezTerm's a script of
-the person's own; and VS Code's terminal profiles are the editor's settings. It ends with what a
-window opened through the profile needs, as far as that can be read without a daemon: whether the
-startup entry of the person's shell is installed, and how `kr new` starts the control daemon.
+installed and what state its profile is in:
+
+| State | Meaning |
+| --- | --- |
+| `none` | no profile written |
+| `matches` | written and unchanged |
+| `changed` | altered after `kr` wrote it |
+| `missing` | the profile `kr` wrote is gone |
+| `unlisted` | its settings are written, and it is not in the list the application reads its profiles from |
+| `unreadable` | the program that reads it, `gsettings`, `defaults` or `plutil`, did not answer |
+| `default` | the profile `kr` wrote is the application's default |
+| `foreign` | a profile named `KalaReach` that `kr` did not write, left alone |
+
+It names the applications `kr` writes no profile for, each with its reason: xfce4-terminal and xterm
+have no profiles; Alacritty and kitty keep one configuration file with no list of profiles;
+Ghostty's configuration is a file of the person's own, and WezTerm's a script of the person's own;
+and VS Code's terminal profiles are the editor's settings. It ends with what a window opened
+through the profile needs, as far as that can be read without a daemon: whether the startup entry
+of the person's shell is installed, and how `kr new` starts the control daemon.
 
 `install` refuses, and writes nothing, in these cases:
 
 - The application is not installed. The failure is `TERMINAL_UNAVAILABLE` (exit 7) and names what
   is installed.
 - A file or entry for `KalaReach` is at the profile's place and `kr` did not write it, or `kr`
-  wrote it and it has changed since. Remove it with `remove`, which leaves it as it is, or move it
-  aside.
+  wrote it and it was changed after. Move it aside or rename it: `remove` leaves a changed profile
+  as it is.
 - Konsole would expand a character of the command: it expands `$` and a leading `~` in a profile's
   command, so a `kr` at such a path cannot be named.
 - For GNOME Terminal and Ptyxis: `gsettings` or the application's schema is missing; the
@@ -721,38 +738,63 @@ startup entry of the person's shell is installed, and how `kr new` starts the co
   outside write does to them is not known. Quit it and run the command from another application
   or over SSH. Terminal's preferences must also hold a profile to copy.
 
-These are usage failures (exit 2). A failure of `gsettings`, of the record or of a file exits 1.
-`--dry-run` skips the check for a running Terminal.
+These are usage failures (exit 2). A failure of `gsettings`, `defaults` or `plutil`, of the record or
+of a file exits 1. `--dry-run` skips the check for a running Terminal.
+
+An install that fails after it began writes nothing that stays. For GNOME Terminal and Ptyxis the
+keys go back to what they were, which for an install again is the profile `kr` wrote before. For
+Terminal the preferences are read again by another process, and an entry that is not as written, or
+any other change in them, puts the whole preferences domain back as it was before the write. For a
+file, an install again over a profile the person saved to since the install was planned does not
+overwrite it: the person's file is put back and the install fails as a changed profile.
 
 `install` records what it will write in `terminal-profiles.json` in the installation's state
 directory before it writes anything: for a file its path and its SHA-256, for settings the keys and
-their values, for Terminal's preferences the entry in a canonical text form. `remove` works from
-that record and from nothing else, and takes out only what still matches it. A profile changed
-after `kr` wrote it is left as it is and named, and leaves the record. A profile that is already
-gone leaves the record. A profile that is the application's default is left, and stays in the
-record until another default is chosen. None of these is an error. `remove` without an application
-takes out every profile in the record, and `--dry-run` says what each would come to. A record of a
-later format, or one that cannot be read, is left as it is and named, and nothing is written.
-`install` and `remove` hold the writers' lock the update takes, and a release that reads the record
-at another version refuses them before anything is written.
+their values, for Terminal's preferences the entry as `plutil` writes it, with its keys in order, so
+that a font or colour kept as data is compared too. `remove` works from that record and from
+nothing else, and takes out only what still matches it. A profile changed after `kr` wrote it is
+left where it is, named in the output, and forgotten by the record; so is one that an install cut
+short left with only some of its settings, while it is in the application's list. A profile that
+is already gone is forgotten. A profile that is the application's default is left, and stays in the
+record until another default is chosen. None of these is an error. A profile that cannot be read
+is none of them: if `gsettings`, `defaults` or `plutil` does not answer, or a Windows Terminal
+settings file is there and does not read, so that it is not known whether the profile is the
+default, the removal fails and the record keeps the entry, and a removal run again finishes the
+job. A profile that is not in the application's list is out of the person's sight: `remove` takes
+its settings out, and `install` puts it back in the list.
+
+`remove` without an application takes out every profile in the record, and `--dry-run` says what
+each would come to. A record of a later format, or one that cannot be read, is left as it is and
+named, and nothing is written. `install` and `remove` hold the writers' lock the update takes, and a
+release that reads the record at another version refuses them before anything is written. A
+removal of Terminal's profile writes the dictionary of profiles without the entry, reads it back by
+another process, and puts the whole preferences domain back as it was if the result is not what it
+meant.
 
 GNOME Terminal's and Ptyxis's list of profiles is shared with the application's preferences window
 and with anything else that edits it, and the settings database has no compare-and-set. `kr` reads
 the list, reads it again just before writing, writes it, and reads it back with another process. A
 change in between, or an element missing afterwards, starts the write over, up to a bound; past it
-the install fails with nothing of the profile left. One interleaving remains: another writer landing
-between the last read and the write costs the profile its entry in the list and nothing more,
-because the profile's own keys are `kr`'s and stay.
+the install fails with nothing of the profile left. Two interleavings remain, and neither is
+detected. Another writer landing between the last read and the write is overwritten by it: a profile
+the person added in the preferences window at that moment leaves the list, or one they deleted
+comes back, though the profile's own settings stay. And a writer that read the list before `kr`
+wrote it and writes after `kr` read it back can overwrite the list: the profile then loses its
+entry in it (`status` says `unlisted`, and `install` puts it back), or, in a removal, its
+identifier returns to the list after its settings were reset.
 
-With `--json`, each subcommand prints one document. `status` has `terminals` (for each, `terminal`,
+With `--json`, each subcommand prints one document, and a failure of the command is its exit
+status, with nothing printed after the document. `status` has `terminals` (for each, `terminal`,
 `name`, `installed`, `profile` with one of the states above, and where the profile is and its
 `command` when one is recorded), `no_profile_to_add_to` (each with `terminal` and `why`) and
 `readiness` (`shell`, `shell_entry` as `installed`, `not_installed` or `unknown`, and
 `daemon_start`). `install` has `ok`, `terminal`, `dry_run`, where the profile is (`file`,
-`settings` or `preferences`), `command` as the program and its options, `default` as `false` and
-`readiness`. `remove` has `ok`, `dry_run` and `profiles`, each with `terminal` and a `result` of
-`removed`, `already_gone`, `left_changed` (with `left`, the place it was left), `left_default`,
-`not_recorded` or `failed`; a dry run gives the profile's state in place of those.
+`settings` or `preferences`), `command` as the program and its options, `default` as `false`,
+`roots_from_environment` and `readiness`. `remove` has `ok`, `dry_run` and `profiles`, each with
+`terminal` and a `result` of `removed`, `already_gone`, `left_changed` (with `left`, the place it was
+left), `left_default`, `not_recorded` or `failed`; a dry run gives the profile's state in place of
+those. A removal that cannot take out one of its profiles takes out the others, says which it could
+not, and exits 1.
 
 ## `kr host descriptions`
 
