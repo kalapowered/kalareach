@@ -174,16 +174,19 @@ class and reads it back from the system, and what it reports when it starts is w
 holds, not what it asked for. A class the system does not hold is reported as not applied, with the
 reason.
 
-- **Linux:** the model thread takes `SCHED_BATCH` and niceness 19, and the lowest level of
-  the best-effort I/O class. Threads it starts inherit all three. The I/O class is the lowest
-  best-effort level and not the idle class, because the load reads the weights under a deadline
-  and the idle class makes each request of that read wait for a quiet disk: the deadline
-  scheduler lets an idle request wait ten seconds by default, and the budget fair queueing
-  scheduler gives it a bounded share. How far the lowest best-effort level yields depends on the
-  scheduler. The budget fair queueing scheduler gives it the smallest weight, the deadline
-  scheduler keeps no level inside a class so the class changes nothing there, and a scheduler that
-  ignores priorities, such as the `none` scheduler of most NVMe disks, keeps the class and acts on
-  nothing. What the process reports is what the system holds, not that a disk obeys it.
+- **Linux:** the model thread takes `SCHED_BATCH`, niceness 19 and the idle I/O class. Threads it
+  starts inherit all three. The model's files are read once, at load, and a resident model does no
+  I/O after it, so the load is the only read the I/O class touches. The idle class serves a request
+  after the requests of the other classes: the deadline scheduler (`mq-deadline`) serves an idle
+  request once it has aged past a bound, ten seconds by default, and the budget fair queueing
+  scheduler gives the idle class a bounded share. The best-effort class would not do, because
+  under `mq-deadline` it has no levels and even its lowest level is the same as the owner's. A
+  load that a busy disk delays past its deadline ends as a load that did not finish, and the
+  session then shows the delayed or stale description that section 22 gives when demand exceeds
+  capacity, so the cost falls on the description and not on the terminal. Under the `none`
+  scheduler of most NVMe disks no I/O class has an effect: the class is kept and acts on nothing,
+  so only the processor class lowers the model's share there. What the process reports is what the
+  system holds, not that a disk obeys it.
 - **macOS:** the model thread takes the lowest ordinary thread priority, and the process takes the
   throttled disk policy, which delays its disk requests only while other processes' requests
   contend with them. No measurement here shows what that costs a load of the weights.
