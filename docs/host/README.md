@@ -7128,8 +7128,11 @@ whose barrier never completes stays pending there.
 When the list names every live owner device, revoking what it names would leave a host that cannot
 pair another owner device: pairing waits for an owner device's confirmation, which the wait refuses,
 and the terminal confirms nothing on an owned host. The refusal and `kr doctor` detect this state and
-give the steps that keep one. The refusal gives the record's full path, and the doctor names the file,
-`restored-policy.cbor`. Revoke every other device and share the list names, with `kr device revoke`
+give the steps that keep one once the host has caught up with its feed. While it is behind, a
+record removed by hand is written again at the next start, so the refusal and the doctor say what
+keeps the catch-up from ending (the registry cannot take a write, or the record cannot be written:
+check the disk and the permissions of the state directory) and give no route. The refusal gives the
+record's full path in both states, and the doctor names the file, `restored-policy.cbor`. Revoke every other device and share the list names, with `kr device revoke`
 and `kr share revoke`, but not the last owner device. Stop the daemon. Remove the record's file by
 hand. Start the daemon, which then waits for nothing and checks nothing else on the list: that is
 the cost of the route. Pair a new owner device with the kept owner device's confirmation, and revoke
@@ -7151,7 +7154,8 @@ cannot withdraw its last enrolment until exclusive management has ended, so on s
 terminal ends it first where it can, and otherwise the confirmation comes first. The bound has no
 command. When it lapses the host refuses remote access under a personal grant until it next
 synchronises, and the bound stays. The call is refused while the host knows it is behind its feed,
-with or without a wait standing. While a wait stands it is also refused while a device or share on
+with or without a wait standing; the refusal then says what keeps the catch-up from ending and
+gives the record's full path. While a wait stands it is also refused while a device or share on
 the list of what the wait owes, or one that the scan in hand has met and not yet written, is live in
 the registry. The refusal names up to eight of them, a share as a share, counts the rest, and says
 when the list is full. The host reads liveness as the call runs, so `kr device revoke` and

@@ -93,6 +93,21 @@ const OWNER_ROUTE_REMEDY: &str = concat!(
     exclusive_note!()
 );
 
+/// What a person who finds the restored-policy check while the host is still catching up with its
+/// feed does. The steps that remove the record come after the catch-up: removed before it, the
+/// record is written again at the next start.
+const BEHIND_REMEDY: &str = concat!(
+    "This host catches up with its authority feed by itself and asks again. If it stays like \
+     this, the registry cannot take the write, or the record of the restore cannot be written: \
+     check that the disk of the state directory has room and that the daemon may write there, \
+     and the permissions of its files. Do not remove the file `restored-policy.cbor` beside \
+     the registry database before the host has caught up: the next start finds the restore \
+     again and writes a new record. Once it has caught up, this check names what to revoke at \
+     this machine and gives the steps that end the wait, and the refusal of `kr host policy \
+     --confirm` gives the record's full path. Until then no remote device is served, owner \
+     devices included, and the person at this machine is not refused. "
+);
+
 /// How many devices a refusal or the doctor names.
 const MOST_NAMED: usize = 8;
 
@@ -139,6 +154,20 @@ fn the_way_that_keeps_an_owner(file: &std::path::Path) -> String {
          `kr doctor` also says that a withdrawal this host cannot verify refuses remote grants, \
          take `authority.origin` out of the configuration document before the daemon starts, and \
          set it back after the new owner device is paired",
+        file.display()
+    )
+}
+
+/// The words of the refusal of a confirmation while the host is still catching up with its feed.
+/// `file` is the record of the restore, which a catch-up that cannot write it never ends.
+fn the_refusal_while_behind(file: &std::path::Path) -> String {
+    format!(
+        "this host is still catching up with its authority feed, so the policy it holds is not \
+         yet the one it will hold; confirm it once the host has caught up. The catch-up goes on \
+         by itself and stops while the registry cannot take a write or the record of the restore, \
+         {}, cannot be written: check that the disk of the state directory has room and that the \
+         daemon may write there. Do not remove that record before the host has caught up: the \
+         next start finds the restore again and writes a new one",
         file.display()
     )
 }
@@ -473,10 +502,7 @@ impl Controller {
             let mut kept = self.restored_policy.lock().await;
             if self.policy().behind_its_feed() {
                 return Err(ControllerError::PermissionDenied {
-                    detail: "this host is still catching up with its authority feed, so the \
-                             policy it holds is not yet the one it will hold; confirm it once \
-                             the host has caught up"
-                        .to_owned(),
+                    detail: the_refusal_while_behind(kept.file()),
                 });
             } else if !self.policy().restored_policy_waits() {
                 false
@@ -686,6 +712,18 @@ impl Controller {
         };
         let owing = self.what_the_confirmation_waits_for(held, restored::MOST_OWED);
         let every_owner = matches!(&owing, Some(Owing::Targets(owed)) if owed.every_owner);
+        // The steps that remove the record come only once the host has caught up with its feed: a
+        // record removed before that is written again at the next start.
+        let behind = policy.behind_its_feed();
+        if behind {
+            detail = detail.stated(
+                "; this host is still catching up with its authority feed, so the policy it \
+                 holds is not yet the one it will hold, and a confirmation is refused until it \
+                 has: the catch-up stops while the registry cannot take a write or the record of \
+                 the restore cannot be written, and the steps that end this wait are given once \
+                 it has caught up",
+            );
+        }
         detail = match owing {
             None => detail,
             Some(Owing::AScanThrough) => detail.stated(
@@ -717,7 +755,12 @@ impl Controller {
                 } else {
                     detail
                 };
-                if owed.every_owner {
+                if owed.every_owner && behind {
+                    detail.stated(
+                        "; these are every owner device of this host, so do not revoke all of \
+                         them: the steps that keep one are given once the host has caught up",
+                    )
+                } else if owed.every_owner {
                     detail.stated(
                         "; these are every owner device of this host, so revoking all of them \
                          would leave no way to pair another: the remedy gives the steps that keep \
@@ -735,7 +778,9 @@ impl Controller {
             "The policy this host holds was not found restored",
             DoctorStatus::Warning,
             detail,
-            Some(if unreadable {
+            Some(if behind {
+                BEHIND_REMEDY
+            } else if unreadable {
                 UNREADABLE_REMEDY
             } else if every_owner {
                 OWNER_ROUTE_REMEDY

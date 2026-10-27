@@ -7340,6 +7340,10 @@ async fn a_feed_that_removes_the_host_after_the_first_record_write_failed_leaves
         refused.message.contains("catching up"),
         "refused for the catch-up it cannot begin: {refused:?}"
     );
+    assert!(
+        refused.message.contains(&record.display().to_string()),
+        "and the refusal gives the full path of the record that cannot be written: {refused:?}"
+    );
 
     rig.remote
         .remove(rig.feed())
@@ -7453,6 +7457,122 @@ async fn when_every_owner_device_is_owed_the_route_in_the_refusal_keeps_an_owner
         "with the record gone the host waits for nothing"
     );
     assert!(rig.the_restored_policy_check().await.is_none());
+    let new_owner = rig
+        .pairs(&[ActionRight::HostManage, ActionRight::SessionView])
+        .await;
+    rig.revokes_at_the_machine(kept).await;
+    rig.serves(&new_owner.0, &new_owner.1)
+        .await
+        .expect("the new owner device is served once the kept one is gone");
+}
+
+/// KR-REQ-24.15: while the host is behind its feed, the doctor and the confirmation say what keeps
+/// the catch-up from ending and how to fix it, and give the steps that keep an owner device only
+/// once it has ended: removing the record of the restore while the host is behind writes a new one
+/// at the next start. The refusal of the confirmation gives the record's full path in both states.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn while_the_host_is_behind_its_feed_the_route_that_keeps_an_owner_waits_for_the_catch_up() {
+    let rig = Rig::start().await;
+    let second = rig
+        .pairs(&[ActionRight::HostManage, ActionRight::SessionView])
+        .await;
+    let other = rig.pairs(&[ActionRight::SessionView]).await;
+    let revoked = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.until_the_carrier_is_idle().await;
+    let earlier = a_copy_of_the_registry(&rig.host, "registry-earlier.sqlite3");
+    let request = rig
+        .owner_publishes(0xb1, devices(revoked.1.device_id))
+        .await;
+    rig.poll().await;
+    rig.until_the_revocation_is_acknowledged(&request).await;
+    let kept = rig.owner_device();
+    // A request by a key the host does not know that names every owner device of the host.
+    let key = AuthorisationKeyPair::generate().expect("a key");
+    let naming_every_owner = rig.request_of(
+        &key,
+        DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([0x0f; 16])),
+        0xd1,
+        RevocationTarget::Devices {
+            device_ids: [kept, second.1.device_id, other.1.device_id]
+                .into_iter()
+                .collect::<CanonicalSet<_>>(),
+        },
+    );
+    rig.published_as(&key, &naming_every_owner).await;
+
+    // The restored registry refuses to move its revision, as one that cannot be written does.
+    let rig = rig
+        .restarted(false, |tree| {
+            put_the_registry_back(tree, &earlier);
+            rusqlite::Connection::open(tree.environment().registry_database())
+                .expect("the registry opens")
+                .execute_batch(
+                    "CREATE TRIGGER refuse_revision BEFORE UPDATE OF authority_revision
+                         ON environment BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+                )
+                .expect("the fault is in place");
+        })
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    let file = restored::file_beside(&rig.host.tree().environment().registry_database());
+
+    let check = rig
+        .the_restored_policy_check()
+        .await
+        .expect("the doctor says the host waits");
+    assert!(
+        check.detail().contains("catching up"),
+        "the doctor says what keeps the host from confirming: {}",
+        check.detail()
+    );
+    assert!(
+        check.remedy().is_some_and(|remedy| remedy.contains("disk")
+            && remedy.contains("permissions")
+            && !remedy.contains("pair a new owner device")),
+        "and how to fix it, without the steps that remove the record: {:?}",
+        check.remedy()
+    );
+
+    // The fault goes, the next pass catches up, and the steps that keep an owner come.
+    rusqlite::Connection::open(rig.host.tree().environment().registry_database())
+        .expect("the registry opens")
+        .execute_batch("DROP TRIGGER refuse_revision;")
+        .expect("the fault is cleared");
+    let mut passes = rig.runtime().passes();
+    let seen = *passes.borrow_and_update();
+    rig.timer.release_held();
+    within("a pass finishes", async {
+        while *passes.borrow_and_update() <= seen {
+            passes.changed().await.expect("the carrier is running");
+        }
+    })
+    .await;
+    rig.until_the_carrier_is_idle().await;
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&file.display().to_string()),
+        "the refusal gives the full path of the record to remove: {refused:?}"
+    );
+    let check = rig
+        .the_restored_policy_check()
+        .await
+        .expect("the doctor says the host waits");
+    assert!(
+        check
+            .remedy()
+            .is_some_and(|remedy| remedy.contains("restored-policy.cbor")
+                && remedy.contains("last owner device")),
+        "the doctor gives the steps that keep an owner: {:?}",
+        check.remedy()
+    );
+    rig.revokes_at_the_machine(second.1.device_id).await;
+    rig.revokes_at_the_machine(other.1.device_id).await;
+    let rig = rig.the_wait_is_ended_by_hand().await;
+    rig.until_the_carrier_is_idle().await;
+    assert!(
+        !rig.host.controller().restored_policy_waits(),
+        "with the host caught up, the record gone is the end of the wait"
+    );
     let new_owner = rig
         .pairs(&[ActionRight::HostManage, ActionRight::SessionView])
         .await;
