@@ -1,13 +1,12 @@
-//! The programs that run their futures on the main thread reserve as much stack for it on Windows
-//! as Linux and macOS give it.
+//! `kr`, the control daemon, the worker, the plugin host and the release tool reserve as much stack
+//! for the main thread on Windows as Linux and macOS give it.
 //!
-//! `kr`, the control daemon, the worker, the plugin host and the release tool each block the main
-//! thread on the future they run, so that future lives on a stack the program does not size
-//! itself. Linux and macOS give the main thread 8 MiB. Windows reads the size from the executable's
-//! header, and the linker's default there is 1 MiB. Without the larger reserve a command overflowed
-//! only on Windows, and a later change to any command could bring that back. This case reads the
-//! header of each program the workspace built and holds the reserve to what the other platforms
-//! give.
+//! Each of the five blocks the main thread on the future it runs, so that future lives on a stack
+//! the program's own code does not size. Linux and macOS give the main thread 8 MiB. Windows reads
+//! the size from the executable's header, and the linker's default there is 1 MiB (2 MiB for the
+//! GNU linker). Without the larger reserve a command overflowed only on Windows, and a later change
+//! to any command could bring that back. This case reads the header of each of the five programs
+//! the workspace built and holds the reserve to what the other platforms give.
 
 #![cfg(windows)]
 

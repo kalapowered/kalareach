@@ -716,7 +716,7 @@ fn windows() -> Vec<Step> {
             reading: Reading::Build,
             ..Step::cargo(
                 Group::Rust,
-                "the control daemon, the worker, the forwarder, the plugin host and the release tool the suites start",
+                "the control daemon, the worker, the forwarder and the plugin host the suites start, and the release tool whose header a case reads",
                 &[
                     "build",
                     "--locked",
