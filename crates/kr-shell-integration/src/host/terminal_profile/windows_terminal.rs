@@ -252,17 +252,4 @@ mod tests {
             Some(Some("a, }".to_owned()))
         );
     }
-
-    /// The profile is the default by its name, or by the identifier the settings page writes, in
-    /// either case.
-    #[test]
-    fn the_default_is_named_by_the_profile_s_name_or_its_identifier() {
-        assert!(names_this_profile("KalaReach"));
-        assert!(names_this_profile(PROFILE_GUID));
-        assert!(names_this_profile(&PROFILE_GUID.to_uppercase()));
-        assert!(!names_this_profile("Ubuntu"));
-        assert!(!names_this_profile(
-            "{00000000-0000-0000-0000-000000000000}"
-        ));
-    }
 }

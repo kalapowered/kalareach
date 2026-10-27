@@ -18,7 +18,9 @@ pub(super) enum Presence {
     Missing,
     /// A regular file with this SHA-256.
     File(String),
-    /// Something else: a directory, a link, a file that cannot be read.
+    /// A regular file that could not be read, for this reason: what it holds is not known.
+    Unreadable(std::io::ErrorKind),
+    /// Something else: a directory, a link.
     Other,
 }
 
@@ -27,9 +29,10 @@ pub(super) fn presence(path: &Path) -> Presence {
     match path.symlink_metadata() {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Presence::Missing,
         Err(_) => Presence::Other,
-        Ok(data) if data.is_file() => {
-            std::fs::read(path).map_or(Presence::Other, |bytes| Presence::File(sha256_hex(&bytes)))
-        }
+        Ok(data) if data.is_file() => std::fs::read(path).map_or_else(
+            |error| Presence::Unreadable(error.kind()),
+            |bytes| Presence::File(sha256_hex(&bytes)),
+        ),
         Ok(_) => Presence::Other,
     }
 }
@@ -213,6 +216,9 @@ pub(super) fn remove_if_unchanged(
                 left_at: destination.to_path_buf(),
             });
         }
+        // What a file holds that cannot be read is not known: it is neither taken out nor called
+        // changed.
+        Presence::Unreadable(kind) => return Err(kind.into()),
         Presence::File(_) => {}
     }
     let aside = staging.join(temporary_name("removing"));
