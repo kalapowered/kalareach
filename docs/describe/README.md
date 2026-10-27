@@ -173,7 +173,7 @@ class and reads it back from the system, and what it reports when it starts is w
 holds, not what it asked for. A class the system does not hold is reported as not applied, with the
 reason.
 
-- **Linux:** the model thread takes `SCHED_BATCH` and the lowest niceness, and the lowest level of
+- **Linux:** the model thread takes `SCHED_BATCH` and niceness 19, and the lowest level of
   the best-effort I/O class. Threads it starts inherit all three. The I/O class is the lowest
   best-effort level and not the idle class, because the load reads the weights under a deadline
   and the idle class makes each request of that read wait for a quiet disk: the deadline
@@ -194,9 +194,13 @@ reason.
   seconds (Windows lifts a thread that has waited that long), the daemon can wait past its bound
   for the process to acknowledge a cancellation and ends a process that does not acknowledge in
   time, the process's own watchdog ends it when its control thread takes more than two seconds
-  over one request, and its answer to the daemon's first message can say that the model thread
-  did not report its class. Each ends a process that the daemon starts again after its restart
-  delay, so a machine too busy to run the process gets fewer descriptions. Windows also has a background
+  over one request, and the daemon ends it as silent at the start when its answer to the first
+  message has not come within ten seconds of the start, a bound that the control thread's wait of
+  up to five seconds for the model thread's report of its class takes from. Each of these ends
+  a process that the daemon starts again after its restart delay, so a machine too busy to run
+  the process gets fewer descriptions. When that wait ends first, the answer says the model
+  thread did not report its class and keeps saying so for the life of the process, which reports
+  less than the system holds and ends nothing. Windows also has a background
   mode for a process that lowers CPU, I/O and memory priority together, and this build does not
   use it. On Windows Server 2025 (build 26100) a process that enters it and writes 600 MB keeps a
   working set of 32 MB, with 683 MB committed, where a process with only the idle class, only the
@@ -403,7 +407,8 @@ The daemon holds the process to its bounds, and ends it outright when it breaks 
 | The resident set, read every second during a load or a job | 4 GiB |
 
 The process holds itself to them as well, so no end depends on the daemon alone. Its watchdog ends
-it when its control thread has spent two seconds on one request, which is a daemon that stopped
+it when its control thread has spent two seconds on one request (the wait at the first message for
+the model thread's report of its class is not counted), which is a daemon that stopped
 reading its answers, and when a load or a job runs two seconds past its deadline. The daemon passes
 its own start identity when it starts the process, and once a second the watchdog asks whether that
 daemon is still running: a control thread stuck inside a read never sees its input end, and the

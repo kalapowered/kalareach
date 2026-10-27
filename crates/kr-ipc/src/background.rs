@@ -49,18 +49,6 @@ pub enum IoClass {
     VeryLow,
 }
 
-impl IoClass {
-    /// Returns the stable name this class is reported under.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::BestEffortLowest => "best_effort_lowest",
-            Self::Throttled => "throttled",
-            Self::VeryLow => "very_low",
-        }
-    }
-}
-
 /// Why a class was not applied.
 pub type Refusal = &'static str;
 
