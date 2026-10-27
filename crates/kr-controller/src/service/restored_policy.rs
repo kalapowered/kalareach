@@ -87,8 +87,12 @@ const OWNER_ROUTE_REMEDY: &str = concat!(
      which this host waits for nothing and checks nothing else on its list; start the daemon; \
      pair a new owner device with the kept owner device's confirmation; and revoke the kept owner \
      device if it must go. If a withdrawal this host cannot verify also refuses remote grants, \
-     take `authority.origin` out of the configuration document before the daemon starts and set \
-     it back after the new owner device is paired. ",
+     take `authority.origin` out of the configuration document before the daemon starts, and set \
+     it back only once the new owner device is paired and everything the withdrawal names is \
+     revoked, the kept owner device included: until then the refusal rises again at every scan \
+     that reads the withdrawal. If this host bounds offline validity, finish this inside the \
+     bound: once it ends, the host refuses every remote request under a personal grant, an owner \
+     device's included. ",
     feed_note!(),
     exclusive_note!()
 );
@@ -153,7 +157,11 @@ fn the_way_that_keeps_an_owner(file: &std::path::Path) -> String {
          with the kept owner device's confirmation; revoke the kept owner device if it must go. If \
          `kr doctor` also says that a withdrawal this host cannot verify refuses remote grants, \
          take `authority.origin` out of the configuration document before the daemon starts, and \
-         set it back after the new owner device is paired",
+         set it back only once the new owner device is paired and everything the withdrawal names \
+         is revoked, the kept owner device included (until then the refusal rises again at every \
+         scan that reads the withdrawal); if this host bounds offline validity, finish this inside \
+         the bound, because once it ends the host refuses every remote request under a personal \
+         grant, an owner device's included",
         file.display()
     )
 }
@@ -778,12 +786,14 @@ impl Controller {
             "The policy this host holds was not found restored",
             DoctorStatus::Warning,
             detail,
+            // The steps that keep an owner device come first: the detail says the remedy gives them
+            // whenever the list names every owner device, a record that cannot be read included.
             Some(if behind {
                 BEHIND_REMEDY
-            } else if unreadable {
-                UNREADABLE_REMEDY
             } else if every_owner {
                 OWNER_ROUTE_REMEDY
+            } else if unreadable {
+                UNREADABLE_REMEDY
             } else {
                 WAITS_REMEDY
             }),

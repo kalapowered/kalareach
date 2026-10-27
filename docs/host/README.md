@@ -7098,7 +7098,9 @@ only when the list is full. For the same reason the host writes a target that is
 writes the request's page: one the person revoked at the machine before the scan reached the page,
 or one the restored copy of the registry does not hold. An entry an earlier run wrote is not cleared by a scan, because
 nothing in the record says which request wrote it, and a request the feed has since dropped may
-have. The wait ends with the
+have. The host knows a request by its place in the feed and by everything it says, its signature
+included, so a feed restored to an earlier state that serves another request at a place and under
+an identifier the host knew settles nothing the first request named. The wait ends with the
 confirmation, which removes the record. A scan of another feed clears only entries of its own
 origin, so pointing the host at a feed that holds nothing for it clears nothing. A device is live
 while the registry holds it unrevoked, and a share is live while an unrevoked device holds it as its
@@ -7223,7 +7225,8 @@ a list write that failed or an abort before it followed by a restart with the fe
 absent, leave the host knowing only what the record holds. A record that cannot be read has lost
 its list: no scan writes over it, the run's own memory of what it owes is checked at the
 confirmation, which removes the record (a restart before then forgets what the run learned), and
-the person compares `kr device list` and `kr share list` with what the feed's owners intended. A record that describes no policy row is
+the person compares `kr device list` and `kr share list` with what the feed's owners intended;
+when what the run met names every owner device, the doctor gives the steps that keep one. A record that describes no policy row is
 removed at a start with its list. A second restore, or a rollback and an update again, within the
 week the feed keeps a refused record, after a wait ended in which the host refused a request it
 could not verify, has the feed's refusal read as a request the host never applied; inside one wait

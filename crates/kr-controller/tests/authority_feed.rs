@@ -7381,6 +7381,14 @@ struct EveryOwnerOwed {
 }
 
 async fn a_request_that_names_every_owner_device() -> EveryOwnerOwed {
+    a_request_that_names_every_owner_device_and_a_record(a_restore_was_found).await
+}
+
+/// As [`a_request_that_names_every_owner_device`], with the record `record` puts at its place
+/// when the host starts.
+async fn a_request_that_names_every_owner_device_and_a_record(
+    record: impl FnOnce(&kr_ipc::testing::TempHost),
+) -> EveryOwnerOwed {
     let rig = Rig::start().await;
     let second = rig
         .pairs(&[ActionRight::HostManage, ActionRight::SessionView])
@@ -7400,7 +7408,7 @@ async fn a_request_that_names_every_owner_device() -> EveryOwnerOwed {
         },
     );
     rig.published_as(&key, &request).await;
-    let rig = rig.restarted(false, a_restore_was_found).await;
+    let rig = rig.restarted(false, record).await;
     rig.until_the_carrier_is_idle().await;
     let file = restored::file_beside(&rig.host.tree().environment().registry_database());
     EveryOwnerOwed {
@@ -7464,6 +7472,47 @@ async fn when_every_owner_device_is_owed_the_route_in_the_refusal_keeps_an_owner
     rig.serves(&new_owner.0, &new_owner.1)
         .await
         .expect("the new owner device is served once the kept one is gone");
+}
+
+/// KR-REQ-24.15: a record that cannot be read, with every owner device owed from what the run met,
+/// gets the remedy its detail promises: the doctor says the remedy gives the steps that keep an
+/// owner device only when the remedy does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unreadable_record_with_every_owner_device_owed_is_given_the_steps_its_detail_promises()
+{
+    let EveryOwnerOwed { rig, file, .. } =
+        a_request_that_names_every_owner_device_and_a_record(|tree| {
+            std::fs::write(
+                restored::file_beside(&tree.environment().registry_database()),
+                b"junk",
+            )
+            .expect("junk");
+        })
+        .await;
+    let check = rig
+        .the_restored_policy_check()
+        .await
+        .expect("the doctor says the host waits");
+    assert!(
+        check.detail().contains("cannot be read"),
+        "the record cannot be read: {}",
+        check.detail()
+    );
+    let promises_the_steps = check.detail().contains("the remedy gives the steps");
+    let gives_them = check.remedy().is_some_and(|remedy| {
+        remedy.contains("restored-policy.cbor") && remedy.contains("last owner device")
+    });
+    assert!(
+        !promises_the_steps || gives_them,
+        "the detail promises steps the remedy lacks: {} / {:?}",
+        check.detail(),
+        check.remedy()
+    );
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&file.display().to_string()),
+        "the refusal gives the record's full path: {refused:?}"
+    );
 }
 
 /// KR-REQ-24.15: while the host is behind its feed, the doctor and the confirmation say what keeps
@@ -7630,6 +7679,24 @@ async fn when_a_withdrawal_the_host_cannot_verify_names_every_owner_device_the_r
         refused.message.contains(&file.display().to_string())
             && refused.message.contains("authority.origin"),
         "the refusal gives the record's path and says to take the feed out too: {refused:?}"
+    );
+    assert!(
+        refused
+            .message
+            .contains("everything the withdrawal names is revoked")
+            && refused.message.contains("bounds offline validity"),
+        "and says when to put it back and to finish inside the offline bound: {refused:?}"
+    );
+    let check = rig
+        .the_restored_policy_check()
+        .await
+        .expect("the doctor says the host waits");
+    assert!(
+        check.remedy().is_some_and(|remedy| remedy
+            .contains("everything the withdrawal names is revoked")
+            && remedy.contains("bounds offline validity")),
+        "the doctor's steps say the same: {:?}",
+        check.remedy()
     );
 
     rig.revokes_at_the_machine(second.1.device_id).await;
