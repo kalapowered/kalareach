@@ -1454,12 +1454,61 @@ impl Running {
     }
 }
 
+/// The directory under an environment's state directory where its plugin host files the compiled
+/// components it has made.
+const PLUGIN_CACHE: &str = "plugin-cache";
+
+/// Every path under the environment's compiled-code cache: the directories a filing makes, the
+/// temporary files it writes through and the files it ends with. None where the cache holds
+/// nothing.
+///
+/// A cache that cannot be read is not an empty one: it stops the case.
+fn under_the_cache(environment: &kr_ipc::paths::EnvironmentPaths) -> Vec<PathBuf> {
+    fn walk(directory: &Path, into: &mut Vec<PathBuf>) {
+        let entries = match std::fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => panic!("{} is not read: {error}", directory.display()),
+        };
+        for entry in entries {
+            let entry = entry
+                .unwrap_or_else(|error| panic!("{} is not read: {error}", directory.display()));
+            let path = entry.path();
+            let kind = entry
+                .file_type()
+                .unwrap_or_else(|error| panic!("{} is not read: {error}", path.display()));
+            into.push(path.clone());
+            if kind.is_dir() {
+                walk(&path, into);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(&environment.state_dir().join(PLUGIN_CACHE), &mut found);
+    found
+}
+
+/// The files of the compiled-code cache that a filing has ended with: not the directories, and not
+/// the temporary files a filing writes through.
+fn filed(under_the_cache: &[PathBuf]) -> Vec<&PathBuf> {
+    under_the_cache
+        .iter()
+        .filter(|path| {
+            path.is_file()
+                && !path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("tmp"))
+        })
+        .collect()
+}
+
 /// What an attempt at holding a registration in flight came to.
 enum Attempt {
     /// The registration was held outstanding, the host ended with it so, and everything the claim
     /// is about was shown.
     Held,
-    /// The registration was answered before it could be held, which shows nothing about it.
+    /// The registration may have been answered before it could be held, or the cache that shows
+    /// whether it was could not be relied on, which shows nothing about it.
     Missed(String),
 }
 
@@ -1470,8 +1519,14 @@ const HOLD_ATTEMPTS: u32 = 3;
 /// prompt, and when a worker's report first reads that it is registering the component with the
 /// plugin host, the host is held still. The registration is outstanding while the host stays so;
 /// the host is then ended by the identity it was started under, and what the worker, the program,
-/// the terminal and the binding do after is read. The attempt shows the registration was
-/// outstanding only if the replacement host had to compile the component.
+/// the terminal and the binding do after is read.
+///
+/// What shows the registration was outstanding is the held host's own cache. A host files the
+/// component it compiled in its compiled-code cache before it answers a registration, so a host
+/// held still with nothing filed has not answered; and once held it files nothing more. That reads
+/// the host, and not how the replacement came by the component, which a cache that failed to store
+/// or to load would also make a fresh compile. It rests on the cache working, which the replacement
+/// shows by filing the component it compiled: where it does not, the attempt shows nothing.
 async fn hold_a_registration_and_end_the_host() -> Attempt {
     // Every attempt has a component whose digest no host has compiled, so the registration is a
     // cold compile: the time the host takes over it is what the worker's report can be seen in.
@@ -1535,11 +1590,20 @@ async fn hold_a_registration_and_end_the_host() -> Attempt {
     held::still(&host);
     eprintln!("plugin host {} is held still", host.pid.get());
 
-    // Held still, the host answers nothing. The registration is outstanding if the worker's own
+    // The host files the component it compiled before it answers, and it is held still, so what it
+    // has filed is all it will file. Nothing under its cache means it had not begun to file the
+    // component, and so had not answered: it could not have written an answer the worker has yet
+    // to read. Anything there means it had compiled it, and may have answered.
+    let begun = under_the_cache(&environment);
+    if !begun.is_empty() {
+        return Attempt::Missed(format!(
+            "the host had begun to file the compiled component when it was held still ({begun:?}), \
+             so it had compiled it and may have answered"
+        ));
+    }
+
+    // Held still, the host answers nothing. The registration stays outstanding if the worker's own
     // report, asked for again after the terminal has been sent twenty more lines, still says so.
-    // An answer the host wrote before it was held, which the worker has not yet read, is not
-    // told from one it never wrote by this alone: whether the host wrote one is read below, from
-    // how the replacement came by the component.
     let mark = ticks(&world.terminal);
     let looked_at = tokio::time::Instant::now();
     loop {
@@ -1619,17 +1683,14 @@ async fn hold_a_registration_and_end_the_host() -> Attempt {
             }
             _ => None,
         });
-        // A host files the component it compiled before it answers a registration, and a
-        // replacement then loads it from there. So a replacement that compiled the component shows
-        // that the first host never answered, and one that loaded it shows nothing: the first host
-        // may have answered before it was held, however little time that left the worker.
-        if registered.is_some_and(|reason| reason.contains("loaded from the compiled-code cache")) {
-            return Attempt::Missed(format!(
-                "the replacement loaded the component from the cache ({}), so the first host had \
-                 compiled it and may have answered",
-                registered.unwrap_or_default()
-            ));
-        }
+        // The held host filed nothing, and a replacement is a new process with the same cache, so
+        // it compiles the component: a replacement that loaded it found a filing that nothing
+        // made, which this attempt cannot explain.
+        assert!(
+            !registered
+                .is_some_and(|reason| reason.contains("loaded from the compiled-code cache")),
+            "the replacement loaded a component that the held host had not filed: {reports:?}"
+        );
         if registered.is_some_and(|reason| reason.contains("compiled in")) {
             eprintln!("the binding is registered with the replacement: {reports:?}");
             break;
@@ -1639,6 +1700,20 @@ async fn hold_a_registration_and_end_the_host() -> Attempt {
             "the binding was not registered with the replacement; the workers report {reports:?}"
         );
     }
+    // What shows the held host had not answered rests on a cache that files what is compiled. The
+    // replacement filed its compile before it answered, so where nothing is filed now, a cache
+    // that does not file would have left the held host's compile unfiled as well.
+    let in_the_cache = under_the_cache(&environment);
+    if filed(&in_the_cache).is_empty() {
+        return Attempt::Missed(format!(
+            "the replacement compiled the component and the compiled-code cache holds no file of it \
+             ({in_the_cache:?}), so an empty cache shows nothing about the held host"
+        ));
+    }
+    eprintln!(
+        "the replacement filed its compile: {:?}",
+        filed(&in_the_cache)
+    );
     let client = kr_plugin_service::client::PluginClient::connect(&environment)
         .await
         .expect("the replacement answers");
@@ -1681,11 +1756,15 @@ async fn hold_a_registration_and_end_the_host() -> Attempt {
 /// sent lines it had not been sent, and the daemon starts a replacement under its bound, which the
 /// worker registers the same binding with again, so that the host holds the binding.
 ///
-/// A host files the component it compiled before it answers, and a replacement then loads it from
-/// there. So the replacement must have compiled the component, which shows the first host never
-/// answered. A host that may have answered before it could be held shows nothing about a request
-/// outstanding, so that attempt is made again, up to a bound, and a case that could not hold one
-/// fails.
+/// A host files the component it compiled in its compiled-code cache before it answers. So a host
+/// that is held still with nothing filed has not answered, and once held it files nothing more:
+/// that is read from the held host's cache, and not from how the replacement came by the
+/// component. It rests on the cache working, which the replacement shows by filing the component
+/// it compiled. A host that may have answered before it could be held, or a cache that did not
+/// file, shows nothing about a request outstanding, so that attempt is made again, up to a bound,
+/// and a case that could not hold one fails. What this leaves is a filing that failed in the first
+/// host alone and not in the replacement, and a first host whose cache directory could not be made
+/// and that answered before it was held.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = writes_profiles!()]
 async fn a_plugin_host_that_ends_with_a_registration_unanswered_takes_no_worker_with_it_on_windows()
