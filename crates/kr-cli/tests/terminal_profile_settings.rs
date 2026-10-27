@@ -501,9 +501,11 @@ fn a_profile_that_is_gone_is_forgotten() {
     });
 }
 
-/// The wrapper that plays another writer of the shared list. It counts the calls, fails the one it
-/// is told to, appends an element to the list just before the read it is told to, and overwrites
-/// the list from a stale read just after the write it is told to.
+/// The wrapper that plays another writer of the shared list, and a settings service that goes. It
+/// counts the calls, fails the one it is told to, fails every call from the first write of a
+/// profile's key on, shows no schemas, appends an element to the list just after the read it is
+/// told to has been answered (so that the answer is stale), and overwrites the list from a stale
+/// read just after the write it is told to.
 fn wrapper(directory: &Path) -> PathBuf {
     let path = directory.join("gsettings-wrapper");
     std::fs::write(
@@ -517,15 +519,27 @@ echo "$calls" > "$count_file"
 if [ "$KR_TEST_FAIL_AT" = "$calls" ]; then
   exit 1
 fi
+if [ -n "$KR_TEST_FAIL_FROM_FIRST_SET" ] && [ "$1" = set ]; then
+  : > "$KR_TEST_COUNTS/gone"
+fi
+if [ -e "$KR_TEST_COUNTS/gone" ]; then
+  exit 1
+fi
+if [ -n "$KR_TEST_HIDE_SCHEMAS" ] && { [ "$1" = list-schemas ] || [ "$1" = list-relocatable-schemas ]; }; then
+  exit 0
+fi
 if [ "$1" = get ] && [ "$2" = "$KR_TEST_LIST_SCHEMA" ] && [ "$3" = "$KR_TEST_LIST_KEY" ]; then
   reads=$(cat "$KR_TEST_COUNTS/reads" 2>/dev/null || echo 0)
   reads=$((reads + 1))
   echo "$reads" > "$KR_TEST_COUNTS/reads"
-  if [ "$KR_TEST_APPEND_AT_READ" = "$reads" ]; then
-    current=$("$real" get "$KR_TEST_LIST_SCHEMA" "$KR_TEST_LIST_KEY")
-    current=${current#@as }
+  if [ "$KR_TEST_APPEND_AFTER_READ" = "$reads" ]; then
+    answer=$("$real" "$@")
+    status=$?
+    current=${answer#@as }
     current=${current%]}
     "$real" set "$KR_TEST_LIST_SCHEMA" "$KR_TEST_LIST_KEY" "${current}, 'another-writer']"
+    echo "$answer"
+    exit $status
   fi
 fi
 "$real" "$@"
@@ -584,15 +598,16 @@ fn through_the_wrapper(person: &Person, knobs: &[(&str, String)]) -> ProfileHome
     person.places_through(&wrapper_path, &all)
 }
 
-/// KR-REQ-01.21: another writer appends to the shared list between kr's two reads of it just before
-/// it writes (the plan reads the list once, so these are its second and third reads). Every element
-/// is in the list afterwards, and so is the profile: the write that follows the changed read does
-/// not overwrite the other writer's element.
+/// KR-REQ-01.21: another writer appends to the shared list just after kr has read it, before kr
+/// reads it again and writes (the plan reads the list once, so the first read the write makes is
+/// the second). Every element is in the list afterwards, and so is the profile: the second read
+/// finds the list changed and starts over, so the write does not overwrite the other writer's
+/// element.
 #[test]
 fn a_writer_appending_between_our_reads_loses_nothing() {
     for_each_application(|person| {
         let list_before = person.list();
-        let places = through_the_wrapper(person, &[("KR_TEST_APPEND_AT_READ", "3".to_owned())]);
+        let places = through_the_wrapper(person, &[("KR_TEST_APPEND_AFTER_READ", "2".to_owned())]);
         person.install(&places).expect("installs");
         let list = person.list();
         for uuid in &list_before {
@@ -874,6 +889,79 @@ fn a_gsettings_that_is_not_there_does_not_make_a_profile_forgotten() {
         let outcome = person.remove(&without);
         assert!(
             matches!(outcome, Err(ProfileError::ToolMissing(_))),
+            "{outcome:?}"
+        );
+        assert!(person.recorded_uuid().is_some(), "the record keeps it");
+        assert_eq!(person.remove(&places).expect("removes"), Removed::Removed);
+    });
+}
+
+/// KR-REQ-01.21: an install again that cannot take itself back, because the settings service is
+/// gone from its first write on, leaves a profile the record still names: the record holds both
+/// what was to be written and what the profile held, so the profile reads as kr's, `status` does
+/// not call it changed, and a removal with the service back takes it out.
+#[test]
+fn an_install_again_that_cannot_take_itself_back_leaves_a_profile_the_record_still_names() {
+    for_each_application(|person| {
+        let places = person.places();
+        let list_before = person.list();
+        let command = |round: &str| {
+            let mut command = person.command();
+            command.push(round.to_owned());
+            command
+        };
+        person
+            .install_command(&places, &command("first"))
+            .expect("installs");
+        let uuid = person.recorded_uuid().expect("recorded");
+        let keys = person.keys_of(&uuid);
+
+        let gone = through_the_wrapper(person, &[("KR_TEST_FAIL_FROM_FIRST_SET", "1".to_owned())]);
+        let outcome = person.install_command(&gone, &command("second"));
+        assert!(outcome.is_err(), "{outcome:?}");
+        assert_eq!(
+            person.keys_of(&uuid),
+            keys,
+            "nothing could be written, so the profile is as it was"
+        );
+        let recorded = person
+            .record()
+            .profiles()
+            .expect("reads")
+            .into_iter()
+            .next();
+        let status = profile::status(person.application.terminal, &places, recorded);
+        assert_eq!(
+            status.standing,
+            Some(profile::Standing::Matches),
+            "the profile reads as kr's, not as changed"
+        );
+        assert_eq!(person.remove(&places).expect("removes"), Removed::Removed);
+        assert_eq!(person.list(), list_before);
+        assert!(person.recorded_uuid().is_none());
+    });
+}
+
+/// KR-REQ-01.21: an application whose settings schema is gone (it was uninstalled) is a profile that
+/// cannot be read, which is neither gone nor changed: `status` says so, a removal says why and keeps
+/// the record, and a removal with the schema back takes the profile out.
+#[test]
+fn an_application_whose_schema_is_gone_keeps_its_record_and_says_why() {
+    for_each_application(|person| {
+        let places = person.places();
+        person.install(&places).expect("installs");
+        let hidden = through_the_wrapper(person, &[("KR_TEST_HIDE_SCHEMAS", "1".to_owned())]);
+        let recorded = person
+            .record()
+            .profiles()
+            .expect("reads")
+            .into_iter()
+            .next();
+        let status = profile::status(person.application.terminal, &hidden, recorded);
+        assert_eq!(status.standing, Some(profile::Standing::Unreadable));
+        let outcome = person.remove(&hidden);
+        assert!(
+            matches!(outcome, Err(ProfileError::SchemaAbsent(_))),
             "{outcome:?}"
         );
         assert!(person.recorded_uuid().is_some(), "the record keeps it");
