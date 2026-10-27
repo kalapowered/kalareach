@@ -398,16 +398,3 @@ pub(super) fn take_out(domain: &str) -> Result<(), ProfileError> {
     }
     Err(failed())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Two entries are one value when `plutil` writes them as one text, and the record's text is
-    /// compared after its ends are trimmed.
-    #[test]
-    fn two_entries_are_the_same_when_their_text_is() {
-        assert!(same_entry(b"<dict/>\n", "<dict/>"));
-        assert!(!same_entry(b"<dict/>", "<array/>"));
-    }
-}

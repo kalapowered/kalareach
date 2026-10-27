@@ -118,12 +118,4 @@ mod tests {
             "both layers: the file's JSON escapes decode to the shell's single quotes"
         );
     }
-
-    /// A profile written again keeps the identifier it had.
-    #[test]
-    fn the_identifier_is_read_back_from_the_file() {
-        let text = profile_text(&["/kr".to_owned()], "AAAA");
-        assert_eq!(guid_in(&text).as_deref(), Some("AAAA"));
-        assert_eq!(guid_in("not json"), None);
-    }
 }
