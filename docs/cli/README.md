@@ -166,9 +166,9 @@ Anywhere else it never waits, so a script that reads the output of `kr new` does
 nobody will press. While it waits, the terminal is in single-key mode with its signal keys off, so
 Ctrl-C is a key like any other. What was typed before the wait began is thrown away. One key, the
 end of the input or a failed read ends the wait, and the terminal's modes are put back on every path
-out. A hangup, which is what closing the window sends, or a terminate signal ends the process as that
-signal would, after the modes are back. A terminal that cannot be put into single-key mode is left
-alone and the wait is skipped.
+out. A hangup, which is what closing the window sends, or a terminate, interrupt or quit signal sent
+from outside ends the process as that signal would, after the modes are back. A terminal that
+cannot be put into single-key mode is left alone and the wait is skipped.
 
 ### When no control daemon is running
 
@@ -691,7 +691,9 @@ own environment, and a later `remove` finds the record only with the same variab
 
 `install` takes the identifiers of the platform it runs on and an application that is installed. A
 dry run shows what would be written and writes nothing. An application installed as a Flatpak or a
-Snap keeps its profiles elsewhere and is not found.
+Snap keeps its profiles elsewhere and is not found. A watched folder that is a link to another file
+system makes `install` and `remove` fail with nothing written, because the file is built beside the
+folder's parent and moved in.
 
 Ptyxis 50 starts a profile's command through `systemd-run --user --scope` when `systemd-run` is
 installed. Where no user systemd session answers, such as a session bus of its own with no systemd
