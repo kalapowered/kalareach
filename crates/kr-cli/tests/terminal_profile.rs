@@ -669,6 +669,56 @@ fn a_profile_saved_between_the_plan_and_the_write_is_not_overwritten() {
     }
 }
 
+/// KR-REQ-01.21: what cannot be read is not taken for an answer. Konsole's settings that are there
+/// and do not read stop a removal, which leaves the profile and keeps the record; so does a profile
+/// file that cannot be read.
+#[cfg(unix)]
+#[test]
+fn what_cannot_be_read_stops_a_removal_and_keeps_the_record() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let application = applications()
+        .into_iter()
+        .find(|application| application.terminal == ProfileTerminal::Konsole)
+        .expect("Konsole is in the list");
+    let person = Person::with(&application);
+    (application.seed)(&person);
+    person
+        .install(application.terminal, &command_in(person.tree.root()))
+        .expect("installs");
+    let file = (application.profile)(&person);
+
+    // The settings that name the default are a directory: there, and unreadable as a file.
+    let settings = person.home.join(".config/konsolerc");
+    std::fs::remove_file(&settings).expect("removed");
+    std::fs::create_dir(&settings).expect("a directory");
+    let refused = person.remove(application.terminal);
+    assert!(
+        matches!(refused, Err(ProfileError::DefaultUnknown { .. })),
+        "{refused:?}"
+    );
+    assert!(file.is_file(), "the profile is left");
+    assert_eq!(person.record().profiles().expect("reads").len(), 1);
+    std::fs::remove_dir(&settings).expect("removed");
+
+    // The profile file itself cannot be read.
+    if !rustix::process::getuid().is_root() {
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).expect("mode");
+        let refused = person.remove(application.terminal);
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).expect("mode");
+        assert!(
+            matches!(refused, Err(ProfileError::Io { .. })),
+            "{refused:?}"
+        );
+        assert!(file.is_file(), "the profile is left");
+        assert_eq!(person.record().profiles().expect("reads").len(), 1);
+    }
+    assert_eq!(
+        person.remove(application.terminal).expect("removes"),
+        Removed::Removed
+    );
+}
+
 /// An install again over an unchanged profile rewrites it, for a different command, and the record
 /// follows the file.
 #[test]
@@ -1361,6 +1411,41 @@ mod terminal_app {
             "{refused:?}"
         );
         assert_eq!(std::fs::read(plist(&domain)).expect("preferences"), before);
+    }
+
+    /// An entry of the profiles' name that appears between the plan of an install and its write is
+    /// not written over: the write checks again on what is there then, and the person's entry is
+    /// as they left it.
+    #[test]
+    fn an_entry_that_appears_between_the_plan_and_the_write_is_not_overwritten() {
+        let (person, domain) = person();
+        let command = command_in(person.tree.root());
+        let writers = kr_cli::barrier::hold(person.tree.paths()).expect("the writers' lock");
+        let permit = kr_cli::barrier::permit(&writers, &PROFILE_WRITTEN).expect("a permit");
+        let record = person.record();
+        let held = record.hold(&permit).expect("holds the record");
+        let plan = profile::plan(
+            ProfileTerminal::AppleTerminal,
+            &person.places(),
+            &command,
+            None,
+        )
+        .expect("a plan");
+        let by_hand = r#"<dict><key>name</key><string>KalaReach</string><key>Font</key><data>AAEC</data></dict>"#;
+        edit(
+            &domain,
+            &["-insert", "Window Settings.KalaReach", "-xml", by_hand],
+        );
+        let entry_before = xml(&domain, "Window Settings.KalaReach");
+
+        let written = profile::install(&held, &plan);
+        assert!(
+            matches!(written, Err(ProfileError::ForeignProfile(_))),
+            "{written:?}"
+        );
+        assert_eq!(xml(&domain, "Window Settings.KalaReach"), entry_before);
+        drop(held);
+        assert!(person.record().profiles().expect("reads").is_empty());
     }
 
     /// Preferences that cannot be written are left as they are, and so is the record: an install
