@@ -20,9 +20,9 @@ const HOLD_LINE: &str =
 /// reads the output of `kr new` must not stop for a key nobody will press. The terminal is put into
 /// single-key mode with its signal keys off, so Ctrl-C is a key like another, what was typed
 /// before the wait began is thrown away, and one key, the end of the input or a failure to read it
-/// ends the wait. The terminal's modes are put back on every path out. A hangup or a terminate
-/// signal during the wait ends the process the way that signal would have, after the modes are
-/// back; closing the window is such a hangup.
+/// ends the wait. The terminal's modes are put back on every path out. A hangup, terminate,
+/// interrupt or quit signal during the wait ends the process the way that signal would have, after
+/// the modes are back; closing the window is such a hangup.
 ///
 /// A terminal that cannot be put into the mode is left alone and the wait is skipped: the failure
 /// has been printed, and the command exits with its status.
@@ -96,11 +96,14 @@ impl<F: FnMut()> Drop for PutBack<F> {
     }
 }
 
-/// The signals that end the wait: a hangup and a terminate.
+/// The signals that end the wait: a hangup, a terminate, and an interrupt or quit sent from outside
+/// (the terminal's own keys for those are keys while the wait lasts).
 #[cfg(unix)]
 struct Ending {
     hangup: Option<tokio::signal::unix::Signal>,
     terminate: Option<tokio::signal::unix::Signal>,
+    interrupt: Option<tokio::signal::unix::Signal>,
+    quit: Option<tokio::signal::unix::Signal>,
 }
 
 #[cfg(unix)]
@@ -112,6 +115,8 @@ impl Ending {
         Self {
             hangup: signal(SignalKind::hangup()).ok(),
             terminate: signal(SignalKind::terminate()).ok(),
+            interrupt: signal(SignalKind::interrupt()).ok(),
+            quit: signal(SignalKind::quit()).ok(),
         }
     }
 
@@ -129,6 +134,8 @@ impl Ending {
         tokio::select! {
             () = next(&mut self.hangup) => libc::SIGHUP,
             () = next(&mut self.terminate) => libc::SIGTERM,
+            () = next(&mut self.interrupt) => libc::SIGINT,
+            () = next(&mut self.quit) => libc::SIGQUIT,
         }
     }
 }
