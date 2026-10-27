@@ -92,6 +92,26 @@ pub enum Wrote {
     Preferences(PreferencesWrote),
 }
 
+impl Wrote {
+    /// This write, recorded as it must be while it is made over `before`: a profile an install again
+    /// leaves in an unknown state, because the take-back failed, holds what `before` wrote or what
+    /// this does. A file is replaced or put back whole, so it has no such state.
+    #[must_use]
+    pub fn over(self, before: &Self) -> Self {
+        match (self, before) {
+            (Self::Settings(mut now), Self::Settings(was)) => {
+                now.earlier = Some(was.keys.clone());
+                Self::Settings(now)
+            }
+            (Self::Preferences(mut now), Self::Preferences(was)) => {
+                now.earlier = Some(was.canonical.clone());
+                Self::Preferences(now)
+            }
+            (now, _) => now,
+        }
+    }
+}
+
 /// A file an install wrote.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -117,6 +137,10 @@ pub struct SettingsWrote {
     pub keys: Vec<RecordedKey>,
     /// The shared list that names the profile.
     pub list: RecordedList,
+    /// The keys the profile held before an install again that could not take itself back: until a
+    /// write that holds replaces this record, a key may have either value. `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub earlier: Option<Vec<RecordedKey>>,
 }
 
 /// One key written.
@@ -151,8 +175,13 @@ pub struct PreferencesWrote {
     pub key: String,
     /// The entry's name in that dictionary.
     pub entry: String,
-    /// The entry as the preferences are read back as JSON text.
+    /// The entry as `plutil` writes it (a property list with its keys in order), which is what the
+    /// preferences are read back as.
     pub canonical: String,
+    /// The entry as it was before an install again that could not take itself back: until a write
+    /// that holds replaces this record, the entry may be either. `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub earlier: Option<String>,
 }
 
 impl FileWrote {
@@ -429,6 +458,7 @@ mod tests {
                     key: "list".to_owned(),
                     member: "11111111-2222-4333-8444-555555555555".to_owned(),
                 },
+                earlier: None,
             }),
         }
     }
