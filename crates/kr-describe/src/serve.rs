@@ -11,8 +11,9 @@
 //! * **The model thread** owns the model, takes this environment's lock before its first load, and
 //!   answers each piece of work it is given.
 //! * **The watchdog** ends the process when the control thread has spent longer than
-//!   [`CONTROL_BOUND_MS`] on one request, which is a control thread stuck writing to a daemon that
-//!   is not reading; when a load or a job is [`OVERDUE_GRACE_MS`] past its deadline, which is a
+//!   [`CONTROL_BOUND_MS`] on one request (not counting the wait of the first `hello` for the model
+//!   thread's report of its class, which the daemon's handshake bound limits), which is a control
+//!   thread stuck writing to a daemon that is not reading; when a load or a job is [`OVERDUE_GRACE_MS`] past its deadline, which is a
 //!   model that did not stop; and when the daemon that started it has ended, by its start
 //!   identity, whether or not the control thread saw its input end. No end of this process
 //!   depends on the daemon alone.
@@ -342,9 +343,11 @@ pub fn run<M: Model>(
             Ok(Some(Request::Hello { .. })) => {
                 // The model thread says what it applied once the system has read it back, and on
                 // a machine other work keeps busy it can be a while before it runs. The control
-                // thread is waiting on nothing the watchdog bounds, so it waits the part of the
-                // daemon's handshake bound that leaves the daemon time to hear the answer, and
-                // the report it gives stays for the life of the process.
+                // thread waits up to half the daemon's handshake bound for it, outside the
+                // watchdog's bound on a request, and the report it gives stays for the life of the
+                // process. The daemon's bound runs from the start of the process, so the wait
+                // takes from the time left for the answer and the daemon ends a process that
+                // answers too late.
                 shared.control_since.store(0, Ordering::Release);
                 let background = applied
                     .get_or_insert_with(|| {

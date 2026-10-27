@@ -18,7 +18,7 @@
 //!
 //! | Platform | CPU | IO |
 //! | --- | --- | --- |
-//! | Linux | `SCHED_BATCH` with the lowest niceness, on the calling thread and the threads it starts, which is the scheduler class for non-interactive work | the lowest level of the best-effort class, on the calling thread and the threads it starts |
+//! | Linux | `SCHED_BATCH` with niceness 19, on the calling thread and the threads it starts, which is the scheduler class for non-interactive work | the lowest level of the best-effort class, on the calling thread and the threads it starts |
 //! | macOS | the lowest ordinary thread priority of the calling thread | the throttled disk policy of the process |
 //! | Windows | the idle priority class of the whole process | very low, for the whole process |
 //! | the other Unix systems | the lowest ordinary thread priority, where the thread-priority library gives one, and a reported refusal where it does not | none |
@@ -26,7 +26,7 @@
 //! Windows lowers the class of the whole process, because a thread started by another thread there
 //! begins at the normal priority, and the compute threads of the model runtime are started by the
 //! thread that loads it. That puts the process's control thread and its watchdog in the idle class
-//! too, and three things follow when other work keeps every core busy for longer than a few
+//! too, and four things follow when other work keeps every core busy for longer than a few
 //! seconds (Windows lifts a thread that has waited that long, so the wait is bounded):
 //!
 //! - the daemon can wait past its bound for the process to acknowledge a cancellation, and ends a
@@ -34,11 +34,16 @@
 //! - the process's own watchdog ends the process when its control thread takes more than
 //!   [`crate::serve::CONTROL_BOUND_MS`] over one request, which a control thread that waits for the
 //!   model thread's write of an answer can do;
-//! - the `Ready` answer waits half the daemon's handshake bound for the model thread's report of its
-//!   class, and says it did not hear one when the wait ends.
+//! - the daemon ends the process as silent at the start when `ready` has not come within
+//!   [`crate::supervise::HANDSHAKE_MS`] of the start, and the control thread's wait for the model
+//!   thread's report of its class takes half of that bound out of it;
+//! - the `Ready` answer says the model thread did not report its class when that wait ends, and the
+//!   process keeps that report for its whole life: it reports less than the system holds, and it
+//!   ends nothing.
 //!
-//! Each ends a process the daemon then starts again after its restart delay, so a machine that is
-//! too busy to run the process gets fewer descriptions, and the owner's own work is not the cost.
+//! The first three end a process the daemon then starts again after its restart delay, so a machine
+//! that is too busy to run the process gets fewer descriptions, and the owner's own work is not the
+//! cost.
 //!
 //! The class is the idle priority class and the very low IO priority, set on their own. Windows
 //! also has a background mode for a process, which lowers the CPU, IO and memory priority together,
