@@ -100,8 +100,7 @@ const OWNER_ROUTE_REMEDY: &str = concat!(
 /// What a person who finds the restored-policy check while the host is still catching up with its
 /// feed does. The steps that remove the record come after the catch-up: removed before it, the
 /// record is written again at the next start.
-const BEHIND_REMEDY: &str = concat!(
-    "This host catches up with its authority feed by itself and asks again. If it stays like \
+const BEHIND_REMEDY: &str = "This host catches up with its authority feed by itself and asks again. If it stays like \
      this, the registry cannot take the write, or the record of the restore cannot be written: \
      check that the disk of the state directory has room and that the daemon may write there, \
      and the permissions of its files. Do not remove the file `restored-policy.cbor` beside \
@@ -109,8 +108,7 @@ const BEHIND_REMEDY: &str = concat!(
      again and writes a new record. Once it has caught up, this check names what to revoke at \
      this machine and gives the steps that end the wait, and the refusal of `kr host policy \
      --confirm` gives the record's full path. Until then no remote device is served, owner \
-     devices included, and the person at this machine is not refused. "
-);
+     devices included, and the person at this machine is not refused. ";
 
 /// How many devices a refusal or the doctor names.
 const MOST_NAMED: usize = 8;
