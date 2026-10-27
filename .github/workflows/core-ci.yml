@@ -601,12 +601,13 @@ jobs:
 
       # What has been qualified on this platform, and only that: the suites below, which the steps
       # that follow run in the order they are written. Both legs build the control daemon, the
-      # worker, the forwarder and the plugin host the suites start. The first leg also compiles and
-      # lints the whole workspace with its tests, since a test that only builds on Unix is a Windows
-      # failure, and runs:
+      # worker, the forwarder, the plugin host and the release tool the suites start. The first leg
+      # also compiles and lints the whole workspace with its tests, since a test that only builds
+      # on Unix is a Windows failure, and runs:
       #   - the terminal engine, the repository boundary, the attach client and the first-owner
-      #     pairing against a real control daemon on loopback: all of `kr-term`, `kr-project` and
-      #     `kr-cli`;
+      #     pairing against a real control daemon on loopback, and the main-thread stack that `kr`,
+      #     the control daemon, the worker, the plugin host and the release tool each reserve in
+      #     their executable's header: all of `kr-term`, `kr-project` and `kr-cli`;
       #   - the worker's library and the protocol's library;
       #   - the platform time adapter's reading of this machine's time service, and the recorded
       #     readings every platform's classifier is held to, and that retrust needs the host's time
@@ -702,8 +703,11 @@ jobs:
       #
       # The forwarder is built with them: the worker's transport suite launches the forwarder as a
       # launched agent's relay and as its bridge, and finds it beside the test executable.
+      #
+      # The release tool is built with them as well: `kr-cli`'s `stack_windows` case reads the
+      # header of each program that blocks its main thread on a future, that tool among them.
       - name: Build the control daemon, the worker and the forwarder the suites run
-        run: cargo build --locked -p kr-controller -p kr-worker -p kr-hook -p kr-plugin-host
+        run: cargo build --locked -p kr-controller -p kr-worker -p kr-hook -p kr-plugin-host -p kr-release
 
       # The update suite assembles releases from the programs built beside it, the description
       # process among them, and fails and says so when one is missing.
