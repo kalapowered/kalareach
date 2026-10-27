@@ -1168,33 +1168,38 @@ impl Readings for Kernel {
     }
 }
 
-/// When `process` started, or nothing where it is shown to have ended.
-///
-/// A start that was not read of a process that still runs is not an ended process: it stops the
-/// case, so that a descendant is never left out of the record for want of a reading.
-///
-/// # Panics
-///
-/// Panics when the start was not read and the process is not shown to have ended.
-fn started_unless_ended(
+/// What the readings say of when a process started.
+enum Start {
+    /// The process started then, on the kernel's interrupt clock.
+    At(u64),
+    /// The start was not read, and the process is shown to have ended.
+    Ended,
+    /// The start was not read, and the process is not shown to have ended: what stopped the
+    /// reading, and what the state of the process says.
+    Unread(String),
+}
+
+/// When `process` started, or why that is not known. A start that was not read of a process that
+/// still runs, or may, is not an ended process.
+fn start_of(
     readings: &impl Readings,
     process: &kr_protocol::identity::ProcessStartIdentity,
-) -> Option<u64> {
+) -> Start {
     use kr_ipc::identity::ProcessState;
 
     match readings.started(process) {
-        Ok(started) => Some(started),
+        Ok(started) => Start::At(started),
         Err(why) => match readings.state(process) {
-            ProcessState::Ended => None,
-            ProcessState::Running => panic!(
+            ProcessState::Ended => Start::Ended,
+            ProcessState::Running => Start::Unread(format!(
                 "process {} runs and its start was not read: {why}",
                 process.pid.get()
-            ),
-            ProcessState::Unknown { detail } => panic!(
+            )),
+            ProcessState::Unknown { detail } => Start::Unread(format!(
                 "process {} could not be shown to have ended, and its start was not read: {why}; \
                  {detail}",
                 process.pid.get()
-            ),
+            )),
         },
     }
 }
@@ -1215,7 +1220,8 @@ fn started_unless_ended(
 /// # Panics
 ///
 /// Panics when a process of the list cannot be read, or its parent cannot be shown to be its
-/// parent or not, and neither process is shown to have ended.
+/// parent or not, and neither process is shown to have ended. Both processes are read before that
+/// is decided, so that a process shown to have ended is skipped whatever the other read.
 fn descendants_in(
     pairs: &[(u32, u32)],
     roots: &[kr_protocol::identity::ProcessStartIdentity],
@@ -1260,29 +1266,31 @@ fn descendants_in(
                 // The kernel would not name a parent. What it would not say is told apart by the
                 // starts: a parent that started after its child is not its parent, and a process
                 // that has ended is not there to record; anything else is a reading that failed.
-                Err(why) => {
-                    let parent_started = started_unless_ended(readings, &parent);
-                    let child_started = started_unless_ended(readings, &child);
-                    match (parent_started, child_started) {
-                        (Some(parent_started), Some(child_started))
-                            if parent_started > child_started =>
-                        {
-                            eprintln!(
-                                "process {pid} names process {} as its parent, which started \
-                                 after it did, so it is not recorded: {why}",
-                                parent.pid.get()
-                            );
-                        }
-                        (Some(_), Some(_)) => panic!(
-                            "process {pid} names process {} as its parent, both started and neither \
-                             after the other, and the kernel would not name its parent: {why}",
+                Err(why) => match (start_of(readings, &parent), start_of(readings, &child)) {
+                    // Either process shown ended is not one to record, whatever the other read.
+                    (Start::Ended, _) | (_, Start::Ended) => eprintln!(
+                        "process {pid} or its parent has ended and is not recorded: {why}"
+                    ),
+                    (Start::At(parent_started), Start::At(child_started))
+                        if parent_started > child_started =>
+                    {
+                        eprintln!(
+                            "process {pid} names process {} as its parent, which started after it \
+                             did, so it is not recorded: {why}",
                             parent.pid.get()
-                        ),
-                        _ => eprintln!(
-                            "process {pid} or its parent has ended and is not recorded: {why}"
-                        ),
+                        );
                     }
-                }
+                    (Start::At(_), Start::At(_)) => panic!(
+                        "process {pid} names process {} as its parent, both started and neither \
+                         after the other, and the kernel would not name its parent: {why}",
+                        parent.pid.get()
+                    ),
+                    (Start::Unread(unread), _) | (_, Start::Unread(unread)) => panic!(
+                        "process {pid} names process {} as its parent, and the kernel would not \
+                         name its parent ({why}): {unread}",
+                        parent.pid.get()
+                    ),
+                },
             }
         }
     }
@@ -1455,6 +1463,24 @@ mod the_walk {
         readings.ended.insert(20);
         readings.started_by.insert(20, Err(ended.clone()));
         readings.starts.insert(20, Err(ended));
+        assert_eq!(
+            descendants_in(&LIST, &[identity(ROOT)], &readings),
+            Vec::<ProcessStartIdentity>::new()
+        );
+    }
+
+    #[test]
+    fn a_child_shown_ended_is_skipped_whatever_the_parents_start_read() {
+        let refused = "process 10 could not be opened: access is denied".to_owned();
+        let mut readings = Scripted::default();
+        readings.ended.insert(20);
+        readings
+            .started_by
+            .insert(20, Err("process 20 has ended".to_owned()));
+        readings
+            .starts
+            .insert(20, Err("process 20 has ended".to_owned()));
+        readings.starts.insert(ROOT, Err(refused));
         assert_eq!(
             descendants_in(&LIST, &[identity(ROOT)], &readings),
             Vec::<ProcessStartIdentity>::new()
@@ -2074,9 +2100,15 @@ async fn hold_a_registration_and_end_the_host() -> Attempt {
 /// component. It rests on the cache working, which the replacement shows by filing the component
 /// it compiled. A host that may have answered before it could be held, or a cache that did not
 /// file, shows nothing about a request outstanding, so that attempt is made again, up to a bound,
-/// and a case that could not hold one fails. What this leaves is a filing that failed in the first
-/// host alone and not in the replacement, and a first host whose cache directory could not be made
-/// and that answered before it was held.
+/// and a case that could not hold one fails. A host that refuses a registration before it compiles
+/// files nothing, but its refusal is an answer the worker reads and reports, so the worker's own
+/// report is the second condition for that.
+///
+/// What this leaves open is a filing that failed in the first host alone, with the first host's
+/// cache directory not made, while the replacement's was: a first host that answered before it was
+/// held, with nothing under its cache, cannot be told from one that had not answered. Closing that
+/// takes a host that can be held before it replies, which the plugin host has no way to be asked
+/// for from outside.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = writes_profiles!()]
 async fn a_plugin_host_that_ends_with_a_registration_unanswered_takes_no_worker_with_it_on_windows()
