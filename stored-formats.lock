@@ -610,7 +610,7 @@
         "version": 1,
         "migrates_from": 0
       },
-      "digest": "b64812c52b67b139bed9aae69dca22424c6747a0e72a192bd093ff85c5ee566f",
+      "digest": "4511d1bf241b6ec751033f1f8cf7b108394db06a54b3ee04de083e7933fcbb64",
       "kept": [
         "Recorded, RecordedProfile, Wrote, FileWrote, SettingsWrote, RecordedKey, RecordedList, PreferencesWrote (crates/kr-shell-integration/src/host/terminal_profile/record.rs)",
         "ProfileTerminal (crates/kr-shell-integration/src/host/terminal_profile/mod.rs)"
