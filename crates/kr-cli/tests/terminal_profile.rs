@@ -39,9 +39,7 @@ struct Application {
 /// The preference is written to a file of this test's own, by path, which is not the person's
 /// domain.
 fn iterm2_default(person: &Person, ours: bool) {
-    let preferences = person
-        .home
-        .join("Library/Preferences/com.googlecode.iterm2");
+    let preferences = person.home.join("domains/com.googlecode.iterm2");
     std::fs::create_dir_all(preferences.parent().expect("a directory")).expect("a directory");
     let guid = if ours {
         let text = std::fs::read_to_string(
@@ -547,6 +545,130 @@ fn a_profile_that_is_the_default_is_left_and_kept_in_the_record() {
     }
 }
 
+/// KR-REQ-01.21: Windows Terminal's settings name the default profile by the identifier its
+/// settings page writes, in a file with comments and trailing commas. Such a default is left on
+/// removal. Settings that do not read stop the removal, with the profile left and the record kept:
+/// what cannot be read is not taken to name another profile.
+#[test]
+fn windows_terminal_s_default_is_found_by_its_identifier_and_unreadable_settings_stop_a_removal() {
+    let application = applications()
+        .into_iter()
+        .find(|application| application.terminal == ProfileTerminal::WindowsTerminal)
+        .expect("Windows Terminal is in the list");
+    let person = Person::with(&application);
+    (application.seed)(&person);
+    person
+        .install(application.terminal, &command_in(person.tree.root()))
+        .expect("installs");
+    let file = (application.profile)(&person);
+    let fragment: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).expect("the fragment")).expect("JSON");
+    let guid = fragment["profiles"][0]["guid"]
+        .as_str()
+        .expect("an identifier")
+        .to_owned();
+    let settings = person
+        .home
+        .join("AppData/Local/Microsoft/Windows Terminal/settings.json");
+
+    std::fs::write(
+        &settings,
+        format!(
+            "\u{feff}// mine\n{{\n  /* the default */ \"defaultProfile\": \"{}\", // set in the page\n  \"list\": [1,],\n}}\n",
+            guid.to_uppercase()
+        ),
+    )
+    .expect("settings");
+    assert_eq!(
+        person.remove(application.terminal).expect("removes"),
+        Removed::Default
+    );
+    assert!(file.is_file(), "the profile is left");
+    assert_eq!(person.record().profiles().expect("reads").len(), 1);
+
+    std::fs::write(&settings, "this is not json").expect("settings");
+    let refused = person.remove(application.terminal);
+    assert!(
+        matches!(refused, Err(ProfileError::DefaultUnknown { .. })),
+        "{refused:?}"
+    );
+    assert!(file.is_file(), "the profile is left");
+    assert_eq!(
+        person.record().profiles().expect("reads").len(),
+        1,
+        "and the record keeps it"
+    );
+
+    std::fs::write(&settings, "{\"defaultProfile\": \"Ubuntu\"}").expect("settings");
+    assert_eq!(
+        person.remove(application.terminal).expect("removes"),
+        Removed::Removed
+    );
+    assert!(!file.exists());
+}
+
+/// KR-REQ-01.21: a profile the person saves between the plan of an install again and its write is
+/// not overwritten: the write finds it changed, puts it back as it was, and the record keeps what
+/// it named before.
+#[test]
+fn a_profile_saved_between_the_plan_and_the_write_is_not_overwritten() {
+    for application in applications() {
+        let person = Person::with(&application);
+        (application.seed)(&person);
+        person
+            .install(application.terminal, &command_in(person.tree.root()))
+            .expect("installs");
+        let recorded_before = person.record().profiles().expect("reads");
+
+        let writers = kr_cli::barrier::hold(person.tree.paths()).expect("the writers' lock");
+        let permit = kr_cli::barrier::permit(&writers, &PROFILE_WRITTEN).expect("a permit");
+        let record = person.record();
+        let held = record.hold(&permit).expect("holds the record");
+        let recorded = held.profile(application.terminal).expect("reads");
+        let mut other_command = command_in(person.tree.root());
+        other_command.push("--elsewhere".to_owned());
+        let plan = profile::plan(
+            application.terminal,
+            &person.places(),
+            &other_command,
+            recorded.as_ref(),
+        )
+        .expect("a plan");
+        // The person saves their own change after the plan.
+        let file = (application.profile)(&person);
+        std::fs::write(&file, "saved by the person after the plan").expect("saved");
+
+        let written = profile::install(&held, &plan);
+        assert!(
+            matches!(written, Err(ProfileError::Changed { .. })),
+            "{:?}: {written:?}",
+            application.terminal
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("the file"),
+            "saved by the person after the plan",
+            "{:?}: the person's save is as they left it",
+            application.terminal
+        );
+        drop(held);
+        assert_eq!(
+            person.record().profiles().expect("reads"),
+            recorded_before,
+            "{:?}: the record names what it did",
+            application.terminal
+        );
+        let left: Vec<_> = person
+            .home_only()
+            .into_keys()
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(".kalareach-"))
+            })
+            .collect();
+        assert!(left.is_empty(), "no temporary file is left: {left:?}");
+    }
+}
+
 /// An install again over an unchanged profile rewrites it, for a different command, and the record
 /// follows the file.
 #[test]
@@ -659,19 +781,30 @@ fn the_plan_names_the_file_it_writes() {
 mod command {
     use super::*;
 
-    /// The id the command takes for the application of this platform, if it has one.
-    fn this_platform() -> Option<&'static str> {
+    /// The first application of this platform whose profile is a file, which the command cases
+    /// write for. On Linux that is Konsole: GNOME Terminal and Ptyxis keep theirs in settings, and
+    /// `terminal_profile_settings.rs` runs them.
+    fn application() -> Option<Application> {
         ProfileTerminal::on_this_platform()
-            .first()
-            .map(|terminal| terminal.id())
+            .iter()
+            .find_map(|terminal| {
+                applications()
+                    .into_iter()
+                    .find(|application| application.terminal == *terminal)
+            })
     }
 
-    /// The application whose profile file the command writes on this platform.
-    fn application() -> Option<Application> {
-        let id = this_platform()?;
-        applications()
-            .into_iter()
-            .find(|application| application.terminal.id() == id)
+    /// The id the command takes for that application.
+    fn this_platform() -> Option<&'static str> {
+        application().map(|application| application.terminal.id())
+    }
+
+    /// What `status --json` says of one application.
+    fn listed<'a>(status: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
+        status["terminals"]
+            .as_array()
+            .and_then(|terminals| terminals.iter().find(|each| each["terminal"] == id))
+            .unwrap_or_else(|| panic!("{id} is listed: {status}"))
     }
 
     /// A `kr host terminal-profile` run for a person, with their home and the host's directories,
@@ -723,9 +856,8 @@ mod command {
         let (output, said) = run(&person, &["status", "--json"]);
         assert!(output.status.success(), "{said}");
         let status = document(&output);
-        assert_eq!(status["terminals"][0]["terminal"], id);
-        assert_eq!(status["terminals"][0]["installed"], true);
-        assert_eq!(status["terminals"][0]["profile"], "none");
+        assert_eq!(listed(&status, id)["installed"], true);
+        assert_eq!(listed(&status, id)["profile"], "none");
         assert_eq!(person.everything(), before, "status writes nothing");
 
         let (output, said) = run(&person, &["install", id, "--dry-run", "--json"]);
@@ -781,7 +913,7 @@ mod command {
 
         let (output, said) = run(&person, &["status", "--json"]);
         assert!(output.status.success(), "{said}");
-        assert_eq!(document(&output)["terminals"][0]["profile"], "matches");
+        assert_eq!(listed(&document(&output), id)["profile"], "matches");
 
         let (output, said) = run(&person, &["remove", "--json"]);
         assert!(output.status.success(), "{said}");
@@ -805,6 +937,18 @@ mod command {
             return;
         };
         let person = Person::new();
+        // The command looks for an application in the system's own folders too, which a test cannot
+        // empty: where this machine has the application, there is nothing to refuse.
+        let mut theirs = ProfileHome::of_this_user().expect("a home");
+        theirs.programs = vec![person.programs.clone()];
+        theirs
+            .applications
+            .retain(|folder| !folder.starts_with(&theirs.home));
+        let terminal = ProfileTerminal::from_id(id).expect("a known application");
+        if profile::is_present(terminal, &theirs) {
+            eprintln!("skipped: {id} is installed on this machine, and the command would find it");
+            return;
+        }
         let before = person.everything();
         let (output, said) = run(&person, &["install", id]);
         assert_eq!(output.status.code(), Some(7), "{said}");
@@ -845,6 +989,66 @@ mod command {
         assert!(said.contains("no longer kr's to remove"), "{said}");
         assert!(file.is_file(), "the edited file is left");
     }
+
+    /// KR-REQ-26.04: a removal that cannot take a profile out says so once. With `--json` the
+    /// output is one document and the failure is the exit status; the record keeps the entry, and
+    /// the next removal finishes the job.
+    #[cfg(unix)]
+    #[test]
+    fn a_removal_that_fails_prints_one_document_and_keeps_the_record() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        /// Gives a directory its mode back when it goes, so the test's own tree can be removed.
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+
+        let Some(application) = application() else {
+            return;
+        };
+        if rustix::process::getuid().is_root() {
+            // A directory without write permission stops nobody who is root.
+            return;
+        }
+        let id = application.terminal.id();
+        let person = Person::with(&application);
+        (application.seed)(&person);
+        let (output, said) = run(&person, &["install", id, "--json"]);
+        assert!(output.status.success(), "{said}");
+
+        // The folder a removal moves the file aside into cannot be written to.
+        let file = (application.profile)(&person);
+        let staging = file
+            .parent()
+            .and_then(Path::parent)
+            .expect("the folder above the watched one")
+            .to_path_buf();
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o555))
+            .expect("read-only");
+        let restore = Restore(staging);
+        let (output, said) = run(&person, &["remove", "--json"]);
+        assert_eq!(output.status.code(), Some(1), "{said}");
+        let one: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("one document: {error}: {said}"));
+        assert_eq!(one["ok"], false);
+        assert_eq!(one["profiles"][0]["result"], "failed");
+        assert!(
+            output.stderr.is_empty(),
+            "nothing more is said: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(file.is_file(), "the profile is left");
+        assert_eq!(person.record().profiles().expect("reads").len(), 1);
+
+        drop(restore);
+        let (output, said) = run(&person, &["remove", "--json"]);
+        assert!(output.status.success(), "{said}");
+        assert_eq!(document(&output)["profiles"][0]["result"], "removed");
+        assert!(!file.exists());
+    }
 }
 
 /// Terminal.app, whose profile is an entry of its preferences' dictionary of profiles. These run
@@ -854,7 +1058,8 @@ mod command {
 mod terminal_app {
     use super::*;
 
-    /// The preferences of a person who has Terminal's two usual profiles and chose `Pro`.
+    /// The preferences of a person who has Terminal's two usual profiles and chose `Pro`, whose font
+    /// and colours are data, as Terminal keeps them: JSON cannot hold those.
     const PREFERENCES: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -864,7 +1069,7 @@ mod terminal_app {
   <key>Window Settings</key>
   <dict>
     <key>Basic</key><dict><key>name</key><string>Basic</string><key>type</key><string>Window Settings</string><key>ProfileCurrentVersion</key><real>2.07</real></dict>
-    <key>Pro</key><dict><key>name</key><string>Pro</string><key>type</key><string>Window Settings</string><key>ProfileCurrentVersion</key><real>2.07</real><key>BackgroundBlur</key><real>0.5</real></dict>
+    <key>Pro</key><dict><key>name</key><string>Pro</string><key>type</key><string>Window Settings</string><key>ProfileCurrentVersion</key><real>2.07</real><key>BackgroundBlur</key><real>0.5</real><key>Font</key><data>YnBsaXN0MDDUAQIDBAUGBwpYJHZlcnNpb25ZJGFyY2hpdmVyVCR0b3BYJG9iamVjdHM=</data><key>BackgroundColor</key><data>AAECAwQF</data><key>when</key><date>2026-01-01T00:00:00Z</date></dict>
   </dict>
 </dict>
 </plist>
@@ -875,64 +1080,121 @@ mod terminal_app {
         let person = Person::new();
         std::fs::create_dir_all(person.home.join("Applications/Terminal.app"))
             .expect("the application");
-        let domain = person.home.join("Library/Preferences/com.apple.Terminal");
+        let domain = person.home.join("domains/com.apple.Terminal");
         std::fs::create_dir_all(domain.parent().expect("a directory")).expect("a directory");
-        std::fs::write(domain.with_extension("plist"), PREFERENCES).expect("preferences");
+        std::fs::write(plist(&domain), PREFERENCES).expect("preferences");
         (person, domain)
     }
 
-    /// The preferences as JSON, as `plutil` reads the file.
-    fn preferences(domain: &Path) -> serde_json::Value {
+    /// The preferences file the domain names: `defaults` appends `.plist` to the path it is given,
+    /// after any extension the name has (`com.apple.Terminal` has one that is not a file type).
+    fn plist(domain: &Path) -> PathBuf {
+        let mut path = domain.as_os_str().to_owned();
+        path.push(".plist");
+        PathBuf::from(path)
+    }
+
+    /// The value at a key path of the preferences file, in the format `plutil` writes with its keys
+    /// in order and holds every type, or `None` where there is none.
+    fn xml(domain: &Path, key_path: &str) -> Option<String> {
         let output = std::process::Command::new("/usr/bin/plutil")
-            .args(["-convert", "json", "-o", "-"])
-            .arg(domain.with_extension("plist"))
+            .args(["-extract", key_path, "xml1", "-o", "-"])
+            .arg(plist(domain))
             .output()
             .expect("plutil runs");
-        assert!(output.status.success());
-        serde_json::from_slice(&output.stdout).expect("JSON")
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// The value at a key path as `plutil` prints it raw (a string as it is, data in base 64).
+    fn raw(domain: &Path, key_path: &str) -> String {
+        let output = std::process::Command::new("/usr/bin/plutil")
+            .args(["-extract", key_path, "raw", "-o", "-"])
+            .arg(plist(domain))
+            .output()
+            .expect("plutil runs");
+        assert!(output.status.success(), "{key_path}");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    /// The whole preferences file in the format `plutil` writes, without the entry kr writes.
+    fn without_the_entry(domain: &Path) -> String {
+        let converted = std::process::Command::new("/usr/bin/plutil")
+            .args(["-convert", "xml1", "-o", "-"])
+            .arg(plist(domain))
+            .output()
+            .expect("plutil runs");
+        assert!(converted.status.success());
+        let mut removing = std::process::Command::new("/usr/bin/plutil")
+            .args(["-remove", "Window Settings.KalaReach", "-o", "-", "-"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("plutil runs");
+        use std::io::Write as _;
+        let _ = removing
+            .stdin
+            .take()
+            .expect("a pipe")
+            .write_all(&converted.stdout);
+        let removed = removing.wait_with_output().expect("plutil ends");
+        // Where there is no entry to remove, the file is what it is.
+        String::from_utf8_lossy(if removed.status.success() {
+            &removed.stdout
+        } else {
+            &converted.stdout
+        })
+        .into_owned()
     }
 
     /// Edits the preferences file as the person would, with `plutil`.
     fn edit(domain: &Path, arguments: &[&str]) {
         let status = std::process::Command::new("/usr/bin/plutil")
             .args(arguments)
-            .arg(domain.with_extension("plist"))
+            .arg(plist(domain))
             .status()
             .expect("plutil runs");
         assert!(status.success(), "{arguments:?}");
     }
 
     /// KR-REQ-01.21: an install adds one entry to the dictionary of profiles, a copy of the profile
-    /// the person opens windows with and with a command of its own; nothing else in the preferences
-    /// moves; a removal puts the preferences back as they were.
+    /// the person opens windows with (its font and colours too, which are data) and with a command
+    /// of its own; nothing else in the preferences moves; a removal puts the preferences back as
+    /// they were.
     #[test]
     fn an_install_adds_one_entry_copied_from_the_default_profile_and_a_removal_takes_it_out() {
         let (person, domain) = person();
-        let before = preferences(&domain);
+        let before = without_the_entry(&domain);
         let command = command_in(person.tree.root());
         person
             .install(ProfileTerminal::AppleTerminal, &command)
             .expect("installs");
 
-        let after = preferences(&domain);
-        let entry = &after["Window Settings"]["KalaReach"];
-        assert_eq!(entry["name"], "KalaReach");
-        assert_eq!(entry["RunCommandAsShell"], true);
+        assert_eq!(raw(&domain, "Window Settings.KalaReach.name"), "KalaReach");
         assert_eq!(
-            entry["BackgroundBlur"], 0.5,
-            "a copy of the person's default profile"
+            raw(&domain, "Window Settings.KalaReach.RunCommandAsShell"),
+            "true"
         );
-        let command_string = entry["CommandString"].as_str().expect("a command");
+        for copied in ["BackgroundBlur", "Font", "BackgroundColor"] {
+            assert_eq!(
+                raw(&domain, &format!("Window Settings.KalaReach.{copied}")),
+                raw(&domain, &format!("Window Settings.Pro.{copied}")),
+                "{copied} is copied from the person's default profile as it is"
+            );
+        }
+        let command_string = raw(&domain, "Window Settings.KalaReach.CommandString");
         assert!(
             command_string.ends_with("kr dir/kr' new --attach --hold-on-failure"),
             "the command is quoted for the shell that runs it: {command_string}"
         );
-        let mut without = after.clone();
-        without["Window Settings"]
-            .as_object_mut()
-            .expect("an object")
-            .remove("KalaReach");
-        assert_eq!(without, before, "nothing else in the preferences moved");
+        assert_eq!(
+            without_the_entry(&domain),
+            before,
+            "nothing else in the preferences moved"
+        );
 
         assert_eq!(
             person
@@ -940,7 +1202,60 @@ mod terminal_app {
                 .expect("removes"),
             Removed::Removed
         );
-        assert_eq!(preferences(&domain), before);
+        assert_eq!(without_the_entry(&domain), before);
+        assert!(xml(&domain, "Window Settings.KalaReach").is_none());
+        assert!(person.record().profiles().expect("reads").is_empty());
+    }
+
+    /// An entry that holds data is read whole: one the person changes by a font or a colour is a
+    /// changed entry, left by a removal and named, and not one that is gone; and one of the
+    /// profiles' name that holds data and that kr did not write is refused and left as it is.
+    #[test]
+    fn an_entry_that_holds_data_is_changed_when_its_data_is_and_foreign_when_kr_did_not_write_it() {
+        let (person, domain) = person();
+        let command = command_in(person.tree.root());
+        person
+            .install(ProfileTerminal::AppleTerminal, &command)
+            .expect("installs");
+        edit(
+            &domain,
+            &[
+                "-replace",
+                "Window Settings.KalaReach.BackgroundColor",
+                "-data",
+                "AAEC",
+            ],
+        );
+        let recorded = person
+            .record()
+            .profiles()
+            .expect("reads")
+            .into_iter()
+            .find(|profile| profile.terminal == ProfileTerminal::AppleTerminal);
+        let status = profile::status(ProfileTerminal::AppleTerminal, &person.places(), recorded);
+        assert_eq!(status.standing, Some(profile::Standing::Changed));
+        let removed = person
+            .remove(ProfileTerminal::AppleTerminal)
+            .expect("removes");
+        assert!(matches!(removed, Removed::Changed { .. }), "{removed:?}");
+        assert_eq!(
+            raw(&domain, "Window Settings.KalaReach.BackgroundColor"),
+            "AAEC"
+        );
+        edit(&domain, &["-remove", "Window Settings.KalaReach"]);
+
+        let by_hand = r#"<dict><key>name</key><string>KalaReach</string><key>Font</key><data>AAEC</data></dict>"#;
+        edit(
+            &domain,
+            &["-insert", "Window Settings.KalaReach", "-xml", by_hand],
+        );
+        let entry_before = xml(&domain, "Window Settings.KalaReach");
+        let refused = person.install(ProfileTerminal::AppleTerminal, &command);
+        assert!(
+            matches!(refused, Err(ProfileError::ForeignProfile(_))),
+            "{refused:?}"
+        );
+        assert_eq!(xml(&domain, "Window Settings.KalaReach"), entry_before);
         assert!(person.record().profiles().expect("reads").is_empty());
     }
 
@@ -958,7 +1273,7 @@ mod terminal_app {
                 "Window Settings.KalaReach",
                 "-dictionary",
                 "-o",
-                &domain.with_extension("plist").display().to_string(),
+                &plist(&domain).display().to_string(),
             ],
         );
         let refused = person.install(ProfileTerminal::AppleTerminal, &command);
@@ -988,7 +1303,7 @@ mod terminal_app {
                 .expect("removes"),
             Removed::Default
         );
-        assert!(preferences(&domain)["Window Settings"]["KalaReach"].is_object());
+        assert!(xml(&domain, "Window Settings.KalaReach").is_some());
         assert_eq!(
             person.record().profiles().expect("reads").len(),
             1,
@@ -1013,7 +1328,7 @@ mod terminal_app {
             .remove(ProfileTerminal::AppleTerminal)
             .expect("removes");
         assert!(matches!(removed, Removed::Changed { .. }), "{removed:?}");
-        assert!(preferences(&domain)["Window Settings"]["KalaReach"].is_object());
+        assert!(xml(&domain, "Window Settings.KalaReach").is_some());
         assert!(person.record().profiles().expect("reads").is_empty());
         edit(&domain, &["-remove", "Window Settings.KalaReach"]);
 
@@ -1036,7 +1351,7 @@ mod terminal_app {
     fn preferences_with_no_profiles_are_refused_with_nothing_written() {
         let (person, domain) = person();
         edit(&domain, &["-remove", "Window Settings"]);
-        let before = preferences(&domain);
+        let before = std::fs::read(plist(&domain)).expect("preferences");
         let refused = person.install(
             ProfileTerminal::AppleTerminal,
             &command_in(person.tree.root()),
@@ -1045,7 +1360,68 @@ mod terminal_app {
             matches!(refused, Err(ProfileError::NoProfiles(_))),
             "{refused:?}"
         );
-        assert_eq!(preferences(&domain), before);
+        assert_eq!(std::fs::read(plist(&domain)).expect("preferences"), before);
+    }
+
+    /// Preferences that cannot be written are left as they are, and so is the record: an install
+    /// that could not write records nothing, and a removal that could not write keeps its entry,
+    /// and the next one finishes once the preferences can be written.
+    #[test]
+    fn preferences_that_cannot_be_written_are_left_and_so_is_the_record() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        /// Gives a directory its mode back when it goes, so the test's own tree can be removed.
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+
+        let (person, domain) = person();
+        if rustix::process::getuid().is_root() {
+            return;
+        }
+        let command = command_in(person.tree.root());
+        let folder = domain.parent().expect("a directory").to_path_buf();
+        let before = std::fs::read(plist(&domain)).expect("preferences");
+
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555))
+            .expect("read-only");
+        let restore = Restore(folder.clone());
+        let refused = person.install(ProfileTerminal::AppleTerminal, &command);
+        assert!(
+            matches!(refused, Err(ProfileError::ToolFailed { .. })),
+            "{refused:?}"
+        );
+        assert!(person.record().profiles().expect("reads").is_empty());
+        assert_eq!(std::fs::read(plist(&domain)).expect("preferences"), before);
+        drop(restore);
+
+        person
+            .install(ProfileTerminal::AppleTerminal, &command)
+            .expect("installs");
+        let installed = std::fs::read(plist(&domain)).expect("preferences");
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555))
+            .expect("read-only");
+        let restore = Restore(folder);
+        let failed = person.remove(ProfileTerminal::AppleTerminal);
+        assert!(
+            matches!(failed, Err(ProfileError::ToolFailed { .. })),
+            "{failed:?}"
+        );
+        assert_eq!(person.record().profiles().expect("reads").len(), 1);
+        assert_eq!(
+            std::fs::read(plist(&domain)).expect("preferences"),
+            installed
+        );
+        drop(restore);
+        assert_eq!(
+            person
+                .remove(ProfileTerminal::AppleTerminal)
+                .expect("finishes"),
+            Removed::Removed
+        );
     }
 
     /// A process called `Terminal` is the person's own Terminal running, and the command refuses a
@@ -1059,10 +1435,11 @@ mod terminal_app {
                 &command_in(person.tree.root()),
             )
             .expect("installs");
-        // A copy of `sleep` called Terminal stands in for the application.
+        // A link to `sleep` called Terminal stands in for the application: the system's own
+        // programs do not run as copies, and a process is named for the path it was started by.
         let stand_in = person.tree.root().join("running").join("Terminal");
         std::fs::create_dir_all(stand_in.parent().expect("a directory")).expect("a directory");
-        std::fs::copy("/bin/sleep", &stand_in).expect("a program");
+        std::os::unix::fs::symlink("/bin/sleep", &stand_in).expect("a link");
         let mut running = std::process::Command::new(&stand_in)
             .arg("600")
             .spawn()
@@ -1080,13 +1457,14 @@ mod terminal_app {
         running.kill().expect("ends the stand-in by its own handle");
         running.wait().expect("collects it");
         assert!(ready, "a process called Terminal is a running Terminal");
-        assert!(
-            !output.status.success(),
-            "{}",
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(String::from_utf8_lossy(&output.stderr).contains("is running"));
-        assert!(preferences(&domain)["Window Settings"]["KalaReach"].is_object());
+        assert!(!output.status.success(), "{said}");
+        assert!(said.contains("is running"), "{said}");
+        assert!(xml(&domain, "Window Settings.KalaReach").is_some());
         assert_eq!(
             person.record().profiles().expect("reads").len(),
             1,

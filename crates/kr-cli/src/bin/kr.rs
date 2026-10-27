@@ -1205,8 +1205,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                 Ok(Completion::Done)
             }
             HostCommand::TerminalProfile(arguments) => {
-                kr_cli::terminal_profile::run(&paths, &arguments, cli.json)?;
-                Ok(Completion::Done)
+                kr_cli::terminal_profile::run(&paths, &arguments, cli.json)
             }
             HostCommand::ImportJournals => kr_cli::import::run(&paths, cli.json),
             HostCommand::Install(install) => {

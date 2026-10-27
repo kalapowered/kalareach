@@ -26,6 +26,7 @@ use crate::cli::{
 };
 use crate::error::{CliError, Result};
 use crate::output::{self, Asked, Document, Request};
+use crate::report::Completion;
 use crate::stdout_line;
 
 /// What a profile's command runs after the program: the options that make each window a session of
@@ -61,12 +62,19 @@ const REFUSED: [(&str, &str); 7] = [
 ///
 /// Returns a usage failure for a terminal application this platform has no profile for or that is
 /// not installed, a refusal to write over a file that is not kr's, and a resource failure when the
-/// record or a file cannot be used.
-pub fn run(paths: &HostPaths, arguments: &TerminalProfileArguments, json: bool) -> Result<()> {
+/// record or a file cannot be used. A removal that took some profiles out and could not take out
+/// another has written its result already, and says so in the completion it returns.
+pub fn run(
+    paths: &HostPaths,
+    arguments: &TerminalProfileArguments,
+    json: bool,
+) -> Result<Completion> {
     let record = ProfileRecord::in_state_directory(paths.state_root());
     match &arguments.command {
-        TerminalProfileCommand::Status => status(paths, &record, json),
-        TerminalProfileCommand::Install(install) => install_profile(paths, &record, install, json),
+        TerminalProfileCommand::Status => status(paths, &record, json).map(|()| Completion::Done),
+        TerminalProfileCommand::Install(install) => {
+            install_profile(paths, &record, install, json).map(|()| Completion::Done)
+        }
         TerminalProfileCommand::Remove(remove) => remove_profiles(paths, &record, remove, json),
     }
 }
@@ -142,7 +150,10 @@ const fn how_to_choose(terminal: ProfileTerminal) -> &'static str {
             "open a window with `gnome-terminal --profile=KalaReach`, or choose KalaReach in \
              GNOME Terminal's File menu"
         }
-        ProfileTerminal::Ptyxis => "choose KalaReach in Ptyxis's new-tab menu",
+        ProfileTerminal::Ptyxis => {
+            "choose KalaReach in Ptyxis's new-tab menu, or open a tab with `ptyxis \
+             --tab-with-profile=<identifier>`, the identifier being the last part of the path above"
+        }
         ProfileTerminal::WindowsTerminal => {
             "open a window with `wt -p KalaReach`, or choose KalaReach in the new-tab menu"
         }
@@ -207,6 +218,8 @@ const fn standing_word(standing: Standing) -> &'static str {
         Standing::Matches => "matches",
         Standing::Changed => "changed",
         Standing::Missing => "missing",
+        Standing::Unlisted => "unlisted",
+        Standing::Unreadable => "unreadable",
     }
 }
 
@@ -407,6 +420,13 @@ fn status_line(status: &terminal_profile::Status) -> Shown {
         "matches" => Shown::said("the profile is written and unchanged"),
         "changed" => Shown::said("the profile was changed after kr wrote it"),
         "missing" => Shown::said("the profile kr wrote is gone"),
+        "unlisted" => Shown::said(
+            "the profile's settings are written, but it is not in the list the application \
+             reads its profiles from; install puts it back",
+        ),
+        "unreadable" => Shown::said(
+            "the profile could not be read, because the program that reads it did not answer",
+        ),
         _ => Shown::said("the profile is this terminal application's default"),
     };
     shown!("{}: {}; {}", name, installed, state)
@@ -537,6 +557,7 @@ fn install_profile(
             )
             .with("command", command_words(&plan.command))
             .with("default", false)
+            .with("roots_from_environment", roots_from_environment())
             .with("readiness", readiness.json()),
         );
         return Ok(());
@@ -565,8 +586,23 @@ fn install_profile(
         "  a window closes when its session ends, and the session goes on running when the window \
          is closed first: a profile that is the default starts a session for each window",
     ));
+    if roots_from_environment() {
+        output::say(&Shown::said(
+            "  KR_STATE_DIR or KR_RUNTIME_DIR is set here, and a window opened through the profile \
+             does not have it: that window uses the default roots, and remove finds this record \
+             only with the same variable set",
+        ));
+    }
     readiness.say();
     Ok(())
+}
+
+/// Whether this run's own roots come from the environment, which a window the emulator opens does
+/// not have.
+fn roots_from_environment() -> bool {
+    ["KR_STATE_DIR", "KR_RUNTIME_DIR"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
 }
 
 /// Takes out the profiles the record names, for one terminal application or for every one.
@@ -575,7 +611,7 @@ fn remove_profiles(
     record: &ProfileRecord,
     arguments: &TerminalProfileRemove,
     json: bool,
-) -> Result<()> {
+) -> Result<Completion> {
     let only = arguments
         .terminal
         .as_deref()
@@ -654,7 +690,8 @@ fn remove_profiles(
                 .with("dry_run", arguments.dry_run)
                 .with("profiles", documents),
         );
-        return failed.map_or(Ok(()), Err);
+        // The document is the result: a failure is reported by the exit status alone.
+        return Ok(failed.map_or(Completion::Done, Completion::Reported));
     }
     if results.is_empty() {
         output::say(&Shown::said(
@@ -676,7 +713,7 @@ fn remove_profiles(
             }
         }
     }
-    failed.map_or(Ok(()), Err)
+    Ok(failed.map_or(Completion::Done, Completion::Reported))
 }
 
 /// What a removal, or a dry run of one, came to for one profile.
@@ -701,6 +738,14 @@ impl RemovalReport {
                 (Some(Standing::Missing), _) => {
                     shown!("{}: the profile is already gone; would forget it", name)
                 }
+                (Some(Standing::Unlisted), _) => shown!(
+                    "{}: the profile is not in the application's list; would take out its settings",
+                    name
+                ),
+                (Some(Standing::Unreadable), _) => shown!(
+                    "{}: the profile could not be read; would take nothing out and keep the record",
+                    name
+                ),
                 _ => shown!(
                     "{}: the profile was changed after kr wrote it; would leave it and forget it",
                     name
@@ -711,10 +756,11 @@ impl RemovalReport {
             Self::Did(Removed::AlreadyGone) => {
                 shown!("{}: the profile was already gone", name)
             }
-            Self::Did(Removed::Changed { .. }) => shown!(
-                "{}: left the profile: it was changed after kr wrote it, so it is no longer kr's \
-                 to remove",
-                name
+            Self::Did(Removed::Changed { left_at }) => shown!(
+                "{}: left the profile at {}: it was changed after kr wrote it, so it is no longer \
+                 kr's to remove",
+                name,
+                Shown::root(Path::new(left_at))
             ),
             Self::Did(Removed::Default) => shown!(
                 "{}: left the profile, which is the application's default; choose another default \
@@ -817,8 +863,8 @@ fn failure(error: &ProfileError, home: &ProfileHome) -> CliError {
         )),
         ProfileError::Running(terminal) => CliError::Usage(shown!(
             "{} is running, and what an outside change to its preferences does while it runs is \
-             not known; quit {}, and run this from another application, an SSH session or the \
-             setup assistant. Nothing was written",
+             not known; quit {}, and run this from another application or an SSH session. Nothing \
+             was changed",
             Shown::said(terminal.name()),
             Shown::said(terminal.name())
         )),
@@ -833,17 +879,33 @@ fn failure(error: &ProfileError, home: &ProfileHome) -> CliError {
              nothing was written",
             Shown::said(terminal.name())
         )),
-        ProfileError::ToolFailed { terminal, status } => CliError::Other(match status {
-            Some(status) => shown!(
-                "gsettings failed (exit status {}) while kr read or wrote {}'s profile",
-                *status,
-                Shown::said(terminal.name())
-            ),
-            None => shown!(
-                "gsettings failed or gave no answer while kr read or wrote {}'s profile",
-                Shown::said(terminal.name())
-            ),
-        }),
+        ProfileError::ToolFailed { terminal, status } => {
+            let tool = if *terminal == ProfileTerminal::AppleTerminal {
+                "defaults or plutil"
+            } else {
+                "gsettings"
+            };
+            CliError::Other(match status {
+                Some(status) => shown!(
+                    "{} failed (exit status {}) while kr read or wrote {}'s profile",
+                    Shown::said(tool),
+                    *status,
+                    Shown::said(terminal.name())
+                ),
+                None => shown!(
+                    "{} failed or gave no answer while kr read or wrote {}'s profile; what is \
+                     recorded is kept",
+                    Shown::said(tool),
+                    Shown::said(terminal.name())
+                ),
+            })
+        }
+        ProfileError::DefaultUnknown { terminal, place } => CliError::Other(shown!(
+            "{} does not read, so which profile {} opens by default is not known and the profile \
+             was left; correct or move aside that file, and run this again",
+            Shown::root(place),
+            Shown::said(terminal.name())
+        )),
         ProfileError::SchemaAbsent(terminal) => CliError::Usage(shown!(
             "{}'s settings schema is not installed, so there is no profile to write; nothing was \
              written",
@@ -867,8 +929,8 @@ fn failure(error: &ProfileError, home: &ProfileHome) -> CliError {
             Shown::said(terminal.name())
         )),
         ProfileError::ListBusy(terminal) => CliError::Other(shown!(
-            "{}'s list of profiles changed each time kr tried to write it; nothing of the profile \
-             was left, and running this again tries again",
+            "{}'s list of profiles changed each time kr tried to write it; nothing was changed, and \
+             running this again tries again",
             Shown::said(terminal.name())
         )),
         ProfileError::Io { place, source } => {
