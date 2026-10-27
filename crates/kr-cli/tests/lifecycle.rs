@@ -4983,6 +4983,22 @@ impl HeadlessEmulator {
         }
     }
 
+    /// Fails the case, with what was printed, if the script ended with a failure.
+    fn assert_running_or_ended_cleanly(&self) {
+        if let Some(status) = self
+            .child
+            .borrow_mut()
+            .try_wait()
+            .expect("the script's state")
+        {
+            assert!(
+                status.success(),
+                "the script that runs the emulator ended with {status}:\n{}",
+                std::fs::read_to_string(&self.log).unwrap_or_default()
+            );
+        }
+    }
+
     /// Fails the case, with what was printed, if the script ended: it waits at its gates until the
     /// case lets it go, so an end before then means the profile or a window did not come up.
     fn assert_running(&self) {
@@ -5082,6 +5098,7 @@ fn windows_through_the_profile_create_a_session_each(
         .expect("copies the program");
     }
     let (first, second) = (host.work.join("go-on"), host.work.join("finish"));
+    let removal = host.work.join("removal.json");
     let kr = quoted(&program_directory.join("kr"));
     let stand_in = host.root().join("scope-stand-in");
     let search_path = if without_a_scope_manager {
@@ -5110,9 +5127,11 @@ fn windows_through_the_profile_create_a_session_each(
          {open_first}\n\
          cat {first} >/dev/null\n\
          {open_second}\n\
-         cat {second} >/dev/null\n",
+         cat {second} >/dev/null\n\
+         {kr} host terminal-profile remove --json >{removal}\n",
         first = quoted(&first),
         second = quoted(&second),
+        removal = quoted(&removal),
     );
     let emulator = HeadlessEmulator::start(&host, &script);
     let live = |wanted: usize| -> Vec<Value> {
@@ -5178,6 +5197,16 @@ fn windows_through_the_profile_create_a_session_each(
         assert_eq!(worker_exit_status(worker), 0);
     }
     release(&second);
+    // The profile the application has opened windows through is still the one kr wrote: a removal,
+    // run in the application's own session, takes it out.
+    let removed: Value = until("the removal the script runs", || {
+        emulator.assert_running_or_ended_cleanly();
+        std::fs::read_to_string(&removal)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+    });
+    assert_eq!(removed["ok"], true, "{removed}");
+    assert_eq!(removed["profiles"][0]["result"], "removed", "{removed}");
 }
 
 /// KR-REQ-01.21, KR-REQ-07.42: a real GNOME Terminal opens a window and then a tab through the
