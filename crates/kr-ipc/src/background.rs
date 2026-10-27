@@ -12,18 +12,19 @@
 //! | --- | --- | --- |
 //! | Windows | the idle priority class of the process | very low I/O priority of the process |
 //! | macOS | the caller's own (this module sets none) | the throttled disk policy of the process |
-//! | Linux | the caller's own (this module sets none) | the lowest best-effort level of the calling thread, which threads it starts afterwards inherit |
+//! | Linux | the caller's own (this module sets none) | the idle class of the calling thread, which threads it starts afterwards inherit |
 //! | the remaining platforms | none | none |
 //!
-//! The Linux class is the lowest level of the best-effort class and not the idle class. A model's
-//! files are read once, at load, under a deadline, and the idle class makes each request of that
-//! read wait for a quiet disk: the kernel's deadline scheduler lets an idle request wait ten
-//! seconds by default before it serves it, and the budget fair queueing scheduler gives it a
-//! bounded share. A load that is a long run of faults, each held for that long, could miss its
-//! deadline on a disk that other work keeps busy. The best-effort class keeps a request in the queue
-//! of ordinary work. How far its lowest level yields depends on the scheduler: the budget fair
-//! queueing scheduler gives it the smallest weight, and the deadline scheduler keeps no level
-//! inside a class, so the class changes nothing there.
+//! The Linux class is the idle class. A model's files are read once, at load, and a resident model
+//! does no I/O after it, so the load is the only read the class touches. The idle class serves a
+//! request after the requests of the other classes: the kernel's deadline scheduler (`mq-deadline`)
+//! serves an idle request once it has aged past a bound, ten seconds by default, and the budget fair
+//! queueing scheduler gives the idle class a bounded share. The best-effort class would give the
+//! reads nothing that sets them apart from the owner's: under `mq-deadline` it has no levels, so
+//! even its lowest level is the same as the owner's. A load that a busy disk delays past its
+//! deadline ends as a load that did not finish, and the session then shows the delayed or stale
+//! description that section 22 already gives when demand exceeds capacity. The cost falls on that
+//! description and not on the terminal.
 //!
 //! Windows has a background mode for a process (`PROCESS_MODE_BACKGROUND_BEGIN`) that lowers the
 //! CPU, I/O and memory priority together, and this module does not use it: on Windows Server 2025
@@ -34,15 +35,16 @@
 //! measures it. The idle priority class and the very low I/O priority are set on their own and
 //! leave the working set alone.
 //!
-//! The system applies an I/O class only through the I/O scheduler that serves the disk. A scheduler
-//! that ignores priorities (the `none` scheduler of most NVMe disks) keeps the class and acts on
-//! nothing, so the read-back says what the system holds and not that a disk obeys it.
+//! The system applies an I/O class only through the I/O scheduler that serves the disk. Under the
+//! `none` scheduler of most NVMe disks no I/O class has an effect: the class is kept and acts on
+//! nothing, so only the processor class lowers the model's share there, and the read-back says what
+//! the system holds and not that a disk obeys it.
 
 /// An I/O class, by what the system reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IoClass {
-    /// Linux: the best-effort class at its lowest level.
-    BestEffortLowest,
+    /// Linux: the idle class.
+    Idle,
     /// macOS: the throttled disk policy.
     Throttled,
     /// Windows: the very low I/O priority.
@@ -149,27 +151,26 @@ mod platform {
 
     /// `IOPRIO_WHO_PROCESS`: the target is a thread, and zero is the calling thread.
     const WHO_PROCESS: libc::c_int = 1;
-    /// `IOPRIO_CLASS_BE`, the best-effort class.
-    const CLASS_BEST_EFFORT: libc::c_int = 2;
+    /// `IOPRIO_CLASS_IDLE`, the idle class.
+    const CLASS_IDLE: libc::c_int = 3;
     /// The shift of the class in the value the system takes.
     const CLASS_SHIFT: libc::c_int = 13;
-    /// The lowest level a best-effort thread can have.
-    const LOWEST_LEVEL: libc::c_int = 7;
 
-    const LOWEST: libc::c_int = (CLASS_BEST_EFFORT << CLASS_SHIFT) | LOWEST_LEVEL;
+    /// The value the system takes for the idle class, which has no level.
+    const IDLE: libc::c_int = CLASS_IDLE << CLASS_SHIFT;
 
     pub(super) fn lower_io_class() -> std::result::Result<IoClass, Refusal> {
         // SAFETY: the call takes three integers and changes the I/O priority of the calling
         // thread; it reads no memory of this process.
-        let set = unsafe { libc::syscall(libc::SYS_ioprio_set, WHO_PROCESS, 0, LOWEST) };
+        let set = unsafe { libc::syscall(libc::SYS_ioprio_set, WHO_PROCESS, 0, IDLE) };
         if set != 0 {
-            return Err("this host refused the lowest best-effort I/O level");
+            return Err("this host refused the idle I/O class");
         }
-        io_class().ok_or("this host did not report the I/O level it was given")
+        io_class().ok_or("this host did not report the I/O class it was given")
     }
 
     pub(super) fn io_class() -> Option<IoClass> {
-        (raw() == libc::c_long::from(LOWEST)).then_some(IoClass::BestEffortLowest)
+        (raw() == libc::c_long::from(IDLE)).then_some(IoClass::Idle)
     }
 
     /// The I/O priority of the calling thread as the system numbers it, or -1.
@@ -490,8 +491,8 @@ mod tests {
         })
         .join()
         .expect("the thread ends");
-        assert_eq!(lowered.0.0, Ok(IoClass::BestEffortLowest));
-        assert_eq!(lowered.0.1, Some(IoClass::BestEffortLowest));
+        assert_eq!(lowered.0.0, Ok(IoClass::Idle));
+        assert_eq!(lowered.0.1, Some(IoClass::Idle));
         assert_eq!(lowered.1, None, "and the class is put back");
 
         // A thread started by a thread that lowered its class has the class it was started with.
@@ -503,7 +504,7 @@ mod tests {
         })
         .join()
         .expect("the thread ends");
-        assert_eq!(inherited, Some(IoClass::BestEffortLowest));
+        assert_eq!(inherited, Some(IoClass::Idle));
     }
 
     /// The process's own disk policy is set and read back, and put back as it was found, so the

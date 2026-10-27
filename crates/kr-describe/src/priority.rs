@@ -18,7 +18,7 @@
 //!
 //! | Platform | CPU | IO |
 //! | --- | --- | --- |
-//! | Linux | `SCHED_BATCH` with niceness 19, on the calling thread and the threads it starts, which is the scheduler class for non-interactive work | the lowest level of the best-effort class, on the calling thread and the threads it starts |
+//! | Linux | `SCHED_BATCH` with niceness 19, on the calling thread and the threads it starts, which is the scheduler class for non-interactive work | the idle class, on the calling thread and the threads it starts |
 //! | macOS | the lowest ordinary thread priority of the calling thread | the throttled disk policy of the process |
 //! | Windows | the idle priority class of the whole process | very low, for the whole process |
 //! | the other Unix systems | the lowest ordinary thread priority, where the thread-priority library gives one, and a reported refusal where it does not | none |
