@@ -133,6 +133,11 @@ struct OwedNow {
     /// Whether every live owner device of this host is among them (named, or by its pairing
     /// grant), so that revoking what is named would leave no way to pair another owner device.
     every_owner: bool,
+    /// Whether the host may still be behind its feed: it is, or it reads a feed that no scan of
+    /// this run has read through, so that a restart has not yet compared the registry with it. The
+    /// steps that remove the record are not given then, since a host that starts below its feed
+    /// finds the restore again and writes a new record.
+    catching_up: bool,
 }
 
 /// Names a target in a refusal.
@@ -234,7 +239,15 @@ fn the_refusal_while_the_wait_is_owed(
                      the rest",
                 );
             }
-            if owed.every_owner {
+            if owed.every_owner && owed.catching_up {
+                said.push_str(
+                    "; these are every owner device of this host, so do not revoke all of them, \
+                     and do not remove the record of the restore yet: this host has not caught \
+                     up with its authority feed, and a record removed before it has is written \
+                     again at the next start. The steps that keep an owner device are given \
+                     once it has caught up",
+                );
+            } else if owed.every_owner {
                 said.push_str("; ");
                 said.push_str(&the_way_that_keeps_an_owner(file));
             }
@@ -627,7 +640,17 @@ impl Controller {
             named,
             full: full_in_memory || held_count >= most,
             every_owner,
+            catching_up: self.may_be_catching_up(),
         })
+    }
+
+    /// Whether this host may be behind its feed: it knows it is, or it reads a feed that no scan of
+    /// this run has read through. A host that reads no feed, or whose feed removed it, is not.
+    fn may_be_catching_up(&self) -> bool {
+        self.policy().behind_its_feed()
+            || self
+                .feed_runtime()
+                .is_some_and(|feed| !feed.has_read_the_feed_through())
     }
 
     /// A feed that removed this host is read no more, so a pass that found the registry behind it
@@ -721,6 +744,7 @@ impl Controller {
         // The steps that remove the record come only once the host has caught up with its feed: a
         // record removed before that is written again at the next start.
         let behind = policy.behind_its_feed();
+        let not_compared = !behind && self.may_be_catching_up();
         if behind {
             detail = detail.stated(
                 "; this host is still catching up with its authority feed, so the policy it \
@@ -761,10 +785,11 @@ impl Controller {
                 } else {
                     detail
                 };
-                if owed.every_owner && behind {
+                if owed.every_owner && (behind || not_compared) {
                     detail.stated(
                         "; these are every owner device of this host, so do not revoke all of \
-                         them: the steps that keep one are given once the host has caught up",
+                         them: the steps that keep one are given once a scan of this run has read \
+                         the authority feed through and the host has caught up with it",
                     )
                 } else if owed.every_owner {
                     detail.stated(
@@ -786,7 +811,7 @@ impl Controller {
             detail,
             // The steps that keep an owner device come first: the detail says the remedy gives them
             // whenever the list names every owner device, a record that cannot be read included.
-            Some(if behind {
+            Some(if behind || (not_compared && every_owner) {
                 BEHIND_REMEDY
             } else if every_owner {
                 OWNER_ROUTE_REMEDY

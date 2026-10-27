@@ -7130,10 +7130,10 @@ whose barrier never completes stays pending there.
 When the list names every live owner device, revoking what it names would leave a host that cannot
 pair another owner device: pairing waits for an owner device's confirmation, which the wait refuses,
 and the terminal confirms nothing on an owned host. The refusal and `kr doctor` detect this state and
-give the steps that keep one once the host has caught up with its feed. While it is behind, a
-record removed by hand is written again at the next start, so the refusal and the doctor say what
-keeps the catch-up from ending (the registry cannot take a write, or the record cannot be written:
-check the disk and the permissions of the state directory) and give no route. The refusal gives the
+give the steps that keep one once the host has caught up with its feed. While it is behind, or
+after a start and before a scan of that run has read the feed through, a record removed by hand is
+written again at the next start, so the refusal and the doctor say what keeps the catch-up from
+ending and give no route. The refusal gives the
 record's full path in both states, and the doctor names the file, `restored-policy.cbor`. Revoke every other device and share the list names, with `kr device revoke`
 and `kr share revoke`, but not the last owner device. Stop the daemon. Remove the record's file by
 hand. Start the daemon, which then waits for nothing and checks nothing else on the list: that is

@@ -7474,6 +7474,93 @@ async fn when_every_owner_device_is_owed_the_route_in_the_refusal_keeps_an_owner
         .expect("the new owner device is served once the kept one is gone");
 }
 
+/// KR-REQ-24.15: after a restart, before this run has compared its registry with its feed, the
+/// doctor and the confirmation do not give the steps that remove the record: a host that starts
+/// below its feed finds the restore again and writes a new record, whatever the retained one owes.
+/// The steps come once this run's scan has read the feed through and the host has caught up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn before_this_run_has_compared_its_feed_the_route_that_keeps_an_owner_is_not_given() {
+    let rig = Rig::start().await;
+    let revoked = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.until_the_carrier_is_idle().await;
+    let earlier = a_copy_of_the_registry(&rig.host, "registry-earlier.sqlite3");
+    let request = rig
+        .owner_publishes(0xb1, devices(revoked.1.device_id))
+        .await;
+    rig.poll().await;
+    rig.until_the_revocation_is_acknowledged(&request).await;
+    let kept = rig.owner_device();
+    // A request by a key the host does not know that names the only owner device.
+    let key = AuthorisationKeyPair::generate().expect("a key");
+    let naming_the_owner = rig.request_of(
+        &key,
+        DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([0x0f; 16])),
+        0xd1,
+        devices(kept),
+    );
+    rig.published_as(&key, &naming_the_owner).await;
+
+    // A first run finds a restore and writes down that the only owner device is owed.
+    let rig = rig.restarted(false, a_restore_was_found).await;
+    rig.until_the_carrier_is_idle().await;
+    rig.until_the_carrier_is_idle().await;
+    assert!(
+        rig.what_the_record_lists()
+            .contains(&restored::Target::Device(kept)),
+        "the record owes the only owner device"
+    );
+
+    // The registry is put back below the feed and the next run's first read cannot complete.
+    let reads = rig.arrivals("read");
+    rig.served
+        .web()
+        .fail_with_member(AUTHORITY, "read", 1, Moment::Hold);
+    let rig = rig
+        .restarted(false, |tree| put_the_registry_back(tree, &earlier))
+        .await;
+    rig.until_arrivals("read", reads + 1).await;
+    let file = restored::file_beside(&rig.host.tree().environment().registry_database());
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&kept.to_string())
+            && !refused.message.contains(&file.display().to_string()),
+        "the refusal names what is owed and gives no route before the first comparison: {refused:?}"
+    );
+    let check = rig
+        .the_restored_policy_check()
+        .await
+        .expect("the doctor says the host waits");
+    assert!(
+        check
+            .remedy()
+            .is_some_and(|remedy| !remedy.contains("pair a new owner device")
+                && remedy.contains("restored-policy.cbor")),
+        "the doctor warns against removing the record and gives no steps: {:?}",
+        check.remedy()
+    );
+
+    // The read completes, the host catches up, and the steps that keep an owner come.
+    rig.served.web().release_held();
+    rig.until_the_carrier_is_idle().await;
+    rig.until_the_carrier_is_idle().await;
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&file.display().to_string()),
+        "the refusal gives the route and the record's full path once the host has caught up: {refused:?}"
+    );
+    let check = rig
+        .the_restored_policy_check()
+        .await
+        .expect("the doctor says the host waits");
+    assert!(
+        check
+            .remedy()
+            .is_some_and(|remedy| remedy.contains("pair a new owner device")),
+        "and the doctor gives the steps: {:?}",
+        check.remedy()
+    );
+}
+
 /// KR-REQ-24.15: a record that cannot be read, with every owner device owed from what the run met,
 /// gets the remedy its detail promises: the doctor says the remedy gives the steps that keep an
 /// owner device only when the remedy does.
