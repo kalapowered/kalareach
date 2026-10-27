@@ -6,9 +6,12 @@
 //! application's preferences window and with anything else that edits it, and the settings
 //! database has no compare-and-set. A write of the list is therefore read before, read again just
 //! before, written, and read back by another process; any change in between, and any element
-//! missing afterwards, starts it over, up to a bound. The one interleaving that remains is another
-//! writer landing between the last read and the write, which costs the profile its entry in the
-//! list and no more: the profile's keys are kr's own and survive it.
+//! missing afterwards, starts it over, up to a bound. Two interleavings remain, and both are named
+//! limits. Another writer landing between the last read and the write is overwritten by it: an
+//! element it added is lost from the list, or one it took out comes back. And a writer working
+//! from a read it made before this one wrote, landing after the read back, can overwrite the list
+//! and cost the profile its entry in it (or, in a removal, put the identifier back). The profile's
+//! keys are kr's own and survive both, and a removal takes the keys of an unlisted profile out.
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -53,6 +56,16 @@ impl Gsettings {
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         let mut child = command.spawn().map_err(|_| ToolFailure::Missing)?;
+        // What the program prints is read as it runs: one that prints more than a pipe holds would
+        // otherwise wait for a reader until its limit.
+        let reader = child.stdout.take().map(|mut stdout| {
+            std::thread::spawn(move || {
+                use std::io::Read as _;
+                let mut printed = Vec::new();
+                let _ = stdout.read_to_end(&mut printed);
+                printed
+            })
+        });
         let started = Instant::now();
         let status = loop {
             match child.try_wait() {
@@ -67,11 +80,10 @@ impl Gsettings {
                 }
             }
         };
-        let mut printed = String::new();
-        if let Some(mut stdout) = child.stdout.take() {
-            use std::io::Read as _;
-            let _ = stdout.read_to_string(&mut printed);
-        }
+        let printed = reader
+            .and_then(|reader| reader.join().ok())
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default();
         if status.success() {
             Ok(printed.trim().to_owned())
         } else {
@@ -107,12 +119,18 @@ impl Gsettings {
         Ok(known)
     }
 
-    /// The keys of a schema.
-    fn keys(&self, schema: &str) -> Result<Vec<String>, ToolFailure> {
+    /// Every key of a schema at a path, with its value, in the text `gsettings` prints values in:
+    /// one call for the whole profile.
+    fn dump(&self, target: &str) -> Result<Vec<(String, String)>, ToolFailure> {
         Ok(self
-            .run(&["list-keys", schema])?
+            .run(&["list-recursively", target])?
             .lines()
-            .map(|line| line.trim().to_owned())
+            .filter_map(|line| {
+                // `schema key value`, the value being the rest of the line.
+                let mut parts = line.splitn(3, ' ');
+                let (_, key, value) = (parts.next()?, parts.next()?, parts.next()?);
+                Some((key.to_owned(), value.to_owned()))
+            })
             .collect())
     }
 }
@@ -339,6 +357,11 @@ pub(super) struct SettingsPlan {
     pub gsettings: Gsettings,
     pub uuid: String,
     pub wrote: SettingsWrote,
+    /// The keys of the profile kr wrote earlier, which are in place now and which a write that
+    /// fails puts back; `None` where there is no profile to put back.
+    pub previous: Option<Vec<RecordedKey>>,
+    /// Whether the profile is already in the shared list, so that a failed write leaves it there.
+    pub listed_before: bool,
 }
 
 /// Works out the install, and refuses what it must not write beside.
@@ -407,34 +430,51 @@ pub(super) fn plan(
             member: uuid.clone(),
         },
     };
+    let listed_before = list.contains(&uuid);
     Ok(SettingsPlan {
         spec,
         gsettings: gsettings.clone(),
         uuid,
         wrote,
+        previous: None,
+        listed_before,
     })
 }
 
 /// Carries out the plan: the profile's keys first, then its place in the shared list, and a read
-/// back by another process of both. A write that does not hold takes itself back.
+/// back by another process of both. A write that does not hold takes itself back: the keys go back
+/// to what they were (the values of the profile kr wrote earlier, or unset), and the profile leaves
+/// the list unless it was in it before.
 ///
 /// # Errors
 ///
-/// Returns why the profile is not written and whether anything of it may be left in the shared
-/// list, which a failure of the cleanup itself can leave there.
+/// Returns why the profile is not written and whether anything of it may be left that could not be
+/// taken back, which the caller then keeps the record's entry for, so that a removal can finish
+/// the job.
 pub(super) fn write(plan: &SettingsPlan) -> Result<(), (ProfileError, bool)> {
     let spec = &plan.spec;
     let gsettings = &plan.gsettings;
     let target = format!("{}:{}", plan.wrote.schema, plan.wrote.path);
+    // Puts every key back, and says whether each one is. A key that cannot be put back does not
+    // stop the others.
     let undo = || {
+        let mut all_back = true;
         for key in &plan.wrote.keys {
-            let _ = gsettings.reset(&target, &key.key);
+            let before = plan
+                .previous
+                .as_ref()
+                .and_then(|previous| previous.iter().find(|earlier| earlier.key == key.key));
+            let back = match before {
+                Some(earlier) => gsettings.set(&target, &key.key, &earlier.value),
+                None => gsettings.reset(&target, &key.key),
+            };
+            all_back &= back.is_ok();
         }
+        all_back
     };
     for key in &plan.wrote.keys {
         if let Err(failure) = gsettings.set(&target, &key.key, &key.value) {
-            undo();
-            return Err((tool(failure, spec), false));
+            return Err((tool(failure, spec), !undo()));
         }
     }
     // Read back by a process of its own: a backend that keeps a write only in the process that
@@ -444,17 +484,16 @@ pub(super) fn write(plan: &SettingsPlan) -> Result<(), (ProfileError, bool)> {
             .get(&target, &key.key)
             .is_ok_and(|read| same_value(&read, &key.value));
         if !held {
-            undo();
-            return Err((ProfileError::NotPersisted(spec.terminal), false));
+            return Err((ProfileError::NotPersisted(spec.terminal), !undo()));
         }
     }
     if let Err(error) = change_list(gsettings, spec, &plan.uuid, true) {
         // The write of the list may have landed before it failed to read back: the identifier is
-        // taken out again, and if that fails too the caller keeps the record's entry, so that a
-        // removal can finish the job.
-        let cleaned = change_list(gsettings, spec, &plan.uuid, false).is_ok();
-        undo();
-        return Err((error, !cleaned));
+        // taken out again, unless it was in the list before this write, and if that fails too the
+        // caller keeps the record's entry.
+        let cleaned = plan.listed_before || change_list(gsettings, spec, &plan.uuid, false).is_ok();
+        let restored = undo();
+        return Err((error, !(cleaned && restored)));
     }
     Ok(())
 }
@@ -520,34 +559,58 @@ pub(super) enum Reading {
 }
 
 /// Reads where a recorded profile stands.
-pub(super) fn read(gsettings: &Gsettings, spec: Spec, wrote: &SettingsWrote) -> Reading {
+///
+/// Every key kr wrote must have the value it wrote and every other key of the profile must be
+/// unset, or the profile has changed. A profile that is not in the list the application reads is
+/// out of the person's sight, and one whose keys are some of kr's and the rest unset (an install
+/// or a removal that was cut short) is read as unchanged, so that a removal can finish it.
+///
+/// # Errors
+///
+/// Returns the failure of `gsettings`: a profile that cannot be read is not one that has changed or
+/// is gone.
+pub(super) fn read(
+    gsettings: &Gsettings,
+    spec: Spec,
+    wrote: &SettingsWrote,
+) -> Result<Reading, ProfileError> {
     let target = format!("{}:{}", wrote.schema, wrote.path);
     let unused = format!("{}:{}", wrote.schema, unused_path(&spec));
-    let in_list = profiles(gsettings, &spec)
-        .map(|list| list.contains(&wrote.list.member))
-        .unwrap_or(false);
-    let Ok(keys) = gsettings.keys(&wrote.schema) else {
-        return Reading::Changed;
-    };
+    let in_list = profiles(gsettings, &spec)?.contains(&wrote.list.member);
+    let values = gsettings
+        .dump(&target)
+        .map_err(|failure| tool(failure, &spec))?;
+    let defaults = gsettings
+        .dump(&unused)
+        .map_err(|failure| tool(failure, &spec))?;
     let mut ours_match = true;
     let mut ours_default = true;
+    let mut ours_kr_s_or_unset = true;
     let mut others_default = true;
-    for key in &keys {
-        let Ok(value) = gsettings.get(&target, key) else {
-            return Reading::Changed;
-        };
-        let Ok(default) = gsettings.get(&unused, key) else {
-            return Reading::Changed;
-        };
+    for (key, value) in &values {
+        let unset = defaults
+            .iter()
+            .find(|(other, _)| other == key)
+            .is_some_and(|(_, default)| same_value(value, default));
         match wrote.keys.iter().find(|written| written.key == *key) {
             Some(written) => {
-                ours_match &= same_value(&value, &written.value);
-                ours_default &= same_value(&value, &default);
+                let ours = same_value(value, &written.value);
+                ours_match &= ours;
+                ours_default &= unset;
+                ours_kr_s_or_unset &= ours || unset;
             }
-            None => others_default &= same_value(&value, &default),
+            None => others_default &= unset,
         }
     }
-    if ours_default && others_default {
+    // A key kr wrote that the schema does not list is one that is not kept.
+    for written in &wrote.keys {
+        if !values.iter().any(|(key, _)| *key == written.key) {
+            ours_match = false;
+            ours_default = false;
+            ours_kr_s_or_unset = false;
+        }
+    }
+    Ok(if ours_default && others_default {
         // Nothing of the profile's own is set: gone, unless its place in the list is left over,
         // which a removal takes out.
         if in_list {
@@ -555,16 +618,24 @@ pub(super) fn read(gsettings: &Gsettings, spec: Spec, wrote: &SettingsWrote) -> 
         } else {
             Reading::Gone
         }
-    } else if ours_match && others_default {
+    } else if others_default && (ours_match || (!in_list && ours_kr_s_or_unset)) {
         Reading::Unchanged { in_list }
     } else {
         Reading::Changed
-    }
+    })
 }
 
 /// Whether the recorded profile is the application's default.
-pub(super) fn is_default(gsettings: &Gsettings, spec: Spec, wrote: &SettingsWrote) -> bool {
-    default_profile(gsettings, &spec).is_ok_and(|default| default == wrote.list.member)
+///
+/// # Errors
+///
+/// Returns the failure of `gsettings`: what cannot be read is not taken to be no default.
+pub(super) fn is_default(
+    gsettings: &Gsettings,
+    spec: Spec,
+    wrote: &SettingsWrote,
+) -> Result<bool, ProfileError> {
+    Ok(default_profile(gsettings, &spec)? == wrote.list.member)
 }
 
 /// Takes an unchanged profile out: its keys are reset and its identifier leaves the shared list.
