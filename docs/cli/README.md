@@ -684,7 +684,9 @@ own environment, and a later `remove` finds the record only with the same variab
 
 `install` takes the identifiers of the platform it runs on and an application that is installed. A
 dry run shows what would be written and writes nothing. An application installed as a Flatpak or a
-Snap keeps its profiles elsewhere and is not found. A watched folder that is a link to another file
+Snap keeps its profiles in folders of its own, which `install` does not write to: a Flatpak is not
+found, and a Snap whose program is on the `PATH` is found and given a profile that it does not
+read. A watched folder that is a link to another file
 system makes `install` and `remove` fail with nothing written, because the file is built beside the
 folder's parent and moved in.
 
@@ -704,7 +706,7 @@ installed and what state its profile is in:
 | `changed` | altered after `kr` wrote it |
 | `missing` | the profile `kr` wrote is gone |
 | `unlisted` | its settings are written, and it is not in the list the application reads its profiles from |
-| `unreadable` | the program that reads it, `gsettings`, `defaults` or `plutil`, did not answer |
+| `unreadable` | the program that reads it, `gsettings`, `defaults` or `plutil`, did not answer; or the application's settings schema is gone (it was uninstalled), a file that is there does not read, or the settings that name the default do not |
 | `default` | the profile `kr` wrote is the application's default |
 | `foreign` | a profile named `KalaReach` that `kr` did not write, left alone |
 
@@ -736,12 +738,19 @@ of the person's shell is installed, and how `kr new` starts the control daemon.
 These are usage failures (exit 2). A failure of `gsettings`, `defaults` or `plutil`, of the record or
 of a file exits 1. `--dry-run` skips the check for a running Terminal.
 
-An install that fails after it began writes nothing that stays. For GNOME Terminal and Ptyxis the
-keys go back to what they were, which for an install again is the profile `kr` wrote before. For
-Terminal the preferences are read again by another process, and an entry that is not as written, or
-any other change in them, puts the whole preferences domain back as it was before the write. For a
-file, an install again over a profile the person saved to since the install was planned does not
-overwrite it: the person's file is put back and the install fails as a changed profile.
+An install that fails after it began writing takes back what it wrote. For GNOME Terminal and
+Ptyxis the keys go back to what they were, which for an install again is the profile `kr` wrote
+before, and a profile that was in the list stays in it. For Terminal the preferences are read again
+by another process, and an entry that is not as written, or another profile that moved, puts this
+entry back as it was before the write (the entry, or none) and touches nothing else. For a file, an
+install again over a profile the person saved to since the install was planned does not overwrite
+it: the person's file is put back and the install fails as a changed profile. Terminal's entry is
+checked against the record again on the preferences as they are when the write is made, so an entry
+of the name that appeared after the plan is not written over either. When the settings service or
+`defaults` stops answering during the install, so that even taking the write back fails, the profile
+may hold what it held before or what was to be written, or for GNOME Terminal and Ptyxis some of
+each: the record then keeps both, so the profile still reads as `kr`'s, `status` does not call it
+changed, and `install` or `remove` run again finishes the job.
 
 `install` records what it will write in `terminal-profiles.json` in the installation's state
 directory before it writes anything: for a file its path and its SHA-256, for settings the keys and
@@ -755,16 +764,22 @@ record until another default is chosen. None of these is an error. A profile tha
 is none of them: if `gsettings`, `defaults` or `plutil` does not answer, or a Windows Terminal
 settings file is there and does not read, so that it is not known whether the profile is the
 default, the removal fails and the record keeps the entry, and a removal run again finishes the
-job. A profile that is not in the application's list is out of the person's sight: `remove` takes
+job. An application whose settings schema was uninstalled cannot be read through `gsettings`: `status`
+says `unreadable`, and a removal says so and keeps the entry; install the application again and run
+the removal, or take the profile's settings and its place in the list out of the settings database
+by hand (`dconf`, which needs no schema). A profile that is not in the application's list is out of
+the person's sight: `remove` takes
 its settings out, and `install` puts it back in the list.
 
 `remove` without an application takes out every profile in the record, and `--dry-run` says what
 each would come to. A record of a later format, or one that cannot be read, is left as it is and
 named, and nothing is written. `install` and `remove` hold the writers' lock the update takes, and a
 release that reads the record at another version refuses them before anything is written. A
-removal of Terminal's profile writes the dictionary of profiles without the entry, reads it back by
-another process, and puts the whole preferences domain back as it was if the result is not what it
-meant.
+removal of Terminal's profile checks the entry and the default again on one read of the
+preferences, writes the dictionary of profiles without the entry, reads it back by another process,
+and puts the entry back if the result is not what it meant. Terminal's entry is compared as the
+`plutil` on the machine writes it, so a macOS update that changes how a property list is written does
+not make an entry `changed`.
 
 GNOME Terminal's and Ptyxis's list of profiles is shared with the application's preferences window
 and with anything else that edits it, and the settings database has no compare-and-set. `kr` reads
@@ -788,8 +803,10 @@ status, with nothing printed after the document. `status` has `terminals` (for e
 `roots_from_environment` and `readiness`. `remove` has `ok`, `dry_run` and `profiles`, each with
 `terminal` and a `result` of `removed`, `already_gone`, `left_changed` (with `left`, the place it was
 left), `left_default`, `not_recorded` or `failed`; a dry run gives the profile's state in place of
-those. A removal that cannot take out one of its profiles takes out the others, says which it could
-not, and exits 1.
+those. The `failed` entry of a profile that could not be taken out carries `code`, `message` and
+`exit_code`. A removal that cannot take out one of its profiles takes out the others, says which it
+could not, and exits with the status of the first it could not take out: 1 for a failure of a tool,
+the record or a file, 2 for a running Terminal, a missing `gsettings` or a missing schema.
 
 ## `kr host descriptions`
 
