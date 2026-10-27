@@ -634,6 +634,9 @@ pub async fn subscribe(
 pub fn spawn_input_reader(
     terminal: std::fs::File,
 ) -> (tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>, InputStop) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use rustix::event::{PollFd, PollFlags, poll};
     use rustix::io::Errno;
 
@@ -650,6 +653,10 @@ pub fn spawn_input_reader(
             );
         }
     };
+    // Set by the thread when the terminal cannot be waited for, so that it reads without waiting
+    // and cannot be woken either.
+    let unwakeable = Arc::new(AtomicBool::new(false));
+    let unwakeable_here = Arc::clone(&unwakeable);
     let thread = std::thread::spawn(move || {
         let mut terminal = terminal;
         let mut buffer = vec![0_u8; 8 * 1024];
@@ -667,7 +674,18 @@ pub fn spawn_input_reader(
             if !waiting[1].revents().is_empty() {
                 break;
             }
-            if waiting[0].revents().is_empty() {
+            if waiting[0].revents().contains(PollFlags::NVAL) {
+                // A terminal that cannot be waited for (macOS answers a poll of `/dev/tty` at
+                // once): the read blocks, and nothing wakes it. Said before the pipe is looked at
+                // once more, so that a stop is either seen here or knows the thread cannot be
+                // joined.
+                unwakeable_here.store(true, Ordering::SeqCst);
+                let mut stopped = [PollFd::new(&woken, PollFlags::IN)];
+                if matches!(poll(&mut stopped, Some(&rustix::event::Timespec { tv_sec: 0, tv_nsec: 0 })), Ok(n) if n > 0)
+                {
+                    break;
+                }
+            } else if waiting[0].revents().is_empty() {
                 continue;
             }
             match terminal.read(&mut buffer) {
@@ -686,6 +704,7 @@ pub fn spawn_input_reader(
         receiver,
         InputStop {
             wake: Some(wake),
+            unwakeable,
             thread,
         },
     )
@@ -699,12 +718,38 @@ pub fn spawn_input_reader(
 pub fn spawn_input_reader(
     terminal: std::fs::File,
 ) -> (tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>, InputStop) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-    let thread = spawn_blocking_reader(terminal, sender);
-    (receiver, InputStop { thread })
+    let stopping = Arc::new(AtomicBool::new(false));
+    let stopping_here = Arc::clone(&stopping);
+    let thread = std::thread::spawn(move || {
+        let mut terminal = terminal;
+        let mut buffer = vec![0_u8; 8 * 1024];
+        loop {
+            // Looked at before every read: a stop that came between two reads cancelled nothing,
+            // and this is what ends the thread then.
+            if stopping_here.load(Ordering::SeqCst) {
+                break;
+            }
+            match terminal.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    if sender.send(buffer[..read].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+    });
+    (receiver, InputStop { stopping, thread })
 }
 
 /// The thread that reads `terminal` until its input ends or `sender` has no receiver.
+#[cfg(unix)]
 fn spawn_blocking_reader(
     terminal: std::fs::File,
     sender: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
@@ -737,6 +782,8 @@ pub struct InputStop {
     /// The write end of the pipe the thread also waits on; closing it wakes the thread. None when
     /// no pipe could be made and the thread cannot be woken.
     wake: Option<std::os::fd::OwnedFd>,
+    /// Whether the thread found a terminal it cannot wait for and so cannot be woken.
+    unwakeable: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The reading thread.
     thread: std::thread::JoinHandle<()>,
 }
@@ -744,14 +791,20 @@ pub struct InputStop {
 #[cfg(unix)]
 impl InputStop {
     /// A stop for a thread that cannot be woken.
-    const fn unstoppable(thread: std::thread::JoinHandle<()>) -> Self {
-        Self { wake: None, thread }
+    fn unstoppable(thread: std::thread::JoinHandle<()>) -> Self {
+        Self {
+            wake: None,
+            unwakeable: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            thread,
+        }
     }
 
-    /// Ends the thread, which has ended when this returns.
+    /// Ends the thread, which has ended when this returns, unless it cannot be woken: a thread
+    /// blocked in a read of a terminal that cannot be waited for is left to end with the next key,
+    /// and is not joined.
     pub fn stop(self) {
-        if self.wake.is_some() {
-            drop(self.wake);
+        drop(self.wake);
+        if !self.unwakeable.load(std::sync::atomic::Ordering::SeqCst) {
             let _ = self.thread.join();
         }
     }
@@ -760,15 +813,25 @@ impl InputStop {
 /// What ends the thread [`spawn_input_reader`] started.
 #[cfg(not(unix))]
 pub struct InputStop {
+    /// Set to ask the thread to stop, which it looks at before every read.
+    stopping: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The reading thread.
     thread: std::thread::JoinHandle<()>,
 }
 
 #[cfg(not(unix))]
 impl InputStop {
-    /// Cancels the thread's read and leaves the thread to finish by itself.
+    /// Asks the thread to stop and cancels the read it may be in, again and again until it has
+    /// ended or a second has gone: a cancel that came between two reads cancelled nothing, and the
+    /// thread looks at the request before its next one.
     pub fn stop(self) {
-        crate::platform::cancel_blocked_read(&self.thread);
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !self.thread.is_finished() && std::time::Instant::now() < deadline {
+            crate::platform::cancel_blocked_read(&self.thread);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 }
 
