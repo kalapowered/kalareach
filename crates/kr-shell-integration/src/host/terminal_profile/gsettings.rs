@@ -429,6 +429,7 @@ pub(super) fn plan(
             key: spec.list_key.to_owned(),
             member: uuid.clone(),
         },
+        earlier: None,
     };
     let listed_before = list.contains(&uuid);
     Ok(SettingsPlan {
@@ -574,6 +575,16 @@ pub(super) fn read(
     spec: Spec,
     wrote: &SettingsWrote,
 ) -> Result<Reading, ProfileError> {
+    // The schemas the keys are read through: without them nothing can be read, and a profile whose
+    // application was uninstalled is not one that has gone.
+    let schemas = gsettings
+        .schemas()
+        .map_err(|failure| tool(failure, &spec))?;
+    if !schemas.iter().any(|schema| *schema == spec.list_schema)
+        || !schemas.iter().any(|schema| *schema == spec.profile_schema)
+    {
+        return Err(ProfileError::SchemaAbsent(spec.terminal));
+    }
     let target = format!("{}:{}", wrote.schema, wrote.path);
     let unused = format!("{}:{}", wrote.schema, unused_path(&spec));
     let in_list = profiles(gsettings, &spec)?.contains(&wrote.list.member);
@@ -594,7 +605,13 @@ pub(super) fn read(
             .is_some_and(|(_, default)| same_value(value, default));
         match wrote.keys.iter().find(|written| written.key == *key) {
             Some(written) => {
-                let ours = same_value(value, &written.value);
+                // What kr wrote, or what the profile held before an install again that could not
+                // take itself back.
+                let ours =
+                    same_value(value, &written.value)
+                        || wrote.earlier.iter().flatten().any(|earlier| {
+                            earlier.key == *key && same_value(value, &earlier.value)
+                        });
                 ours_match &= ours;
                 ours_default &= unset;
                 ours_kr_s_or_unset &= ours || unset;
