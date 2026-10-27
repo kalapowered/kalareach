@@ -1003,6 +1003,17 @@ impl ServiceWeb {
         }
     }
 
+    /// Every authority feed is restored to a state from before the record of one request: that
+    /// record and the ones after it are gone, and the next request published takes its place in
+    /// the sequence.
+    pub fn the_feeds_return_to_before(&self, request_id: kr_protocol::ids::RevocationRequestId) {
+        let request_id = serde_json::to_value(request_id).expect("an identifier");
+        let request_id = request_id.as_str().expect("an identifier is text");
+        for feed in self.state.lock().expect("the state").feeds.values_mut() {
+            feed.return_to_before(request_id);
+        }
+    }
+
     /// Backup storage is turned on or off by some other client.
     pub fn set_backup(&self, on: bool) {
         let mut state = self.state.lock().expect("the state");

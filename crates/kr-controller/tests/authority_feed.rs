@@ -6490,6 +6490,69 @@ async fn a_device_the_person_revoked_before_the_scan_reached_its_page_is_owed_wh
     .await;
 }
 
+/// KR-REQ-24.15: a request is known by what it says and not by its place and identifier alone. A
+/// feed restored to a state from before a request the host holds as undecided serves another
+/// request at its place under its identifier; that request's settlement is not the first one's,
+/// and the device the first one names stays owed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_different_request_at_the_place_of_one_the_host_holds_does_not_settle_it() {
+    let rig = Rig::start().await;
+    let victim = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.until_the_carrier_is_idle().await;
+    let earlier = a_copy_of_the_registry(&rig.host, "registry-before-the-owner.sqlite3");
+    let owner = rig
+        .pairs(&[ActionRight::HostManage, ActionRight::SessionView])
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    let key = owner.0.keys().authorisation.clone();
+    let withdrawal = rig.request_of(&key, owner.1.device_id, 0xc1, devices(victim.1.device_id));
+    rig.published_as(&key, &withdrawal).await;
+    rig.poll().await;
+    rig.until_the_revocation_is_acknowledged_to(&key, &withdrawal)
+        .await;
+
+    // The restored registry lacks the owner: the withdrawal cannot be verified and owes the device.
+    let rig = rig
+        .restarted(false, |tree| put_the_registry_back(tree, &earlier))
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    rig.until_the_carrier_is_idle().await;
+    let target = restored::Target::Device(victim.1.device_id);
+    assert!(rig.what_the_record_lists().contains(&target));
+
+    // The feed is restored to a state from before the withdrawal, and serves another request at
+    // its place under its identifier: one the key of the owner it names did not sign.
+    rig.served
+        .web()
+        .the_feeds_return_to_before(withdrawal.request_id);
+    let forger = AuthorisationKeyPair::generate().expect("a key");
+    let forged = rig.request_of(
+        &forger,
+        rig.owner_device(),
+        0xc1,
+        devices(victim.1.device_id),
+    );
+    rig.published_as(&forger, &forged).await;
+    rig.poll().await;
+    rig.poll().await;
+    assert_eq!(
+        rig.held_as(&forger, &forged).await.rejected.0,
+        Some(RejectionReason::NoOwnerAuthority),
+        "the other request is refused on what a restore cannot change"
+    );
+    assert!(
+        rig.what_the_record_lists().contains(&target),
+        "and the device the withdrawal named stays owed: nothing settled the withdrawal"
+    );
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&victim.1.device_id.to_string()),
+        "{refused:?}"
+    );
+    rig.revokes_at_the_machine(victim.1.device_id).await;
+    assert!(rig.the_owner_confirms().await.lifted);
+}
+
 /// KR-REQ-24.15: a record of the restore that cannot be read is not written over by a finding
 /// either: the registry is behind the feed, the host catches up, and the record stays what it was,
 /// so the doctor still says that it cannot be read and the confirmation removes it.

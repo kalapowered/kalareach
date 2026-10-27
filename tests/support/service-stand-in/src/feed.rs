@@ -612,6 +612,21 @@ impl Feed {
         });
     }
 
+    /// The feed is restored to a state from before the record of `request_id`: that record and
+    /// every record after it are gone, and the next request published takes its sequence.
+    pub(crate) fn return_to_before(&mut self, request_id: &str) {
+        let Some(sequence) = self
+            .records
+            .iter()
+            .find(|(_, record)| record.request_id == request_id)
+            .map(|(sequence, _)| *sequence)
+        else {
+            return;
+        };
+        self.records.retain(|held, _| *held < sequence);
+        self.host_mut().next_sequence = sequence;
+    }
+
     fn host(&self) -> &Host {
         self.host.as_ref().expect("the host row")
     }
