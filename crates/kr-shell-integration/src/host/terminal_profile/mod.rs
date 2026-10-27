@@ -187,15 +187,15 @@ impl ProfileHome {
             local_app_data: Some(home.join("AppData").join("Local")),
             programs,
             applications: vec![home.join("Applications")],
+            // Files of the home's own, named by their path. Not under `Library/Preferences`: a path
+            // there is not read by `defaults` as a file of its own.
             iterm_preferences: home
-                .join("Library")
-                .join("Preferences")
+                .join("domains")
                 .join("com.googlecode.iterm2")
                 .display()
                 .to_string(),
             terminal_preferences: home
-                .join("Library")
-                .join("Preferences")
+                .join("domains")
                 .join("com.apple.Terminal")
                 .display()
                 .to_string(),
@@ -303,6 +303,15 @@ pub enum ProfileError {
     /// The list of profiles changed under every attempt to write it.
     #[error("{}'s list of profiles kept changing while it was written", .0.name())]
     ListBusy(ProfileTerminal),
+    /// The settings that say which profile the emulator opens by default cannot be read, so it is
+    /// not known whether this profile is it.
+    #[error("{} does not read, so which profile {} opens by default is not known", .place.display(), .terminal.name())]
+    DefaultUnknown {
+        /// The emulator.
+        terminal: ProfileTerminal,
+        /// The settings file.
+        place: PathBuf,
+    },
     /// A file could not be read or written.
     #[error("{}: {source}", .place.display())]
     Io {
@@ -410,7 +419,9 @@ enum How {
         staging: PathBuf,
         text: String,
         made: Vec<PathBuf>,
-        replace: bool,
+        /// The digest the file at the destination must still have for it to be replaced; `None`
+        /// where nothing is there to replace.
+        replace: Option<String>,
     },
     /// Keys of a settings schema, and a place in a shared list.
     Settings(Box<gsettings::SettingsPlan>),
@@ -492,15 +503,22 @@ pub fn plan(
                 Some(_) => return Err(ProfileError::RecordedOtherwise(terminal)),
                 None => None,
             };
-            let plan =
+            let mut plan =
                 gsettings::plan(&home.settings, spec, &words::shell_words(command), earlier)?;
-            // A profile that was changed after kr wrote it is not kr's to write over.
-            if let Some(earlier) = earlier
-                && gsettings::read(&home.settings, spec, earlier) == gsettings::Reading::Changed
-            {
-                return Err(ProfileError::Changed {
-                    place: PathBuf::from(&earlier.path),
-                });
+            // A profile that was changed after kr wrote it is not kr's to write over. One that is
+            // there as kr wrote it is put back as it was if this write fails.
+            if let Some(earlier) = earlier {
+                match gsettings::read(&home.settings, spec, earlier)? {
+                    gsettings::Reading::Changed => {
+                        return Err(ProfileError::Changed {
+                            place: PathBuf::from(&earlier.path),
+                        });
+                    }
+                    gsettings::Reading::Unchanged { .. } => {
+                        plan.previous = Some(earlier.keys.clone());
+                    }
+                    gsettings::Reading::Gone => {}
+                }
             }
             Ok(Plan {
                 terminal,
@@ -554,36 +572,37 @@ fn plan_file(
         Some(_) => return Err(ProfileError::RecordedOtherwise(terminal)),
         None => None,
     };
-    let (replace, made) = match (earlier, files::presence(destination)) {
-        // Nothing the record names is there, and something is: it is not kr's.
-        (None, files::Presence::File(_) | files::Presence::Other) => {
-            return Err(ProfileError::Foreign { place });
-        }
-        (None, files::Presence::Missing) => {
-            (false, files::missing_directories(&parent_of(destination)))
-        }
-        (Some(earlier), presence) => {
-            let recorded_file = earlier.file()?;
-            if recorded_file != destination {
-                return Err(ProfileError::RecordedElsewhere {
-                    terminal,
-                    recorded: recorded_file,
-                });
+    let (replace, made): (Option<String>, Vec<PathBuf>) =
+        match (earlier, files::presence(destination)) {
+            // Nothing the record names is there, and something is: it is not kr's.
+            (None, files::Presence::File(_) | files::Presence::Other) => {
+                return Err(ProfileError::Foreign { place });
             }
-            match presence {
-                files::Presence::File(sha) if sha == earlier.sha256 => {
-                    (true, earlier.made_directories()?)
+            (None, files::Presence::Missing) => {
+                (None, files::missing_directories(&parent_of(destination)))
+            }
+            (Some(earlier), presence) => {
+                let recorded_file = earlier.file()?;
+                if recorded_file != destination {
+                    return Err(ProfileError::RecordedElsewhere {
+                        terminal,
+                        recorded: recorded_file,
+                    });
                 }
-                files::Presence::File(_) | files::Presence::Other => {
-                    return Err(ProfileError::Changed { place });
-                }
-                // Gone since: written again, and the directories it needed are made again.
-                files::Presence::Missing => {
-                    (false, files::missing_directories(&parent_of(destination)))
+                match presence {
+                    files::Presence::File(sha) if sha == earlier.sha256 => {
+                        (Some(sha), earlier.made_directories()?)
+                    }
+                    files::Presence::File(_) | files::Presence::Other => {
+                        return Err(ProfileError::Changed { place });
+                    }
+                    // Gone since: written again, and the directories it needed are made again.
+                    files::Presence::Missing => {
+                        (None, files::missing_directories(&parent_of(destination)))
+                    }
                 }
             }
-        }
-    };
+        };
     let wrote = Wrote::File(FileWrote::intending(destination, &text, &made));
     Ok(Plan {
         terminal,
@@ -640,10 +659,18 @@ fn write(plan: &Plan) -> Result<(), (ProfileError, bool)> {
             text,
             made,
             replace,
-        } => files::publish(destination, staging, text, made, *replace)
-            .map_err(|error| (ProfileError::io(destination, error), false)),
+        } => match files::publish(destination, staging, text, made, replace.as_deref()) {
+            Ok(files::Published::Written) => Ok(()),
+            Ok(files::Published::Changed) => Err((
+                ProfileError::Changed {
+                    place: destination.clone(),
+                },
+                false,
+            )),
+            Err(error) => Err((ProfileError::io(destination, error), false)),
+        },
         How::Settings(plan) => gsettings::write(plan),
-        How::Preferences(plan) => apple::write(plan).map_err(|error| (error, false)),
+        How::Preferences(plan) => apple::write(plan),
     }
 }
 
@@ -656,6 +683,10 @@ pub enum Standing {
     Changed,
     /// It is not there.
     Missing,
+    /// Its keys are written and it is not in the list the application reads its profiles from.
+    Unlisted,
+    /// It could not be read: the tool that reads it did not answer.
+    Unreadable,
 }
 
 /// What `status` knows of one emulator.
@@ -692,7 +723,7 @@ pub fn status(
             || (terminal == ProfileTerminal::AppleTerminal && apple::foreign(home)));
     let default = recorded
         .as_ref()
-        .is_some_and(|profile| is_default(terminal, home, profile));
+        .is_some_and(|profile| is_default(terminal, home, profile).unwrap_or(false));
     Status {
         terminal,
         present: is_present(terminal, home),
@@ -714,15 +745,18 @@ fn standing(profile: &RecordedProfile, home: &ProfileHome) -> Standing {
         Wrote::Settings(wrote) => settings_spec(profile.terminal).map_or(
             Standing::Changed,
             |spec| match gsettings::read(&home.settings, spec, wrote) {
-                gsettings::Reading::Unchanged { .. } => Standing::Matches,
-                gsettings::Reading::Gone => Standing::Missing,
-                gsettings::Reading::Changed => Standing::Changed,
+                Ok(gsettings::Reading::Unchanged { in_list: true }) => Standing::Matches,
+                Ok(gsettings::Reading::Unchanged { in_list: false }) => Standing::Unlisted,
+                Ok(gsettings::Reading::Gone) => Standing::Missing,
+                Ok(gsettings::Reading::Changed) => Standing::Changed,
+                Err(_) => Standing::Unreadable,
             },
         ),
         Wrote::Preferences(wrote) => match apple::reading(&wrote.domain, wrote) {
-            apple::Reading::Matches => Standing::Matches,
-            apple::Reading::Changed => Standing::Changed,
-            apple::Reading::Missing => Standing::Missing,
+            Ok(apple::Reading::Matches) => Standing::Matches,
+            Ok(apple::Reading::Changed) => Standing::Changed,
+            Ok(apple::Reading::Missing) => Standing::Missing,
+            Err(_) => Standing::Unreadable,
         },
     }
 }
@@ -738,10 +772,19 @@ fn profile_path(terminal: ProfileTerminal, home: &ProfileHome) -> Option<PathBuf
 }
 
 /// Whether the recorded profile is the emulator's default.
-fn is_default(terminal: ProfileTerminal, home: &ProfileHome, profile: &RecordedProfile) -> bool {
+///
+/// # Errors
+///
+/// Returns why that cannot be told: a tool or a settings file that does not answer is not taken to
+/// mean the profile is not the default.
+fn is_default(
+    terminal: ProfileTerminal,
+    home: &ProfileHome,
+    profile: &RecordedProfile,
+) -> Result<bool, ProfileError> {
     match terminal {
-        ProfileTerminal::Konsole => konsole::is_default(home),
-        ProfileTerminal::Iterm2 => match &profile.wrote {
+        ProfileTerminal::Konsole => Ok(konsole::is_default(home)),
+        ProfileTerminal::Iterm2 => Ok(match &profile.wrote {
             Wrote::File(wrote) => wrote
                 .file()
                 .ok()
@@ -749,16 +792,17 @@ fn is_default(terminal: ProfileTerminal, home: &ProfileHome, profile: &RecordedP
                 .and_then(|text| iterm2::guid_in(&text))
                 .is_some_and(|guid| iterm2::is_default(home, &guid)),
             _ => false,
-        },
+        }),
         ProfileTerminal::WindowsTerminal => windows_terminal::is_default(home),
         ProfileTerminal::GnomeTerminal | ProfileTerminal::Ptyxis => match &profile.wrote {
-            Wrote::Settings(wrote) => settings_spec(terminal)
-                .is_ok_and(|spec| gsettings::is_default(&home.settings, spec, wrote)),
-            _ => false,
+            Wrote::Settings(wrote) => {
+                gsettings::is_default(&home.settings, settings_spec(terminal)?, wrote)
+            }
+            _ => Ok(false),
         },
         ProfileTerminal::AppleTerminal => match &profile.wrote {
             Wrote::Preferences(wrote) => apple::is_default(&wrote.domain, wrote),
-            _ => false,
+            _ => Ok(false),
         },
     }
 }
@@ -797,7 +841,8 @@ pub fn remove(
     let removed = match &profile.wrote {
         Wrote::File(wrote) => {
             let destination = wrote.file()?;
-            if standing(&profile, home) != Standing::Missing && is_default(terminal, home, &profile)
+            if standing(&profile, home) != Standing::Missing
+                && is_default(terminal, home, &profile)?
             {
                 return Ok(Removed::Default);
             }
@@ -825,8 +870,8 @@ pub fn remove(
         }
         Wrote::Settings(wrote) => {
             let spec = settings_spec(terminal)?;
-            let reading = gsettings::read(&home.settings, spec, wrote);
-            if reading != gsettings::Reading::Gone && is_default(terminal, home, &profile) {
+            let reading = gsettings::read(&home.settings, spec, wrote)?;
+            if reading != gsettings::Reading::Gone && is_default(terminal, home, &profile)? {
                 return Ok(Removed::Default);
             }
             match reading {
@@ -841,12 +886,11 @@ pub fn remove(
             }
         }
         Wrote::Preferences(wrote) => {
-            if apple::reading(&wrote.domain, wrote) != apple::Reading::Missing
-                && is_default(terminal, home, &profile)
-            {
+            let reading = apple::reading(&wrote.domain, wrote)?;
+            if reading != apple::Reading::Missing && is_default(terminal, home, &profile)? {
                 return Ok(Removed::Default);
             }
-            match apple::reading(&wrote.domain, wrote) {
+            match reading {
                 apple::Reading::Missing => Removed::AlreadyGone,
                 apple::Reading::Matches => {
                     apple::take_out(&wrote.domain)?;

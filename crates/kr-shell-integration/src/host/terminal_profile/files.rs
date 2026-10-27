@@ -54,12 +54,23 @@ fn temporary_name(purpose: &str) -> String {
     format!(".kalareach-{purpose}-{}-{nanos}", std::process::id())
 }
 
+/// What a publish came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Published {
+    /// The file is in place.
+    Written,
+    /// The file at the destination was not what the caller found there, and is left as it is.
+    Changed,
+}
+
 /// Writes `text` to `destination`, building it first in `staging` and creating the directories in
 /// `made`, outermost first.
 ///
-/// With `replace` false the destination must not exist: the file is linked into place and the link
-/// fails if the name is taken. With it true the file replaces the destination, which the caller
-/// has found to be the one it wrote. On failure nothing this call created is left.
+/// With `replace` `None` the destination must not exist: the file is linked into place and the
+/// link fails if the name is taken. With it `Some(digest)` the file at the destination is moved
+/// aside and read there, and replaced only if it has that digest, which is the one the caller found
+/// when it planned the write: a save of the person's in between is not overwritten but put back.
+/// On failure nothing this call created is left.
 ///
 /// # Errors
 ///
@@ -69,8 +80,8 @@ pub(super) fn publish(
     staging: &Path,
     text: &str,
     made: &[PathBuf],
-    replace: bool,
-) -> std::io::Result<()> {
+    replace: Option<&str>,
+) -> std::io::Result<Published> {
     let mut created: Vec<&Path> = Vec::new();
     let undo = |created: &[&Path]| {
         for directory in created.iter().rev() {
@@ -96,21 +107,73 @@ pub(super) fn publish(
             file.write_all(text.as_bytes())?;
             file.sync_all()
         });
-    let published = written.and_then(|()| {
-        if replace {
-            std::fs::rename(&temporary, destination)
-        } else {
-            std::fs::hard_link(&temporary, destination)
-        }
-    });
-    // The temporary name goes in both cases: after a link the file is the destination's, and after
-    // a rename it is gone already.
+    let published = written.and_then(|()| put_in_place(&temporary, destination, staging, replace));
+    // The temporary name goes in every case: after a link the file is the destination's.
     let _ = std::fs::remove_file(&temporary);
-    if let Err(error) = published {
-        undo(&created);
-        return Err(error);
+    match published {
+        Ok(Published::Written) => Ok(Published::Written),
+        Ok(Published::Changed) => {
+            undo(&created);
+            Ok(Published::Changed)
+        }
+        Err(error) => {
+            undo(&created);
+            Err(error)
+        }
     }
-    Ok(())
+}
+
+/// Links the finished file into place, after moving a file that is there aside and checking it is
+/// the one `replace` names.
+fn put_in_place(
+    temporary: &Path,
+    destination: &Path,
+    staging: &Path,
+    replace: Option<&str>,
+) -> std::io::Result<Published> {
+    let Some(expected) = replace else {
+        return std::fs::hard_link(temporary, destination).map(|()| Published::Written);
+    };
+    let aside = staging.join(temporary_name("replacing"));
+    match std::fs::rename(destination, &aside) {
+        Ok(()) => {}
+        // Gone since it was read: written as new.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return std::fs::hard_link(temporary, destination).map(|()| Published::Written);
+        }
+        Err(error) => return Err(error),
+    }
+    let held = std::fs::read(&aside).map(|bytes| sha256_hex(&bytes));
+    if held.as_deref().is_ok_and(|held| held == expected) {
+        return match std::fs::hard_link(temporary, destination) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&aside);
+                Ok(Published::Written)
+            }
+            Err(error) => {
+                // The name was taken in between: the file moved aside goes back if the name is
+                // free, and is otherwise left where it is.
+                if std::fs::hard_link(&aside, destination).is_ok() {
+                    let _ = std::fs::remove_file(&aside);
+                }
+                Err(error)
+            }
+        };
+    }
+    // Not what was read when the write was planned: the person's file goes back as it was.
+    match std::fs::hard_link(&aside, destination) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&aside);
+            Ok(Published::Changed)
+        }
+        Err(error) => Err(std::io::Error::new(
+            error.kind(),
+            format!(
+                "the file at the profile's place was changed and is left at {}: {error}",
+                aside.display()
+            ),
+        )),
+    }
 }
 
 /// What taking a file out came to.

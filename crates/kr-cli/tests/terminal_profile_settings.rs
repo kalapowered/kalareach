@@ -233,6 +233,15 @@ impl Person {
 
     /// Installs as the command does.
     fn install(&self, places: &ProfileHome) -> Result<(), ProfileError> {
+        self.install_command(places, &self.command())
+    }
+
+    /// Installs a profile that runs `command`, as the command does.
+    fn install_command(
+        &self,
+        places: &ProfileHome,
+        command: &[String],
+    ) -> Result<(), ProfileError> {
         let terminal = self.application.terminal;
         if !profile::is_present(terminal, places) {
             return Err(ProfileError::NotInstalled(terminal));
@@ -242,7 +251,7 @@ impl Person {
         let record = self.record();
         let held = record.hold(&permit).expect("holds the record");
         let recorded = held.profile(terminal)?;
-        let plan = profile::plan(terminal, places, &self.command(), recorded.as_ref())?;
+        let plan = profile::plan(terminal, places, command, recorded.as_ref())?;
         profile::install(&held, &plan)
     }
 
@@ -575,13 +584,15 @@ fn through_the_wrapper(person: &Person, knobs: &[(&str, String)]) -> ProfileHome
     person.places_through(&wrapper_path, &all)
 }
 
-/// KR-REQ-01.21: another writer appends to the shared list between kr's two reads. Every element is
-/// in the list afterwards, and so is the profile.
+/// KR-REQ-01.21: another writer appends to the shared list between kr's two reads of it just before
+/// it writes (the plan reads the list once, so these are its second and third reads). Every element
+/// is in the list afterwards, and so is the profile: the write that follows the changed read does
+/// not overwrite the other writer's element.
 #[test]
 fn a_writer_appending_between_our_reads_loses_nothing() {
     for_each_application(|person| {
         let list_before = person.list();
-        let places = through_the_wrapper(person, &[("KR_TEST_APPEND_AT_READ", "2".to_owned())]);
+        let places = through_the_wrapper(person, &[("KR_TEST_APPEND_AT_READ", "3".to_owned())]);
         person.install(&places).expect("installs");
         let list = person.list();
         for uuid in &list_before {
@@ -699,5 +710,173 @@ fn the_plan_names_the_settings_it_writes() {
             }
             Place::File(_) | Place::Preferences { .. } => panic!("settings, not a file"),
         }
+    });
+}
+
+/// How many calls the wrapper counted.
+fn calls_of(places: &ProfileHome) -> u32 {
+    let counts = places
+        .settings
+        .environment
+        .iter()
+        .find(|(name, _)| name == "KR_TEST_COUNTS")
+        .map(|(_, value)| PathBuf::from(value))
+        .expect("the counts");
+    std::fs::read_to_string(counts.join("calls"))
+        .expect("the count")
+        .trim()
+        .parse()
+        .expect("a number")
+}
+
+/// KR-REQ-01.21: a removal that is interrupted at any call of `gsettings` is a failure, and keeps
+/// what the record names: a call that does not answer is not a profile that has gone or changed,
+/// and a profile that cannot be read is never taken for one that is not the default. The next
+/// removal finishes the job. The case fails each call of a removal in turn.
+#[test]
+fn a_removal_interrupted_at_any_call_keeps_the_record_and_the_next_one_finishes() {
+    for_each_application(|person| {
+        let places = person.places();
+        let list_before = person.list();
+        person.install(&places).expect("installs");
+        let counting = through_the_wrapper(person, &[]);
+        assert_eq!(person.remove(&counting).expect("removes"), Removed::Removed);
+        let calls = calls_of(&counting);
+        assert!(calls > 5, "a removal makes several calls: {calls}");
+
+        for failing in 1..=calls {
+            person.install(&places).expect("installs");
+            let through = through_the_wrapper(person, &[("KR_TEST_FAIL_AT", failing.to_string())]);
+            let outcome = person.remove(&through);
+            assert!(
+                outcome.is_err(),
+                "call {failing}: a call that fails does not make a removal that succeeded: {outcome:?}"
+            );
+            assert!(
+                person.recorded_uuid().is_some(),
+                "call {failing}: the record keeps the entry"
+            );
+            assert_eq!(
+                person.remove(&places).expect("finishes"),
+                Removed::Removed,
+                "call {failing}: the next removal finishes the job"
+            );
+            assert_eq!(person.list(), list_before, "call {failing}");
+            assert!(person.recorded_uuid().is_none(), "call {failing}");
+        }
+    });
+}
+
+/// KR-REQ-01.21: an install again that fails at any call of `gsettings` leaves the profile kr wrote
+/// as it was: its keys, its place in the list and the record are what they were, and the command it
+/// runs still works.
+#[test]
+fn an_install_again_that_fails_leaves_the_profile_as_it_was() {
+    for_each_application(|person| {
+        let places = person.places();
+        let command = |round: &str| {
+            let mut command = person.command();
+            command.push(round.to_owned());
+            command
+        };
+        person
+            .install_command(&places, &command("first"))
+            .expect("installs");
+        let uuid = person.recorded_uuid().expect("recorded");
+        let counting = through_the_wrapper(person, &[]);
+        person
+            .install_command(&counting, &command("counting"))
+            .expect("installs again");
+        let calls = calls_of(&counting);
+        assert!(calls > 5, "an install again makes several calls: {calls}");
+
+        for failing in 1..=calls {
+            let keys = person.keys_of(&uuid);
+            let list = person.list();
+            let record = person.record().profiles().expect("reads");
+            let through = through_the_wrapper(person, &[("KR_TEST_FAIL_AT", failing.to_string())]);
+            let outcome = person.install_command(&through, &command(&format!("round {failing}")));
+            if outcome.is_ok() {
+                continue;
+            }
+            assert_eq!(
+                person.keys_of(&uuid),
+                keys,
+                "call {failing}: the profile's keys are as they were"
+            );
+            assert_eq!(person.list(), list, "call {failing}: the list");
+            assert_eq!(
+                person.record().profiles().expect("reads"),
+                record,
+                "call {failing}: the record"
+            );
+        }
+        assert_eq!(person.remove(&places).expect("removes"), Removed::Removed);
+    });
+}
+
+/// A profile that is not in the list the application reads is reported as such, a removal takes its
+/// keys out, and an install again puts it back in the list.
+#[test]
+fn a_profile_out_of_the_list_is_unlisted_and_a_removal_or_an_install_deals_with_it() {
+    for_each_application(|person| {
+        let places = person.places();
+        let list_before = person.list();
+        for removing in [true, false] {
+            person.install(&places).expect("installs");
+            let uuid = person.recorded_uuid().expect("recorded");
+            let quoted: Vec<String> = list_before.iter().map(|u| format!("'{u}'")).collect();
+            person.set(
+                person.application.list_schema,
+                person.application.list_key,
+                &format!("[{}]", quoted.join(", ")),
+            );
+            let recorded = person
+                .record()
+                .profiles()
+                .expect("reads")
+                .into_iter()
+                .next();
+            let status = profile::status(person.application.terminal, &places, recorded);
+            assert_eq!(status.standing, Some(profile::Standing::Unlisted));
+            if removing {
+                assert_eq!(person.remove(&places).expect("removes"), Removed::Removed);
+                assert_eq!(person.keys_of(&uuid), person.keys_of("not-a-profile"));
+            } else {
+                person.install(&places).expect("installs again");
+                assert!(person.list().contains(&uuid), "put back in the list");
+                assert_eq!(person.remove(&places).expect("removes"), Removed::Removed);
+            }
+            assert_eq!(person.list(), list_before);
+            assert!(person.recorded_uuid().is_none());
+        }
+    });
+}
+
+/// A `gsettings` that is not there is a profile that cannot be read, which is neither gone nor
+/// changed: `status` says so, a removal fails and keeps the record, and a removal with the program
+/// back takes the profile out.
+#[test]
+fn a_gsettings_that_is_not_there_does_not_make_a_profile_forgotten() {
+    for_each_application(|person| {
+        let places = person.places();
+        person.install(&places).expect("installs");
+        let mut without = person.places();
+        without.settings.program = PathBuf::from("/nonexistent/gsettings");
+        let recorded = person
+            .record()
+            .profiles()
+            .expect("reads")
+            .into_iter()
+            .next();
+        let status = profile::status(person.application.terminal, &without, recorded);
+        assert_eq!(status.standing, Some(profile::Standing::Unreadable));
+        let outcome = person.remove(&without);
+        assert!(
+            matches!(outcome, Err(ProfileError::ToolMissing(_))),
+            "{outcome:?}"
+        );
+        assert!(person.recorded_uuid().is_some(), "the record keeps it");
+        assert_eq!(person.remove(&places).expect("removes"), Removed::Removed);
     });
 }
