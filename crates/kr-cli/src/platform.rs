@@ -93,7 +93,8 @@ mod console {
             Ok(Self { input, output })
         }
 
-        /// Returns the console's input handle, which is the one bytes are read from.
+        /// Returns the console's input handle, which is the one bytes are read from. Nothing is
+        /// written to it: a console takes written bytes on its output handle.
         #[must_use]
         pub const fn handle(&self) -> &File {
             &self.input

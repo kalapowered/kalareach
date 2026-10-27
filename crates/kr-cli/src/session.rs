@@ -1198,9 +1198,12 @@ where
     }
     let raw_replaced = terminal.enter_raw_mode()?;
 
-    let handle = Arc::new(
+    // What the session draws goes to the terminal's output handle. On Windows that is the console's
+    // output buffer, `CONOUT$`, and not its input handle, which is the one the input reader below
+    // reads from and takes no drawn bytes.
+    let output = Arc::new(
         terminal
-            .handle()
+            .output()
             .try_clone()
             .map_err(|error| CliError::Terminal(Shown::io(&error)))?,
     );
@@ -1234,7 +1237,7 @@ where
             owns_geometry: geometry.owner.as_ref() == Some(&attachment.attachment_id),
         },
         &mut input,
-        &handle,
+        &output,
         &terminal,
         resized.as_mut(),
         &mut display,

@@ -636,9 +636,16 @@ mod unix {
             Ok(Self { handle })
         }
 
-        /// Returns the terminal handle.
+        /// Returns the terminal handle, which is the one bytes are read from.
         #[must_use]
         pub const fn handle(&self) -> &File {
+            &self.handle
+        }
+
+        /// Returns the terminal handle, which is the one bytes are written to: a terminal device
+        /// is read and written through one handle.
+        #[must_use]
+        pub const fn output(&self) -> &File {
             &self.handle
         }
 

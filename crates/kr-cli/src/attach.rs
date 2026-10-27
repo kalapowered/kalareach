@@ -122,7 +122,9 @@ impl RestorationGuard {
         terminal: &ControllingTerminal,
         saved: &SavedModes,
     ) -> Result<Self> {
-        let handle = terminal.handle().try_clone().map_err(|error| {
+        // The guard writes to the terminal through its standard output, so it is given the
+        // terminal's output handle; on Windows the input handle takes no written bytes.
+        let handle = terminal.output().try_clone().map_err(|error| {
             CliError::Terminal(shown!("duplicate the terminal: {}", Shown::io(&error)))
         })?;
         Self::arm_on_handle(program, handle, saved)
