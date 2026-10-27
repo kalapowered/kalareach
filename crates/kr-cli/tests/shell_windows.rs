@@ -1113,12 +1113,189 @@ fn product_programs_of_this_account() -> Vec<String> {
         .collect()
 }
 
+/// What the system says of the processes [`descendants_in`] walks, behind a seam so that a case
+/// can put a reading that fails where it wants one, which no real kernel does on request.
+trait Readings {
+    /// Asks the system about one process identifier.
+    fn process(&self, pid: u32) -> kr_ipc::identity::ProcessQuery;
+
+    /// The process the kernel shows started `child`, as the identity it was started under; or why
+    /// no process is shown to have.
+    fn parent_of(
+        &self,
+        child: &kr_protocol::identity::ProcessStartIdentity,
+    ) -> Result<kr_protocol::identity::ProcessStartIdentity, String>;
+
+    /// When the process started, on the kernel's interrupt clock, which a clock that moved does
+    /// not change; or what stopped the reading.
+    fn started(&self, process: &kr_protocol::identity::ProcessStartIdentity)
+    -> Result<u64, String>;
+
+    /// Whether the process is still the one that was started.
+    fn state(
+        &self,
+        process: &kr_protocol::identity::ProcessStartIdentity,
+    ) -> kr_ipc::identity::ProcessState;
+}
+
+/// The system's own readings.
+struct Kernel;
+
+impl Readings for Kernel {
+    fn process(&self, pid: u32) -> kr_ipc::identity::ProcessQuery {
+        kr_ipc::identity::query_process(pid)
+    }
+
+    fn parent_of(
+        &self,
+        child: &kr_protocol::identity::ProcessStartIdentity,
+    ) -> Result<kr_protocol::identity::ProcessStartIdentity, String> {
+        kr_worker::windows::lineage::parent_of(child)
+    }
+
+    fn started(
+        &self,
+        process: &kr_protocol::identity::ProcessStartIdentity,
+    ) -> Result<u64, String> {
+        kr_worker::windows::lineage::monotonic_start(process)
+    }
+
+    fn state(
+        &self,
+        process: &kr_protocol::identity::ProcessStartIdentity,
+    ) -> kr_ipc::identity::ProcessState {
+        kr_ipc::identity::process_state(process)
+    }
+}
+
+/// When `process` started, or nothing where it is shown to have ended.
+///
+/// A start that was not read of a process that still runs is not an ended process: it stops the
+/// case, so that a descendant is never left out of the record for want of a reading.
+///
+/// # Panics
+///
+/// Panics when the start was not read and the process is not shown to have ended.
+fn started_unless_ended(
+    readings: &impl Readings,
+    process: &kr_protocol::identity::ProcessStartIdentity,
+) -> Option<u64> {
+    use kr_ipc::identity::ProcessState;
+
+    match readings.started(process) {
+        Ok(started) => Some(started),
+        Err(why) => match readings.state(process) {
+            ProcessState::Ended => None,
+            ProcessState::Running => panic!(
+                "process {} runs and its start was not read: {why}",
+                process.pid.get()
+            ),
+            ProcessState::Unknown { detail } => panic!(
+                "process {} could not be shown to have ended, and its start was not read: {why}; \
+                 {detail}",
+                process.pid.get()
+            ),
+        },
+    }
+}
+
+/// Every process of `pairs` (a process identifier and the identifier it names as its parent) that
+/// descends, through parents shown to be running, from one of `roots`, as the identity it was
+/// started under.
+///
+/// A process is a child when the kernel names the recorded parent as the process that started it.
+/// One that names a recorded parent's identifier but was started by another process is not its
+/// child: the identifier was another process's, which has ended. Where the kernel names no parent,
+/// the order of its starts, which a clock that moved does not change, tells the two apart: a parent
+/// was running before its child existed, so one that started after it is no parent, and a process
+/// the kernel shows ended since the list was made is not there to record. A reading that did not
+/// come is neither of these, and stops the case: a process whose parent could not be established
+/// is not one the record can leave out.
+///
+/// # Panics
+///
+/// Panics when a process of the list cannot be read, or its parent cannot be shown to be its
+/// parent or not, and neither process is shown to have ended.
+fn descendants_in(
+    pairs: &[(u32, u32)],
+    roots: &[kr_protocol::identity::ProcessStartIdentity],
+    readings: &impl Readings,
+) -> Vec<kr_protocol::identity::ProcessStartIdentity> {
+    use kr_ipc::identity::ProcessQuery;
+
+    let mut found: Vec<kr_protocol::identity::ProcessStartIdentity> = Vec::new();
+    let mut parents: Vec<kr_protocol::identity::ProcessStartIdentity> = roots.to_vec();
+    while let Some(parent) = parents.pop() {
+        for (pid, _) in pairs
+            .iter()
+            .filter(|(_, named)| u64::from(*named) == parent.pid.get())
+        {
+            // A process that ended since the list was read is not one to record; one the system
+            // will not describe is a process that cannot be shown to have ended, and stops the
+            // case.
+            let child = match readings.process(*pid) {
+                ProcessQuery::Present(child) => child,
+                ProcessQuery::Gone => continue,
+                ProcessQuery::CannotEstablish(error) => {
+                    panic!(
+                        "process {pid}, which names process {} as its parent: {error}",
+                        parent.pid.get()
+                    )
+                }
+            };
+            if found.contains(&child) || roots.contains(&child) {
+                continue;
+            }
+            match readings.parent_of(&child) {
+                Ok(started_by) if started_by == parent => {
+                    found.push(child.clone());
+                    parents.push(child);
+                }
+                Ok(started_by) => eprintln!(
+                    "process {pid} names process {} as its parent, but process {} started it, so it \
+                     is not recorded",
+                    parent.pid.get(),
+                    started_by.pid.get()
+                ),
+                // The kernel would not name a parent. What it would not say is told apart by the
+                // starts: a parent that started after its child is not its parent, and a process
+                // that has ended is not there to record; anything else is a reading that failed.
+                Err(why) => {
+                    let parent_started = started_unless_ended(readings, &parent);
+                    let child_started = started_unless_ended(readings, &child);
+                    match (parent_started, child_started) {
+                        (Some(parent_started), Some(child_started))
+                            if parent_started > child_started =>
+                        {
+                            eprintln!(
+                                "process {pid} names process {} as its parent, which started \
+                                 after it did, so it is not recorded: {why}",
+                                parent.pid.get()
+                            );
+                        }
+                        (Some(_), Some(_)) => panic!(
+                            "process {pid} names process {} as its parent, both started and neither \
+                             after the other, and the kernel would not name its parent: {why}",
+                            parent.pid.get()
+                        ),
+                        _ => eprintln!(
+                            "process {pid} or its parent has ended and is not recorded: {why}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
 /// Every process that is running now and descends, through running parents, from one of `roots`, by
 /// the parent each names, as the identity it was started under, read from the system's own list of
 /// processes.
 ///
-/// A process that names a root's identifier as its parent but was not started by it is not its
-/// child: the identifier was another process's, which has ended.
+/// # Panics
+///
+/// Panics when the list cannot be had, or [`descendants_in`] stops.
 fn descendants_of(
     roots: &[kr_protocol::identity::ProcessStartIdentity],
 ) -> Vec<kr_protocol::identity::ProcessStartIdentity> {
@@ -1146,43 +1323,178 @@ fn descendants_of(
         })
         .collect();
     assert!(!pairs.is_empty(), "the system listed no process");
-    let mut found: Vec<kr_protocol::identity::ProcessStartIdentity> = Vec::new();
-    let mut parents: Vec<kr_protocol::identity::ProcessStartIdentity> = roots.to_vec();
-    while let Some(parent) = parents.pop() {
-        for (pid, _) in pairs
-            .iter()
-            .filter(|(_, named)| u64::from(*named) == parent.pid.get())
-        {
-            // A process that ended since the list was read is not one to record; one the system
-            // will not describe is a process that cannot be shown to have ended, and stops the
-            // case.
-            let child = match kr_ipc::identity::query_process(*pid) {
-                kr_ipc::identity::ProcessQuery::Present(child) => child,
-                kr_ipc::identity::ProcessQuery::Gone => continue,
-                kr_ipc::identity::ProcessQuery::CannotEstablish(error) => {
-                    panic!(
-                        "process {pid}, which names process {} as its parent: {error}",
-                        parent.pid.get()
-                    )
-                }
-            };
-            if found.contains(&child) || roots.contains(&child) {
-                continue;
+    descendants_in(&pairs, roots, &Kernel)
+}
+
+/// The walk over a table of readings that a case writes down, with the reading that fails where it
+/// wants one.
+mod the_walk {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use kr_ipc::identity::{ProcessQuery, ProcessState};
+    use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
+
+    use super::{Readings, descendants_in};
+
+    /// The identity of the process numbered `pid`.
+    fn identity(pid: u32) -> ProcessStartIdentity {
+        ProcessStartIdentity::new(
+            u64::from(pid),
+            ProcessStartSource::WindowsProcessCreationTime,
+            1_000 + u64::from(pid),
+        )
+    }
+
+    /// What the system says, where a process not named here is running, was started by the
+    /// process the list names, and started when its number says: the lower the earlier.
+    #[derive(Default)]
+    struct Scripted {
+        /// Processes no longer there when they are asked about.
+        gone: BTreeSet<u32>,
+        /// Processes shown to have ended when their state is asked for.
+        ended: BTreeSet<u32>,
+        /// What the kernel says of who started a process, by the process: the number of the
+        /// process, or why none is named.
+        started_by: BTreeMap<u32, Result<u32, String>>,
+        /// What the kernel says of when a process started, by the process.
+        starts: BTreeMap<u32, Result<u64, String>>,
+    }
+
+    impl Readings for Scripted {
+        fn process(&self, pid: u32) -> ProcessQuery {
+            if self.gone.contains(&pid) {
+                ProcessQuery::Gone
+            } else {
+                ProcessQuery::Present(identity(pid))
             }
-            // By the kernel's own order of starts, which a clock that moved does not change.
-            match kr_worker::windows::lineage::started_by(&child, &parent) {
-                Ok(()) => {
-                    found.push(child.clone());
-                    parents.push(child);
-                }
-                Err(why) => eprintln!(
-                    "process {pid} names process {} as its parent and is not recorded: {why}",
-                    parent.pid.get()
-                ),
+        }
+
+        fn parent_of(&self, child: &ProcessStartIdentity) -> Result<ProcessStartIdentity, String> {
+            let pid = u32::try_from(child.pid.get()).expect("a process identifier");
+            let named = LIST
+                .iter()
+                .find(|(listed, _)| *listed == pid)
+                .map_or(0, |(_, parent)| *parent);
+            self.started_by
+                .get(&pid)
+                .cloned()
+                .unwrap_or(Ok(named))
+                .map(identity)
+        }
+
+        fn started(&self, process: &ProcessStartIdentity) -> Result<u64, String> {
+            let pid = u32::try_from(process.pid.get()).expect("a process identifier");
+            self.starts.get(&pid).cloned().unwrap_or(Ok(u64::from(pid)))
+        }
+
+        fn state(&self, process: &ProcessStartIdentity) -> ProcessState {
+            let pid = u32::try_from(process.pid.get()).expect("a process identifier");
+            if self.ended.contains(&pid) {
+                ProcessState::Ended
+            } else {
+                ProcessState::Running
             }
         }
     }
-    found
+
+    /// The process the walk starts from, and the list: process 20 and process 30 are its child and
+    /// its grandchild, and process 40 names a parent that is not recorded.
+    const ROOT: u32 = 10;
+    const LIST: [(u32, u32); 3] = [(20, ROOT), (30, 20), (40, 5)];
+
+    #[test]
+    fn what_the_kernel_shows_a_recorded_process_started_is_recorded_with_what_that_started() {
+        let found = descendants_in(&LIST, &[identity(ROOT)], &Scripted::default());
+        assert_eq!(found, [identity(20), identity(30)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "runs and its start was not read")]
+    fn a_child_whose_start_was_not_read_stops_the_walk_and_is_not_left_out() {
+        let refused = "process 20 could not be opened: access is denied".to_owned();
+        let mut readings = Scripted::default();
+        readings.started_by.insert(20, Err(refused.clone()));
+        readings.starts.insert(20, Err(refused));
+        descendants_in(&LIST, &[identity(ROOT)], &readings);
+    }
+
+    #[test]
+    #[should_panic(expected = "runs and its start was not read")]
+    fn a_grandchild_whose_start_was_not_read_stops_the_walk_and_does_not_leave_out_its_subtree() {
+        let refused = "process 30 could not be opened: access is denied".to_owned();
+        let mut readings = Scripted::default();
+        readings.started_by.insert(30, Err(refused.clone()));
+        readings.starts.insert(30, Err(refused));
+        descendants_in(&LIST, &[identity(ROOT)], &readings);
+    }
+
+    #[test]
+    #[should_panic(expected = "runs and its start was not read")]
+    fn a_parent_whose_start_was_not_read_stops_the_walk() {
+        let refused = "process 10 could not be opened: access is denied".to_owned();
+        let mut readings = Scripted::default();
+        readings.started_by.insert(20, Err(refused.clone()));
+        readings.starts.insert(ROOT, Err(refused));
+        descendants_in(&LIST, &[identity(ROOT)], &readings);
+    }
+
+    #[test]
+    #[should_panic(expected = "neither after the other")]
+    fn a_refusal_that_no_reading_explains_stops_the_walk() {
+        let mut readings = Scripted::default();
+        readings
+            .started_by
+            .insert(20, Err("process 20 changed while it was read".to_owned()));
+        descendants_in(&LIST, &[identity(ROOT)], &readings);
+    }
+
+    #[test]
+    fn a_process_the_kernel_shows_ended_since_the_list_was_made_is_not_recorded() {
+        let ended = "process 20 has ended".to_owned();
+        let mut readings = Scripted::default();
+        readings.ended.insert(20);
+        readings.started_by.insert(20, Err(ended.clone()));
+        readings.starts.insert(20, Err(ended));
+        assert_eq!(
+            descendants_in(&LIST, &[identity(ROOT)], &readings),
+            Vec::<ProcessStartIdentity>::new()
+        );
+    }
+
+    #[test]
+    fn a_process_that_is_gone_when_it_is_asked_about_is_not_recorded() {
+        let mut readings = Scripted::default();
+        readings.gone.insert(20);
+        assert_eq!(
+            descendants_in(&LIST, &[identity(ROOT)], &readings),
+            Vec::<ProcessStartIdentity>::new()
+        );
+    }
+
+    #[test]
+    fn a_process_the_kernel_shows_another_process_started_is_not_recorded() {
+        let mut readings = Scripted::default();
+        readings.started_by.insert(20, Ok(7));
+        assert_eq!(
+            descendants_in(&LIST, &[identity(ROOT)], &readings),
+            Vec::<ProcessStartIdentity>::new()
+        );
+    }
+
+    #[test]
+    fn a_process_that_started_before_the_parent_it_names_is_not_its_child() {
+        let mut readings = Scripted::default();
+        readings.started_by.insert(
+            20,
+            Err("the process that holds identifier 10 started after process 20 did".to_owned()),
+        );
+        readings.starts.insert(ROOT, Ok(500));
+        readings.starts.insert(20, Ok(100));
+        assert_eq!(
+            descendants_in(&LIST, &[identity(ROOT)], &readings),
+            Vec::<ProcessStartIdentity>::new()
+        );
+    }
 }
 
 /// Holding a process still, as a signal from a terminal does: every thread of it stops, and it
@@ -1841,13 +2153,16 @@ fn assert_the_entry_is_as_documented(exported: &str) {
 ///
 /// A program a package with a component recognises is typed at the managed prompt of a session on
 /// Windows, and the daemon starts the plugin host and registers the component in it. Before the
-/// sign-out, the daemon (this test's process), the worker, the plugin host and every process either
-/// started, the shell and the program among them, are each shown running, by the identity they were
-/// started under, in this login session; the startup entry is shown to be the one the product
-/// registers, and as the host guide says it is. Their identities and the entry as the Task
-/// Scheduler exports it are kept for the half that follows; the account's profiles are put back;
-/// nothing this case holds is let go of, so that only the sign-out can end what it started; and the
-/// account is signed out, which ends this process.
+/// sign-out, the daemon (this test's process), the worker, the plugin host and every running
+/// process the kernel shows either of the last two started, the shell and the program among them,
+/// are each shown running, by the identity they were started under, in this login session. That is
+/// the record, and it holds what the kernel shows: a process whose parent had ended when the
+/// processes were listed is not shown to descend from either and is outside it, and a reading that
+/// did not come stops the case, so that no process is left out for want of one. The startup entry
+/// is shown to be the one the product registers, and as the host guide says it is. The identities
+/// and the entry as the Task Scheduler exports it are kept for the half that follows; the
+/// account's profiles are put back; nothing this case holds is let go of, so that only the sign-out
+/// can end what it started; and the account is signed out, which ends this process.
 ///
 /// The case is run by a run that signs the account in again afterwards, as a temporary standard
 /// account, and runs the case that follows. It signs out the account that runs it, so it runs only
@@ -2057,12 +2372,15 @@ async fn with_a_plugin_host_running_the_session_is_set_up_and_the_account_signed
 /// KR-REQ-07.69: after the sign-out, nothing the session started is left, the plugin host included,
 /// and the per-user startup entry stands, as the host guide says it does.
 ///
-/// Run in the account's next sign-in, by the identities the half before the sign-out recorded: the
-/// daemon (the first half's own process, which ends with the session), the worker, the plugin host
-/// and every process either started, the shell and the program among them, are each ended; no
-/// program of the product runs as this account in any login session, so nothing started at the
-/// sign-in; and the environment's task is registered with no trigger and is exactly as it was
-/// exported before, so that nothing starts until a `kr new` after this sign-in.
+/// Run in the account's next sign-in, by the identities the half before the sign-out recorded: every
+/// process the record holds, of any image, is ended. That is the daemon (the first half's own
+/// process, which ends with the session), the worker, the plugin host and the running processes the
+/// kernel showed either of the last two had started, the shell, the program and the console hosts
+/// among them. Beyond the record only the product's own programs are looked for, the `kr` and
+/// `kr-*` images that run as this account in any login session, so nothing started at the sign-in;
+/// a process that is neither in the record nor an image of the product is not looked for. The
+/// environment's task is registered with no trigger and is exactly as it was exported before, so
+/// that nothing starts until a `kr new` after this sign-in.
 #[test]
 #[ignore = follows_a_sign_out!()]
 fn after_a_sign_out_nothing_the_session_started_is_left_and_the_startup_entry_stands() {
