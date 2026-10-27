@@ -89,6 +89,22 @@ impl ConsoleOutput {
     }
 }
 
+/// The highest number of the numbered lines the session prints that `text` shows.
+fn ticks(text: &str) -> u64 {
+    text.split("tick-")
+        .skip(1)
+        .filter_map(|piece| {
+            piece
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse::<u64>()
+                .ok()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// `kr attach` running on a pseudo-console of its own.
 struct Attached {
     child: Box<dyn portable_pty::Child + Send + Sync>,
@@ -137,23 +153,27 @@ impl Attached {
         }
     }
 
-    /// Waits until the console shows `marker`, failing when it does not within the liveness
-    /// deadline or when the command ends before it does.
-    fn shows(&mut self, marker: &str, what: &str) {
+    /// Waits until the console shows a numbered line higher than `above`, and returns its number;
+    /// it fails when the console does not within the liveness deadline, or when the command ends
+    /// before it does.
+    fn shows_a_line_after(&mut self, above: u64, what: &str) -> u64 {
         let started = Instant::now();
-        while !self.output.text().contains(marker) {
+        loop {
+            let text = self.output.text();
+            let shown = ticks(&text);
+            if shown > above {
+                return shown;
+            }
             if let Some(status) = self.child.try_wait().expect("the command's state") {
                 panic!(
-                    "{what}: kr attach ended ({status}) before the console showed {marker:?}; the \
-                     console shows: {}",
-                    self.output.text()
+                    "{what}: kr attach ended ({status}) before the console showed a line after \
+                     {above}; the console shows: {text:?}"
                 );
             }
             assert!(
                 started.elapsed() < LIVENESS_DEADLINE,
-                "{what}: waited {:?} for {marker:?}; the console shows: {}",
+                "{what}: waited {:?} for a line after {above}; the console shows: {text:?}",
                 started.elapsed(),
-                self.output.text()
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -172,12 +192,12 @@ impl Attached {
 /// opens the console's input handle and its output handle, and what the session draws goes to the
 /// output handle, which is the only one a console takes drawn bytes on.
 ///
-/// A session whose root shell is the Windows command shell is typed into through the client library,
-/// and `kr attach` runs on a pseudo-console of its own. The console shows what the session had
-/// already printed when the command attached, which arrives as the screen, and then what the
-/// session prints after, which arrives as output; and the command is still attached after both. A
-/// command that wrote to the input handle would show neither and would end at the first byte it was
-/// sent.
+/// A session whose root shell is the Windows command shell is typed a program that prints a
+/// numbered line every moment, through the client library, and `kr attach` runs on a pseudo-console
+/// of its own, of the session's size so that the worker streams what the session writes as it is
+/// written. The console shows a line the session printed after the console was opened, and then
+/// twenty lines more, and the command is still attached after both. A command that wrote to the
+/// input handle would show none and would end at the first byte it was sent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_console_attached_with_kr_attach_shows_what_the_session_writes() {
     let host = WorkerHost::start().await;
@@ -187,23 +207,22 @@ async fn a_console_attached_with_kr_attach_shows_what_the_session_writes() {
         .session();
     let environment = host.tree.environment();
     let mut typist = WorkerTerminal::attach(&environment, session_id, dimensions).await;
-    // Each marker is escaped as typed, so the line the shell echoes does not hold it: only what the
-    // shell prints once the line runs does.
-    typist.type_line("echo K^R-before-the-attach").await;
+    // The line the shell echoes holds the number as typed, `%i`, and no digits: only what the
+    // program prints holds a number.
     typist
-        .shown(
-            "KR-before-the-attach",
-            "the session prints the first marker",
-        )
+        .type_line("for /l %i in (1,1,100000) do @(echo tick-%i & ping -n 1 127.0.0.1 >nul)")
         .await;
+    typist
+        .shown("tick-1", "the session prints the program's first line")
+        .await;
+    let printed = ticks(&typist.text());
 
     let mut console = Attached::start(&host, &session_id.to_string(), dimensions);
-    console.shows("KR-before-the-attach", "the screen the session already had");
-    typist.type_line("echo K^R-after-the-attach").await;
-    console.shows("KR-after-the-attach", "what the session prints after");
+    let first = console.shows_a_line_after(printed, "a line the session printed after");
+    let later = console.shows_a_line_after(first + 20, "twenty lines more");
     assert!(
         console.running(),
-        "kr attach ended; the console shows: {}",
+        "kr attach ended after the console showed lines {first} to {later}; the console shows: {:?}",
         console.output.text()
     );
 
