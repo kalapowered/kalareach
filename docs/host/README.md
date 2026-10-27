@@ -7133,7 +7133,10 @@ and the terminal confirms nothing on an owned host. The refusal and `kr doctor` 
 give the steps that keep one once the host has caught up with its feed. While it is behind, or
 after a start and before a scan of that run has read the feed through, a record removed by hand is
 written again at the next start, so the refusal and the doctor say what keeps the catch-up from
-ending and give no route. The refusal gives the
+ending and give no route. A catch-up that does not end has the causes the feed check of `kr doctor`
+tells apart: a page of the feed that cannot be reached, a request the feed refused, or a write that
+fails (the registry cannot take it, or the record of the restore cannot be written: check the disk
+and the permissions of the state directory). The refusal gives the
 record's full path in both states, and the doctor names the file, `restored-policy.cbor`. Revoke every other device and share the list names, with `kr device revoke`
 and `kr share revoke`, but not the last owner device. Stop the daemon. Remove the record's file by
 hand. Start the daemon, which then waits for nothing and checks nothing else on the list: that is

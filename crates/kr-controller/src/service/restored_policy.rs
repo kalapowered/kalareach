@@ -101,12 +101,14 @@ const OWNER_ROUTE_REMEDY: &str = concat!(
 /// feed does. The steps that remove the record come after the catch-up: removed before it, the
 /// record is written again at the next start.
 const BEHIND_REMEDY: &str = "This host catches up with its authority feed by itself and asks again. If it stays like \
-     this, the registry cannot take the write, or the record of the restore cannot be written: \
-     check that the disk of the state directory has room and that the daemon may write there, \
-     and the permissions of its files. Do not remove the file `restored-policy.cbor` beside \
-     the registry database before the host has caught up: the next start finds the restore \
-     again and writes a new record. Once it has caught up, this check names what to revoke at \
-     this machine and gives the steps that end the wait, and the refusal of `kr host policy \
+     this, read the feed check of `kr doctor`, which tells the causes apart: a page of the feed \
+     that cannot be reached, a request the feed refused, or a write this host cannot make. For \
+     a write, the registry may not take it, or the record of the restore may not be writable: \
+     check that the disk of the state directory has room, that the daemon may write there, and \
+     the permissions of its files. Do not remove the file `restored-policy.cbor` beside the \
+     registry database before the host has caught up: the next start finds the restore again \
+     and writes a new record. Once it has caught up, this check names what to revoke at this \
+     machine and gives the steps that end the wait, and the refusal of `kr host policy \
      --confirm` gives the record's full path. Until then no remote device is served, owner \
      devices included, and the person at this machine is not refused. ";
 
@@ -175,10 +177,10 @@ fn the_refusal_while_behind(file: &std::path::Path) -> String {
     format!(
         "this host is still catching up with its authority feed, so the policy it holds is not \
          yet the one it will hold; confirm it once the host has caught up. The catch-up goes on \
-         by itself and stops while the registry cannot take a write or the record of the restore, \
-         {}, cannot be written: check that the disk of the state directory has room and that the \
-         daemon may write there. Do not remove that record before the host has caught up: the \
-         next start finds the restore again and writes a new one",
+         by itself and stops while a page of the feed cannot be reached, the feed refuses a \
+         request, or a write fails (the registry cannot take it, or the record of the restore, \
+         {}, cannot be written): `kr doctor` tells these apart. Do not remove that record before \
+         the host has caught up: the next start finds the restore again and writes a new one",
         file.display()
     )
 }
@@ -749,9 +751,9 @@ impl Controller {
             detail = detail.stated(
                 "; this host is still catching up with its authority feed, so the policy it \
                  holds is not yet the one it will hold, and a confirmation is refused until it \
-                 has: the catch-up stops while the registry cannot take a write or the record of \
-                 the restore cannot be written, and the steps that end this wait are given once \
-                 it has caught up",
+                 has: the catch-up stops while a page of the feed cannot be reached, the feed \
+                 refuses a request, or a write fails, which the feed check says, and the steps \
+                 that end this wait are given once it has caught up",
             );
         }
         detail = match owing {

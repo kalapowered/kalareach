@@ -897,6 +897,21 @@ async fn a_host_that_cannot_finish_catching_up_refuses_remote_access_until_a_pas
         "a pass the feed stopped is not put down to the registry: {:?}",
         check.remedy()
     );
+    // The restored-policy check says the same: a catch-up that does not end is not put down to a
+    // failed write alone, since the feed can be the cause.
+    let check = rig
+        .the_restored_policy_check()
+        .await
+        .expect("the doctor says the host waits");
+    assert!(
+        check
+            .remedy()
+            .is_some_and(|remedy| remedy.contains("cannot be reached")
+                && remedy.contains("refused")
+                && remedy.contains("kr doctor")),
+        "and names the causes of a catch-up that does not end: {:?}",
+        check.remedy()
+    );
 
     // The fault clears, and the pass that follows finishes what the first could not.
     rusqlite::Connection::open(rig.host.tree().environment().registry_database())
