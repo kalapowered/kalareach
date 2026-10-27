@@ -152,12 +152,14 @@ does, then the line `kr: this window stays open so the error above can be read; 
 close it`, and waits for one key. After the key it exits with the status it would have had without
 the flag.
 
-The command holds when it could not create or attach the session, and when the session closed for
-any reason except its shell exiting or a close on request: a signal ended the shell, the shell never
-started, the worker went, the desktop login ended, the host shut down, or the connection to the
-session ended ([When the session closes](#when-the-session-closes) lists them). A session whose
-shell exited, with any status, ended the way the person ended it. The command exits with that
-closure's status at once, and the window closes as its terminal application normally closes it.
+The command holds on every ending except three: the session's shell exiting, with any status, a
+close on request, and the person detaching. That is, it holds when it could not create or attach the
+session, and when the attachment ended any other way: a signal ended the shell, the shell never
+started, the worker went, the desktop login ended, the host shut down, the connection to the
+session ended, another attachment took the input lease, or input may not have reached the session
+([When the session closes](#when-the-session-closes) lists them). A session whose shell exited, with
+any status, ended the way the person ended it. The command exits with that closure's status at
+once, and the window closes as its terminal application normally closes it.
 
 It waits only when standard input and standard output are terminals and the run is not `--json`.
 Anywhere else it never waits, so a script that reads the output of `kr new` does not stop for a key
