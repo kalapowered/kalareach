@@ -6266,6 +6266,230 @@ async fn a_device_the_host_revoked_after_a_restore_stays_owed_when_the_registry_
     assert!(rig.the_owner_confirms().await.lifted);
 }
 
+/// A device the feed revoked and one it revoked after, both paired and live in the copy taken
+/// first, and the registry as it was after the first revocation in a second copy.
+struct TwoRevocations {
+    rig: Rig,
+    first_revoked: (Device, kr_controller::service::net::devices::DeviceRecord),
+    second_revoked: (Device, kr_controller::service::net::devices::DeviceRecord),
+    first_request: RevocationRequest,
+    second_request: RevocationRequest,
+}
+
+/// Two devices paired, the owner's feed revoking the first and then the second, each carried out
+/// and acknowledged as complete. `between` runs after the first revocation, with the rig and the
+/// two devices, and `before` after both devices are paired and before any revocation.
+async fn two_revocations_the_registry_will_lose<B, T>(before: B, between: T) -> TwoRevocations
+where
+    B: FnOnce(&Rig),
+    T: FnOnce(&Rig),
+{
+    let rig = Rig::start().await;
+    let first_revoked = rig.pairs(&[ActionRight::SessionView]).await;
+    let second_revoked = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.until_the_carrier_is_idle().await;
+    before(&rig);
+    let first_request = rig
+        .owner_publishes(0xe1, devices(first_revoked.1.device_id))
+        .await;
+    rig.poll().await;
+    rig.until_the_revocation_is_acknowledged(&first_request)
+        .await;
+    between(&rig);
+    let second_request = rig
+        .owner_publishes(0xe2, devices(second_revoked.1.device_id))
+        .await;
+    rig.poll().await;
+    rig.until_the_revocation_is_acknowledged(&second_request)
+        .await;
+    TwoRevocations {
+        rig,
+        first_revoked,
+        second_revoked,
+        first_request,
+        second_request,
+    }
+}
+
+impl Rig {
+    /// The feed's retention ends both requests, and the registry is put back to `copy`: a second
+    /// restore in the same wait, after the requests that owed the first revoked device are gone.
+    async fn restored_again_after_the_feed_dropped(
+        self,
+        requests: [&RevocationRequest; 2],
+        copy: &std::path::Path,
+    ) -> Self {
+        for request in requests {
+            self.served.web().the_feeds_drop(request.request_id);
+        }
+        self.poll().await;
+        let rig = self
+            .restarted(false, |tree| put_the_registry_back(tree, copy))
+            .await;
+        rig.until_the_carrier_is_idle().await;
+        rig.until_the_carrier_is_idle().await;
+        rig
+    }
+
+    /// The wait still owes `device`: the confirmation is refused and names it, and revoking what
+    /// is owed at the machine ends the wait.
+    async fn the_wait_owes_and_the_person_revokes(&self, device: DeviceId, others: &[DeviceId]) {
+        let refused = self.the_confirmation_is_refused().await;
+        assert!(
+            refused.message.contains(&device.to_string()),
+            "the device the second restore brought back is owed: {refused:?}"
+        );
+        self.revokes_at_the_machine(device).await;
+        for other in others {
+            if !self.has_revoked(*other).await {
+                self.revokes_at_the_machine(*other).await;
+            }
+        }
+        assert!(self.the_owner_confirms().await.lifted);
+    }
+}
+
+/// KR-REQ-24.15: a device the registry of the first copy no longer holds live when the scan writes
+/// the request that names it is owed all the same: the feed drops the request, the registry is put
+/// back to a copy in which the device is live, and the list is all that says the host owes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_revoked_in_the_first_copy_is_owed_when_a_second_copy_holds_it_live() {
+    let mut first = None;
+    let mut second = None;
+    let TwoRevocations {
+        rig,
+        first_revoked,
+        second_revoked,
+        first_request,
+        second_request,
+    } = two_revocations_the_registry_will_lose(
+        |rig| first = Some(a_copy_of_the_registry(&rig.host, "registry-live.sqlite3")),
+        |rig| {
+            second = Some(a_copy_of_the_registry(
+                &rig.host,
+                "registry-revoked.sqlite3",
+            ))
+        },
+    )
+    .await;
+    let (first, second) = (first.expect("a copy"), second.expect("a copy"));
+
+    // The first restore is to the copy in which the first device is already revoked.
+    let rig = rig
+        .restarted(false, |tree| put_the_registry_back(tree, &second))
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    rig.until_the_carrier_is_idle().await;
+    assert!(
+        rig.what_the_record_lists()
+            .contains(&restored::Target::Device(first_revoked.1.device_id)),
+        "the device the request names is owed although it is not live in the copy"
+    );
+
+    let rig = rig
+        .restored_again_after_the_feed_dropped([&first_request, &second_request], &first)
+        .await;
+    rig.the_wait_owes_and_the_person_revokes(
+        first_revoked.1.device_id,
+        &[second_revoked.1.device_id],
+    )
+    .await;
+}
+
+/// KR-REQ-24.15: a device the first copy never held is owed when a request names it, and a second
+/// copy in which it is live finds it owed after the feed dropped the request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_the_first_copy_never_held_is_owed_when_a_second_copy_holds_it_live() {
+    let rig = Rig::start().await;
+    let second_revoked = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.until_the_carrier_is_idle().await;
+    let without = a_copy_of_the_registry(&rig.host, "registry-without.sqlite3");
+    let first_revoked = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.until_the_carrier_is_idle().await;
+    let with = a_copy_of_the_registry(&rig.host, "registry-with.sqlite3");
+    let first_request = rig
+        .owner_publishes(0xe1, devices(first_revoked.1.device_id))
+        .await;
+    rig.poll().await;
+    rig.until_the_revocation_is_acknowledged(&first_request)
+        .await;
+    let second_request = rig
+        .owner_publishes(0xe2, devices(second_revoked.1.device_id))
+        .await;
+    rig.poll().await;
+    rig.until_the_revocation_is_acknowledged(&second_request)
+        .await;
+
+    let rig = rig
+        .restarted(false, |tree| put_the_registry_back(tree, &without))
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    rig.until_the_carrier_is_idle().await;
+    assert!(
+        rig.what_the_record_lists()
+            .contains(&restored::Target::Device(first_revoked.1.device_id)),
+        "the device the registry does not hold is owed all the same"
+    );
+
+    let rig = rig
+        .restored_again_after_the_feed_dropped([&first_request, &second_request], &with)
+        .await;
+    rig.the_wait_owes_and_the_person_revokes(
+        first_revoked.1.device_id,
+        &[second_revoked.1.device_id],
+    )
+    .await;
+}
+
+/// KR-REQ-24.15: a device the person revoked at the machine before the scan reached the page that
+/// names it is owed all the same, and the same copy put back again finds it owed after the feed
+/// dropped the request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_the_person_revoked_before_the_scan_reached_its_page_is_owed_when_the_copy_is_put_back_again()
+ {
+    let mut copy = None;
+    let TwoRevocations {
+        rig,
+        first_revoked,
+        second_revoked,
+        first_request,
+        second_request,
+    } = two_revocations_the_registry_will_lose(
+        |rig| copy = Some(a_copy_of_the_registry(&rig.host, "registry-live.sqlite3")),
+        |_| {},
+    )
+    .await;
+    let copy = copy.expect("a copy");
+
+    // The first read of the run is held while the person revokes the device at the machine.
+    let reads = rig.arrivals("read");
+    rig.served
+        .web()
+        .fail_with_member(AUTHORITY, "read", 1, Moment::Hold);
+    let rig = rig
+        .restarted(false, |tree| put_the_registry_back(tree, &copy))
+        .await;
+    rig.until_arrivals("read", reads + 1).await;
+    rig.revokes_at_the_machine(first_revoked.1.device_id).await;
+    rig.served.web().release_held();
+    rig.until_the_carrier_is_idle().await;
+    rig.until_the_carrier_is_idle().await;
+    assert!(
+        rig.what_the_record_lists()
+            .contains(&restored::Target::Device(first_revoked.1.device_id)),
+        "the device the person revoked is owed although it is not live when its page is written"
+    );
+
+    let rig = rig
+        .restored_again_after_the_feed_dropped([&first_request, &second_request], &copy)
+        .await;
+    rig.the_wait_owes_and_the_person_revokes(
+        first_revoked.1.device_id,
+        &[second_revoked.1.device_id],
+    )
+    .await;
+}
+
 /// KR-REQ-24.15: a record of the restore that cannot be read is not written over by a finding
 /// either: the registry is behind the feed, the host catches up, and the record stays what it was,
 /// so the doctor still says that it cannot be read and the confirmation removes it.

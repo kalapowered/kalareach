@@ -150,10 +150,13 @@ pub struct Merged {
 /// An entry leaves it when `change` clears it and its target is live, and never because no request
 /// names it now (a request the feed dropped after its retention left its entry where it was) or
 /// because its target is not live now, whoever revoked it: a registry put back again brings the
-/// target back, and the request that owed it may be gone by then. An entry whose target is not live
-/// yields its place to an added one when the list holds `most` entries. A target not live is not
-/// added, and one that cannot be shown not to be live is. The entries held stay, new ones are added
-/// in order until `most` entries are held, and the rest are left out and `full` is set.
+/// target back, and the request that owed it may be gone by then. For the same reason a target that
+/// is not live when it is added (revoked at the machine before the scan reached its page, or absent
+/// from this copy of the registry) is added too. An entry whose target is not live blocks no
+/// confirmation, counts toward no cap and yields its place to a live target when the list holds
+/// `most` entries. The entries held stay and new ones are added in order until `most` entries are
+/// held. A live target that finds no room is left out and `full` is set; one that is not live and
+/// finds no room is left out and `full` stays as it was.
 #[must_use]
 pub fn merged(
     held: &[Owed],
@@ -176,13 +179,18 @@ pub fn merged(
             origin: change.origin,
             target: *target,
         };
-        if owed.contains(&entry) || !live(target) {
+        if owed.contains(&entry) {
             continue;
         }
         if owed.len() >= most {
-            let spent = owed.iter().find(|held| !live(&held.target)).copied();
+            // Only a live target takes the place of an entry that is not live.
+            let target_live = live(target);
+            let spent = owed
+                .iter()
+                .find(|held| target_live && !live(&held.target))
+                .copied();
             let Some(spent) = spent else {
-                full = true;
+                full |= target_live;
                 continue;
             };
             owed.remove(&spent);
@@ -1053,7 +1061,7 @@ mod tests {
     }
 
     #[test]
-    fn an_entry_that_is_not_live_stays_and_a_target_that_is_not_live_is_not_added() {
+    fn an_entry_that_is_not_live_stays_and_a_target_that_is_not_live_is_added() {
         let held = vec![entry(1, device(1)), entry(2, device(2))];
         let origin = Digest256::from_bytes([1; 32]);
         let merged = merged(
@@ -1070,11 +1078,40 @@ mod tests {
             merged.owed,
             vec![
                 entry(1, device(1)),
+                entry(1, device(3)),
                 entry(1, device(4)),
                 entry(2, device(2))
             ],
-            "a registry put back again can bring device 2 back, with the request that owed it gone"
+            "a registry put back again can bring device 2 and device 3 back, with the request that \
+             owed them gone"
         );
+        assert!(!merged.full);
+    }
+
+    #[test]
+    fn a_target_that_is_not_live_finds_no_room_at_the_cap_and_does_not_say_the_list_is_full() {
+        let origin = Digest256::from_bytes([1; 32]);
+        let held = vec![entry(1, device(1)), entry(1, device(2))];
+        let change = Change {
+            origin,
+            add: &[device(3)],
+            clear: &[],
+        };
+        // Device 2 is not live, and device 3 is not live either: it takes nobody's place.
+        let left_out = merged(&held, &change, 2, |target| *target == device(1));
+        assert_eq!(left_out.owed, held);
+        assert!(!left_out.full);
+        // Device 3 is live: it takes the place of device 2, which is not.
+        let takes_it = merged(&held, &change, 2, |target| *target != device(2));
+        assert_eq!(
+            takes_it.owed,
+            vec![entry(1, device(1)), entry(1, device(3))]
+        );
+        assert!(!takes_it.full);
+        // Both entries are live and device 3 is not: it is left out, and the list is not full for it.
+        let alone = merged(&held, &change, 2, |target| *target != device(3));
+        assert_eq!(alone.owed, held);
+        assert!(!alone.full);
     }
 
     #[test]

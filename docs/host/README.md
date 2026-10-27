@@ -7094,7 +7094,9 @@ the feed dropped after its retention leaves its entry where it was, even when a 
 feed names the same target and is settled. It does not leave because its target was revoked
 either, by the person or by the host carrying a request out, since a registry put back again
 brings the target back, after the request that owed it may be gone; such an entry yields its place
-only when the list is full. An entry an earlier run wrote is not cleared by a scan, because
+only when the list is full. For the same reason the host writes a target that is not live when it
+writes the request's page: one the person revoked at the machine before the scan reached the page,
+or one the restored copy of the registry does not hold. An entry an earlier run wrote is not cleared by a scan, because
 nothing in the record says which request wrote it, and a request the feed has since dropped may
 have. The wait ends with the
 confirmation, which removes the record. A scan of another feed clears only entries of its own
@@ -7105,10 +7107,11 @@ target live. The list can hold a target whose request the host then dismissed on
 scan of the run that wrote the entry reads the feed through and clears it, or, when a stop came
 first, until the wait ends; it holds the confirmation back only while the target is live. The list
 holds at most 512 entries, and the file at most 64 KiB. For a host that reads its feed, an entry
-whose target is not live does not count toward the 512: it gives its place to a new one. When 512
-entries are live and a request names one more live target, the host keeps what it holds and adds
-by the lowest sequence, the scan does not count as read through, and the refusal says that the list
-is full; revoking some lets the next scan find the others. A host that reads no feed, or whose feed
+whose target is not live does not count toward the 512: it gives its place to a live target. When
+512 entries are live and a request names one more live target, the host keeps what it holds and
+adds by the lowest sequence, the scan does not count as read through, and the refusal says that the
+list is full; revoking some lets the next scan find the others. A target that is not live and finds
+no room is left out, and the list does not read as full for it. A host that reads no feed, or whose feed
 removed it, reads a list of 512 entries as full, whichever of them are live.
 
 Each finding restarts the scan at the first record: the registry found behind the feed, put back
@@ -7207,11 +7210,11 @@ The list has limits of its own. A device the owner revoked at the machine after 
 the feed, so the host cannot know it: the person reads what the host holds with
 `kr organisation list` and revokes again what the restore brought back. A request the feed dropped
 before any scan of this host read it can be neither carried out nor owed, and one a scan read and
-wrote down stays owed after the feed drops it, unless the host dismissed it on evidence while its
-target was live. An owner who publishes again a completed request the
+wrote down stays owed after the feed drops it, whether its target was live when the scan wrote the
+page or not, unless the host dismissed it on evidence while its target was live. An owner who publishes again a completed request the
 feed dropped after its retention, from a device the restored registry lacks, is refused as a request
 above the bound, and its target stays live at the lift: the person revokes the target at the
-machine, or publishes again from an owner device the registry holds. More than 512 owed targets, or
+machine, or publishes again from an owner device the registry holds. More than 512 owed targets (a target that is not live is then the first left out), or
 a list write that failed or an abort before it followed by a restart with the feed removed or
 absent, leave the host knowing only what the record holds. A record that cannot be read has lost
 its list: no scan writes over it, the run's own memory of what it owes is checked at the
