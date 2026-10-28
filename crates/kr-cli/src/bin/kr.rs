@@ -1610,7 +1610,9 @@ fn creation_report(
     match (presentation_error, outcome) {
         (Some(error), _) => Completion::Reported(error),
         (None, Some(outcome)) => {
-            // The shell's own exit, with any status, is how the person ended the session.
+            // The shell's own exit, with any status, is how the person ended the session. A close on
+            // request and a detach, whatever its origin, are no failure at all: they are `Done`,
+            // and so is no reason to hold the window.
             let by_its_shell = outcome.closure().is_some_and(|record| {
                 matches!(record.reason, kr_protocol::session::ClosureReason::RootExit)
             });
