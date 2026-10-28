@@ -24,6 +24,7 @@ import { withArchive } from './android-classes.mjs'
 import {
   ANDROID_PERMISSIONS,
   certificateFingerprint,
+  checkIos,
   declaresSignInLink,
   embeddedCode,
   problemsInBundleConfig,
@@ -218,7 +219,7 @@ const TOKEN = `eyJ${'a'.repeat(12)}.eyJ${'b'.repeat(12)}.${'c'.repeat(12)}`
 const suppressed = suppressedIfSecret({ problems: ['the version name is "the-secret-itself"'], facts: { secretsFound: 1 } })
 held('a bundle that holds a secret is reported by its count, with nothing quoted from it', [1, true], [suppressed.facts.secretsFound, !JSON.stringify(suppressed).includes('the-secret-itself')])
 held('an error message that quotes a secret is withheld, and one that does not is kept', ['the details are withheld: they quote a secret file', 'no such file'], [withheldIfSecret('could not read /x/the-secret-itself', secretNeedles(Buffer.from('the-secret-itself\n'))), withheldIfSecret('no such file', secretNeedles(Buffer.from('the-secret-itself\n')))])
-held('an error message that quotes a signed token is withheld too', 'the details are withheld: they quote a secret file', withheldIfSecret(`could not read /x/${TOKEN}`, secretNeedles(Buffer.from('the-secret-itself\n'))))
+held('an error message that quotes a signed token is withheld too', false, withheldIfSecret(`could not read /x/${TOKEN}`, secretNeedles(Buffer.from('the-secret-itself\n'))).includes(TOKEN))
 {
   // A member whose name holds the secret and whose compression the reader refuses: the reader's own
   // error quotes the member's name, and the scan must not pass that on.
@@ -471,8 +472,27 @@ if (codesign.error || process.platform !== 'darwin') {
   held('the code embedded in a bundle is its frameworks and dylibs, and nothing else', ['Inner.framework', 'Plain.dylib'], embeddedCode(signed).map((each) => each.name))
   const adHoc = signerOf(join(frameworks, 'Plain.dylib'))
   heldProblems('a real ad hoc signature on embedded code is read and refused', problemsInEmbeddedSignature({ ...adHoc, hostLeafSha1: 'AB'.repeat(20), team: TEAM }), ['signed ad hoc', 'not signed with an Apple Distribution'])
-  held('the application and the extension carry no embedded code of their own here', [], embeddedCode(extension))
+  held('a bundle with no Frameworks directory has no embedded code', [], embeddedCode(extension))
   held('the extension is sealed with the shared group alone and no push', [[`${TEAM}.to.kala.reach.shared`], undefined], [notification['keychain-access-groups'], notification['aps-environment']])
+  // The whole export-stage check on this bundle: embedded code that is signed ad hoc is named among its
+  // problems, and a bundle without it is not.
+  const exportCheck = () => checkIos({ path: signed, stage: 'export', versionCode: '1', versionName: '0.1.0', secretFiles: [], skipAppChecks: true }).problems
+  held('the export check names embedded code that is signed ad hoc', true, exportCheck().some((each) => each.startsWith('Plain.dylib in the application is signed ad hoc')))
+  // A name in a problem line is quoted out of the bundle like a value is: the command prints it only
+  // through the filter, and the record is written the same way.
+  const leaking = join(frameworks, 'leak-correct-horse-battery-staple.dylib')
+  copyFileSync(join(frameworks, 'Plain.dylib'), leaking)
+  const leakSecret = join(work, 'name-secret'); writeFileSync(leakSecret, 'correct-horse-battery-staple\n')
+  const leakRecord = join(work, 'name-record.json')
+  const named = spawnSync(process.execPath, [join(import.meta.dirname, 'store-bundle.mjs'), '--ios', signed, '--stage', 'export', '--version-code', '1', '--version-name', '0.1.0', '--skip-app-checks', '--secret-file', leakSecret, '--record', leakRecord], { encoding: 'utf8' })
+  held(
+    'a problem that quotes a file name holding the secret reaches neither the terminal nor the record',
+    [1, false, false],
+    [named.status, `${named.stdout}${named.stderr}`.includes('correct-horse-battery-staple'), readFileSync(leakRecord, 'utf8').includes('correct-horse-battery-staple')]
+  )
+  rmSync(leaking, { force: true })
+  rmSync(frameworks, { recursive: true, force: true })
+  held('and names none once the bundle has no embedded code', false, exportCheck().some((each) => each.includes(' in the application ')))
 }
 
 // -- the shell library: the guard that puts the Apple project back, and the build number rules ---
@@ -543,37 +563,36 @@ held('when the project cannot be put back the guard fails, and keeps the copy an
 spawnSync('chmod', ['0644', localConfig])
 rmSync(localConfig, { force: true })
 
-// A lock goes only when the run that holds it is gone: a lock that is old but whose owner still runs
-// stays, and one whose owner has ended, or that names no owner and has aged, is taken over.
-const lockCase = (setup) => {
+// The receipt lock is a kernel lock on a file: a run that holds it keeps it however slow it is, and a
+// run that ends, killed or not, cannot leave it held.
+const lockCase = (holder) => {
   const base = join(work, `lock-${Math.random().toString(36).slice(2)}`)
   mkdirSync(join(base, 'receipts'), { recursive: true })
-  const lock = join(base, 'receipts', 'ios.lock')
-  const answer = shell(`${setup.replaceAll('$LOCK', `"${lock}"`)}; kr_store_receipt ios 39900; status=$?; [ -z "\${owner:-}" ] || kill "$owner" 2>/dev/null; echo "status=$status lock=$([ -d "${lock}" ] && echo kept || echo gone)"`, {
-    KR_STORE_ROOT: base,
-    KR_STORE_LOCK_WAIT: '2'
-  })
+  const file = join(base, 'receipts', 'ios.flock')
+  const script = `${holder.replaceAll('$FILE', `"${file}"`)}; kr_store_receipt ios 39900; echo "status=$?"; [ -z "\${holder:-}" ] || kill -9 "$holder" 2>/dev/null; true`
+  const answer = shell(script, { KR_STORE_ROOT: base, KR_STORE_LOCK_WAIT: '2' })
   let receipt = 'none'
   try { receipt = readFileSync(join(base, 'receipts', 'ios'), 'utf8').trim() } catch { /* no receipt */ }
   return { text: answer.stdout.trim().split('\n').pop(), receipt }
 }
-const aged = 'touch -t 202001010000 $LOCK'
-const liveOwner = lockCase(`sleep 30 & owner=$!; mkdir $LOCK; printf '%s\\n' "$owner" > $LOCK/owner; ${aged}`)
-held('an old lock whose owner is still running is not taken, and no receipt is written', ['status=2 lock=kept', 'none'], [liveOwner.text, liveOwner.receipt])
-const deadOwner = lockCase(`sleep 0 & owner=$!; wait $owner; mkdir $LOCK; printf '%s\\n' "$owner" > $LOCK/owner`)
-held('a lock whose owner has ended is taken over at once', ['status=0 lock=gone', '39900'], [deadOwner.text, deadOwner.receipt])
-const ownerless = lockCase(`mkdir $LOCK; ${aged}`)
-held('a lock that names no owner and has aged is taken over', ['status=0 lock=gone', '39900'], [ownerless.text, ownerless.receipt])
+// The holder takes the lock in a shell of its own, then becomes `sleep`, so killing it ends the lock.
+const holding = '( exec 8>>$FILE; lockf -s -t 0 8 && : >$FILE.ready; exec sleep 30 ) & holder=$!; until [ -e $FILE.ready ]; do sleep 0.1; done'
+const held_ = lockCase(holding)
+held('a lock that another run holds is waited for, and then refused with no receipt', ['status=2', 'none'], [held_.text, held_.receipt])
+const killed = lockCase(`${holding}; kill -9 $holder; wait $holder 2>/dev/null`)
+held('a lock whose holder was killed is free at once', ['status=0', '39900'], [killed.text, killed.receipt])
+const free = lockCase('true')
+held('a lock nobody holds is taken', ['status=0', '39900'], [free.text, free.receipt])
 
 // The logs Xcode keeps request tokens in: Packaging.log beside the export, and a log bundle in the
 // temporary directory that the export log names.
-const tokenLogs = (temporary, where) => {
+const tokenLogs = (temporary, where, naming = true) => {
   const base = mkdtempSync(join(work, 'tokens-'))
   mkdirSync(join(base, 'export'), { recursive: true })
   writeFileSync(join(base, 'export', 'Packaging.log'), 'a token')
   const bundle = where(base)
   mkdirSync(bundle, { recursive: true }); writeFileSync(join(bundle, 'IDEDistribution.log'), 'a token')
-  writeFileSync(join(base, 'export.log'), `Created bundle at path "${bundle}".\n`)
+  writeFileSync(join(base, 'export.log'), naming ? `Created bundle at path "${bundle}".\n` : 'Export started.\n')
   const answer = shell(`${temporary}; kr_store_remove_token_logs "${base}"; echo "status=$?"`, {})
   const exists = (path) => spawnSync('test', ['-e', path]).status === 0
   const removed = answer.stdout.trim().split('\n').pop()
@@ -585,7 +604,8 @@ const userTemporary = spawnSync('getconf', ['DARWIN_USER_TEMP_DIR'], { encoding:
 const temporaryHere = join(work, 'xcode-temp'); mkdirSync(temporaryHere)
 held('Xcode\'s two token logs are removed when the temporary directory is named', ['status=0', false, false], tokenLogs(`export TMPDIR="${temporaryHere}"`, () => join(temporaryHere, 'a.xcdistributionlogs')))
 held('Xcode\'s two token logs are removed when TMPDIR is not set', ['status=0', false, false], tokenLogs('unset TMPDIR', () => join(userTemporary, `kr-selftest-${process.pid}.xcdistributionlogs`)))
-held('a log bundle outside the temporary directory is kept, and the failure says so', ['status=2', false, true], tokenLogs(`export TMPDIR="${temporaryHere}"`, (base) => join(base, 'elsewhere', 'a.xcdistributionlogs')))
+held('an export log that names no log bundle fails the cleanup, since tokens may remain', ['status=2', false, true], tokenLogs(`export TMPDIR="${temporaryHere}"`, () => join(temporaryHere, 'b.xcdistributionlogs'), false))
+held('a log bundle outside the temporary directory is kept, and the cleanup fails', ['status=2', false, true], tokenLogs(`export TMPDIR="${temporaryHere}"`, (base) => join(base, 'elsewhere', 'a.xcdistributionlogs')))
 
 const racing = join(work, 'racing'); mkdirSync(racing)
 shell('for n in $(seq 39100 39139); do kr_store_receipt ios $n & done; wait', { KR_STORE_ROOT: racing })

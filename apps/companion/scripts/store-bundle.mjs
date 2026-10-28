@@ -370,13 +370,16 @@ export function withheldIfSecret(message, needles) {
  * that cannot be read cannot be quoted, and the message then stands as it is.
  */
 function failureText(failure, secretFiles) {
-  let needles = []
+  return withheldIfSecret(String(failure.message), quotableNeedles(secretFiles))
+}
+
+/** The needles of the secret files, or none when a file cannot be read: a secret that cannot be read cannot be quoted. */
+function quotableNeedles(secretFiles) {
   try {
-    needles = needlesOf(secretFiles)
+    return needlesOf(secretFiles)
   } catch {
-    // A secret that cannot be read cannot be quoted.
+    return []
   }
-  return withheldIfSecret(String(failure.message), needles)
 }
 
 /**
@@ -495,7 +498,6 @@ export function profileFromXml(xml) {
   return profile
 }
 
-/** What is wrong with the signature an exported bundle carries, given its profile. */
 /**
  * What is wrong with the signature of a framework or dylib inside a bundle: it is signed with a
  * distribution certificate of the team, and the same one as the bundle that holds it, which its own
@@ -536,6 +538,7 @@ export function signerOf(path) {
   return { described: described.stderr, leafSha1 }
 }
 
+/** What is wrong with the signature an exported bundle carries, given its profile. */
 export function problemsInExportSignature({ described, leafSha1, profile, entitlements, team }) {
   const problems = []
   if (/Signature=adhoc/.test(described)) problems.push('is signed ad hoc, not with a distribution certificate')
@@ -653,21 +656,21 @@ export function checkIos(options) {
       const signed = run('codesign', ['--verify', '--deep', '--strict', bundle.path])
       if (signed.status !== 0) problems.push(`${bundle.name}'s signature does not verify: ${signed.stderr.trim().split('\n')[0]}`)
       if (options.stage === 'export') {
+        const { described, leafSha1 } = signerOf(bundle.path)
+        for (const code of embeddedCode(bundle.path)) {
+          const signer = signerOf(code.path)
+          for (const each of problemsInEmbeddedSignature({ ...signer, hostLeafSha1: leafSha1, team: want.team })) {
+            problems.push(`${code.name} in ${bundle.name} ${each}`)
+          }
+        }
         const profilePath = join(bundle.path, 'embedded.mobileprovision')
         if (!existsSync(profilePath)) {
           problems.push(`${bundle.name} carries no provisioning profile`)
           continue
         }
         const profile = readProfile(profilePath)
-        const { described, leafSha1 } = signerOf(bundle.path)
         for (const each of problemsInExportSignature({ described, leafSha1, profile, entitlements, team: want.team })) {
           problems.push(`${bundle.name} ${each}`)
-        }
-        for (const code of embeddedCode(bundle.path)) {
-          const signer = signerOf(code.path)
-          for (const each of problemsInEmbeddedSignature({ ...signer, hostLeafSha1: leafSha1, team: want.team })) {
-            problems.push(`${code.name} in ${bundle.name} ${each}`)
-          }
         }
         for (const each of problemsInProfile(profile, { team: want.team, identifier: info.CFBundleIdentifier, push: index === 0 })) {
           problems.push(`${bundle.name}'s profile: ${each}`)
@@ -792,23 +795,26 @@ if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) 
     if (found > 0) result = secretFirst(found)
   }
   const shown = relative(process.cwd(), options.path)
-  const problems = [...new Set(result.problems)]
+  // A problem can quote a name or a value out of the bundle, so each goes through the same filter as
+  // every other message before it reaches the terminal or the record.
+  const quotable = quotableNeedles(options.secretFiles)
+  const problems = [...new Set(result.problems.map((each) => withheldIfSecret(each, quotable)))]
   if (options.record) {
     const stats = statSync(options.path)
-    const record = {
+    const identity = {
       file: options.path.split('/').pop(),
       platform: options.platform,
       stage: options.stage ?? null,
       versionName: options.versionName,
       versionCode: Number(options.versionCode),
       bytes: stats.size,
-      sha256: stats.isFile() ? sha256(options.path) : null,
-      holds: problems.length === 0,
-      problems,
-      ...result.facts,
-      ...options.notes
+      sha256: stats.isFile() ? sha256(options.path) : null
     }
-    writeFileSync(options.record, `${JSON.stringify(record, null, 2)}\n`)
+    let text = `${JSON.stringify({ ...identity, holds: problems.length === 0, problems, ...result.facts, ...options.notes }, null, 2)}\n`
+    if (holdsSecret(Buffer.from(text, 'utf8'), quotable)) {
+      text = `${JSON.stringify({ ...identity, holds: false, problems: ['the details are withheld: the record quotes a secret file'] }, null, 2)}\n`
+    }
+    writeFileSync(options.record, text)
   }
   if (problems.length > 0) {
     console.error(`${shown}:\n${problems.map((each) => `  ${each}`).join('\n')}`)
