@@ -830,7 +830,10 @@ mod tests {
             None
         );
         put_profile(&domain, PROFILE_NAME, &profile_of(PROFILE_NAME, "ours"));
-        let ours = current_entry(&recorded(String::new()));
+        let other = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>name</key><string>Other</string></dict></plist>"#;
+        let ours = current_entry(&recorded(other.to_owned()));
         assert!(
             matches!(ours, Err(ProfileError::Changed { .. })),
             "an entry the record does not name: {ours:?}"
