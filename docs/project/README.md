@@ -866,11 +866,12 @@ nothing ever changes what an earlier test or review was about.
 | `diff.read` | A working copy's changes, or a captured version's, with both sides' content revisions | `files.read` |
 | `changeset.capture` | An immutable version of a working copy | `changeset.create` |
 | `changeset.read` | One exact version, every version beside it, and everything that names it | `files.read` |
+| `changeset.test_reports` | What this host read out of the test reports the suites that ran against one exact version wrote: each report's format, its counts and the cases that did not pass plainly | `files.read` |
 | `changeset.materialize` | An independent copy of one exact version, in a directory of this host's own | `workspace.manage` |
 | `diff.apply` | Applies a version at a named destination class | `files.apply_diff` |
 | `diff.revert` | Puts the base's own content back for the paths a version changed | `files.apply_diff` |
 
-A paired device reaches `changeset.read`, `changeset.materialize` and `diff.read` of a recorded version, for a version inside its grant, and is never told the path of a materialisation's directory. It is refused `changeset.capture`, `diff.apply`, `diff.revert` and `diff.read` of a working copy, which run the Git program on a working tree. `docs/host/README.md` gives the rule that decides whether a version is inside a grant.
+A paired device reaches `changeset.read`, `changeset.materialize` and `diff.read` of a recorded version, for a version inside its grant, and is never told the path of a materialisation's directory. It is refused `changeset.test_reports`, which only the local owner reads, and `changeset.capture`, `diff.apply`, `diff.revert` and `diff.read` of a working copy, which run the Git program on a working tree. `docs/host/README.md` gives the rule that decides whether a version is inside a grant.
 
 A version whose provenance names a session is review work for that session, whether a capture
 recorded it or it was derived from a modified materialisation. The control daemon reads the newest

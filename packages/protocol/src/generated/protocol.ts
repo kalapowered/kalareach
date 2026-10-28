@@ -3262,6 +3262,9 @@ export interface KalaReachProtocol {
   sync_object_record?: SyncObjectRecord
   terminal_geometry_transfer_params?: TerminalGeometryTransferParams
   terminal_resize_params?: TerminalResizeParams
+  test_report?: TestReport
+  test_reports_params?: TestReportsParams
+  test_reports_result?: TestReportsResult
   time_adapter_reading?: TimeAdapterReading1
   time_checkpoint?: TimeCheckpoint
   upload_begin_params?: UploadBeginParams
@@ -19344,6 +19347,7 @@ export interface MethodEntry {
     | 'diff.revert'
     | 'changeset.capture'
     | 'changeset.read'
+    | 'changeset.test_reports'
     | 'changeset.materialize'
     | 'review.read'
     | 'review.acknowledge'
@@ -28453,6 +28457,7 @@ export interface ServiceRequestPayload {
     | 'diff.revert'
     | 'changeset.capture'
     | 'changeset.read'
+    | 'changeset.test_reports'
     | 'changeset.materialize'
     | 'review.read'
     | 'review.acknowledge'
@@ -30512,6 +30517,155 @@ export interface Dimensions6 {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   rows: string
+}
+/**
+ * What this host read out of one declared output of one run.
+ */
+export interface TestReport {
+  /**
+   * The format the document opened as.
+   */
+  format: 'junit_xml' | 'go_test_json'
+  /**
+   * The run it belongs to: the materialisation the suite ran in, which names the version.
+   */
+  materialisation_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  output_bytes: string
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  output_digest: string
+  /**
+   * The declared output the document was, relative to the copy's root.
+   */
+  output_path: string
+  /**
+   * What this host made of it.
+   */
+  reading:
+    | {
+        /**
+         * The first [`MAX_REPORT_CASES`] cases that did not pass plainly, in document order.
+         */
+        cases: ReportCase[]
+        /**
+         * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+         */
+        cases_omitted: string
+        state: 'parsed'
+        totals: ReportTotals
+      }
+    | {
+        /**
+         * Why.
+         */
+        reason: 'over_size' | 'too_deep' | 'too_large' | 'not_supported' | 'malformed'
+        state: 'unreadable'
+      }
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  recorded_at_ms: string
+}
+/**
+ * One case that did not pass plainly.
+ */
+export interface ReportCase {
+  /**
+   * How long it ran, in milliseconds, when the tool said.
+   */
+  duration_ms: U64 | null
+  /**
+   * The class, suite or package the tool put it in, bounded in the same way.
+   */
+  group: string | null
+  /**
+   * The test's name as the tool wrote it, at most [`MAX_REPORT_NAME_BYTES`] bytes. It is report
+   * content: a parameterised test's name can carry the value it ran with.
+   */
+  name: string
+  /**
+   * What became of it.
+   */
+  outcome: 'failed' | 'errored' | 'skipped' | 'flaky'
+}
+/**
+ * The counts, taken from the cases.
+ */
+export interface ReportTotals {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  errored: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  failed: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  flaky: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  passed: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  skipped: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  tests: string
+}
+/**
+ * Parameters of `changeset.test_reports`.
+ */
+export interface TestReportsParams {
+  /**
+   * One immutable captured change set.
+   */
+  change_set_id: string
+  /**
+   * One run of the version, to read the reports of that run alone, or nothing for the newest
+   * runs of the version.
+   */
+  materialisation_id: MaterialisationId | null
+  /**
+   * The version to read, or nothing for the latest.
+   */
+  version: ChangeSetVersion | null
+}
+/**
+ * Result of `changeset.test_reports`.
+ */
+export interface TestReportsResult {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  omitted: string
+  /**
+   * The reports of the version's runs, the newest result's first, at most
+   * [`MAX_REPORTS_PER_ANSWER`].
+   */
+  reports: TestReport[]
+  version: VersionRef12
+}
+/**
+ * One exact version of one change set.
+ */
+export interface VersionRef12 {
+  /**
+   * The change set.
+   */
+  change_set_id: string
+  /**
+   * The version within it, counting from one.
+   */
+  version: string
 }
 /**
  * One reading of the platform time adapter.

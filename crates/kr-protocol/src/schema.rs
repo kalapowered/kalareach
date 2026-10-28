@@ -246,6 +246,7 @@ use crate::skill::{
     ChangeManifest, ChangeOperation, InstalledFile,
 };
 use crate::sync::{SealedRecoveryBundle, SyncConflictCopy, SyncObjectRecord};
+use crate::test_report::{TestReport, TestReportsParams, TestReportsResult};
 use crate::transfer::{
     AgentDraftAddAttachmentParams, AgentDraftAddAttachmentResult, AttachmentContribution,
     AttachmentHandle, AttachmentReadGrant, DownloadBeginParams, DownloadBeginResult,
@@ -724,6 +725,9 @@ pub fn protocol_schema() -> Value {
         "changeset_materialize_result" => ChangesetMaterializeResult,
         "changeset_read_params" => ChangesetReadParams,
         "changeset_read_result" => ChangesetReadResult,
+        "test_report" => TestReport,
+        "test_reports_params" => TestReportsParams,
+        "test_reports_result" => TestReportsResult,
         "diff_apply_params" => DiffApplyParams,
         "diff_apply_result" => DiffApplyResult,
         "diff_entry" => DiffEntry,

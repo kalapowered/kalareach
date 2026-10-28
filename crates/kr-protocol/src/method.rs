@@ -1418,6 +1418,16 @@ methods! {
     freshness: CurrentAuthority, confirmation: None, idempotency: READ,
     doc: "Read one exact change-set version.";
 
+    ChangesetTestReports = "changeset.test_reports", ChangesAndDiffs,
+    effect: Read, ingress: [LocalIpc], rights: [req(FilesRead)], selectors: [ChangeSet],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: CurrentAuthority,
+    confirmation: None, idempotency: READ,
+    doc: "Read what this host made of the test reports the suites that ran against one exact \
+          change-set version wrote: for each declared output in a documented format, the format, \
+          the counts taken from the cases, and the cases that did not pass plainly, by name. A \
+          reading is labelled parsed; a document that opened as a documented format and could not \
+          be read says why. The answer is the local owner's and holds no failure text.";
+
     ChangesetMaterialize = "changeset.materialize", ChangesAndDiffs,
     effect: Write, ingress: [LocalIpc, PairedDevice, Workflow], rights: [req(WorkspaceManage)],
     selectors: [ChangeSet, Workspace],
