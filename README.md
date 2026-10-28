@@ -230,6 +230,36 @@ To see what a package release will include, without creating a tag:
 bash scripts/release-packages.sh --output /tmp/kalareach-packages
 ```
 
+## Install a host
+
+Host releases for macOS and Linux are made available as GitHub pre-releases with tags beginning with `host/v`. Each release contains one archive per target, named `kalareach-<target>-<release>.tar.gz`, and a `SHA256SUMS` file that covers all four. The `<target>` should match the architecture of your host; `aarch64-apple-darwin` or `x86_64-apple-darwin` for macOS 14 or above, or `aarch64-unknown-linux-gnu` or `x86_64-unknown-linux-gnu` for Linux with glibc 2.35 or above. Use `curl -LO` to download the appropriate archive and the `SHA256SUMS` file; downloading the archive with a browser may cause it to be unpacked, which leaves nothing to check. Once you have both files, check, unpack and install the archive:
+
+```sh
+shasum -a 256 --ignore-missing -c SHA256SUMS   # sha256sum --ignore-missing -c SHA256SUMS on Linux
+tar -xzf kalareach-<target>-<release>.tar.gz
+kalareach-<target>-<release>/bin/kr host install
+```
+
+`kr host install` will verify the signed manifest for the release and check every file against it before making the release current. It will then print the directory to add to your `PATH`. On macOS, every program in the archive is signed by Kala Holdings Inc. and notarised by Apple. The first time you open one that came from a browser, Apple's service is asked about it, so the first launch will require a network connection.
+
+A host joins no network until its configuration document says so. Run `kr host startup --set standalone`, which writes the document and prints its path, and add the following sections to it. You must also set `level` to `4`, as the document now contains sections at that level. The network applies when the control daemon starts. Also run `kr shell install`, so that the shells you start under KalaReach open their bridge to it.
+
+```json
+"network": {
+  "enabled": true,
+  "relay_urls": ["https://relay-1.reach.kala.to"],
+  "pkarr_publisher_url": "https://ns1.reach.kala.to/pkarr",
+  "pkarr_resolver_url": "https://ns1.reach.kala.to/pkarr"
+},
+"authority": { "origin": "https://reach.kala.to" },
+"mailbox": { "origin": "https://reach.kala.to" },
+"relay": { "origin": "https://reach.kala.to" }
+```
+
+Before you create your first KalaReach session, open a second terminal window and use that to pair your first phone. `kr pair invite --owner` asks you to type `pair`, then shows a pairing code and a QR code; `kr pair confirm` takes the value the phone shows. `kr new` attaches the terminal it runs in, and the first pairing is refused inside a KalaReach session; on macOS it is also refused in a window opened after a session started. If `kr new` fails with a message that the control daemon did not respond, and `controller.log` mentions the secret store, the system keyring may not be opening correctly for your login session. You can use `kr-controller --secret-store file` to start the daemon with an alternative secret store that keeps device keys in a directory under the state root.
+
+To update to a new release, download the archive for the new release and run `kr host update --archive <archive>`. `kr host rollback` goes back to the release before it. [docs/host/updates.md](docs/host/updates.md) says what an update does to a running session, and [docs/releases/macos-signing.md](docs/releases/macos-signing.md) says how the releases are signed.
+
 ## Recovering a host
 
 A host keeps what it knows in two owner-only directories for each operating-system user, with one
