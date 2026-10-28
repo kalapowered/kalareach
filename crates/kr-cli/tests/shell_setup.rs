@@ -49,6 +49,19 @@ impl Setup {
         let runtime = root.path().join("runtime");
         let state = root.path().join("state");
         std::fs::create_dir(&home).expect("a home");
+        // The terminal preferences of this home's own, which `defaults` reads by path: a domain with
+        // no file fails to read, which is not what a person with no profile of their own has.
+        #[cfg(target_os = "macos")]
+        {
+            std::fs::create_dir_all(home.join("domains")).expect("a directory");
+            for domain in ["com.googlecode.iterm2", "com.apple.Terminal"] {
+                std::fs::write(
+                    home.join("domains").join(format!("{domain}.plist")),
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict/></plist>\n",
+                )
+                .expect("preferences");
+            }
+        }
         let programs = root.path().join("programs");
         std::fs::create_dir(&programs).expect("a directory");
         std::fs::write(programs.join("konsole"), b"#!/bin/sh\n").expect("Konsole stands in");
@@ -110,6 +123,11 @@ impl Setup {
             .env("HOME", &self.home)
             .env("KR_RUNTIME_DIR", &self.runtime)
             .env("KR_STATE_DIR", &self.state)
+            // `defaults` ignores HOME: the terminal preferences are files of this setup's own.
+            .env(
+                kr_shell_integration::host::terminal_profile::PREFERENCES_DIRECTORY_VARIABLE,
+                self.home.join("domains"),
+            )
             .env(PACKAGE_ROOT_VARIABLE, &self.packages)
             .current_dir(&self.state)
             .stdin(std::process::Stdio::null());
