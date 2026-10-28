@@ -74,7 +74,7 @@ const TABLE: &[Row] = &[
     Row {
         command: &["changeset"],
         short: None,
-        operations: &["capture", "read", "materialize"],
+        operations: &["capture", "read", "test-reports", "materialize"],
     },
     Row {
         command: &["diff"],
@@ -156,6 +156,7 @@ const LINES: &[&[&str]] = &[
     &["workspace", "remove", UUID],
     &["changeset", "capture", UUID, "--label", "the work"],
     &["changeset", "read", UUID],
+    &["changeset", "test-reports", UUID, "--run", UUID],
     &["changeset", "materialize", UUID, "1", "--purpose", "review"],
     &["diff", "read", "--workspace", UUID],
     &["diff", "apply", UUID, "1", "--to", "proposal"],

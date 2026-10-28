@@ -387,6 +387,8 @@ pub enum ChangesetCommand {
     Capture(ChangesetCaptureArguments),
     /// Read one exact version of a change set, and every version beside it.
     Read(ChangesetReadArguments),
+    /// Read what this host made of the test reports the suites that ran against a version wrote.
+    TestReports(ChangesetTestReportsArguments),
     /// Write one exact version into an independent directory of this host's own.
     Materialize(ChangesetMaterializeArguments),
 }
@@ -450,6 +452,23 @@ pub struct ChangesetReadArguments {
     /// The version to read. The latest when absent.
     #[arg(long)]
     pub version: Option<u64>,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// `kr changeset test-reports`.
+#[derive(Args)]
+pub struct ChangesetTestReportsArguments {
+    /// The change set, by identifier.
+    pub change_set: String,
+    /// The version to read. The latest when absent.
+    #[arg(long)]
+    pub version: Option<u64>,
+    /// Read the reports of this run alone, by the identifier `kr changeset read` gives its
+    /// materialisation. The newest runs of the version when absent.
+    #[arg(long)]
+    pub run: Option<String>,
     /// The environment.
     #[command(flatten)]
     pub selector: EnvironmentSelector,

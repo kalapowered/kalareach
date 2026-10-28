@@ -12,16 +12,18 @@ use kr_protocol::changeset::{
     ChangesetMaterializeParams, ChangesetMaterializeResult, ChangesetReadParams,
     ChangesetReadResult, FileGrant, MaterialisationPurpose, SourceConsistency,
 };
-use kr_protocol::ids::{ChangeSetId, ChangeSetVersion, WorkspaceId};
+use kr_protocol::error::ErrorCode;
+use kr_protocol::ids::{ChangeSetId, ChangeSetVersion, MaterialisationId, WorkspaceId};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::Nullable;
+use kr_protocol::test_report::{ReportReading, TestReport, TestReportsParams, TestReportsResult};
 
 use crate::cli::{
     ChangesetCaptureArguments, ChangesetCommand, ChangesetMaterializeArguments,
-    ChangesetReadArguments, ConsistencyArgument, PurposeArgument,
+    ChangesetReadArguments, ChangesetTestReportsArguments, ConsistencyArgument, PurposeArgument,
 };
 use crate::daemon::{Daemon, identifier};
-use crate::error::Result;
+use crate::error::{CliError, Result};
 use crate::output::{self, Asked, Line, Request, left, right};
 use crate::{answer, stdout_line};
 
@@ -34,6 +36,7 @@ pub async fn run(paths: &HostPaths, command: ChangesetCommand, json: bool) -> Re
     match command {
         ChangesetCommand::Capture(arguments) => capture(paths, &arguments, json).await,
         ChangesetCommand::Read(arguments) => read(paths, &arguments, json).await,
+        ChangesetCommand::TestReports(arguments) => test_reports(paths, &arguments, json).await,
         ChangesetCommand::Materialize(arguments) => materialize(paths, &arguments, json).await,
     }
 }
@@ -140,6 +143,127 @@ async fn read(paths: &HostPaths, arguments: &ChangesetReadArguments, json: bool)
         ));
     }
     Ok(())
+}
+
+/// `kr changeset test-reports`.
+///
+/// Names and paths in a report are content a test wrote, which a person asked for by asking for the
+/// report, so they are shown as that and nowhere else; the counts and the words are the host's.
+async fn test_reports(
+    paths: &HostPaths,
+    arguments: &ChangesetTestReportsArguments,
+    json: bool,
+) -> Result<()> {
+    let change_set = change_set_identifier(&arguments.change_set)?;
+    let run: Option<MaterialisationId> = arguments
+        .run
+        .as_deref()
+        .map(|text| identifier(text, "a run"))
+        .transpose()?;
+    let mut daemon = Daemon::open(paths, &arguments.selector).await?;
+    let version = arguments
+        .version
+        .map(ChangeSetVersion::new)
+        .map_or_else(Nullable::null, Nullable::some);
+    let asked = daemon
+        .read::<_, TestReportsResult>(
+            Method::ChangesetTestReports,
+            &TestReportsParams {
+                change_set_id: change_set,
+                version,
+                materialisation_id: run.map_or_else(Nullable::null, Nullable::some),
+            },
+        )
+        .await;
+    let answered = match asked {
+        // A daemon of a release before this method does not list it, and refuses it as it refuses
+        // any method it does not list, as a grant without the right does. The same version is
+        // read once more, which asks for the same right: where that is answered, the daemon does
+        // not know the method; where it is refused too, the refusal is the grant's.
+        Err(CliError::Refused(refusal)) if refusal.code == ErrorCode::PermissionDenied => {
+            let params = ChangesetReadParams {
+                change_set_id: change_set,
+                version,
+            };
+            return match daemon
+                .read::<_, ChangesetReadResult>(Method::ChangesetRead, &params)
+                .await
+            {
+                Ok(_) => Err(CliError::Other(kr_client::shown::Shown::said(
+                    "the daemon of this environment is of a release that does not read test \
+                     reports; update it",
+                ))),
+                Err(CliError::Refused(again)) if again.code == ErrorCode::PermissionDenied => {
+                    Err(CliError::Refused(refusal))
+                }
+                Err(other) => Err(other),
+            };
+        }
+        other => other?,
+    };
+    if json {
+        output::document(&answer::test_reports_result(&answered));
+        return Ok(());
+    }
+    output::line(&stdout_line!(
+        "version {} of change set {}: {} report{}",
+        answered.version.version.get(),
+        output::closed_word(&answered.version.change_set_id),
+        answered.reports.len(),
+        if answered.reports.len() == 1 { "" } else { "s" }
+    ));
+    for report in &answered.reports {
+        output::lines(&report_lines(report));
+    }
+    if answered.omitted.get() > 0 {
+        output::line(&stdout_line!(
+            "and {} more; name a run with --run",
+            answered.omitted.get()
+        ));
+    }
+    Ok(())
+}
+
+/// One report as lines for a person: where it was read from, what it holds and each case that did
+/// not pass plainly.
+fn report_lines(report: &TestReport) -> Vec<Line> {
+    let mut lines = vec![stdout_line!(
+        "  {} ({}, run {}), {}",
+        Asked::text(Request::Changesets, &report.output_path),
+        crate::shown::wire_word(report.format),
+        output::closed_word(&report.materialisation_id),
+        match &report.reading {
+            ReportReading::Parsed { totals, .. } => stdout_line!(
+                "parsed: {} tests, {} failed, {} errored, {} skipped, {} flaky",
+                output::closed_word(&totals.tests),
+                output::closed_word(&totals.failed),
+                output::closed_word(&totals.errored),
+                output::closed_word(&totals.skipped),
+                output::closed_word(&totals.flaky)
+            ),
+            ReportReading::Unreadable { reason } => {
+                stdout_line!("not read: {}", crate::shown::wire_word(*reason))
+            }
+        }
+    )];
+    if let ReportReading::Parsed {
+        cases,
+        cases_omitted,
+        ..
+    } = &report.reading
+    {
+        for case in cases {
+            lines.push(stdout_line!(
+                "    {} {}",
+                left(8, &crate::shown::wire_word(case.outcome)),
+                Asked::text(Request::Changesets, &case.name)
+            ));
+        }
+        if cases_omitted.get() > 0 {
+            lines.push(stdout_line!("    and {} more", cases_omitted.get()));
+        }
+    }
+    lines
 }
 
 /// `kr changeset materialize`.
