@@ -663,6 +663,23 @@ struct Home {
     environment: Vec<(String, String)>,
 }
 
+/// The terminal preferences of a home's own, which `defaults` reads by path where
+/// `KR_TERMINAL_PREFERENCES_DIR` names the home's `domains` directory: a domain with no file fails
+/// to read, which is not what a person with no profile of their own has. Nothing on other platforms.
+fn own_terminal_preferences(home: &Path) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    std::fs::create_dir_all(home.join("domains")).expect("a directory");
+    for domain in ["com.googlecode.iterm2", "com.apple.Terminal"] {
+        std::fs::write(
+            home.join("domains").join(format!("{domain}.plist")),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict/></plist>\n",
+        )
+        .expect("preferences");
+    }
+}
+
 /// Installs, starts the daemon's startup choice, and removes, over `home`, asserting each of the
 /// section's claims that needs no session.
 fn install_and_remove(kr: &Kr, package: &Package, home: &Home, label: &str) {
@@ -672,6 +689,7 @@ fn install_and_remove(kr: &Kr, package: &Package, home: &Home, label: &str) {
     if cfg!(target_os = "macos") {
         std::fs::create_dir_all(home.path.join("Applications/iTerm.app")).expect("an application");
     }
+    own_terminal_preferences(&home.path);
     let before = snapshot(&home.path);
     let shell = home.kind.as_str();
 
@@ -972,19 +990,7 @@ fn installing_beside_iterm2_and_over_unusual_files_adds_only_the_marked_entry() 
             .expect("a directory on the internal disk");
         let path = root.path().join("home");
         std::fs::create_dir(&path).expect("a home");
-        // The terminal preferences of this home's own, which `defaults` reads by path: a domain with
-        // no file fails to read, which is not what a person with no profile of their own has.
-        #[cfg(target_os = "macos")]
-        {
-            std::fs::create_dir_all(path.join("domains")).expect("a directory");
-            for domain in ["com.googlecode.iterm2", "com.apple.Terminal"] {
-                std::fs::write(
-                    path.join("domains").join(format!("{domain}.plist")),
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict/></plist>\n",
-                )
-                .expect("preferences");
-            }
-        }
+        own_terminal_preferences(&path);
         for (name, text) in files {
             std::fs::write(path.join(name), text).expect("a startup file");
         }
