@@ -73,14 +73,37 @@ kr_store_number() {
 # the larger of the number it holds and this one, so two runs that overlap cannot lower it, and a
 # failure to write it is the caller's failure.
 kr_store_receipt() {
-    local platform=$1 number=$2 receipt old=0 temporary
+    local platform=$1 number=$2 receipt old=0 temporary lock waited=0 status=0
     receipt="$KR_STORE_ROOT/receipts/$platform"
     mkdir -p "$KR_STORE_ROOT/receipts" || return 2
+    lock="$receipt.lock"
+    # One writer at a time: the lock is a directory, and one that is more than a minute old is a
+    # writer that died.
+    until mkdir "$lock" 2>/dev/null; do
+        if [ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then rmdir "$lock" 2>/dev/null; continue; fi
+        waited=$((waited + 1))
+        if [ "$waited" -gt 60 ]; then kr_store_say "the receipt for $platform is locked by another run" >&2; return 2; fi
+        sleep 1
+    done
     [ ! -f "$receipt" ] || old="$(tr -d '[:space:]' <"$receipt")"
     if [ "$old" -gt "$number" ] 2>/dev/null; then number=$old; fi
-    temporary="$(mktemp "$receipt.XXXXXX")" || return 2
-    if ! { printf '%s\n' "$number" >"$temporary" && mv -f "$temporary" "$receipt"; }; then
-        rm -f -- "${temporary:?}"
+    if temporary="$(mktemp "$receipt.XXXXXX")" && printf '%s\n' "$number" >"$temporary" && mv -f "$temporary" "$receipt"; then
+        status=0
+    else
+        rm -f -- "${temporary:-$receipt.none}"
+        status=2
+    fi
+    rmdir "$lock" 2>/dev/null
+    return "$status"
+}
+
+# kr_store_claim_number <platform> <number>: reserves a build number for a platform, whatever the
+# version, so that two builds of different versions made in one minute cannot both ship it (Google
+# Play wants every version code to be unique). It fails when the number is already claimed.
+kr_store_claim_number() {
+    mkdir -p "$KR_STORE_ROOT/claims" || return 2
+    if ! mkdir "$KR_STORE_ROOT/claims/$1-$2" 2>/dev/null; then
+        kr_store_say "build number $2 is already claimed for $1; wait a minute" >&2
         return 2
     fi
 }
@@ -117,8 +140,11 @@ process.stdout.write(v)' "$1" "$2"
 # kr_store_clean_tree <repository>: the tracked files carry no uncommitted change, so a store build
 # is of a commit. `KR_STORE_ALLOW_DIRTY=1` lifts it for a run that is only a trial.
 kr_store_clean_tree() {
+    local changes
+    changes="$(git -C "$1" status --porcelain --untracked-files=no 2>/dev/null)" \
+        || { kr_store_say "git could not read the state of $1" >&2; return 2; }
     [ "${KR_STORE_ALLOW_DIRTY:-}" = 1 ] && return 0
-    if [ -n "$(git -C "$1" status --porcelain --untracked-files=no)" ]; then
+    if [ -n "$changes" ]; then
         kr_store_say "the tracked files have uncommitted changes; a store build is of a commit (KR_STORE_ALLOW_DIRTY=1 allows a trial)" >&2
         return 2
     fi
@@ -136,26 +162,27 @@ kr_store_cargo_target() {
 # files, the project itself) and reads one ignored file there, `Local.xcconfig`. These two
 # functions put all of it back, and they never touch work a person has not committed:
 #
-#   kr_store_guard_begin <repository> <apple directory>   refuses unless the tracked files under the
-#                          directory are clean (the trial override of `kr_store_clean_tree` does not
-#                          lift this one, because putting them back is a checkout), and keeps a copy
-#                          of a `Local.xcconfig` that exists;
+#   kr_store_guard_begin <repository> <apple directory>   refuses unless the directory has no
+#                          uncommitted change and no new file (the trial override of
+#                          `kr_store_clean_tree` does not lift this one, because putting the
+#                          directory back is a checkout), and keeps a copy of a `Local.xcconfig`
+#                          that exists;
 #   kr_store_guard_write_local <text>   writes `Local.xcconfig`, which `kr_store_guard_end` removes
 #                          again (or replaces by the saved copy);
 #   kr_store_guard_end     checks out the tracked files and restores `Local.xcconfig`. When it cannot
 #                          put something back it keeps the saved copy and names where it is.
 kr_store_guard_begin() {
-    kr_guard_repo=$1
-    kr_guard_relative=${2#"$1"/}
-    kr_guard_local="$2/Local.xcconfig"
-    kr_guard_kept=""
-    kr_guard_had=0
-    kr_guard_wrote=0
-    if [ -n "$(git -C "$kr_guard_repo" status --porcelain -- "$kr_guard_relative")" ]; then
-        kr_store_say "the Apple project has uncommitted changes under $kr_guard_relative; the build puts that directory back when it ends, so commit or discard them first" >&2
+    local relative=${2#"$1"/} changes
+    changes="$(git -C "$1" status --porcelain -- "$relative" 2>/dev/null)" \
+        || { kr_store_say "git could not read the state of $1" >&2; return 2; }
+    if [ -n "$changes" ]; then
+        kr_store_say "the Apple project has uncommitted or new files under $relative; the build puts that directory back when it ends, so commit or discard them first" >&2
         return 2
     fi
     kr_guard_kept="$(mktemp -d "${TMPDIR:-/tmp}/kr-store-guard.XXXXXX")" || return 2
+    kr_guard_local="$2/Local.xcconfig"
+    kr_guard_had=0
+    kr_guard_wrote=0
     if [ -f "$kr_guard_local" ]; then
         if ! cp -p "$kr_guard_local" "$kr_guard_kept/Local.xcconfig"; then
             kr_store_say "could not keep $kr_guard_local; nothing was changed" >&2
@@ -164,6 +191,9 @@ kr_store_guard_begin() {
         fi
         kr_guard_had=1
     fi
+    # Only now does the guard hold anything to put back.
+    kr_guard_relative=$relative
+    kr_guard_repo=$1
 }
 
 kr_store_guard_write_local() {

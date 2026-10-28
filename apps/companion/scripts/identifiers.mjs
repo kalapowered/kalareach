@@ -562,7 +562,7 @@ export function factsFromProto(bytes) {
     element.children.forEach(walk)
   }
   walk(manifest)
-  return { package: manifest.attributes.find(([name]) => name === 'package')?.[1], values }
+  return { package: manifest.attributes.find(([name]) => name === 'package')?.[1], values, root: manifest }
 }
 
 /** The manifest of a packaged application: an APK's through `aapt2`, a bundle's from its archive. */

@@ -24,7 +24,10 @@ import { withArchive } from './android-classes.mjs'
 import {
   ANDROID_PERMISSIONS,
   certificateFingerprint,
+  declaresSignInLink,
   problemsInBundleConfig,
+  problemsInEncryptionKey,
+  withheldIfSecret,
   problemsInExportSignature,
   secretsUnder,
   suppressedIfSecret,
@@ -82,6 +85,22 @@ function xmlNode(name, attributes = {}, children = []) {
 
 const WANT = { identifier: 'to.kala.reach', versionCode: 39800, versionName: '0.1.0' }
 
+/** The intent filters an activity carries: one complete sign-in link, or a named defect of it. */
+function link(kind) {
+  const filter = (children, autoVerify = 'true') => xmlNode('intent-filter', { autoVerify }, children)
+  const action = xmlNode('action', { name: 'android.intent.action.VIEW' })
+  const categories = [xmlNode('category', { name: 'android.intent.category.DEFAULT' }), xmlNode('category', { name: 'android.intent.category.BROWSABLE' })]
+  const data = (attributes) => xmlNode('data', attributes)
+  const whole = { scheme: 'https', host: 'reach.kala.to', path: '/app/oauth/callback' }
+  if (kind === 'no-scheme') return [filter([action, ...categories, data({ host: 'reach.kala.to', path: '/app/oauth/callback' })])]
+  if (kind === 'no-browsable') return [filter([action, categories[0], data(whole)])]
+  if (kind === 'not-verified') return [filter([action, ...categories, data(whole)], 'false')]
+  if (kind === 'split') {
+    return [filter([action, ...categories, data({ scheme: 'https', host: 'reach.kala.to' })]), filter([data({ path: '/app/oauth/callback' })])]
+  }
+  return [filter([action, ...categories, data(whole)])]
+}
+
 function manifest(change = {}) {
   const option = (key, fallback) => (Object.hasOwn(change, key) ? change[key] : fallback)
   const permissions = option('permissions', ANDROID_PERMISSIONS)
@@ -93,9 +112,7 @@ function manifest(change = {}) {
         usesCleartextTraffic: option('cleartext', 'false'),
         ...(option('debuggable', null) === null ? {} : { debuggable: option('debuggable', null) }),
         ...(option('testOnly', null) === null ? {} : { testOnly: option('testOnly', null) })
-      }, option('link', true)
-        ? [xmlNode('activity', {}, [xmlNode('intent-filter', { autoVerify: 'true' }, [xmlNode('data', { scheme: 'https', host: 'reach.kala.to', path: '/app/oauth/callback' })])])]
-        : [])
+      }, option('link', true) ? [xmlNode('activity', {}, link(option('link', true)))] : [])
     ])
   )
 }
@@ -108,6 +125,10 @@ heldProblems('a debuggable bundle is refused', problemsInAndroidManifest(manifes
 heldProblems('a test-only bundle is refused', problemsInAndroidManifest(manifest({ testOnly: 'true' }), WANT), ['testOnly to true'])
 heldProblems('a lower minimum platform is refused', problemsInAndroidManifest(manifest({ minSdk: '24' }), WANT), ['minSdkVersion'])
 heldProblems('a manifest without the verified sign-in link is refused', problemsInAndroidManifest(manifest({ link: false }), WANT), ['verified sign-in link'])
+for (const kind of ['no-scheme', 'no-browsable', 'not-verified', 'split']) {
+  held(`a sign-in link that is ${kind} is not the link`, false, declaresSignInLink(manifest({ link: kind }).root))
+}
+held('a complete filter is the link', true, declaresSignInLink(manifest().root))
 heldProblems('a bundle that allows cleartext traffic is refused', problemsInAndroidManifest(manifest({ cleartext: 'true' }), WANT), [
   'usesCleartextTraffic'
 ])
@@ -194,12 +215,29 @@ held('a secret text in a compressed member of a real archive is found', 1, (() =
   spawnSync('jar', ['cf', join(work, 'compressed.aab'), '-C', dir, 'a.txt'])
   return withArchive(join(work, 'compressed.aab'), (members, read) => placesWithSecret(members.map((member) => read(member)), secretNeedles(Buffer.from('correct-horse-battery-staple\n'))))
 })())
-held('a bundle that holds a secret is reported by that fact alone, quoting nothing of the bundle', ["a secret file's text is in 1 place of the bundle; nothing else is reported"], suppressedIfSecret({ problems: ['the version name is "the-secret-itself"'], facts: { secretsFound: 1 } }).problems)
+const suppressed = suppressedIfSecret({ problems: ['the version name is "the-secret-itself"'], facts: { secretsFound: 1 } })
+held('a bundle that holds a secret is reported by its count, with nothing quoted from it', [1, true], [suppressed.facts.secretsFound, !JSON.stringify(suppressed).includes('the-secret-itself')])
+held('an error message that quotes a secret is withheld, and one that does not is kept', ['the details are withheld: they quote a secret file', 'no such file'], [withheldIfSecret('could not read /x/the-secret-itself', secretNeedles(Buffer.from('the-secret-itself\n'))), withheldIfSecret('no such file', secretNeedles(Buffer.from('the-secret-itself\n')))])
 held('a directory with a secret in a log is found, and a clean one is not', [1, 0], (() => {
   const dirty = join(work, 'dirty'); mkdirSync(dirty); writeFileSync(join(dirty, 'run.log'), 'x correct-horse-battery-staple y')
   const clean = join(work, 'clean'); mkdirSync(clean); writeFileSync(join(clean, 'run.log'), 'nothing here')
   const needles = secretNeedles(Buffer.from('correct-horse-battery-staple\n'))
   return [secretsUnder(dirty, needles), secretsUnder(clean, needles)]
+})())
+held('a signed token in a log is found though no secret file matches', 1, (() => {
+  const logs = join(work, 'tokens'); mkdirSync(logs)
+  writeFileSync(join(logs, 'Packaging.log'), '"Authorization" = "Bearer eyJhbGciOiJFUzI1NiJ9.eyJpc3MiOiJhYmMifQ.c2lnbmF0dXJlLXNpZ25hdHVyZQ";')
+  return secretsUnder(logs, secretNeedles(Buffer.from('unrelated-secret-text\n')))
+})())
+held('a secret in a compressed member of a package under the directory is found, and one inside an .apks is left to its own package', [1, 0], (() => {
+  const dir = join(work, 'packages'); mkdirSync(dir)
+  const inner = join(work, 'inner'); mkdirSync(inner); writeFileSync(join(inner, 'a.txt'), 'x correct-horse-battery-staple y')
+  spawnSync('jar', ['cf', join(dir, 'universal.apk'), '-C', inner, 'a.txt'])
+  const needles = secretNeedles(Buffer.from('correct-horse-battery-staple\n'))
+  const first = secretsUnder(dir, needles)
+  rmSync(join(dir, 'universal.apk'))
+  spawnSync('jar', ['cf', join(dir, 'set.apks'), '-C', inner, 'a.txt'])
+  return [first, secretsUnder(dir, needles)]
 })())
 held('a short password file is found whole', 1, placesWithSecret([Buffer.from('prefix-hunter2hunter2-suffix')], secretNeedles(Buffer.from('hunter2hunter2\n'))))
 
@@ -253,6 +291,24 @@ if (tools.some((answer) => answer.error)) {
   spawnSync('cp', [byUpload, added])
   writeFileSync(join(content, 'later.txt'), 'added after signing')
   spawnSync('jar', ['uf', added, '-C', content, 'later.txt'])
+  // The whole command on a signed bundle whose version name is the secret: nothing of it may reach
+  // the output, the record or an error.
+  const leaked = 'versionname-secret-0001'
+  const leakFile = join(work, 'leak-secret'); writeFileSync(leakFile, `${leaked}\n`)
+  const leakCertificate = join(work, 'leak.pem'); writeFileSync(leakCertificate, upload.pem)
+  const leakUnsigned = join(work, 'leak-unsigned.aab')
+  const leakTree = join(work, 'leak-tree')
+  mkdirSync(join(leakTree, 'base', 'manifest'), { recursive: true })
+  mkdirSync(join(leakTree, 'base', 'dex'))
+  writeFileSync(join(leakTree, 'base', 'manifest', 'AndroidManifest.xml'), xmlNode('manifest', { package: 'to.kala.reach', versionName: leaked }))
+  writeFileSync(join(leakTree, 'base', 'dex', 'classes.dex'), 'dex')
+  spawnSync('jar', ['cf', leakUnsigned, '-C', leakTree, 'base'])
+  const leakBundle = join(work, 'leak.aab')
+  spawnSync('jarsigner', ['-keystore', upload.store, '-storetype', 'PKCS12', '-storepass:file', upload.password, '-signedjar', leakBundle, leakUnsigned, 'upload'])
+  const leakRecord = join(work, 'leak-record.json')
+  const leakRun = spawnSync(process.execPath, [join(import.meta.dirname, 'store-bundle.mjs'), '--android', leakBundle, '--version-code', '1', '--version-name', '0.1.0', '--certificate', leakCertificate, '--secret-file', leakFile, '--record', leakRecord], { encoding: 'utf8' })
+  const recorded = readFileSync(leakRecord, 'utf8')
+  held('a bundle whose version name is the secret fails, and the secret is in no output and no record', [1, false, true, false, 'false'], [leakRun.status, (leakRun.stdout + leakRun.stderr).includes(leaked), /secret file's text is in 1 place/.test(leakRun.stderr), recorded.includes(leaked), String(JSON.parse(recorded).holds)])
   heldProblems('a signed bundle with an entry added after signing is refused', problemsInSignature(added, upload.pem).problems, ['entries that are not signed'])
   heldProblems('a bundle with no signature is refused', problemsInSignature(unsigned, upload.pem).problems, ['does not verify'])
 }
@@ -313,6 +369,12 @@ heldProblems(
   problemsInExportSignature({ ...exportedFine, entitlements: { ...exportedFine.entitlements, 'com.apple.developer.associated-domains': ['applinks:example.com'] } }),
   ['allows no com.apple.developer.associated-domains']
 )
+
+held('an application that says it uses encryption passes, and one that is silent or says no does not', [0, 1, 1], [
+  problemsInEncryptionKey({ ITSAppUsesNonExemptEncryption: true }).length,
+  problemsInEncryptionKey({}).length,
+  problemsInEncryptionKey({ ITSAppUsesNonExemptEncryption: false }).length
+])
 
 const versions = { versionCode: 39800, versionName: '0.1.0' }
 const info = (code, name) => ({ CFBundleVersion: code, CFBundleShortVersionString: name })
@@ -426,6 +488,35 @@ held('a number of eleven digits, or no number, is refused', [2, 2], [number(1234
 shell('kr_store_receipt ios 39500; kr_store_receipt ios 39200', { KR_STORE_ROOT: root })
 held('the receipt keeps the larger number when two builds finish out of order', '39500\n', readFileSync(join(receipts, 'ios'), 'utf8'))
 held('a second claim on one output directory fails', [0, 2], [shell(`kr_store_claim "${join(root, 'out')}"`).status, shell(`kr_store_claim "${join(root, 'out')}"`).status])
+
+const notARepository = join(work, 'not-a-repository'); mkdirSync(join(notARepository, 'gen'), { recursive: true })
+held('a place git cannot read is not taken for a clean one', [7, 2], [
+  shell(`kr_store_guard_begin "${notARepository}" "${notARepository}/gen" || exit 7`).status,
+  shell(`kr_store_clean_tree "${notARepository}"`).status
+])
+
+writeFileSync(localConfig, 'KR_SIGN_STYLE = Manual # kept\n')
+const stuck = shell(
+  `kr_store_guard_begin "${repository}" "${appleDirectory}" || exit 7; kr_store_guard_write_local "KR_GOOGLE_SERVICE_INFO = /x"; chmod 0444 "${localConfig}"; kr_store_guard_end; echo "end=$?"; ls -d "\${TMPDIR:-/tmp}"/kr-store-guard.* | head -1`,
+  { TMPDIR: work }
+)
+const keptCopy = stuck.stdout.trim().split('\n').pop()
+held('when the project cannot be put back the guard fails, and keeps the copy and names it', [true, true, "KR_SIGN_STYLE = Manual # kept\n"], [
+  stuck.stdout.includes('end=1'),
+  stuck.stderr.includes(keptCopy),
+  readFileSync(join(keptCopy, 'Local.xcconfig'), 'utf8')
+])
+spawnSync('chmod', ['0644', localConfig])
+rmSync(localConfig, { force: true })
+
+const racing = join(work, 'racing'); mkdirSync(racing)
+shell('for n in $(seq 39100 39139); do kr_store_receipt ios $n & done; wait', { KR_STORE_ROOT: racing })
+held('forty receipts written at once leave the largest number', '39139\n', readFileSync(join(racing, 'receipts', 'ios'), 'utf8'))
+held('a build number claimed once cannot be claimed again, whatever the version, but is free for the other platform', [0, 2, 0], [
+  shell('kr_store_claim_number android 39500', { KR_STORE_ROOT: racing }).status,
+  shell('kr_store_claim_number android 39500', { KR_STORE_ROOT: racing }).status,
+  shell('kr_store_claim_number ios 39500', { KR_STORE_ROOT: racing }).status
+])
 
 rmSync(work, { recursive: true, force: true })
 console.log(`${passed} held, ${failures} failed, ${notRun} not run`)

@@ -8,8 +8,8 @@
 //   Android  the signer is the upload key and nobody else (a debug key would be refused by Google
 //            Play, and a lost upload key cannot be told from a wrong one afterwards); the version
 //            code and name are the ones asked for; the manifest is the release's (not debuggable,
-//            no cleartext traffic, the targets Google Play requires, exactly the permissions the
-//            application declares); the native libraries are the architectures asked for and every
+//            no cleartext traffic, the targets Google Play requires, the permissions this check
+//            lists and the verified sign-in link); the native libraries are the architectures asked for and every
 //            one is laid out for 16 KB memory pages; and no secret was packaged.
 //   iOS      the version and build number agree across the application and its notification
 //            extension (a store refuses an extension whose version differs); the push environment
@@ -111,6 +111,29 @@ function attribute(facts, element, name) {
   return facts.values.find(([each, key]) => each === element && key === name)?.[2]
 }
 
+/** Whether one intent filter of the manifest is the application's verified sign-in link. */
+export function declaresSignInLink(root) {
+  const filters = []
+  const walk = (element) => {
+    if (element.name === 'intent-filter') filters.push(element)
+    element.children.forEach(walk)
+  }
+  walk(root)
+  return filters.some((filter) => {
+    const has = (child, name, value) =>
+      filter.children.some((each) => each.name === child && each.attributes.some(([key, found]) => key === name && found === value))
+    return (
+      filter.attributes.some(([key, value]) => key === 'autoVerify' && value === 'true') &&
+      has('action', 'name', 'android.intent.action.VIEW') &&
+      has('category', 'name', 'android.intent.category.DEFAULT') &&
+      has('category', 'name', 'android.intent.category.BROWSABLE') &&
+      has('data', 'scheme', 'https') &&
+      has('data', 'host', 'reach.kala.to') &&
+      has('data', 'path', '/app/oauth/callback')
+    )
+  })
+}
+
 /** What is wrong with the manifest of a release bundle. */
 export function problemsInAndroidManifest(facts, want) {
   const problems = []
@@ -138,14 +161,9 @@ export function problemsInAndroidManifest(facts, want) {
   for (const each of wanted.filter((name) => !found.includes(name))) {
     problems.push(`the manifest does not ask for ${each}, which this check lists`)
   }
-  // The sign-in's answer returns through this verified link; without the filter it opens a browser.
-  const declares = (element, name, value) => facts.values.some(([e, k, v]) => e === element && k === name && v === value)
-  if (
-    !declares('data', 'host', 'reach.kala.to') ||
-    !declares('data', 'path', '/app/oauth/callback') ||
-    !declares('intent-filter', 'autoVerify', 'true')
-  ) {
-    problems.push('the manifest does not declare the verified sign-in link https://reach.kala.to/app/oauth/callback')
+  // The sign-in's answer returns through this verified link; without it the answer opens a browser.
+  if (!declaresSignInLink(facts.root)) {
+    problems.push('the manifest does not declare the verified sign-in link https://reach.kala.to/app/oauth/callback in one intent filter')
   }
   return problems
 }
@@ -293,8 +311,7 @@ export function bundletoolVersion(bundletool) {
 
 /**
  * Whether the bundle's resource table carries the Firebase configuration of the application: the
- * project and the application the configuration file names. Only a yes or no leaves this function;
- * what the file holds is client configuration that goes into the bundle and nowhere else.
+ * project and the application the configuration file names. Only a yes or no leaves this function.
  */
 export function problemsInFirebase(resources, configuration, identifier) {
   const client = (configuration.client ?? []).find((each) => each?.client_info?.android_client_info?.package_name === identifier)
@@ -316,11 +333,44 @@ export function suppressedIfSecret(result) {
   return { problems: [`a secret file's text is in ${found} place${found === 1 ? '' : 's'} of the bundle; nothing else is reported`], facts: { secretsFound: found } }
 }
 
-/** How many files under a directory hold any secret, bundles aside (they are read member by member). */
+/** The shape of a signed token: three base64url parts, the first two of JSON (`eyJ`). */
+const TOKEN_SHAPE = /eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/
+
+/** Whether bytes hold a secret's text or a token made from one. */
+function holdsSecret(bytes, needles) {
+  return needles.some((needle) => bytes.includes(needle)) || TOKEN_SHAPE.test(bytes.toString('latin1'))
+}
+
+/**
+ * How many files under a directory hold a secret's text or a signed token, a bundle counting once
+ * for each member that does (a bundle is compressed, so its bytes are searched member by member).
+ * `.apks` files hold other packages whole and are left out: each package is read as an `.apk`.
+ */
 export function secretsUnder(directory, needles) {
-  const skipped = /\.(aab|ipa|apks|apk)$/
-  const files = filesUnder(directory).filter((file) => !skipped.test(file))
-  return placesWithSecret(files.map((file) => readFileSync(file)), needles)
+  let places = 0
+  for (const file of filesUnder(directory)) {
+    if (/\.apks$/.test(file)) continue
+    if (/\.(aab|ipa|apk)$/.test(file)) {
+      places += withArchive(file, (members, read) => members.filter((member) => holdsSecret(read(member), needles)).length)
+    } else if (holdsSecret(readFileSync(file), needles)) {
+      places += 1
+    }
+  }
+  return places
+}
+
+/** A message with nothing of it left when it quotes a secret. */
+export function withheldIfSecret(message, needles) {
+  const bytes = Buffer.from(message, 'utf8')
+  return needles.some((needle) => bytes.includes(needle)) ? 'the details are withheld: they quote a secret file' : message
+}
+
+/**
+ * The secret-bearing places of a bundle, before anything else is read from it: the other checks
+ * quote values out of the bundle and raise errors that name them.
+ */
+function secretFirst(places) {
+  return suppressedIfSecret({ problems: [], facts: { secretsFound: places } })
 }
 
 export function checkAndroid(options) {
@@ -329,6 +379,9 @@ export function checkAndroid(options) {
   const certificatePem = readFileSync(options.certificate, 'utf8')
   const identifier = declared(dirname(SCRIPTS)).identifier
   const needles = needlesOf(options.secretFiles)
+  const first = withArchive(options.path, (members, read) => placesWithSecret(members.map((member) => read(member)), needles))
+  if (first > 0) return secretFirst(first)
+  facts.secretsFound = 0
   openBundle(options.path, (manifest, members, read) => {
     problems.push(
       ...problemsInAndroidManifest(manifest, {
@@ -338,12 +391,6 @@ export function checkAndroid(options) {
       })
     )
     problems.push(...problemsInAndroidLibraries(members, read, options.abis))
-    const places = placesWithSecret(
-      members.map((member) => read(member)),
-      needles
-    )
-    facts.secretsFound = places
-    if (places > 0) problems.push(`a secret file's text is in ${places} members of the bundle`)
     facts.members = members.length
     if (options.firebase) {
       const table = members.find((member) => member.name === 'base/resources.pb')
@@ -462,6 +509,13 @@ function filesUnder(root) {
   return found
 }
 
+/** What is wrong with the application's export-compliance key: the owner's answer is that it uses encryption. */
+export function problemsInEncryptionKey(info) {
+  return info.ITSAppUsesNonExemptEncryption === true
+    ? []
+    : ["the application's Info.plist does not carry ITSAppUsesNonExemptEncryption set to true"]
+}
+
 /** The lines a check printed after the one that counts its problems, or its last lines. */
 export function failureLines(output) {
   const lines = output.trim().split('\n')
@@ -512,10 +566,15 @@ export function checkIos(options) {
     app = unpacked.app
   }
   try {
+    const needles = needlesOf(options.secretFiles)
+    const first = placesWithSecret(filesUnder(app).map((file) => readFileSync(file)), needles)
+    if (first > 0) return secretFirst(first)
+    facts.secretsFound = 0
     problems.push(...problemsInBundle(app, want))
     const bundles = iosBundles(app)
     const infos = bundles.map((bundle) => [bundle.name, plistValue(join(bundle.path, 'Info.plist'))])
     problems.push(...problemsInVersions(infos, options))
+    problems.push(...problemsInEncryptionKey(infos[0][1]))
     facts.bundles = infos.map(([name, info]) => ({ name, identifier: info.CFBundleIdentifier }))
 
     for (const [index, bundle] of bundles.entries()) {
@@ -567,15 +626,13 @@ export function checkIos(options) {
 
     if (!existsSync(join(app, 'GoogleService-Info.plist'))) problems.push('the application carries no GoogleService-Info.plist')
 
-    const needles = needlesOf(options.secretFiles)
-    const places = placesWithSecret(filesUnder(app).map((file) => readFileSync(file)), needles)
-    facts.secretsFound = places
-    if (places > 0) problems.push(`a secret file's text is in ${places} files of the application`)
-
     if (!options.skipAppChecks) {
       for (const [script, what] of [['privacy-manifest.mjs', 'privacy manifest'], ['debug-code.mjs', 'debug code']]) {
         const answer = run(process.execPath, [join(SCRIPTS, script), app])
         if (answer.status !== 0) problems.push(`the ${what} check fails: ${failureLines(answer.stdout + answer.stderr)}`)
+        for (const line of answer.stdout.split('\n')) {
+          if (line.startsWith('recorded exception: ')) (facts.recordedExceptions ??= []).push(line.slice('recorded exception: '.length))
+        }
       }
     }
   } finally {
@@ -631,10 +688,8 @@ function parse(argv) {
       throw new Error(`unknown option ${flag}`)
     }
   }
-  if (options.scanDir) {
-    if (options.secretFiles.length === 0) throw new Error('--scan-dir needs a --secret-file')
-    return options
-  }
+  if (options.scanDir && options.secretFiles.length === 0) throw new Error('--scan-dir needs a --secret-file')
+  if (options.scanDir && !options.platform) return options
   if (!options.platform) throw new Error('give --android <bundle> or --ios <ipa or app>')
   if (!/^[0-9]+$/.test(options.versionCode ?? '')) throw new Error('--version-code must be a whole number')
   if (!options.versionName) throw new Error('--version-name is required')
@@ -652,7 +707,7 @@ if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) 
     console.error(failure.message)
     process.exit(2)
   }
-  if (options.scanDir) {
+  if (options.scanDir && !options.platform) {
     let places
     try {
       places = secretsUnder(options.scanDir, needlesOf(options.secretFiles))
@@ -661,18 +716,34 @@ if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) 
       process.exit(2)
     }
     if (places > 0) {
-      console.error(`a secret file's text is in ${places} file${places === 1 ? '' : 's'} under ${options.scanDir}`)
+      console.error(`a secret file's text or a signed token is in ${places} place${places === 1 ? '' : 's'} under ${options.scanDir}`)
       process.exit(1)
     }
-    console.log(`no secret file's text is in the files under ${options.scanDir}`)
+    console.log(`no secret file's text and no signed token is in the files under ${options.scanDir}`)
     process.exit(0)
   }
   let result
   try {
     result = options.platform === 'android' ? checkAndroid(options) : checkIos(options)
   } catch (failure) {
-    console.error(`could not read ${options.path}: ${failure.message}`)
+    let needles = []
+    try {
+      needles = needlesOf(options.secretFiles)
+    } catch {
+      // A secret that cannot be read cannot be quoted.
+    }
+    console.error(`could not read ${options.path}: ${withheldIfSecret(String(failure.message), needles)}`)
     process.exit(2)
+  }
+  if (options.scanDir && !(result.facts.secretsFound > 0)) {
+    let found = 0
+    try {
+      found = secretsUnder(options.scanDir, needlesOf(options.secretFiles))
+    } catch (failure) {
+      console.error(`could not scan ${options.scanDir}: ${failure.message}`)
+      process.exit(2)
+    }
+    if (found > 0) result = secretFirst(found)
   }
   const shown = relative(process.cwd(), options.path)
   const problems = [...new Set(result.problems)]
