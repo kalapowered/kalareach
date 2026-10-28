@@ -15,6 +15,11 @@ name: release-host
 # every digest in the run's summary, so the person who approves can compare them with what the
 # signing script printed.
 #
+# `matrix` asks whether the signed release matrix the managed service publishes lists a tier for the
+# package version the commit carries, as every other job that publishes a release does. It holds no
+# key and no write access, and `channel` and `publish` both wait for it, so a release the matrix does
+# not serve is refused before anyone is asked to approve a use of the release keys.
+#
 # `channel` is the only job that holds a key. It is behind the `update-signing` environment, which
 # puts a person in front of every use of the update channel's two release keys, it has no write
 # access to the repository, and it runs the one script that seals a tree. The tool that script runs
@@ -228,10 +233,53 @@ jobs:
           retention-days: 3
           if-no-files-found: error
 
+  # A release is published only if the signed release matrix the managed service publishes lists a
+  # tier for the package version this commit carries: a host that runs the release reads the same
+  # matrix, and a matrix that lists no tier for it refuses that host a new lease on the managed
+  # relay service. A service that does not answer is asked again twice, a minute apart; a refusal
+  # is not asked again. The job reads a public document and holds no key and no write access.
+  matrix:
+    name: the published release matrix lists this release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Hold the commit to a full hash
+        env:
+          COMMIT: ${{ inputs.commit }}
+        run: printf '%s' "$COMMIT" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::the commit is a full hash"; exit 1; }
+
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ inputs.commit }}
+          persist-credentials: false
+
+      - name: Install rustup where the image has none
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 --silent --show-error --fail https://sh.rustup.rs |
+              sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: The published release matrix lists this release
+        run: |
+          set -uo pipefail
+          rustup show active-toolchain || rustup toolchain install
+          cargo build --locked --release -p kr-release-matrix-check
+          for attempt in 1 2 3; do
+            target/release/kr-release-matrix-check --origin https://reach.kala.to && exit 0
+            code=$?
+            [ "$code" -eq 2 ] || exit "$code"
+            [ "$attempt" -lt 3 ] && sleep 60
+          done
+          exit 2
+
   # The release tool, built by a job that holds no key, for the job that does.
   tool:
     name: the release tool
     needs: source
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -267,7 +315,8 @@ jobs:
 
   channel:
     name: seal the four trees with the channel's release keys
-    needs: [source, tool]
+    needs: [source, tool, matrix]
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     # The environment carries the deployment policy and the reviewer, which puts a person in front
@@ -389,6 +438,7 @@ jobs:
   check:
     name: check ${{ matrix.target }}
     needs: [source, channel]
+    if: github.ref == 'refs/heads/main'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
@@ -477,7 +527,8 @@ jobs:
   # No key and no environment: only the right to write a release, and only after every check passed.
   publish:
     name: publish the release
-    needs: [source, channel, check]
+    needs: [source, channel, check, matrix]
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
