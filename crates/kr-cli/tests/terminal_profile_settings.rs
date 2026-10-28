@@ -518,8 +518,15 @@ fn a_profile_that_is_gone_is_forgotten() {
 /// read just after the write it is told to.
 fn wrapper(directory: &Path) -> PathBuf {
     let path = directory.join("gsettings-wrapper");
+    // Placed once, by a process that starts nothing: a program this test binary writes itself is
+    // held open for writing by any child another thread starts at that moment, and cannot be
+    // started until the child has taken over.
+    if path.exists() {
+        return path;
+    }
+    let source = directory.join("gsettings-wrapper.source");
     std::fs::write(
-        &path,
+        &source,
         r#"#!/bin/sh
 real="$KR_TEST_REAL_GSETTINGS"
 count_file="$KR_TEST_COUNTS/calls"
@@ -630,8 +637,7 @@ exit $status
 "#,
     )
     .expect("the wrapper");
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("executable");
+    kr_ipc::testing::place_program(&source, &path);
     path
 }
 
@@ -845,9 +851,10 @@ fn a_removal_interrupted_at_any_call_keeps_the_record_and_the_next_one_finishes(
                 person.recorded_uuid().is_some(),
                 "call {failing}: the record keeps the entry"
             );
-            // The last call reads back the last key's reset: when it is the one that fails, the
-            // profile is already out and the record is all that is left.
-            let expected = if failing == calls {
+            // The last three calls are the read back of the last key's reset and the two reads of
+            // the last look: when one of them fails, the profile is already out and the record is
+            // all that is left.
+            let expected = if failing + 2 >= calls {
                 Removed::AlreadyGone
             } else {
                 Removed::Removed
