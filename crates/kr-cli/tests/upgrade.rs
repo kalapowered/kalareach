@@ -527,7 +527,16 @@ struct Setup {
     /// the manifest of a release from before that store does not: a rollback to it is decided by
     /// the update check on that manifest, with the release's own programs behind it.
     without_the_organisation_store: bool,
+    /// The configuration document names a test suite, `reports`, that writes a JUnit report as its
+    /// output, for a workflow's `run_tests` node to run.
+    suite: bool,
 }
+
+/// The suite a host set up with one is given: it writes a report with a failed case beside a passed
+/// one, as a runner does, and ends with status 0.
+const REPORTING_SUITE: &str = "mkdir -p reports && printf '%s\\n' '<testsuite name=\"s\">' \
+    '<testcase name=\"passes\"/>' '<testcase name=\"fails\"><failure/></testcase>' \
+    '</testsuite>' > reports/junit.xml";
 
 /// The named pipes the contact server of a session runs on.
 struct ContactPipes {
@@ -542,10 +551,31 @@ struct ContactPipes {
 /// Writes the configuration document that puts `host`'s daemon on the network, bound to `address`
 /// on loopback, with no relay and no discovery. A daemon reads it when it starts.
 fn bind_the_network_at(host: &Host, address: &str) {
+    configure_the_host(host, Some(address), false);
+}
+
+/// Writes the configuration document of `host`'s daemon: on the network at `address` on loopback
+/// when one is given, and naming the suite that writes a JUnit report when `suite` is set.
+fn configure_the_host(host: &Host, address: Option<&str>, suite: bool) {
     let mut document = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
     document.revision = 1;
-    document.network.enabled = Nullable::some(true);
-    document.network.bind_address = Nullable::some(address.to_owned());
+    if let Some(address) = address {
+        document.network.enabled = Nullable::some(true);
+        document.network.bind_address = Nullable::some(address.to_owned());
+    }
+    if suite {
+        document.automation.test_suites = Nullable::some(
+            [(
+                "reports".to_owned(),
+                kr_protocol::hostinfo::configuration::TestSuite {
+                    command: REPORTING_SUITE.to_owned(),
+                    outputs: vec!["reports/junit.xml".to_owned()],
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+    }
     let path = kr_worker::config::document_path(&host.tree.environment());
     std::fs::create_dir_all(path.parent().expect("the document has a directory"))
         .expect("the state directory");
@@ -613,6 +643,7 @@ impl Updated {
             agent,
             states_its_own_major,
             without_the_organisation_store,
+            suite,
         } = setup;
         let mut one = before.assembled(1);
         if without_the_organisation_store {
@@ -627,10 +658,10 @@ impl Updated {
             .retaining_what_this_build_does();
         let mut host = Host::bare();
         host.install(&one);
-        if on_the_network {
+        if on_the_network || suite {
             // The document is what puts a host on the network: this one joins on loopback alone,
             // and selects no relay and no discovery.
-            bind_the_network_at(&host, "127.0.0.1:0");
+            configure_the_host(&host, on_the_network.then_some("127.0.0.1:0"), suite);
         }
         if plugin {
             install_plugin(&host).await;
@@ -4161,4 +4192,357 @@ async fn a_rollback_leaves_the_record_of_a_restored_policy_and_an_update_again_w
     updated.the_worker_is_as_it_was().await;
     host.close(&updated.kr_before(), &updated.display);
     host.worker_ended(&updated.worker).await;
+}
+
+/// Runs installed Git directly, to build a repository for the host to adopt.
+fn git_fixture(directory: &Path, arguments: &[&str]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(["-c", "user.name=KalaReach Fixture"])
+        .args(["-c", "user.email=fixture@example.invalid"])
+        .args(["-c", "commit.gpgSign=false"])
+        .args(arguments)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("LC_ALL", "C")
+        .output()
+        .expect("installed Git runs");
+    assert!(
+        output.status.success(),
+        "the fixture could not be built: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// What a run of the reporting suite is: a workflow of one `run_tests` node against `version`.
+fn a_definition_that_runs_the_reporting_suite(
+    grant: kr_protocol::ids::GrantId,
+    environment_id: kr_protocol::ids::EnvironmentId,
+    version: kr_protocol::changeset::VersionRef,
+) -> kr_protocol::automation::WorkflowDefinition {
+    use kr_protocol::automation::{
+        RunTestsParams, WorkflowActionKind, WorkflowDeadlines, WorkflowDefinition, WorkflowNode,
+        WorkflowResourceScope, WorkflowTrigger,
+    };
+    use kr_protocol::ids::WorkflowId;
+    use kr_protocol::scalars::{U64, Uuid};
+
+    WorkflowDefinition {
+        workflow_id: WorkflowId::new(Uuid::from_bytes([0x42; 16])),
+        revision: U64::new(1),
+        name: "a suite that writes a report".to_owned(),
+        description: Nullable::null(),
+        trigger: WorkflowTrigger {
+            event_type: "manual".to_owned(),
+        },
+        resource_scope: WorkflowResourceScope::default(),
+        nodes: vec![WorkflowNode {
+            node_id: "tests".to_owned(),
+            action_kind: WorkflowActionKind::RunTests,
+            action_params: serde_json::to_string(&RunTestsParams {
+                suite: "reports".to_owned(),
+                version,
+            })
+            .expect("the node's typed parameters"),
+            declared_environment: Nullable::some(environment_id),
+        }],
+        edges: Vec::new(),
+        deadlines: WorkflowDeadlines::default(),
+        grant_reference: grant,
+        enabled: false,
+        explicit_recurrence: false,
+    }
+}
+
+/// One read, made over the daemon's own socket as the person at the host, and what the daemon
+/// answered.
+async fn a_host_read<P: serde::Serialize + ?Sized, T: kr_protocol::wire::WireMessage>(
+    endpoint: &kr_ipc::paths::Endpoint,
+    method: Method,
+    params: &P,
+) -> Result<T, kr_protocol::error::ProtocolError> {
+    let mut client = LocalClient::connect(endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("reaches the daemon");
+    client
+        .request(method, params)
+        .await
+        .expect("the call reaches the daemon")
+        .map(|answer| answer.to_typed().expect("an answer of the declared shape"))
+}
+
+/// KR-REQ-25.06, KR-REQ-26.10, KR-REQ-26.08: what this release reads out of a suite's reports lives
+/// in a store of its own, which the release before ignores, so a rollback loses nothing it protected
+/// and an update brings the reports back.
+///
+/// The release before runs the suite (its result carries the declared output's reference and no
+/// report), this release runs it again (a result and a report row), the release before reads that
+/// result and its evidence as it reads any, refuses the method that reads reports as a method it
+/// does not list, and records a run of its own with no row; this release then serves the one row,
+/// bound to the run it came from. A `kr` of this release tells that daemon from a lost right.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_report_store_the_release_before_ignores_is_kept_across_a_rollback_and_an_update() {
+    use kr_protocol::automation::{
+        WorkflowEnableParams, WorkflowInstallParams, WorkflowRunParams, WorkflowRunResult,
+    };
+    use kr_protocol::changeset::{ChangesetReadParams, ChangesetReadResult, VersionRef};
+    use kr_protocol::error::ErrorCode;
+    use kr_protocol::ids::{ChangeSetId, ChangeSetVersion};
+    use kr_protocol::scalars::Uuid;
+    use kr_protocol::test_report::{ReportReading, TestReportsParams, TestReportsResult};
+
+    let prepared = Updated::prepare(Setup {
+        network: true,
+        suite: true,
+        ..Setup::default()
+    })
+    .await;
+    let endpoint = prepared
+        .host
+        .tree
+        .environment()
+        .controller_endpoint()
+        .expect("an endpoint");
+    let environment_id = prepared.host.tree.environment_id();
+    let owner = door::Door::pair_the_first_owner(&endpoint, environment_id).await;
+
+    // A repository with one edit in it, adopted, its own tree selected, and one version of that.
+    let source = prepared.host.scratch("work").join("source");
+    std::fs::create_dir_all(&source).expect("a directory for the repository");
+    git_fixture(&source, &["init", "--initial-branch=main"]);
+    std::fs::write(source.join("README.md"), "a repository\n").expect("a tracked file");
+    git_fixture(&source, &["add", "-A"]);
+    git_fixture(&source, &["commit", "-m", "the first commit"]);
+    std::fs::write(source.join("README.md"), "changed after the commit\n").expect("a dirty file");
+    let said = |(output, said): (Output, Value)| {
+        assert!(
+            output.status.success(),
+            "{said} {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        said
+    };
+    let adopted =
+        said(
+            prepared
+                .host
+                .kr_json(&["project", "adopt", &source.display().to_string(), "--json"]),
+        );
+    let project = adopted["project"]["project_repository_id"]
+        .as_str()
+        .expect("the project's identifier")
+        .to_owned();
+    let created = said(prepared.host.kr_json(&[
+        "workspace",
+        "create",
+        &project,
+        "--kind",
+        "shared",
+        "--json",
+    ]));
+    let workspace = created["workspace"]["workspace_id"]
+        .as_str()
+        .expect("the workspace's identifier")
+        .to_owned();
+    let captured = said(prepared.host.kr_json(&[
+        "changeset",
+        "capture",
+        &workspace,
+        "--label",
+        "the work",
+        "--include",
+        "all",
+        "--json",
+    ]));
+    let change_set = captured["version"]["change_set_id"]
+        .as_str()
+        .expect("the change set's identifier")
+        .to_owned();
+    let version = VersionRef {
+        change_set_id: ChangeSetId::new(change_set.parse::<Uuid>().expect("an identifier")),
+        version: ChangeSetVersion::new(1),
+    };
+
+    let document =
+        a_definition_that_runs_the_reporting_suite(owner.grant_id, environment_id, version);
+    a_workflow_mutation(
+        &endpoint,
+        environment_id,
+        Method::WorkflowInstall,
+        &WorkflowInstallParams {
+            workflow_id: document.workflow_id,
+            revision: document.revision,
+            definition: document.clone(),
+            grant_reference: document.grant_reference,
+        },
+    )
+    .await
+    .expect("the release before installs the definition");
+    a_workflow_mutation(
+        &endpoint,
+        environment_id,
+        Method::WorkflowEnable,
+        &WorkflowEnableParams {
+            workflow_id: document.workflow_id,
+            revision: document.revision,
+        },
+    )
+    .await
+    .expect("the release before enables it");
+    let run = |event: &'static str| {
+        let (endpoint, document) = (endpoint.clone(), document.clone());
+        async move {
+            let run: WorkflowRunResult = a_workflow_mutation(
+                &endpoint,
+                environment_id,
+                Method::WorkflowRun,
+                &WorkflowRunParams {
+                    workflow_id: document.workflow_id,
+                    revision: document.revision,
+                    event_id: event.to_owned(),
+                    event_type: "manual".to_owned(),
+                    event_payload: Nullable::null(),
+                },
+            )
+            .await
+            .unwrap_or_else(|refusal| panic!("the run is admitted ({event}): {refusal:?}"))
+            .to_typed()
+            .expect("a run result");
+            assert_eq!(
+                run.status,
+                kr_protocol::automation::WorkflowRunStatus::Completed,
+                "the suite ends with status 0 against the version ({event}): {run:?}"
+            );
+        }
+    };
+    let results = || {
+        let endpoint = endpoint.clone();
+        async move {
+            a_host_read::<_, ChangesetReadResult>(
+                &endpoint,
+                Method::ChangesetRead,
+                &ChangesetReadParams {
+                    change_set_id: version.change_set_id,
+                    version: Nullable::some(version.version),
+                },
+            )
+            .await
+            .expect("changeset.read answers")
+            .results
+        }
+    };
+    let reports = || {
+        let endpoint = endpoint.clone();
+        async move {
+            a_host_read::<_, TestReportsResult>(
+                &endpoint,
+                Method::ChangesetTestReports,
+                &TestReportsParams {
+                    change_set_id: version.change_set_id,
+                    version: Nullable::some(version.version),
+                    materialisation_id: Nullable::null(),
+                },
+            )
+            .await
+        }
+    };
+
+    // The release before: a result, and a method it does not list.
+    run("evt-before-the-update").await;
+    assert_eq!(results().await.len(), 1);
+    let refused = reports()
+        .await
+        .expect_err("the release before lists no such method");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied);
+
+    // This release: a result and the report beside it, bound to that run.
+    let updated = prepared.update().await;
+    run("evt-after-the-update").await;
+    let after_the_update = results().await;
+    assert_eq!(after_the_update.len(), 2);
+    let second = after_the_update[1].materialisation_id;
+    let answered = reports().await.expect("this release reads reports");
+    let [report] = &answered.reports[..] else {
+        panic!("one report, of the run this release made: {answered:?}");
+    };
+    assert_eq!(report.materialisation_id, second);
+    assert!(
+        matches!(&report.reading, ReportReading::Parsed { totals, .. }
+            if totals.tests.get() == 2 && totals.failed.get() == 1),
+        "{report:?}"
+    );
+
+    // Back to the release before: it reads the result this release wrote as it reads any, ignores
+    // the store of reports, and records a run of its own with no row.
+    let (output, said) = updated.host.kr_json(&["host", "rollback", "--json"]);
+    assert!(
+        output.status.success(),
+        "the rollback goes ahead: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        updated.host.daemon_build().await,
+        format!("kr-controller/{}", updated.one.name()),
+        "the daemon is the release before's again"
+    );
+    let after_the_rollback = results().await;
+    assert_eq!(after_the_rollback.len(), 2);
+    assert_eq!(
+        after_the_rollback[1], after_the_update[1],
+        "the result this release wrote reads as it was"
+    );
+    run("evt-after-the-rollback").await;
+    assert_eq!(results().await.len(), 3);
+    assert_eq!(
+        reports()
+            .await
+            .expect_err("the release before still lists no such method")
+            .code,
+        ErrorCode::PermissionDenied
+    );
+    // The `kr` of this release asks again with a read the release before lists, which is answered,
+    // so what it says is that the daemon is too old and not that a right is missing.
+    let refused = updated.host.run(
+        &updated.kr_now(),
+        &["changeset", "test-reports", &change_set, "--json"],
+    );
+    assert!(!refused.status.success());
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(said.contains("update"), "{said}");
+
+    // Forward again: the store the release before left alone serves the one report of the run it
+    // was written for, and none for the runs the release before made.
+    let archive = updated.host.scratch("archives").join("two-again.tar.gz");
+    updated.two.archive(&archive);
+    let (output, said) = updated.host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive.display().to_string(),
+        "--json",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "the update again goes on: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        updated.host.daemon_build().await,
+        format!("kr-controller/{}", updated.two.name()),
+        "the daemon is of the new release again"
+    );
+    let again = reports().await.expect("this release reads reports again");
+    let [report] = &again.reports[..] else {
+        panic!("the one report is served again: {again:?}");
+    };
+    assert_eq!(report.materialisation_id, second);
+    drop(owner);
 }
