@@ -920,6 +920,15 @@ mod command {
     /// A `kr host terminal-profile` run for a person, with their home and the host's directories,
     /// and the programs they have on their path.
     fn run(person: &Person, arguments: &[&str]) -> (std::process::Output, String) {
+        run_with(person, arguments, &[])
+    }
+
+    /// [`run`] with some of its environment set otherwise, each as `(name, value)`.
+    fn run_with(
+        person: &Person,
+        arguments: &[&str],
+        otherwise: &[(&str, &std::ffi::OsStr)],
+    ) -> (std::process::Output, String) {
         let mut command = std::process::Command::new(support::kr());
         command
             .args(["host", "terminal-profile"])
@@ -942,6 +951,9 @@ mod command {
             )
             .current_dir(&person.home)
             .stdin(std::process::Stdio::null());
+        for (name, value) in otherwise {
+            command.env(name, value);
+        }
         let output = command.output().expect("kr runs");
         let said = format!(
             "{}{}",
@@ -954,6 +966,73 @@ mod command {
     /// The JSON a run printed.
     fn document(output: &std::process::Output) -> serde_json::Value {
         serde_json::from_slice(&output.stdout).expect("a JSON document")
+    }
+
+    /// KR-REQ-01.21, KR-REQ-26.04: a run that names a directory of preferences of its own is confined
+    /// to its home, and it never reads the variable as unset. An empty value, a relative one and one
+    /// outside the home are refused with nothing read or written; and a record made by a run that was
+    /// not confined, which names a profile outside the home, is left alone whatever the preferences
+    /// the confined run reads say (an empty file of its own must never permit the removal of the
+    /// person's real default profile).
+    #[test]
+    fn a_run_confined_to_its_home_refuses_a_bad_directory_and_a_record_outside_it() {
+        let Some(application) = application() else {
+            return;
+        };
+        let id = application.terminal.id();
+        let person = Person::with(&application);
+        (application.seed)(&person);
+        let variable = kr_shell_integration::host::terminal_profile::PREFERENCES_DIRECTORY_VARIABLE;
+
+        // A bad value is refused, not read as unset: nothing is written.
+        let before = person.everything();
+        let outside = person.tree.root().join("outside");
+        for bad in [
+            std::ffi::OsString::new(),
+            "relative/domains".into(),
+            outside.clone().into_os_string(),
+        ] {
+            for arguments in [&["install", id][..], &["status"][..]] {
+                let (output, said) = run_with(&person, arguments, &[(variable, &bad)]);
+                assert_eq!(
+                    output.status.code(),
+                    Some(2),
+                    "{bad:?} {arguments:?}: {said}"
+                );
+                assert!(said.contains(variable), "{bad:?}: {said}");
+            }
+        }
+        assert_eq!(person.everything(), before, "and nothing was written");
+
+        // The profile is installed by a run that is not confined to anything else (the variable names
+        // the person's own directory, as every case here does), then a run confined to another home
+        // finds a record that names this one.
+        let (output, said) = run(&person, &["install", id]);
+        assert!(output.status.success(), "{said}");
+        let profile = (application.profile)(&person);
+        assert!(profile.is_file());
+        let installed = person.everything();
+
+        let other = Person::with(&application);
+        (application.seed)(&other);
+        let domains = other.home.join("domains");
+        for arguments in [&["remove", id][..], &["install", id][..]] {
+            let (output, said) = run_with(
+                &person,
+                arguments,
+                &[
+                    ("HOME", other.home.as_os_str()),
+                    ("USERPROFILE", other.home.as_os_str()),
+                    ("LOCALAPPDATA", other.home.join("AppData/Local").as_os_str()),
+                    ("PATH", other.programs.as_os_str()),
+                    (variable, domains.as_os_str()),
+                ],
+            );
+            assert_eq!(output.status.code(), Some(2), "{arguments:?}: {said}");
+            assert!(said.contains("confined"), "{said}");
+        }
+        assert!(profile.is_file(), "the profile the record names is left");
+        assert_eq!(person.everything(), installed, "and so is the record");
     }
 
     /// KR-REQ-01.21, KR-REQ-26.04: the command installs the profile and writes nothing else of its
