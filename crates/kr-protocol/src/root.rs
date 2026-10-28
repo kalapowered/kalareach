@@ -40,11 +40,11 @@ pub const FENCE_EXCHANGE_TIMEOUT: DurationMs = DurationMs::new(250);
 
 /// How long the reader has to decide a launch, measured from when it receives the request.
 ///
-/// Shorter than the worker's hold on purpose. The two sides measure on their own clocks, so the
-/// only way "on timeout, install no command" can be a fact rather than a hope is for the reader's
-/// own budget to end before the worker gives up, with the difference covering one local frame each
-/// way. A worker that has already spent part of its hold sends what is left of this budget rather
-/// than the whole of it, so queueing shortens the reader's window and never extends it.
+/// Shorter than the worker's hold on purpose. The two sides measure on their own clocks, so a
+/// request the reader reads at once has a budget that ends before the worker gives up, with the
+/// difference covering one local frame each way. The worker sends the budget whole, whatever time
+/// the request waits in its own queue, so a request that waited long can have a budget that ends
+/// after the hold: the reader's own answer, not the worker's clock, is what the caller is told.
 pub const LAUNCH_READER_BUDGET: DurationMs = DurationMs::new(200);
 
 /// The hint a bridge prints when it consumes an end-of-file gesture it cannot attribute.
