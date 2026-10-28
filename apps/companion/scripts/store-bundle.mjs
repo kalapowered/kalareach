@@ -340,14 +340,19 @@ function iosBundles(app) {
 }
 
 /** What is wrong with an App Store provisioning profile's content. */
-export function problemsInProfile(profile, { team, identifier, now = new Date() }) {
+export function problemsInProfile(profile, { team, identifier, push = true, now = new Date() }) {
   const problems = []
   const entitlements = profile.Entitlements ?? {}
   if (profile.TeamIdentifier?.[0] !== team) problems.push(`its team is ${profile.TeamIdentifier?.[0]}, not ${team}`)
   if (entitlements['application-identifier'] !== `${team}.${identifier}`) {
     problems.push(`its application identifier is ${entitlements['application-identifier']}`)
   }
-  if (entitlements['aps-environment'] !== 'production') problems.push('its push environment is not production')
+  // A bundle that receives push needs the production environment; one that does not (the extension
+  // is started by the system with the notification and registers for nothing) may carry none.
+  const environment = entitlements['aps-environment']
+  if (push ? environment !== 'production' : environment !== undefined && environment !== 'production') {
+    problems.push('its push environment is not production')
+  }
   if (entitlements['get-task-allow'] !== false) problems.push('it lets a debugger attach')
   if (profile.ProvisionedDevices !== undefined) problems.push('it lists devices, so it is not an App Store profile')
   if (profile.ProvisionsAllDevices === true) problems.push('it is an enterprise profile')
@@ -355,10 +360,36 @@ export function problemsInProfile(profile, { team, identifier, now = new Date() 
   return problems
 }
 
+/**
+ * What a decoded provisioning profile says, key by key. A profile holds data and dates, which a
+ * conversion of the whole to JSON refuses, so each value is taken on its own; a key an App Store
+ * profile does not have (`ProvisionedDevices`) is simply absent.
+ */
+export function profileFromXml(xml) {
+  const take = (key, format) => {
+    const answer = spawnSync('plutil', ['-extract', key, format, '-o', '-', '-'], { input: xml, encoding: 'utf8' })
+    if (answer.error || answer.status !== 0) return undefined
+    return format === 'json' ? JSON.parse(answer.stdout) : answer.stdout.trim()
+  }
+  const profile = {
+    Name: take('Name', 'raw'),
+    UUID: take('UUID', 'raw'),
+    TeamIdentifier: take('TeamIdentifier', 'json'),
+    ExpirationDate: take('ExpirationDate', 'raw'),
+    Entitlements: take('Entitlements', 'json'),
+    ProvisionedDevices: take('ProvisionedDevices', 'json'),
+    ProvisionsAllDevices: take('ProvisionsAllDevices', 'raw') === 'true' ? true : undefined
+  }
+  if (profile.Entitlements === undefined || profile.TeamIdentifier === undefined) {
+    throw new Error('a provisioning profile has no entitlements or no team')
+  }
+  return profile
+}
+
 function readProfile(path) {
   const decoded = run('security', ['cms', '-D', '-i', path])
   if (decoded.status !== 0) throw new Error(`${path} is not a provisioning profile that can be read`)
-  return plistValue(null, decoded.stdout)
+  return profileFromXml(decoded.stdout)
 }
 
 /** The files under a directory, recursively. */
@@ -370,6 +401,13 @@ function filesUnder(root) {
     else if (entry.isFile()) found.push(path)
   }
   return found
+}
+
+/** The lines a check printed after the one that counts its problems, or its last lines. */
+export function failureLines(output) {
+  const lines = output.trim().split('\n')
+  const counted = lines.findIndex((line) => /^\d+ problems?:?$/.test(line.trim()))
+  return (counted < 0 ? lines.slice(-3) : lines.slice(counted + 1)).map((line) => line.trim()).join(' | ')
 }
 
 /** What is wrong with the versions of an application and its extensions. */
@@ -441,7 +479,7 @@ export function checkIos(options) {
           continue
         }
         const profile = readProfile(profilePath)
-        for (const each of problemsInProfile(profile, { team: want.team, identifier: info.CFBundleIdentifier })) {
+        for (const each of problemsInProfile(profile, { team: want.team, identifier: info.CFBundleIdentifier, push: index === 0 })) {
           problems.push(`${bundle.name}'s profile: ${each}`)
         }
         facts.profiles = [...(facts.profiles ?? []), { bundle: info.CFBundleIdentifier, name: profile.Name, uuid: profile.UUID, expires: profile.ExpirationDate }]
@@ -458,7 +496,7 @@ export function checkIos(options) {
     if (!options.skipAppChecks) {
       for (const [script, what] of [['privacy-manifest.mjs', 'privacy manifest'], ['debug-code.mjs', 'debug code']]) {
         const answer = run(process.execPath, [join(SCRIPTS, script), app])
-        if (answer.status !== 0) problems.push(`the ${what} check fails: ${(answer.stdout + answer.stderr).trim().split('\n').slice(-3).join(' | ')}`)
+        if (answer.status !== 0) problems.push(`the ${what} check fails: ${failureLines(answer.stdout + answer.stderr)}`)
       }
     }
   } finally {
