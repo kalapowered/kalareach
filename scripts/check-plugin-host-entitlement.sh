@@ -18,6 +18,12 @@
 #   3. with the hardened runtime and the plugin host's one entitlement
 #      (`scripts/macos-entitlements/kr-plugin-host.plist`): it has to succeed.
 #
+# First a probe: a small program that writes machine code into memory, makes it executable and runs
+# it, signed ad hoc with the hardened runtime and no entitlement. On a Mac that enforces the hardened
+# runtime it is ended. A hosted build machine can be a virtual machine that does not enforce it (the
+# probe then runs to the end), and nothing is shown there: the script says so and succeeds, rather
+# than fail on a machine that cannot tell the two signatures apart.
+#
 # The program's own signature is not touched. An ad hoc signature can carry the hardened runtime
 # (`--code-signature-flags runtime`); it has no team, which the plugin host does not need, because it
 # loads no module of another program.
@@ -71,6 +77,33 @@ attempt() { # <label> <program path>
 
 args=("$@")
 failed=0
+
+# The probe: arm64 `mov w0, #42; ret`, or x86-64 `mov eax, 42; ret`, written into a page that was
+# read-write, made read-execute, and called.
+cat > "$work/probe.c" << 'PROBE'
+#include <stdint.h>
+#include <string.h>
+#include <sys/mman.h>
+int main(void) {
+#if defined(__aarch64__)
+    static const uint8_t code[] = {0x40, 0x05, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6};
+#else
+    static const uint8_t code[] = {0xb8, 0x2a, 0x00, 0x00, 0x00, 0xc3};
+#endif
+    void *page = mmap(0, 16384, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (page == MAP_FAILED) return 2;
+    memcpy(page, code, sizeof code);
+    if (mprotect(page, 16384, PROT_READ | PROT_EXEC) != 0) return 3;
+    return ((int (*)(void))page)() == 42 ? 0 : 4;
+}
+PROBE
+/usr/bin/clang -o "$work/probe" "$work/probe.c"
+"$rcodesign" sign --binary-identifier probe --code-signature-flags runtime "$work/probe" > /dev/null 2>&1
+if { "$work/probe" > /dev/null 2>&1; } 2> /dev/null; then
+    echo "check-plugin-host-entitlement: this machine does not enforce the hardened runtime on code made at run time (a program signed with it and no entitlement runs one), so nothing is shown here; the check is made on a Mac that enforces it"
+    exit 0
+fi
+echo "check-plugin-host-entitlement: ok: this machine enforces the hardened runtime on code made at run time"
 
 plain="$(signed_copy plain)"
 rc="$(attempt "without the hardened runtime" "$plain")"

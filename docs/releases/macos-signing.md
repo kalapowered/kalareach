@@ -44,8 +44,12 @@ takes an exception to library validation. One program has one entitlement:
 
 `scripts/check-plugin-host-entitlement.sh` shows both halves on the processor it runs on: the
 `kr-plugin-runtime` test that calls a component's exports succeeds without the hardened runtime, is
-ended with the hardened runtime and no entitlement, and succeeds with the entitlement. The build
-step runs it on both Mac architectures in every run.
+ended with the hardened runtime and no entitlement, and succeeds with the entitlement. It first runs a
+probe that makes code at run time under the hardened runtime and no entitlement, and on a machine that does
+not end the probe (the virtual machines that host a build can be one) it says that nothing is shown and
+succeeds. The build step runs it on both Mac architectures in every run, and a Mac that enforces the
+hardened runtime shows both halves. It also runs the `service` suite of `kr-plugin-host`, which starts the
+plugin host as its own process, with the plugin host signed in place the same three ways.
 
 `scripts/check-macos-signatures.sh` holds a tree to what it is supposed to be: every file passes
 `codesign --verify --strict`, the entitlements are the list above and no other, and a Developer ID
