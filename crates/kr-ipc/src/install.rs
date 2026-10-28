@@ -17,10 +17,12 @@
 //! | `update.lock`, `install.lock` | The locks an update and a starting control daemon take |
 //! | `writers.lock` | The lock a command that writes a stored record takes, shared, and an update takes, exclusively, from before it checks the stores to after it switches |
 //!
-//! An update puts the new release beside the old ones and renames a new `current` link over the
-//! old one, in one step, and nothing else changes: whatever must follow an update names its path through
+//! An update puts the new release beside the old ones and puts a new `current` link in the place of
+//! the old one, in one step, and nothing else changes: whatever must follow an update names its path through
 //! `current` ([`Running::stable`]), and whatever starts another process of its own release names
-//! its release's own directory ([`Running::own`]).
+//! its release's own directory ([`Running::own`]). On macOS the step exchanges the two links, and the
+//! old one stays beside `current` as `.current-<uuid>`, naming no more than a release's directory
+//! and holding nothing, until the next switch takes it away.
 //!
 //! # Which release a process runs
 //!
@@ -1246,7 +1248,8 @@ impl Store {
 impl Store {
     /// Makes `release` current: one new link put in the place of `current`, and the store's
     /// directory flushed so the change survives a crash. Nothing else changes. A link that an
-    /// earlier switch left beside `current` by a crash is taken away first.
+    /// earlier switch left beside `current` is taken away first: the one it swapped out, on macOS,
+    /// or the one a crash left, anywhere.
     ///
     /// `update` is the update lock, so what `current` names stays what an install or an update
     /// found it to be for as long as that holds it. `install` is the install lock, taken
@@ -1308,14 +1311,14 @@ impl Store {
     /// A rename over a name that holds a link is not one step on APFS: a reader that resolves the
     /// name while it is replaced sometimes finds no link there (`readlink` fails with `EINVAL`, and
     /// the program through it is missing). Three readers that read `current` while a loop renamed a
-    /// fresh link over it 2,000 times failed 1% of their reads (361 of 39,740 on one volume, 341 of
-    /// 32,138 on another). The same loop exchanging the names with `RENAME_SWAP` failed none of
-    /// 54,498, 43,629 and 49,408 reads, and a C loop over about 2 million reads saw no failed
-    /// `readlink`. The exchange narrows the window and does not close it: readers in the background
-    /// scheduling class still found no link for a moment, once to three times in about 190,000 reads
-    /// of one run of the switch case. The exchange leaves the old link at `temporary`, which is
-    /// removed afterwards; a crash between the two leaves that link, and the next switch takes it
-    /// away. A file system that cannot exchange names gets the rename, as it did before.
+    /// fresh link over it failed about 2% of their reads at normal priority (2,027 of 88,322).
+    /// Exchanging the names with `RENAME_SWAP` removes that, provided the old link stays: the
+    /// exchange leaves it at `temporary`, and a reader that resolved `current` just before still
+    /// holds it, so removing it at once made those readers fail in the background scheduling class
+    /// (13 to 23 reads in about 420,000). With the old link kept, the same loops failed none of
+    /// about 1.2 million reads in that class and none at normal priority. The next switch takes the
+    /// kept link away, as it takes away one a crash left. A file system that cannot exchange names
+    /// gets the rename, as it did before.
     #[cfg(target_os = "macos")]
     fn put_in_place_of_current(&self, temporary: &Path) -> std::io::Result<()> {
         use rustix::fs::{CWD, RenameFlags, renameat_with};
@@ -1328,10 +1331,7 @@ impl Store {
             self.current_link(),
             RenameFlags::EXCHANGE,
         ) {
-            Ok(()) => {
-                let _ = std::fs::remove_file(temporary);
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(Errno::NOENT | Errno::NOTSUP) => std::fs::rename(temporary, self.current_link()),
             Err(error) => Err(error.into()),
         }
@@ -3035,7 +3035,11 @@ mod tests {
             .filter_map(std::result::Result::ok)
             .filter(|entry| entry.file_name().to_string_lossy().starts_with('.'))
             .collect();
-        assert!(leftovers.is_empty(), "no temporary link is left behind");
+        // Only an exchange leaves the link it swapped out, and the next switch takes it away.
+        assert!(
+            leftovers.len() <= usize::from(cfg!(target_os = "macos")),
+            "no temporary link is left behind: {leftovers:?}"
+        );
     }
 
     /// A link that a crash left beside `current` names no release `current` could take, and the next
@@ -3071,6 +3075,69 @@ mod tests {
             "the leftover link is gone"
         );
         assert_eq!(test.store.current().expect("reads"), Some(one));
+    }
+
+    /// A link kept beside `current` names a release and holds nothing: the release it names is
+    /// removed as any other, the store still lists and reads what it should, and the next switch
+    /// takes the link away.
+    #[test]
+    fn a_link_kept_beside_current_holds_no_release_and_the_next_switch_takes_it_away() {
+        let test = test_store();
+        let one = release("0.1.0+aaaaaaaaaaaa");
+        let two = release("0.2.0+bbbbbbbbbbbb");
+        install(&test.store, &one);
+        install(&test.store, &two);
+        let update = test
+            .store
+            .try_lock_update()
+            .expect("locks")
+            .expect("nothing else updates");
+        let held = test
+            .store
+            .try_lock_install()
+            .expect("locks")
+            .expect("nothing starts a daemon");
+        let writers = test
+            .store
+            .try_lock_writers()
+            .expect("locks")
+            .expect("no command is writing");
+        test.store
+            .switch(&one, &update, &held, &writers)
+            .expect("switches");
+        test.store
+            .switch(&two, &update, &held, &writers)
+            .expect("switches");
+        // The link the second switch swapped out on macOS, and the same state made by hand elsewhere.
+        let kept = test.store.root().join(".current-kept");
+        if std::fs::read_dir(test.store.root())
+            .expect("the store")
+            .filter_map(std::result::Result::ok)
+            .all(|entry| !entry.file_name().to_string_lossy().starts_with(".current-"))
+        {
+            std::os::unix::fs::symlink(Path::new(VERSIONS).join(one.as_str()), &kept)
+                .expect("a kept link");
+        }
+        assert!(
+            test.store.retire(&one, &update).expect("removes"),
+            "the release a kept link names is removed as any other"
+        );
+        assert_eq!(test.store.releases().expect("lists"), vec![two.clone()]);
+        assert_eq!(test.store.current().expect("reads"), Some(two.clone()));
+        test.store
+            .switch(&two, &update, &held, &writers)
+            .expect("switches");
+        let names_one = std::fs::read_dir(test.store.root())
+            .expect("the store")
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".current-"))
+            .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+            .any(|target| target.ends_with(one.as_str()));
+        assert!(
+            !names_one,
+            "the next switch took the link that named it away"
+        );
+        assert_eq!(test.store.current().expect("reads"), Some(two));
     }
 
     /// One update at a time: the update lock is refused while another holds it.

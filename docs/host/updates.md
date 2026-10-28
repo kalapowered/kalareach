@@ -203,8 +203,11 @@ Only the current release's `kr` updates the host. An update, in order:
 
 On macOS the switch exchanges the new link with `current` instead of renaming it over `current`,
 because a reader that resolves `current` while a rename replaces it can find no link there for a
-moment. The exchange narrows that window and does not close it: a reader in the background
-scheduling class can still meet it, rarely, while a switch runs.
+moment (about 2% of the reads of three readers that never stopped, while a loop switched). The
+exchange leaves the old link beside `current` as `.current-<uuid>`, and the next switch takes it
+away: removing it at once failed a reader that had resolved `current` just before, while keeping it
+failed none of about 1.2 million reads. The kept link names a release's directory and holds
+nothing, so the release it names is removed as any other.
 
 An update that is held waits. It starts again every daemon it stopped, from the release still
 current, keeps the new release staged for the next attempt, which replaces it by the copy it checks
