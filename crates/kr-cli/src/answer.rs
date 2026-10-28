@@ -69,6 +69,7 @@ use kr_protocol::project::WorkspaceCreateResult;
 use kr_protocol::project::WorkspaceListResult;
 use kr_protocol::project::WorkspaceRemoveResult;
 use kr_protocol::project::WorkspaceSummary;
+use kr_protocol::test_report::{ReportCase, ReportReading, TestReport, TestReportsResult};
 
 /// `ChangesetCaptureResult`, in the shape the protocol answers it.
 #[must_use]
@@ -277,6 +278,68 @@ pub fn changeset_read_result(value: &ChangesetReadResult) -> Document {
                 .collect::<Vec<_>>(),
         )
         .with("ok", true)
+}
+
+/// `TestReportsResult`, in the shape the protocol answers it.
+#[must_use]
+pub fn test_reports_result(value: &TestReportsResult) -> Document {
+    Document::new()
+        .with("version", closed(&value.version))
+        .with(
+            "reports",
+            value.reports.iter().map(test_report).collect::<Vec<_>>(),
+        )
+        .with("omitted", closed(&value.omitted))
+        .with("ok", true)
+}
+
+/// `TestReport`, in the shape the protocol answers it. The path of the output and the names of the
+/// cases are what the suite's tool wrote, shown because the report was asked for.
+fn test_report(value: &TestReport) -> Document {
+    Document::new()
+        .with("materialisation_id", closed(&value.materialisation_id))
+        .with(
+            "output_path",
+            Asked::text(Request::Changesets, &value.output_path),
+        )
+        .with("output_digest", closed(&value.output_digest))
+        .with("output_bytes", closed(&value.output_bytes))
+        .with("format", closed(&value.format))
+        .with("reading", report_reading(&value.reading))
+        .with("recorded_at_ms", closed(&value.recorded_at_ms))
+}
+
+/// `ReportReading`, in the shape the protocol answers it.
+fn report_reading(value: &ReportReading) -> Document {
+    match value {
+        ReportReading::Parsed {
+            totals,
+            cases,
+            cases_omitted,
+        } => Document::new()
+            .with("state", "parsed")
+            .with("totals", closed(totals))
+            .with("cases", cases.iter().map(report_case).collect::<Vec<_>>())
+            .with("cases_omitted", closed(cases_omitted)),
+        ReportReading::Unreadable { reason } => Document::new()
+            .with("state", "unreadable")
+            .with("reason", closed(reason)),
+    }
+}
+
+/// `ReportCase`, in the shape the protocol answers it.
+fn report_case(value: &ReportCase) -> Document {
+    Document::new()
+        .with("name", Asked::text(Request::Changesets, &value.name))
+        .with(
+            "group",
+            value
+                .group
+                .as_ref()
+                .map(|text| Asked::text(Request::Changesets, text)),
+        )
+        .with("outcome", closed(&value.outcome))
+        .with("duration_ms", closed(&value.duration_ms))
 }
 
 /// `ChangeSetVersionSummary`, in the shape the protocol answers it.
@@ -1209,6 +1272,7 @@ mod tests {
     fn planted_text_in_every_answer_shows_only_where_it_was_asked_for() {
         let capture = held("kr changeset capture", changeset_capture_result);
         let read = held("kr changeset read", changeset_read_result);
+        let reports = held("kr changeset test-reports", test_reports_result);
         held("kr changeset materialize", changeset_materialize_result);
         let diff = held("kr diff read", diff_read_result);
         let applied = held("kr diff apply", diff_apply_result);
@@ -1233,6 +1297,8 @@ mod tests {
             (&capture, "version.changes[].path"),
             (&capture, "version.policy.grant.included_paths[]"),
             (&read, "materialisations[].directory_path"),
+            (&reports, "reports[].output_path"),
+            (&reports, "reports[].reading.cases[].name"),
             (&diff, "tracked[].path"),
             (&applied, "changed_paths[]"),
             (&applied, "reference.name"),

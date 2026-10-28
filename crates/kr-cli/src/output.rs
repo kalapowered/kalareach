@@ -667,6 +667,10 @@ impl claim::Claimed for kr_protocol::changeset::TestedSource {}
 impl claim::Claimed for kr_protocol::changeset::TreeSummary {}
 impl claim::Claimed for kr_protocol::changeset::VersionRef {}
 impl claim::Claimed for kr_protocol::project::ContentClass {}
+impl claim::Claimed for kr_protocol::test_report::ReportFormat {}
+impl claim::Claimed for kr_protocol::test_report::ReportOutcome {}
+impl claim::Claimed for kr_protocol::test_report::ReportTotals {}
+impl claim::Claimed for kr_protocol::test_report::UnreadableReason {}
 impl claim::Claimed for kr_protocol::ids::CausalRootId {}
 impl claim::Claimed for kr_protocol::ids::ChangeSetId {}
 impl claim::Claimed for kr_protocol::ids::ChangeSetVersion {}
