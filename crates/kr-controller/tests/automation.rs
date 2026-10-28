@@ -8776,7 +8776,15 @@ async fn a_daemon_starts_without_a_store_of_reports_it_cannot_use(
     number: u8,
     state: impl FnOnce(&Path),
 ) {
-    let before = std::cell::RefCell::new(Vec::new());
+    // The record and its write-ahead log, as they were put there.
+    let held = |state_dir: &Path| {
+        let record = state_dir.join(kr_controller::test_reports::TEST_REPORTS_RECORD);
+        (
+            std::fs::read(&record).expect("the file was put there"),
+            std::fs::read(record.with_extension("sqlite3-wal")).ok(),
+        )
+    };
+    let before = std::cell::RefCell::new(None);
     let host = working_host_with_suites_after(
         &[(
             "reports",
@@ -8785,9 +8793,7 @@ async fn a_daemon_starts_without_a_store_of_reports_it_cannot_use(
         )],
         |state_dir| {
             state(state_dir);
-            *before.borrow_mut() =
-                std::fs::read(state_dir.join(kr_controller::test_reports::TEST_REPORTS_RECORD))
-                    .expect("the file was put there");
+            *before.borrow_mut() = Some(held(state_dir));
         },
     )
     .await;
@@ -8822,15 +8828,9 @@ async fn a_daemon_starts_without_a_store_of_reports_it_cannot_use(
         .expect_err("there is no store to read");
     assert_eq!(refused.code, ErrorCode::StorageUnavailable, "{refused:?}");
     assert_eq!(
-        std::fs::read(
-            host._temp
-                .environment()
-                .state_dir()
-                .join(kr_controller::test_reports::TEST_REPORTS_RECORD)
-        )
-        .expect("the file is still there"),
+        Some(held(host._temp.environment().state_dir())),
         *before.borrow(),
-        "the daemon left the file as it found it"
+        "the daemon left the file, and the log beside it, as it found them"
     );
     host.clients.abort();
 }
@@ -8849,42 +8849,68 @@ async fn a_store_of_reports_that_is_not_a_database_does_not_stop_the_daemon() {
 }
 
 /// KR-REQ-25.06: a store of reports of a schema this build does not read, as a later release
-/// leaves it, does not stop the daemon, and a rollback to that release finds it as it was.
+/// leaves it with a write-ahead log not yet folded into the file, does not stop the daemon, and a
+/// rollback to that release finds the file and the log as they were.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_store_of_reports_of_a_newer_schema_does_not_stop_the_daemon() {
     a_daemon_starts_without_a_store_of_reports_it_cannot_use(166, |state_dir| {
+        // Made in a place of its own with its log kept from being folded, and copied with the log
+        // beside it, so that the daemon meets a file whose newest pages are in the log.
+        let made = tempfile::TempDir::new().expect("a place for the file");
+        let record = made
+            .path()
+            .join(kr_controller::test_reports::TEST_REPORTS_RECORD);
+        let connection = rusqlite::Connection::open(&record).expect("the file opens");
+        connection
+            .execute_batch(&format!(
+                "PRAGMA journal_mode = WAL;
+                 PRAGMA wal_autocheckpoint = 0;
+                 CREATE TABLE test_reports_schema (version INTEGER NOT NULL);
+                 INSERT INTO test_reports_schema (version) VALUES ({});",
+                kr_controller::test_reports::SCHEMA_VERSION + 1
+            ))
+            .expect("the schema is written");
+        let log = record.with_extension("sqlite3-wal");
+        assert!(
+            std::fs::metadata(&log).expect("the log is there").len() > 0,
+            "the schema is in the log and not yet in the file"
+        );
+        for file in [&record, &log] {
+            std::fs::copy(file, state_dir.join(file.file_name().expect("a name")))
+                .expect("the file is copied");
+        }
+        drop(connection);
+    })
+    .await;
+}
+
+/// KR-REQ-25.06: a store of reports with a row that names no run this build can read does not stop
+/// the daemon either, and the file, which is not in write-ahead mode, stays as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_store_of_reports_with_a_row_it_cannot_read_does_not_stop_the_daemon() {
+    a_daemon_starts_without_a_store_of_reports_it_cannot_use(168, |state_dir| {
         let connection = rusqlite::Connection::open(
             state_dir.join(kr_controller::test_reports::TEST_REPORTS_RECORD),
         )
         .expect("the file opens");
         connection
             .execute_batch(&format!(
-                "CREATE TABLE test_reports_schema (version INTEGER NOT NULL);
-                 INSERT INTO test_reports_schema (version) VALUES ({});",
-                kr_controller::test_reports::SCHEMA_VERSION + 1
+                "PRAGMA journal_mode = DELETE;
+                 CREATE TABLE test_reports_schema (version INTEGER NOT NULL);
+                 INSERT INTO test_reports_schema (version) VALUES ({});
+                 CREATE TABLE test_reports (
+                     materialisation_id BLOB NOT NULL,
+                     output_path        TEXT NOT NULL,
+                     output_digest      BLOB NOT NULL,
+                     recorded_at_ms     INTEGER NOT NULL,
+                     record             TEXT NOT NULL,
+                     PRIMARY KEY (materialisation_id, output_path)
+                 );
+                 INSERT INTO test_reports
+                     VALUES (x'0102', 'reports/junit.xml', x'00', 0, '{{}}');",
+                kr_controller::test_reports::SCHEMA_VERSION
             ))
-            .expect("the schema is written");
-    })
-    .await;
-}
-
-/// KR-REQ-25.06: a store of reports with a row that names no run this build can read does not stop
-/// the daemon either.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn a_store_of_reports_with_a_row_it_cannot_read_does_not_stop_the_daemon() {
-    a_daemon_starts_without_a_store_of_reports_it_cannot_use(168, |state_dir| {
-        drop(kr_controller::test_reports::Reports::open(state_dir).expect("the store is made"));
-        rusqlite::Connection::open(
-            state_dir.join(kr_controller::test_reports::TEST_REPORTS_RECORD),
-        )
-        .expect("the file opens")
-        .execute(
-            "INSERT INTO test_reports
-                 (materialisation_id, output_path, output_digest, recorded_at_ms, record)
-             VALUES (x'0102', 'reports/junit.xml', x'00', 0, '{}')",
-            [],
-        )
-        .expect("the row is written");
+            .expect("the file is written");
     })
     .await;
 }
