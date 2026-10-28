@@ -87,6 +87,11 @@ trap kr_store_guard_end EXIT
 kr_store_claim "$out" || exit 2
 kr_store_say "version $version, build number $number, team $team, into $out"
 
+# What the build is of, taken before it rewrites tracked project files.
+commit="$(git -C "$here" rev-parse HEAD)"
+dirty=false
+[ -z "$(git -C "$here" status --porcelain --untracked-files=no)" ] || dirty=true
+
 # The Firebase file for the build phase, and the team's prefix, which a build with signing off
 # cannot take from a provisioning profile (Build.xcconfig says so).
 kr_store_guard_write_local "$(printf 'KR_GOOGLE_SERVICE_INFO = %s\nAppIdentifierPrefix = %s.' "$firebase" "$team")" \
@@ -116,9 +121,6 @@ app="$archive/Products/Applications/KalaReach.app"
 kr_store_say "signing the archive ad hoc with the entitlements of the application and its extension"
 node "$companion/scripts/store-ios-sign.mjs" "$app" "$team" >"$out/archive-entitlements.json" \
     || { kr_store_say "the archive could not be signed"; exit 2; }
-commit="$(git -C "$here" rev-parse HEAD)"
-dirty=false
-[ -z "$(git -C "$here" status --porcelain --untracked-files=no)" ] || dirty=true
 common=(--version-code "$number" --version-name "$version")
 [ -z "$key_file" ] || common+=(--secret-file "$key_file")
 notes=(--note "commit=$commit" --note "uncommittedChanges=$dirty" --note "xcode=$(xcodebuild -version | tr '\n' ' ')"
