@@ -143,9 +143,8 @@ impl ChangeSetModule {
             let reports = crate::test_reports::Reports::open(paths.state_dir())?;
             // A report whose run the change-set store holds no result for was kept while that
             // store was replaced by an older copy of itself. Nothing serves it, so it is let go.
-            reports.forget_runs_without_a_result(|run| {
-                materialise::has_result(&service, run).map_err(unavailable)
-            })?;
+            let held = materialise::runs_with_a_result(&service).map_err(unavailable)?;
+            reports.forget_runs_without_a_result(&held)?;
             Ok::<_, ControllerError>((service, reports))
         })
         .await

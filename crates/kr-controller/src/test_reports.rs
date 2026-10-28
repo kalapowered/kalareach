@@ -216,19 +216,19 @@ impl Reports {
         })
     }
 
-    /// Lets go of every report whose run `has_result` says the change-set store holds no result
-    /// for, and says how many runs that was.
+    /// Lets go of every report whose run is not among `runs_with_a_result`, the runs the
+    /// change-set store holds a result for, and says how many runs that was.
     ///
     /// # Errors
     ///
-    /// Returns an error when the record cannot be read or written, or when `has_result` fails.
+    /// Returns an error when the record cannot be read or written.
     pub fn forget_runs_without_a_result(
         &self,
-        mut has_result: impl FnMut(MaterialisationId) -> Result<bool>,
+        runs_with_a_result: &std::collections::HashSet<MaterialisationId>,
     ) -> Result<usize> {
         let mut forgotten = 0;
         for run in self.runs()? {
-            if !has_result(run)? {
+            if !runs_with_a_result.contains(&run) {
                 self.forget_run(run)?;
                 forgotten += 1;
             }

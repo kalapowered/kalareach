@@ -1824,16 +1824,15 @@ pub fn results(
     rows.iter().map(|row| decode_stored(&row.record)).collect()
 }
 
-/// Returns whether a result is recorded against one materialisation.
+/// Returns every materialisation a result is recorded against, in one read.
 ///
 /// # Errors
 ///
 /// Returns [`ChangeSetError::StoreUnavailable`] when the read fails.
-pub fn has_result(
+pub fn runs_with_a_result(
     service: &ChangeSetService,
-    materialisation_id: MaterialisationId,
-) -> Result<bool> {
-    service.locked()?.has_result(materialisation_id)
+) -> Result<std::collections::HashSet<MaterialisationId>> {
+    service.locked()?.materialisations_with_a_result()
 }
 
 #[cfg(test)]
