@@ -169,10 +169,10 @@ key is checked again against the same two pages.
 
 The scripts stop at a checked file. A build that failed a check, or whose output directory held a
 secret, leaves its files and no receipt. A failed check also leaves a `store-build.json` whose
-`holds` is false. Only the receipt marks a build that passed every step: the last search of the
-output directory can fail a run after its record says `holds` is true, and on Android `holds`
-covers the bundle's checks while the emulator leg, a separate command, keeps its result in its own
-log and exit status. A run that stops before its check leaves no record and no receipt. An iOS run
+`holds` is false. The receipt for a platform holds the highest build number whose build command
+passed every step. The last search of the output directory can fail a run after its record says
+`holds` is true, and on Android the emulator leg is a separate command that runs later and keeps its
+result only in its own log and exit status. A run that stops before its check leaves no record and no receipt. An iOS run
 that is interrupted removes Xcode's logs and searches its output directory before it ends.
 
 Uploading is separate: the first Android bundle through Play Console, and the iOS build with
