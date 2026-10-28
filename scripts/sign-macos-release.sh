@@ -202,12 +202,13 @@ if [ -n "$run" ]; then
     facts="$(gh api "repos/$repo/actions/runs/$run" --jq '"\(.path) \(.conclusion) \(.head_sha) \(.head_branch)"')"
     wanted=".github/workflows/release-tree.yml success $commit"
     if [ "$stage" -eq 1 ]; then
-        wanted="$wanted main"
+        [ "$facts" = "$wanted main" ] || { echo "sign-macos-release: run $run is not a successful release-tree run on main at $commit: $facts" >&2; exit 1; }
+    else
+        case "$facts" in
+            "$wanted "*) ;;
+            *) echo "sign-macos-release: run $run is not a successful release-tree run at $commit: $facts" >&2; exit 1 ;;
+        esac
     fi
-    case "$facts" in
-        "$wanted"*) ;;
-        *) echo "sign-macos-release: run $run is not a successful release-tree run at $commit$([ "$stage" -eq 1 ] && echo ' on main'): $facts" >&2; exit 1 ;;
-    esac
     gh api "repos/$repo/actions/runs/$run/artifacts" --paginate \
         --jq '.artifacts[] | "\(.id) \(.name) \(.expired) \(.digest)"' > "${TMPDIR:-/tmp}/kr-artifacts.$$"
 fi

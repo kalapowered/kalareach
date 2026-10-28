@@ -13,8 +13,8 @@
 #
 # The release is the tag `host/v<release>`, made by publishing the draft at <sha>, so the tag names
 # the commit that was built. The shape is the one the package releases settled: refuse before
-# creating anything (including when the repository does not make releases immutable), assemble as a
-# draft, hold the stored assets and the bytes the draft serves to what was packed before publishing,
+# creating anything (including when nothing shows that the repository makes releases immutable), assemble
+# as a draft, hold the stored assets and the bytes the draft serves to what was packed before publishing,
 # and confirm afterwards that the tag resolves to this release at this commit and that nobody can
 # replace what it serves. A failure before publication leaves a draft; a failure of the last
 # confirmation leaves a published release, which is never deleted. The release is a pre-release and is never marked the latest,
@@ -120,12 +120,24 @@ while index < len(text):
     if exists "repos/$repo/git/ref/tags/$tag"; then
         fail "$tag is already a tag of this repository"
     fi
-    # A repository that does not make releases immutable would publish a release whose assets can be
-    # replaced, which cannot be undone, so it is refused before a draft is made. A token that cannot
-    # read the setting leaves the last confirmation to decide.
-    local setting
+    # A release published where releases are not immutable has assets that can be replaced, which
+    # cannot be undone, so nothing is made unless something shows they are immutable. The setting
+    # itself needs a token that can administer the repository: when the token can read it, it has to
+    # say enabled. When it cannot, the newest published release of the repository has to report
+    # itself immutable, which a release published while the setting is off does not.
+    local setting newest
     setting="$(gh api "repos/$repo/immutable-releases" 2> /dev/null | python3 -I -c 'import json, sys; print(json.load(sys.stdin).get("enabled"))' 2> /dev/null || true)"
-    [ "$setting" != False ] || fail "this repository does not make releases immutable, so nothing is published"
+    case "$setting" in
+        True) ;;
+        False) fail "this repository does not make releases immutable, so nothing is published" ;;
+        *)
+            newest="$(gh api "repos/$repo/releases?per_page=1" 2> /dev/null | python3 -I -c '
+import json, sys
+releases = [r for r in json.load(sys.stdin) if not r["draft"]]
+print(str(releases[0]["immutable"]).lower() if releases else "none")' 2> /dev/null || true)"
+            [ "$newest" = true ] || fail "nothing shows that this repository makes releases immutable (the setting cannot be read, and the newest published release answers '${newest:-nothing}'), so nothing is published"
+            ;;
+    esac
 
     local key_ids
     key_ids="$(python3 -I -c '
@@ -245,6 +257,14 @@ for asset in json.load(sys.stdin)["assets"]:
         sleep 3
     done
 
+    # The public release holds what the draft held when it was checked.
+    gh api "repos/$repo/releases/$id" | python3 -I -c '
+import json, sys
+for asset in json.load(sys.stdin)["assets"]:
+    print(asset["name"], asset["size"], asset["digest"])
+' | sort > "$work/public-assets"
+    cmp -s "$work/packed-assets" "$work/public-assets" || fail "the published release holds other assets than were checked"
+
     # Where each asset is served, for the notes.
     gh api "repos/$repo/releases/$id" | python3 -I -c '
 import json, sys
@@ -360,7 +380,7 @@ def find(identifier):
 
 if method == "POST" and path.endswith("/releases"):
     release = {"id": state["next"], "tag_name": fields["tag_name"], "draft": True, "prerelease": fields.get("prerelease") == "true",
-               "immutable": os.environ.get("STUB_MUTABLE") != "1", "assets": [], "target": fields["target_commitish"], "next_asset": 1}
+               "immutable": os.environ.get("STUB_PUBLISH_MUTABLE") != "1", "assets": [], "target": fields["target_commitish"], "next_asset": 1}
     state["next"] += 1
     state["releases"].append(release)
     save()
@@ -377,10 +397,17 @@ elif method == "POST" and path.startswith("upload://"):
     release["assets"].append(asset)
     release["next_asset"] += 1
     save()
+elif method == "GET" and path.startswith(f"repos/{repo}/releases?"):
+    published = [r for r in state["releases"] if not r["draft"]]
+    print(json.dumps([release_json(r) for r in sorted(published, key=lambda r: -r["id"])][:1]))
 elif method == "GET" and path == f"repos/{repo}/releases":
     print(json.dumps([release_json(r) for r in state["releases"]]))
 elif method == "GET" and path == f"repos/{repo}/immutable-releases":
-    print(json.dumps({"enabled": os.environ.get("STUB_MUTABLE") != "1", "enforced_by_owner": False}))
+    # A token that cannot administer the repository is answered 404; STUB_SETTING stands for one that can.
+    if os.environ.get("STUB_SETTING") in ("true", "false"):
+        print(json.dumps({"enabled": os.environ["STUB_SETTING"] == "true", "enforced_by_owner": False}))
+    else:
+        sys.exit("gh: Not Found (HTTP 404)")
 elif method == "GET" and path.startswith(f"repos/{repo}/releases/tags/"):
     tag = path[len(f"repos/{repo}/releases/tags/"):]
     matches = [r for r in state["releases"] if r["tag_name"] == tag and not r["draft"]]
@@ -399,7 +426,10 @@ elif method == "GET" and path.startswith(f"repos/{repo}/releases/assets/"):
         for asset in release["assets"]:
             if asset["id"] == identifier:
                 sys.stdout.flush()
-                sys.stdout.buffer.write(open(asset["path"], "rb").read())
+                data = open(asset["path"], "rb").read()
+                if os.environ.get("STUB_SERVE_OTHER") == asset["name"]:
+                    data = data + b"x"
+                sys.stdout.buffer.write(data)
                 sys.exit(0)
     sys.exit(1)
 elif method == "GET" and path.startswith(f"repos/{repo}/releases/"):
@@ -433,39 +463,71 @@ sys.exit(0 if any((what == "published" and not r["draft"]) or (what == "draft" a
 PYTHON
 }
 
-seed_release() { # <tag> <draft: true|false>
-    python3 -I - "$STUB_STATE/state.json" "$1" "$2" "$commit" << 'PYTHON'
+# The state every case starts from: one published release of the repository, immutable unless BASE says
+# otherwise (mutable, or none), and a copy of it to compare the end state with.
+seed_base() {
+    python3 -I - "$STUB_STATE" "${BASE:-immutable}" "$commit" << 'PYTHON'
 import json
+import os
+import shutil
 import sys
 
-path, tag, draft, commit = sys.argv[1:5]
-release = {"id": 1, "tag_name": tag, "draft": draft == "true", "prerelease": True, "immutable": True,
-           "assets": [], "target": commit, "next_asset": 1}
-json.dump({"releases": [release], "next": 2}, open(path, "w"))
+directory, base, commit = sys.argv[1:4]
+releases = []
+if base != "none":
+    releases.append({"id": 1, "tag_name": "packages/v0.0.0+000000000000", "draft": False, "prerelease": False,
+                     "immutable": base == "immutable", "assets": [], "target": commit, "next_asset": 1})
+json.dump({"releases": releases, "next": 2}, open(os.path.join(directory, "state.json"), "w"))
+shutil.copy(os.path.join(directory, "state.json"), os.path.join(directory, "initial.json"))
+PYTHON
+}
+
+seed_release() { # <tag> <draft: true|false>: another release, part of the state a case starts from
+    python3 -I - "$STUB_STATE" "$1" "$2" "$commit" << 'PYTHON'
+import json
+import os
+import shutil
+import sys
+
+directory, tag, draft, commit = sys.argv[1:5]
+path = os.path.join(directory, "state.json")
+state = json.load(open(path))
+state["releases"].append({"id": state["next"], "tag_name": tag, "draft": draft == "true", "prerelease": True,
+                          "immutable": True, "assets": [], "target": commit, "next_asset": 1})
+state["next"] += 1
+json.dump(state, open(path, "w"))
+shutil.copy(path, os.path.join(directory, "initial.json"))
 PYTHON
 }
 
 go() { publish --repo o/r --release "$release" --commit "$commit" --archives "$work/archives" --verified "$work/verified" --root "$work/root.json"; }
 
 case_control() { go && state_has published "host/v$release" && ! state_has draft "host/v$release"; }
-case_published() { seed_release "host/v$release" false; ( go ) && return 1; state_has published "host/v$release" && ! state_has draft "host/v$release" && [ "$(nothing_created)" = yes ]; }
+case_published() { seed_release "host/v$release" false; ( go ) && return 1; [ "$(nothing_created)" = yes ]; }
 case_draft() { seed_release "host/v$release" true; ( go ) && return 1; [ "$(nothing_created)" = yes ]; }
 case_staging_removed() { seed_release "host-staging/v$release" true; go && ! state_has draft "host-staging/v$release"; }
 case_corrupt() { ( STUB_CORRUPT=SHA256SUMS go ) && return 1; state_has draft "host/v$release" && ! state_has published "host/v$release"; }
-case_mutable() { ( STUB_MUTABLE=1 go ) && return 1; [ "$(nothing_created)" = yes ] && ! state_has published "host/v$release"; }
+case_serves_other() { ( STUB_SERVE_OTHER="kalareach-${targets[0]}-$release.tar.gz" go ) && return 1; state_has draft "host/v$release" && ! state_has published "host/v$release"; }
+case_setting_off() { ( STUB_SETTING=false go ) && return 1; [ "$(nothing_created)" = yes ]; }
+case_setting_on() { STUB_SETTING=true go && state_has published "host/v$release"; }
+case_published_mutable() { ( STUB_PUBLISH_MUTABLE=1 go ) && return 1; state_has published "host/v$release"; }
+case_no_proof() { ( go ) && return 1; [ "$(nothing_created)" = yes ]; }
 case_digest_differs() { ( go ) && return 1; [ "$(nothing_created)" = yes ]; }
 case_missing_archive() { ( go ) && return 1; [ "$(nothing_created)" = yes ]; }
 
-# "yes" when the stand-in holds no release it did not start with: nothing was created.
+# "yes" when the stand-in holds exactly the releases and assets it started the case with.
 nothing_created() {
-    python3 -I - "$STUB_STATE/state.json" << 'PYTHON'
+    python3 -I - "$STUB_STATE" << 'PYTHON'
 import json
 import os
 import sys
 
-path = sys.argv[1]
-state = json.load(open(path)) if os.path.exists(path) else {"releases": []}
-print("yes" if all(not release["assets"] and release["id"] == 1 for release in state["releases"]) else "no")
+def shape(path):
+    state = json.load(open(path))
+    return sorted((r["id"], r["tag_name"], r["draft"], len(r["assets"])) for r in state["releases"])
+
+directory = sys.argv[1]
+print("yes" if shape(os.path.join(directory, "state.json")) == shape(os.path.join(directory, "initial.json")) else "no")
 PYTHON
 }
 
@@ -490,7 +552,7 @@ json.dump({"signed": {"roles": {"targets": {"keyids": ["aa", "bb"]}}}}, open("'"
         local rc=0
         rm -rf "${work:?}/state"
         mkdir -p "$work/state"
-        ( export STUB_STATE="$work/state" PATH="$work/bin:$PATH"; "$3" ) > "$work/out.txt" 2>&1 || rc=$?
+        ( export STUB_STATE="$work/state" PATH="$work/bin:$PATH"; seed_base; "$3" ) > "$work/out.txt" 2>&1 || rc=$?
         if { [ "$2" = pass ] && [ "$rc" -ne 0 ]; } || { [ "$2" = refuse ] && [ "$rc" -eq 0 ]; }; then
             echo "self-test FAILED: $1 (exit $rc)"
             sed 's/^/    /' "$work/out.txt"
@@ -506,7 +568,12 @@ json.dump({"signed": {"roles": {"targets": {"keyids": ["aa", "bb"]}}}}, open("'"
     run "a published release of the tag is refused, and nothing is created beside it" pass case_published
     run "a draft of the tag is refused, and nothing is created beside it" pass case_draft
     run "a store that keeps other bytes than were uploaded leaves a draft and no release" pass case_corrupt
-    run "a repository that does not make releases immutable is refused before a draft is made" pass case_mutable
+    run "a repository setting that reads as off is refused before a draft is made" pass case_setting_off
+    run "a setting that can be read and is on is enough" pass case_setting_on
+    BASE=mutable run "no readable setting and a newest release that is not immutable is refused before a draft is made" pass case_no_proof
+    BASE=none run "no readable setting and no published release is refused before a draft is made" pass case_no_proof
+    run "a draft that serves other bytes than were packed is not published" pass case_serves_other
+    run "a release that turns out to be replaceable after it is published ends the run with an error" pass case_published_mutable
 
     printf 'changed\n' >> "$work/archives/kalareach-${targets[0]}-$release.tar.gz"
     run "an archive that differs from the sum its check recorded is refused before anything is created" pass case_digest_differs
