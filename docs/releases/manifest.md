@@ -217,28 +217,33 @@ must sign and how many are made, two by default): `root-key.pk8`, `snapshot-key.
 `timestamp-key.pk8` and one `targets-<n>.pk8` for each signer, with a root that names each role's own
 key. A host checks no snapshot or timestamp of the update channel, but a root has a key for each
 role, and each is a key of its own. A run that proves the pipeline
-signs with those and throws them away with the run; the channel's own keys are to be held in
-hardware and on offline media (none exists yet), never in a tree, an archive or a repository.
+signs with those and throws them away with the run. The macOS and Linux releases are signed with the
+keys of the channel committed in `release/tester-channel/root.json` instead ([signing keys](keys.md)),
+which are never in a tree, an archive or a repository.
 
 ## Publishing
 
-A `host/v<version>+<commit>` tag starts two workflows: `release-tree.yml` for the four macOS and Linux
-targets and `release-windows.yml` for the two Windows targets. In each, a first job settles which
-commit the run is about, and every job after it checks that commit out by its identifier and not by
-the ref, so a branch that moves while the trees build, or while the signing waits for approval,
-cannot change what is built or signed. The next job builds the programs on a runner of the target's
-own kind, assembles the tree, signs its manifest with keys of its own, packs it and holds the archive
-to what a host stages. It reads no secret and uses no environment, and the archive it keeps says in
-its name that it is not a release. The last job signs for release behind the `release-signing` environment: the platform's own signature first (Developer ID and
-notarisation on macOS, Authenticode on Windows), then the manifest again, since the first changed the
-files, with the channel's release keys. It runs for a tag and the default branch only.
+The macOS and Linux releases are made in four steps, and [the procedure](macos-signing.md) says what
+each does and checks. `release-tree.yml`, run by hand on `main`, builds the four trees on runners of
+their own platforms, proves each with a root and keys made for the run, and keeps the tree as it
+stands before that run's signature, with its digest. `scripts/sign-macos-release.sh` signs and
+notarises the two macOS trees on the machine that holds the Developer ID. `release-host.yml` seals
+all four trees, which is to write each manifest again over the files as they now are (a signature
+changes the bytes the digests cover) and sign it with the update channel's two release keys, checks
+each archive on its own platform against the root committed in `release/tester-channel/root.json`,
+and publishes the four archives and one `SHA256SUMS` as a pre-release `host/v<version>+<commit>`
+that is never marked the latest. A person approves the use of the release keys once, and that
+approval decides the publication.
 
-The channel's release keys do not exist yet. They are made at a key ceremony and held in hardware
-and on offline media, and no mechanism of this repository gives a run one. So the job that signs
-stops at that step on every platform and **tagging a host release does not publish one until the
-ceremony has been held.** On macOS it stops sooner, at the Developer ID step, while that identity is
-not set up; the step for the channel keys follows it. The ceremony belongs to the project owner. A release
-that has been published is never changed: a correction is a new commit under its own tag.
+Every job after the first settles the commit by its identifier and not by the ref, so a branch that
+moves while the trees build, or while an approval waits, cannot change what is built or signed. The
+tag is made by publishing the release at the commit, and a tag made that way starts no workflow.
+A release that has been published is never changed: a correction is a new commit under its own tag.
+
+`release-windows.yml` builds and checks the two Windows trees and, when the repository variable
+`WINDOWS_HOST_RELEASE` is `true`, signs them behind its own environment. The variable is not set, so
+a Windows host is not released and the job asks for no approval. The channel's release keys that sign
+the Windows manifests do not exist yet; the Windows job stops at that step.
 
 ## Package managers
 
