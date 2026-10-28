@@ -352,8 +352,8 @@ impl AuthoritySource for HostGrants {
 pub struct HostActions {
     changesets: Arc<ChangeSetService>,
     /// Where what a suite's test reports held is kept, beside the result the change-set service
-    /// records for the run.
-    reports: Arc<crate::test_reports::Reports>,
+    /// records for the run. Nothing when that store could not be used.
+    reports: Option<Arc<crate::test_reports::Reports>>,
     authority: Arc<dyn AuthoritySource>,
     daemon: Arc<Daemon>,
     environment_id: EnvironmentId,
@@ -590,7 +590,7 @@ impl ActionRunner for HostActions {
         let node_context = NodeContext {
             daemon: Arc::clone(&self.daemon),
             changesets: Arc::clone(&self.changesets),
-            reports: Arc::clone(&self.reports),
+            reports: self.reports.clone(),
             ledger: Arc::clone(&self.ledger),
             scratch_root: self.scratch_root.clone(),
             holds: Arc::clone(&self.holds),
@@ -803,7 +803,7 @@ impl HeldGrant {
 struct NodeContext {
     daemon: Arc<Daemon>,
     changesets: Arc<ChangeSetService>,
-    reports: Arc<crate::test_reports::Reports>,
+    reports: Option<Arc<crate::test_reports::Reports>>,
     ledger: Arc<ResourceLedger>,
     scratch_root: PathBuf,
     holds: Arc<std::sync::Mutex<()>>,
@@ -1885,7 +1885,7 @@ async fn observe_tests(
             run.version,
             run.suite.to_owned(),
         );
-        let reports = Arc::clone(&context.reports);
+        let reports = context.reports.clone();
         let session_id = run.session_id;
         blocking(
             move || -> kr_changeset::Result<kr_protocol::changeset::MaterialisationResult> {
@@ -1894,7 +1894,7 @@ async fn observe_tests(
                 // What the suite's reports held is read after the result is recorded and never
                 // changes it, the evidence or the node: a report that cannot be read or kept is
                 // said in the evidence line and nowhere else.
-                let reports_said = keep_reports(&reports, &recorded);
+                let reports_said = keep_reports(reports.as_deref(), &recorded);
                 changesets.record_evidence(
                     version.change_set_id,
                     version.version,
@@ -1953,7 +1953,7 @@ async fn observe_tests(
 /// Reading and keeping are best effort and say so: nothing here can fail the node, change its
 /// outcome or stop its result and evidence from being recorded.
 fn keep_reports(
-    reports: &crate::test_reports::Reports,
+    reports: Option<&crate::test_reports::Reports>,
     recorded: &materialise::Recorded,
 ) -> String {
     use kr_protocol::test_report::{ReportReading, TestReport};
@@ -1986,7 +1986,7 @@ fn keep_reports(
             reading,
             recorded_at_ms: recorded.result.recorded_at_ms,
         };
-        if reports.record(&report).is_err() {
+        if reports.is_none_or(|reports| reports.record(&report).is_err()) {
             unkept += 1;
         }
     }
@@ -2814,6 +2814,7 @@ impl AutomationModule {
         paths: &kr_ipc::paths::EnvironmentPaths,
         environment_id: EnvironmentId,
         changesets: Arc<ChangeSetService>,
+        reports: Option<Arc<crate::test_reports::Reports>>,
     ) -> Result<Self> {
         // The state directory, not the runtime one: a causal budget has to survive a reboot, and
         // a runtime directory is cleared by one.
@@ -2836,19 +2837,9 @@ impl AutomationModule {
                     detail: kr_project::git::redact(&error.to_string()),
                 })?
         };
-        // What the suites' test reports held is kept in a store of its own beside the journal, as
-        // the ledger is: the change-set store's format is read by the release before this one.
-        let reports = {
-            let state_dir = state_dir.clone();
-            tokio::task::spawn_blocking(move || crate::test_reports::Reports::open(&state_dir))
-                .await
-                .map_err(|_| ControllerError::RegistryUnavailable {
-                    detail: "the store of test reports could not be opened".to_owned(),
-                })??
-        };
         let actions = Arc::new(HostActions {
             changesets,
-            reports: Arc::new(reports),
+            reports,
             authority: Arc::clone(&grants),
             daemon: Arc::clone(&daemon),
             environment_id,

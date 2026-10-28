@@ -113,8 +113,9 @@ impl kr_changeset::store::StillAdmitted for Admission {
 #[derive(Debug)]
 pub struct ChangeSetModule {
     service: Arc<ChangeSetService>,
-    /// What this host read out of the test reports a suite wrote, in a store of its own.
-    reports: Arc<crate::test_reports::Reports>,
+    /// What this host read out of the test reports a suite wrote, in a store of its own. Nothing
+    /// when that store could not be used: the daemon runs without reports.
+    reports: Option<Arc<crate::test_reports::Reports>>,
 }
 
 impl ChangeSetModule {
@@ -140,11 +141,10 @@ impl ChangeSetModule {
             // An apply an earlier daemon died inside is settled before anything is served, so a
             // caller never reads an apply that is open for ever.
             service.recover_before_serving().map_err(unavailable)?;
-            let reports = crate::test_reports::Reports::open(paths.state_dir())?;
             // A report whose run the change-set store holds no result for was kept while that
             // store was replaced by an older copy of itself. Nothing serves it, so it is let go.
             let held = materialise::runs_with_a_result(&service).map_err(unavailable)?;
-            reports.forget_runs_without_a_result(&held)?;
+            let reports = crate::test_reports::Reports::open_for_a_daemon(paths.state_dir(), &held);
             Ok::<_, ControllerError>((service, reports))
         })
         .await
@@ -153,8 +153,14 @@ impl ChangeSetModule {
         })??;
         Ok(Self {
             service: Arc::new(service),
-            reports: Arc::new(reports),
+            reports: reports.map(Arc::new),
         })
+    }
+
+    /// Returns the store of test reports, when this daemon could use it.
+    #[must_use]
+    pub const fn reports(&self) -> Option<&Arc<crate::test_reports::Reports>> {
+        self.reports.as_ref()
     }
 
     /// Returns the service itself.
@@ -290,7 +296,7 @@ impl ChangeSetModule {
             ));
         };
         let service = Arc::clone(&self.service);
-        let reports = Arc::clone(&self.reports);
+        let reports = self.reports.clone();
         let params = request.params.clone();
         blocking(move || match method {
             Method::ChangesetRead => {
@@ -299,7 +305,14 @@ impl ChangeSetModule {
             }
             Method::ChangesetTestReports => {
                 let params: TestReportsParams = typed(&params)?;
-                encode(&read_test_reports(&service, &reports, &params)?)
+                let Some(reports) = &reports else {
+                    return Err(ProtocolError::new(
+                        ErrorCode::StorageUnavailable,
+                        "this daemon runs without its record of test reports, which it could not \
+                         use when it started",
+                    ));
+                };
+                encode(&read_test_reports(&service, reports, &params)?)
             }
             Method::DiffRead => {
                 let params: DiffReadParams = typed(&params)?;
