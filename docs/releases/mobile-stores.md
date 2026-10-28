@@ -24,14 +24,19 @@ API key that anyone but its owner can read.
 | `firebase-apps/GoogleService-Info.plist` | The iOS push configuration (`KR_GOOGLE_SERVICE_INFO` names another) |
 
 A secret is only ever a file whose path a tool receives. The scripts never put a password or a key
-on a command line, in the environment or in a log. The checker reads each secret file in its own
-process and searches for its text: in every decompressed member of the Android bundle, in every
-file of the iOS application, and at the end of a build in every file of the output directory,
-logs and records included. It prints how many places held it, and when a bundle holds one it
-reports that and nothing else, since the other messages quote values out of the bundle. A secret
-shorter than eight characters is refused, because it would match anything. The Firebase files are
-client configuration and not secrets: they go into the bundle as the application's configuration,
-and the build directories keep a copy as they do of every resource.
+on a command line or in the environment. The checker reads each secret file in its own process and
+searches for its text before it reads anything else from a bundle: in every decompressed member of
+the Android bundle, in every file of the iOS application, and, in a run that reaches its check, in
+every file of the output directory (the members of a `.aab`, `.ipa` or `.apk` one by one, and the
+`.apks` set through its packages). A signed token, the kind Xcode writes into its export logs from
+the API key, counts as a find as well. It prints how many places held one. When a bundle holds
+one it reports that and nothing else, because the other messages quote values out of the bundle,
+and an error message that quotes a secret is withheld. A run that ends early still searches its
+output directory and says so when it finds something. A secret shorter than eight characters is
+refused, because it would match anything. The caller's own log of a run, outside the output
+directory, is not read. The Firebase files are client configuration and not secrets: they go into
+the bundle as the application's configuration, and the build directories keep a copy as they do
+of every resource.
 
 ## Version and build number
 
@@ -42,9 +47,11 @@ The version is `version` in `src-tauri/tauri.conf.json`. It is the Android `vers
 The build number is the count of whole minutes since 2026-10-01T00:00Z. It is the Android
 `versionCode` and the iOS `CFBundleVersion`. Each platform keeps a receipt with the highest number
 it has built and checked, and a script refuses a number at or below it. That covers a clock set
-back, a number given by hand with `--build-number` and a rebuild of an old number. The two
-platforms need not agree on a number. A counter in continuous integration has to start above the
-receipts.
+back, a number given by hand with `--build-number` and a rebuild of an old number. The receipt is
+updated under a lock and keeps the larger number, so builds that end together cannot lower it. A
+number is also claimed for its platform when a build starts, whatever the version, so two builds
+of different versions in one minute cannot both ship it. The two platforms need not agree on a
+number. A counter in continuous integration has to start above the receipts.
 
 ## Android
 
@@ -59,13 +66,15 @@ line nor the long-lived Gradle process. `store-bundle.mjs --android` reads the f
   certificate;
 - the manifest has the package, version code and version name asked for, targets API 36, sets no
   `debuggable` or `testOnly` flag, permits no cleartext traffic, declares the verified sign-in link
-  `https://reach.kala.to/app/oauth/callback`, and asks for exactly the permissions the checker
-  lists (the application's own and the ones its libraries add), so a library that starts to ask for
-  another stops the build;
-- the bundle holds the requested architectures, and every loadable segment of every library is
-  aligned to 16 KB;
+  `https://reach.kala.to/app/oauth/callback` in one intent filter (the `VIEW` action, the default
+  and browsable categories, the `https` scheme, the host and the path), and asks for exactly the
+  permissions the checker lists (the application's own and the ones its libraries add), so a
+  library that starts to ask for another stops the build;
+- the bundle holds the requested architectures, read from the directory names, and every loadable
+  segment of every library is aligned to 16 KB;
 - `bundletool validate` accepts it and its configuration asks for 16 KB page alignment;
-- the resource table carries the Firebase project and application of `google-services.json`;
+- the resource table carries the Firebase project and application identifiers of
+  `google-services.json`;
 - the identifier check passes on the signed file, after `pnpm android` ran its class check on the
   unsigned one.
 
@@ -88,28 +97,31 @@ that Play installs.
 1. `tauri ios build --no-sign --archive-only` archives the application and its notification
    extension. The build number goes in as the bundle version, a single integer, because `agvtool`
    writes it into every target and the store refuses more than three numbers. Tauri runs without
-   any `APPLE_*` or `IOS_*` variable in its environment. With the API key present it switches
-   signing off and leaves an archive with no entitlements, and the team prefix of the keychain
-   groups expands to nothing; with a certificate present it imports it into a keychain it makes. A
-   transient `Local.xcconfig` supplies the Firebase file and `AppIdentifierPrefix`.
+   any `APPLE_*` or `IOS_*` variable in its environment: it reads several of them before it looks
+   at `--no-sign`, and with a certificate present it imports the certificate into a keychain it
+   makes and writes its identity into the project. The archive carries no entitlements of its own,
+   and the team prefix of the keychain groups would expand to nothing, so a transient
+   `Local.xcconfig` supplies `AppIdentifierPrefix` and the Firebase file.
 2. `store-ios-sign.mjs` signs the archive ad hoc, deepest code first, with the entitlements of the
    two source files: the team's prefix in place of the placeholder, the production push
    environment and `get-task-allow` off. The signature names no certificate. It exists so that the
-   export finds the entitlements and keeps them. The extension's entitlement is its shared
-   keychain group alone.
+   export finds the entitlements and keeps them. The only keychain group of the extension is the
+   shared one.
 3. `xcodebuild -exportArchive` signs the build for the App Store, with `-allowProvisioningUpdates`
    and the API key. Xcode uses the cloud-managed Apple Distribution certificate and the App Store
    profiles of both identifiers, creating them when they do not exist. The export must leave the
    login keychain's signing identities and the keychain search list as they were, and the script
    fails when either changes.
 
-`--unsigned-archive` stops after step 2, which needs no Apple account. The build rewrites tracked
-files under `gen/apple`, so the script refuses to start when any has uncommitted changes, and
-puts the directory back when it ends, together with a `Local.xcconfig` that was there before. The
-export saves two profiles of its own, `iOS Team Store Provisioning Profile` for each identifier,
-under `~/Library/Developer/Xcode/UserData/Provisioning Profiles`, and the script removes the log
-Xcode keeps of the export in the temporary directory, since it holds request tokens made from the
-key.
+`--unsigned-archive` stops after step 2, which needs no Apple account. The build rewrites files
+under `gen/apple`, so the script refuses to start when that directory has an uncommitted change or
+a new file, or when git cannot say. It puts the directory back when it ends, together with a
+`Local.xcconfig` that was there before, and an edit made there while the build runs is lost with
+it. When it cannot put something back, the script fails, writes no receipt and names the copy it
+kept. The export saves two profiles of its own, `iOS Team Store Provisioning Profile` for each
+identifier, under `~/Library/Developer/Xcode/UserData/Provisioning Profiles`. It also writes
+request tokens made from the key into two logs, `export/Packaging.log` beside the exported build
+and a log bundle in the temporary directory, and the script removes both.
 
 `store-bundle.mjs --ios` reads the exported `.ipa`:
 
@@ -122,18 +134,30 @@ key.
 - each bundle has an App Store profile of the team with no device list, and the application's
   profile carries the production push environment;
 - the application and the extension have the same `CFBundleVersion` and `CFBundleShortVersionString`;
-- the application carries `GoogleService-Info.plist`;
+- the application carries `GoogleService-Info.plist` and says it uses encryption
+  (`ITSAppUsesNonExemptEncryption` set to true);
 - `privacy-manifest.mjs` and `debug-code.mjs` hold the exported application. The device build is the
   one that is uploaded, and it can link code the Simulator build leaves out, which is why these
-  two run on it and not on the Simulator's.
+  two run on it and not on the Simulator's. The privacy check carries one recorded exception, the
+  notification extension's import of `fstat`, which libsodium makes to confirm that
+  `/dev/urandom` is a character device (the page on the App Store privacy answers states it). The
+  check names it by the extension's executable and the symbol, prints it on every run, and fails on
+  any other use of an API Apple lists. The checker copies the printed line into the build's record.
 
-The scripts do not set `ITSAppUsesNonExemptEncryption`, so App Store Connect asks for the
-export-compliance answer for each build until `Info.plist` carries it.
+## Export compliance
+
+The owner's answer is that the application uses encryption, and only standard algorithms. The
+application's `Info.plist` therefore carries `ITSAppUsesNonExemptEncryption` set to true, in
+`project.yml` and in the generated file, and the checker refuses a build without it. App Store
+Connect then asks about the kind of encryption on the first build, and the answer is "standard
+encryption algorithms", with France not selected. Later builds use the same declaration.
 
 ## What a person does
 
-The scripts stop at a checked file. A build that failed a check leaves its files and a
-`store-build.json` whose `holds` is false, and no receipt: it is not uploaded. Uploading is separate: the first Android bundle through Play
-Console, and the iOS build with `xcrun altool --upload-app` and the same API key. The store forms,
-the testers' lists, the app-signing fingerprint and the export-compliance answer are entered in the
-stores' own consoles.
+The scripts stop at a checked file. A build that failed a check, or whose output directory held a
+secret, leaves its files and a `store-build.json` whose `holds` is false, and no receipt: it is not
+uploaded. A run that stops before its check leaves no record, and no receipt either. Uploading is
+separate: the first Android bundle through Play Console, and the iOS build with
+`xcrun altool --upload-app` and the same API key. The store forms, the testers' lists and the
+export-compliance answer to App Store Connect are entered in the stores' own consoles. The
+app-signing fingerprint goes into the web service's configuration, as above.

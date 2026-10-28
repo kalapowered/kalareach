@@ -646,10 +646,33 @@ export function sdksIn(app) {
  *
  * @returns {{ binaries: object[], declarations: object[], sdks: object[], notes: string[], problems: string[] }}
  */
-export function examine(path) {
+/**
+ * The uses this check accepts without a manifest declaration, each named by the executable that
+ * makes it and the symbol it imports, with why it has no reason in Apple's list. A use that is not
+ * named here fails, and so does one of these once its bundle ships a manifest of its own (the
+ * ordinary rules then apply to it).
+ *
+ * The notification extension links the preview library, which carries libsodium. On the phone the
+ * linker keeps libsodium's check of its random source, which calls `fstat` on `/dev/urandom` to
+ * confirm it is a character device (`randombytes_sysrandom`). Nothing in the extension reads the
+ * timestamp or size of a file in its container, so no reason of Apple's for that category is true
+ * of it, and none is declared. The Simulator build drops that code, so only a build for the phone
+ * shows the use. The application's executable has the same call, stated in the App Store privacy
+ * page beside the other use no reason covers.
+ */
+export const RECORDED_EXCEPTIONS = [
+  {
+    executable: 'PlugIns/KalaReachNotificationService.appex/KalaReachNotificationService',
+    api: 'fstat',
+    reason: "libsodium's check that /dev/urandom is a character device; no reason in Apple's list matches it"
+  }
+]
+
+export function examine(path, exceptions = RECORDED_EXCEPTIONS) {
   const app = resolve(path)
   const problems = []
   const notes = []
+  const recorded = []
   const binaries = []
   const declarations = []
   const manifests = new Map()
@@ -728,6 +751,11 @@ export function examine(path) {
       const name = relative(app, binary.file)
       for (const [api, categories] of binary.uses) {
         for (const category of categories) used.add(category)
+        const known = manifest.present ? undefined : exceptions.find((each) => each.executable === name && each.api === api)
+        if (known) {
+          recorded.push(`${name} uses ${categories.join(' or ')} (${api}): ${known.reason}`)
+          continue
+        }
         if (!categories.some((category) => manifest.declared.has(category))) {
           const need = categories.length > 1 ? `${categories.join(' or ')}` : categories[0]
           problems.push(
@@ -770,7 +798,7 @@ export function examine(path) {
   for (const sdk of sdks) {
     if (!sdk.ships) problems.push(`${sdk.container} is ${sdk.sdk}, which Apple lists as needing a privacy manifest, and ships none`)
   }
-  return { binaries, declarations, sdks, notes, problems }
+  return { binaries, declarations, sdks, notes, problems, recorded }
 }
 
 // -- the command ---------------------------------------------------------------------------------
@@ -812,6 +840,7 @@ export function report(app, result) {
     console.log(`${result.notes.length} note${result.notes.length === 1 ? '' : 's'} (not failures):`)
     for (const note of result.notes) console.log(`  ${note}`)
   }
+  for (const each of result.recorded) console.log(`recorded exception: ${each}`)
   if (result.problems.length === 0) {
     console.log('every category the product uses is declared, and every declaration is used')
     return true

@@ -16,7 +16,7 @@
 # command line, nor in the environment, nor in a log, nor in the build's long-lived process.
 # Push needs the Firebase configuration of the application: `firebase-apps/google-services.json`
 # in the same directory (`KR_GOOGLE_SERVICES_JSON` names another). It goes into the bundle as the
-# application's configuration and nowhere else.
+# application's configuration, and the build directories keep a copy as they do of every resource.
 #
 # The version is `version` in `tauri.conf.json`. The build number is the whole minutes since
 # 2026-10-01T00:00Z, and it must be above the one the receipt for this platform holds, so it is the
@@ -196,11 +196,13 @@ if [ "$mode" = device ]; then
     done
     "$adb" -s "$serial" exec-out screencap -p >"$shots/store-launch-$version_code.png" 2>/dev/null
     "$adb" -s "$serial" logcat -d -b crash >"$leg/crash.log" 2>&1
+    pid_after="$("$adb" -s "$serial" shell pidof "$app_id" 2>/dev/null | tr -d '\r')"
+    [ "$pid_after" = "$pid" ] || pid=""
     "$adb" -s "$serial" logcat -d 2>/dev/null | grep -v -E 'CompositionEngine|AccessibilityNodeInfoDumper' | tail -3000 >"$leg/logcat.log"
     "$adb" -s "$serial" shell pm get-app-links "$app_id" >"$leg/app-links.txt" 2>&1
     "$adb" -s "$serial" shell dumpsys package "$app_id" 2>/dev/null | grep -E 'versionCode|versionName|signatures|targetSdk' >"$leg/package.txt"
     if [ -n "$pid" ]; then
-        say "check=the store-signed application starts and is running ok=1 detail=pid $pid"
+        say "check=the store-signed application starts, is on top and is still running after the logs were read ok=1 detail=pid $pid"
     else
         say "check=the store-signed application starts and is running ok=0 detail=$(tr '\n' ' ' <"$leg/am-start.txt" | cut -c1-200)"
         status=2
@@ -252,7 +254,15 @@ ndk="$sdk/ndk/$ndk_version"
 version="$(kr_store_version "$here")" || exit 2
 number="$(kr_store_number android "$number_given")" || exit 2
 out="$KR_STORE_ROOT/$version-$number"
+kr_store_claim_number android "$number" || exit 2
 kr_store_claim "$out" || exit 2
+# However the run ends, its output directory is searched for the password's text and for signed
+# tokens; a run that got to its check has been held to that search already.
+final_scan() {
+    node "$companion/scripts/store-bundle.mjs" --scan-dir "$out" --secret-file "$password_file" >>"$out/scan.log" 2>&1 \
+        || kr_store_say "the password's text, or a signed token, is in $out (see $out/scan.log); nothing in it is to be uploaded"
+}
+trap final_scan EXIT
 kr_store_say "version $version, build number $number, into $out"
 
 # The shell's own NDK may be an older one: a release linked by it would not be laid out for 16 KB
@@ -282,7 +292,7 @@ commit="$(git -C "$here" rev-parse HEAD)"
 dirty=false
 [ -z "$(git -C "$here" status --porcelain --untracked-files=no)" ] || dirty=true
 node "$companion/scripts/store-bundle.mjs" --android "$signed" --version-code "$number" --version-name "$version" \
-    --certificate "$certificate" --secret-file "$password_file" --bundletool "$bundletool" --firebase "$firebase" \
+    --certificate "$certificate" --secret-file "$password_file" --scan-dir "$out" --bundletool "$bundletool" --firebase "$firebase" \
     --record "$out/store-build.json" \
     --note "commit=$commit" --note "uncommittedChanges=$dirty" --note "ndk=$ndk_version" \
     --note "abis=arm64-v8a,x86_64" --note "builtAt=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -291,9 +301,7 @@ node "$companion/scripts/store-bundle.mjs" --android "$signed" --version-code "$
     2>&1 | tee "$out/check.log"
 checked=${PIPESTATUS[0]}
 rm -f -- "${marker:?}"
-node "$companion/scripts/store-bundle.mjs" --scan-dir "$out" --secret-file "$password_file" 2>&1 | tee -a "$out/check.log"
-scanned=${PIPESTATUS[0]}
-[ "$checked" = 0 ] && [ "$scanned" = 0 ] || { kr_store_say "the bundle does not hold; no build number was recorded as built, and $out/store-build.json is not to be uploaded"; exit 2; }
+[ "$checked" = 0 ] || { kr_store_say "the bundle does not hold; no build number was recorded as built, and what is in $out is not to be uploaded"; exit 2; }
 
 kr_store_receipt android "$number" || { kr_store_say "the build number could not be recorded"; exit 2; }
 kr_store_say "built and checked: $signed"

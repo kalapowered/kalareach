@@ -420,6 +420,15 @@ if (toolchain) {
     int fx_free(void) { struct statfs s; return statfs("/", &s); }
   `
   const EXT = `int main(void) { return 0; }`
+  const FSTAT_ONLY = `
+    #include <sys/stat.h>
+    int main(void) { struct stat s; return fstat(0, &s); }
+  `
+  const FSTAT_AND_STAT = `
+    #include <sys/stat.h>
+    int main(void) { struct stat s; return fstat(0, &s) + stat("/", &s); }
+  `
+  const NAMED = [{ executable: 'PlugIns/Ext.appex/Ext', api: 'fstat', reason: 'a named use' }]
   const ATTR = `
     #include <unistd.h>
     #include <sys/attr.h>
@@ -559,6 +568,23 @@ if (toolchain) {
     'a framework with no manifest at all fails, saying so',
     examine(bundle('framework-none', { app: whole, framework: null })).problems,
     ['and the manifest of Frameworks/Lib.framework is missing']
+  )
+  const fstatOnly = examine(bundle('extension-fstat', { app: whole, framework: library_manifest, extension: { source: FSTAT_ONLY } }), NAMED)
+  held('a named use of an extension with no manifest is recorded and is no problem', '0 problems, 1 recorded', `${fstatOnly.problems.length} problems, ${fstatOnly.recorded.length} recorded`)
+  heldProblems(
+    'the same use fails when it is not named',
+    examine(bundle('extension-fstat-unnamed', { app: whole, framework: library_manifest, extension: { source: FSTAT_ONLY } }), []).problems,
+    ['Ext uses FileTimestamp (fstat)']
+  )
+  heldProblems(
+    'another API of the same executable still fails beside a named one',
+    examine(bundle('extension-fstat-stat', { app: whole, framework: library_manifest, extension: { source: FSTAT_AND_STAT } }), NAMED).problems,
+    ['Ext uses FileTimestamp (stat)']
+  )
+  heldProblems(
+    'the project default names no executable of this fixture',
+    examine(bundle('extension-fstat-default', { app: whole, framework: library_manifest, extension: { source: FSTAT_ONLY } })).problems,
+    ['Ext uses FileTimestamp (fstat)']
   )
   heldProblems(
     'an extension that uses a category and has no manifest fails',
