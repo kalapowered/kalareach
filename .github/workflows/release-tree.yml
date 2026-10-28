@@ -16,11 +16,13 @@ name: release-tree
 #
 # On macOS the tree is signed ad hoc before its manifest is written, since a signature changes the
 # bytes a manifest covers, and each file is held to it. The plugin host, which runs Wasmtime, is
-# signed with the hardened runtime and the one entitlement a Developer ID release gives it, and the
-# "Show what the plugin host's entitlement is for" step shows both halves on each macOS target:
-# without the entitlement a program that makes code at run time is ended, and with it the same
-# program runs. An ad hoc signature has no team, so the other programs carry no hardened runtime,
-# which a Developer ID signature does.
+# signed with the hardened runtime and the one entitlement a Developer ID release gives it. The
+# "Show what the plugin host's entitlement is for" step shows, on a macOS target whose machine
+# enforces the hardened runtime, that a program that makes code at run time is ended without the
+# entitlement and runs with it. A hosted runner that is a virtual machine may not enforce it: the step
+# before finds out, and the step is then skipped with a warning, since it would show nothing. An ad hoc
+# signature has no team, so the other programs carry no hardened runtime, which a Developer ID
+# signature does.
 #
 # Each run keeps the tree of each target as it was before this run's signature was put on it, for
 # three days. A release is made from those trees by the steps that follow, none of which is in this
@@ -203,6 +205,19 @@ jobs:
       - name: Build the release tool
         run: cargo build --locked --release -p kr-release
 
+      - name: Find out whether this machine enforces the hardened runtime
+        id: enforce
+        if: runner.os == 'macOS'
+        run: |
+          if bash scripts/check-plugin-host-entitlement.sh --probe; then
+            echo "enforced=true" >> "$GITHUB_OUTPUT"
+          else
+            status=$?
+            [ "$status" -eq 10 ] || exit "$status"
+            echo "enforced=false" >> "$GITHUB_OUTPUT"
+            echo "The hardened runtime is not enforced on this runner, so the plugin host's entitlement is not shown here." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       # The plugin host runs Wasmtime, which writes machine code into memory and makes it
       # executable, and the hardened runtime ends a process that does so unless it holds
       # `com.apple.security.cs.allow-unsigned-executable-memory`. The test executable that compiles
@@ -211,7 +226,7 @@ jobs:
       # and the plugin host's one entitlement it succeeds. The plugin host's own `service` suite is
       # then run against the plugin host signed the same three ways.
       - name: Show what the plugin host's entitlement is for
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && steps.enforce.outputs.enforced == 'true'
         run: |
           rustup target add wasm32-wasip2
           bash scripts/build-plugin-fixtures.sh

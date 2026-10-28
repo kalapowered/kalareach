@@ -168,18 +168,24 @@ jobs:
             top="kalareach-$target-$RELEASE"
             out="$RUNNER_TEMP/to-seal/$target"
             mkdir -p "$out" "$RUNNER_TEMP/look"
+            # The tree the run built, by the digest GitHub holds for its artefact and the sum beside it.
+            line="$(grep " unsigned-$top " "$RUNNER_TEMP/artifacts")"
+            read -r id name expired digest <<< "$line"
+            [ "$expired" = false ] || { echo "::error::$name has expired"; exit 1; }
+            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > "$RUNNER_TEMP/$target.zip"
+            [ "sha256:$(sha256sum "$RUNNER_TEMP/$target.zip" | cut -d' ' -f1)" = "$digest" ] || { echo "::error::$name is not the artefact GitHub holds the digest of"; exit 1; }
+            unzip -q "$RUNNER_TEMP/$target.zip" -d "$RUNNER_TEMP/$target-unzipped"
+            (cd "$RUNNER_TEMP/$target-unzipped" && sha256sum -c "$top.tar.sha256")
             case "$target" in
               *-apple-darwin)
+                # The signed tree is the run's tree with its programs signed: the manifest of the one is
+                # the manifest of the other, since nothing signs release.json before it is sealed.
                 cp "$RUNNER_TEMP/staged-files/signed-$top.tar" "$out/$top.tar"
+                tar -xOf "$RUNNER_TEMP/$target-unzipped/$top.tar" "$top/release.json" > "$RUNNER_TEMP/$target.run-release.json"
+                tar -xOf "$out/$top.tar" "$top/release.json" > "$RUNNER_TEMP/$target.staged-release.json"
+                cmp "$RUNNER_TEMP/$target.run-release.json" "$RUNNER_TEMP/$target.staged-release.json" || { echo "::error::the staged tree of $target is not made from the tree the run built: the manifests differ"; exit 1; }
                 ;;
               *)
-                line="$(grep " unsigned-$top " "$RUNNER_TEMP/artifacts")"
-                read -r id name expired digest <<< "$line"
-                [ "$expired" = false ] || { echo "::error::$name has expired"; exit 1; }
-                gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > "$RUNNER_TEMP/$target.zip"
-                [ "sha256:$(sha256sum "$RUNNER_TEMP/$target.zip" | cut -d' ' -f1)" = "$digest" ] || { echo "::error::$name is not the artefact GitHub holds the digest of"; exit 1; }
-                unzip -q "$RUNNER_TEMP/$target.zip" -d "$RUNNER_TEMP/$target-unzipped"
-                (cd "$RUNNER_TEMP/$target-unzipped" && sha256sum -c "$top.tar.sha256")
                 cp "$RUNNER_TEMP/$target-unzipped/$top.tar" "$out/$top.tar"
                 ;;
             esac
@@ -301,7 +307,7 @@ jobs:
 
       - name: Name the plugins commit the bundled catalogue was taken from
         id: plugins
-        run: echo "commit=$(python3 -c 'import json; print(json.load(open("bundled-plugins.lock"))["source"]["commit"])')" >> "$GITHUB_OUTPUT"
+        run: echo "commit=$(python3 -I -c 'import json; print(json.load(open("bundled-plugins.lock"))["source"]["commit"])')" >> "$GITHUB_OUTPUT"
 
       - name: Check out the plugins repository at that commit
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
