@@ -487,6 +487,15 @@ impl Held {
             .is_some_and(|default| same_value(value, default))
     }
 
+    /// Whether every key of the profile that kr did not write is at its default: a font or a colour
+    /// the person set is theirs, and a profile that holds one is not kr's to write over or take out.
+    fn others_unset(&self, kr_keys: &[RecordedKey]) -> bool {
+        self.values
+            .iter()
+            .filter(|(key, _)| !kr_keys.iter().any(|written| written.key == *key))
+            .all(|(key, value)| self.is_unset(key, value))
+    }
+
     /// The value the key held when this was read, or `None` where it was not set.
     fn was(&self, key: &str) -> Option<&str> {
         self.value(key).filter(|value| !self.is_unset(key, value))
@@ -589,6 +598,13 @@ pub(super) fn write(plan: &SettingsPlan) -> Result<(), (ProfileError, bool)> {
         if !kept {
             return Err((changed(), false));
         }
+    }
+    // A key kr does not write that the person set (a font, a colour) makes the profile theirs: it
+    // is read again just before the first key is set, and either read finding one stops the write.
+    let again = Held::of(gsettings, spec, &plan.wrote.schema, &plan.wrote.path)
+        .map_err(|error| (error, false))?;
+    if !held.others_unset(&plan.wrote.keys) || !again.others_unset(&plan.wrote.keys) {
+        return Err((changed(), false));
     }
     // Puts back the keys written so far, and says whether each is back (see `Held::restore`). A key
     // that cannot be put back does not stop the others.
@@ -838,17 +854,44 @@ pub(super) fn take_out(
     let known = known_values(wrote);
     let held = Held::of(gsettings, &spec, &wrote.schema, &wrote.path)?;
     let ours = |key: &str, value: &str| held.is_kr_s(key, value, &known, None);
-    if wrote.keys.iter().any(|key| {
-        !held
-            .value(&key.key)
-            .is_some_and(|value| ours(&key.key, value))
-    }) {
+    // Every key of the profile is read, not only the three kr wrote: a font or a colour the person
+    // set makes the profile theirs.
+    if !held.others_unset(&wrote.keys)
+        || wrote.keys.iter().any(|key| {
+            !held
+                .value(&key.key)
+                .is_some_and(|value| ours(&key.key, value))
+        })
+    {
         return Ok(TakenOut::Changed);
     }
     // The list first: a profile out of the list and with its keys set is invisible, where one in
     // the list with its keys reset would be shown unnamed.
     change_list(gsettings, &spec, &wrote.list.member, false)?;
     let mut reset: Vec<&RecordedKey> = Vec::new();
+    // Puts back what this removal changed so far: the keys it reset, and the place in the list if
+    // the profile was in it. A key that holds something the person put there is left (see
+    // `Held::restore`). Says whether everything is back.
+    let put_back = |reset: &[&RecordedKey]| {
+        let mut back = true;
+        for earlier in reset {
+            back &= held.restore(gsettings, &target, &earlier.key, None);
+        }
+        if in_list {
+            back &= change_list(gsettings, &spec, &wrote.list.member, true).is_ok();
+        }
+        back
+    };
+    // The profile is read again now that it is out of the list: a key kr does not write that the
+    // person set since the first read makes it theirs.
+    let again = Held::of(gsettings, &spec, &wrote.schema, &wrote.path)?;
+    if !again.others_unset(&wrote.keys) {
+        return if put_back(&reset) {
+            Ok(TakenOut::Changed)
+        } else {
+            Err(ProfileError::Changing(spec.terminal))
+        };
+    }
     for key in &wrote.keys {
         let now = gsettings
             .get(&target, &key.key)
@@ -857,14 +900,7 @@ pub(super) fn take_out(
             // The person changed this key since the read above. The profile is theirs now, so the
             // profile goes back as it was: its place in the list, and the keys already reset. Only
             // when it is back is it left, with nothing recorded.
-            let mut back = true;
-            for earlier in &reset {
-                back &= held.restore(gsettings, &target, &earlier.key, None);
-            }
-            if in_list {
-                back &= change_list(gsettings, &spec, &wrote.list.member, true).is_ok();
-            }
-            return if back {
+            return if put_back(&reset) {
                 Ok(TakenOut::Changed)
             } else {
                 Err(ProfileError::Changing(spec.terminal))
@@ -877,12 +913,25 @@ pub(super) fn take_out(
         let after = gsettings
             .get(&target, &key.key)
             .map_err(|failure| tool(failure, &spec))?;
-        if !held
+        if held
             .default(&key.key)
             .is_some_and(|default| same_value(&after, default))
         {
+            continue;
+        }
+        // Not the default after a reset: either the reset was not kept (the key still holds what
+        // it held), or another writer set it since. The first is a settings service that does not
+        // keep its resets; the second is the person's edit, which is left, with what this removal
+        // changed put back, and the record kept.
+        let unkept = held
+            .value(&key.key)
+            .is_some_and(|value| same_value(&after, value));
+        if unkept {
             return Err(ProfileError::NotPersisted(spec.terminal));
         }
+        reset.pop();
+        put_back(&reset);
+        return Err(ProfileError::Changing(spec.terminal));
     }
     Ok(TakenOut::Removed)
 }
