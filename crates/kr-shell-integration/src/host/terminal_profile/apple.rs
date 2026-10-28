@@ -731,41 +731,45 @@ mod tests {
     #[test]
     fn a_default_profile_with_a_dot_in_its_name_is_the_one_copied() {
         let (directory, domain) = scratch("dotted");
-        put_profile(&domain, "Work.Dark", &profile_of("Work.Dark", "dotted"));
-        run_ok(
-            DEFAULTS,
-            &["write", &domain, DEFAULT_PROFILE, "-string", " Work.Dark"],
-            b"",
+        // The profiles are written into the file whole: `defaults` itself reads a backslash in the
+        // name it is given as an escape, which Terminal's own names do not.
+        let names = [" Work.Dark", "Work.Dark", "p\\q", "m\\.n", "a.b\\c"];
+        let profiles: String = names
+            .iter()
+            .map(|name| format!("<key>{name}</key>{}", profile_of(name, "found")))
+            .collect();
+        std::fs::write(
+            format!("{domain}.plist"),
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>Default Window Settings</key><string> Work.Dark</string>
+<key>Window Settings</key><dict>
+<key>Basic</key><dict><key>name</key><string>Basic</string></dict>{profiles}</dict></dict></plist>"#
+            ),
         )
-        .expect("a default");
-        put_profile(&domain, " Work.Dark", &profile_of(" Work.Dark", "spaced"));
+        .expect("preferences");
         let mut home = ProfileHome::under(&directory, Vec::new());
-        home.terminal_preferences = domain;
+        home.terminal_preferences = domain.clone();
         let plan = plan(&home, "kr new --attach --hold-on-failure", None).expect("a plan");
-        assert!(plan.entry.contains("spaced"), "{}", plan.entry);
+        assert!(
+            plan.entry.contains("found") && plan.entry.contains("KalaReach"),
+            "the default's own profile is the one copied, not Basic: {}",
+            plan.entry
+        );
         // `plutil` reads `\.` as a dot of the name and every other backslash as itself.
         assert_eq!(entry_path("a.b\\c"), "Window Settings.a\\.b\\c");
-        for name in ["p\\q", "m\\.n", "a.b\\c"] {
-            put_profile(&home.terminal_preferences, name, &profile_of(name, "found"));
-            let exported = export(&home.terminal_preferences).expect("exports");
+        let exported = export(&domain).expect("exports");
+        for name in names {
             let found = entry(&exported, &entry_path(name)).expect("reads");
             assert!(
                 found.is_some_and(|text| String::from_utf8_lossy(&text).contains("found")),
                 "{name}"
             );
         }
-        assert_eq!(
-            current_entry(&home.terminal_preferences).expect("reads"),
-            None
-        );
-        put_profile(
-            &home.terminal_preferences,
-            PROFILE_NAME,
-            &profile_of(PROFILE_NAME, "now"),
-        );
-        let now = current_entry(&home.terminal_preferences)
-            .expect("reads")
-            .expect("there");
+        assert_eq!(current_entry(&domain).expect("reads"), None);
+        put_profile(&domain, PROFILE_NAME, &profile_of(PROFILE_NAME, "now"));
+        let now = current_entry(&domain).expect("reads").expect("there");
         assert!(now.contains("now"), "{now}");
         let _ = std::fs::remove_dir_all(directory);
     }
