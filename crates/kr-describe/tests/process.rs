@@ -725,6 +725,20 @@ impl Model for Recording {
     }
 }
 
+/// What the system reports of the background class this process holds, where this process is what
+/// holds one: the process's priority class and I/O class on Windows, its disk policy on macOS, and
+/// on Linux the I/O class of the calling thread, which a server run on another thread leaves alone.
+fn classes() -> impl PartialEq + std::fmt::Debug {
+    #[cfg(windows)]
+    {
+        kr_ipc::background::process_class()
+    }
+    #[cfg(not(windows))]
+    {
+        kr_ipc::background::io_class()
+    }
+}
+
 /// KR-REQ-22.10: a job runs with the thread count and bounds it was sent and with the sampler of
 /// the profile the process loaded.
 #[test]
@@ -743,6 +757,11 @@ fn a_job_runs_with_the_limits_sent_and_the_loaded_profiles_sampler() {
     }
     let recording = Recording::default();
     let runtime = tempfile::tempdir().expect("a directory on the internal disk");
+    // The server runs inside this process, and on macOS and Windows the background class its model
+    // thread takes is the whole process's, which every later case of this binary would run in. So
+    // the case notes the class it found and puts it back where it was.
+    let found = classes();
+    let saved = kr_ipc::background::save();
     let serving = {
         let recording = recording.clone();
         let output = Shared(output.clone());
@@ -772,7 +791,14 @@ fn a_job_runs_with_the_limits_sent_and_the_loaded_profiles_sampler() {
         std::thread::sleep(Duration::from_millis(5));
     }
     drop(write);
-    assert_eq!(serving.join().expect("the serving thread"), Exit::Ended);
+    let ended = serving.join().expect("the serving thread");
+    saved.restore().expect("the class is put back");
+    assert_eq!(
+        classes(),
+        found,
+        "the process is left in the class it found"
+    );
+    assert_eq!(ended, Exit::Ended);
     let recorded = recording.0.lock().expect("the record").clone();
     assert_eq!(
         recorded,
