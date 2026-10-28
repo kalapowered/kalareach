@@ -44,8 +44,8 @@
 # requires.
 #
 # The build number is recorded only for a build that passed every check. A failed one leaves its
-# files and a `store-build.json` whose `holds` is false: that file is not to be uploaded.
-# Nothing is uploaded by this script. A build is a heavy step:
+# files, and a failed check leaves a `store-build.json` whose `holds` is false: none of it is to be
+# uploaded, and only a receipt marks a build that passed every step. Nothing is uploaded by this script. A build is a heavy step:
 #
 #   bash lead-scripts/with-slot.sh <label> scripts/store-ios.sh
 #
@@ -211,7 +211,7 @@ PLIST
         kr_store_say "the login keychain's identities or the search list changed during the export (see $out/keychain-*.txt); stopping"
         return 2
     fi
-    [ "$exported" = 0 ] || { kr_store_say "the export failed (see $out/export.log)"; tail -20 "$out/export.log" | sed 's/^/    /'; return 2; }
+    [ "$exported" = 0 ] || { kr_store_say "the export failed (see $out/export.log)"; tail -20 "$out/export.log" | grep -v -E 'eyJ[A-Za-z0-9_-]{8,}\.eyJ' | sed 's/^/    /'; return 2; }
     ipa="$(find "$out/export" -maxdepth 1 -name '*.ipa' | head -1)"
     [ -f "$ipa" ] || { kr_store_say "the export left no .ipa in $out/export"; return 2; }
 
@@ -225,6 +225,7 @@ build
 status=$?
 
 # However the build ended, the run's debts are paid; a failure of any of them fails the script.
+trap '' INT TERM HUP
 finish || status=2
 trap - INT TERM HUP
 if [ "$status" != 0 ]; then
