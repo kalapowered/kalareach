@@ -926,8 +926,8 @@ pub fn remove(
             }
             match reading {
                 gsettings::Reading::Gone => Removed::AlreadyGone,
-                gsettings::Reading::Unchanged { .. } => {
-                    match gsettings::take_out(&home.settings, spec, wrote)? {
+                gsettings::Reading::Unchanged { in_list } => {
+                    match gsettings::take_out(&home.settings, spec, wrote, in_list)? {
                         gsettings::TakenOut::Removed => Removed::Removed,
                         gsettings::TakenOut::Changed => Removed::Changed {
                             left_at: wrote.path.clone(),
