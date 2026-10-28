@@ -91,7 +91,7 @@ if [ "$mode" = device ]; then
     : >"$log"
     say() { kr_store_say "$*" | tee -a "$log"; }
 
-    tools="$(ls -d "$sdk"/build-tools/* 2>/dev/null | sort -V | tail -1)"
+    tools="$(find "$sdk/build-tools" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -1)"
     [ -x "$tools/zipalign" ] && [ -x "$tools/apksigner" ] || { say "no build tools with zipalign and apksigner"; exit 2; }
     adb="${KR_ADB:-$sdk/platform-tools/adb}"
     [ -x "$adb" ] || { say "no adb at $adb"; exit 3; }
