@@ -18,7 +18,7 @@ use kr_shell_integration::host::terminal_profile::record::{
     PROFILE_WRITTEN, ProfileRecord, RecordError, Wrote,
 };
 use kr_shell_integration::host::terminal_profile::{
-    Place, ProfileError, ProfileHome, ProfileTerminal, Removed, Standing,
+    HomeError, Place, ProfileError, ProfileHome, ProfileTerminal, Removed, Standing,
 };
 
 use crate::cli::{
@@ -81,10 +81,16 @@ pub fn run(
 
 /// The places this person's terminal applications keep their profiles in.
 fn this_user() -> Result<ProfileHome> {
-    ProfileHome::of_this_user().ok_or_else(|| {
-        CliError::Usage(Shown::said(
-            "there is no home directory to find a terminal application's profiles in",
-        ))
+    ProfileHome::of_this_user().map_err(|error| {
+        CliError::Usage(Shown::said(match error {
+            HomeError::NoHome => {
+                "there is no home directory to find a terminal application's profiles in"
+            }
+            HomeError::PreferencesDirectory => {
+                "KR_TERMINAL_PREFERENCES_DIR must be an absolute directory inside the home this \
+                 run uses; it is empty, relative or outside it, and nothing was read or written"
+            }
+        }))
     })
 }
 
@@ -860,6 +866,12 @@ fn failure(error: &ProfileError, home: &ProfileHome) -> CliError {
             "Konsole expands a $ and a leading ~ in a profile's command, so it cannot run {}; \
              nothing was written",
             Shown::root(word)
+        )),
+        ProfileError::Outside(terminal) => CliError::Usage(shown!(
+            "the record names {}'s profile outside the home this run is confined to \
+             (KR_TERMINAL_PREFERENCES_DIR is set), so it was left alone and nothing was written; \
+             run this without the variable to work on it",
+            Shown::said(terminal.name())
         )),
         ProfileError::RecordedElsewhere { terminal, recorded } => CliError::Usage(shown!(
             "the record names {}'s profile at {}, not where this install writes it; run kr host \
