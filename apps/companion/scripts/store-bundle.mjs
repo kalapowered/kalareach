@@ -365,6 +365,21 @@ export function withheldIfSecret(message, needles) {
 }
 
 /**
+ * The text of a build's record and its problems. A record that would quote a secret or a signed
+ * token is replaced by one that holds only the identity of the bundle and says why, and that is a
+ * problem of its own, so the build does not hold.
+ */
+export function recordOf({ identity, problems, facts, notes }, needles) {
+  const safe = (value) => (typeof value === 'string' ? withheldIfSecret(value, needles) : value)
+  const named = { ...identity, file: safe(identity.file), versionName: safe(identity.versionName) }
+  const text = (holds, list, rest) => `${JSON.stringify({ ...named, holds, problems: list, ...rest }, null, 2)}\n`
+  const whole = text(problems.length === 0, problems, { ...facts, ...notes })
+  if (!holdsSecret(Buffer.from(whole, 'utf8'), needles)) return { problems, text: whole }
+  const withheld = 'the details are withheld: the record quotes a secret file'
+  return { problems: [...problems, withheld], text: text(false, [withheld], {}) }
+}
+
+/**
  * The text of a failure, for a log: an error from reading a bundle or a directory can quote a name
  * or a value out of it, so it goes through the same filter as every other message. A secret file
  * that cannot be read cannot be quoted, and the message then stands as it is.
@@ -794,11 +809,11 @@ if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) 
     }
     if (found > 0) result = secretFirst(found)
   }
-  const shown = relative(process.cwd(), options.path)
   // A problem can quote a name or a value out of the bundle, so each goes through the same filter as
   // every other message before it reaches the terminal or the record.
   const quotable = quotableNeedles(options.secretFiles)
-  const problems = [...new Set(result.problems.map((each) => withheldIfSecret(each, quotable)))]
+  const shown = withheldIfSecret(relative(process.cwd(), options.path), quotable)
+  let problems = [...new Set(result.problems.map((each) => withheldIfSecret(each, quotable)))]
   if (options.record) {
     const stats = statSync(options.path)
     const identity = {
@@ -810,11 +825,9 @@ if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) 
       bytes: stats.size,
       sha256: stats.isFile() ? sha256(options.path) : null
     }
-    let text = `${JSON.stringify({ ...identity, holds: problems.length === 0, problems, ...result.facts, ...options.notes }, null, 2)}\n`
-    if (holdsSecret(Buffer.from(text, 'utf8'), quotable)) {
-      text = `${JSON.stringify({ ...identity, holds: false, problems: ['the details are withheld: the record quotes a secret file'] }, null, 2)}\n`
-    }
-    writeFileSync(options.record, text)
+    const made = recordOf({ identity, problems, facts: result.facts, notes: options.notes }, quotable)
+    problems = made.problems
+    writeFileSync(options.record, made.text)
   }
   if (problems.length > 0) {
     console.error(`${shown}:\n${problems.map((each) => `  ${each}`).join('\n')}`)

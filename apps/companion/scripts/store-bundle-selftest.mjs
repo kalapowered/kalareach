@@ -43,6 +43,7 @@ import {
   problemsInSignature,
   problemsInVersions,
   profileFromXml,
+  recordOf,
   secretNeedles,
   signerOf
 } from './store-bundle.mjs'
@@ -235,6 +236,20 @@ held('an error message that quotes a signed token is withheld too', false, withh
   const secretFile = join(work, 'unreadable-secret'); writeFileSync(secretFile, 'correct-horse-battery-staple\n')
   const scan = spawnSync(process.execPath, [join(import.meta.dirname, 'store-bundle.mjs'), '--scan-dir', scanned, '--secret-file', secretFile], { encoding: 'utf8' })
   held('a directory scan that fails prints nothing of the secret it was looking for', [2, false], [scan.status, `${scan.stdout}${scan.stderr}`.includes('correct-horse-battery-staple')])
+}
+{
+  const needles = secretNeedles(Buffer.from('correct-horse-battery-staple\n'))
+  const identity = { file: 'KalaReach.ipa', platform: 'ios', stage: 'export', versionName: '0.1.0', versionCode: 1, bytes: 1, sha256: 'ab' }
+  const clean = recordOf({ identity, problems: [], facts: { pushEnvironment: 'production' }, notes: { commit: 'abc' } }, needles)
+  held('a record that quotes nothing secret is kept as it is', [0, true], [clean.problems.length, JSON.parse(clean.text).holds])
+  for (const [what, parts] of [
+    ['a note', { notes: { leak: TOKEN } }],
+    ['a fact', { facts: { leak: 'correct-horse-battery-staple' } }]
+  ]) {
+    const made = recordOf({ identity, problems: [], facts: {}, notes: {}, ...parts }, needles)
+    held(`a record that quotes a secret in ${what} is replaced, and the build does not hold`, [1, false, false], [made.problems.length, JSON.parse(made.text).holds, /correct-horse-battery-staple|eyJ/.test(made.text)])
+  }
+  held('a file name that quotes a secret never reaches the record', false, recordOf({ identity: { ...identity, file: 'correct-horse-battery-staple.ipa' }, problems: [], facts: {}, notes: {} }, needles).text.includes('correct-horse-battery-staple'))
 }
 held('a directory with a secret in a log is found, and a clean one is not', [1, 0], (() => {
   const dirty = join(work, 'dirty'); mkdirSync(dirty); writeFileSync(join(dirty, 'run.log'), 'x correct-horse-battery-staple y')
@@ -574,7 +589,7 @@ const lockCase = (holder) => {
   mkdirSync(join(base, 'receipts'), { recursive: true })
   const file = join(base, 'receipts', 'ios.flock')
   const script = `${holder.replaceAll('$FILE', `"${file}"`)}; kr_store_receipt ios 39900; echo "status=$?"; [ -z "\${holder:-}" ] || kill -9 "$holder" 2>/dev/null; true`
-  const answer = shell(script, { KR_STORE_ROOT: base, KR_STORE_LOCK_WAIT: '2' })
+  const answer = shell(script, { KR_STORE_ROOT: base, KR_STORE_LOCK_WAIT: '0' })
   let receipt = 'none'
   try { receipt = readFileSync(join(base, 'receipts', 'ios'), 'utf8').trim() } catch { /* no receipt */ }
   return { text: answer.stdout.trim().split('\n').pop(), receipt }
@@ -582,9 +597,11 @@ const lockCase = (holder) => {
 // The holder takes the lock in a shell of its own, then becomes `sleep`, so killing it ends the lock.
 const holding = '( exec 8>>$FILE; lockf -s -t 0 8 && : >$FILE.ready; exec sleep 30 ) & holder=$!; until [ -e $FILE.ready ]; do sleep 0.1; done'
 const held_ = lockCase(holding)
-held('a lock that another run holds is waited for, and then refused with no receipt', ['status=2', 'none'], [held_.text, held_.receipt])
-const killed = lockCase(`${holding}; kill -9 $holder; wait $holder 2>/dev/null`)
-held('a lock whose holder was killed is free at once', ['status=0', '39900'], [killed.text, killed.receipt])
+held('a lock that another run holds is refused, and no receipt is written', ['status=2', 'none'], [held_.text, held_.receipt])
+const killed = lockCase(`${holding}; kill -9 $holder; wait $holder 2>/dev/null; holder=`)
+held('a lock whose holder was killed is free at once (the kernel releases it)', ['status=0', '39900'], [killed.text, killed.receipt])
+const badWait = shell('kr_store_receipt ios 39900', { KR_STORE_ROOT: join(work, 'bad-wait'), KR_STORE_LOCK_WAIT: '1.5' })
+held('a wait that is not a whole number of seconds is refused', 2, badWait.status)
 const free = lockCase('true')
 held('a lock nobody holds is taken', ['status=0', '39900'], [free.text, free.receipt])
 

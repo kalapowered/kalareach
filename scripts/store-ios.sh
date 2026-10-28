@@ -45,7 +45,8 @@
 #
 # The build number is recorded only for a build that passed every check. A failed one leaves its
 # files, and a failed check leaves a `store-build.json` whose `holds` is false: none of it is to be
-# uploaded, and only a receipt marks a build that passed every step. Nothing is uploaded by this script. A build is a heavy step:
+# uploaded. The receipt holds the highest number whose build passed every step of this script.
+# Nothing is uploaded by this script. A build is a heavy step:
 #
 #   bash lead-scripts/with-slot.sh <label> scripts/store-ios.sh
 #
@@ -167,7 +168,7 @@ build() {
         if node "$companion/scripts/$each.mjs" "$app" >"$out/archive-$each.log" 2>&1; then
             kr_store_say "the archive's $each check holds"
         else
-            kr_store_say "the archive's $each check FAILS (the exported build is held to it): $(grep -E 'uses|problem|missing|declares' "$out/archive-$each.log" | head -3 | tr '\n' ' ' | cut -c1-300)"
+            kr_store_say "the archive's $each check FAILS (the exported build is held to it; see $out/archive-$each.log)"
         fi
     done
     if [ "$archive_only" = 1 ]; then
@@ -206,12 +207,14 @@ PLIST
         -authenticationKeyIssuerID "$issuer" >"$out/export.log" 2>&1
     local exported=$?
     snapshot >"$out/keychain-after.txt"
-    kr_store_remove_token_logs "$out" || return 2
+    local cleaned=0
+    kr_store_remove_token_logs "$out" || cleaned=2
     if ! cmp -s "$out/keychain-before.txt" "$out/keychain-after.txt"; then
         kr_store_say "the login keychain's identities or the search list changed during the export (see $out/keychain-*.txt); stopping"
         return 2
     fi
     [ "$exported" = 0 ] || { kr_store_say "the export failed (see $out/export.log)"; tail -20 "$out/export.log" | grep -v -E 'eyJ[A-Za-z0-9_-]{8,}\.eyJ' | sed 's/^/    /'; return 2; }
+    [ "$cleaned" = 0 ] || return 2
     ipa="$(find "$out/export" -maxdepth 1 -name '*.ipa' | head -1)"
     [ -f "$ipa" ] || { kr_store_say "the export left no .ipa in $out/export"; return 2; }
 
