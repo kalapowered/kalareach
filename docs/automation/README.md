@@ -637,11 +637,11 @@ A test result is what this host observed, and nothing a caller reports.
   the platform has not yet recorded when the result is recorded, a write by a process that outlives
   the session, or a system clock set back by an account allowed to set it.
 * **Declared outputs.** A suite may declare paths it intends to write, other than its source, such
-  as a build directory. These paths are not compared, and each one that is there is recorded in
-  one reference, in path order, found through handles that follow no link and stay on the copy's
-  mount, whatever the reading of the source found: a reading that stops at a problem in the source
-  still records every declared output, and a copy that cannot be opened records none. A directory is recorded as the digest of its
-  sorted listing (the path, length and instant written of every entry, links listed and not
+  as a build directory. These paths are not compared. Each one that is there is recorded in one
+  reference, in path order, found through handles that follow no link and stay on the copy's mount.
+  That holds whatever the reading of the source found: a reading that stops at a problem in the
+  source still records every declared output, and a copy that cannot be opened records none. A
+  directory is recorded as the digest of its sorted listing (the path, length and instant written of every entry, links listed and not
   followed), with the sum of the lengths it lists. The listing holds up to 50,000 entries, 64 levels
   and 16 MiB of path text; beyond this it is a truncated listing. A file is recorded as the digest
   of its first 64 MiB and its whole length. A symbolic link or other non-file, non-directory object
@@ -691,31 +691,31 @@ A test result is what this host observed, and nothing a caller reports.
   over 255 bytes), which the configuration accepts and every dispatch of that suite then refuses. A
   declaration beneath a file of the version is accepted, but the directory above its output cannot
   be made, so the result of a suite that declares one is always indeterminate.
-* **Test reports.** A declared output that is a file and opens as a report in a format this host
-  documents is read after the result is recorded: JUnit XML (`testsuites` or `testsuite` holding
-  `testcase` elements, with the rerun and flaky elements of the tools that retry) and the event
-  stream of `go test -json` (the `TestEvent` objects, and the `BuildEvent` objects the go command
-  interleaves with them). The format is recognised from the start of the file, so the owner declares
-  nothing beyond the path; a file that opens as neither is not a report and leaves no record. What
-  was read is kept in a store of its own, `test-reports.sqlite3`, bound to the run, the path and the
-  digest of the file the result records for that output, and `changeset.test_reports` answers it to
-  the local owner as `kr changeset test-reports` prints it. A report whose digest is not the one its
-  run's result records is not served. A reading is labelled `parsed`: the host read the document as
-  the format and counted its cases itself, so the totals come from the cases and never from the
-  counts the tool wrote in its own header (a case that failed counts failed, one with an `error`
-  errored, one that was skipped skipped, and one that failed and then passed on a rerun passed and is
-  also counted flaky; a Go test counts once, a subtest and the test that holds it each count, and a
-  package that failed with no failed test, or a build that failed, is one errored case). A report
-  keeps the names and the outcomes of up to 50 cases that did not pass plainly, in the order of the
-  document, with names cut at 128 bytes, and counts the rest; it keeps no failure message, stack
-  trace or output, which are text the code under test wrote and stay in the session's retained
-  history. A document that opens as a format and cannot be read says why: it is over the 16 MiB a
-  report may be (and 32 MiB for the reports of a run), nests deeper than 24 elements, holds more than
-  2,000,000 events or lines, declares a document type or an encoding other than UTF-8, or is not
-  well formed. Nothing is expanded: only the five predefined entities and numeric references are
-  read. The reading never changes the node: the node follows the suite's exit status as it always
-  did, and a report that disagrees with it, or that cannot be read or kept, is recorded or said
-  beside it. This host reads no runner's human-readable output.
+* **Test reports.** After the result is recorded, the host reads each declared output that is a
+  file and opens as a report in a format it documents. There are two: JUnit XML (`testsuites` or
+  `testsuite` holding `testcase` elements, with the rerun and flaky elements of the tools that
+  retry) and the event stream of `go test -json` (the `TestEvent` objects, and the `BuildEvent`
+  objects the go command interleaves with them). The format is recognised from the start of the
+  file, so the owner declares nothing beyond the path. A file that opens as neither is not a report
+  and leaves no record. What was read is kept in a store of its own, `test-reports.sqlite3`, bound
+  to the run, the path and the digest the result records for that output. `changeset.test_reports`
+  answers it to the local owner, and `kr changeset test-reports` prints it. A report whose digest
+  is not the one its run's result records is not served. A reading is labelled `parsed`: the host
+  read the document as that format and counted the cases itself, so the totals come from the cases
+  and never from the counts the tool wrote in its own header. A case with a `failure` is failed,
+  one with an `error` is errored, and a skipped one is skipped. A case that failed and then passed
+  on a rerun counts as passed and also as flaky. In a Go stream, a subtest and the test that holds
+  it each count; a package that failed with no failed test, and a build that failed, are each one
+  errored case. A report keeps the names and outcomes of up to 50 cases that did not pass plainly,
+  in document order, with names cut at 128 bytes, and counts the rest. It keeps no failure
+  message, stack trace or output: the code under test wrote that text, and it stays in the
+  session's retained history. A document that opens as a format and cannot be read says why. It is
+  over the 16 MiB a report may be (32 MiB for the reports of one run), nests deeper than 24
+  elements, holds more than 2,000,000 events or lines, declares a document type or an encoding
+  other than UTF-8, or is not well formed. Nothing is expanded; only the five predefined entities
+  and numeric references are read. The reading never changes the node. The node follows the suite's
+  exit status as it always did, and a report that disagrees with it, or that cannot be read or
+  kept, is recorded or said beside it. This host reads no runner's human-readable output.
 * **The copy's release.** A copy is taken away by the dispatch at once when no suite ran (the copy
   could not be written whole, or its session could not be made), and otherwise once the session has
   closed and its worker is accounted for; the sweep takes away any other copy. A node that settles
