@@ -6578,6 +6578,15 @@ async fn a_created_session_is_kept_when_its_node_is_asked_to_stop_after_its_admi
 /// A daemon with real sessions whose configuration document names `suites` (a name, its command,
 /// and the output paths it declares), started before anything else is done.
 async fn working_host_with_suites(suites: &[(&str, &str, &[&str])]) -> Host {
+    working_host_with_suites_after(suites, |_| {}).await
+}
+
+/// [`working_host_with_suites`], with `before_the_daemon_starts` given the environment's state
+/// directory after the configuration is written and before the daemon starts.
+async fn working_host_with_suites_after(
+    suites: &[(&str, &str, &[&str])],
+    before_the_daemon_starts: impl FnOnce(&Path),
+) -> Host {
     let temp = teardown::Tree::create();
     let worker = temp.root().join("kr-worker");
     kr_ipc::testing::place_and_start_once(&beside_this_test("kr-worker"), &worker, &["--version"]);
@@ -6597,6 +6606,9 @@ async fn working_host_with_suites(suites: &[(&str, &str, &[&str])]) -> Host {
             .collect(),
     );
     write_configuration(&temp.environment(), &document);
+    let environment = temp.environment();
+    std::fs::create_dir_all(environment.state_dir()).expect("the state directory");
+    before_the_daemon_starts(environment.state_dir());
     working_host_on(temp, |supervisor| supervisor).await
 }
 
@@ -8752,6 +8764,128 @@ async fn a_report_the_result_does_not_vouch_for_is_never_served() {
         "the run's own row stays"
     );
     host.clients.abort();
+}
+
+/// KR-REQ-25.06: a store of reports this daemon cannot use leaves the daemon, and the file, as they
+/// are. With the file put in `state` before the daemon starts, the daemon starts; a suite that
+/// ends 0 against a version is a success whose result attests it, and its evidence says that the
+/// report was read and not kept; `changeset.test_reports` answers that storage is unavailable; and
+/// the file holds the bytes it held, for a release that can read it to find them.
+async fn a_daemon_starts_without_a_store_of_reports_it_cannot_use(
+    number: u8,
+    state: impl FnOnce(&Path),
+) {
+    let before = std::cell::RefCell::new(Vec::new());
+    let host = working_host_with_suites_after(
+        &[(
+            "reports",
+            &writes_report("reports/junit.xml", &A_JUNIT_REPORT, 0),
+            &["reports/junit.xml"],
+        )],
+        |state_dir| {
+            state(state_dir);
+            *before.borrow_mut() =
+                std::fs::read(state_dir.join(kr_controller::test_reports::TEST_REPORTS_RECORD))
+                    .expect("the file was put there");
+        },
+    )
+    .await;
+    let mut control = client(&host).await;
+    let workspace = adopted_workspace(&mut control, host.environment_id, host.work()).await;
+    let version = captured(&mut control, &host, workspace, number).await;
+    let (run, receipt, read) = tests_run(&mut control, &host, number + 1, "reports", version).await;
+    assert_eq!(run.status, WorkflowRunStatus::Completed, "{run:?}");
+    assert_eq!(receipt.status, NodeStatus::Success, "{receipt:?}");
+    assert_eq!(
+        read.results[0].tested_source,
+        TestedSource::UnmodifiedVersion
+    );
+    assert!(
+        read.evidence.iter().any(|evidence| evidence.kind
+            == kr_protocol::changeset::EvidenceKind::TestResult
+            && evidence.detail.contains("read and not kept")),
+        "{:?}",
+        read.evidence
+    );
+    let refused = control
+        .request(
+            Method::ChangesetTestReports,
+            &kr_protocol::test_report::TestReportsParams {
+                change_set_id: version.change_set_id,
+                version: Nullable::some(version.version),
+                materialisation_id: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect_err("there is no store to read");
+    assert_eq!(refused.code, ErrorCode::StorageUnavailable, "{refused:?}");
+    assert_eq!(
+        std::fs::read(
+            host._temp
+                .environment()
+                .state_dir()
+                .join(kr_controller::test_reports::TEST_REPORTS_RECORD)
+        )
+        .expect("the file is still there"),
+        *before.borrow(),
+        "the daemon left the file as it found it"
+    );
+    host.clients.abort();
+}
+
+/// KR-REQ-25.06: a store of reports that is not a database does not stop the daemon.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_store_of_reports_that_is_not_a_database_does_not_stop_the_daemon() {
+    a_daemon_starts_without_a_store_of_reports_it_cannot_use(164, |state_dir| {
+        std::fs::write(
+            state_dir.join(kr_controller::test_reports::TEST_REPORTS_RECORD),
+            "this is not a database, and no release of this product wrote it\n".repeat(4),
+        )
+        .expect("the file is written");
+    })
+    .await;
+}
+
+/// KR-REQ-25.06: a store of reports of a schema this build does not read, as a later release
+/// leaves it, does not stop the daemon, and a rollback to that release finds it as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_store_of_reports_of_a_newer_schema_does_not_stop_the_daemon() {
+    a_daemon_starts_without_a_store_of_reports_it_cannot_use(166, |state_dir| {
+        let connection = rusqlite::Connection::open(
+            state_dir.join(kr_controller::test_reports::TEST_REPORTS_RECORD),
+        )
+        .expect("the file opens");
+        connection
+            .execute_batch(&format!(
+                "CREATE TABLE test_reports_schema (version INTEGER NOT NULL);
+                 INSERT INTO test_reports_schema (version) VALUES ({});",
+                kr_controller::test_reports::SCHEMA_VERSION + 1
+            ))
+            .expect("the schema is written");
+    })
+    .await;
+}
+
+/// KR-REQ-25.06: a store of reports with a row that names no run this build can read does not stop
+/// the daemon either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_store_of_reports_with_a_row_it_cannot_read_does_not_stop_the_daemon() {
+    a_daemon_starts_without_a_store_of_reports_it_cannot_use(168, |state_dir| {
+        drop(kr_controller::test_reports::Reports::open(state_dir).expect("the store is made"));
+        rusqlite::Connection::open(
+            state_dir.join(kr_controller::test_reports::TEST_REPORTS_RECORD),
+        )
+        .expect("the file opens")
+        .execute(
+            "INSERT INTO test_reports
+                 (materialisation_id, output_path, output_digest, recorded_at_ms, record)
+             VALUES (x'0102', 'reports/junit.xml', x'00', 0, '{}')",
+            [],
+        )
+        .expect("the row is written");
+    })
+    .await;
 }
 
 /// KR-REQ-25.06: a report that cannot be kept never changes what the node, its result and its
