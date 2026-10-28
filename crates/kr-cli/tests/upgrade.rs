@@ -4233,7 +4233,7 @@ async fn a_report_store_the_release_before_ignores_is_kept_across_a_rollback_and
             );
         }
     };
-    let results = || {
+    let read = || {
         let endpoint = endpoint.clone();
         async move {
             a_host_read::<_, ChangesetReadResult>(
@@ -4246,7 +4246,6 @@ async fn a_report_store_the_release_before_ignores_is_kept_across_a_rollback_and
             )
             .await
             .expect("changeset.read answers")
-            .results
         }
     };
     let reports = || {
@@ -4267,18 +4266,51 @@ async fn a_report_store_the_release_before_ignores_is_kept_across_a_rollback_and
 
     // The release before: a result, and a method it does not list.
     run("evt-before-the-update").await;
-    assert_eq!(results().await.len(), 1);
+    assert_eq!(read().await.results.len(), 1);
     let refused = reports()
         .await
         .expect_err("the release before lists no such method");
     assert_eq!(refused.code, ErrorCode::PermissionDenied);
 
-    // This release: a result and the report beside it, bound to that run.
-    let updated = prepared.update().await;
+    // This release: a copy of the change-set store as it stands with the first run in it, then a
+    // result and the report beside it, bound to that run.
+    let mut updated = prepared.update().await;
+    let environment = updated.host.tree.environment();
+    let changesets_store = kr_changeset::service::ChangeSetService::root_of(&environment)
+        .join(kr_changeset::store::STORE_FILE_NAME);
+    let reports_store = environment
+        .state_dir()
+        .join(kr_controller::test_reports::TEST_REPORTS_RECORD);
+    let copy_before_the_second_run = updated
+        .host
+        .scratch("stores")
+        .join("changesets-before.sqlite");
+    rusqlite::Connection::open_with_flags(
+        &changesets_store,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("the change-set store opens beside the daemon")
+    .execute(
+        "VACUUM INTO ?1",
+        [copy_before_the_second_run.to_str().expect("a path")],
+    )
+    .expect("a consistent copy of the store");
+    let reports_held = || {
+        rusqlite::Connection::open_with_flags(
+            &reports_store,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("the store of reports opens beside the daemon")
+        .query_row("SELECT count(*) FROM test_reports", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .expect("the rows are counted")
+    };
     run("evt-after-the-update").await;
-    let after_the_update = results().await;
-    assert_eq!(after_the_update.len(), 2);
-    let second = after_the_update[1].materialisation_id;
+    let after_the_update = read().await;
+    assert_eq!(after_the_update.results.len(), 2);
+    let second = after_the_update.results[1].materialisation_id;
+    assert_eq!(reports_held(), 1, "one row, of the run this release made");
     let answered = reports().await.expect("this release reads reports");
     let [report] = &answered.reports[..] else {
         panic!("one report, of the run this release made: {answered:?}");
@@ -4303,14 +4335,18 @@ async fn a_report_store_the_release_before_ignores_is_kept_across_a_rollback_and
         format!("kr-controller/{}", updated.one.name()),
         "the daemon is the release before's again"
     );
-    let after_the_rollback = results().await;
-    assert_eq!(after_the_rollback.len(), 2);
     assert_eq!(
-        after_the_rollback[1], after_the_update[1],
-        "the result this release wrote reads as it was"
+        read().await,
+        after_the_update,
+        "the result this release wrote, and the evidence beside it, read as they were"
     );
     run("evt-after-the-rollback").await;
-    assert_eq!(results().await.len(), 3);
+    assert_eq!(read().await.results.len(), 3);
+    assert_eq!(
+        reports_held(),
+        1,
+        "the release before left the store of reports as it was"
+    );
     assert_eq!(
         reports()
             .await
@@ -4330,7 +4366,7 @@ async fn a_report_store_the_release_before_ignores_is_kept_across_a_rollback_and
         String::from_utf8_lossy(&refused.stdout),
         String::from_utf8_lossy(&refused.stderr)
     );
-    assert!(said.contains("update"), "{said}");
+    assert!(said.contains("does not read test reports"), "{said}");
 
     // Forward again: the store the release before left alone serves the one report of the run it
     // was written for, and none for the runs the release before made.
@@ -4359,5 +4395,40 @@ async fn a_report_store_the_release_before_ignores_is_kept_across_a_rollback_and
         panic!("the one report is served again: {again:?}");
     };
     assert_eq!(report.materialisation_id, second);
+    let three = read().await;
+    assert_eq!(
+        three.results.len(),
+        3,
+        "the run of the release before reads"
+    );
+    assert_eq!(three.results[1], after_the_update.results[1]);
+
+    // The change-set store is put back as it was before the second run, with the daemon stopped and
+    // the store of reports kept: the report now names a run the store holds no result for. It is
+    // not served, and the daemon lets it go when it opens.
+    assert!(
+        updated.host.stop_the_daemon().await,
+        "no daemon serves the host"
+    );
+    std::fs::copy(&copy_before_the_second_run, &changesets_store)
+        .expect("the older copy takes the store's place");
+    for beside in ["changesets.sqlite-wal", "changesets.sqlite-shm"] {
+        let _ = std::fs::remove_file(changesets_store.with_file_name(beside));
+    }
+    assert_eq!(reports_held(), 1, "the store of reports is kept");
+    let controller = updated.host.store.stable(Program::Controller);
+    updated.host.start_daemon(&controller).await;
+    assert_eq!(
+        read().await.results.len(),
+        1,
+        "the store is the older copy: the two runs made after it was taken are gone"
+    );
+    let restored = reports().await.expect("this release reads reports");
+    assert!(restored.reports.is_empty(), "{restored:?}");
+    assert_eq!(
+        reports_held(),
+        0,
+        "the report of a run no one holds is let go"
+    );
     drop(owner);
 }
