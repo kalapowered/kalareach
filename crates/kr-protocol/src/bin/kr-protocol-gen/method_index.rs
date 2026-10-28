@@ -263,6 +263,7 @@ pub(crate) const fn described_in(method: Method) -> Section {
         | Method::DiffRevert
         | Method::ChangesetCapture
         | Method::ChangesetRead
+        | Method::ChangesetTestReports
         | Method::ChangesetMaterialize => at(PROJECT, "Change sets"),
 
         Method::ReviewRead => at(METHOD_REFERENCE, "Reading review state"),

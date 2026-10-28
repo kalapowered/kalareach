@@ -247,6 +247,7 @@ document.
 | `diff.revert` | write | `local_ipc`, `paired_device`, `workflow` | Revert a previously applied change under the same destination contract. | [Project: Change sets](../project/README.md) |
 | `changeset.capture` | write | `local_ipc`, `paired_device`, `workflow` | Capture an immutable change-set version with its policy and provenance. | [Project: Change sets](../project/README.md) |
 | `changeset.read` | read | `local_ipc`, `paired_device`, `workflow` | Read one exact change-set version. | [Project: Change sets](../project/README.md) |
+| `changeset.test_reports` | read | `local_ipc` | Read what this host made of the test reports the suites that ran against one exact change-set version wrote: for each declared output in a documented format, the format, the counts taken from the cases, and the cases that did not pass plainly, by name. A reading is labelled parsed; a document that opened as a documented format and could not be read says why. The answer is the local owner's and holds no failure text. | [Project: Change sets](../project/README.md) |
 | `changeset.materialize` | write | `local_ipc`, `paired_device`, `workflow` | Materialise an exact change-set version into an independent workspace. | [Project: Change sets](../project/README.md) |
 
 ## Review and attention
