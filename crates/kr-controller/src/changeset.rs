@@ -143,8 +143,11 @@ impl ChangeSetModule {
             service.recover_before_serving().map_err(unavailable)?;
             // A report whose run the change-set store holds no result for was kept while that
             // store was replaced by an older copy of itself. Nothing serves it, so it is let go.
-            let held = materialise::runs_with_a_result(&service).map_err(unavailable)?;
-            let reports = crate::test_reports::Reports::open_for_a_daemon(paths.state_dir(), &held);
+            let reports =
+                crate::test_reports::Reports::open_for_a_daemon(paths.state_dir(), || {
+                    materialise::runs_with_a_result(&service)
+                        .map_err(|error| kr_project::git::redact(&error.to_string()))
+                });
             Ok::<_, ControllerError>((service, reports))
         })
         .await
@@ -309,7 +312,9 @@ impl ChangeSetModule {
                     return Err(ProtocolError::new(
                         ErrorCode::StorageUnavailable,
                         "this daemon runs without its record of test reports, which it could not \
-                         use when it started",
+                         use when it started and left as it was; the daemon's log names the file \
+                         and the reason: move the file aside, or update to the release that wrote \
+                         it, and restart the daemon",
                     ));
                 };
                 encode(&read_test_reports(&service, reports, &params)?)
