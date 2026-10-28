@@ -799,9 +799,16 @@ fn a_removal_interrupted_at_any_call_keeps_the_record_and_the_next_one_finishes(
                 person.recorded_uuid().is_some(),
                 "call {failing}: the record keeps the entry"
             );
+            // The last call reads back the last key's reset: when it is the one that fails, the
+            // profile is already out and the record is all that is left.
+            let expected = if failing == calls {
+                Removed::AlreadyGone
+            } else {
+                Removed::Removed
+            };
             assert_eq!(
                 person.remove(&places).expect("finishes"),
-                Removed::Removed,
+                expected,
                 "call {failing}: the next removal finishes the job"
             );
             assert_eq!(person.list(), list_before, "call {failing}");
