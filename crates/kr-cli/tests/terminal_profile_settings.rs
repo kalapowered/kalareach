@@ -505,7 +505,8 @@ fn a_profile_that_is_gone_is_forgotten() {
 /// counts the calls, fails the one it is told to, fails every call from the first write of a
 /// profile's key on, says that every reset worked and does none, says the same of every write of
 /// a profile's key after the first, sets a key of the profile as the person would just after the
-/// read of a profile it is told to has been answered, shows no schemas, appends an element to the list just after the read it is
+/// read of a profile it is told to has been answered or just after the first write of a key, shows
+/// no schemas, appends an element to the list just after the read it is
 /// told to has been answered (so that the answer is stale), and overwrites the list from a stale
 /// read just after the write it is told to.
 fn wrapper(directory: &Path) -> PathBuf {
@@ -579,6 +580,16 @@ if [ "$1" = set ] && [ "$2" = "$KR_TEST_LIST_SCHEMA" ] && [ "$3" = "$KR_TEST_LIS
   if [ "$KR_TEST_OVERWRITE_AT_SET" = "$sets" ]; then
     "$real" set "$KR_TEST_LIST_SCHEMA" "$KR_TEST_LIST_KEY" "$KR_TEST_STALE"
   fi
+fi
+if [ "$1" = set ] && [ -n "$KR_TEST_PERSON_AFTER_KEY_SET" ]; then
+  case "$2" in
+    *:/*)
+      if [ ! -e "$KR_TEST_COUNTS/person-set" ]; then
+        : > "$KR_TEST_COUNTS/person-set"
+        "$real" set "$2" "$3" "$KR_TEST_PERSON_VALUE"
+      fi
+      ;;
+  esac
 fi
 exit $status
 "#,
@@ -1090,6 +1101,17 @@ fn a_key_the_person_changed_during_a_removal_is_left_as_it_is() {
                 "'/bin/theirs'",
                 "after read {after}: what the person put there stays"
             );
+            // A change that came after the list was written leaves the profile as it was found:
+            // in the list, with the keys kr had already reset back.
+            assert!(
+                person.list().contains(&uuid),
+                "after read {after}: the profile is in the list"
+            );
+            assert_eq!(
+                person.get(&target, person.application.name_key),
+                "'KalaReach'",
+                "after read {after}: and still named"
+            );
             // Put the settings back for the next round.
             for key in [
                 "custom-command",
@@ -1195,5 +1217,44 @@ fn a_second_failed_install_keeps_the_values_the_first_left() {
         assert_eq!(person.remove(&places).expect("removes"), Removed::Removed);
         assert_eq!(person.list(), list_before);
         assert!(person.recorded_uuid().is_none());
+    });
+}
+
+/// KR-REQ-01.21: a key the person changed right after kr wrote it is not put back when the write
+/// is taken back: the install fails with the person's value in it, and the keys that are kr's are
+/// back.
+#[test]
+fn a_key_the_person_changed_after_the_write_is_not_taken_back_over() {
+    for_each_application(|person| {
+        let places = person.places();
+        person.install(&places).expect("installs");
+        let uuid = person.recorded_uuid().expect("recorded");
+        let target = target_of(person, &uuid);
+        let command_before = person.get(&target, "custom-command");
+        let changing = through_the_wrapper(
+            person,
+            &[
+                ("KR_TEST_PERSON_AFTER_KEY_SET", "1".to_owned()),
+                ("KR_TEST_PERSON_VALUE", "'Mine'".to_owned()),
+            ],
+        );
+        let mut again = person.command();
+        again.push("another".to_owned());
+        let outcome = person.install_command(&changing, &again);
+        assert!(
+            matches!(outcome, Err(ProfileError::NotPersisted(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            person.get(&target, person.application.name_key),
+            "'Mine'",
+            "what the person put there stays"
+        );
+        assert_eq!(
+            person.get(&target, "custom-command"),
+            command_before,
+            "and the keys that are kr's are back"
+        );
+        assert_eq!(person.recorded_uuid().as_deref(), Some(uuid.as_str()));
     });
 }

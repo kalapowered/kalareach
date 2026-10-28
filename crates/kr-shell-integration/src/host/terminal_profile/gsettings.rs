@@ -539,13 +539,24 @@ pub(super) fn write(plan: &SettingsPlan) -> Result<(), (ProfileError, bool)> {
         }
     }
     // Puts back the keys written so far, and says whether each is back, read by another process. A
-    // key that cannot be put back does not stop the others.
+    // key that holds neither what kr wrote nor what it held before is the person's, changed since
+    // kr wrote it: it is left, and nothing of kr's is in it. A key that cannot be put back does not
+    // stop the others.
     let undo = |written: &[RecordedKey]| {
         let mut all_back = true;
         for key in written {
             let value = held
                 .value(&key.key)
                 .filter(|value| !held.is_unset(&key.key, value));
+            let now = gsettings.get(&target, &key.key);
+            let ours = match (&now, value) {
+                (Ok(now), Some(value)) => same_value(now, &key.value) || same_value(now, value),
+                (Ok(now), None) => same_value(now, &key.value) || held.is_unset(&key.key, now),
+                (Err(_), _) => true,
+            };
+            if !ours {
+                continue;
+            }
             let back = match value {
                 Some(value) => {
                     gsettings.set(&target, &key.key, value).is_ok()
@@ -769,9 +780,10 @@ pub(super) enum TakenOut {
 }
 
 /// Takes an unchanged profile out: its identifier leaves the shared list and its keys are reset.
-/// Every key is read before the first write and again just before it is reset, and one that holds
-/// a value the person put there stops the removal with that key and the keys after it as they are.
-/// Each reset is read back by another process: a key that still holds its value is a failure.
+/// Every key is read before the first write and again just before it is reset. One that holds a
+/// value the person put there stops the removal: the keys already reset and the place in the list
+/// are put back, and the profile is left as it was. Each reset is read back by another process: a
+/// key that still holds its value is a failure.
 ///
 /// # Errors
 ///
@@ -796,13 +808,32 @@ pub(super) fn take_out(
     // The list first: a profile out of the list and with its keys set is invisible, where one in
     // the list with its keys reset would be shown unnamed.
     change_list(gsettings, &spec, &wrote.list.member, false)?;
+    let mut reset: Vec<&RecordedKey> = Vec::new();
     for key in &wrote.keys {
         let now = gsettings
             .get(&target, &key.key)
             .map_err(|failure| tool(failure, &spec))?;
         if !ours(&key.key, &now) {
-            return Ok(TakenOut::Changed);
+            // The person changed this key since the read above. The profile is theirs now, so the
+            // profile goes back as it was: its place in the list, and the keys already reset. Only
+            // when it is back is it left, with nothing recorded.
+            let mut back = true;
+            for earlier in &reset {
+                if let Some(value) = held.value(&earlier.key) {
+                    back &= gsettings.set(&target, &earlier.key, value).is_ok()
+                        && gsettings
+                            .get(&target, &earlier.key)
+                            .is_ok_and(|read| same_value(&read, value));
+                }
+            }
+            back &= change_list(gsettings, &spec, &wrote.list.member, true).is_ok();
+            return if back {
+                Ok(TakenOut::Changed)
+            } else {
+                Err(ProfileError::Changing(spec.terminal))
+            };
         }
+        reset.push(key);
         gsettings
             .reset(&target, &key.key)
             .map_err(|failure| tool(failure, &spec))?;

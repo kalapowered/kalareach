@@ -317,9 +317,9 @@ pub enum ProfileError {
     /// A write did not outlast the process that made it.
     #[error("{}'s settings did not keep a write; there is no settings service in this session", .0.name())]
     NotPersisted(ProfileTerminal),
-    /// The preferences changed between kr reading them and writing them back, so nothing was
-    /// written.
-    #[error("{}'s preferences changed while kr was about to write them", .0.name())]
+    /// The profile changed between kr reading it and writing it, so kr stopped. Where the profile
+    /// is not as kr found it, what kr could not put back stays recorded.
+    #[error("{}'s profile changed while kr was writing it", .0.name())]
     Changing(ProfileTerminal),
     /// The list of profiles changed under every attempt to write it.
     #[error("{}'s list of profiles kept changing while it was written", .0.name())]
@@ -661,9 +661,16 @@ pub fn install(held: &HeldProfiles<'_>, plan: &Plan) -> Result<(), ProfileError>
     };
     // While a profile is written over one kr wrote before, it may hold either: the record says so,
     // and says it of the new write only until the write is known to hold.
-    let while_written = match &before {
-        Some(profile) => plan.wrote.clone().over(&profile.wrote),
-        None => plan.wrote.clone(),
+    let while_written = match (&before, &plan.wrote) {
+        // An entry is written whole, so it holds what it holds now or what is to be written: the
+        // record says what it holds now, which is read, not taken from the record.
+        (Some(_), Wrote::Preferences(wrote)) => {
+            let mut wrote = wrote.clone();
+            wrote.earlier = apple::current_entry(&wrote.domain)?;
+            Wrote::Preferences(wrote)
+        }
+        (Some(profile), wrote) => wrote.clone().over(&profile.wrote),
+        (None, wrote) => wrote.clone(),
     };
     held.put(recorded(while_written.clone()))?;
     if let Err((error, left_over)) = write(plan) {

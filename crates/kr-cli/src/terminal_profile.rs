@@ -936,13 +936,14 @@ fn failure(error: &ProfileError, home: &ProfileHome) -> CliError {
             Shown::said(terminal.name())
         )),
         ProfileError::NotPersisted(terminal) => CliError::Usage(shown!(
-            "{}'s settings did not keep what kr wrote, which is what a session with no settings \
-             service does; run this in a desktop session. What was written has been taken back",
+            "{}'s settings did not keep what kr wrote or reset, which is what a session with no \
+             settings service does; run this in a desktop session. What kr could not put back is \
+             kept in its record, and kr host terminal-profile remove takes it out",
             Shown::said(terminal.name())
         )),
         ProfileError::Changing(terminal) => CliError::Other(shown!(
-            "{}'s preferences changed while kr was about to write them, so kr wrote nothing; what \
-             is recorded is kept, and running this again tries again",
+            "{}'s profile changed while kr was writing it, so kr stopped; what is recorded is \
+             kept, and running this again tries again",
             Shown::said(terminal.name())
         )),
         ProfileError::ListBusy(terminal) => CliError::Other(shown!(
