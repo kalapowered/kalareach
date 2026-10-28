@@ -366,10 +366,10 @@ heldProblems(
   ['allows no com.apple.developer.associated-domains']
 )
 
-held('an application that says it uses encryption passes, and one that is silent or says no does not', [0, 1, 1], [
-  problemsInEncryptionKey({ ITSAppUsesNonExemptEncryption: true }).length,
+held('an application that says it needs no export documentation passes, and one that is silent or says it does not', [0, 1, 1], [
+  problemsInEncryptionKey({ ITSAppUsesNonExemptEncryption: false }).length,
   problemsInEncryptionKey({}).length,
-  problemsInEncryptionKey({ ITSAppUsesNonExemptEncryption: false }).length
+  problemsInEncryptionKey({ ITSAppUsesNonExemptEncryption: true }).length
 ])
 
 const versions = { versionCode: 39800, versionName: '0.1.0' }

@@ -509,11 +509,11 @@ function filesUnder(root) {
   return found
 }
 
-/** What is wrong with the application's export-compliance key: the owner's answer is that it uses encryption. */
+/** What is wrong with the application's export-compliance key: it must say that the application needs no export documentation. */
 export function problemsInEncryptionKey(info) {
-  return info.ITSAppUsesNonExemptEncryption === true
+  return info.ITSAppUsesNonExemptEncryption === false
     ? []
-    : ["the application's Info.plist does not carry ITSAppUsesNonExemptEncryption set to true"]
+    : ["the application's Info.plist does not carry ITSAppUsesNonExemptEncryption set to false"]
 }
 
 /** The lines a check printed after the one that counts its problems, or its last lines. */
