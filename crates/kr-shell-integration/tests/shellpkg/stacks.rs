@@ -981,6 +981,11 @@ fn home_environment(home: &Path, order: &Path) -> Vec<(String, String)> {
         ("XDG_CONFIG_HOME".to_owned(), told(&home.join(".config"))),
         ("XDG_DATA_HOME".to_owned(), told(&home.join(".local/share"))),
         ("XDG_CACHE_HOME".to_owned(), told(&home.join(".cache"))),
+        // `defaults` ignores HOME: the terminal preferences are files of this home's own.
+        (
+            "KR_TERMINAL_PREFERENCES_DIR".to_owned(),
+            told(&home.join("domains")),
+        ),
         ("KR_TEST_ORDER".to_owned(), told(order)),
         ("TERM".to_owned(), "xterm-256color".to_owned()),
         ("LANG".to_owned(), "C".to_owned()),
