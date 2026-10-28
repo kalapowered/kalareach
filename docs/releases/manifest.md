@@ -242,8 +242,9 @@ A release that has been published is never changed: a correction is a new commit
 
 `release-windows.yml` builds and checks the two Windows trees and, when the repository variable
 `WINDOWS_HOST_RELEASE` is `true`, signs them behind its own environment. The variable is not set, so
-a Windows host is not released and the job asks for no approval. The channel's release keys that sign
-the Windows manifests do not exist yet; the Windows job stops at that step.
+a Windows host is not released and the job asks for no approval. The Windows archives are to be signed
+under the production update channel, whose release keys are made at a key ceremony; the job stops at the
+step that writes the manifest again and signs it until they exist.
 
 ## Package managers
 

@@ -59,8 +59,9 @@ ID. The script tests itself with trees made to fail.
 
 `xcrun notarytool submit` takes a zip of each tree with an App Store Connect API key of the
 organisation's team: the key file, its key identifier and its issuer identifier, read from
-`asc-api-key.json`. The submission identifier is kept at once. The step goes on only when the status
-is `Accepted`. A status of `In Progress` when the wait times out is not a failure of the submission:
+`asc-api-key.json`. The submission is made without waiting, so its identifier is printed as soon as the
+service has the upload, and the script then waits for it. The step goes on only when the status is
+`Accepted`. A status of `In Progress` when the wait times out is not a failure of the submission:
 resume it with `xcrun notarytool wait <submission id>` and the same key options. `notarytool log
 <submission id>` has the service's reasons for a refusal, and the script saves it beside the tree.
 
@@ -73,7 +74,7 @@ so that first launch needs a network. A program fetched by `curl`, or put in the
 ## The files that sign
 
 They are under `~/.config/kalareach-secrets/apple`, mode 0600, and the script refuses to run when
-one is missing or readable by another user:
+one is missing or has another mode:
 
 | File | What it is |
 | --- | --- |
@@ -94,8 +95,8 @@ scripts/sign-macos-release.sh --build-run <run id> --commit <full commit hash>
 
 The script takes the two macOS trees from the run's artefacts, after it holds the run to the commit
 and each artefact to the digest GitHub states for it and to the sum beside it. It signs, checks,
-notarises, checks again, and puts the two signed trees, their sums and the notary submissions in a
-draft pre-release named `host-staging/v<release>`, the one place a command outside a workflow can
+notarises, checks again, and puts the two signed trees, the notary submissions, a record of the run and commit they came
+from and one file of sums over all of them in a draft pre-release named `host-staging/v<release>`, the one place a command outside a workflow can
 leave files for one. It ends by printing the command that starts the sealing, with the digest of the
 sums as an input. `--no-stage` stops before the draft. A draft that is already there is a refusal
 that names `scripts/sign-macos-release.sh --remove-staging <release>`; the script removes a draft it
@@ -111,9 +112,10 @@ Its `source` job holds the inputs to what they name before anything is approved:
 `main`, the run is a successful `release-tree.yml` run on that commit, each tree is the artefact whose
 digest GitHub states, and the staged files hash to the input. It prints every digest in the run's
 summary. The person who approves the `update-signing` deployment compares them with what the signing
-script printed. The approval is the one approval of a release: the jobs after it run without another,
+script printed. The files the sealing job takes are kept for three days, so the approval has to come within three
+days of the dispatch. The approval is the one approval of a release: the jobs after it run without another,
 and `publish` runs only after every archive has been verified against the root committed in
-`release/tester-channel/root.json`, installed into a store and started on its own platform.
+`release/tester-channel/root.json`, installed into a store and checked on its own platform.
 
 ## Reading a refusal
 
