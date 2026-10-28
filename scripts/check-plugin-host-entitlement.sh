@@ -2,12 +2,15 @@
 # Shows that the entitlement the plugin host is signed with is the one thing standing between it and
 # the hardened runtime, on the machine that runs it.
 #
-#   scripts/check-plugin-host-entitlement.sh <program> [<argument>...]
+#   scripts/check-plugin-host-entitlement.sh [--host <kr-plugin-host>] <program> [<argument>...]
 #
 # <program> is a Mach-O program that compiles and runs a WebAssembly component the way the plugin
 # host does (Wasmtime writes machine code into memory and then makes it executable), such as the
 # test executable of `kr-plugin-runtime`'s `execution` suite with a case's name as its argument. The
-# command is run three times, each on a copy of the program signed ad hoc:
+# command is run three times, each on a copy of the program signed ad hoc. With --host, <program>
+# is instead a test that starts the plugin host, such as the `service` suite of `kr-plugin-host`, and
+# it is the plugin host that is signed: the file --host names is signed in place for each run and the
+# file it had is put back at the end.
 #
 #   1. without the hardened runtime: it has to succeed, which shows the command itself is sound;
 #   2. with the hardened runtime and no entitlement: it has to fail, which shows the hardened
@@ -22,6 +25,11 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+host=""
+if [ "${1:-}" = --host ]; then
+    host="${2:?--host needs the plugin host}"
+    shift 2
+fi
 program="${1:?name the program}"
 shift
 
@@ -34,9 +42,22 @@ rcodesign="${KR_RCODESIGN:-$(bash "$here/install-rcodesign.sh")}"
 work="$(mktemp -d "${TMPDIR:-/tmp}/kr-entitlement.XXXXXX")"
 trap 'rm -rf "${work:?}"' EXIT
 
+if [ -n "$host" ]; then
+    cp -p "$host" "$work/host.original"
+    trap 'cp -p "$work/host.original" "$host"; rm -rf "${work:?}"' EXIT
+fi
+
+# The program to run, signed ad hoc with the options given; with --host, the plugin host is signed in
+# place and the program is run as it is.
 signed_copy() { # <name> <signing options...>
     local name="$1"
     shift
+    if [ -n "$host" ]; then
+        cp -p "$work/host.original" "$host"
+        "$rcodesign" sign --binary-identifier kr-plugin-host "$@" "$host" > /dev/null 2>&1
+        echo "$program"
+        return
+    fi
     cp "$program" "$work/$name"
     "$rcodesign" sign --binary-identifier "$name" "$@" "$work/$name" > /dev/null 2>&1
     echo "$work/$name"

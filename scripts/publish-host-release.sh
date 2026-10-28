@@ -13,9 +13,11 @@
 #
 # The release is the tag `host/v<release>`, made by publishing the draft at <sha>, so the tag names
 # the commit that was built. The shape is the one the package releases settled: refuse before
-# creating anything, assemble as a draft, hold the stored assets to what was packed before
-# publishing, and confirm afterwards that the tag resolves to this release at this commit and that
-# nobody can replace what it serves. The release is a pre-release and is never marked the latest,
+# creating anything (including when the repository does not make releases immutable), assemble as a
+# draft, hold the stored assets and the bytes the draft serves to what was packed before publishing,
+# and confirm afterwards that the tag resolves to this release at this commit and that nobody can
+# replace what it serves. A failure before publication leaves a draft; a failure of the last
+# confirmation leaves a published release, which is never deleted. The release is a pre-release and is never marked the latest,
 # so the package release stays what the repository's page shows first. A draft the macOS signing
 # staged under `host-staging/v<release>` is deleted once the release is published. A published
 # release is never changed except in its notes, and a mistake is corrected by a release of a new
@@ -34,8 +36,18 @@ fail() {
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/kr-publish.XXXXXX")"
 trap 'rm -rf "${scratch:?}"' EXIT
 
-# A field of a JSON document on standard input; the expression is Python over `d`.
-jq_py() { python3 -I -c 'import json, sys; d = json.load(sys.stdin); print(eval(sys.argv[1]))' "$1"; }
+# Whether `gh api <path>` finds something: 0 when it does, 1 on a 404, and the script stops on any
+# other answer, since an error is not the same as nothing being there.
+exists() {
+    local answer
+    if answer="$(gh api "$1" 2>&1)"; then
+        return 0
+    fi
+    case "$answer" in
+        *"HTTP 404"* | *"Not Found"*) return 1 ;;
+        *) fail "asking GitHub about $1 failed: $answer" ;;
+    esac
+}
 
 publish() {
     local repo="" release="" commit="" archives="" verified="" root=""
@@ -105,9 +117,15 @@ while index < len(text):
         echo 'leave it where it is and release the corrected commit under its own tag.' >&2
         exit 1
     fi
-    if gh api "repos/$repo/git/ref/tags/$tag" --silent 2> /dev/null; then
+    if exists "repos/$repo/git/ref/tags/$tag"; then
         fail "$tag is already a tag of this repository"
     fi
+    # A repository that does not make releases immutable would publish a release whose assets can be
+    # replaced, which cannot be undone, so it is refused before a draft is made. A token that cannot
+    # read the setting leaves the last confirmation to decide.
+    local setting
+    setting="$(gh api "repos/$repo/immutable-releases" 2> /dev/null | python3 -I -c 'import json, sys; print(json.load(sys.stdin).get("enabled"))' 2> /dev/null || true)"
+    [ "$setting" != False ] || fail "this repository does not make releases immutable, so nothing is published"
 
     local key_ids
     key_ids="$(python3 -I -c '
@@ -116,6 +134,7 @@ signed = json.load(open(sys.argv[1], encoding="utf-8"))["signed"]
 print(", ".join(signed["roles"]["targets"]["keyids"]))
 ' "$root")"
 
+    # shellcheck disable=SC2016
     {
         echo
         echo "Check an archive after it is downloaded, with the one sum file for all four:"
@@ -129,9 +148,9 @@ print(", ".join(signed["roles"]["targets"]["keyids"]))
         echo
         echo 'A host that has an earlier release takes this one with'
         # shellcheck disable=SC2016
-        echo '`kr host update --archive <archive>`. `kr host install` and `kr host update` check the'
-        echo "release's manifest against the update channel root the release carries, whose targets"
-        echo "key identifiers are: $key_ids."
+        echo '`kr host update --archive <archive>`. `kr host install` checks the release'"'"'s manifest against'
+        echo 'the update channel root the release carries, and `kr host update` against the root the host'
+        echo "already trusts. The targets key identifiers of that root are: $key_ids."
         echo
         echo 'SHA256SUMS:'
         echo
@@ -191,6 +210,22 @@ for asset in json.load(sys.stdin)["assets"]:
         sleep 3
     done
 
+    # The bytes the draft serves, by the identifier of each asset, are the bytes that were packed.
+    mkdir -p "$work/served"
+    gh api "repos/$repo/releases/$id" | python3 -I -c '
+import json, sys
+for asset in json.load(sys.stdin)["assets"]:
+    print(asset["id"], asset["name"])
+' > "$work/draft-assets"
+    local asset_id asset_name
+    while read -r asset_id asset_name; do
+        gh api "repos/$repo/releases/assets/$asset_id" --header 'Accept: application/octet-stream' > "$work/served/$asset_name"
+        case "$asset_name" in
+            SHA256SUMS) cmp -s "$work/SHA256SUMS" "$work/served/$asset_name" || fail "the draft serves other sums than were packed" ;;
+            *) cmp -s "$archives/$asset_name" "$work/served/$asset_name" || fail "the draft serves other bytes than were packed for $asset_name" ;;
+        esac
+    done < "$work/draft-assets"
+
     gh api --method PATCH "repos/$repo/releases/$id" -F draft=false --silent
 
     # What a tester pins is a URL and a digest, so the release behind them has to be one nobody can
@@ -210,19 +245,13 @@ for asset in json.load(sys.stdin)["assets"]:
         sleep 3
     done
 
-    # What the release serves, fetched back by the identifier of each asset.
-    mkdir -p "$work/served"
+    # Where each asset is served, for the notes.
     gh api "repos/$repo/releases/$id" | python3 -I -c '
 import json, sys
 for asset in json.load(sys.stdin)["assets"]:
     print(asset["id"], asset["name"], asset["browser_download_url"])
 ' > "$work/served-assets"
-    local asset_id asset_name asset_url
-    while read -r asset_id asset_name asset_url; do
-        gh api "repos/$repo/releases/assets/$asset_id" --header 'Accept: application/octet-stream' > "$work/served/$asset_name"
-    done < "$work/served-assets"
-    cmp "$work/SHA256SUMS" "$work/served/SHA256SUMS" || fail "the sums the release serves are not the sums that were packed"
-    (cd "$work/served" && shasum -a 256 -c SHA256SUMS) || fail "what the release serves does not match its sums"
+    local asset_url
 
     {
         echo "The KalaReach host $release for macOS and Linux, built from commit $commit."
@@ -350,6 +379,8 @@ elif method == "POST" and path.startswith("upload://"):
     save()
 elif method == "GET" and path == f"repos/{repo}/releases":
     print(json.dumps([release_json(r) for r in state["releases"]]))
+elif method == "GET" and path == f"repos/{repo}/immutable-releases":
+    print(json.dumps({"enabled": os.environ.get("STUB_MUTABLE") != "1", "enforced_by_owner": False}))
 elif method == "GET" and path.startswith(f"repos/{repo}/releases/tags/"):
     tag = path[len(f"repos/{repo}/releases/tags/"):]
     matches = [r for r in state["releases"] if r["tag_name"] == tag and not r["draft"]]
@@ -360,7 +391,7 @@ elif method == "GET" and path.startswith(f"repos/{repo}/git/ref/tags/"):
     tag = path[len(f"repos/{repo}/git/ref/tags/"):]
     matches = [r for r in state["releases"] if r["tag_name"] == tag and not r["draft"]]
     if not matches:
-        sys.exit(1)
+        sys.exit("gh: Not Found (HTTP 404)")
     print(json.dumps({"object": {"sha": matches[0]["target"]}}))
 elif method == "GET" and path.startswith(f"repos/{repo}/releases/assets/"):
     identifier = int(path.rsplit("/", 1)[1])
@@ -417,11 +448,26 @@ PYTHON
 go() { publish --repo o/r --release "$release" --commit "$commit" --archives "$work/archives" --verified "$work/verified" --root "$work/root.json"; }
 
 case_control() { go && state_has published "host/v$release" && ! state_has draft "host/v$release"; }
-case_published() { seed_release "host/v$release" false; go; }
-case_draft() { seed_release "host/v$release" true; go; }
+case_published() { seed_release "host/v$release" false; ( go ) && return 1; state_has published "host/v$release" && ! state_has draft "host/v$release" && [ "$(nothing_created)" = yes ]; }
+case_draft() { seed_release "host/v$release" true; ( go ) && return 1; [ "$(nothing_created)" = yes ]; }
 case_staging_removed() { seed_release "host-staging/v$release" true; go && ! state_has draft "host-staging/v$release"; }
-case_corrupt() { STUB_CORRUPT=SHA256SUMS go; rc=$?; state_has draft "host/v$release" && ! state_has published "host/v$release" && exit "$rc"; exit 0; }
-case_mutable() { STUB_MUTABLE=1 go; }
+case_corrupt() { ( STUB_CORRUPT=SHA256SUMS go ) && return 1; state_has draft "host/v$release" && ! state_has published "host/v$release"; }
+case_mutable() { ( STUB_MUTABLE=1 go ) && return 1; [ "$(nothing_created)" = yes ] && ! state_has published "host/v$release"; }
+case_digest_differs() { ( go ) && return 1; [ "$(nothing_created)" = yes ]; }
+case_missing_archive() { ( go ) && return 1; [ "$(nothing_created)" = yes ]; }
+
+# "yes" when the stand-in holds no release it did not start with: nothing was created.
+nothing_created() {
+    python3 -I - "$STUB_STATE/state.json" << 'PYTHON'
+import json
+import os
+import sys
+
+path = sys.argv[1]
+state = json.load(open(path)) if os.path.exists(path) else {"releases": []}
+print("yes" if all(not release["assets"] and release["id"] == 1 for release in state["releases"]) else "no")
+PYTHON
+}
 
 self_test() {
     failures=0
@@ -457,16 +503,16 @@ json.dump({"signed": {"roles": {"targets": {"keyids": ["aa", "bb"]}}}}, open("'"
 
     run "the control: four archives at their recorded digests are published as an immutable pre-release at the commit" pass case_control
     run "a staging draft of the release is deleted once it is published" pass case_staging_removed
-    run "a published release of the tag is refused" refuse case_published
-    run "a draft of the tag is refused" refuse case_draft
-    run "a store that keeps other bytes than were uploaded leaves a draft and no release" refuse case_corrupt
-    run "a release that can be replaced is refused" refuse case_mutable
+    run "a published release of the tag is refused, and nothing is created beside it" pass case_published
+    run "a draft of the tag is refused, and nothing is created beside it" pass case_draft
+    run "a store that keeps other bytes than were uploaded leaves a draft and no release" pass case_corrupt
+    run "a repository that does not make releases immutable is refused before a draft is made" pass case_mutable
 
     printf 'changed\n' >> "$work/archives/kalareach-${targets[0]}-$release.tar.gz"
-    run "an archive that differs from the sum its check recorded is refused before anything is created" refuse case_published_never_created
+    run "an archive that differs from the sum its check recorded is refused before anything is created" pass case_digest_differs
     printf 'archive of %s\n' "${targets[0]}" > "$work/archives/kalareach-${targets[0]}-$release.tar.gz"
     rm -f "$work/archives/kalareach-${targets[3]}-$release.tar.gz"
-    run "a missing archive is refused" refuse go
+    run "a missing archive is refused before anything is created" pass case_missing_archive
 
     if [ "$failures" -ne 0 ]; then
         echo "publish-host-release: $failures self-test case(s) failed" >&2
@@ -474,7 +520,6 @@ json.dump({"signed": {"roles": {"targets": {"keyids": ["aa", "bb"]}}}}, open("'"
     fi
     echo "publish-host-release: the self-test passed"
 }
-case_published_never_created() { go; rc=$?; ! state_has draft "host/v$release" && ! state_has published "host/v$release" && exit "$rc"; exit 0; }
 
 if [ "${1:-}" = self-test ]; then
     self_test

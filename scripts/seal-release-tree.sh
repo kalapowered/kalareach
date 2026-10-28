@@ -108,7 +108,7 @@ mkdir -p "$out"
 archive="$out/$top.tar.gz"
 # No extended attributes: macOS's tar writes a second entry for each, which a release archive does
 # not hold.
-COPYFILE_DISABLE=1 tar -C "$(dirname "$tree")" -czf "$archive" "$top"
+COPYFILE_DISABLE=1 tar --no-xattrs -C "$(dirname "$tree")" -czf "$archive" "$top"
 (cd "$out" && { sha256sum "$top.tar.gz" 2> /dev/null || shasum -a 256 "$top.tar.gz"; } > SHA256SUMS)
 python3 -I "$here/check-release-archive.py" check --archive "$archive" --sums "$out/SHA256SUMS"
 python3 -I "$here/check-release-secrets.py" scan "$archive"

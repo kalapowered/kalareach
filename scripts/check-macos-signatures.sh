@@ -7,13 +7,15 @@
 #   scripts/check-macos-signatures.sh self-test
 #
 # Every mode: each file passes `codesign --verify --strict`, and the entitlements are an
-# allow-list. `bin/kr-plugin-host` has exactly `com.apple.security.cs.allow-unsigned-executable-memory`,
-# because it runs Wasmtime, which makes machine code at run time and is ended by the hardened runtime
-# without it; every other file has none. So none is sandboxed (the host runs development tools
-# unsandboxed) and none excepts itself from library validation (a module of another team is refused).
+# allow-list. `bin/kr-plugin-host` has exactly one entitlement, `com.apple.security.cs.allow-unsigned-executable-memory`
+# set to true, because it runs Wasmtime, which makes machine code at run time and is ended by the
+# hardened runtime without it; every other file has none. So none is sandboxed (the host runs
+# development tools unsandboxed) and none excepts itself from library validation (a module of another
+# team is refused).
 #
-# ad-hoc: the system's assessment refuses the file, which is the control that the check does not
-# pass everything. developer-id: each file has the hardened runtime, a three-certificate chain that
+# ad-hoc: the plugin host has the hardened runtime and no other file has it (an ad hoc signature has no
+# team, which library validation needs to load a shell's modules), and the system's assessment
+# refuses the file, which is the control that the check does not pass everything. developer-id: each file has the hardened runtime, a three-certificate chain that
 # ends at Apple, the one team that signs this project's releases, and a timestamp; the team is the
 # constant below and a designated requirement over the Developer ID leaf and intermediate says so,
 # so a Developer ID of another team, the individual team's included, is refused. notarized: each
@@ -23,9 +25,9 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-team="${KR_EXPECTED_TEAM:-L775WGST9V}"
+team="L775WGST9V"
 entitled="bin/kr-plugin-host"
-entitlement="com.apple.security.cs.allow-unsigned-executable-memory"
+entitlements_wanted='{"com.apple.security.cs.allow-unsigned-executable-memory": true}'
 
 # The Developer ID leaf and its intermediate (Apple's object identifiers 1.2.840.113635.100.6.1.13
 # and 1.2.840.113635.100.6.2.6) and the team in the leaf's subject.
@@ -33,11 +35,12 @@ requirement() {
     printf '=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] and certificate leaf[field.1.2.840.113635.100.6.1.13] and certificate leaf[subject.OU] = "%s"' "$1"
 }
 
-entitlement_keys() {
+# The file's entitlements as one JSON object with its keys sorted, or nothing when it has none.
+entitlements_of() {
     local plist
     plist="$(/usr/bin/codesign -d --entitlements :- "$1" 2> /dev/null || true)"
     [ -n "$plist" ] || return 0
-    printf '%s' "$plist" | /usr/bin/plutil -convert json -o - - | /usr/bin/python3 -I -c 'import json, sys; print("\n".join(sorted(json.load(sys.stdin))))'
+    printf '%s' "$plist" | /usr/bin/plutil -convert json -o - - | /usr/bin/python3 -I -c 'import json, sys; print(json.dumps(json.load(sys.stdin), sort_keys=True))'
 }
 
 check() {
@@ -51,15 +54,19 @@ check() {
         count=$((count + 1))
         relative="${file#"$tree"/}"
         /usr/bin/codesign --verify --strict "$file" 2> /dev/null || fail "$relative does not pass codesign --verify --strict"
-        keys="$(entitlement_keys "$file")"
+        keys="$(entitlements_of "$file")"
         if [ "$relative" = "$entitled" ]; then
-            [ "$keys" = "$entitlement" ] || fail "$relative must have the entitlement $entitlement and no other, and has: ${keys:-none}"
+            [ "$keys" = "$entitlements_wanted" ] || fail "$relative must have exactly $entitlements_wanted, and has: ${keys:-none}"
         elif [ -n "$keys" ]; then
-            fail "$relative has entitlements, and only $entitled has one: $(printf '%s' "$keys" | tr '\n' ' ')"
+            fail "$relative has entitlements, and only $entitled has one: $keys"
         fi
         details="$(/usr/bin/codesign -d --verbose=4 "$file" 2>&1 || true)"
         case "$mode" in
             ad-hoc)
+                case "$details" in
+                    *"flags="*runtime*) [ "$relative" = "$entitled" ] || fail "$relative has the hardened runtime, which an ad hoc file has only when it is the plugin host" ;;
+                    *) [ "$relative" != "$entitled" ] || fail "$relative does not have the hardened runtime" ;;
+                esac
                 if /usr/sbin/spctl --assess --type open --context context:primary-signature "$file" 2> /dev/null; then
                     fail "the system accepts the ad hoc file $relative, so this check could not tell a signed release from an unsigned one"
                 fi
@@ -114,8 +121,8 @@ self_test() {
         [ -z "$entitlements" ] || options+=(--entitlements-xml-file "$entitlements")
         "$rcodesign" sign "${options[@]}" "$work/$tree/$file" > /dev/null 2>&1
     }
-    plist_of() {
-        printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>%s</key><true/></dict></plist>\n' "$1" > "$work/$2.plist"
+    plist_of() { # <key> <name> [true|false]
+        printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>%s</key><%s/></dict></plist>\n' "$1" "${3:-true}" > "$work/$2.plist"
         printf '%s' "$work/$2.plist"
     }
     expect() { # <name> <exit wanted: 0 or 1> <tree> <mode>
@@ -141,6 +148,18 @@ self_test() {
     make_tree missing-entitlement
     resign missing-entitlement bin/kr-plugin-host "" --code-signature-flags runtime
     expect "a plugin host without its entitlement is refused" 1 missing-entitlement ad-hoc
+
+    make_tree false-entitlement
+    resign false-entitlement bin/kr-plugin-host "$(plist_of com.apple.security.cs.allow-unsigned-executable-memory off false)" --code-signature-flags runtime
+    expect "an entitlement set to false is refused" 1 false-entitlement ad-hoc
+
+    make_tree no-runtime
+    resign no-runtime bin/kr-plugin-host "$here/macos-entitlements/kr-plugin-host.plist"
+    expect "a plugin host without the hardened runtime is refused" 1 no-runtime ad-hoc
+
+    make_tree runtime-elsewhere
+    resign runtime-elsewhere shells/module "" --code-signature-flags runtime
+    expect "an ad hoc file other than the plugin host with the hardened runtime is refused" 1 runtime-elsewhere ad-hoc
 
     make_tree two-entitlements
     cat > "$work/two.plist" << 'PLIST'

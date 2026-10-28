@@ -21,10 +21,12 @@
 # `release-tree.yml`, after the run is held to the commit and each artefact to the digest GitHub
 # states for it and to the sum beside it; each tree is signed (`sign-macos-tree.sh developer-id`),
 # held to what a Developer ID release is, notarised with `notarytool`, held to what a notarised
-# release is, and packed. Unless --no-stage, the two packed trees, their sums and the notary
-# submissions are put in a draft pre-release named host-staging/v<release>, and the command that
-# starts the sealing is printed with the digest of the sums, which the workflow holds the staging
-# to. A draft is the place a command outside a workflow can leave files for one.
+# release is, and packed. Unless --no-stage, the two packed trees, the notary submissions and the run
+# and commit they were made from are put in a draft pre-release named host-staging/v<release>, with one
+# file of sums over all four, and the command that starts the sealing is printed with the digest of
+# that file, which the workflow holds the staging to. A draft is the place a command outside a
+# workflow can leave files for one. A staged release is made only from a run on main; with --no-stage a
+# run of any branch may be used, since nothing leaves this machine.
 #
 # With --archive: a release archive of an earlier run is unpacked and signed and notarised the same
 # way, nothing is staged, and the signed trees are left in the work directory.
@@ -63,6 +65,19 @@ if [ "$(uname -s)" != Darwin ]; then
 fi
 
 staging_tag() { printf 'host-staging/v%s' "$1"; }
+
+# Whether `gh api <path>` finds something: 0 when it does, 1 on a 404, and the script stops on any
+# other answer, since an error is not the same as nothing being there.
+exists() {
+    local answer
+    if answer="$(gh api "$1" 2>&1)"; then
+        return 0
+    fi
+    case "$answer" in
+        *"HTTP 404"*) return 1 ;;
+        *) echo "sign-macos-release: asking GitHub about $1 failed: $answer" >&2; exit 1 ;;
+    esac
+}
 
 # The staging draft of a release, as "<id> <draft>" lines.
 staging_of() {
@@ -185,10 +200,14 @@ manifest_fact() { # <release.json> <member>
 trees=()
 if [ -n "$run" ]; then
     facts="$(gh api "repos/$repo/actions/runs/$run" --jq '"\(.path) \(.conclusion) \(.head_sha) \(.head_branch)"')"
-    if [ "$facts" != ".github/workflows/release-tree.yml success $commit main" ]; then
-        echo "sign-macos-release: run $run is not a successful release-tree run on main at $commit: $facts" >&2
-        exit 1
+    wanted=".github/workflows/release-tree.yml success $commit"
+    if [ "$stage" -eq 1 ]; then
+        wanted="$wanted main"
     fi
+    case "$facts" in
+        "$wanted"*) ;;
+        *) echo "sign-macos-release: run $run is not a successful release-tree run at $commit$([ "$stage" -eq 1 ] && echo ' on main'): $facts" >&2; exit 1 ;;
+    esac
     gh api "repos/$repo/actions/runs/$run/artifacts" --paginate \
         --jq '.artifacts[] | "\(.id) \(.name) \(.expired) \(.digest)"' > "${TMPDIR:-/tmp}/kr-artifacts.$$"
 fi
@@ -261,8 +280,8 @@ if [ "$stage" -eq 1 ]; then
         echo "    scripts/sign-macos-release.sh --remove-staging $release" >&2
         exit 1
     fi
-    if gh api "repos/$repo/releases/tags/host/v$release" --silent 2> /dev/null; then
-        echo "sign-macos-release: host/v$release already has a release" >&2
+    if exists "repos/$repo/releases/tags/host/v$release" || exists "repos/$repo/git/ref/tags/host/v$release"; then
+        echo "sign-macos-release: host/v$release already has a release or a tag" >&2
         exit 1
     fi
 fi
@@ -285,21 +304,25 @@ for tree in "${trees[@]}"; do
     submitted="$work/$top.submit.json"
     set +e
     xcrun notarytool submit "$zip" --key "$notary" --key-id "$notary_id" --issuer "$notary_issuer" \
-        --output-format json --wait --timeout 60m > "$submitted" 2> "$work/$top.submit.err"
+        --output-format json > "$submitted" 2> "$work/$top.submit.err"
     set -e
-    submission="$(python3 -I -c 'import json, sys; d = json.load(open(sys.argv[1])); print(d.get("id", ""), d.get("status", ""))' "$submitted" 2> /dev/null || true)"
-    id="${submission%% *}"
-    status="${submission#* }"
+    id="$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1])).get("id", ""))' "$submitted" 2> /dev/null || true)"
     if [ -z "$id" ]; then
         echo "sign-macos-release: the notary service did not accept the submission of $top:" >&2
         cat "$work/$top.submit.err" >&2
         exit 1
     fi
+    echo "sign-macos-release: the notary submission of $top is $id; resume it with: xcrun notarytool wait $id --key <the notary key> --key-id <its id> --issuer <its issuer>"
+    set +e
+    xcrun notarytool wait "$id" --key "$notary" --key-id "$notary_id" --issuer "$notary_issuer" \
+        --output-format json --timeout 60m > "$work/$top.wait.json" 2> "$work/$top.wait.err"
+    set -e
+    status="$(xcrun notarytool info "$id" --key "$notary" --key-id "$notary_id" --issuer "$notary_issuer" --output-format json 2> /dev/null \
+        | python3 -I -c 'import json, sys; print(json.load(sys.stdin).get("status", ""))' 2> /dev/null || true)"
     xcrun notarytool log "$id" "$work/$top.notary-log.json" --key "$notary" --key-id "$notary_id" --issuer "$notary_issuer" > /dev/null 2>&1 || true
     if [ "$status" != Accepted ]; then
-        echo "sign-macos-release: the submission $id of $top is $status, not Accepted." >&2
-        echo "Its log, if the service has one yet, is $work/$top.notary-log.json. A submission still in progress" >&2
-        echo "is resumed with: xcrun notarytool wait $id --key <the notary key> --key-id <id> --issuer <issuer>" >&2
+        echo "sign-macos-release: the submission $id of $top is ${status:-of unknown status}, not Accepted." >&2
+        echo "Its log, if the service has one yet, is $work/$top.notary-log.json." >&2
         exit 1
     fi
     rm -f "$zip"
@@ -316,9 +339,11 @@ for tree in "${trees[@]}"; do
         sleep 30
     done
 
-    COPYFILE_DISABLE=1 tar -C "$(dirname "$tree")" -cf "$out/signed-$top.tar" "$top"
+    COPYFILE_DISABLE=1 tar --no-xattrs -C "$(dirname "$tree")" -cf "$out/signed-$top.tar" "$top"
     (cd "$out" && shasum -a 256 "signed-$top.tar") >> "$out/STAGED-SHA256SUMS"
 done
+printf 'run=%s\ncommit=%s\nrelease=%s\n' "${run:-none}" "${commit:-none}" "$release" > "$out/STAGED-RUN.txt"
+(cd "$out" && shasum -a 256 STAGED-NOTARY.txt STAGED-RUN.txt) >> "$out/STAGED-SHA256SUMS"
 sums_digest="$(sha256_of "$out/STAGED-SHA256SUMS")"
 echo "sign-macos-release: signed and notarised $release; STAGED-SHA256SUMS sha256 $sums_digest"
 cat "$out/STAGED-SHA256SUMS"
@@ -347,7 +372,7 @@ upload="${created#* }"
 upload="${upload%%\{*}"
 case "$staged_id" in '' | *[!0-9]*) echo "sign-macos-release: creating the staging draft did not name one release: $created" >&2; staged_id=""; exit 1 ;; esac
 
-for file in "$out"/signed-*.tar "$out/STAGED-SHA256SUMS" "$out/STAGED-NOTARY.txt"; do
+for file in "$out"/signed-*.tar "$out/STAGED-SHA256SUMS" "$out/STAGED-NOTARY.txt" "$out/STAGED-RUN.txt"; do
     attempt=1
     until gh api --method POST "$upload" --raw-field "name=$(basename "$file")" \
         --header 'Content-Type: application/octet-stream' --input "$file" --silent; do
@@ -360,7 +385,7 @@ for file in "$out"/signed-*.tar "$out/STAGED-SHA256SUMS" "$out/STAGED-NOTARY.txt
     done
 done
 
-for file in "$out"/signed-*.tar "$out/STAGED-SHA256SUMS" "$out/STAGED-NOTARY.txt"; do
+for file in "$out"/signed-*.tar "$out/STAGED-SHA256SUMS" "$out/STAGED-NOTARY.txt" "$out/STAGED-RUN.txt"; do
     printf '%s %s sha256:%s\n' "$(basename "$file")" "$(wc -c < "$file" | tr -d ' ')" "$(sha256_of "$file")"
 done | sort > "$work/packed-assets"
 attempt=1
