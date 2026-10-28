@@ -3,6 +3,11 @@
 # the hardened runtime, on the machine that runs it.
 #
 #   scripts/check-plugin-host-entitlement.sh [--host <kr-plugin-host>] <program> [<argument>...]
+#   scripts/check-plugin-host-entitlement.sh --probe
+#
+# With --probe only the probe below is run, and the exit status says what it found: 0 when this machine
+# enforces the hardened runtime, 10 when it does not. A workflow runs it first so as not to build what
+# it cannot use.
 #
 # <program> is a Mach-O program that compiles and runs a WebAssembly component the way the plugin
 # host does (Wasmtime writes machine code into memory and then makes it executable), such as the
@@ -32,7 +37,11 @@ set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 host=""
-if [ "${1:-}" = --host ]; then
+probe_only=0
+if [ "${1:-}" = --probe ]; then
+    probe_only=1
+    set -- probe
+elif [ "${1:-}" = --host ]; then
     host="${2:?--host needs the plugin host}"
     shift 2
 fi
@@ -50,23 +59,25 @@ trap 'rm -rf "${work:?}"' EXIT
 
 if [ -n "$host" ]; then
     cp -p "$host" "$work/host.original"
-    trap 'cp -p "$work/host.original" "$host"; rm -rf "${work:?}"' EXIT
+    trap 'cp -p "$work/host.original" "$host" && rm -rf "${work:?}"' EXIT
 fi
 
 # The program to run, signed ad hoc with the options given; with --host, the plugin host is signed in
 # place and the program is run as it is.
+# It sets $signed to the file to run, and is called as a command and not in a substitution, which
+# would hide a failure of the copy or of the signature.
 signed_copy() { # <name> <signing options...>
     local name="$1"
     shift
     if [ -n "$host" ]; then
         cp -p "$work/host.original" "$host"
         "$rcodesign" sign --binary-identifier kr-plugin-host "$@" "$host" > /dev/null 2>&1
-        echo "$program"
-        return
+        signed="$program"
+        return 0
     fi
     cp "$program" "$work/$name"
     "$rcodesign" sign --binary-identifier "$name" "$@" "$work/$name" > /dev/null 2>&1
-    echo "$work/$name"
+    signed="$work/$name"
 }
 
 attempt() { # <label> <program path>
@@ -99,13 +110,26 @@ int main(void) {
 PROBE
 /usr/bin/clang -o "$work/probe" "$work/probe.c"
 "$rcodesign" sign --binary-identifier probe --code-signature-flags runtime "$work/probe" > /dev/null 2>&1
+probe_flags="$(/usr/bin/codesign -d --verbose=2 "$work/probe" 2>&1 || true)"
+case "$probe_flags" in
+    *"flags="*runtime*) ;;
+    *) echo "check-plugin-host-entitlement: the probe does not carry the hardened runtime, so it shows nothing" >&2; exit 1 ;;
+esac
 if { "$work/probe" > /dev/null 2>&1; } 2> /dev/null; then
-    echo "check-plugin-host-entitlement: this machine does not enforce the hardened runtime on code made at run time (a program signed with it and no entitlement runs one), so nothing is shown here; the check is made on a Mac that enforces it"
+    message="this machine does not enforce the hardened runtime on code made at run time (a program signed with it and no entitlement runs one), so nothing is shown here; the check is made on a Mac that enforces it"
+    if [ "${GITHUB_ACTIONS:-}" = true ]; then
+        echo "::warning::check-plugin-host-entitlement: $message"
+    else
+        echo "check-plugin-host-entitlement: $message"
+    fi
+    [ "$probe_only" -eq 0 ] || exit 10
     exit 0
 fi
 echo "check-plugin-host-entitlement: ok: this machine enforces the hardened runtime on code made at run time"
+[ "$probe_only" -eq 0 ] || exit 0
 
-plain="$(signed_copy plain)"
+signed_copy plain
+plain="$signed"
 rc="$(attempt "without the hardened runtime" "$plain")"
 if [ "$rc" -eq 0 ]; then
     echo "check-plugin-host-entitlement: ok: without the hardened runtime the command succeeds"
@@ -115,7 +139,8 @@ else
     exit 1
 fi
 
-hardened="$(signed_copy hardened --code-signature-flags runtime)"
+signed_copy hardened --code-signature-flags runtime
+hardened="$signed"
 rc="$(attempt "with the hardened runtime and no entitlement" "$hardened")"
 if [ "$rc" -ne 0 ]; then
     echo "check-plugin-host-entitlement: ok: with the hardened runtime and no entitlement the command is ended (exit $rc)"
@@ -124,7 +149,8 @@ else
     failed=1
 fi
 
-entitled="$(signed_copy entitled --code-signature-flags runtime --entitlements-xml-file "$here/macos-entitlements/kr-plugin-host.plist")"
+signed_copy entitled --code-signature-flags runtime --entitlements-xml-file "$here/macos-entitlements/kr-plugin-host.plist"
+entitled="$signed"
 rc="$(attempt "with the hardened runtime and the entitlement" "$entitled")"
 if [ "$rc" -eq 0 ]; then
     echo "check-plugin-host-entitlement: ok: with the hardened runtime and the entitlement the command succeeds"
