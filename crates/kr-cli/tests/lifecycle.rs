@@ -4746,8 +4746,8 @@ fn a_window_whose_shell_a_signal_ended_is_held_and_one_closed_on_request_is_not(
     let (killed, created) = host.create_in_window_with("--hold-on-failure", "IFS= read -r _");
     let killing = killed.mark();
     killed.type_text(b"kill -KILL $$\r");
-    killed.wait_until_single_key(killing, "new-finished-", "kr waits for a key");
     killed.wait_for(killing, HELD, "the window says it is held");
+    killed.wait_until_single_key(killing, "new-finished-", "kr waits for a key");
     killed.type_text(b"x");
     killed.attachment_ended(
         killing,
