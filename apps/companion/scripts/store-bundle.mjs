@@ -29,7 +29,9 @@
 //        --certificate <upload-certificate.pem> [--abis arm64-v8a,x86_64] [--secret-file <path> ...]
 //        [--firebase <google-services.json>] [--record <store-build.json>] [--note key=value ...]
 //   node scripts/store-bundle.mjs --ios <app.ipa | KalaReach.app> --stage archive|export
-//        --version-code <n> --version-name <v> [--secret-file <path> ...] [--record <file>]
+//        --version-code <n> --version-name <v> [--skip-app-checks] [--secret-file <path> ...] [--record <file>]
+//   `--skip-app-checks` leaves out the privacy-manifest and debug-code checks, which a caller runs on its own.
+//   The record is written whether the bundle holds or not: it says which, and why.
 // Exit 0 when the bundle holds, 1 when it does not, 2 when it could not be read.
 import { Buffer } from 'node:buffer'
 import { spawnSync } from 'node:child_process'
@@ -453,9 +455,11 @@ export function checkIos(options) {
     facts.secretsFound = places
     if (places > 0) problems.push(`a secret file's text is in ${places} files of the application`)
 
-    for (const [script, what] of [['privacy-manifest.mjs', 'privacy manifest'], ['debug-code.mjs', 'debug code']]) {
-      const answer = run(process.execPath, [join(SCRIPTS, script), app])
-      if (answer.status !== 0) problems.push(`the ${what} check fails: ${(answer.stdout + answer.stderr).trim().split('\n').slice(-3).join(' | ')}`)
+    if (!options.skipAppChecks) {
+      for (const [script, what] of [['privacy-manifest.mjs', 'privacy manifest'], ['debug-code.mjs', 'debug code']]) {
+        const answer = run(process.execPath, [join(SCRIPTS, script), app])
+        if (answer.status !== 0) problems.push(`the ${what} check fails: ${(answer.stdout + answer.stderr).trim().split('\n').slice(-3).join(' | ')}`)
+      }
     }
   } finally {
     if (unpacked) rmSync(unpacked.root, { recursive: true, force: true })
@@ -491,6 +495,8 @@ function parse(argv) {
     } else if (VALUE_FLAGS[flag]) {
       options[VALUE_FLAGS[flag]] = take(index)
       index += 1
+    } else if (flag === '--skip-app-checks') {
+      options.skipAppChecks = true
     } else if (flag === '--abis') {
       options.abis = take(index).split(',')
       index += 1
@@ -530,11 +536,7 @@ if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) 
     process.exit(2)
   }
   const shown = relative(process.cwd(), options.path)
-  if (result.problems.length > 0) {
-    console.error(`${shown}:\n${[...new Set(result.problems)].map((each) => `  ${each}`).join('\n')}`)
-    process.exit(1)
-  }
-  console.log(`${shown}: holds for ${options.platform} (version ${options.versionName}, build ${options.versionCode})`)
+  const problems = [...new Set(result.problems)]
   if (options.record) {
     const stats = statSync(options.path)
     const record = {
@@ -545,9 +547,16 @@ if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) 
       versionCode: Number(options.versionCode),
       bytes: stats.size,
       sha256: stats.isFile() ? sha256(options.path) : null,
+      holds: problems.length === 0,
+      problems,
       ...result.facts,
       ...options.notes
     }
     writeFileSync(options.record, `${JSON.stringify(record, null, 2)}\n`)
   }
+  if (problems.length > 0) {
+    console.error(`${shown}:\n${problems.map((each) => `  ${each}`).join('\n')}`)
+    process.exit(1)
+  }
+  console.log(`${shown}: holds for ${options.platform} (version ${options.versionName}, build ${options.versionCode})`)
 }
