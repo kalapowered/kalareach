@@ -96,15 +96,25 @@ impl Wrote {
     /// This write, recorded as it must be while it is made over `before`: a profile an install again
     /// leaves in an unknown state, because the take-back failed, holds what `before` wrote or what
     /// this does. A file is replaced or put back whole, so it has no such state.
+    ///
+    /// What `before` already kept as the earlier values stays: a second install that fails after a
+    /// first one that could not take itself back must not lose the values the profile still holds.
+    /// Only a write that holds, or a removal, ends that state.
     #[must_use]
     pub fn over(self, before: &Self) -> Self {
         match (self, before) {
             (Self::Settings(mut now), Self::Settings(was)) => {
-                now.earlier = Some(was.keys.clone());
+                let mut alternatives = was.earlier.clone().unwrap_or_default();
+                for key in &was.keys {
+                    if !alternatives.contains(key) {
+                        alternatives.push(key.clone());
+                    }
+                }
+                now.earlier = Some(alternatives);
                 Self::Settings(now)
             }
             (Self::Preferences(mut now), Self::Preferences(was)) => {
-                now.earlier = Some(was.canonical.clone());
+                now.earlier = Some(was.earlier.clone().unwrap_or_else(|| was.canonical.clone()));
                 Self::Preferences(now)
             }
             (now, _) => now,
@@ -548,5 +558,62 @@ mod tests {
                 text
             );
         }
+    }
+
+    fn key(name: &str, value: &str) -> RecordedKey {
+        RecordedKey {
+            key: name.to_owned(),
+            value: value.to_owned(),
+        }
+    }
+
+    fn settings(command: &str, earlier: Option<Vec<RecordedKey>>) -> SettingsWrote {
+        SettingsWrote {
+            schema: "schema".to_owned(),
+            path: "/path/".to_owned(),
+            keys: vec![key("custom-command", command)],
+            list: RecordedList {
+                schema: "list".to_owned(),
+                key: "list".to_owned(),
+                member: "member".to_owned(),
+            },
+            earlier,
+        }
+    }
+
+    fn preferences(canonical: &str, earlier: Option<&str>) -> PreferencesWrote {
+        PreferencesWrote {
+            domain: "domain".to_owned(),
+            key: "Window Settings".to_owned(),
+            entry: "KalaReach".to_owned(),
+            canonical: canonical.to_owned(),
+            earlier: earlier.map(str::to_owned),
+        }
+    }
+
+    /// KR-REQ-01.21: an install made over a profile whose earlier install could not take itself back
+    /// keeps the values the profile held before that install, whichever way the record is written
+    /// again, until a write holds or a removal has restored them.
+    #[test]
+    fn a_record_made_over_an_unknown_state_keeps_the_first_values() {
+        let first = Wrote::Settings(settings("'a'", None));
+        let second = Wrote::Settings(settings("'b'", None)).over(&first);
+        let third = Wrote::Settings(settings("'b'", None)).over(&second);
+        let Wrote::Settings(third) = third else {
+            panic!("settings stay settings");
+        };
+        let earlier = third.earlier.expect("the earlier values are kept");
+        assert!(
+            earlier.contains(&key("custom-command", "'a'")),
+            "the first install's values are still there: {earlier:?}"
+        );
+
+        let first = Wrote::Preferences(preferences("<a/>", None));
+        let second = Wrote::Preferences(preferences("<b/>", None)).over(&first);
+        let third = Wrote::Preferences(preferences("<b/>", None)).over(&second);
+        let Wrote::Preferences(third) = third else {
+            panic!("preferences stay preferences");
+        };
+        assert_eq!(third.earlier.as_deref(), Some("<a/>"));
     }
 }

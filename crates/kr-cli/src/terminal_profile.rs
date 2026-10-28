@@ -940,6 +940,11 @@ fn failure(error: &ProfileError, home: &ProfileHome) -> CliError {
              service does; run this in a desktop session. What was written has been taken back",
             Shown::said(terminal.name())
         )),
+        ProfileError::Changing(terminal) => CliError::Other(shown!(
+            "{}'s preferences changed while kr was about to write them, so kr wrote nothing; what \
+             is recorded is kept, and running this again tries again",
+            Shown::said(terminal.name())
+        )),
         ProfileError::ListBusy(terminal) => CliError::Other(shown!(
             "{}'s list of profiles changed each time kr tried to write it, so whether the profile is \
              in it is not known: kr host terminal-profile status says, and running this again \
