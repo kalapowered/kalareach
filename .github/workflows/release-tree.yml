@@ -372,6 +372,7 @@ jobs:
             identity="$(cat "$root/shells/zsh/current")"
             "$root/shells/zsh/$identity/bin/zsh" -f -c 'zmodload zsh/zle && print -r -- "zle loaded from $module_path[1]"'
           done
+          bash scripts/check-host-start.sh "$store/current/bin/kr"
 
       # The release after this one, made of the same programs, so that an upgrade has a release to
       # go to. It is sealed with this run's keys like the first, and is no more a release than it.
