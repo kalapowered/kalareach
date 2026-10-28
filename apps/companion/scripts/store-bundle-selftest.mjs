@@ -28,6 +28,7 @@ import {
   problemsInAndroidLibraries,
   problemsInAndroidManifest,
   problemsInElf,
+  problemsInFirebase,
   problemsInProfile,
   problemsInSignature,
   problemsInVersions,
@@ -148,6 +149,18 @@ heldProblems('an architecture nobody asked for is refused', libraries(bundleOf('
   'architectures arm64-v8a, armeabi-v7a, x86_64'
 ])
 heldProblems('a bundle with a 4 KB library is refused', libraries(bundleOf('small', ['arm64-v8a'], 4096), ['arm64-v8a']), ['aligns a loadable segment'])
+
+// -- the push configuration ------------------------------------------------------------------
+
+const configuration = {
+  project_info: { project_id: 'example-project' },
+  client: [{ client_info: { mobilesdk_app_id: '1:123:android:abc', android_client_info: { package_name: 'to.kala.reach' } } }]
+}
+const table = Buffer.from('xx example-project yy 1:123:android:abc zz')
+held('a bundle that carries the application\'s Firebase configuration passes', [], problemsInFirebase(table, configuration, 'to.kala.reach'))
+heldProblems('a bundle without the configuration is refused', problemsInFirebase(Buffer.from('nothing'), configuration, 'to.kala.reach'), ['does not carry the Firebase configuration'])
+heldProblems('a bundle with only the project is refused', problemsInFirebase(Buffer.from('example-project'), configuration, 'to.kala.reach'), ['does not carry'])
+heldProblems('a configuration for another application is refused', problemsInFirebase(table, configuration, 'to.kala.other'), ['names no application to.kala.other'])
 
 // -- secrets -------------------------------------------------------------------------------------
 

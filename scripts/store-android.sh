@@ -162,8 +162,17 @@ if [ "$mode" = device ]; then
     "$adb" -s "$serial" install -r "$apk" >>"$log" 2>&1 || { say "the package did not install"; exit 2; }
     "$adb" -s "$serial" shell pm grant "$app_id" android.permission.POST_NOTIFICATIONS >>"$log" 2>&1
     "$adb" -s "$serial" logcat -c
-    "$adb" -s "$serial" shell monkey -p "$app_id" -c android.intent.category.LAUNCHER 1 >>"$log" 2>&1
-    sleep 20
+    # Started the way the repository's other launch check starts it, and waited for: `am start -W`
+    # says whether the activity came up, and the process is then looked for until it appears.
+    started="$("$adb" -s "$serial" shell am start -W -n "$app_id/.MainActivity" 2>&1 | tr -d '\r')"
+    printf '%s\n' "$started" >"$leg/am-start.txt"
+    pid=""
+    for _ in $(seq 1 30); do
+        pid="$("$adb" -s "$serial" shell pidof "$app_id" 2>/dev/null | tr -d '\r')"
+        [ -n "$pid" ] && break
+        sleep 1
+    done
+    sleep 10
     pid="$("$adb" -s "$serial" shell pidof "$app_id" 2>/dev/null | tr -d '\r')"
     "$adb" -s "$serial" exec-out screencap -p >"$shots/store-launch-$version_code.png" 2>/dev/null
     "$adb" -s "$serial" logcat -d -b crash >"$leg/crash.log" 2>&1
@@ -173,7 +182,7 @@ if [ "$mode" = device ]; then
     if [ -n "$pid" ]; then
         say "check=the store-signed application starts and is running ok=1 detail=pid $pid"
     else
-        say "check=the store-signed application starts and is running ok=0"
+        say "check=the store-signed application starts and is running ok=0 detail=$(tr '\n' ' ' <"$leg/am-start.txt" | cut -c1-200)"
         status=2
     fi
     if [ -z "$(tr -d '[:space:]' <"$leg/crash.log")" ]; then
@@ -188,7 +197,7 @@ if [ "$mode" = device ]; then
         say "check=the installed version code is $version_code ok=0"
         status=2
     fi
-    say "Firebase lines in the log: $(grep -c -i 'FirebaseApp' "$leg/logcat.log" || true); app links: $(tr -s ' ' <"$leg/app-links.txt" | grep -E 'reach.kala.to|Domain verification state' | head -3 | tr '\n' ';')"
+    say "app links as the platform reports them: $(tr -s ' ' <"$leg/app-links.txt" | grep -E 'reach.kala.to|Domain verification state' | head -3 | tr '\n' ';')"
     finish
     emulator_pid=""
     trap - EXIT
@@ -250,7 +259,7 @@ commit="$(git -C "$here" rev-parse HEAD)"
 dirty=false
 [ -z "$(git -C "$here" status --porcelain --untracked-files=no)" ] || dirty=true
 node "$companion/scripts/store-bundle.mjs" --android "$signed" --version-code "$number" --version-name "$version" \
-    --certificate "$certificate" --secret-file "$password_file" --bundletool "$bundletool" \
+    --certificate "$certificate" --secret-file "$password_file" --bundletool "$bundletool" --firebase "$firebase" \
     --record "$out/store-build.json" \
     --note "commit=$commit" --note "uncommittedChanges=$dirty" --note "ndk=$ndk_version" \
     --note "abis=arm64-v8a,x86_64" --note "builtAt=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
