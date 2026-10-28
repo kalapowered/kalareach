@@ -284,7 +284,9 @@ fn check_ownership(
 
 /// Writes the entry into the dictionary of profiles, and checks by another process that the entry
 /// is there as it was written and that no other profile moved. A write that is not takes itself
-/// back: the entry only, never a profile or a preference of the person's own.
+/// back: the entry only, never a profile or a preference of the person's own, but for taking out an
+/// entry that was not there, which writes the dictionary of profiles whole while it is as the read
+/// just before shows it.
 ///
 /// # Errors
 ///
@@ -415,18 +417,28 @@ fn write_without(domain: &str, seen: &[u8]) -> Result<bool, ProfileError> {
 }
 
 /// The profile's entry as the preferences hold it now, in the text a record keeps it in, or `None`
-/// where there is none.
+/// where there is none, for a record that names it as `recorded`.
 ///
 /// # Errors
 ///
-/// Returns the failure of a tool: an entry that cannot be read is not one that is not there.
-pub(super) fn current_entry(domain: &str) -> Result<Option<String>, ProfileError> {
-    let exported = export(domain)?;
-    entry(&exported, &entry_path(PROFILE_NAME))?
-        .map(|present| {
-            normal(&present).map(|text| String::from_utf8_lossy(&text).trim().to_owned())
-        })
-        .transpose()
+/// Returns the failure of a tool: an entry that cannot be read is not one that is not there. An
+/// entry that is not one `recorded` names is [`ProfileError::Changed`]: it is not kr's, so it is not
+/// to be written into a record as if it were.
+pub(super) fn current_entry(recorded: &PreferencesWrote) -> Result<Option<String>, ProfileError> {
+    let exported = export(&recorded.domain)?;
+    let Some(present) = entry(&exported, &entry_path(PROFILE_NAME))? else {
+        return Ok(None);
+    };
+    if !is_recorded(&present, recorded)? {
+        return Err(ProfileError::Changed {
+            place: std::path::PathBuf::from(entry_path(PROFILE_NAME)),
+        });
+    }
+    Ok(Some(
+        String::from_utf8_lossy(&normal(&present)?)
+            .trim()
+            .to_owned(),
+    ))
 }
 
 /// Where the entry stands against what was written.
@@ -734,43 +746,109 @@ mod tests {
         // The profiles are written into the file whole: `defaults` itself reads a backslash in the
         // name it is given as an escape, which Terminal's own names do not.
         let names = [" Work.Dark", "Work.Dark", "p\\q", "m\\.n", "a.b\\c"];
-        let profiles: String = names
-            .iter()
-            .map(|name| format!("<key>{name}</key>{}", profile_of(name, "found")))
-            .collect();
-        std::fs::write(
-            format!("{domain}.plist"),
+        let profiles = |kr: bool| -> String {
+            names
+                .iter()
+                .map(|name| {
+                    let marker = match *name {
+                        " Work.Dark" => "spaced",
+                        "Work.Dark" => "dotted",
+                        _ => "found",
+                    };
+                    format!("<key>{name}</key>{}", profile_of(name, marker))
+                })
+                .chain(kr.then(|| {
+                    format!(
+                        "<key>{PROFILE_NAME}</key>{}",
+                        profile_of(PROFILE_NAME, "ours")
+                    )
+                }))
+                .collect()
+        };
+        let preferences = |kr: bool| {
             format!(
                 r#"<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict>
 <key>Default Window Settings</key><string> Work.Dark</string>
 <key>Window Settings</key><dict>
-<key>Basic</key><dict><key>name</key><string>Basic</string></dict>{profiles}</dict></dict></plist>"#
-            ),
-        )
-        .expect("preferences");
+<key>Basic</key><dict><key>name</key><string>Basic</string></dict>{}</dict></dict></plist>"#,
+                profiles(kr)
+            )
+        };
+        std::fs::write(format!("{domain}.plist"), preferences(false)).expect("preferences");
         let mut home = ProfileHome::under(&directory, Vec::new());
         home.terminal_preferences = domain.clone();
         let plan = plan(&home, "kr new --attach --hold-on-failure", None).expect("a plan");
         assert!(
-            plan.entry.contains("found") && plan.entry.contains("KalaReach"),
-            "the default's own profile is the one copied, not Basic: {}",
+            plan.entry.contains("spaced") && !plan.entry.contains("dotted"),
+            "the profile named as the default, spaces and all, is the one copied: {}",
             plan.entry
         );
         // `plutil` reads `\.` as a dot of the name and every other backslash as itself.
         assert_eq!(entry_path("a.b\\c"), "Window Settings.a\\.b\\c");
-        let exported = export(&domain).expect("exports");
-        for name in names {
-            let found = entry(&exported, &entry_path(name)).expect("reads");
-            assert!(
-                found.is_some_and(|text| String::from_utf8_lossy(&text).contains("found")),
-                "{name}"
-            );
-        }
-        assert_eq!(current_entry(&domain).expect("reads"), None);
-        put_profile(&domain, PROFILE_NAME, &profile_of(PROFILE_NAME, "now"));
-        let now = current_entry(&domain).expect("reads").expect("there");
-        assert!(now.contains("now"), "{now}");
+        let finds_every_name = |exported: &[u8]| {
+            for name in names {
+                let found = entry(exported, &entry_path(name)).expect("reads");
+                assert!(
+                    found.is_some_and(|text| !text.is_empty()),
+                    "{name} is found"
+                );
+            }
+        };
+        finds_every_name(&export(&domain).expect("exports"));
+
+        // A removal writes the dictionary through `defaults`, and those names come out of it as
+        // they went in.
+        std::fs::write(format!("{domain}.plist"), preferences(true)).expect("preferences");
+        let seen = export(&domain).expect("exports");
+        assert!(write_without(&domain, &seen).expect("answers"));
+        let after = export(&domain).expect("exports");
+        finds_every_name(&after);
+        assert!(
+            entry(&after, &entry_path(PROFILE_NAME))
+                .expect("reads")
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// KR-REQ-01.21: the entry an install again records as what it holds is read against the record:
+    /// the entry the record names is recorded, none is none, and one that is not the record's is a
+    /// changed profile and is not written into a record as kr's.
+    #[test]
+    fn an_entry_that_is_not_the_recorded_one_is_not_recorded_as_kr_s() {
+        let (directory, domain) = scratch("recorded");
+        let recorded = |canonical: String| PreferencesWrote {
+            domain: domain.clone(),
+            key: WINDOW_SETTINGS.to_owned(),
+            entry: PROFILE_NAME.to_owned(),
+            canonical,
+            earlier: None,
+        };
+        assert_eq!(
+            current_entry(&recorded(String::new())).expect("reads"),
+            None
+        );
+        put_profile(&domain, PROFILE_NAME, &profile_of(PROFILE_NAME, "ours"));
+        let ours = current_entry(&recorded(String::new()));
+        assert!(
+            matches!(ours, Err(ProfileError::Changed { .. })),
+            "an entry the record does not name: {ours:?}"
+        );
+        let text = entry(
+            &export(&domain).expect("exports"),
+            &entry_path(PROFILE_NAME),
+        )
+        .expect("reads")
+        .expect("there");
+        let known = recorded(String::from_utf8_lossy(&text).into_owned());
+        let now = current_entry(&known).expect("reads").expect("there");
+        assert!(now.contains("ours"), "{now}");
+        put_profile(&domain, PROFILE_NAME, &profile_of(PROFILE_NAME, "theirs"));
+        assert!(matches!(
+            current_entry(&known),
+            Err(ProfileError::Changed { .. })
+        ));
         let _ = std::fs::remove_dir_all(directory);
     }
 }

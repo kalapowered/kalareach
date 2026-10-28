@@ -752,9 +752,9 @@ of the person's shell is installed, and how `kr new` starts the control daemon.
 These are usage failures (exit 2). A failure of `gsettings`, `defaults` or `plutil`, of the record or
 of a file exits 1. `--dry-run` skips the check for a running Terminal. `defaults` reads the user's
 own preferences whatever `HOME` says; `KR_TERMINAL_PREFERENCES_DIR`, an absolute directory, makes
-`kr` take Terminal's and iTerm2's preferences from files of that name under it
-(`com.apple.Terminal`, `com.googlecode.iterm2`), so a run that must not reach the person's own
-names a directory of its own.
+`kr` take Terminal's and iTerm2's preferences from the files `com.apple.Terminal.plist` and
+`com.googlecode.iterm2.plist` under it (`defaults` adds the extension to the path), so a run that
+must not reach the person's own names a directory of its own.
 
 An install that fails after it began writing takes back what it wrote. For GNOME Terminal and
 Ptyxis the keys go back to what they held when the write began, which for an install again is the
