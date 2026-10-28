@@ -1763,8 +1763,9 @@ fn a_re_read_keeps_only_the_reports_within_its_bounds() {
 }
 
 /// KR-REQ-25.06: a declared output below a link the run planted is not reached. Each component
-/// of a declared path is opened without following a link, so a link to a directory outside the
-/// copy lends the reader of reports nothing; the control is the same file below a real directory.
+/// of a declared path is opened without following a link, so neither a link to a directory outside
+/// the copy nor one to a directory beside it inside the copy lends the reader of reports a file;
+/// the control is the same file below a real directory.
 #[test]
 fn a_declared_output_below_a_planted_link_is_not_read() {
     let fixture = Fixture::create();
@@ -1775,30 +1776,44 @@ fn a_declared_output_below_a_planted_link_is_not_read() {
         "<testsuite><testcase name=\"a\"/></testsuite>\n",
     );
 
-    let (record, made) = a_copy_to_run_in(&fixture, "above");
-    let directory = Path::new(&made.directory_path);
-    std::os::unix::fs::symlink(&outside, directory.join("reports"))
-        .expect("a link to a directory outside the copy");
-    let outputs = declared(&fixture, &record, &["reports/junit.xml"]).expect("a declaration");
-    let binding = binding::bind_run(fixture.service(), made.materialisation_id, &outputs);
-    let recorded = materialise::record_result(
-        fixture.service(),
-        made.materialisation_id,
-        &report(),
-        &outputs,
-        &binding,
-    )
-    .expect("the result is recorded");
-    assert!(recorded.declared.is_empty(), "{:?}", recorded.declared);
-    assert!(
-        recorded
-            .result
-            .outputs
-            .iter()
-            .all(|output| output.label != "reports/junit.xml"),
-        "{:?}",
-        recorded.result.outputs
-    );
+    for (name, target) in [
+        ("above", outside.to_str().expect("a path").to_owned()),
+        ("beside", "kept-beside".to_owned()),
+    ] {
+        let (record, made) = a_copy_to_run_in(&fixture, name);
+        let directory = Path::new(&made.directory_path);
+        write(
+            directory,
+            "kept-beside/junit.xml",
+            "<testsuite><testcase name=\"a\"/></testsuite>\n",
+        );
+        std::os::unix::fs::symlink(&target, directory.join("reports"))
+            .expect("a link to a directory");
+        let outputs = declared(&fixture, &record, &["reports/junit.xml"]).expect("a declaration");
+        let binding = binding::bind_run(fixture.service(), made.materialisation_id, &outputs);
+        let recorded = materialise::record_result(
+            fixture.service(),
+            made.materialisation_id,
+            &report(),
+            &outputs,
+            &binding,
+        )
+        .expect("the result is recorded");
+        assert!(
+            recorded.declared.is_empty(),
+            "{name}: {:?}",
+            recorded.declared
+        );
+        assert!(
+            recorded
+                .result
+                .outputs
+                .iter()
+                .all(|output| output.label != "reports/junit.xml"),
+            "{name}: {:?}",
+            recorded.result.outputs
+        );
+    }
 
     let (record, made) = a_copy_to_run_in(&fixture, "real");
     let directory = Path::new(&made.directory_path);
