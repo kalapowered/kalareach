@@ -700,28 +700,32 @@ A test result is what this host observed, and nothing a caller reports.
   and leaves no record. What was read is kept in a store of its own, `test-reports.sqlite3`, bound
   to the run, the path and the digest the result records for that output. `changeset.test_reports`
   answers it to the local owner, and `kr changeset test-reports` prints it. A report whose digest is
-  not the one its run's result records is not served. A store this host cannot use (a file that is
-  not a database, a schema it does not read, a row that names no run it can read) does not stop the
-  daemon: the file is left as it is, nothing is kept in it or answered from it,
-  `changeset.test_reports` answers that storage is unavailable, and the evidence says the report was
-  read and not kept. A reading is labelled `parsed`: the host read the document as that format and
-  counted the cases itself, so the totals come from the cases and never from the counts the tool
-  wrote in its own header. A case with a `failure` is failed, one with an `error` is errored, and a
-  skipped one is skipped. A case that failed and then passed on a rerun counts as passed and also as
-  flaky. In a Go stream, a subtest and the test that holds it each count; a package that failed with
-  no failed test, and a build that failed, are each one errored case. A report keeps the names and
-  outcomes of up to 50 cases that did not pass plainly, in document order, with names cut at 128
-  bytes, and counts the rest. It keeps no failure message, stack trace or output: the code under
-  test wrote that text, and it stays in the session's retained history. A document that opens as a
-  format and cannot be read says why. It is over the 16 MiB a report may be (32 MiB for the reports
-  of one run), nests deeper than 24 elements, holds more than 2,000,000 events or lines, has a `go
-  test -json` line over 1 MiB or tests that failed in more than 20,000 packages, declares a document
-  type or an encoding other than UTF-8, or is not well formed (an XML document with more than one
-  root, text outside its root, or more than 1,000 lines in a `go test -json` stream that are not
-  events). Nothing is expanded; only the five predefined entities and numeric references are read.
-  The reading never changes the node. The node follows the suite's exit status as it always did, and
-  a report that disagrees with it, or that cannot be read or kept, is recorded or said beside it.
-  This host reads no runner's human-readable output.
+  not the one its run's result records is not served. When the daemon starts it lets go of the
+  reports of a run the change-set store holds no result for, which is what a change-set store
+  restored from an older copy leaves behind; that is permanent, so restoring the newer store
+  afterwards does not bring those reports back. A store this host cannot use (a file that is not a
+  database, a schema it does not read, a row that names no run it can read) does not stop the
+  daemon: the file is left as it is (it is looked at through a connection that cannot write before
+  it is opened for writing), nothing is kept in it or answered from it, `changeset.test_reports`
+  answers that storage is unavailable, and the evidence says the report was read and not kept. A
+  reading is labelled `parsed`: the host read the document as that format and counted the cases
+  itself, so the totals come from the cases and never from the counts the tool wrote in its own
+  header. A case with a `failure` is failed, one with an `error` is errored, and a skipped one is
+  skipped. A case that failed and then passed on a rerun counts as passed and also as flaky. In a Go
+  stream, a subtest and the test that holds it each count; a package that failed with no failed
+  test, and a build that failed, are each one errored case. A report keeps the names and outcomes of
+  up to 50 cases that did not pass plainly, in document order, with names cut at 128 bytes, and
+  counts the rest. It keeps no failure message, stack trace or output: the code under test wrote
+  that text, and it stays in the session's retained history. A document that opens as a format and
+  cannot be read says why. It is over the 16 MiB a report may be (32 MiB for the reports of one
+  run), nests deeper than 24 elements, holds more than 2,000,000 events or lines, has a `go test
+  -json` line over 1 MiB or tests that failed in more than 20,000 packages, declares a document type
+  or an encoding other than UTF-8, or is not well formed (an XML document with more than one root,
+  text outside its root, or more than 1,000 lines in a `go test -json` stream that are not events).
+  Nothing is expanded; only the five predefined entities and numeric references are read. The
+  reading never changes the node. The node follows the suite's exit status as it always did, and a
+  report that disagrees with it, or that cannot be read or kept, is recorded or said beside it. This
+  host reads no runner's human-readable output.
 * **The copy's release.** A copy is taken away by the dispatch at once when no suite ran (the copy
   could not be written whole, or its session could not be made), and otherwise once the session has
   closed and its worker is accounted for; the sweep takes away any other copy. A node that settles
