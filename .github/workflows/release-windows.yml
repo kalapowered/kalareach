@@ -423,8 +423,10 @@ jobs:
     name: sign and publish
     needs: [gate, build]
     # A release tag and the default branch only: a run on any other ref skips this job and never
-    # reaches the environment.
-    if: ${{ github.ref_type == 'tag' || github.ref_name == github.event.repository.default_branch }}
+    # reaches the environment. And only once the repository variable below is set: a host tag
+    # also starts this workflow, and until a Windows host is released the job is skipped, so no
+    # approval is asked for it. The variable is created when a Windows host release is.
+    if: ${{ vars.WINDOWS_HOST_RELEASE == 'true' && (github.ref_type == 'tag' || github.ref_name == github.event.repository.default_branch) }}
     runs-on: windows-2025
     timeout-minutes: 90
     # The federated credential Entra holds names this environment, so a run without it cannot
