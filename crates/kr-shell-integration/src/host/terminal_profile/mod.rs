@@ -142,9 +142,10 @@ pub struct ProfileHome {
     pub terminal_preferences: String,
     /// How the settings database is reached for the applications that keep profiles in it.
     pub settings: gsettings::Gsettings,
-    /// The directory this run is confined to, where [`PREFERENCES_DIRECTORY_VARIABLE`] is set: a
-    /// record that names a profile file or a preferences path outside it was made by a run that was
-    /// not confined, and is left alone.
+    /// The directory this run is confined to, where [`PREFERENCES_DIRECTORY_VARIABLE`] is set: the
+    /// home, which is not the account's own. A record that names a profile file or a preferences
+    /// path outside it was made by a run that was not confined and is left alone, and an install
+    /// that would write a profile file outside it is refused.
     pub confined_to: Option<PathBuf>,
 }
 
@@ -152,10 +153,14 @@ pub struct ProfileHome {
 /// in for, in place of the system's own domains. `defaults` reads the user's real domains whatever
 /// `HOME` says, so a run that must not reach them (a test's) names a directory of its own here.
 ///
-/// The directory must be an absolute path inside the home the run uses, and the run is then
-/// confined to that home: every read and write is of its own files, and a record that names a
-/// profile outside the home is refused. An empty value, a relative path or a path outside the home
-/// is refused too, never read as unset, since a run that sets the variable means to stay away from
+/// The directory must be an absolute path inside the home the run uses, and that home must not be
+/// the account's own: a run that keeps the account's home would work on the user's real profile
+/// files beside the scratch preferences. The run is then confined to that home: the preferences
+/// Terminal and iTerm2 keep and the profile files of the applications are its own, a record that
+/// names a profile outside the home is refused, and so is an install that would write one outside
+/// it. The settings of GNOME Terminal and Ptyxis are the session's own settings database's, which
+/// the variable does not move. An empty value, a relative path, a path outside the home or an own
+/// home is refused, never read as unset, since a run that sets the variable means to stay away from
 /// the user's own preferences.
 pub const PREFERENCES_DIRECTORY_VARIABLE: &str = "KR_TERMINAL_PREFERENCES_DIR";
 
@@ -172,6 +177,39 @@ pub enum HomeError {
          it is empty, relative or outside it, and nothing was read or written"
     )]
     PreferencesDirectory,
+    /// [`PREFERENCES_DIRECTORY_VARIABLE`] is set and the home this run uses is the account's own,
+    /// so the files kr would work on beside the scratch preferences are the user's real ones.
+    #[error(
+        "{PREFERENCES_DIRECTORY_VARIABLE} is for a run whose home is not the account's own; \
+         nothing was read or written"
+    )]
+    OwnHome,
+}
+
+/// Whether `home` is the account's own home directory. Where the system's record of the account
+/// cannot be read, a Unix home is taken to be the account's own, since a run that means to stay
+/// away from it should not go on on a guess; other platforms keep no such record and have no
+/// preferences to redirect.
+fn is_the_accounts_own(home: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        let Some(own) = kr_ipc::paths::passwd_entry().and_then(|entry| entry.home) else {
+            return true;
+        };
+        let same = |left: &Path, right: &Path| {
+            left == right
+                || matches!(
+                    (std::fs::canonicalize(left), std::fs::canonicalize(right)),
+                    (Ok(left), Ok(right)) if left == right
+                )
+        };
+        same(home, Path::new(&own))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = home;
+        false
+    }
 }
 
 /// The preferences domain called `name`, in `directory` where one is named.
@@ -203,16 +241,18 @@ impl ProfileHome {
             None => None,
             Some(directory) => {
                 let directory = PathBuf::from(directory);
-                if directory.is_absolute()
+                if !(directory.is_absolute()
                     && directory.starts_with(&home)
                     && !directory
                         .components()
-                        .any(|part| part == std::path::Component::ParentDir)
+                        .any(|part| part == std::path::Component::ParentDir))
                 {
-                    Some(directory)
-                } else {
                     return Err(HomeError::PreferencesDirectory);
                 }
+                if is_the_accounts_own(&home) {
+                    return Err(HomeError::OwnHome);
+                }
+                Some(directory)
             }
         };
         Ok(Self {
@@ -275,6 +315,15 @@ impl ProfileHome {
                 ],
             },
         }
+    }
+
+    /// Whether this run may write the profile file at `path`: always, unless it is confined to a
+    /// directory, and then only inside it.
+    #[must_use]
+    pub fn may_write(&self, path: &Path) -> bool {
+        self.confined_to
+            .as_deref()
+            .is_none_or(|root| path.starts_with(root))
     }
 
     /// Whether this run may work on what `profile` names: always, unless it is confined to a
@@ -534,7 +583,9 @@ pub fn plan(
     if !is_present(terminal, home) {
         return Err(ProfileError::NotInstalled(terminal));
     }
-    if recorded.is_some_and(|profile| !home.confines(profile)) {
+    if recorded.is_some_and(|profile| !home.confines(profile))
+        || profile_path(terminal, home).is_some_and(|destination| !home.may_write(&destination))
+    {
         return Err(ProfileError::Outside(terminal));
     }
     match terminal {
