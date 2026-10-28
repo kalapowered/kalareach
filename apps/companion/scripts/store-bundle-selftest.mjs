@@ -24,6 +24,7 @@ import { withArchive } from './android-classes.mjs'
 import {
   ANDROID_PERMISSIONS,
   certificateFingerprint,
+  failureLines,
   placesWithSecret,
   problemsInAndroidLibraries,
   problemsInAndroidManifest,
@@ -32,6 +33,7 @@ import {
   problemsInProfile,
   problemsInSignature,
   problemsInVersions,
+  profileFromXml,
   secretNeedles
 } from './store-bundle.mjs'
 import { ENTITLEMENT_SOURCES, entitlementsOfArchive } from './store-ios-sign.mjs'
@@ -237,6 +239,34 @@ const development = {
 heldProblems('a development profile is refused', problemsInProfile(development, where), ['push environment', 'debugger', 'lists devices'])
 heldProblems('a profile of another team is refused', problemsInProfile({ ...appStore, TeamIdentifier: ['JT6GW3W9W6'] }, where), ['its team is JT6GW3W9W6'])
 heldProblems('an expired profile is refused', problemsInProfile({ ...appStore, ExpirationDate: '2020-01-01T00:00:00Z' }, where), ['expired'])
+
+// A profile as Apple makes one: with certificates (data) and dates, which a whole-file conversion to
+// JSON refuses, and with no device list.
+const profileXml = `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>Name</key><string>iOS Team Store Provisioning Profile: to.kala.reach</string>
+<key>UUID</key><string>70ce149f-4fe0-48f6-b681-f66c63f4421e</string>
+<key>TeamIdentifier</key><array><string>${TEAM}</string></array>
+<key>CreationDate</key><date>2026-10-28T14:20:40Z</date>
+<key>ExpirationDate</key><date>2099-01-01T00:00:00Z</date>
+<key>DeveloperCertificates</key><array><data>AAEC</data></array>
+<key>Entitlements</key><dict>
+<key>application-identifier</key><string>${TEAM}.to.kala.reach</string>
+<key>aps-environment</key><string>production</string>
+<key>get-task-allow</key><false/>
+</dict></dict></plist>`
+const extensionProfile = { ...appStore, Entitlements: { 'application-identifier': `${TEAM}.to.kala.reach.notifications`, 'get-task-allow': false } }
+held('the extension\'s profile needs no push environment', [], problemsInProfile(extensionProfile, { team: TEAM, identifier: 'to.kala.reach.notifications', push: false }))
+heldProblems('the application\'s profile does', problemsInProfile(extensionProfile, { team: TEAM, identifier: 'to.kala.reach.notifications' }), ['push environment'])
+held(
+  'a failing check is quoted from its problem count, not from the notes before it',
+  'KalaReach: uses fstat',
+  failureLines('9 notes (not failures):\n  the manifest in a.bundle: empty\n1 problem:\n  KalaReach: uses fstat\n')
+)
+const read = profileFromXml(Buffer.from(profileXml))
+held('a profile with dates and data is read key by key', [], problemsInProfile(read, where))
+held('an App Store profile has no device list', undefined, read.ProvisionedDevices)
+held('a profile is read with its name', 'iOS Team Store Provisioning Profile: to.kala.reach', read.Name)
 
 const versions = { versionCode: 39800, versionName: '0.1.0' }
 const info = (code, name) => ({ CFBundleVersion: code, CFBundleShortVersionString: name })
