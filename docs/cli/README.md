@@ -749,19 +749,25 @@ of the person's shell is installed, and how `kr new` starts the control daemon.
   or over SSH. Terminal's preferences must also hold a profile to copy.
 
 These are usage failures (exit 2). A failure of `gsettings`, `defaults` or `plutil`, of the record or
-of a file exits 1. `--dry-run` skips the check for a running Terminal.
+of a file exits 1. `--dry-run` skips the check for a running Terminal. `defaults` reads the user's
+own preferences whatever `HOME` says; `KR_TERMINAL_PREFERENCES_DIR`, an absolute directory, makes
+`kr` take Terminal's and iTerm2's preferences from files of that name under it
+(`com.apple.Terminal`, `com.googlecode.iterm2`), so a run that must not reach the person's own
+names a directory of its own.
 
 An install that fails after it began writing takes back what it wrote. For GNOME Terminal and
 Ptyxis the keys go back to what they held when the write began, which for an install again is the
 profile `kr` wrote before, and a profile that was in the list stays in it; each key put back is read
-back by another process, and a key that is not back keeps the record's entry. Before a key changes,
+back by another process, and a key that is not back keeps the record's entry; a key the person
+changed after `kr` wrote it is not put back over. Before a key changes,
 `kr` reads it again, and a key the person changed since the keys were read for the write stops the
 install as a changed profile, with the keys it had written put back and the person's key as it is.
 For Terminal the preferences are read again by another process, and an entry that is not as written,
 or another profile that moved, puts this entry back as it was before the write (the entry, or none)
-and touches nothing else: an entry the person changed since the write is not put back, and taking
-out an entry that was not there before writes the dictionary of profiles only while it is as the
-read just before shows it. For a file, an
+and touches nothing else but for one case: an entry the person changed since the write is not put
+back, and taking out an entry that was not there before writes the dictionary of profiles whole,
+only while the preferences are as the read just before shows them, with the named limit of a removal
+below. For a file, an
 install again over a profile the person saved to since the install was planned does not overwrite
 it: the person's file is put back and the install fails as a changed profile. Terminal's entry is
 checked against the record again on the preferences as they are when the write is made, so an entry
@@ -771,7 +777,8 @@ may hold what it held before or what was to be written, or for GNOME Terminal an
 each: the record then keeps both, so the profile still reads as `kr`'s, `status` does not call it
 changed, and `install` or `remove` run again finishes the job. An install again that fails once more
 keeps the values the profile held before the first one failed, beside the ones it was to write, until
-a write holds or a removal has taken the profile out.
+a write holds or a removal has taken the profile out; for Terminal, whose entry is written whole,
+the record names the entry it holds when the install again begins.
 
 `install` records what it will write in `terminal-profiles.json` in the installation's state
 directory before it writes anything: for a file its path and its SHA-256, for settings the keys and
@@ -792,8 +799,9 @@ by hand (`dconf`, which needs no schema). A profile that is not in the applicati
 the person's sight: `remove` takes
 its settings out, and `install` puts it back in the list. A removal of GNOME Terminal's or Ptyxis's
 profile reads each of its keys before it writes anything, and again just before it resets the key.
-A key that holds something the person put there stops the removal as a changed profile: that key and
-those after it are left as they are, and the record forgets the profile. A reset that the settings
+A key that holds something the person put there stops the removal as a changed profile: the keys
+already reset and the profile's place in the list are put back, so the profile is left as `kr` found
+it, and the record forgets it; if they cannot be put back the record keeps the entry. A reset that the settings
 say worked and did not keep is a failure, and the record keeps the entry.
 
 `remove` without an application takes out every profile in the record, and `--dry-run` says what
