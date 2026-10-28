@@ -80,8 +80,16 @@ kr_store_receipt() (
     receipt="$KR_STORE_ROOT/receipts/$platform"
     mkdir -p "$KR_STORE_ROOT/receipts" || exit 2
     exec 9>>"$receipt.flock" || exit 2
-    if ! lockf -s -t "${KR_STORE_LOCK_WAIT:-60}" 9; then
-        kr_store_say "the receipt for $platform is locked by another run" >&2
+    limit="${KR_STORE_LOCK_WAIT:-60}"
+    case "$limit" in
+        *[!0-9]*) kr_store_say "KR_STORE_LOCK_WAIT must be a whole number of seconds, not '$limit'" >&2; exit 2 ;;
+    esac
+    lockf -s -t "$limit" 9
+    locked=$?
+    if [ "$locked" != 0 ]; then
+        # 75 is lockf's answer when another process holds the lock.
+        if [ "$locked" = 75 ]; then kr_store_say "the receipt for $platform is locked by another run" >&2
+        else kr_store_say "lockf failed with status $locked, so the receipt for $platform cannot be written" >&2; fi
         exit 2
     fi
     old=0
