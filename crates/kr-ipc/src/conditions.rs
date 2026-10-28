@@ -267,7 +267,10 @@ mod windows {
         };
         let mut zones = Vec::new();
         for item in items {
-            // SAFETY: the format asked for a long, so the value is the union's 32-bit member.
+            // SAFETY: the format asked for a long, so the value is the union's 32-bit member when
+            // the counter was formatted. For an item whose status is a failure the bytes are still
+            // initialised (the buffer was zeroed and the call wrote into it) and every bit pattern
+            // is an `i32`; `counted` gives no limit for such an item and ignores this number.
             let limit = unsafe { item.FmtValue.Anonymous.longValue };
             // SAFETY: the name is a null-terminated wide string the call placed in the buffer,
             // which is still held.
@@ -337,7 +340,7 @@ mod tests {
     /// A zone as a counter reported it: a status that holds data gives its number, the first
     /// reading after a change included, and a counter that held no data, or a number below nought,
     /// gives a listed zone with no limit. Statuses are the system's: 0 valid data, 1 new data, and
-    /// the failures Performance Data Helper returns for a counter that cannot be read.
+    /// three of the failures Performance Data Helper returns for a counter that cannot be read.
     #[test]
     fn a_zone_the_counters_gave_no_reading_of_is_listed_with_no_limit() {
         let zone = |status, value| ThermalZone::counted("zone".to_owned(), status, value);
@@ -360,8 +363,17 @@ mod tests {
             None,
             "a counter that is not there"
         );
+        assert_eq!(
+            limit(0xC000_0BBA_u32, 100),
+            None,
+            "a counter with invalid data (PDH_CSTATUS_INVALID_DATA)"
+        );
         assert_eq!(limit(0, -1), None, "a number below nought");
-        assert_eq!(zone(2, 100).name, "zone", "and the zone stays in the list");
+        assert_eq!(
+            zone(0xC000_0BBA_u32, 100).name,
+            "zone",
+            "and the name is kept"
+        );
     }
 
     /// The machine's own management data, asked through PowerShell, and what this module reads

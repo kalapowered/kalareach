@@ -548,9 +548,9 @@ fn the_thermal_zones_a_platform_lists_say_how_hot_the_host_is() {
     );
 }
 
-/// KR-REQ-22.13: a Windows host reads its power source and, when it lists a thermal zone, how hot it
-/// is; what the policy is given is what the system said, and a reading the system would not give
-/// stays unqualified.
+/// KR-REQ-22.13: a Windows host reads its power source and, when it lists a thermal zone and reads
+/// each one, how hot it is; a power source the system would not name, and a host that lists no
+/// zone, stay unqualified.
 #[cfg(windows)]
 #[test]
 fn a_windows_host_reads_its_power_source_and_its_thermal_zones() {

@@ -627,8 +627,10 @@ pub mod platform {
     fn thermal() -> Signal<ThermalState> {
         // The passive limit of each thermal zone the platform reports: the share of the processors'
         // top speed it allows because of heat, which is the platform saying it is holding
-        // something back. The worst zone decides. A machine with no zone to read is not thereby
-        // hot, and says nothing.
+        // something back. `thermal_of_zones` says how the zones are put together: the worst zone
+        // that was read decides when it is limited, a zone that was listed and not read keeps the
+        // host from reading as nominal, and a machine with no zone to read is not thereby hot and
+        // says nothing.
         thermal_of_zones(&kr_ipc::conditions::thermal_zones())
     }
 
