@@ -30,7 +30,9 @@
     "test:debug-code": "node scripts/debug-code-selftest.mjs",
     "test:firebase-configuration": "node scripts/firebase-configuration-selftest.mjs",
     "test:firebase-android-configuration": "node scripts/firebase-android-configuration-selftest.mjs",
-    "test:sign-ios": "node scripts/sign-ios-selftest.mjs"
+    "test:sign-ios": "node scripts/sign-ios-selftest.mjs",
+    "store-bundle": "node scripts/store-bundle.mjs",
+    "test:store-bundle": "node scripts/store-bundle-selftest.mjs"
   },
   "dependencies": {
     "@kalareach/plugin-sdk": "workspace:*",
