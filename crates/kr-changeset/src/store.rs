@@ -1427,6 +1427,21 @@ impl Store {
         transaction.commit().map_err(ChangeSetError::store)
     }
 
+    /// Returns whether a result is recorded against one materialisation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChangeSetError::StoreUnavailable`] when the read fails.
+    pub fn has_result(&self, materialisation_id: MaterialisationId) -> Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM results WHERE materialisation_id = ?1)",
+                params![uuid_bytes(materialisation_id.get())],
+                |row| row.get(0),
+            )
+            .map_err(ChangeSetError::store)
+    }
+
     /// Returns every result recorded against the materialisations of one version.
     ///
     /// # Errors

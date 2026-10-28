@@ -16,8 +16,10 @@ kr-ipc.workspace = true
 kr-project = { workspace = true }
 kr-protocol.workspace = true
 kr-transfer.workspace = true
+quick-xml.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
 serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 uuid.workspace = true
 

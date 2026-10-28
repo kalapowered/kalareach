@@ -351,6 +351,9 @@ impl AuthoritySource for HostGrants {
 /// nobody produced.
 pub struct HostActions {
     changesets: Arc<ChangeSetService>,
+    /// Where what a suite's test reports held is kept, beside the result the change-set service
+    /// records for the run.
+    reports: Arc<crate::test_reports::Reports>,
     authority: Arc<dyn AuthoritySource>,
     daemon: Arc<Daemon>,
     environment_id: EnvironmentId,
@@ -587,6 +590,7 @@ impl ActionRunner for HostActions {
         let node_context = NodeContext {
             daemon: Arc::clone(&self.daemon),
             changesets: Arc::clone(&self.changesets),
+            reports: Arc::clone(&self.reports),
             ledger: Arc::clone(&self.ledger),
             scratch_root: self.scratch_root.clone(),
             holds: Arc::clone(&self.holds),
@@ -799,6 +803,7 @@ impl HeldGrant {
 struct NodeContext {
     daemon: Arc<Daemon>,
     changesets: Arc<ChangeSetService>,
+    reports: Arc<crate::test_reports::Reports>,
     ledger: Arc<ResourceLedger>,
     scratch_root: PathBuf,
     holds: Arc<std::sync::Mutex<()>>,
@@ -1880,24 +1885,30 @@ async fn observe_tests(
             run.version,
             run.suite.to_owned(),
         );
+        let reports = Arc::clone(&context.reports);
         let session_id = run.session_id;
         blocking(
             move || -> kr_changeset::Result<kr_protocol::changeset::MaterialisationResult> {
-                let result =
+                let recorded =
                     materialise::record_result(&changesets, id, &report, &outputs, &binding)?;
+                // What the suite's reports held is read after the result is recorded and never
+                // changes it, the evidence or the node: a report that cannot be read or kept is
+                // said in the evidence line and nowhere else.
+                let reports_said = keep_reports(&reports, &recorded);
                 changesets.record_evidence(
                     version.change_set_id,
                     version.version,
                     EvidenceKind::TestResult,
                     &format!(
-                        "suite '{suite}' in session {session_id} {ended}; the tested source is {}",
-                        match result.tested_source {
+                        "suite '{suite}' in session {session_id} {ended}; the tested source is \
+                         {}{reports_said}",
+                        match recorded.result.tested_source {
                             TestedSource::UnmodifiedVersion => "this version, unmodified",
                             TestedSource::Indeterminate => "indeterminate",
                         }
                     ),
                 )?;
-                Ok(result)
+                Ok(recorded.result)
             },
         )
         .await
@@ -1933,6 +1944,63 @@ async fn observe_tests(
         },
         other => other,
     })
+}
+
+/// Reads each declared output of a run that is a test report in a documented format, keeps what it
+/// held in the store of reports, and says in a clause of the evidence line how that went. Nothing
+/// when no output was a report.
+///
+/// Reading and keeping are best effort and say so: nothing here can fail the node, change its
+/// outcome or stop its result and evidence from being recorded.
+fn keep_reports(
+    reports: &crate::test_reports::Reports,
+    recorded: &materialise::Recorded,
+) -> String {
+    use kr_protocol::test_report::{ReportReading, TestReport};
+
+    let (mut parsed, mut unread, mut unkept) = (0_u64, 0_u64, 0_u64);
+    let (mut tests, mut not_passed) = (0_u64, 0_u64);
+    for output in &recorded.declared {
+        let Some(contents) = &output.contents else {
+            continue;
+        };
+        let Some((format, reading)) =
+            kr_changeset::report::read(&contents.bytes, contents.complete)
+        else {
+            continue;
+        };
+        match &reading {
+            ReportReading::Parsed { totals, .. } => {
+                parsed += 1;
+                tests += totals.tests.get();
+                not_passed += totals.failed.get() + totals.errored.get();
+            }
+            ReportReading::Unreadable { .. } => unread += 1,
+        }
+        let report = TestReport {
+            materialisation_id: recorded.result.materialisation_id,
+            output_path: output.reference.label.clone(),
+            output_digest: output.reference.digest,
+            output_bytes: output.reference.byte_len,
+            format,
+            reading,
+            recorded_at_ms: recorded.result.recorded_at_ms,
+        };
+        if reports.record(&report).is_err() {
+            unkept += 1;
+        }
+    }
+    if parsed + unread == 0 {
+        return String::new();
+    }
+    let mut said = format!(
+        "; reports: {parsed} read ({tests} tests, {not_passed} failed or errored), {unread} not \
+         read"
+    );
+    if unkept > 0 {
+        said.push_str(&format!(", {unkept} read and not kept"));
+    }
+    said
 }
 
 /// Whether a closure could not account for the session's own worker, which may then still write
@@ -2768,8 +2836,19 @@ impl AutomationModule {
                     detail: kr_project::git::redact(&error.to_string()),
                 })?
         };
+        // What the suites' test reports held is kept in a store of its own beside the journal, as
+        // the ledger is: the change-set store's format is read by the release before this one.
+        let reports = {
+            let state_dir = state_dir.clone();
+            tokio::task::spawn_blocking(move || crate::test_reports::Reports::open(&state_dir))
+                .await
+                .map_err(|_| ControllerError::RegistryUnavailable {
+                    detail: "the store of test reports could not be opened".to_owned(),
+                })??
+        };
         let actions = Arc::new(HostActions {
             changesets,
+            reports: Arc::new(reports),
             authority: Arc::clone(&grants),
             daemon: Arc::clone(&daemon),
             environment_id,
