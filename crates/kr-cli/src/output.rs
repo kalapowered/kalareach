@@ -1387,6 +1387,10 @@ mod tests {
         assert_closed::<kr_protocol::changeset::TreeSummary>();
         assert_closed::<kr_protocol::changeset::VersionRef>();
         assert_closed::<kr_protocol::project::ContentClass>();
+        assert_closed::<kr_protocol::test_report::ReportFormat>();
+        assert_closed::<kr_protocol::test_report::ReportOutcome>();
+        assert_closed::<kr_protocol::test_report::ReportTotals>();
+        assert_closed::<kr_protocol::test_report::UnreadableReason>();
         assert_closed::<kr_protocol::ids::CausalRootId>();
         assert_closed::<kr_protocol::ids::ChangeSetId>();
         assert_closed::<kr_protocol::ids::ChangeSetVersion>();
