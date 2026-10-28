@@ -153,7 +153,10 @@ The version comes out of the workspace rather than being typed, and the workflow
 the runner and refuses a tag that names either the version or the commit wrongly. That refusal
 happens before anything is built.
 
-Pushing the tag starts the run. The initial `gate` job settles the exact 40-character commit SHA
+Pushing the tag starts the run. The macOS and Linux releases are published by `release-host.yml`
+([the procedure](macos-signing.md)), which makes its tag by publishing and so starts no workflow.
+The `release` job below also requires the repository variable `WINDOWS_HOST_RELEASE` to be `true`:
+while the variable is unset the job shows as skipped and asks no one for an approval. The initial `gate` job settles the exact 40-character commit SHA
 from `github.sha` (or `inputs.ref`) and records it in the job summary and outputs. The `build` job,
 once for each Windows target and with no environment and no secret, checks out that exact SHA, builds,
 assembles the tree, and proves it: it signs the manifest with keys of its own, packs it, and holds
@@ -381,19 +384,12 @@ run is suspected, or signing access must be revoked immediately:
      and time it lists, the earliest Microsoft accepts, and releases again each Windows release whose
      `share/signatures.txt` names the thumbprint of one of them. Where the start of the window is not
      known, the owner takes the earliest time it could have begun.
-5. Treat the Apple signing credentials as leaked, whatever step 4 finds:
-   - A run that could use the weakened environment could read the Apple Developer ID certificate, its
-     password and the notary key (`docs/releases/keys.md`), and copying them leaves no Azure signature
-     and no sign in the logs. They stay valid outside GitHub.
-   - The project owner revokes the notary key in App Store Connect, which stops the copied key from
-     notarising at once. The Apple developer account cannot revoke a Developer ID certificate: the
-     owner asks Apple to revoke it by email to `product-security@apple.com`, saying that its private
-     key is compromised, and creates a new Developer ID certificate in the account. Apple's revocation
-     stops users installing any app the old certificate signed, so each macOS release it signed that must
-     stay installable is released again from a new commit, under that commit's tag, signed with the new
-     certificate.
-   - No macOS release is signed until the new certificate and notary key are in the new environment,
-     and the old ones are never put there.
+5. Check the macOS and Linux channel too, whatever step 4 finds. The Apple signing credentials are not
+   behind the `release-signing` environment: they are files on the machine that runs
+   `scripts/sign-macos-release.sh`, and no run of a workflow reads them. The update channel's two
+   release keys are secrets of the `update-signing` environment, which a weakened `release-signing`
+   environment does not reach. If either environment or that machine is in doubt, the project owner replaces the
+   credentials it held, as [the macOS and Linux procedure](macos-signing.md#keys-and-replacing-them) describes.
 6. Controlled restoration via identity and subject rotation (Required):
    - A GitHub Actions OIDC token assertion (`iss`, `aud`, `sub`) is bound to the repository and
      environment subject, not the Azure Client ID. Restoring under the same subject or reusing the old
@@ -403,11 +399,8 @@ run is suspected, or signing access must be revoked immediately:
      application identity:
      1. The GitHub repository administrator creates a new, distinct GitHub environment (for example
         `release-signing-v2`) with fresh required reviewers and deployment branch/tag policies. The
-        environment `release-signing` is named by both `release-windows.yml` and the `sign` job of
-        `release-tree.yml` (macOS and Linux trees), and the Apple signing and notarisation secrets and the variables with their
-        identifiers are read behind it, so the new environment takes over those too: it gets the
-        replacement credentials of step 5 and never the old ones, and the compromised environment is
-        deleted only once both workflows name the new one.
+        environment `release-signing` is named by `release-windows.yml` alone, so the compromised
+        environment is deleted once that workflow names the new one.
      2. The Entra application administrator creates a new application registration and service principal,
         configured with a federated credential scoped strictly to the new environment subject
         (`repo:kalapowered@290383971/kalareach@1371146076:environment:release-signing-v2`). The old
