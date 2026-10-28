@@ -165,9 +165,32 @@ fn a_package_failure_with_no_failed_test_is_a_case_of_its_own() {
     );
     let (_, totals, cases, _) = parsed(stream.as_bytes());
     assert_eq!(totals, [2, 0, 1, 1, 0, 0]);
+    // In the order of the stream: the failure of `a` comes before the test that failed in `b`.
     assert_eq!(
         names(&cases),
-        [("TestX".to_owned(), Failed), ("a".to_owned(), Errored)]
+        [("a".to_owned(), Errored), ("TestX".to_owned(), Failed)]
+    );
+}
+
+/// Two packages whose names agree up to the cut that is kept for display are two packages: a test
+/// failing in one does not hide the failure of the other.
+#[test]
+fn packages_whose_names_agree_up_to_the_cut_are_told_apart() {
+    let shared = "p".repeat(MAX_REPORT_NAME_BYTES + 10);
+    let stream = [
+        format!(r#"{{"Action":"fail","Package":"{shared}/one","Test":"TestX"}}"#),
+        format!(r#"{{"Action":"fail","Package":"{shared}/one"}}"#),
+        format!(r#"{{"Action":"fail","Package":"{shared}/two"}}"#),
+    ]
+    .join("\n");
+    let (_, totals, cases, _) = parsed(stream.as_bytes());
+    assert_eq!(totals, [2, 0, 1, 1, 0, 0]);
+    assert_eq!(
+        names(&cases),
+        [
+            ("TestX".to_owned(), Failed),
+            ("p".repeat(MAX_REPORT_NAME_BYTES), Errored)
+        ]
     );
 }
 
@@ -213,6 +236,15 @@ fn what_is_not_a_report_is_not_one_and_what_cannot_be_read_says_why() {
         refused(b"<testsuite><testcase name=\"a\"/></testcase></testsuite>"),
         UnreadableReason::Malformed
     );
+    // A case outside the root element is no part of the report; nor is a second root, or text
+    // after the root.
+    for outside in [
+        &b"<testsuite/><testcase name=\"outside\"><failure/></testcase>"[..],
+        b"<testsuite><testcase name=\"a\"/></testsuite><testsuite><testcase name=\"b\"/></testsuite>",
+        b"<testsuite><testcase name=\"a\"/></testsuite>trailing text",
+    ] {
+        assert_eq!(refused(outside), UnreadableReason::Malformed, "{outside:?}");
+    }
 
     // A file longer than a run keeps is recognised from its opening and refused as over size.
     let opening = &fixture("nextest-0.9.146.junit.xml")[..4096];

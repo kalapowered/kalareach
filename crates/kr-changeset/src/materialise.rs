@@ -955,10 +955,11 @@ fn walk(
 pub struct DeclaredOutput {
     /// What the result records about it.
     pub reference: OutputReference,
-    /// What a file's reading left, for a caller that reads reports: the bytes the reference's
-    /// digest was taken from, kept whole for a file of at most [`MAX_REPORT_FILE_BYTES`] while the
-    /// run's kept bytes stay within [`MAX_REPORT_BYTES_PER_RUN`], and otherwise only the first
-    /// [`OPENING_BYTES`] of it. Nothing for an output that is not a file this host could read.
+    /// What a file's reading left, for a caller that reads reports: for a file whose opening shows
+    /// a documented report format, the bytes the reference's digest was taken from, kept whole for
+    /// a file of at most [`MAX_REPORT_FILE_BYTES`] while the run's kept bytes stay within
+    /// [`MAX_REPORT_BYTES_PER_RUN`], and otherwise only the first [`OPENING_BYTES`] of it. Nothing
+    /// for an output that shows no such format, or that is not a file this host could read.
     pub contents: Option<FileContents>,
 }
 
@@ -974,8 +975,8 @@ pub struct FileContents {
 /// The largest declared file whose bytes a re-read keeps whole for a reader of reports.
 pub const MAX_REPORT_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
-/// The most bytes of declared files a re-read keeps whole in one run. A file that would pass it
-/// keeps its opening only, so a suite that declares sixteen large files does not hold them all.
+/// The most bytes of report files a re-read keeps whole in one run. A report that would pass it
+/// keeps its opening only, so a suite that declares sixteen large reports does not hold them all.
 pub const MAX_REPORT_BYTES_PER_RUN: u64 = 32 * 1024 * 1024;
 
 /// How much of the start of a declared file a re-read keeps when it keeps the file's opening only.
@@ -1065,22 +1066,32 @@ fn describe_output(
                 };
                 let described = reference(kind, &head, length);
                 // The bytes are the ones the digest covers, so what a reader of them parses is
-                // what the result records.
+                // what the result records. Only a file whose opening shows a documented format is
+                // kept, and only that file spends the run's budget; any other is read for its
+                // digest and let go. A file kept by its opening is copied out, so that the buffer
+                // it was read into goes with the read.
                 let read = head.len() as u64;
-                let whole = read <= MAX_REPORT_FILE_BYTES
+                let contents = if crate::report::recognise(&head).is_none() {
+                    None
+                } else if read <= MAX_REPORT_FILE_BYTES
                     && spent.saturating_add(read) <= MAX_REPORT_BYTES_PER_RUN
-                    && read == length;
-                if whole {
+                    && read == length
+                {
                     *spent += read;
+                    head.shrink_to_fit();
+                    Some(FileContents {
+                        bytes: head,
+                        complete: true,
+                    })
                 } else {
-                    head.truncate(OPENING_BYTES);
-                }
+                    Some(FileContents {
+                        bytes: head[..head.len().min(OPENING_BYTES)].to_vec(),
+                        complete: false,
+                    })
+                };
                 DeclaredOutput {
                     reference: described,
-                    contents: Some(FileContents {
-                        bytes: head,
-                        complete: whole,
-                    }),
+                    contents,
                 }
             }
             Err(_) => without_contents(reference("unreadable output", b"", 0)),
