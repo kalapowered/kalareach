@@ -423,20 +423,34 @@ pub mod platform {
         }
     }
 
-    /// What a set of thermal zones says of the heat: the worst of them, and nothing when the
-    /// machine lists none.
+    /// What a set of thermal zones says of the heat: the worst of the zones that were read, and
+    /// nothing when the machine lists none.
+    ///
+    /// A zone the platform listed and gave no reading of is not one that holds nothing back, so
+    /// the host is nominal only when every zone was read and none is limited. A zone that was
+    /// read as limited is still heat, whatever the others did.
     #[must_use]
     pub fn thermal_of_zones(zones: &[kr_ipc::conditions::ThermalZone]) -> Signal<ThermalState> {
-        zones
+        let worst = zones
             .iter()
-            .map(|zone| thermal_of_speed_limit(zone.passive_limit_percent))
-            .max()
-            .map_or(
-                Signal::Unqualified {
-                    why: "this host reported no thermal zone",
-                },
-                Signal::Qualified,
-            )
+            .filter_map(|zone| zone.passive_limit_percent)
+            .map(thermal_of_speed_limit)
+            .max();
+        let unread = zones
+            .iter()
+            .any(|zone| zone.passive_limit_percent.is_none());
+        match (worst, unread) {
+            (Some(heat @ (ThermalState::Elevated | ThermalState::Critical)), _) => {
+                Signal::Qualified(heat)
+            }
+            (_, true) => Signal::Unqualified {
+                why: "this host listed a thermal zone it gave no reading of",
+            },
+            (Some(nominal), false) => Signal::Qualified(nominal),
+            (None, false) => Signal::Unqualified {
+                why: "this host reported no thermal zone",
+            },
+        }
     }
 
     fn memory() -> (Signal<u64>, Signal<u64>) {

@@ -64,8 +64,31 @@ pub struct ThermalZone {
     /// The zone's name, as the platform names it.
     pub name: String,
     /// The share of the processors' top speed the platform is allowing because of heat, in percent:
-    /// 100 when it holds nothing back.
-    pub passive_limit_percent: u32,
+    /// 100 when it holds nothing back. Nothing when the platform listed the zone and gave no usable
+    /// reading of it: a counter that held no data, or a value below nought.
+    pub passive_limit_percent: Option<u32>,
+}
+
+/// The status of a counter whose value is a reading, and the status of the first reading after a
+/// change, which is a reading too. The Windows module holds these equal to the system's own.
+#[cfg(any(windows, test))]
+const STATUS_VALID_DATA: u32 = 0;
+#[cfg(any(windows, test))]
+const STATUS_NEW_DATA: u32 = 1;
+
+impl ThermalZone {
+    /// A zone as a counter reported it: `status` is the counter's status and `value` the number it
+    /// formatted. A reading counts when the status says the counter holds data and the number is
+    /// not below nought; any other zone is listed with no limit, so that a zone the platform could
+    /// not read is never taken for one that holds nothing back.
+    #[cfg(any(windows, test))]
+    fn counted(name: String, status: u32, value: i32) -> Self {
+        let held = status == STATUS_VALID_DATA || status == STATUS_NEW_DATA;
+        Self {
+            name,
+            passive_limit_percent: held.then(|| u32::try_from(value).ok()).flatten(),
+        }
+    }
 }
 
 /// Reads where the machine's power comes from.
@@ -92,7 +115,8 @@ pub const fn power_status() -> Option<PowerStatus> {
     None
 }
 
-/// Reads the passive limit of every thermal zone the platform reports.
+/// Reads the passive limit of every thermal zone the platform reports, each zone in the list
+/// whether or not it could be read.
 ///
 /// An empty list means the machine has no zone to read, or the platform would not read them.
 #[cfg(windows)]
@@ -132,11 +156,11 @@ mod windows {
     /// in every language.
     const PASSIVE_LIMIT: &str = r"\Thermal Zone Information(*)\% Passive Limit";
 
-    /// Whether a counter value's status says it holds data: the first reading of a counter after
-    /// a change reports new data, and both statuses are readings.
-    const fn holds_data(status: u32) -> bool {
-        status == PDH_CSTATUS_VALID_DATA || status == PDH_CSTATUS_NEW_DATA
-    }
+    // The statuses the pure reading of a zone counts are the system's own.
+    const _: () = assert!(
+        super::STATUS_VALID_DATA == PDH_CSTATUS_VALID_DATA
+            && super::STATUS_NEW_DATA == PDH_CSTATUS_NEW_DATA
+    );
 
     pub(super) fn power_status() -> Option<PowerStatus> {
         let mut status = SYSTEM_POWER_STATUS {
@@ -243,20 +267,12 @@ mod windows {
         };
         let mut zones = Vec::new();
         for item in items {
-            if !holds_data(item.FmtValue.CStatus) {
-                continue;
-            }
             // SAFETY: the format asked for a long, so the value is the union's 32-bit member.
             let limit = unsafe { item.FmtValue.Anonymous.longValue };
             // SAFETY: the name is a null-terminated wide string the call placed in the buffer,
             // which is still held.
             let name = unsafe { wide_string(item.szName) };
-            if let Ok(passive_limit_percent) = u32::try_from(limit) {
-                zones.push(ThermalZone {
-                    name,
-                    passive_limit_percent,
-                });
-            }
+            zones.push(ThermalZone::counted(name, item.FmtValue.CStatus, limit));
         }
         Some(zones)
     }
@@ -285,7 +301,7 @@ mod windows {
 
 #[cfg(test)]
 mod tests {
-    use super::{PowerStatus, Supply};
+    use super::{PowerStatus, Supply, ThermalZone};
 
     /// Windows' power-status call, answered with the bytes machines returned: a desktop with no
     /// battery that is plugged in (recorded on the Windows test machine, whose class has no
@@ -318,6 +334,36 @@ mod tests {
         );
     }
 
+    /// A zone as a counter reported it: a status that holds data gives its number, the first
+    /// reading after a change included, and a counter that held no data, or a number below nought,
+    /// gives a listed zone with no limit. Statuses are the system's: 0 valid data, 1 new data, and
+    /// the failures Performance Data Helper returns for a counter that cannot be read.
+    #[test]
+    fn a_zone_the_counters_gave_no_reading_of_is_listed_with_no_limit() {
+        let zone = |status, value| ThermalZone::counted("zone".to_owned(), status, value);
+        let limit = |status, value| zone(status, value).passive_limit_percent;
+
+        assert_eq!(limit(0, 100), Some(100), "valid data");
+        assert_eq!(limit(1, 61), Some(61), "the first reading after a change");
+        assert_eq!(
+            limit(0, 0),
+            Some(0),
+            "a platform holding the processors still"
+        );
+        assert_eq!(
+            limit(0x8000_07D5_u32, 100),
+            None,
+            "a counter with no data (PDH_NO_DATA)"
+        );
+        assert_eq!(
+            limit(0xC000_0BB8_u32, 100),
+            None,
+            "a counter that is not there"
+        );
+        assert_eq!(limit(0, -1), None, "a number below nought");
+        assert_eq!(zone(2, 100).name, "zone", "and the zone stays in the list");
+    }
+
     /// The machine's own management data, asked through PowerShell, and what this module reads
     /// through the performance counters: the thermal zones are the ones the management data lists,
     /// each with the limit it lists, and a machine that lists none has none.
@@ -335,18 +381,18 @@ mod tests {
             .expect("PowerShell runs");
         assert!(printed.status.success(), "{printed:?}");
         let text = String::from_utf8_lossy(&printed.stdout).into_owned();
-        let mut listed: Vec<(String, u32)> = text
+        let mut listed: Vec<(String, Option<u32>)> = text
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty())
             .map(|line| {
                 let (name, limit) = line.rsplit_once('=').expect("a name and a limit");
-                (name.to_lowercase(), limit.parse().expect("a limit"))
+                (name.to_lowercase(), Some(limit.parse().expect("a limit")))
             })
             .collect();
         listed.sort();
 
-        let mut read: Vec<(String, u32)> = thermal_zones()
+        let mut read: Vec<(String, Option<u32>)> = thermal_zones()
             .into_iter()
             .map(|zone| (zone.name.to_lowercase(), zone.passive_limit_percent))
             .collect();

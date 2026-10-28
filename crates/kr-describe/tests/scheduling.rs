@@ -500,14 +500,16 @@ fn this_host_names_the_background_mechanism_it_actually_applied() {
 }
 
 /// KR-REQ-22.13: what a platform's thermal zones say of the heat is the worst of them, by how far
-/// the platform is holding the processors back, and a machine that lists no zone says nothing. The
-/// first set is what the Windows test machine's performance counters returned.
+/// the platform is holding the processors back, and a machine that lists no zone says nothing. A
+/// zone the platform listed and gave no reading of cannot be taken for one that holds nothing back:
+/// with no zone showing heat the host's heat is not known, and a zone that does show heat still
+/// does. The first set is what the Windows test machine's performance counters returned.
 #[test]
 fn the_thermal_zones_a_platform_lists_say_how_hot_the_host_is() {
     use kr_describe::resource::{Signal, ThermalState, platform::thermal_of_zones};
     use kr_ipc::conditions::ThermalZone;
 
-    let zones = |limits: &[u32]| -> Vec<ThermalZone> {
+    let zones = |limits: &[Option<u32>]| -> Vec<ThermalZone> {
         limits
             .iter()
             .enumerate()
@@ -517,18 +519,33 @@ fn the_thermal_zones_a_platform_lists_say_how_hot_the_host_is() {
             })
             .collect()
     };
-    let read = |limits: &[u32]| thermal_of_zones(&zones(limits));
+    let read = |limits: &[Option<u32>]| thermal_of_zones(&zones(limits));
 
-    assert_eq!(read(&[100]), Signal::Qualified(ThermalState::Nominal));
-    assert_eq!(read(&[100, 99]), Signal::Qualified(ThermalState::Elevated));
-    assert_eq!(read(&[50]), Signal::Qualified(ThermalState::Elevated));
-    assert_eq!(read(&[49]), Signal::Qualified(ThermalState::Critical));
+    assert_eq!(read(&[Some(100)]), Signal::Qualified(ThermalState::Nominal));
     assert_eq!(
-        read(&[100, 70, 20]),
+        read(&[Some(100), Some(99)]),
+        Signal::Qualified(ThermalState::Elevated)
+    );
+    assert_eq!(read(&[Some(50)]), Signal::Qualified(ThermalState::Elevated));
+    assert_eq!(read(&[Some(49)]), Signal::Qualified(ThermalState::Critical));
+    assert_eq!(
+        read(&[Some(100), Some(70), Some(20)]),
         Signal::Qualified(ThermalState::Critical),
         "the worst zone decides"
     );
     assert!(matches!(read(&[]), Signal::Unqualified { .. }));
+
+    // A zone with no reading beside one at 100 is not a host with nothing held back.
+    assert!(matches!(
+        read(&[Some(100), None]),
+        Signal::Unqualified { .. }
+    ));
+    assert!(matches!(read(&[None]), Signal::Unqualified { .. }));
+    // Heat that was read is still heat.
+    assert_eq!(
+        read(&[None, Some(60)]),
+        Signal::Qualified(ThermalState::Elevated)
+    );
 }
 
 /// KR-REQ-22.13: a Windows host reads its power source and, when it lists a thermal zone, how hot it
@@ -549,10 +566,20 @@ fn a_windows_host_reads_its_power_source_and_its_thermal_zones() {
         conditions.power
     );
     let zones = kr_ipc::conditions::thermal_zones();
-    assert_eq!(
-        matches!(conditions.thermal, Signal::Qualified(_)),
-        !zones.is_empty(),
-        "{:?} against {zones:?}",
-        conditions.thermal
-    );
+    if zones.is_empty() {
+        assert!(
+            matches!(conditions.thermal, Signal::Unqualified { .. }),
+            "{:?} against {zones:?}",
+            conditions.thermal
+        );
+    } else if zones
+        .iter()
+        .all(|zone| zone.passive_limit_percent.is_some())
+    {
+        assert!(
+            matches!(conditions.thermal, Signal::Qualified(_)),
+            "{:?} against {zones:?}",
+            conditions.thermal
+        );
+    }
 }
