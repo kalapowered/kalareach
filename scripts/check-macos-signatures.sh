@@ -21,6 +21,10 @@
 # so a Developer ID of another team, the individual team's included, is refused. notarized: each
 # file also passes `codesign --check-notarization` and the system's assessment of it accepts it as a
 # Notarized Developer ID, which needs the network and a notarised release.
+#
+# The self-test signs ad hoc, so it shows the entitlement, runtime and signature rules. A tree signed by
+# another team's Developer ID, or a requirement that fails, needs a certificate of another team to try and
+# has no case here.
 
 set -euo pipefail
 

@@ -6,12 +6,13 @@
 # `kr host install` copies and admits a release, and `kr --version` reads nothing of the host, so
 # neither shows that the control daemon, a worker and a shell of the release start. This does: it
 # chooses the standalone start, installs the shells' startup entries, creates a session with no
-# terminal attached (`kr new --invisible --headless`), lists it, and closes it. The state and runtime
-# directories are made for the run and removed at its end, and on Linux so is the home directory, so a
-# person's own host is never read or written. It runs only on a throwaway machine (a CI runner, which
-# sets CI, or a guest, with KR_THROWAWAY_HOST=1): a started host keeps its device keys in the machine's
-# key store, which on macOS is the login keychain of the account that runs it, and `kr shell install`
-# edits that account's shell startup files on macOS.
+# terminal attached (`kr new --invisible --headless`), lists it, and closes it. It then stops the
+# control daemon that `kr new` started, removes the startup entries it installed, and removes the
+# state and runtime directories made for the run, and on Linux the home directory too, so a person's
+# own host is never read or written. It runs only on a throwaway machine (a CI runner, which sets CI,
+# or a guest, with KR_THROWAWAY_HOST=1): a started host keeps its device keys in the machine's key
+# store, which on macOS is the login keychain of the account that runs it, and on macOS the startup
+# entries go into that account's shell startup files.
 
 set -euo pipefail
 
@@ -26,10 +27,18 @@ chmod 700 "$work"
 mkdir -m 700 "$work/home" "$work/state" "$work/run"
 export KR_STATE_DIR="$work/state" KR_RUNTIME_DIR="$work/run"
 if [ "$(uname -s)" = Linux ]; then
-    export HOME="$work/home"
+    mkdir -m 700 "$work/home/.config"
+    export HOME="$work/home" XDG_CONFIG_HOME="$work/home/.config"
 fi
+daemon=""
 cleanup() {
     "$kr" close 1 > /dev/null 2>&1 || true
+    # The daemon is the process `kr new` reported starting; nothing else is ended.
+    if [ -n "$daemon" ]; then
+        kill "$daemon" 2> /dev/null || true
+        for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$daemon" 2> /dev/null || break; sleep 1; done
+    fi
+    "$kr" shell remove > /dev/null 2>&1 || true
     chmod -R u+w "${work:?}" 2> /dev/null || true
     rm -rf "${work:?}"
 }
@@ -37,11 +46,18 @@ trap cleanup EXIT
 
 "$kr" host startup --set standalone
 "$kr" shell install
-"$kr" new --invisible --headless
+created="$("$kr" new --invisible --headless 2>&1)"
+printf '%s\n' "$created"
+daemon="$(printf '%s\n' "$created" | sed -n 's/.*started the control daemon.*(process \([0-9][0-9]*\)).*/\1/p' | head -1)"
 listed="$("$kr" list)"
 printf '%s\n' "$listed"
 case "$listed" in
     *"no sessions"* | "") echo "check-host-start: the host lists no session after it created one" >&2; exit 1 ;;
 esac
 "$kr" close 1
+# A close is asked for and takes a moment: the daemon is stopped once no session is left.
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    case "$("$kr" list)" in *"no sessions"*) break ;; esac
+    sleep 1
+done
 echo "check-host-start: the control daemon, a worker and a shell of $("$kr" --version) started, and the session closed"
