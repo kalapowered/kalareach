@@ -8732,8 +8732,17 @@ async fn a_report_the_result_does_not_vouch_for_is_never_served() {
             .reports
             .is_empty()
     );
+    // What the change-set store holds results for is what the daemon itself answers for the
+    // version; the orphan is not among it.
+    let held: std::collections::HashSet<_> = version_as_read(&mut control, version)
+        .await
+        .results
+        .iter()
+        .map(|result| result.materialisation_id)
+        .collect();
+    assert!(held.contains(&run) && !held.contains(&orphan));
     let forgotten = reports
-        .forget_runs_without_a_result(|held| Ok(held == run))
+        .forget_runs_without_a_result(&held)
         .expect("the orphans are forgotten");
     assert_eq!(forgotten, 1);
     assert!(reports.of_run(orphan).expect("reads").is_empty());
