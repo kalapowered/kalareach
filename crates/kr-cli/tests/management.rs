@@ -382,6 +382,15 @@ async fn repositories_workspaces_change_sets_and_diffs_are_managed_through_the_d
     let read = host.kr_json(&["changeset", "read", &change_set]);
     assert_eq!(read["version"]["label"], "the review", "{read}");
     assert_eq!(read["versions"].as_array().map(Vec::len), Some(1), "{read}");
+    // A version no suite has run against has no reports, and the command reaches the daemon's
+    // method for them at the host as the person.
+    let reports = host.kr_json(&["changeset", "test-reports", &change_set]);
+    assert_eq!(
+        reports["reports"].as_array().map(Vec::len),
+        Some(0),
+        "{reports}"
+    );
+    assert_eq!(reports["omitted"], "0", "{reports}");
     let materialised = host.kr_json(&[
         "changeset",
         "materialize",

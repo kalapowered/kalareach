@@ -38,7 +38,7 @@ worker directly for what a session owns.
 | `kr pair [invite/confirm/cancel/status]` | `kr p` | Pair a device: issue an invitation, approve the device that answers it, withdraw one, or read one |
 | `kr project [list/init/clone/adopt]` | — | An environment's source repositories: list them, create one, clone one, or register a checkout that exists |
 | `kr workspace [list/create/remove]` | — | The shared or isolated working copies of a repository. A live session is never moved |
-| `kr changeset [capture/read/materialize]` | — | Capture an exact version of a workspace's work, read one, or write one out on its own |
+| `kr changeset [capture/read/test-reports/materialize]` | — | Capture an exact version of a workspace's work, read one, read the test reports of its runs, or write one out on its own |
 | `kr diff [read/apply/revert]` | — | Read changes, or apply or revert a change-set version at a destination you name |
 | `kr workflow rearm <causal-root> --grant <id>` | — | Give a causal chain of automation workflows whose budget ran out a new budget, and continue it |
 | `kr device [list/revoke]` | — | The devices paired with this host, and revoking one |
@@ -1501,6 +1501,7 @@ pinned against it and review evidence. It lists them and leaves the workspace wa
 | --- | --- |
 | `kr changeset capture <workspace> (--label <label> \| --change-set <id>) [--include <class>]... [--include-path <path>]... [--exclude-path <path>]... [--quiesced] [--require <per-file\|quiesced\|atomic>] [--pin] [--note <text>]` | Records one immutable version of a workspace's work |
 | `kr changeset read <change-set> [--version <n>]` | Reads one exact version, the latest by default, with every version beside it |
+| `kr changeset test-reports <change-set> [--version <n>] [--run <run>]` | Prints what this host read out of the test reports the suites that ran against that version wrote: each report's format, its counts and the cases that did not pass plainly, by name. The newest runs come first, at most 32 reports, and `--run` names one run |
 | `kr changeset materialize <change-set> <version> --purpose <test\|review\|inspection> [--label <label>]` | Writes one exact version into a directory of the host's own |
 | `kr diff read (--workspace <id> \| --change-set <id> --version <n>)` | Reads the changes of a live tree or of one captured version, each path with its content digest |
 | `kr diff apply <change-set> <version> --to <proposal\|reference\|working-tree> ...` | Applies that version at the destination named |
