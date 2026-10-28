@@ -4506,6 +4506,25 @@ async fn a_report_store_the_release_before_ignores_is_kept_across_a_rollback_and
             if totals.tests.get() == 2 && totals.failed.get() == 1),
         "{report:?}"
     );
+    // The `kr` of this release prints the case that failed, by name, because it was asked for the
+    // report, and not the case that passed plainly.
+    let printed = updated.host.run(
+        &updated.kr_now(),
+        &["changeset", "test-reports", &change_set],
+    );
+    assert!(
+        printed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&printed.stderr)
+    );
+    let printed = String::from_utf8_lossy(&printed.stdout);
+    assert!(
+        printed
+            .lines()
+            .any(|line| line.trim_end().ends_with("fails")),
+        "{printed}"
+    );
+    assert!(!printed.contains("passes"), "{printed}");
 
     // Back to the release before: it reads the result this release wrote as it reads any, ignores
     // the store of reports, and records a run of its own with no row.
