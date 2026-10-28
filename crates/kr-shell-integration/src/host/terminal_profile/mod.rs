@@ -144,6 +144,23 @@ pub struct ProfileHome {
     pub settings: gsettings::Gsettings,
 }
 
+/// The variable that names a directory of preferences files, by the name of the domain each stands
+/// in for, in place of the system's own domains. `defaults` reads the user's real domains whatever
+/// `HOME` says, so a run that must not reach them (a test's) names a directory of its own here.
+pub const PREFERENCES_DIRECTORY_VARIABLE: &str = "KR_TERMINAL_PREFERENCES_DIR";
+
+/// The preferences domain called `name`, or the path of its stand-in where
+/// [`PREFERENCES_DIRECTORY_VARIABLE`] names an absolute directory.
+fn preferences_domain(name: &str) -> String {
+    std::env::var_os(PREFERENCES_DIRECTORY_VARIABLE)
+        .map(PathBuf::from)
+        .filter(|directory| directory.is_absolute())
+        .map_or_else(
+            || name.to_owned(),
+            |directory| directory.join(name).display().to_string(),
+        )
+}
+
 impl ProfileHome {
     /// This user's places, from the environment, or `None` when there is no absolute home.
     #[must_use]
@@ -167,8 +184,8 @@ impl ProfileHome {
                 PathBuf::from("/System/Applications/Utilities"),
                 home.join("Applications"),
             ],
-            iterm_preferences: "com.googlecode.iterm2".to_owned(),
-            terminal_preferences: "com.apple.Terminal".to_owned(),
+            iterm_preferences: preferences_domain("com.googlecode.iterm2"),
+            terminal_preferences: preferences_domain("com.apple.Terminal"),
             settings: gsettings::Gsettings::of_this_session(),
             home,
         })

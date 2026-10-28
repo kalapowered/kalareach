@@ -972,6 +972,19 @@ fn installing_beside_iterm2_and_over_unusual_files_adds_only_the_marked_entry() 
             .expect("a directory on the internal disk");
         let path = root.path().join("home");
         std::fs::create_dir(&path).expect("a home");
+        // The terminal preferences of this home's own, which `defaults` reads by path: a domain with
+        // no file fails to read, which is not what a person with no profile of their own has.
+        #[cfg(target_os = "macos")]
+        {
+            std::fs::create_dir_all(path.join("domains")).expect("a directory");
+            for domain in ["com.googlecode.iterm2", "com.apple.Terminal"] {
+                std::fs::write(
+                    path.join("domains").join(format!("{domain}.plist")),
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict/></plist>\n",
+                )
+                .expect("preferences");
+            }
+        }
         for (name, text) in files {
             std::fs::write(path.join(name), text).expect("a startup file");
         }
@@ -982,6 +995,12 @@ fn installing_beside_iterm2_and_over_unusual_files_adds_only_the_marked_entry() 
                 ("HOME".to_owned(), told(&path)),
                 ("ZDOTDIR".to_owned(), told(&path)),
                 ("XDG_CONFIG_HOME".to_owned(), told(&path.join(".config"))),
+                // `defaults` ignores HOME: the terminal preferences are files of this home's own.
+                (
+                    kr_shell_integration::host::terminal_profile::PREFERENCES_DIRECTORY_VARIABLE
+                        .to_owned(),
+                    told(&path.join("domains")),
+                ),
                 ("TERM".to_owned(), "xterm-256color".to_owned()),
             ],
             path,

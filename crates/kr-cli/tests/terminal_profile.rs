@@ -68,6 +68,13 @@ fn iterm2_default(person: &Person, ours: bool) {
     );
 }
 
+/// Preferences with nothing in them.
+#[cfg(target_os = "macos")]
+const EMPTY_PREFERENCES: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict/></plist>
+"#;
+
 /// Every application whose profile is a file, on every platform.
 fn applications() -> Vec<Application> {
     vec![
@@ -201,6 +208,19 @@ impl Person {
         let programs = tree.root().join("programs");
         for directory in [&home, &programs] {
             std::fs::create_dir_all(directory).expect("a directory");
+        }
+        // The preferences of this person's own, which `defaults` reads by path: with none there, a
+        // read of the domain fails, which is not what a person with no profile of their own has.
+        #[cfg(target_os = "macos")]
+        {
+            std::fs::create_dir_all(home.join("domains")).expect("a directory");
+            for domain in ["com.googlecode.iterm2", "com.apple.Terminal"] {
+                std::fs::write(
+                    home.join("domains").join(format!("{domain}.plist")),
+                    EMPTY_PREFERENCES,
+                )
+                .expect("preferences");
+            }
         }
         Self {
             tree,
@@ -874,6 +894,12 @@ mod command {
             .env("SHELL", "/bin/sh")
             .env("KR_RUNTIME_DIR", person.tree.paths().runtime_root())
             .env("KR_STATE_DIR", person.tree.paths().state_root())
+            // `defaults` ignores HOME: the preferences are this person's own files, never the
+            // runner's.
+            .env(
+                kr_shell_integration::host::terminal_profile::PREFERENCES_DIRECTORY_VARIABLE,
+                person.home.join("domains"),
+            )
             .current_dir(&person.home)
             .stdin(std::process::Stdio::null());
         let output = command.output().expect("kr runs");
@@ -991,6 +1017,9 @@ mod command {
         // empty: where this machine has the application, there is nothing to refuse.
         let mut theirs = ProfileHome::of_this_user().expect("a home");
         theirs.programs = vec![person.programs.clone()];
+        // Only the applications are the machine's own: its preferences are not asked.
+        theirs.iterm_preferences = person.places().iterm_preferences;
+        theirs.terminal_preferences = person.places().terminal_preferences;
         theirs
             .applications
             .retain(|folder| !folder.starts_with(&theirs.home));
