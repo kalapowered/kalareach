@@ -1969,6 +1969,7 @@ fn keep_reports(
         else {
             continue;
         };
+        let was_read = matches!(reading, ReportReading::Parsed { .. });
         match &reading {
             ReportReading::Parsed { totals, .. } => {
                 parsed += 1;
@@ -1986,7 +1987,9 @@ fn keep_reports(
             reading,
             recorded_at_ms: recorded.result.recorded_at_ms,
         };
-        if reports.is_none_or(|reports| reports.record(&report).is_err()) {
+        // A report that was read and could not be kept is said so; one that could not be read
+        // is said not read, whether or not its refusal could be kept.
+        if reports.is_none_or(|reports| reports.record(&report).is_err()) && was_read {
             unkept += 1;
         }
     }
