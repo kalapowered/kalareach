@@ -4736,6 +4736,52 @@ fn a_window_held_after_its_attachment_needs_one_key_and_one_whose_shell_exited_n
     ended(&exited.root, "the shell that exited");
 }
 
+/// KR-REQ-01.21, KR-REQ-07.42: a window whose session's shell a signal ended is held for one key,
+/// and ends with the status of a session that closed that way; a window whose session was closed on
+/// request is not held and ends with status 0.
+#[test]
+fn a_window_whose_shell_a_signal_ended_is_held_and_one_closed_on_request_is_not() {
+    let host = Host::start();
+
+    let (killed, created) = host.create_in_window_with("--hold-on-failure", "IFS= read -r _");
+    let killing = killed.mark();
+    killed.type_text(b"kill -KILL $$\r");
+    killed.wait_until_single_key(killing, "new-finished-", "kr waits for a key");
+    killed.wait_for(killing, HELD, "the window says it is held");
+    killed.type_text(b"x");
+    killed.attachment_ended(
+        killing,
+        "new-finished-",
+        NOT_CLEAN,
+        b"a signal ended its shell",
+        "the attachment whose shell a signal ended, ended by one key",
+    );
+    killed.wait_until_put_back("the terminal came back when the key ended the wait");
+    host.wait_until_closed(&created.session_id.to_string());
+
+    let (asked, requested) = host.create_in_window_with("--hold-on-failure", "IFS= read -r _");
+    let closing = asked.mark();
+    let closed = host.kr(&["close", &requested.session_id.to_string()]);
+    assert!(
+        closed.status.success(),
+        "kr close: {}",
+        String::from_utf8_lossy(&closed.stderr)
+    );
+    asked.attachment_ended(
+        closing,
+        "new-finished-",
+        CLEAN,
+        CLOSED_ON_REQUEST,
+        "the only attachment of a session closed on request",
+    );
+    assert!(
+        !contains(&asked.screen.since(closing), HELD),
+        "a close on request is not held for"
+    );
+    asked.wait_until_put_back("the terminal came back when the session closed");
+    host.wait_until_closed(&requested.session_id.to_string());
+}
+
 /// The value of a KDE configuration file's line as the file keeps it, back to the text it holds.
 fn kconfig_unescaped(value: &str) -> String {
     let mut text = String::new();
