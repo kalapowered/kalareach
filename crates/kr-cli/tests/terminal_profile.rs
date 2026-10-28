@@ -572,6 +572,10 @@ fn a_profile_that_is_the_default_is_left_and_kept_in_the_record() {
 #[test]
 fn a_profile_that_cannot_be_looked_at_is_neither_changed_nor_forgotten() {
     use std::os::unix::fs::PermissionsExt as _;
+    // Root searches any folder.
+    if rustix::process::getuid().is_root() {
+        return;
+    }
     for application in applications() {
         let person = Person::with(&application);
         (application.seed)(&person);
@@ -1004,6 +1008,27 @@ mod command {
         }
         assert_eq!(person.everything(), before, "and nothing was written");
 
+        // The home the run uses must not be the account's own: with it, the scratch preferences
+        // would sit beside the user's real profile files, and an empty scratch file would say a
+        // real default profile is not the default. A read-only command, so that a regression
+        // cannot write there.
+        if let Some(own) = kr_ipc::paths::passwd_entry().and_then(|entry| entry.home) {
+            let own = PathBuf::from(own);
+            let scratch = own.join("kr-terminal-profile-test-never-made");
+            let (output, said) = run_with(
+                &person,
+                &["status"],
+                &[
+                    ("HOME", own.as_os_str()),
+                    ("USERPROFILE", own.as_os_str()),
+                    (variable, scratch.as_os_str()),
+                ],
+            );
+            assert_eq!(output.status.code(), Some(2), "{said}");
+            assert!(said.contains("account's own"), "{said}");
+            assert!(!scratch.exists());
+        }
+
         // The profile is installed by a run that is not confined to anything else (the variable names
         // the person's own directory, as every case here does), then a run confined to another home
         // finds a record that names this one.
@@ -1033,6 +1058,21 @@ mod command {
         }
         assert!(profile.is_file(), "the profile the record names is left");
         assert_eq!(person.everything(), installed, "and so is the record");
+
+        // A new install is refused where it would write outside the home too, so that a profile is
+        // never written that a confined removal then refuses: Konsole follows XDG_DATA_HOME.
+        if application.terminal == ProfileTerminal::Konsole {
+            let (output, said) = run(&person, &["remove", id]);
+            assert!(output.status.success(), "{said}");
+            let elsewhere = person.tree.root().join("elsewhere");
+            let (output, said) = run_with(
+                &person,
+                &["install", id],
+                &[("XDG_DATA_HOME", elsewhere.as_os_str())],
+            );
+            assert_eq!(output.status.code(), Some(2), "{said}");
+            assert!(!elsewhere.exists(), "nothing was written outside the home");
+        }
     }
 
     /// KR-REQ-01.21, KR-REQ-26.04: the command installs the profile and writes nothing else of its

@@ -90,6 +90,10 @@ fn this_user() -> Result<ProfileHome> {
                 "KR_TERMINAL_PREFERENCES_DIR must be an absolute directory inside the home this \
                  run uses; it is empty, relative or outside it, and nothing was read or written"
             }
+            HomeError::OwnHome => {
+                "KR_TERMINAL_PREFERENCES_DIR is for a run whose home is not the account's own; \
+                 nothing was read or written"
+            }
         }))
     })
 }
