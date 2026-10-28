@@ -142,36 +142,81 @@ pub struct ProfileHome {
     pub terminal_preferences: String,
     /// How the settings database is reached for the applications that keep profiles in it.
     pub settings: gsettings::Gsettings,
+    /// The directory this run is confined to, where [`PREFERENCES_DIRECTORY_VARIABLE`] is set: a
+    /// record that names a profile file or a preferences path outside it was made by a run that was
+    /// not confined, and is left alone.
+    pub confined_to: Option<PathBuf>,
 }
 
 /// The variable that names a directory of preferences files, by the name of the domain each stands
 /// in for, in place of the system's own domains. `defaults` reads the user's real domains whatever
 /// `HOME` says, so a run that must not reach them (a test's) names a directory of its own here.
+///
+/// The directory must be an absolute path inside the home the run uses, and the run is then
+/// confined to that home: every read and write is of its own files, and a record that names a
+/// profile outside the home is refused. An empty value, a relative path or a path outside the home
+/// is refused too, never read as unset, since a run that sets the variable means to stay away from
+/// the user's own preferences.
 pub const PREFERENCES_DIRECTORY_VARIABLE: &str = "KR_TERMINAL_PREFERENCES_DIR";
 
-/// The preferences domain called `name`, or the path of its stand-in where
-/// [`PREFERENCES_DIRECTORY_VARIABLE`] names an absolute directory.
-fn preferences_domain(name: &str) -> String {
-    std::env::var_os(PREFERENCES_DIRECTORY_VARIABLE)
-        .map(PathBuf::from)
-        .filter(|directory| directory.is_absolute())
-        .map_or_else(
-            || name.to_owned(),
-            |directory| directory.join(name).display().to_string(),
-        )
+/// Why the places of this user cannot be worked out.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum HomeError {
+    /// There is no absolute home directory.
+    #[error("there is no home directory to find a terminal application's profiles in")]
+    NoHome,
+    /// [`PREFERENCES_DIRECTORY_VARIABLE`] is set to something that is not an absolute directory
+    /// inside the home.
+    #[error(
+        "{PREFERENCES_DIRECTORY_VARIABLE} must be an absolute directory inside the home this run uses; \
+         it is empty, relative or outside it, and nothing was read or written"
+    )]
+    PreferencesDirectory,
+}
+
+/// The preferences domain called `name`, in `directory` where one is named.
+fn preferences_domain(directory: Option<&Path>, name: &str) -> String {
+    directory.map_or_else(
+        || name.to_owned(),
+        |directory| directory.join(name).display().to_string(),
+    )
 }
 
 impl ProfileHome {
-    /// This user's places, from the environment, or `None` when there is no absolute home.
-    #[must_use]
-    pub fn of_this_user() -> Option<Self> {
+    /// This user's places, from the environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HomeError::NoHome`] when there is no absolute home, and
+    /// [`HomeError::PreferencesDirectory`] when [`PREFERENCES_DIRECTORY_VARIABLE`] is set and is not
+    /// an absolute directory inside the home.
+    pub fn of_this_user() -> Result<Self, HomeError> {
         let absolute = |name: &str| {
             std::env::var_os(name)
                 .map(PathBuf::from)
                 .filter(|path| path.is_absolute())
         };
-        let home = absolute("HOME").or_else(|| absolute("USERPROFILE"))?;
-        Some(Self {
+        let home = absolute("HOME")
+            .or_else(|| absolute("USERPROFILE"))
+            .ok_or(HomeError::NoHome)?;
+        let preferences = match std::env::var_os(PREFERENCES_DIRECTORY_VARIABLE) {
+            None => None,
+            Some(directory) => {
+                let directory = PathBuf::from(directory);
+                if directory.is_absolute()
+                    && directory.starts_with(&home)
+                    && !directory
+                        .components()
+                        .any(|part| part == std::path::Component::ParentDir)
+                {
+                    Some(directory)
+                } else {
+                    return Err(HomeError::PreferencesDirectory);
+                }
+            }
+        };
+        Ok(Self {
+            confined_to: preferences.as_ref().map(|_| home.clone()),
             data_home: absolute("XDG_DATA_HOME").unwrap_or_else(|| home.join(".local/share")),
             config_home: absolute("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config")),
             application_support: home.join("Library").join("Application Support"),
@@ -184,8 +229,8 @@ impl ProfileHome {
                 PathBuf::from("/System/Applications/Utilities"),
                 home.join("Applications"),
             ],
-            iterm_preferences: preferences_domain("com.googlecode.iterm2"),
-            terminal_preferences: preferences_domain("com.apple.Terminal"),
+            iterm_preferences: preferences_domain(preferences.as_deref(), "com.googlecode.iterm2"),
+            terminal_preferences: preferences_domain(preferences.as_deref(), "com.apple.Terminal"),
             settings: gsettings::Gsettings::of_this_session(),
             home,
         })
@@ -197,6 +242,7 @@ impl ProfileHome {
     #[must_use]
     pub fn under(home: &Path, programs: Vec<PathBuf>) -> Self {
         Self {
+            confined_to: None,
             home: home.to_path_buf(),
             data_home: home.join(".local/share"),
             config_home: home.join(".config"),
@@ -228,6 +274,23 @@ impl ProfileHome {
                     ("HOME".to_owned(), home.display().to_string()),
                 ],
             },
+        }
+    }
+
+    /// Whether this run may work on what `profile` names: always, unless it is confined to a
+    /// directory, and then only for a profile file or a preferences path inside it. A record made
+    /// by a run that was not confined names the user's own files and domains, and a confined run
+    /// reads and writes none of them.
+    #[must_use]
+    pub fn confines(&self, profile: &RecordedProfile) -> bool {
+        let Some(root) = self.confined_to.as_deref() else {
+            return true;
+        };
+        match &profile.wrote {
+            Wrote::File(wrote) => wrote.file().is_ok_and(|file| file.starts_with(root)),
+            Wrote::Preferences(wrote) => Path::new(&wrote.domain).starts_with(root),
+            // The settings database is reached through the session's own `gsettings`.
+            Wrote::Settings(_) => true,
         }
     }
 
@@ -283,6 +346,10 @@ pub enum ProfileError {
         /// Where the record says it is.
         recorded: PathBuf,
     },
+    /// This run is confined to a home by [`PREFERENCES_DIRECTORY_VARIABLE`], and the record names a
+    /// profile outside it: one a run that was not confined made, which this run leaves alone.
+    #[error("the record names {}'s profile outside the home this run is confined to, so it was left alone", .0.name())]
+    Outside(ProfileTerminal),
     /// The record names a profile for the emulator that is not of the kind this install writes.
     #[error("the record names {}'s profile as another kind of write than this platform makes", .0.name())]
     RecordedOtherwise(ProfileTerminal),
@@ -466,6 +533,9 @@ pub fn plan(
 ) -> Result<Plan, ProfileError> {
     if !is_present(terminal, home) {
         return Err(ProfileError::NotInstalled(terminal));
+    }
+    if recorded.is_some_and(|profile| !home.confines(profile)) {
+        return Err(ProfileError::Outside(terminal));
     }
     match terminal {
         ProfileTerminal::Konsole => plan_file(
@@ -788,6 +858,10 @@ pub fn status(
 
 /// Where a recorded profile stands.
 fn standing(profile: &RecordedProfile, home: &ProfileHome) -> Standing {
+    // A profile this run is confined away from is not looked at: what it holds is not known.
+    if !home.confines(profile) {
+        return Standing::Unreadable;
+    }
     match &profile.wrote {
         Wrote::File(wrote) => match wrote.file().map(|file| files::presence(&file)) {
             Ok(files::Presence::Missing) => Standing::Missing,
@@ -835,6 +909,9 @@ fn is_default(
     home: &ProfileHome,
     profile: &RecordedProfile,
 ) -> Result<bool, ProfileError> {
+    if !home.confines(profile) {
+        return Err(ProfileError::Outside(terminal));
+    }
     match terminal {
         ProfileTerminal::Konsole => konsole::is_default(home),
         ProfileTerminal::Iterm2 => match &profile.wrote {
@@ -894,6 +971,9 @@ pub fn remove(
     let Some(profile) = held.profile(terminal)? else {
         return Ok(Removed::NotRecorded);
     };
+    if !home.confines(&profile) {
+        return Err(ProfileError::Outside(terminal));
+    }
     let removed = match &profile.wrote {
         Wrote::File(wrote) => {
             let destination = wrote.file()?;
