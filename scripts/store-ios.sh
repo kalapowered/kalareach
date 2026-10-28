@@ -129,9 +129,19 @@ common=(--version-code "$number" --version-name "$version")
 notes=(--note "commit=$commit" --note "xcode=$(xcodebuild -version | tr '\n' ' ')" --note "builtAt=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     --note "tauriCli=$(node -e 'process.stdout.write(require(process.argv[1]).version)' "$companion/node_modules/@tauri-apps/cli/package.json")")
 kr_store_say "checking the archive"
-node "$companion/scripts/store-bundle.mjs" --ios "$app" --stage archive "${common[@]}" "${notes[@]}" \
+node "$companion/scripts/store-bundle.mjs" --ios "$app" --stage archive --skip-app-checks "${common[@]}" "${notes[@]}" \
     --record "$out/archive-build.json" 2>&1 | tee "$out/archive-check.log"
 [ "${PIPESTATUS[0]}" = 0 ] || { kr_store_say "the archive does not hold"; exit 2; }
+# The privacy manifest and the debug code are read from this application too, so that a finding is
+# known before an export is made; they are held against the exported build, which is the one that
+# is uploaded, and the same binaries are in both.
+for each in privacy-manifest debug-code; do
+    if node "$companion/scripts/$each.mjs" "$app" >"$out/archive-$each.log" 2>&1; then
+        kr_store_say "the archive's $each check holds"
+    else
+        kr_store_say "the archive's $each check FAILS (the exported build is held to it): $(grep -E 'uses|problem|missing|declares' "$out/archive-$each.log" | head -3 | tr '\n' ' ' | cut -c1-300)"
+    fi
+done
 if [ "$archive_only" = 1 ]; then
     kr_store_say "archived and checked (no export asked for): $archive"
     exit 0
@@ -179,7 +189,7 @@ ipa="$(find "$out/export" -maxdepth 1 -name '*.ipa' | head -1)"
 kr_store_say "checking the exported build"
 node "$companion/scripts/store-bundle.mjs" --ios "$ipa" --stage export "${common[@]}" "${notes[@]}" \
     --record "$out/store-build.json" 2>&1 | tee "$out/check.log"
-[ "${PIPESTATUS[0]}" = 0 ] || { kr_store_say "the build does not hold; nothing was recorded as built"; exit 2; }
+[ "${PIPESTATUS[0]}" = 0 ] || { kr_store_say "the exported build does not hold; no build number was recorded as built (the record is $out/store-build.json)"; exit 2; }
 
 kr_store_receipt ios "$number"
 kr_store_say "built and checked: $ipa"
