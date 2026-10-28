@@ -89,6 +89,19 @@ impl ConsoleOutput {
     }
 }
 
+/// How many numbered lines the program prints that `text` shows: `tick-` and a digit. The line the
+/// shell echoes when it is typed holds `tick-%i`, which is no number.
+fn numbered_lines(text: &str) -> usize {
+    text.match_indices("tick-")
+        .filter(|(at, marker)| {
+            text[at + marker.len()..]
+                .chars()
+                .next()
+                .is_some_and(|next| next.is_ascii_digit())
+        })
+        .count()
+}
+
 /// `kr attach` running on a pseudo-console of its own.
 struct Attached {
     child: Box<dyn portable_pty::Child + Send + Sync>,
@@ -137,24 +150,26 @@ impl Attached {
         }
     }
 
-    /// Waits until the console has shown `marker` `times` times; it fails when the console does not
-    /// within the liveness deadline, or when the command ends before it does.
-    fn shows(&mut self, marker: &str, times: usize, what: &str) {
+    /// Waits until `count` finds at least `times` of what it counts in the console's output; it
+    /// fails when it does not within the liveness deadline, or when the command ends before it
+    /// does.
+    fn shows(&mut self, what: &str, count: impl Fn(&str) -> usize, times: usize) {
         let started = Instant::now();
         loop {
             let text = self.output.text();
-            if text.matches(marker).count() >= times {
+            if count(&text) >= times {
                 return;
             }
             if let Some(status) = self.child.try_wait().expect("the command's state") {
                 panic!(
-                    "{what}: kr attach ended ({status}) before the console showed {marker:?} \
-                     {times} time(s); the console shows: {text:?}"
+                    "{what}: kr attach ended ({status}) before the console showed it {times} \
+                     time(s); the console shows: {text:?}"
                 );
             }
             assert!(
                 started.elapsed() < LIVENESS_DEADLINE,
-                "{what}: waited {:?} for {marker:?} {times} time(s); the console shows: {text:?}",
+                "{what}: waited {:?} for the console to show it {times} time(s); the console \
+                 shows: {text:?}",
                 started.elapsed(),
             );
             std::thread::sleep(Duration::from_millis(20));
@@ -206,9 +221,17 @@ async fn a_console_attached_with_kr_attach_shows_what_the_session_writes() {
         .await;
 
     let mut console = Attached::start(&host, &session_id.to_string(), dimensions);
-    console.shows("tick-", 2, "the lines of the session's screen");
+    console.shows(
+        "the numbered lines of the session's screen",
+        numbered_lines,
+        2,
+    );
     std::fs::write(&gate, b"open").expect("the file the session waits for");
-    console.shows("KR-gate-opened", 1, "what the session prints after");
+    console.shows(
+        "what the session prints after",
+        |text| text.matches("KR-gate-opened").count(),
+        1,
+    );
     assert!(
         console.running(),
         "kr attach ended; the console shows: {:?}",

@@ -18,7 +18,10 @@ path = "src/bin/kr-plugin-host.rs"
 # nothing without this feature, and no shipped build enables it. This crate's own tests enable it
 # through the development dependency below; a suite of another crate that starts the host built
 # beside its test binary needs it built with `cargo build -p kr-plugin-host --features testing`,
-# which a workspace test run does by itself.
+# which a workspace test run does by itself. It also builds a host that holds every registration it
+# is sent, before it reads or compiles anything, while a file named `hold-registrations` is in its
+# environment's state directory, which the Windows case of a host that ends with a registration
+# unanswered relies on.
 testing = ["kr-plugin-runtime/testing"]
 
 [dependencies]

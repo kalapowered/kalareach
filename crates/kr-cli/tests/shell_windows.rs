@@ -1281,8 +1281,8 @@ fn descendants_in(
                         );
                     }
                     (Start::At(_), Start::At(_)) => panic!(
-                        "process {pid} names process {} as its parent, both started and neither \
-                         after the other, and the kernel would not name its parent: {why}",
+                        "process {pid} names process {} as its parent, which started no later than \
+                         it did, and the kernel would not name its parent: {why}",
                         parent.pid.get()
                     ),
                     (Start::Unread(unread), _) | (_, Start::Unread(unread)) => panic!(
@@ -1447,7 +1447,7 @@ mod the_walk {
     }
 
     #[test]
-    #[should_panic(expected = "neither after the other")]
+    #[should_panic(expected = "would not name its parent")]
     fn a_refusal_that_no_reading_explains_stops_the_walk() {
         let mut readings = Scripted::default();
         readings

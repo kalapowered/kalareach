@@ -34,7 +34,8 @@ libc.workspace = true
 
 [features]
 # What this crate's own tests use to hold the engine's epoch still and advance it one tick at a
-# time. It compiles to nothing without this feature, and no shipped build enables it.
+# time, and to hold a registration at a gate file in the environment's state directory until the
+# file is removed. It compiles to nothing without this feature, and no shipped build enables it.
 testing = ["kr-plugin-service/testing"]
 
 [dev-dependencies]
