@@ -300,6 +300,10 @@ pub enum ProfileError {
     /// A write did not outlast the process that made it.
     #[error("{}'s settings did not keep a write; there is no settings service in this session", .0.name())]
     NotPersisted(ProfileTerminal),
+    /// The preferences changed between kr reading them and writing them back, so nothing was
+    /// written.
+    #[error("{}'s preferences changed while kr was about to write them", .0.name())]
+    Changing(ProfileTerminal),
     /// The list of profiles changed under every attempt to write it.
     #[error("{}'s list of profiles kept changing while it was written", .0.name())]
     ListBusy(ProfileTerminal),
@@ -503,10 +507,10 @@ pub fn plan(
                 Some(_) => return Err(ProfileError::RecordedOtherwise(terminal)),
                 None => None,
             };
-            let mut plan =
+            let plan =
                 gsettings::plan(&home.settings, spec, &words::shell_words(command), earlier)?;
-            // A profile that was changed after kr wrote it is not kr's to write over. One that is
-            // there as kr wrote it is put back as it was if this write fails.
+            // A profile that was changed after kr wrote it is not kr's to write over. The write
+            // reads it again before it changes a key, and puts back what it changed if it fails.
             if let Some(earlier) = earlier {
                 match gsettings::read(&home.settings, spec, earlier)? {
                     gsettings::Reading::Changed => {
@@ -514,10 +518,7 @@ pub fn plan(
                             place: PathBuf::from(&earlier.path),
                         });
                     }
-                    gsettings::Reading::Unchanged { .. } => {
-                        plan.previous = Some(earlier.keys.clone());
-                    }
-                    gsettings::Reading::Gone => {}
+                    gsettings::Reading::Unchanged { .. } | gsettings::Reading::Gone => {}
                 }
             }
             Ok(Plan {
@@ -902,8 +903,12 @@ pub fn remove(
             match reading {
                 gsettings::Reading::Gone => Removed::AlreadyGone,
                 gsettings::Reading::Unchanged { .. } => {
-                    gsettings::take_out(&home.settings, spec, wrote)?;
-                    Removed::Removed
+                    match gsettings::take_out(&home.settings, spec, wrote)? {
+                        gsettings::TakenOut::Removed => Removed::Removed,
+                        gsettings::TakenOut::Changed => Removed::Changed {
+                            left_at: wrote.path.clone(),
+                        },
+                    }
                 }
                 gsettings::Reading::Changed => Removed::Changed {
                     left_at: wrote.path.clone(),
