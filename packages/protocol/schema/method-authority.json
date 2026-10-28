@@ -1,6 +1,6 @@
 {
   "description": "One exhaustive authority entry per method. Anything not listed is denied. Generated from crates/kr-protocol; do not edit by hand.",
-  "method_count": 190,
+  "method_count": 191,
   "methods": [
     {
       "capability": "none",
@@ -4240,6 +4240,35 @@
         "change_set"
       ],
       "summary": "Read one exact change-set version.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "changes_and_diffs",
+      "history_filter": "not_applicable",
+      "idempotency": "idempotent_read",
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "changeset.test_reports",
+      "name": "changeset.test_reports",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "files.read"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "change_set"
+      ],
+      "summary": "Read what this host made of the test reports the suites that ran against one exact change-set version wrote: for each declared output in a documented format, the format, the counts taken from the cases, and the cases that did not pass plainly, by name. A reading is labelled parsed; a document that opened as a documented format and could not be read says why. The answer is the local owner's and holds no failure text.",
       "version": 1
     },
     {
