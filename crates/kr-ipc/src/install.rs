@@ -1309,10 +1309,13 @@ impl Store {
     /// name while it is replaced sometimes finds no link there (`readlink` fails with `EINVAL`, and
     /// the program through it is missing). Three readers that read `current` while a loop renamed a
     /// fresh link over it 2,000 times failed 1% of their reads (361 of 39,740 on one volume, 341 of
-    /// 32,138 on another), and the same loop exchanging the names with `RENAME_SWAP` failed none of
-    /// 54,498, 43,629 and 49,408. The exchange leaves the old link at `temporary`, which is removed
-    /// afterwards; a crash between the two leaves that link, and the next switch takes it away. A
-    /// file system that cannot exchange names gets the rename, as it did before.
+    /// 32,138 on another). The same loop exchanging the names with `RENAME_SWAP` failed none of
+    /// 54,498, 43,629 and 49,408 reads, and a C loop over about 2 million reads saw no failed
+    /// `readlink`. The exchange narrows the window and does not close it: readers in the background
+    /// scheduling class still found no link for a moment, once to three times in about 190,000 reads
+    /// of one run of the switch case. The exchange leaves the old link at `temporary`, which is
+    /// removed afterwards; a crash between the two leaves that link, and the next switch takes it
+    /// away. A file system that cannot exchange names gets the rename, as it did before.
     #[cfg(target_os = "macos")]
     fn put_in_place_of_current(&self, temporary: &Path) -> std::io::Result<()> {
         use rustix::fs::{CWD, RenameFlags, renameat_with};

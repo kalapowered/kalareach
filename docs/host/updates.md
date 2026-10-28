@@ -201,6 +201,11 @@ Only the current release's `kr` updates the host. An update, in order:
 7. removes the releases nothing needs: not the current one, not the previous one, not one staged
    for a later update, and not one a running program holds.
 
+On macOS the switch exchanges the new link with `current` instead of renaming it over `current`,
+because a reader that resolves `current` while a rename replaces it can find no link there for a
+moment. The exchange narrows that window and does not close it: a reader in the background
+scheduling class can still meet it, rarely, while a switch runs.
+
 An update that is held waits. It starts again every daemon it stopped, from the release still
 current, keeps the new release staged for the next attempt, which replaces it by the copy it checks
 then, and exits with 9. When a daemon it stopped does not start again, it exits with 1 instead,
