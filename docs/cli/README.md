@@ -154,13 +154,18 @@ close it`, and waits for one key. After the key it exits with the status it woul
 the flag.
 
 The command holds on every ending except three: the session's shell exiting, with any status, a
-close on request, and the person detaching. That is, it holds when it could not create or attach the
-session, and when the attachment ended any other way: a signal ended the shell, the shell never
-started, the worker went, the desktop login ended, the host shut down, the connection to the
-session ended, another attachment took the input lease, or input may not have reached the session
+close on request, and a detach. It holds when it could not create or attach the session, and when
+the attachment ended any other way: a signal ended the shell, the shell never started, the worker
+went, the desktop login ended, the host shut down, the connection to the session ended, another
+attachment took the input lease, or input may not have reached the session
 ([When the session closes](#when-the-session-closes) lists them). A session whose shell exited, with
-any status, ended the way the person ended it. The command exits with that closure's status at
-once, and the window closes as its terminal application normally closes it.
+any status, ended the way the person ended it. A detach is not a failure, because the session goes
+on and can be attached again, so a detach of any origin ends the command at once: Ctrl-D at an empty
+root prompt, `kr detach` typed in the window, and `kr detach --attachment` run from another place
+all close the window without a key. The command cannot tell where a detach came from, so a detach
+from another place closes the window as well. In each of these cases the command exits with the
+status the attachment ends with at once, and the window closes as its terminal application normally
+closes it.
 
 It waits only when standard input and standard output are terminals and the run is not `--json`.
 Anywhere else it never waits, so a script that reads the output of `kr new` does not stop for a key
@@ -747,10 +752,16 @@ These are usage failures (exit 2). A failure of `gsettings`, `defaults` or `plut
 of a file exits 1. `--dry-run` skips the check for a running Terminal.
 
 An install that fails after it began writing takes back what it wrote. For GNOME Terminal and
-Ptyxis the keys go back to what they were, which for an install again is the profile `kr` wrote
-before, and a profile that was in the list stays in it. For Terminal the preferences are read again
-by another process, and an entry that is not as written, or another profile that moved, puts this
-entry back as it was before the write (the entry, or none) and touches nothing else. For a file, an
+Ptyxis the keys go back to what they held when the write began, which for an install again is the
+profile `kr` wrote before, and a profile that was in the list stays in it; each key put back is read
+back by another process, and a key that is not back keeps the record's entry. Before a key changes,
+`kr` reads it again, and a key the person changed since the keys were read for the write stops the
+install as a changed profile, with the keys it had written put back and the person's key as it is.
+For Terminal the preferences are read again by another process, and an entry that is not as written,
+or another profile that moved, puts this entry back as it was before the write (the entry, or none)
+and touches nothing else: an entry the person changed since the write is not put back, and taking
+out an entry that was not there before writes the dictionary of profiles only while it is as the
+read just before shows it. For a file, an
 install again over a profile the person saved to since the install was planned does not overwrite
 it: the person's file is put back and the install fails as a changed profile. Terminal's entry is
 checked against the record again on the preferences as they are when the write is made, so an entry
@@ -758,7 +769,9 @@ of the name that appeared after the plan is not written over either. When the se
 `defaults` stops answering during the install, so that even taking the write back fails, the profile
 may hold what it held before or what was to be written, or for GNOME Terminal and Ptyxis some of
 each: the record then keeps both, so the profile still reads as `kr`'s, `status` does not call it
-changed, and `install` or `remove` run again finishes the job.
+changed, and `install` or `remove` run again finishes the job. An install again that fails once more
+keeps the values the profile held before the first one failed, beside the ones it was to write, until
+a write holds or a removal has taken the profile out.
 
 `install` records what it will write in `terminal-profiles.json` in the installation's state
 directory before it writes anything: for a file its path and its SHA-256, for settings the keys and
@@ -777,15 +790,24 @@ says `unreadable`, and a removal says so and keeps the entry; install the applic
 the removal, or take the profile's settings and its place in the list out of the settings database
 by hand (`dconf`, which needs no schema). A profile that is not in the application's list is out of
 the person's sight: `remove` takes
-its settings out, and `install` puts it back in the list.
+its settings out, and `install` puts it back in the list. A removal of GNOME Terminal's or Ptyxis's
+profile reads each of its keys before it writes anything, and again just before it resets the key.
+A key that holds something the person put there stops the removal as a changed profile: that key and
+those after it are left as they are, and the record forgets the profile. A reset that the settings
+say worked and did not keep is a failure, and the record keeps the entry.
 
 `remove` without an application takes out every profile in the record, and `--dry-run` says what
 each would come to. A record of a later format, or one that cannot be read, is left as it is and
 named, and nothing is written. `install` and `remove` hold the writers' lock the update takes, and a
 release that reads the record at another version refuses them before anything is written. A
 removal of Terminal's profile checks the entry and the default again on one read of the
-preferences, writes the dictionary of profiles without the entry, reads it back by another process,
-and puts the entry back if the result is not what it meant. Terminal's entry is compared as the
+preferences, reads them once more just before it writes, and writes the dictionary of profiles
+without the entry only if the dictionary has not moved since the first read; if it has, nothing is
+written, the removal fails, and the record keeps the entry. It then reads the dictionary back by
+another process, and puts the entry back if the result is not what it meant. `defaults` has no
+operation that takes one entry out of a dictionary, so the dictionary is written whole, and a change
+another application makes to another profile in the short time between the second read and the
+write is lost: a named limit, as the shared list's is for GNOME Terminal and Ptyxis. Terminal's entry is compared as the
 `plutil` on the machine writes it, so a macOS update that changes how a property list is written does
 not make an entry `changed`.
 
