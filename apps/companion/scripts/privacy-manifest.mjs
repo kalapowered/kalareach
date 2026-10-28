@@ -642,11 +642,6 @@ export function sdksIn(app) {
 }
 
 /**
- * Holds a built application to its manifests.
- *
- * @returns {{ binaries: object[], declarations: object[], sdks: object[], notes: string[], problems: string[] }}
- */
-/**
  * The uses this check accepts without a manifest declaration, each named by the executable that
  * makes it and the symbol it imports, with why it has no reason in Apple's list. A use that is not
  * named here fails, and so does one of these once its bundle ships a manifest of its own (the
@@ -668,6 +663,11 @@ export const RECORDED_EXCEPTIONS = [
   }
 ]
 
+/**
+ * Holds a built application to its manifests.
+ *
+ * @returns {{ binaries: object[], declarations: object[], sdks: object[], notes: string[], problems: string[], recorded: string[] }}
+ */
 export function examine(path, exceptions = RECORDED_EXCEPTIONS) {
   const app = resolve(path)
   const problems = []
