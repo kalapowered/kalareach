@@ -1679,3 +1679,146 @@ fn a_derived_version_is_told_to_the_host_and_is_the_newest_of_its_change_set() {
     assert_eq!(heads[0].version, derived.version);
     assert_eq!(heads[0].session_id, Some(session));
 }
+
+/// A file that opens with `opening` and is `length` bytes long, its padding not written.
+fn write_sparse(root: &Path, relative: &str, opening: &str, length: u64) {
+    let path = root.join(relative);
+    std::fs::create_dir_all(path.parent().expect("a directory above the file"))
+        .expect("the directories above the file");
+    let mut file = std::fs::File::create(&path).expect("the file is created");
+    std::io::Write::write_all(&mut file, opening.as_bytes()).expect("the opening is written");
+    file.set_len(length).expect("the padding is a hole");
+}
+
+/// KR-REQ-25.06: a re-read keeps the bytes of a declared file only when its opening shows a
+/// documented report format, and only within the bounds that stop a suite making the daemon hold
+/// what it declares. A report over 16 MiB, and a report that would take the run past 32 MiB, are
+/// kept by their opening alone, in a buffer of the opening's size and not the one the file was
+/// read into; a file that opens as no report keeps nothing and spends none of the 32 MiB. Every
+/// file's reference and digest are recorded as before.
+#[test]
+fn a_re_read_keeps_only_the_reports_within_its_bounds() {
+    const MIB: u64 = 1024 * 1024;
+    let fixture = Fixture::create();
+    let (record, made) = a_copy_to_run_in(&fixture, "bounds");
+    let directory = Path::new(&made.directory_path);
+    write_sparse(directory, "a-notes.json", r#"{"name":"notes"}"#, 15 * MIB);
+    write_sparse(directory, "b-over.xml", "<testsuite>", 16 * MIB + 1);
+    write_sparse(directory, "c-first.xml", "<testsuite>", 14 * MIB);
+    write_sparse(directory, "d-second.xml", "<testsuite>", 14 * MIB);
+    write_sparse(directory, "e-third.xml", "<testsuite>", 14 * MIB);
+    let outputs = declared(
+        &fixture,
+        &record,
+        &[
+            "a-notes.json",
+            "b-over.xml",
+            "c-first.xml",
+            "d-second.xml",
+            "e-third.xml",
+        ],
+    )
+    .expect("the declaration is fine");
+    let binding = binding::bind_run(fixture.service(), made.materialisation_id, &outputs);
+    let recorded = materialise::record_result(
+        fixture.service(),
+        made.materialisation_id,
+        &report(),
+        &outputs,
+        &binding,
+    )
+    .expect("the result is recorded");
+
+    let kept = |label: &str| {
+        let output = recorded
+            .declared
+            .iter()
+            .find(|output| output.reference.label == label)
+            .unwrap_or_else(|| panic!("{label} is described"));
+        assert!(
+            recorded
+                .result
+                .outputs
+                .iter()
+                .any(|recorded| recorded == &output.reference),
+            "{label}: the result records the reference the bytes were read with"
+        );
+        output.contents.as_ref()
+    };
+    assert!(kept("a-notes.json").is_none(), "no report, nothing kept");
+    for over in ["b-over.xml", "e-third.xml"] {
+        let contents = kept(over).expect("a report keeps its opening");
+        assert!(!contents.complete, "{over}");
+        assert_eq!(contents.bytes.len(), materialise::OPENING_BYTES, "{over}");
+        assert!(
+            contents.bytes.capacity() < MIB as usize,
+            "{over}: the opening does not hold the buffer the file was read into"
+        );
+    }
+    for whole in ["c-first.xml", "d-second.xml"] {
+        let contents = kept(whole).expect("a report within the bounds is kept");
+        assert!(contents.complete, "{whole}");
+        assert_eq!(contents.bytes.len() as u64, 14 * MIB, "{whole}");
+    }
+}
+
+/// KR-REQ-25.06: a declared output below a link the run planted is not reached. Each component
+/// of a declared path is opened without following a link, so a link to a directory outside the
+/// copy lends the reader of reports nothing; the control is the same file below a real directory.
+#[test]
+fn a_declared_output_below_a_planted_link_is_not_read() {
+    let fixture = Fixture::create();
+    let outside = fixture.work().join("outside-the-copy");
+    write(
+        &outside,
+        "junit.xml",
+        "<testsuite><testcase name=\"a\"/></testsuite>\n",
+    );
+
+    let (record, made) = a_copy_to_run_in(&fixture, "above");
+    let directory = Path::new(&made.directory_path);
+    std::os::unix::fs::symlink(&outside, directory.join("reports"))
+        .expect("a link to a directory outside the copy");
+    let outputs = declared(&fixture, &record, &["reports/junit.xml"]).expect("a declaration");
+    let binding = binding::bind_run(fixture.service(), made.materialisation_id, &outputs);
+    let recorded = materialise::record_result(
+        fixture.service(),
+        made.materialisation_id,
+        &report(),
+        &outputs,
+        &binding,
+    )
+    .expect("the result is recorded");
+    assert!(recorded.declared.is_empty(), "{:?}", recorded.declared);
+    assert!(
+        recorded
+            .result
+            .outputs
+            .iter()
+            .all(|output| output.label != "reports/junit.xml"),
+        "{:?}",
+        recorded.result.outputs
+    );
+
+    let (record, made) = a_copy_to_run_in(&fixture, "real");
+    let directory = Path::new(&made.directory_path);
+    write(
+        directory,
+        "reports/junit.xml",
+        "<testsuite><testcase name=\"a\"/></testsuite>\n",
+    );
+    let outputs = declared(&fixture, &record, &["reports/junit.xml"]).expect("a declaration");
+    let binding = binding::bind_run(fixture.service(), made.materialisation_id, &outputs);
+    let recorded = materialise::record_result(
+        fixture.service(),
+        made.materialisation_id,
+        &report(),
+        &outputs,
+        &binding,
+    )
+    .expect("the result is recorded");
+    let [output] = &recorded.declared[..] else {
+        panic!("the control is described: {:?}", recorded.declared);
+    };
+    assert!(output.contents.as_ref().is_some_and(|c| c.complete));
+}
