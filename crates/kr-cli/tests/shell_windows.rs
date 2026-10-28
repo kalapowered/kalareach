@@ -1523,60 +1523,6 @@ mod the_walk {
     }
 }
 
-/// Holding a process still, as a signal from a terminal does: every thread of it stops, and it
-/// answers nothing until it is ended.
-mod held {
-    #![expect(
-        unsafe_code,
-        reason = "stopping a process is a native call with no safe interface: the process is opened \
-                  by its identifier and `NtSuspendProcess` is handed that handle, and nothing else"
-    )]
-
-    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
-
-    use kr_ipc::identity::{ProcessState, process_state};
-    use kr_protocol::identity::ProcessStartIdentity;
-    use windows_sys::Win32::Foundation::HANDLE;
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SUSPEND_RESUME};
-
-    #[link(name = "ntdll")]
-    unsafe extern "system" {
-        fn NtSuspendProcess(process: HANDLE) -> i32;
-    }
-
-    /// Stops every thread of the process `identity` names, once that is shown to be the process
-    /// that was started.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the process cannot be opened, is not the one that was recorded, or is not
-    /// stopped.
-    pub fn still(identity: &ProcessStartIdentity) {
-        let pid = u32::try_from(identity.pid.get()).expect("a process identifier");
-        // SAFETY: the call takes numbers and returns a handle or null.
-        let opened = unsafe { OpenProcess(PROCESS_SUSPEND_RESUME, 0, pid) };
-        assert!(
-            !opened.is_null(),
-            "process {pid} is opened to be held still: {}",
-            std::io::Error::last_os_error()
-        );
-        // SAFETY: the handle is a new one, which nothing else owns, and it is closed once, when
-        // this goes out of scope, however the function leaves.
-        let process = unsafe { OwnedHandle::from_raw_handle(opened.cast()) };
-        // An identifier is not given to another process while a handle to its process is open, so
-        // what is read now, with the handle held, is the process that was started.
-        assert_eq!(
-            process_state(identity),
-            ProcessState::Running,
-            "process {pid} is still the one that was started"
-        );
-        // SAFETY: the handle is open for the call, and was opened with the right to suspend. The
-        // process stays stopped when the handle is closed.
-        let status = unsafe { NtSuspendProcess(process.as_raw_handle().cast()) };
-        assert!(status >= 0, "NtSuspendProcess answered {status:#x}");
-    }
-}
-
 /// The component with a section of its own at the end, so that its digest is one no host has
 /// compiled before and a registration of it is a cold compile.
 fn a_component_of_its_own(component: &[u8]) -> Vec<u8> {
@@ -1792,82 +1738,74 @@ impl Running {
     }
 }
 
-/// The directory under an environment's state directory where its plugin host files the compiled
-/// components it has made.
-const PLUGIN_CACHE: &str = "plugin-cache";
+/// The plugin host's registration gate, closed while this is held: a plugin host built with the
+/// `testing` feature holds every registration it is sent, before it reads or compiles anything and
+/// so before it can answer, for as long as the gate file is in the environment's state directory,
+/// and makes a second file there when one has reached the gate. The names are the host's own
+/// (`REGISTRATION_GATE` and `REGISTRATION_GATE_REACHED` in `kr-plugin-runtime`'s `service::host`);
+/// a host built without the feature reads neither.
+struct RegistrationGate {
+    gate: PathBuf,
+    reached: PathBuf,
+}
 
-/// Every path under the environment's compiled-code cache: the directories a filing makes, the
-/// temporary files it writes through and the files it ends with. None where the cache holds
-/// nothing.
-///
-/// A cache that cannot be read is not an empty one: it stops the case.
-fn under_the_cache(environment: &kr_ipc::paths::EnvironmentPaths) -> Vec<PathBuf> {
-    fn walk(directory: &Path, into: &mut Vec<PathBuf>) {
-        let entries = match std::fs::read_dir(directory) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-            Err(error) => panic!("{} is not read: {error}", directory.display()),
-        };
-        for entry in entries {
-            let entry = entry
-                .unwrap_or_else(|error| panic!("{} is not read: {error}", directory.display()));
-            let path = entry.path();
-            let kind = entry
-                .file_type()
-                .unwrap_or_else(|error| panic!("{} is not read: {error}", path.display()));
-            into.push(path.clone());
-            if kind.is_dir() {
-                walk(&path, into);
-            }
+impl RegistrationGate {
+    /// Closes the gate for the environment's hosts.
+    fn close(environment: &kr_ipc::paths::EnvironmentPaths) -> Self {
+        let directory = environment.state_dir();
+        std::fs::create_dir_all(directory).expect("the environment's state directory");
+        let gate = directory.join("hold-registrations");
+        std::fs::write(&gate, b"closed").expect("the gate is closed");
+        Self {
+            gate,
+            reached: directory.join("hold-registrations.reached"),
         }
     }
-    let mut found = Vec::new();
-    walk(&environment.state_dir().join(PLUGIN_CACHE), &mut found);
-    found
+
+    /// Whether a registration has reached the closed gate of some host.
+    fn reached(&self) -> bool {
+        self.reached.exists()
+    }
+
+    /// Opens the gate: the registrations it holds go on.
+    fn open(&self) {
+        match std::fs::remove_file(&self.gate) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("the gate is not opened: {error}"),
+        }
+    }
 }
 
-/// The files of the compiled-code cache that a filing has ended with: not the directories, and not
-/// the temporary files a filing writes through.
-fn filed(under_the_cache: &[PathBuf]) -> Vec<&PathBuf> {
-    under_the_cache
-        .iter()
-        .filter(|path| {
-            path.is_file()
-                && !path
-                    .extension()
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("tmp"))
-        })
-        .collect()
+impl Drop for RegistrationGate {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.gate);
+    }
 }
 
-/// What an attempt at holding a registration in flight came to.
-enum Attempt {
-    /// The registration was held outstanding, the host ended with it so, and everything the claim
-    /// is about was shown.
-    Held,
-    /// The registration may have been answered before it could be held, or the cache that shows
-    /// whether it was could not be relied on, which shows nothing about it.
-    Missed(String),
-}
-
-/// How many times the case tries to hold a registration in flight before it says it could not.
-const HOLD_ATTEMPTS: u32 = 3;
-
-/// One attempt: a program that prints a numbered line every moment is typed at the managed
-/// prompt, and when a worker's report first reads that it is registering the component with the
-/// plugin host, the host is held still. The registration is outstanding while the host stays so;
-/// the host is then ended by the identity it was started under, and what the worker, the program,
-/// the terminal and the binding do after is read.
+/// KR-REQ-05.07: a plugin host that ends with a registration unanswered takes no worker with it,
+/// and the binding comes back, on Windows.
 ///
-/// What shows the registration was outstanding is the held host's own cache. A host files the
-/// component it compiled in its compiled-code cache before it answers a registration, so a host
-/// held still with nothing filed has not answered; and once held it files nothing more. That reads
-/// the host, and not how the replacement came by the component, which a cache that failed to store
-/// or to load would also make a fresh compile. It rests on the cache working, which the replacement
-/// shows by filing the component it compiled: where it does not, the attempt shows nothing.
-async fn hold_a_registration_and_end_the_host() -> Attempt {
-    // Every attempt has a component whose digest no host has compiled, so the registration is a
-    // cold compile: the time the host takes over it is what the worker's report can be seen in.
+/// A worker is running a program a package that ships a component recognises, which prints a
+/// numbered line every moment, and registers its binding with the plugin host the daemon started.
+/// The host holds the registration at its closed gate (`RegistrationGate`), before it reads or
+/// compiles anything, so it has not answered and cannot: the host says so itself, by the file it
+/// makes when the registration reaches the gate. The worker's own report, asked for again after the
+/// terminal has been sent twenty lines more, still reads that it is registering. The host is then
+/// ended by the identity it was started under with that request outstanding. The worker goes on,
+/// the terminal goes on being sent lines it had not been sent, and with the gate open the daemon
+/// starts a replacement under its bound, which the worker registers the same binding with again,
+/// so that the host holds the binding. The replacement had to compile the component: the first
+/// host never reached its compile.
+///
+/// It needs the plugin host built with the `testing` feature, as the other cases of the plugin
+/// runtime do; with any other host the registration never reaches the gate and the case fails
+/// there, since nothing else shows that a registration was held unanswered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = writes_profiles!()]
+async fn a_plugin_host_that_ends_with_a_registration_unanswered_takes_no_worker_with_it_on_windows()
+{
+    // A component whose digest no host has compiled, so that a registration of it is a cold compile.
     let component = a_component_of_its_own(&well_behaved());
     let mut world = Running::start(&component).await;
     let environment = world.environment.clone();
@@ -1877,9 +1815,10 @@ async fn hold_a_registration_and_end_the_host() -> Attempt {
         "a plugin host was published before any program was typed"
     );
     // The plugin host is the environment's own job, which no test teardown ends: it goes when this
-    // attempt does, whichever way the attempt goes.
+    // case does, whichever way the case goes.
     let _host_ends = HostEnding(&published);
     let controller = world.managed.host.controller();
+    let gate = RegistrationGate::close(&environment);
 
     // The program prints the registration its launcher gave it, which the typed line cannot spell,
     // and then a numbered line every moment; `rem` takes the flags the integration adds after what
@@ -1906,12 +1845,10 @@ async fn hold_a_registration_and_end_the_host() -> Attempt {
                 eprintln!("the worker reports the registration as sent: {report:?}");
                 break *id;
             }
-            Some([(_, report)]) if report.state == ComponentState::Registered => {
-                return Attempt::Missed(
-                    "the registration was answered before a report of it outstanding was read"
-                        .to_owned(),
-                );
-            }
+            Some([(_, report)]) if report.state == ComponentState::Registered => panic!(
+                "the registration was answered through a closed gate: the plugin host is not built \
+                 with the testing feature"
+            ),
             _ => {}
         }
         assert!(
@@ -1925,23 +1862,18 @@ async fn hold_a_registration_and_end_the_host() -> Attempt {
     let host = published()
         .expect("the plugin host is published while a worker registers with it")
         .process_start_identity;
-    held::still(&host);
-    eprintln!("plugin host {} is held still", host.pid.get());
+    // The registration has reached the host and stands at its gate: neither compiled nor answered.
+    until("the registration to reach the closed gate", || async {
+        gate.reached().then_some(())
+    })
+    .await;
+    eprintln!(
+        "the registration is held at the closed gate of plugin host {}",
+        host.pid.get()
+    );
 
-    // The host files the component it compiled before it answers, and it is held still, so what it
-    // has filed is all it will file. Nothing under its cache means it had not begun to file the
-    // component, and so had not answered: it could not have written an answer the worker has yet
-    // to read. Anything there means it had compiled it, and may have answered.
-    let begun = under_the_cache(&environment);
-    if !begun.is_empty() {
-        return Attempt::Missed(format!(
-            "the host had begun to file the compiled component when it was held still ({begun:?}), \
-             so it had compiled it and may have answered"
-        ));
-    }
-
-    // Held still, the host answers nothing. The registration stays outstanding if the worker's own
-    // report, asked for again after the terminal has been sent twenty more lines, still says so.
+    // The registration stays outstanding if the worker's own report, asked for again after the
+    // terminal has been sent twenty more lines, still says so.
     let mark = ticks(&world.terminal);
     let looked_at = tokio::time::Instant::now();
     loop {
@@ -1952,18 +1884,13 @@ async fn hold_a_registration_and_end_the_host() -> Attempt {
                     let shown = ticks(&world.terminal);
                     if shown > mark + 20 {
                         eprintln!(
-                            "the host is held still, the worker still reports the registration \
-                             as sent ({report:?}), and the terminal was sent lines {mark} to {shown}"
+                            "the registration is held, the worker still reports it as sent \
+                             ({report:?}), and the terminal was sent lines {mark} to {shown}"
                         );
                         break;
                     }
                 }
-                [(_, report)] if report.state == ComponentState::Registered => {
-                    return Attempt::Missed(
-                        "the registration was answered before the host was held still".to_owned(),
-                    );
-                }
-                other => panic!("a held host's registration is reported as {other:?}"),
+                other => panic!("a held registration is reported as {other:?}"),
             }
         }
         assert!(
@@ -1975,12 +1902,13 @@ async fn hold_a_registration_and_end_the_host() -> Attempt {
     assert_eq!(
         kr_ipc::identity::process_state(&host),
         kr_ipc::identity::ProcessState::Running,
-        "the host is held still and is not ended"
+        "the host is held at its gate and is not ended"
     );
 
-    // The host ends with the registration outstanding.
+    // The host ends with the registration outstanding; the gate opens once it has.
     let worker = worker_of(&environment, world.session_id);
     end_by_identity(&host).await;
+    gate.open();
     assert_eq!(
         kr_ipc::identity::process_state(&worker),
         kr_ipc::identity::ProcessState::Running,
@@ -2021,13 +1949,12 @@ async fn hold_a_registration_and_end_the_host() -> Attempt {
             }
             _ => None,
         });
-        // The held host filed nothing, and a replacement is a new process with the same cache, so
-        // it compiles the component: a replacement that loaded it found a filing that nothing
-        // made, which this attempt cannot explain.
+        // The first host never reached its compile, so the replacement compiles the component: a
+        // replacement that loaded it from the cache found a filing that nothing made.
         assert!(
             !registered
                 .is_some_and(|reason| reason.contains("loaded from the compiled-code cache")),
-            "the replacement loaded a component that the held host had not filed: {reports:?}"
+            "the replacement loaded a component that the held host had not compiled: {reports:?}"
         );
         if registered.is_some_and(|reason| reason.contains("compiled in")) {
             eprintln!("the binding is registered with the replacement: {reports:?}");
@@ -2038,20 +1965,6 @@ async fn hold_a_registration_and_end_the_host() -> Attempt {
             "the binding was not registered with the replacement; the workers report {reports:?}"
         );
     }
-    // What shows the held host had not answered rests on a cache that files what is compiled. The
-    // replacement filed its compile before it answered, so where nothing is filed now, a cache
-    // that does not file would have left the held host's compile unfiled as well.
-    let in_the_cache = under_the_cache(&environment);
-    if filed(&in_the_cache).is_empty() {
-        return Attempt::Missed(format!(
-            "the replacement compiled the component and the compiled-code cache holds no file of it \
-             ({in_the_cache:?}), so an empty cache shows nothing about the held host"
-        ));
-    }
-    eprintln!(
-        "the replacement filed its compile: {:?}",
-        filed(&in_the_cache)
-    );
     let client = kr_plugin_service::client::PluginClient::connect(&environment)
         .await
         .expect("the replacement answers");
@@ -2079,51 +1992,6 @@ async fn hold_a_registration_and_end_the_host() -> Attempt {
         worker.pid.get(),
         ticks(&world.terminal)
     );
-    Attempt::Held
-}
-
-/// KR-REQ-05.07: a plugin host that ends with a registration unanswered takes no worker with it,
-/// and the binding comes back, on Windows.
-///
-/// A worker is running a program a package that ships a component recognises, which prints a
-/// numbered line every moment, and registers its binding with the plugin host the daemon started.
-/// The host is held still the moment the worker reports that it is registering, so that the request
-/// goes unanswered: the worker's own report, asked for again after the terminal has been sent
-/// twenty lines more, still reads that it is registering. The host is then ended by the identity it
-/// was started under with that request outstanding. The worker goes on, the terminal goes on being
-/// sent lines it had not been sent, and the daemon starts a replacement under its bound, which the
-/// worker registers the same binding with again, so that the host holds the binding.
-///
-/// A host files the component it compiled in its compiled-code cache before it answers. So a host
-/// that is held still with nothing filed has not answered, and once held it files nothing more:
-/// that is read from the held host's cache, and not from how the replacement came by the
-/// component. It rests on the cache working, which the replacement shows by filing the component
-/// it compiled. A host that may have answered before it could be held, or a cache that did not
-/// file, shows nothing about a request outstanding, so that attempt is made again, up to a bound,
-/// and a case that could not hold one fails. A host that refuses a registration before it compiles
-/// files nothing, but its refusal is an answer the worker reads and reports, so the worker's own
-/// report is the second condition for that.
-///
-/// What this leaves open is a filing that failed in the first host alone, with the first host's
-/// cache directory not made, while the replacement's was: a first host that answered before it was
-/// held, with nothing under its cache, cannot be told from one that had not answered. Closing that
-/// takes a host that can be held before it replies, which the plugin host has no way to be asked
-/// for from outside.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = writes_profiles!()]
-async fn a_plugin_host_that_ends_with_a_registration_unanswered_takes_no_worker_with_it_on_windows()
-{
-    let mut missed = Vec::new();
-    for attempt in 1..=HOLD_ATTEMPTS {
-        match hold_a_registration_and_end_the_host().await {
-            Attempt::Held => return,
-            Attempt::Missed(why) => {
-                eprintln!("attempt {attempt} showed nothing: {why}");
-                missed.push(why);
-            }
-        }
-    }
-    panic!("could not hold a registration in flight in {HOLD_ATTEMPTS} attempts: {missed:?}");
 }
 
 /// Where the case that signs the account out leaves what the case that follows the sign-out reads:
