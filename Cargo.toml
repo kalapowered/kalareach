@@ -198,9 +198,10 @@ qrcodegen = "=1.8.0"
 # own account of it. Dev-dependencies of the companion crate only.
 resvg = { version = "=0.48.1", default-features = false }
 rqrr = "=0.11.0"
-# Reads the JUnit result files that Gradle writes for the Android application's unit tests, which
-# the conformance report keys to the requirement rows. Already in the tree through the property-list
-# reader that `netdev` uses, and it has one dependency.
+# Reads JUnit XML: the result files that Gradle writes for the Android application's unit tests,
+# which the conformance report keys to the requirement rows, and the test reports a workflow's suite
+# writes, which the change-set service reads after the suite ends. Already in the tree through the
+# property-list reader that `netdev` uses, and it has one dependency.
 quick-xml = "=0.42.0"
 quote = "=1.0.47"
 # Certificates a test issues for a loopback server of its own, so the transport's certificate and

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="1" failures="2" skipped="2" tests="7" time="0.016" timestamp="2026-10-28T04:49:04.668164+02:00" hostname="localhost"><testcase classname="test_sample" name="test_adds" time="0.000" /><testcase classname="test_sample" name="test_fails_an_assertion" time="0.000"><failure message="assert (2 + 2) == 5">def test_fails_an_assertion():
+&gt;       assert 2 + 2 == 5
+E       assert (2 + 2) == 5
+
+test_sample.py:9: AssertionError</failure></testcase><testcase classname="test_sample" name="test_is_skipped" time="0.000"><skipped type="pytest.skip" message="not today">test_sample.py:12: not today</skipped></testcase><testcase classname="test_sample" name="test_table[1]" time="0.000" /><testcase classname="test_sample" name="test_table[2]" time="0.000"><failure message="assert 2 &lt; 2">n = 2
+
+    @pytest.mark.parametrize("n", [1, 2])
+    def test_table(n):
+&gt;       assert n &lt; 2
+E       assert 2 &lt; 2
+
+test_sample.py:19: AssertionError</failure></testcase><testcase classname="test_sample" name="test_errors_in_setup" time="0.000"><error message="failed on setup with &quot;file test_sample.py, line 22&#10;  def test_errors_in_setup(missing_fixture):&#10;E       fixture 'missing_fixture' not found&#10;&gt;       available fixtures: cache, capfd, capfdbinary, caplog, capsys, capsysbinary, capteesys, doctest_namespace, monkeypatch, pytestconfig, record_property, record_testsuite_property, record_xml_attribute, recwarn, subtests, tmp_path, tmp_path_factory, tmpdir, tmpdir_factory&#10;[+3 more lines; full report in element text]">file test_sample.py, line 22
+  def test_errors_in_setup(missing_fixture):
+E       fixture 'missing_fixture' not found
+&gt;       available fixtures: cache, capfd, capfdbinary, caplog, capsys, capsysbinary, capteesys, doctest_namespace, monkeypatch, pytestconfig, record_property, record_testsuite_property, record_xml_attribute, recwarn, subtests, tmp_path, tmp_path_factory, tmpdir, tmpdir_factory
+&gt;       use 'pytest --fixtures [testpath]' for help on them.
+
+test_sample.py:22</error></testcase><testcase classname="test_sample" name="test_expected_to_fail" time="0.000"><skipped type="pytest.xfail" message="known" /></testcase></testsuite></testsuites>

@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<testsuites name="vitest tests" tests="6" failures="2" errors="0" time="0.0043735">
+    <testsuite name="sample.test.js" timestamp="2026-10-28T02:48:57.373Z" hostname="localhost" tests="6" failures="2" errors="0" skipped="2" time="0.0043735">
+        <testcase classname="sample.test.js" name="arithmetic &gt; adds" time="0.000874166">
+        </testcase>
+        <testcase classname="sample.test.js" name="arithmetic &gt; fails an assertion" time="0.002435833">
+            <failure message="expected 4 to be 5 // Object.is equality" type="AssertionError">
+AssertionError: expected 4 to be 5 // Object.is equality
+
+- Expected
++ Received
+
+- 5
++ 4
+
+ ❯ sample.test.js:5:50
+            </failure>
+        </testcase>
+        <testcase classname="sample.test.js" name="arithmetic &gt; is skipped" time="0">
+            <skipped/>
+        </testcase>
+        <testcase classname="sample.test.js" name="arithmetic &gt; is a todo" time="0">
+            <skipped/>
+        </testcase>
+        <testcase classname="sample.test.js" name="arithmetic &gt; table 1" time="0.000094917">
+        </testcase>
+        <testcase classname="sample.test.js" name="arithmetic &gt; table 2" time="0.000239667">
+            <failure message="expected 2 to be less than 2" type="AssertionError">
+AssertionError: expected 2 to be less than 2
+ ❯ sample.test.js:8:50
+            </failure>
+        </testcase>
+    </testsuite>
+</testsuites>

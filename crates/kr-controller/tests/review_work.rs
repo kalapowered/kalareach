@@ -715,7 +715,8 @@ async fn a_derived_version_is_new_review_work() {
         &outputs,
         &bound,
     )
-    .expect("the result is recorded");
+    .expect("the result is recorded")
+    .result;
     let derived = result
         .derived_output_version
         .0

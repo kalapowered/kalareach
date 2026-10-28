@@ -8412,3 +8412,376 @@ async fn a_restarted_daemon_does_not_count_a_session_that_ended_while_it_was_dow
     );
     host.clients.abort();
 }
+
+/// A suite command that writes `lines` to `path` in the copy it runs in, and ends with `status`.
+fn writes_report(path: &str, lines: &[&str], status: u8) -> String {
+    let directory = path
+        .rsplit_once('/')
+        .map_or(".", |(directory, _)| directory);
+    let lines: Vec<String> = lines.iter().map(|line| format!("'{line}'")).collect();
+    format!(
+        "mkdir -p {directory} && printf '%s\\n' {} > {path}; exit {status}",
+        lines.join(" ")
+    )
+}
+
+/// The three-case JUnit report the cases below read: one failed, one skipped, one passed.
+const A_JUNIT_REPORT: [&str; 7] = [
+    "<testsuites>",
+    "<testsuite name=\"suite\">",
+    "<testcase name=\"passes\" classname=\"suite.Case\" time=\"0.5\"/>",
+    "<testcase name=\"fails\" classname=\"suite.Case\"><failure message=\"nope\">trace</failure></testcase>",
+    "<testcase name=\"skips\" classname=\"suite.Case\"><skipped/></testcase>",
+    "</testsuite>",
+    "</testsuites>",
+];
+
+/// What `changeset.test_reports` answers for a version, for one run or the newest runs.
+async fn test_reports_of(
+    control: &mut LocalClient,
+    version: kr_protocol::changeset::VersionRef,
+    run: Option<kr_protocol::ids::MaterialisationId>,
+) -> kr_protocol::test_report::TestReportsResult {
+    typed(
+        &control
+            .request(
+                Method::ChangesetTestReports,
+                &kr_protocol::test_report::TestReportsParams {
+                    change_set_id: version.change_set_id,
+                    version: Nullable::some(version.version),
+                    materialisation_id: run.map_or_else(Nullable::null, Nullable::some),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("changeset.test_reports succeeds"),
+    )
+}
+
+fn parsed_totals(report: &kr_protocol::test_report::TestReport) -> [u64; 6] {
+    match &report.reading {
+        kr_protocol::test_report::ReportReading::Parsed { totals, .. } => [
+            totals.tests.get(),
+            totals.passed.get(),
+            totals.failed.get(),
+            totals.errored.get(),
+            totals.skipped.get(),
+            totals.flaky.get(),
+        ],
+        other => panic!("the report was not read: {other:?}"),
+    }
+}
+
+/// KR-REQ-25.06: a JUnit report a suite declares as an output is parsed after the suite ends, and
+/// what was read is answered as parsed, bound to the digest of the file the run's result records.
+/// A document in no documented format leaves nothing, a report that disagrees with the suite's exit
+/// status is recorded beside it and the node follows the exit status as it always did, and each run
+/// adds its own reports.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_suite_that_declares_a_junit_report_leaves_it_parsed_beside_its_result() {
+    let host = working_host_with_suites(&[
+        (
+            "reports",
+            &writes_report("reports/junit.xml", &A_JUNIT_REPORT, 1),
+            &["reports/junit.xml"],
+        ),
+        (
+            "disagrees",
+            &writes_report("reports/junit.xml", &A_JUNIT_REPORT, 0),
+            &["reports/junit.xml"],
+        ),
+        (
+            "notes",
+            &writes_report("notes/info.xml", &["<project><name>x</name></project>"], 0),
+            &["notes/info.xml"],
+        ),
+    ])
+    .await;
+    let mut control = client(&host).await;
+    let workspace = adopted_workspace(&mut control, host.environment_id, host.work()).await;
+    let version = captured(&mut control, &host, workspace, 150).await;
+
+    let (run, receipt, read) = tests_run(&mut control, &host, 151, "reports", version).await;
+    assert_eq!(run.status, WorkflowRunStatus::Failed, "{run:?}");
+    assert_eq!(
+        receipt.status,
+        NodeStatus::Failed,
+        "the exit status decides: {receipt:?}"
+    );
+    let first = read.results[0].materialisation_id;
+    let answered = test_reports_of(&mut control, version, None).await;
+    assert_eq!(answered.version, version);
+    assert_eq!(answered.omitted.get(), 0);
+    let [report] = &answered.reports[..] else {
+        panic!("one report: {answered:?}");
+    };
+    assert_eq!(report.materialisation_id, first);
+    assert_eq!(report.output_path, "reports/junit.xml");
+    assert_eq!(
+        report.format,
+        kr_protocol::test_report::ReportFormat::JunitXml
+    );
+    assert_eq!(parsed_totals(report), [3, 1, 1, 0, 1, 0]);
+    let kr_protocol::test_report::ReportReading::Parsed { cases, .. } = &report.reading else {
+        unreachable!("read above");
+    };
+    assert_eq!(
+        cases
+            .iter()
+            .map(|case| case.name.as_str())
+            .collect::<Vec<_>>(),
+        ["fails", "skips"]
+    );
+    // The report is the file the result records: the same path, the same digest and length.
+    let output = read.results[0]
+        .outputs
+        .iter()
+        .find(|output| output.label == "reports/junit.xml")
+        .expect("the result records the declared output");
+    assert_eq!(output.digest, report.output_digest);
+    assert_eq!(output.byte_len, report.output_bytes);
+
+    // The report says the suite failed a case while the suite said it passed, and the node is
+    // what the suite said.
+    let (run, receipt, read) = tests_run(&mut control, &host, 152, "disagrees", version).await;
+    assert_eq!(run.status, WorkflowRunStatus::Completed, "{run:?}");
+    assert_eq!(receipt.status, NodeStatus::Success, "{receipt:?}");
+    let second = read
+        .results
+        .iter()
+        .find(|result| result.command == "disagrees")
+        .expect("the second run is recorded")
+        .materialisation_id;
+    let answered = test_reports_of(&mut control, version, None).await;
+    assert_eq!(
+        answered.reports.len(),
+        2,
+        "each run adds its own: {answered:?}"
+    );
+    assert_eq!(
+        answered.reports[0].materialisation_id, second,
+        "the newest run's first"
+    );
+    assert_eq!(parsed_totals(&answered.reports[0])[2], 1);
+    let only_first = test_reports_of(&mut control, version, Some(first)).await;
+    assert_eq!(only_first.reports.len(), 1);
+    assert_eq!(only_first.reports[0].materialisation_id, first);
+
+    // A declared file in no documented format is not a report.
+    let (_, receipt, read) = tests_run(&mut control, &host, 153, "notes", version).await;
+    assert_eq!(receipt.status, NodeStatus::Success, "{receipt:?}");
+    let third = read
+        .results
+        .iter()
+        .find(|result| result.command == "notes")
+        .expect("the third run is recorded")
+        .materialisation_id;
+    assert!(
+        test_reports_of(&mut control, version, Some(third))
+            .await
+            .reports
+            .is_empty(),
+        "a document that opens as no report format leaves no record"
+    );
+    host.clients.abort();
+}
+
+/// KR-REQ-25.06: a report is read from the copy whatever else the copy holds. The re-read of a copy
+/// ends at the first thing it cannot represent, here a link among many beside the report's
+/// directory, and the declared output is still described once, with the digest the result records.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_report_is_read_when_the_copy_holds_something_the_source_cannot_represent() {
+    let links = "i=0; while [ $i -lt 50 ]; do ln -s /nowhere link$i; i=$((i+1)); done";
+    let host = working_host_with_suites(&[(
+        "linked",
+        &format!(
+            "{links}; {}",
+            writes_report("out/report.xml", &A_JUNIT_REPORT, 0)
+        ),
+        &["out/report.xml"],
+    )])
+    .await;
+    let mut control = client(&host).await;
+    let workspace = adopted_workspace(&mut control, host.environment_id, host.work()).await;
+    let version = captured(&mut control, &host, workspace, 154).await;
+
+    let (_, _, read) = tests_run(&mut control, &host, 155, "linked", version).await;
+    let result = &read.results[0];
+    assert_eq!(
+        result.tested_source,
+        TestedSource::Indeterminate,
+        "a link is something the source cannot represent: {result:?}"
+    );
+    assert!(
+        result
+            .outputs
+            .iter()
+            .any(|output| output.label == "out/report.xml"),
+        "the declared output is in the result: {:?}",
+        result.outputs
+    );
+    let answered = test_reports_of(&mut control, version, None).await;
+    assert_eq!(answered.reports.len(), 1, "{answered:?}");
+    assert_eq!(parsed_totals(&answered.reports[0]), [3, 1, 1, 0, 1, 0]);
+    host.clients.abort();
+}
+
+/// KR-REQ-25.06: the answer is bounded however many runs a version has. A suite that declares the
+/// most outputs it may, run three times, leaves forty-eight reports of the most cases a report
+/// lists: the newest thirty-two are answered, the rest are counted, and the answer fits a frame.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_answer_for_a_version_with_many_reports_is_bounded() {
+    let outputs: Vec<String> = (0..16)
+        .map(|index| format!("reports/r{index}.xml"))
+        .collect();
+    let paths: Vec<&str> = outputs.iter().map(String::as_str).collect();
+    let name = "n".repeat(200);
+    let command = format!(
+        "mkdir -p reports; for n in $(seq 0 15); do \
+         {{ echo '<testsuite>'; i=0; while [ $i -lt 60 ]; do \
+         echo \"<testcase name=\\\"{name}$i\\\" classname=\\\"{name}\\\"><failure/></testcase>\"; \
+         i=$((i+1)); done; echo '</testsuite>'; }} > reports/r$n.xml; done"
+    );
+    let host = working_host_with_suites(&[("many", &command, &paths)]).await;
+    let mut control = client(&host).await;
+    let workspace = adopted_workspace(&mut control, host.environment_id, host.work()).await;
+    let version = captured(&mut control, &host, workspace, 156).await;
+    for number in 157..160 {
+        tests_run(&mut control, &host, number, "many", version).await;
+    }
+
+    let answered = test_reports_of(&mut control, version, None).await;
+    assert_eq!(
+        answered.reports.len(),
+        kr_protocol::test_report::MAX_REPORTS_PER_ANSWER
+    );
+    assert_eq!(answered.omitted.get(), 16);
+    let newest = version_as_read(&mut control, version).await;
+    let newest = newest
+        .results
+        .last()
+        .expect("three results")
+        .materialisation_id;
+    assert_eq!(answered.reports[0].materialisation_id, newest);
+    let kr_protocol::test_report::ReportReading::Parsed {
+        cases,
+        cases_omitted,
+        ..
+    } = &answered.reports[0].reading
+    else {
+        panic!("read: {:?}", answered.reports[0]);
+    };
+    assert_eq!(cases.len(), kr_protocol::test_report::MAX_REPORT_CASES);
+    assert_eq!(cases_omitted.get(), 10);
+    assert!(
+        cases
+            .iter()
+            .all(|case| case.name.len() <= kr_protocol::test_report::MAX_REPORT_NAME_BYTES)
+    );
+    host.clients.abort();
+}
+
+/// KR-REQ-25.06: a row the change-set store does not vouch for is never answered. A report whose
+/// digest is not the one its run's result records, and a report for a run the store holds no result
+/// for (a change-set store restored from an older copy while this file was kept), are not served,
+/// and the second is let go when the store opens again; the control serves the row that matches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_report_the_result_does_not_vouch_for_is_never_served() {
+    let host = working_host_with_suites(&[(
+        "reports",
+        &writes_report("reports/junit.xml", &A_JUNIT_REPORT, 0),
+        &["reports/junit.xml"],
+    )])
+    .await;
+    let mut control = client(&host).await;
+    let workspace = adopted_workspace(&mut control, host.environment_id, host.work()).await;
+    let version = captured(&mut control, &host, workspace, 160).await;
+    let (_, _, read) = tests_run(&mut control, &host, 161, "reports", version).await;
+    let run = read.results[0].materialisation_id;
+    let state_dir = host._temp.environment().state_dir().to_path_buf();
+    let reports = kr_controller::test_reports::Reports::open(&state_dir).expect("the store opens");
+
+    assert_eq!(
+        test_reports_of(&mut control, version, None)
+            .await
+            .reports
+            .len(),
+        1,
+        "the control"
+    );
+
+    // The same run and path with another digest, as a store that held another file would.
+    let mut stale = reports.of_run(run).expect("reads").remove(0);
+    stale.output_digest = kr_protocol::scalars::Digest256::from_bytes([7; 32]);
+    reports.record(&stale).expect("the row is replaced");
+    assert!(
+        test_reports_of(&mut control, version, None)
+            .await
+            .reports
+            .is_empty()
+    );
+
+    // A report for a run that no result stands behind.
+    let orphan = kr_protocol::ids::MaterialisationId::new(Uuid::from_bytes([9; 16]));
+    let mut report = stale.clone();
+    report.materialisation_id = orphan;
+    reports.record(&report).expect("the row is written");
+    assert!(
+        test_reports_of(&mut control, version, Some(orphan))
+            .await
+            .reports
+            .is_empty()
+    );
+    let forgotten = reports
+        .forget_runs_without_a_result(|held| Ok(held == run))
+        .expect("the orphans are forgotten");
+    assert_eq!(forgotten, 1);
+    assert!(reports.of_run(orphan).expect("reads").is_empty());
+    assert_eq!(
+        reports.of_run(run).expect("reads").len(),
+        1,
+        "the run's own row stays"
+    );
+    host.clients.abort();
+}
+
+/// KR-REQ-25.06: a report that cannot be kept never changes what the node, its result and its
+/// evidence say: with the store of reports unable to take a row, a suite that ends 0 against the
+/// version is still a success with a result that attests it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_report_that_cannot_be_kept_changes_nothing_else() {
+    let host = working_host_with_suites(&[(
+        "reports",
+        &writes_report("reports/junit.xml", &A_JUNIT_REPORT, 0),
+        &["reports/junit.xml"],
+    )])
+    .await;
+    let mut control = client(&host).await;
+    let workspace = adopted_workspace(&mut control, host.environment_id, host.work()).await;
+    let version = captured(&mut control, &host, workspace, 162).await;
+    rusqlite::Connection::open(
+        host._temp
+            .environment()
+            .state_dir()
+            .join("test-reports.sqlite3"),
+    )
+    .expect("the store opens")
+    .execute("DROP TABLE test_reports", [])
+    .expect("the table goes");
+
+    let (run, receipt, read) = tests_run(&mut control, &host, 163, "reports", version).await;
+    assert_eq!(run.status, WorkflowRunStatus::Completed, "{run:?}");
+    assert_eq!(receipt.status, NodeStatus::Success, "{receipt:?}");
+    assert_eq!(
+        read.results[0].tested_source,
+        TestedSource::UnmodifiedVersion
+    );
+    assert!(
+        read.evidence
+            .iter()
+            .any(|evidence| evidence.kind == kr_protocol::changeset::EvidenceKind::TestResult),
+        "{:?}",
+        read.evidence
+    );
+    host.clients.abort();
+}
