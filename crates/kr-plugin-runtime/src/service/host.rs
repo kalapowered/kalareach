@@ -64,6 +64,16 @@ use crate::service::wire;
 pub const REGISTER_DEADLINE: core::time::Duration =
     core::time::Duration::from_millis(COMPILE_DEADLINE_MS);
 
+/// The file, in the state directory beside the compiled-code cache, that holds every registration
+/// for as long as it exists. A host built without the `testing` feature reads no such file.
+#[cfg(feature = "testing")]
+const REGISTRATION_GATE: &str = "hold-registrations";
+
+/// The file a host makes beside [`REGISTRATION_GATE`] when a registration has reached the gate
+/// while it is closed.
+#[cfg(feature = "testing")]
+const REGISTRATION_GATE_REACHED: &str = "hold-registrations.reached";
+
 /// How many bindings one worker connection may hold.
 ///
 /// A binding is an instance, a thread and a queue, and a connection that could register without
@@ -755,6 +765,30 @@ impl PluginHost {
         }
     }
 
+    /// Holds a registration, before it reads or compiles anything, for as long as the gate file
+    /// exists in the state directory this host files its cache in, and makes a file of its own
+    /// beside the gate when one has reached it.
+    ///
+    /// It serves the by-hand Windows case that ends a plugin host with a registration unanswered
+    /// (`a_plugin_host_that_ends_with_a_registration_unanswered_takes_no_worker_with_it_on_windows`,
+    /// in kr-cli's `shell_windows` suite): a registration held here has been neither compiled nor
+    /// answered, which no reading of a running host from outside shows. The gate is the case's own
+    /// file, in the case's own state directory.
+    #[cfg(feature = "testing")]
+    async fn hold_at_the_registration_gate(&self) {
+        let Some(directory) = self.config.cache_root.parent() else {
+            return;
+        };
+        let gate = directory.join(REGISTRATION_GATE);
+        if !gate.exists() {
+            return;
+        }
+        let _ = std::fs::write(directory.join(REGISTRATION_GATE_REACHED), b"");
+        while gate.exists() {
+            tokio::time::sleep(core::time::Duration::from_millis(20)).await;
+        }
+    }
+
     /// Registers one binding inside one deadline.
     ///
     /// The deadline is absolute across every stage: reading the payload, compiling it, and creating
@@ -765,6 +799,8 @@ impl PluginHost {
         registration: BindingRegistration,
         served: &Arc<Served>,
     ) -> Result<ResponseBody, (String, bool)> {
+        #[cfg(feature = "testing")]
+        self.hold_at_the_registration_gate().await;
         let started = std::time::Instant::now();
         let BindingRegistration {
             binding_id,
