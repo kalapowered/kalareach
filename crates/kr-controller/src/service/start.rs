@@ -666,6 +666,7 @@ impl Controller {
                 &setup.paths,
                 setup.environment_id,
                 Arc::clone(changesets.service()),
+                changesets.reports().cloned(),
             )
             .await?,
         );

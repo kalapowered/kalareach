@@ -2138,6 +2138,7 @@ async fn an_open_automation_module_dispatches_nothing_until_it_is_started() {
         &paths,
         host.environment_id,
         Arc::clone(host.controller.changesets().service()),
+        host.controller.changesets().reports().cloned(),
     )
     .await
     .expect("the module opens");

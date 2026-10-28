@@ -113,6 +113,36 @@ impl Reports {
         })
     }
 
+    /// Opens the record in `state_dir` for a daemon that starts whether it can or not, and lets go
+    /// of the reports whose run is not among `runs_with_a_result`.
+    ///
+    /// A record that cannot be used (a file that is not a database, a schema this build does not
+    /// read, a row that names no run) restricts nothing, so its closed side is no report and not
+    /// no daemon: the failure is said once on the daemon's standard error with the file's path,
+    /// the file is left exactly as it is for the release that can read it, and nothing is kept in
+    /// it or answered from it.
+    #[must_use]
+    pub fn open_for_a_daemon(
+        state_dir: &Path,
+        runs_with_a_result: &std::collections::HashSet<MaterialisationId>,
+    ) -> Option<Self> {
+        match Self::open(state_dir).and_then(|reports| {
+            reports.forget_runs_without_a_result(runs_with_a_result)?;
+            Ok(reports)
+        }) {
+            Ok(reports) => Some(reports),
+            Err(error) => {
+                eprintln!(
+                    "kr-controller: the record of test reports at {} cannot be used and is left \
+                     as it is; no report is kept or answered: {}",
+                    state_dir.join(TEST_REPORTS_RECORD).display(),
+                    kr_project::git::redact(&error.to_string())
+                );
+                None
+            }
+        }
+    }
+
     fn with<T>(&self, body: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T> {
         let connection = self
             .connection
