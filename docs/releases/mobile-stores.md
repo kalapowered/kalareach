@@ -131,8 +131,9 @@ and a log bundle in the temporary directory, and the script removes both.
 - the application's push environment is `production`, neither bundle lets a debugger attach, and
   the associated domains and keychain groups are the ones `identifiers.mjs` expects, the
   application's own group first;
-- every framework and dylib inside a bundle is signed by an Apple Distribution certificate of the
-  team, and by the same certificate as the bundle that holds it;
+- every framework and dylib in the `Frameworks` directory of the application and of each extension
+  is signed by an Apple Distribution certificate of the team, and by the same certificate as the
+  bundle that holds it (code nested deeper is not read; the store refuses nested frameworks);
 - each bundle has an App Store profile of the team with no device list, and the application's
   profile carries the production push environment;
 - the application and the extension have the same `CFBundleVersion` and `CFBundleShortVersionString`;
@@ -167,13 +168,14 @@ key is checked again against the same two pages.
 ## What a person does
 
 The scripts stop at a checked file. A build that failed a check, or whose output directory held a
-secret, leaves its files and a `store-build.json` whose `holds` is false, and no receipt: it is not
-uploaded. A run that stops before its check leaves no record, and no receipt either. On Android,
-`holds` covers the bundle's checks; the emulator leg is a separate command whose result is in its own
-log and exit status. A failed search of the output directory for the secret fails either script and
-leaves no receipt, and an iOS run that is interrupted removes Xcode's logs and searches the
-directory before it ends. Uploading is
-separate: the first Android bundle through Play Console, and the iOS build with
+secret, leaves its files and no receipt. A failed check also leaves a `store-build.json` whose
+`holds` is false. Only the receipt marks a build that passed every step: the last search of the
+output directory can fail a run after its record says `holds` is true, and on Android `holds`
+covers the bundle's checks while the emulator leg, a separate command, keeps its result in its own
+log and exit status. A run that stops before its check leaves no record and no receipt. An iOS run
+that is interrupted removes Xcode's logs and searches its output directory before it ends.
+
+Uploading is separate: the first Android bundle through Play Console, and the iOS build with
 `xcrun altool --upload-app` and the same API key. The store forms and the testers' lists are
 entered in the stores' own consoles. The app-signing fingerprint goes into the web service's
 configuration, as above.

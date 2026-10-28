@@ -71,47 +71,28 @@ kr_store_number() {
 
 # kr_store_receipt <platform> <number>: records a build that passed its checks. The receipt keeps
 # the larger of the number it holds and this one, so two runs that overlap cannot lower it, and a
-# failure to write it is the caller's failure.
-kr_store_receipt() {
-    local platform=$1 number=$2 receipt old=0 temporary lock waited=0 status=0
+# failure to write it is the caller's failure. One writer at a time: the writer holds a kernel lock
+# (`lockf` on a descriptor of `<receipt>.flock`) for the read and the write. The lock goes with the
+# process that holds it, so no run can leave it held and none can take it from a run that is still
+# working; a writer that cannot get it within `KR_STORE_LOCK_WAIT` seconds (default 60) fails.
+kr_store_receipt() (
+    platform=$1 number=$2
     receipt="$KR_STORE_ROOT/receipts/$platform"
-    mkdir -p "$KR_STORE_ROOT/receipts" || return 2
-    lock="$receipt.lock"
-    # One writer at a time: the lock is a directory that holds its owner's process id. A lock is
-    # taken over only when its owner has ended, never because it is old, so a writer that is slow
-    # keeps its lock. (Two waiters that find the same dead owner can both take it over; that needs
-    # an owner that died inside its few milliseconds of work.)
-    until mkdir "$lock" 2>/dev/null; do
-        if kr_store_lock_abandoned "$lock" && rm -f -- "$lock/owner" && rmdir "$lock" 2>/dev/null; then continue; fi
-        waited=$((waited + 1))
-        if [ "$waited" -gt "${KR_STORE_LOCK_WAIT:-60}" ]; then kr_store_say "the receipt for $platform is locked by another run" >&2; return 2; fi
-        sleep 1
-    done
-    printf '%s\n' "${BASHPID:-$$}" >"$lock/owner"
+    mkdir -p "$KR_STORE_ROOT/receipts" || exit 2
+    exec 9>>"$receipt.flock" || exit 2
+    if ! lockf -s -t "${KR_STORE_LOCK_WAIT:-60}" 9; then
+        kr_store_say "the receipt for $platform is locked by another run" >&2
+        exit 2
+    fi
+    old=0
     [ ! -f "$receipt" ] || old="$(tr -d '[:space:]' <"$receipt")"
     if [ "$old" -gt "$number" ] 2>/dev/null; then number=$old; fi
     if temporary="$(mktemp "$receipt.XXXXXX")" && printf '%s\n' "$number" >"$temporary" && mv -f "$temporary" "$receipt"; then
-        status=0
-    else
-        rm -f -- "${temporary:-$receipt.none}"
-        status=2
+        exit 0
     fi
-    rm -f -- "$lock/owner"
-    rmdir "$lock" 2>/dev/null
-    return "$status"
-}
-
-# kr_store_lock_abandoned <lock>: whether the run that made a receipt lock has ended. The owner file
-# holds that run's process id. A lock with no readable owner is abandoned once it is a minute old,
-# far longer than a writer takes between making the directory and naming itself.
-kr_store_lock_abandoned() {
-    local owner
-    owner="$(tr -d '[:space:]' <"$1/owner" 2>/dev/null)"
-    case "$owner" in
-        '' | *[!0-9]*) [ -n "$(find "$1" -maxdepth 0 -mmin +1 2>/dev/null)" ]; return ;;
-    esac
-    ! kill -0 "$owner" 2>/dev/null
-}
+    rm -f -- "${temporary:-$receipt.none}"
+    exit 2
+)
 
 # kr_store_claim_number <platform> <number>: reserves a build number for a platform, whatever the
 # version, so that two builds of different versions made in one minute cannot both ship it (Google
@@ -138,13 +119,18 @@ kr_store_claim() {
 # two places, `Packaging.log` beside the exported build and a log bundle in the temporary directory
 # that the export log names. Neither is of use after the export, and a token is not a secret file a
 # scan could match, so both go. It fails when a log cannot be removed, or is outside the temporary
-# directory, which it does not clear. Xcode writes to the per-user temporary directory when `TMPDIR`
-# is not set.
+# directory, which it does not clear, or when an export log exists and names no bundle. Xcode writes
+# to the per-user temporary directory when `TMPDIR` is not set.
 kr_store_remove_token_logs() {
     local named tmp parent
     rm -f -- "${1:?}/export/Packaging.log"
     named="$(sed -n 's/.*Created bundle at path "\(.*\.xcdistributionlogs\)".*/\1/p' "$1/export.log" 2>/dev/null | head -1)"
-    [ -n "$named" ] || return 0
+    if [ -z "$named" ]; then
+        # An export log names its log bundle on its first line. One that does not may have left tokens
+        # in a place this cannot find.
+        [ ! -e "$1/export.log" ] || { kr_store_say "the export log $1/export.log names no Xcode log bundle; look for one in the temporary directory and remove it by hand" >&2; return 2; }
+        return 0
+    fi
     tmp="$(cd "${TMPDIR:-$(getconf DARWIN_USER_TEMP_DIR)}" 2>/dev/null && pwd -P)"
     parent="$(cd "$(dirname "$named")" 2>/dev/null && pwd -P)"
     if [ -z "$tmp" ] || [ "$parent" != "$tmp" ]; then
