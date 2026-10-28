@@ -108,14 +108,25 @@ fn without(list: &[u8], key_path: &str) -> Result<Option<Vec<u8>>, ProfileError>
 /// A string preference's value.
 fn entry_string(list: &[u8], key: &str) -> Result<Option<String>, ProfileError> {
     Ok(
-        run(PLUTIL, &["-extract", key, "raw", "-o", "-", "-"], list)?
-            .map(|raw| String::from_utf8_lossy(&raw).trim().to_owned()),
+        run(PLUTIL, &["-extract", key, "raw", "-o", "-", "-"], list)?.map(|raw| {
+            // `plutil` ends the value with a line feed; the spaces a name has are its own.
+            let text = String::from_utf8_lossy(&raw).into_owned();
+            text.strip_suffix('\n').map_or(text.clone(), str::to_owned)
+        }),
     )
 }
 
-/// The key path of one profile's entry.
+/// The key path of one profile's entry. A key path is split at each dot, so a dot and a backslash
+/// in a profile's name are escaped to stay part of it.
 fn entry_path(name: &str) -> String {
-    format!("{WINDOW_SETTINGS}.{name}")
+    let mut path = format!("{WINDOW_SETTINGS}.");
+    for character in name.chars() {
+        if matches!(character, '.' | '\\') {
+            path.push('\\');
+        }
+        path.push(character);
+    }
+    path
 }
 
 /// Whether the entry read from the preferences is one the record holds: what was written, or what
@@ -282,6 +293,9 @@ pub(super) fn write(plan: &PreferencesPlan) -> Result<(), (ProfileError, bool)> 
     // that the person saved since is not written over.
     check_ownership(&before, plan.previous.as_ref()).map_err(|error| (error, false))?;
     let was = entry(&before, &entry_path(PROFILE_NAME)).map_err(|error| (error, false))?;
+    // The entry as the check after the write read it: a take-back finds it so, or the person has
+    // changed it since and it is theirs.
+    let mut observed: Option<Vec<u8>> = None;
     let held = (|| {
         run_ok(
             DEFAULTS,
@@ -297,6 +311,7 @@ pub(super) fn write(plan: &PreferencesPlan) -> Result<(), (ProfileError, bool)> 
         )?;
         let after = export(&plan.domain)?;
         let ours = entry(&after, &entry_path(PROFILE_NAME))?;
+        observed.clone_from(&ours);
         let ours_match = match ours {
             Some(ours) => normal(&ours)? == normal(plan.wrote.canonical.as_bytes())?,
             None => false,
@@ -306,25 +321,46 @@ pub(super) fn write(plan: &PreferencesPlan) -> Result<(), (ProfileError, bool)> 
     if held.is_ok_and(|held| held) {
         return Ok(());
     }
-    let put_back = put_back(&plan.domain, was.as_deref());
+    let left: Vec<&[u8]> = std::iter::once(plan.wrote.canonical.as_bytes())
+        .chain(observed.as_deref())
+        .collect();
+    let put_back = put_back(&plan.domain, was.as_deref(), &left);
     Err((failed(), !put_back))
 }
 
+/// Whether two property lists hold one value.
+fn same(left: &[u8], right: &[u8]) -> bool {
+    matches!((normal(left), normal(right)), (Ok(left), Ok(right)) if left == right)
+}
+
 /// Puts this profile's entry back as the snapshot had it (`was`: the entry, or `None` for none),
-/// leaving everything else as it is now, and says whether it is. A dictionary of profiles that is
-/// no longer a dictionary is the one thing put back whole, from `was`'s whole dictionary.
-fn put_back(domain: &str, was: Option<&[u8]>) -> bool {
-    let current = |domain: &str| -> Option<Option<Vec<u8>>> {
-        let exported = export(domain).ok()?;
-        entry(&exported, &entry_path(PROFILE_NAME)).ok()
-    };
+/// leaving everything else as it is now, and says whether it is.
+///
+/// The entry is touched only while it is something kr could have left: absent, as `was` had it, or
+/// as one of `left` has it (what was written, what the check after the write read). An entry that
+/// is anything else was changed by the person since, and is theirs. Putting back an entry that was
+/// not there takes the dictionary of profiles out whole, which is written only while it is as the
+/// read just before shows it; otherwise nothing is written and the entry is not put back.
+fn put_back(domain: &str, was: Option<&[u8]>, left: &[&[u8]]) -> bool {
     let as_was = |now: &Option<Vec<u8>>| match (now, was) {
         (None, None) => true,
-        (Some(now), Some(was)) => matches!((normal(now), normal(was)), (Ok(a), Ok(b)) if a == b),
+        (Some(now), Some(was)) => same(now, was),
         _ => false,
     };
-    if current(domain).is_some_and(|now| as_was(&now)) {
+    let Ok(exported) = export(domain) else {
+        return false;
+    };
+    let Ok(now) = entry(&exported, &entry_path(PROFILE_NAME)) else {
+        return false;
+    };
+    if as_was(&now) {
         return true;
+    }
+    if now
+        .as_deref()
+        .is_some_and(|now| !left.iter().any(|ours| same(now, ours)))
+    {
+        return false;
     }
     let restored = match was {
         Some(entry) => run_ok(
@@ -340,17 +376,32 @@ fn put_back(domain: &str, was: Option<&[u8]>) -> bool {
             b"",
         )
         .is_ok(),
-        None => remove_entry(domain).is_ok(),
+        None => write_without(domain, &exported).is_ok_and(|written| written),
     };
-    restored && current(domain).is_some_and(|now| as_was(&now))
+    restored
+        && export(domain)
+            .and_then(|exported| entry(&exported, &entry_path(PROFILE_NAME)))
+            .is_ok_and(|now| as_was(&now))
 }
 
-/// Takes this profile's entry out of the dictionary of profiles as it is now: the dictionary is
-/// read, the entry is removed from the copy, and the copy is written back as the dictionary.
-fn remove_entry(domain: &str) -> Result<(), ProfileError> {
-    let exported = export(domain)?;
-    let dictionary = entry(&exported, WINDOW_SETTINGS)?.ok_or_else(failed)?;
-    let reduced = normal(&without(&dictionary, PROFILE_NAME)?.ok_or_else(failed)?)?;
+/// The dictionary of profiles as `plutil` writes it, or `None` where there is none.
+fn dictionary(exported: &[u8]) -> Result<Option<Vec<u8>>, ProfileError> {
+    entry(exported, WINDOW_SETTINGS)?
+        .map(|list| normal(&list))
+        .transpose()
+}
+
+/// Writes the dictionary of profiles without this profile's entry, as it is now, if the dictionary
+/// is still the one `seen` shows. `Ok(false)` is a dictionary that moved since: nothing was written,
+/// so a profile the person changed meanwhile is not put back to what it was. The preferences are
+/// read once more just before the write; what remains is the time between that read and the write.
+fn write_without(domain: &str, seen: &[u8]) -> Result<bool, ProfileError> {
+    let now = export(domain)?;
+    if dictionary(&now)? != dictionary(seen)? {
+        return Ok(false);
+    }
+    let list = entry(&now, WINDOW_SETTINGS)?.ok_or_else(failed)?;
+    let reduced = normal(&without(&list, PROFILE_NAME)?.ok_or_else(failed)?)?;
     run_ok(
         DEFAULTS,
         &[
@@ -360,8 +411,8 @@ fn remove_entry(domain: &str) -> Result<(), ProfileError> {
             &String::from_utf8_lossy(&reduced),
         ],
         b"",
-    )
-    .map(|_| ())
+    )?;
+    Ok(true)
 }
 
 /// Where the entry stands against what was written.
@@ -387,13 +438,11 @@ pub(super) fn reading(domain: &str, wrote: &PreferencesWrote) -> Result<Reading,
 
 /// The same, from preferences already read.
 fn reading_in(exported: &[u8], wrote: &PreferencesWrote) -> Result<Reading, ProfileError> {
-    Ok(
-        match entry(exported, &format!("{}.{}", wrote.key, wrote.entry))? {
-            None => Reading::Missing,
-            Some(present) if is_recorded(&present, wrote)? => Reading::Matches,
-            Some(_) => Reading::Changed,
-        },
-    )
+    Ok(match entry(exported, &entry_path(&wrote.entry))? {
+        None => Reading::Missing,
+        Some(present) if is_recorded(&present, wrote)? => Reading::Matches,
+        Some(_) => Reading::Changed,
+    })
 }
 
 /// Whether the recorded entry is the profile Terminal opens windows with, or starts with.
@@ -448,33 +497,22 @@ pub(super) fn take_out(domain: &str, wrote: &PreferencesWrote) -> Result<TakenOu
         Reading::Matches => {}
     }
     let was = entry(&before, &entry_path(PROFILE_NAME))?;
-    let dictionary = entry(&before, WINDOW_SETTINGS)?.ok_or_else(failed)?;
-    let reduced = normal(&without(&dictionary, PROFILE_NAME)?.ok_or_else(failed)?)?;
+    let list = entry(&before, WINDOW_SETTINGS)?.ok_or_else(failed)?;
+    let reduced = normal(&without(&list, PROFILE_NAME)?.ok_or_else(failed)?)?;
+    // Written only while the dictionary is as the read above shows it.
+    if !write_without(domain, &before)? {
+        return Err(ProfileError::Changing(ProfileTerminal::AppleTerminal));
+    }
     let held = (|| {
-        run_ok(
-            DEFAULTS,
-            &[
-                "write",
-                domain,
-                WINDOW_SETTINGS,
-                &String::from_utf8_lossy(&reduced),
-            ],
-            b"",
-        )?;
         let after = export(domain)?;
-        Ok::<bool, ProfileError>(
-            entry(&after, WINDOW_SETTINGS)?
-                .map(|list| normal(&list))
-                .transpose()?
-                .is_some_and(|list| list == reduced),
-        )
+        Ok::<bool, ProfileError>(dictionary(&after)?.is_some_and(|list| list == reduced))
     })();
     if held.is_ok_and(|held| held) {
         return Ok(TakenOut::Removed);
     }
     // Whatever was written is not what was meant: this entry goes back, and nothing else is
     // touched.
-    let _ = put_back(domain, was.as_deref());
+    let _ = put_back(domain, was.as_deref(), &[]);
     Err(failed())
 }
 
@@ -580,6 +618,118 @@ mod tests {
             "put back, nothing left over: {failed_write:?}"
         );
         assert_eq!(export(&domain).expect("exports"), with_entry);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// Writes `entry` as the value of the profile `name` in the scratch preferences.
+    fn put_profile(domain: &str, name: &str, entry: &str) {
+        run_ok(
+            DEFAULTS,
+            &["write", domain, WINDOW_SETTINGS, "-dict-add", name, entry],
+            b"",
+        )
+        .expect("a profile");
+    }
+
+    fn profile_of(name: &str, marker: &str) -> String {
+        format!(
+            "<dict><key>name</key><string>{name}</string><key>Marker</key><string>{marker}</string></dict>"
+        )
+    }
+
+    /// KR-REQ-01.21: the dictionary of profiles is written without the entry only while it is as the
+    /// read shows it. A profile of the person's that changed after the read is not put back to what
+    /// it was: nothing is written.
+    #[test]
+    fn a_dictionary_that_moved_since_the_read_is_not_written() {
+        let (directory, domain) = scratch("moved");
+        put_profile(&domain, PROFILE_NAME, &profile_of(PROFILE_NAME, "ours"));
+        let seen = export(&domain).expect("exports");
+
+        put_profile(&domain, "Pro", &profile_of("Pro", "the person changed it"));
+        let after_the_edit = export(&domain).expect("exports");
+        assert!(
+            !write_without(&domain, &seen).expect("answers"),
+            "a dictionary that moved is not written"
+        );
+        assert_eq!(export(&domain).expect("exports"), after_the_edit);
+
+        // As the read shows it, only the entry goes.
+        let seen = export(&domain).expect("exports");
+        assert!(write_without(&domain, &seen).expect("answers"));
+        let now = export(&domain).expect("exports");
+        assert!(
+            entry(&now, &entry_path(PROFILE_NAME))
+                .expect("reads")
+                .is_none()
+        );
+        assert!(
+            String::from_utf8_lossy(
+                &entry(&now, &entry_path("Pro"))
+                    .expect("reads")
+                    .expect("Pro stays")
+            )
+            .contains("the person changed it")
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// KR-REQ-01.21: a take-back touches the entry only while it is something kr left. An entry the
+    /// person changed after the write is theirs and stays; one kr's own write left is put back.
+    #[test]
+    fn a_take_back_leaves_an_entry_the_person_changed() {
+        let (directory, domain) = scratch("theirs");
+        let earlier = profile_of(PROFILE_NAME, "earlier");
+        let ours = profile_of(PROFILE_NAME, "ours");
+        put_profile(&domain, PROFILE_NAME, &ours);
+        let was = earlier.as_bytes();
+        let left = [ours.as_bytes()];
+
+        // The person saved the profile after kr wrote it: not in `left`, so not put back.
+        put_profile(&domain, PROFILE_NAME, &profile_of(PROFILE_NAME, "theirs"));
+        let theirs = export(&domain).expect("exports");
+        assert!(!put_back(&domain, Some(was), &left));
+        assert_eq!(export(&domain).expect("exports"), theirs);
+        assert!(!put_back(&domain, None, &left));
+        assert_eq!(export(&domain).expect("exports"), theirs);
+
+        // What kr's write left is put back to the earlier entry, or taken out.
+        put_profile(&domain, PROFILE_NAME, &ours);
+        assert!(put_back(&domain, Some(was), &left));
+        let now = export(&domain).expect("exports");
+        let entry_now = entry(&now, &entry_path(PROFILE_NAME))
+            .expect("reads")
+            .expect("there");
+        assert!(String::from_utf8_lossy(&entry_now).contains("earlier"));
+        put_profile(&domain, PROFILE_NAME, &ours);
+        assert!(put_back(&domain, None, &left));
+        let now = export(&domain).expect("exports");
+        assert!(
+            entry(&now, &entry_path(PROFILE_NAME))
+                .expect("reads")
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// KR-REQ-01.21: a default profile whose name has a dot is copied, not another profile: the key
+    /// path escapes the dot.
+    #[test]
+    fn a_default_profile_with_a_dot_in_its_name_is_the_one_copied() {
+        let (directory, domain) = scratch("dotted");
+        put_profile(&domain, "Work.Dark", &profile_of("Work.Dark", "dotted"));
+        run_ok(
+            DEFAULTS,
+            &["write", &domain, DEFAULT_PROFILE, "-string", " Work.Dark"],
+            b"",
+        )
+        .expect("a default");
+        put_profile(&domain, " Work.Dark", &profile_of(" Work.Dark", "spaced"));
+        let mut home = ProfileHome::under(&directory, Vec::new());
+        home.terminal_preferences = domain;
+        let plan = plan(&home, "kr new --attach --hold-on-failure", None).expect("a plan");
+        assert!(plan.entry.contains("spaced"), "{}", plan.entry);
+        assert_eq!(entry_path("a.b\\c"), "Window Settings.a\\.b\\\\c");
         let _ = std::fs::remove_dir_all(directory);
     }
 }

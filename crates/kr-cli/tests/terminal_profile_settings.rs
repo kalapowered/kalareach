@@ -503,7 +503,9 @@ fn a_profile_that_is_gone_is_forgotten() {
 
 /// The wrapper that plays another writer of the shared list, and a settings service that goes. It
 /// counts the calls, fails the one it is told to, fails every call from the first write of a
-/// profile's key on, shows no schemas, appends an element to the list just after the read it is
+/// profile's key on, says that every reset worked and does none, says the same of every write of
+/// a profile's key after the first, sets a key of the profile as the person would just after the
+/// read of a profile it is told to has been answered, shows no schemas, appends an element to the list just after the read it is
 /// told to has been answered (so that the answer is stale), and overwrites the list from a stale
 /// read just after the write it is told to.
 fn wrapper(directory: &Path) -> PathBuf {
@@ -524,6 +526,32 @@ if [ -n "$KR_TEST_FAIL_FROM_FIRST_SET" ] && [ "$1" = set ]; then
 fi
 if [ -e "$KR_TEST_COUNTS/gone" ]; then
   exit 1
+fi
+if [ -n "$KR_TEST_SWALLOW_RESETS" ] && [ "$1" = reset ]; then
+  exit 0
+fi
+if [ -n "$KR_TEST_SWALLOW_AFTER_FIRST_KEY_SET" ] && { [ "$1" = set ] || [ "$1" = reset ]; }; then
+  case "$2" in
+    *:/*)
+      if [ -e "$KR_TEST_COUNTS/first-key-set" ]; then
+        exit 0
+      fi
+      if [ "$1" = set ]; then
+        : > "$KR_TEST_COUNTS/first-key-set"
+      fi
+      ;;
+  esac
+fi
+if [ "$1" = list-recursively ] && [ -n "$KR_TEST_PERSON_AFTER_DUMP" ]; then
+  dumps=$(cat "$KR_TEST_COUNTS/dumps" 2>/dev/null || echo 0)
+  dumps=$((dumps + 1))
+  echo "$dumps" > "$KR_TEST_COUNTS/dumps"
+  "$real" "$@"
+  status=$?
+  if [ "$KR_TEST_PERSON_AFTER_DUMP" = "$dumps" ]; then
+    "$real" set "$KR_TEST_PERSON_TARGET" "$KR_TEST_PERSON_KEY" "$KR_TEST_PERSON_VALUE"
+  fi
+  exit $status
 fi
 if [ -n "$KR_TEST_HIDE_SCHEMAS" ] && { [ "$1" = list-schemas ] || [ "$1" = list-relocatable-schemas ]; }; then
   exit 0
@@ -966,5 +994,199 @@ fn an_application_whose_schema_is_gone_keeps_its_record_and_says_why() {
         );
         assert!(person.recorded_uuid().is_some(), "the record keeps it");
         assert_eq!(person.remove(&places).expect("removes"), Removed::Removed);
+    });
+}
+
+/// The target of a profile's keys.
+fn target_of(person: &Person, uuid: &str) -> String {
+    format!(
+        "{}:{}",
+        person.application.profile_schema,
+        (person.application.profile_path)(uuid)
+    )
+}
+
+/// The places through a wrapper in which the person sets the profile's command just after the
+/// `after`th read of a profile's keys.
+fn through_a_person_who_changes_the_command(
+    person: &Person,
+    uuid: &str,
+    after: u32,
+) -> ProfileHome {
+    through_the_wrapper(
+        person,
+        &[
+            ("KR_TEST_PERSON_AFTER_DUMP", after.to_string()),
+            ("KR_TEST_PERSON_TARGET", target_of(person, uuid)),
+            ("KR_TEST_PERSON_KEY", "custom-command".to_owned()),
+            ("KR_TEST_PERSON_VALUE", "'/bin/theirs'".to_owned()),
+        ],
+    )
+}
+
+/// KR-REQ-01.21: a key the person changed after the plan, or between kr's last read and its write,
+/// is not written over. The write stops with what the person put there still there, the keys it had
+/// already written are back, and the record still names the profile as before.
+#[test]
+fn a_key_the_person_changed_before_the_write_is_not_written_over() {
+    for_each_application(|person| {
+        let places = person.places();
+        person.install(&places).expect("installs");
+        let uuid = person.recorded_uuid().expect("recorded");
+        let target = target_of(person, &uuid);
+        let name = person.get(&target, person.application.name_key);
+        let command_before = person.get(&target, "custom-command");
+        // The plan reads the profile's keys twice (the keys, then their defaults), and the write
+        // reads them again. The person changes the command after the plan's last read (2), and
+        // after the write's first (3).
+        for after in [2, 3] {
+            let mut again = person.command();
+            again.push(format!("round {after}"));
+            let changing = through_a_person_who_changes_the_command(person, &uuid, after);
+            let outcome = person.install_command(&changing, &again);
+            assert!(
+                matches!(outcome, Err(ProfileError::Changed { .. })),
+                "after read {after}: {outcome:?}"
+            );
+            assert_eq!(
+                person.get(&target, "custom-command"),
+                "'/bin/theirs'",
+                "after read {after}: what the person put there stays"
+            );
+            assert_eq!(person.get(&target, person.application.name_key), name);
+            assert_eq!(person.recorded_uuid().as_deref(), Some(uuid.as_str()));
+            // The person puts the command back to kr's, for the next round.
+            person.set(&target, "custom-command", &command_before);
+        }
+        assert_eq!(person.remove(&places).expect("removes"), Removed::Removed);
+    });
+}
+
+/// KR-REQ-01.21: a removal reads each key before it resets it. A key the person changed after the
+/// removal's read is left with what they put there, and the removal says the profile was changed.
+#[test]
+fn a_key_the_person_changed_during_a_removal_is_left_as_it_is() {
+    for_each_application(|person| {
+        let places = person.places();
+        for after in [2, 3] {
+            person.install(&places).expect("installs");
+            let uuid = person.recorded_uuid().expect("recorded");
+            let target = target_of(person, &uuid);
+            let changing = through_a_person_who_changes_the_command(person, &uuid, after);
+            let removed = person.remove(&changing).expect("answers");
+            assert!(
+                matches!(removed, Removed::Changed { .. }),
+                "after read {after}: {removed:?}"
+            );
+            assert_eq!(
+                person.get(&target, "custom-command"),
+                "'/bin/theirs'",
+                "after read {after}: what the person put there stays"
+            );
+            // Put the settings back for the next round.
+            for key in [
+                "custom-command",
+                "use-custom-command",
+                person.application.name_key,
+            ] {
+                let _ = person.gsettings(&["reset", &target, key]);
+            }
+            let list: Vec<String> = person
+                .list()
+                .into_iter()
+                .filter(|member| *member != uuid)
+                .collect();
+            let quoted: Vec<String> = list.iter().map(|member| format!("'{member}'")).collect();
+            person.set(
+                person.application.list_schema,
+                person.application.list_key,
+                &format!("[{}]", quoted.join(", ")),
+            );
+        }
+    });
+}
+
+/// KR-REQ-01.21: a reset that the settings say worked and did not keep is not a removal: the record
+/// keeps the profile, and a removal once the settings keep their resets takes it out.
+#[test]
+fn a_removal_the_settings_did_not_keep_keeps_the_record() {
+    for_each_application(|person| {
+        let places = person.places();
+        let before = person.list();
+        person.install(&places).expect("installs");
+        let uuid = person.recorded_uuid().expect("recorded");
+        let target = target_of(person, &uuid);
+        let swallowing = through_the_wrapper(person, &[("KR_TEST_SWALLOW_RESETS", "1".to_owned())]);
+        let outcome = person.remove(&swallowing);
+        assert!(
+            matches!(outcome, Err(ProfileError::NotPersisted(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(person.recorded_uuid().as_deref(), Some(uuid.as_str()));
+        assert_eq!(person.get(&target, "use-custom-command"), "true");
+        assert_eq!(person.remove(&places).expect("removes"), Removed::Removed);
+        assert_eq!(person.list(), before);
+        assert!(person.recorded_uuid().is_none());
+    });
+}
+
+/// KR-REQ-01.21: an install that cannot take back what it wrote, because the settings say a reset
+/// worked and did not keep it, leaves the record naming the profile, so that a removal finishes it.
+#[test]
+fn an_install_whose_take_back_is_not_kept_keeps_the_record() {
+    for_each_application(|person| {
+        let places = person.places();
+        let before = person.list();
+        let swallowing = through_the_wrapper(
+            person,
+            &[("KR_TEST_SWALLOW_AFTER_FIRST_KEY_SET", "1".to_owned())],
+        );
+        let outcome = person.install(&swallowing);
+        assert!(outcome.is_err(), "{outcome:?}");
+        let uuid = person
+            .recorded_uuid()
+            .expect("the first key stays, so the record names the profile");
+        assert_eq!(
+            person.get(&target_of(person, &uuid), person.application.name_key),
+            "'KalaReach'"
+        );
+        assert_eq!(person.remove(&places).expect("removes"), Removed::Removed);
+        assert_eq!(person.list(), before);
+        assert!(person.recorded_uuid().is_none());
+    });
+}
+
+/// KR-REQ-01.21: a second install that fails, after a first that could not take itself back, keeps
+/// the values the profile held before both: the profile still reads as kr's and a removal takes it
+/// out.
+#[test]
+fn a_second_failed_install_keeps_the_values_the_first_left() {
+    for_each_application(|person| {
+        let places = person.places();
+        let list_before = person.list();
+        let command = |round: &str| {
+            let mut command = person.command();
+            command.push(round.to_owned());
+            command
+        };
+        person
+            .install_command(&places, &command("first"))
+            .expect("installs");
+        for _ in 0..2 {
+            let gone =
+                through_the_wrapper(person, &[("KR_TEST_FAIL_FROM_FIRST_SET", "1".to_owned())]);
+            assert!(person.install_command(&gone, &command("second")).is_err());
+        }
+        let recorded = person
+            .record()
+            .profiles()
+            .expect("reads")
+            .into_iter()
+            .next();
+        let status = profile::status(person.application.terminal, &places, recorded);
+        assert_eq!(status.standing, Some(profile::Standing::Matches));
+        assert_eq!(person.remove(&places).expect("removes"), Removed::Removed);
+        assert_eq!(person.list(), list_before);
+        assert!(person.recorded_uuid().is_none());
     });
 }
