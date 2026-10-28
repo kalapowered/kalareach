@@ -88,6 +88,7 @@ jobs:
         with:
           ref: ${{ inputs.commit }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Hold the commit to main, and the root to this commit
         run: |
@@ -121,10 +122,22 @@ jobs:
         env:
           RELEASE: ${{ steps.run.outputs.release }}
         run: |
-          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/host/v$RELEASE" --silent 2> /dev/null; then
-            echo "::error::host/v$RELEASE already has a release"
+          # Only a 404 is "nothing there"; any other answer from GitHub stops the run.
+          taken() {
+            local answer
+            if answer="$(gh api "$1" 2>&1)"; then return 0; fi
+            case "$answer" in
+              *"HTTP 404"*) return 1 ;;
+              *) echo "::error::asking GitHub about $1 failed: $answer"; exit 1 ;;
+            esac
+          }
+          if taken "repos/$GITHUB_REPOSITORY/releases/tags/host/v$RELEASE" || taken "repos/$GITHUB_REPOSITORY/git/ref/tags/host/v$RELEASE"; then
+            echo "::error::host/v$RELEASE already has a release or a tag"
             exit 1
           fi
+          gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+            --jq ".[] | select(.tag_name == \"host/v$RELEASE\") | \"\(.id) draft=\(.draft)\"" > "$RUNNER_TEMP/leftover"
+          [ ! -s "$RUNNER_TEMP/leftover" ] || { echo "::error::host/v$RELEASE already has a release or a draft:"; cat "$RUNNER_TEMP/leftover"; exit 1; }
           gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
             --jq ".[] | select(.tag_name == \"host-staging/v$RELEASE\" and .draft) | \"\(.id) \(.target_commitish)\"" > "$RUNNER_TEMP/staging"
           [ "$(wc -l < "$RUNNER_TEMP/staging" | tr -d ' ')" -eq 1 ] || { echo "::error::there is not exactly one staging draft of $RELEASE"; exit 1; }
@@ -138,7 +151,12 @@ jobs:
           done < "$RUNNER_TEMP/staged"
           [ "$(sha256sum "$RUNNER_TEMP/staged-files/STAGED-SHA256SUMS" | cut -d' ' -f1)" = "$STAGED_SUMS" ] || { echo "::error::STAGED-SHA256SUMS is not the file the input names"; exit 1; }
           (cd "$RUNNER_TEMP/staged-files" && sha256sum -c STAGED-SHA256SUMS)
-          [ "$(grep -c . "$RUNNER_TEMP/staged-files/STAGED-SHA256SUMS")" -eq 2 ] || { echo "::error::the staged sums name other than the two macOS trees"; exit 1; }
+          # The sums name exactly the two macOS trees, the notary record and the record of the run, and the
+          # draft holds those and the sums themselves and nothing else.
+          want="$(printf '%s\n' "signed-kalareach-aarch64-apple-darwin-$RELEASE.tar" "signed-kalareach-x86_64-apple-darwin-$RELEASE.tar" STAGED-NOTARY.txt STAGED-RUN.txt | sort)"
+          [ "$(awk '{print $2}' "$RUNNER_TEMP/staged-files/STAGED-SHA256SUMS" | sort)" = "$want" ] || { echo "::error::the staged sums do not name the two macOS trees, the notary record and the run record"; exit 1; }
+          [ "$(ls "$RUNNER_TEMP/staged-files" | sort)" = "$(printf '%s\nSTAGED-SHA256SUMS\n' "$want" | sort)" ] || { echo "::error::the staging draft holds other files than the sums name"; exit 1; }
+          [ "$(cat "$RUNNER_TEMP/staged-files/STAGED-RUN.txt")" = "$(printf 'run=%s\ncommit=%s\nrelease=%s' "$BUILD_RUN" "$COMMIT" "$RELEASE")" ] || { echo "::error::the staged trees were made from another run, commit or release than the inputs name"; exit 1; }
 
       # By identifier: the artefact GitHub holds the digest of, the sum beside the tar, and a manifest
       # that names this commit, this release and this target.
@@ -167,7 +185,7 @@ jobs:
             esac
             rm -rf "$RUNNER_TEMP/look/$top"
             tar -xf "$out/$top.tar" -C "$RUNNER_TEMP/look" "$top/release.json"
-            python3 - "$RUNNER_TEMP/look/$top/release.json" "$RELEASE" "$COMMIT" "$target" << 'PYTHON'
+            python3 -I - "$RUNNER_TEMP/look/$top/release.json" "$RELEASE" "$COMMIT" "$target" << 'PYTHON'
           import json
           import sys
 
@@ -201,7 +219,7 @@ jobs:
         with:
           name: to-seal
           path: ${{ runner.temp }}/to-seal
-          retention-days: 1
+          retention-days: 3
           if-no-files-found: error
 
   # The release tool, built by a job that holds no key, for the job that does.
@@ -215,6 +233,7 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ needs.source.outputs.commit }}
+          persist-credentials: false
 
       - name: Install rustup where the image has none
         run: |
@@ -237,7 +256,7 @@ jobs:
         with:
           name: kr-release
           path: ${{ runner.temp }}/tool
-          retention-days: 1
+          retention-days: 3
           if-no-files-found: error
 
   channel:
@@ -258,6 +277,7 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ needs.source.outputs.commit }}
+          persist-credentials: false
 
       - name: Take the trees
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -303,10 +323,14 @@ jobs:
               exit 1
             fi
           done
-          umask 077
-          mkdir -p "$RUNNER_TEMP/channel-keys"
-          printf '%s' "$TARGETS_KEY_1" | base64 --decode > "$RUNNER_TEMP/channel-keys/targets-1.pk8"
-          printf '%s' "$TARGETS_KEY_2" | base64 --decode > "$RUNNER_TEMP/channel-keys/targets-2.pk8"
+          (
+            umask 077
+            mkdir -p "$RUNNER_TEMP/channel-keys"
+            printf '%s' "$TARGETS_KEY_1" | base64 --decode > "$RUNNER_TEMP/channel-keys/targets-1.pk8"
+            printf '%s' "$TARGETS_KEY_2" | base64 --decode > "$RUNNER_TEMP/channel-keys/targets-2.pk8"
+          )
+          # The script reads the keys by path, so the programs it runs get no copy in their environment.
+          unset TARGETS_KEY_1 TARGETS_KEY_2
           for target in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
             top="kalareach-$target-$RELEASE"
             mkdir -p "$RUNNER_TEMP/trees/$target"
@@ -381,6 +405,7 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ needs.source.outputs.commit }}
+          persist-credentials: false
 
       - name: Take the sealed archive
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1

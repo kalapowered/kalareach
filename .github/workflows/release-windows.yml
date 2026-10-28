@@ -13,8 +13,9 @@ name: release-windows
 # in its name. A Windows host keeps no store of releases, so the install into a store that the macOS
 # and Linux jobs make has no counterpart here.
 #
-# The `release` job is the release. It runs for a release tag and for the default branch, and a run
-# on any other ref shows it skipped, so a run that proves the trees never reaches the environment.
+# The `release` job is the release. It runs for a release tag and for the default branch, once the
+# repository variable `WINDOWS_HOST_RELEASE` is `true`, and a run on any other ref, or without the
+# variable, shows it skipped, so a run that proves the trees never reaches the environment.
 # It takes the trees the `build` job made, signs the files that carry a signature, holds each of them
 # to what a release requires, and then writes each manifest again, since signing changed the files,
 # and signs it with the channel's release keys. Those keys do not exist yet, so the job stops there
