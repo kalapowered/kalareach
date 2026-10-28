@@ -27,7 +27,7 @@
 // Usage:
 //   node scripts/store-bundle.mjs --android <app.aab> --version-code <n> --version-name <v>
 //        --certificate <upload-certificate.pem> [--abis arm64-v8a,x86_64] [--secret-file <path> ...]
-//        [--record <store-build.json>] [--note key=value ...]
+//        [--firebase <google-services.json>] [--record <store-build.json>] [--note key=value ...]
 //   node scripts/store-bundle.mjs --ios <app.ipa | KalaReach.app> --stage archive|export
 //        --version-code <n> --version-name <v> [--secret-file <path> ...] [--record <file>]
 // Exit 0 when the bundle holds, 1 when it does not, 2 when it could not be read.
@@ -265,6 +265,21 @@ export function bundletoolVersion(bundletool) {
 
 // -- Android: the whole check ----------------------------------------------------------------
 
+/**
+ * Whether the bundle's resource table carries the Firebase configuration of the application: the
+ * project and the application the configuration file names. Only a yes or no leaves this function;
+ * what the file holds is client configuration that goes into the bundle and nowhere else.
+ */
+export function problemsInFirebase(resources, configuration, identifier) {
+  const client = (configuration.client ?? []).find((each) => each?.client_info?.android_client_info?.package_name === identifier)
+  const wanted = [configuration.project_info?.project_id, client?.client_info?.mobilesdk_app_id]
+  if (wanted.some((each) => typeof each !== 'string' || each === '')) {
+    return [`the Firebase configuration names no application ${identifier}`]
+  }
+  const missing = wanted.filter((each) => !resources.includes(Buffer.from(each, 'utf8')))
+  return missing.length === 0 ? [] : ['the bundle does not carry the Firebase configuration of the application']
+}
+
 export function checkAndroid(options) {
   const problems = []
   const facts = {}
@@ -287,6 +302,14 @@ export function checkAndroid(options) {
     facts.secretsFound = places
     if (places > 0) problems.push(`a secret file's text is in ${places} members of the bundle`)
     facts.members = members.length
+    if (options.firebase) {
+      const table = members.find((member) => member.name === 'base/resources.pb')
+      const problemsOfTable = table
+        ? problemsInFirebase(read(table), JSON.parse(readFileSync(options.firebase, 'utf8')), identifier)
+        : ['the bundle holds no resource table']
+      facts.firebaseConfigured = problemsOfTable.length === 0
+      problems.push(...problemsOfTable)
+    }
     facts.mapping = members.some((member) => member.name.includes('proguard.map'))
   })
   const signature = problemsInSignature(options.path, certificatePem)
@@ -449,7 +472,8 @@ const VALUE_FLAGS = {
   '--certificate': 'certificate',
   '--stage': 'stage',
   '--bundletool': 'bundletool',
-  '--record': 'record'
+  '--record': 'record',
+  '--firebase': 'firebase'
 }
 
 function parse(argv) {
