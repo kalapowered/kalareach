@@ -218,9 +218,10 @@ There are two kinds of release. A package release is initiated by creating a tag
   notarised on the machine that holds the Developer ID, and sealed and published as a pre-release
   `host/v<version>+<commit>` by `.github/workflows/release-host.yml`.
   [docs/releases/macos-signing.md](docs/releases/macos-signing.md) says what each step does and checks.
-- A tag that starts with `host/v` also builds the Windows host executables and PowerShell packages and,
-  once a Windows host is released, signs each of them and publishes them as a release, through
-  `.github/workflows/release-windows.yml`.
+- A tag that starts with `host/v`, pushed to the repository, builds the Windows host executables and
+  PowerShell packages through `.github/workflows/release-windows.yml`, whose job that signs each of
+  them and publishes them as a release runs only when the repository variable `WINDOWS_HOST_RELEASE`
+  is `true`.
   [docs/releases/windows-signing.md](docs/releases/windows-signing.md) says what signs, what the
   release carries and how the signing identity is kept.
 
@@ -240,7 +241,7 @@ tar -xzf kalareach-<target>-<release>.tar.gz
 kalareach-<target>-<release>/bin/kr host install
 ```
 
-`kr host install` will verify the signed manifest for the release and check every file against it before making the release current. It will then print the directory to add to your `PATH`. On macOS, every program in the archive is signed by Kala Holdings Inc. and notarised by Apple. The first time you open one that came from a browser, Apple's service is asked about it, so the first launch will require a network connection.
+`kr host install` will verify the signed manifest for the release and check every file against it before making the release current. It will then print the directory to add to your `PATH`. A first install can check the manifest only against the update channel root that the archive carries, so `SHA256SUMS` and the address you downloaded from are what vouch for the archive; the release notes list the key identifiers of that root. On macOS, every program in the archive is signed by Kala Holdings Inc. and notarised by Apple. The first time you open one that came from a browser, Apple's service is asked about it, so the first launch will require a network connection.
 
 A host joins no network until its configuration document says so. Run `kr host startup --set standalone`, which writes the document and prints its path, and add the following sections to it. You must also set `level` to `4`, as the document now contains sections at that level. The network applies when the control daemon starts. Also run `kr shell install`, so that the shells you start under KalaReach open their bridge to it.
 
@@ -256,7 +257,7 @@ A host joins no network until its configuration document says so. Run `kr host s
 "relay": { "origin": "https://reach.kala.to" }
 ```
 
-Before you create your first KalaReach session, open a second terminal window and use that to pair your first phone. `kr pair invite --owner` asks you to type `pair`, then shows a pairing code and a QR code; `kr pair confirm` takes the value the phone shows. `kr new` attaches the terminal it runs in, and the first pairing is refused inside a KalaReach session; on macOS it is also refused in a window opened after a session started. If `kr new` fails with a message that the control daemon did not respond, and `controller.log` mentions the secret store, the system keyring may not be opening correctly for your login session. You can use `kr-controller --secret-store file` to start the daemon with an alternative secret store that keeps device keys in a directory under the state root.
+Open a second terminal window before you create the first session. Create the session in the first window with `kr new`, which starts the control daemon, and pair your first phone from the second. `kr pair invite --owner` asks you to type `pair`, then shows a pairing code, a QR code and an invitation identifier; `kr pair confirm <invitation>` takes the value the phone shows. `kr new` attaches the terminal it runs in, and the first pairing is refused inside a KalaReach session; on macOS it is also refused in a window opened after a session started. If `kr new` fails with a message that the control daemon did not respond, and `controller.log` mentions the secret store, the system keyring may not be opening correctly for your login session. You can use `kr-controller --secret-store file` to start the daemon with an alternative secret store that keeps device keys in a directory under the state root.
 
 To update to a new release, download the archive for the new release and run `kr host update --archive <archive>`. `kr host rollback` goes back to the release before it. [docs/host/updates.md](docs/host/updates.md) says what an update does to a running session, and [docs/releases/macos-signing.md](docs/releases/macos-signing.md) says how the releases are signed.
 
