@@ -81,6 +81,7 @@ Releases:
 | [releases/support-window.md](releases/support-window.md) | The public protocol majors a host negotiates and how long each is supported, the retained levels, and how a running session keeps working across an update |
 | [releases/keys.md](releases/keys.md) | The signing keys of a release, the plugin catalogue, the relay service and each organisation: what each signs, where it is held and pinned, who rotates it and how it is recovered |
 | [releases/app-store-privacy.md](releases/app-store-privacy.md) | The answers App Store Connect's privacy questions need for the iOS companion, tied to its privacy manifest, the required reason APIs its bundle uses and the packages that ship manifests |
+| [releases/mobile-stores.md](releases/mobile-stores.md) | How the Android bundle for Google Play's testing tracks and the iOS build for TestFlight are built, signed and checked, where the signing material is read from, and how a build number is chosen |
 
 The [repository README](../README.md) says how to build and test this repository, how it is
 released and how a host recovers.
