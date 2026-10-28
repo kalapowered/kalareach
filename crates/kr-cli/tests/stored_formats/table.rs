@@ -510,7 +510,7 @@ pub fn table() -> Vec<Store> {
     use kr_protocol::{
         action, archive, attention, automation, catalogue, changeset, delivery, describe, desktop,
         grant, hostinfo, identity, invitation, machine, mailbox, organisation, pairing, privacy,
-        project, push, session, sharing, skill, transfer, voice,
+        project, push, session, sharing, skill, test_report, transfer, voice,
     };
 
     let mut stores = vec![
@@ -873,6 +873,23 @@ pub fn table() -> Vec<Store> {
             owned: Vec::new(),
             // The answer a repeat of a request for the disclosed checks is given, kept for 30 days.
             kept: vec![protocol::<desktop::CapabilityChecks>("CapabilityChecks")],
+        },
+        // What this host read out of the test reports a workflow's suite wrote, beside the result
+        // the change-set store records for the run. A release that does not name the file records
+        // its results without a report and loses nothing it protected.
+        Store {
+            levels: None,
+            writers: Writers::Daemon,
+            entry: entry(
+                "test-reports",
+                StoreScope::Environment,
+                "test-reports.sqlite3",
+                sqlite_table("test_reports_schema"),
+                version(kr_controller::test_reports::SCHEMA_VERSION),
+                version(kr_controller::test_reports::OLDEST_SCHEMA_VERSION),
+            ),
+            owned: Vec::new(),
+            kept: vec![protocol::<test_report::TestReport>("TestReport")],
         },
         Store {
             levels: None,

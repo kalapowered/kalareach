@@ -47,6 +47,7 @@ use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{ActionId, ActorId, RequestId};
 use kr_protocol::method::{Method, MethodGroup};
 use kr_protocol::scalars::Nullable;
+use kr_protocol::test_report::{MAX_REPORTS_PER_ANSWER, TestReportsParams, TestReportsResult};
 
 use crate::error::{ControllerError, Result};
 
@@ -112,6 +113,8 @@ impl kr_changeset::store::StillAdmitted for Admission {
 #[derive(Debug)]
 pub struct ChangeSetModule {
     service: Arc<ChangeSetService>,
+    /// What this host read out of the test reports a suite wrote, in a store of its own.
+    reports: Arc<crate::test_reports::Reports>,
 }
 
 impl ChangeSetModule {
@@ -126,25 +129,32 @@ impl ChangeSetModule {
         project: Arc<ProjectService>,
     ) -> Result<Self> {
         let paths = paths.clone();
-        let service = tokio::task::spawn_blocking(move || {
-            let service = ChangeSetService::open(&paths, project)?;
+        let (service, reports) = tokio::task::spawn_blocking(move || {
+            // Printed on the daemon's own standard error at startup as well as answered with, and
+            // it can name a state directory a caller chose, so it goes through the same rule every
+            // other message from these services does.
+            let unavailable = |error: kr_changeset::ChangeSetError| {
+                ControllerError::registry(kr_project::git::redact(&error.to_string()))
+            };
+            let service = ChangeSetService::open(&paths, project).map_err(unavailable)?;
             // An apply an earlier daemon died inside is settled before anything is served, so a
             // caller never reads an apply that is open for ever.
-            service.recover_before_serving()?;
-            Ok::<_, kr_changeset::ChangeSetError>(service)
+            service.recover_before_serving().map_err(unavailable)?;
+            let reports = crate::test_reports::Reports::open(paths.state_dir())?;
+            // A report whose run the change-set store holds no result for was kept while that
+            // store was replaced by an older copy of itself. Nothing serves it, so it is let go.
+            reports.forget_runs_without_a_result(|run| {
+                materialise::has_result(&service, run).map_err(unavailable)
+            })?;
+            Ok::<_, ControllerError>((service, reports))
         })
         .await
         .map_err(|_| ControllerError::RegistryUnavailable {
             detail: "the change-set service could not be opened".to_owned(),
-        })?
-        .map_err(|error| ControllerError::RegistryUnavailable {
-            // Printed on the daemon's own standard error at startup as well as answered with, and
-            // it can name a state directory a caller chose, so it goes through the same rule every
-            // other message from these services does.
-            detail: kr_project::git::redact(&error.to_string()),
-        })?;
+        })??;
         Ok(Self {
             service: Arc::new(service),
+            reports: Arc::new(reports),
         })
     }
 
@@ -281,11 +291,16 @@ impl ChangeSetModule {
             ));
         };
         let service = Arc::clone(&self.service);
+        let reports = Arc::clone(&self.reports);
         let params = request.params.clone();
         blocking(move || match method {
             Method::ChangesetRead => {
                 let params: ChangesetReadParams = typed(&params)?;
                 encode(&read_change_set(&service, &params)?)
+            }
+            Method::ChangesetTestReports => {
+                let params: TestReportsParams = typed(&params)?;
+                encode(&read_test_reports(&service, &reports, &params)?)
             }
             Method::DiffRead => {
                 let params: DiffReadParams = typed(&params)?;
@@ -460,6 +475,54 @@ fn read_change_set(
         results: materialise::results(service, named.change_set_id, named.version)?,
         evidence: service.evidence(named.change_set_id, named.version)?,
         version,
+    })
+}
+
+/// Reads what this host made of the test reports the suites that ran against one version wrote.
+///
+/// A report is served only when the result of its run records an output reference with the
+/// report's path and digest, so a row the change-set store does not vouch for is never answered.
+/// The newest run's reports come first, and at most [`MAX_REPORTS_PER_ANSWER`] are answered with
+/// the rest counted, so the answer stays inside a control frame however many runs the version has.
+fn read_test_reports(
+    service: &ChangeSetService,
+    reports: &crate::test_reports::Reports,
+    params: &TestReportsParams,
+) -> Answer<TestReportsResult> {
+    let version = service.record(params.change_set_id, params.version.0)?;
+    let named = VersionRef {
+        change_set_id: version.change_set_id,
+        version: version.version,
+    };
+    let mut results = materialise::results(service, named.change_set_id, named.version)?;
+    results.reverse();
+    if let Some(run) = params.materialisation_id.0 {
+        results.retain(|result| result.materialisation_id == run);
+    }
+    let mut served = Vec::new();
+    let mut omitted = 0_u64;
+    for result in &results {
+        let held = reports
+            .of_run(result.materialisation_id)
+            .map_err(|error| error.to_protocol_error())?;
+        for report in held {
+            let vouched = result.outputs.iter().any(|output| {
+                output.label == report.output_path && output.digest == report.output_digest
+            });
+            if !vouched {
+                continue;
+            }
+            if served.len() < MAX_REPORTS_PER_ANSWER {
+                served.push(report);
+            } else {
+                omitted += 1;
+            }
+        }
+    }
+    Ok(TestReportsResult {
+        version: named,
+        reports: served,
+        omitted: kr_protocol::scalars::U64::new(omitted),
     })
 }
 

@@ -363,7 +363,13 @@ pub fn reread(
 }
 
 /// Re-reads one materialisation like [`reread`], leaving out the paths a run is declared to write
-/// and recording each as an [`OutputReference`].
+/// and describing each as a [`DeclaredOutput`]: an [`OutputReference`] and, for a file, the bytes
+/// its digest was taken from.
+///
+/// Every declared path that is there is described, once and in path order, whatever the walk of
+/// the source found. A walk ends at the first thing it cannot represent, and a result that
+/// listed the outputs the walk had reached by then would list them in the order the directory
+/// gave its entries.
 ///
 /// # Errors
 ///
@@ -376,7 +382,7 @@ pub fn reread_with(
     MaterialisationRow,
     Reread,
     Vec<ObservedPath>,
-    Vec<OutputReference>,
+    Vec<DeclaredOutput>,
 )> {
     let row = service
         .locked()?
@@ -455,8 +461,7 @@ pub fn reread_with(
         entries: crate::capture::MAX_WALK_ENTRIES,
     };
     let mut observed = Vec::new();
-    let mut references = Vec::new();
-    if let Err(detail) = walk(
+    let walked = walk(
         service,
         &directory,
         "",
@@ -466,9 +471,12 @@ pub fn reread_with(
         &mut budget,
         &mut observed,
         outputs,
-        &mut references,
         0,
-    )? {
+    )?;
+    // The declared outputs are described after the walk and whatever it found: it passes over
+    // them, and it ends at the first thing it cannot represent.
+    let references = describe_declared(&directory, outputs);
+    if let Err(detail) = walked {
         return Ok((row, Reread::Indeterminate(detail), observed, references));
     }
     found.canonicalise();
@@ -605,8 +613,7 @@ impl Outputs {
         self.declared.contains(path)
     }
 
-    /// The declared paths, relative and normalised.
-    #[cfg(unix)]
+    /// The declared paths, relative and normalised, in path order.
     pub(crate) const fn declared(&self) -> &std::collections::BTreeSet<String> {
         &self.declared
     }
@@ -681,7 +688,6 @@ fn walk(
     budget: &mut Budget,
     observed: &mut Vec<ObservedPath>,
     outputs: &Outputs,
-    references: &mut Vec<OutputReference>,
     depth: usize,
 ) -> Result<std::result::Result<(), String>> {
     if depth >= crate::capture::MAX_WALK_DEPTH {
@@ -719,9 +725,9 @@ fn walk(
         };
         // A declared output is matched by its name before anything else is asked of it: a link,
         // a great number of entries or a name a rule keeps out is exactly what build output
-        // trips, and none of them is a reason to doubt the source.
+        // trips, and none of them is a reason to doubt the source. It is described by
+        // `describe_declared`, once the walk is over.
         if outputs.declares(&path) {
-            references.push(describe_output(directory, &name, &path));
             continue;
         }
         // What kind of thing it is is decided **before** the grant, so an unsupported object at a
@@ -780,7 +786,6 @@ fn walk(
                 budget,
                 observed,
                 outputs,
-                references,
                 depth + 1,
             )? {
                 return Ok(Err(detail));
@@ -945,41 +950,140 @@ fn walk(
     Ok(Ok(()))
 }
 
-/// What one declared output holds, as a reference and never as a failure.
+/// What the re-read read of one declared output.
+#[derive(Clone, Debug)]
+pub struct DeclaredOutput {
+    /// What the result records about it.
+    pub reference: OutputReference,
+    /// What a file's reading left, for a caller that reads reports: the bytes the reference's
+    /// digest was taken from, kept whole for a file of at most [`MAX_REPORT_FILE_BYTES`] while the
+    /// run's kept bytes stay within [`MAX_REPORT_BYTES_PER_RUN`], and otherwise only the first
+    /// [`OPENING_BYTES`] of it. Nothing for an output that is not a file this host could read.
+    pub contents: Option<FileContents>,
+}
+
+/// The bytes of a declared file that a re-read kept.
+#[derive(Clone, Debug)]
+pub struct FileContents {
+    /// The whole file, or its opening when `complete` is false.
+    pub bytes: Vec<u8>,
+    /// Whether `bytes` is the whole file, the one the reference's digest covers.
+    pub complete: bool,
+}
+
+/// The largest declared file whose bytes a re-read keeps whole for a reader of reports.
+pub const MAX_REPORT_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The most bytes of declared files a re-read keeps whole in one run. A file that would pass it
+/// keeps its opening only, so a suite that declares sixteen large files does not hold them all.
+pub const MAX_REPORT_BYTES_PER_RUN: u64 = 32 * 1024 * 1024;
+
+/// How much of the start of a declared file a re-read keeps when it keeps the file's opening only.
+pub const OPENING_BYTES: usize = 64 * 1024;
+
+/// Describes every declared output of a materialisation that is there.
+///
+/// Each is found through handles that follow no link and stay on the mount the directory is
+/// confined to, one component at a time from the copy's root, so an output whose parent is a link,
+/// a file or something mounted over is not one this host reads. The outputs come in path order,
+/// and the bytes a run may keep are spent in that order, so which file keeps its bytes does not
+/// depend on how a directory lists its entries. A declared path that is not there has nothing to
+/// describe.
+fn describe_declared(directory: &AuthorisedDirectory, outputs: &Outputs) -> Vec<DeclaredOutput> {
+    let mut described = Vec::new();
+    let mut spent = 0_u64;
+    for path in outputs.declared() {
+        let (parent, leaf) = path.rsplit_once('/').unwrap_or(("", path.as_str()));
+        let Ok(leaf_name) = RelativeName::parse(leaf) else {
+            continue;
+        };
+        let opened;
+        let holder = if parent.is_empty() {
+            directory
+        } else {
+            let Ok(parent_name) = RelativeName::parse(parent) else {
+                continue;
+            };
+            match directory.subdirectory(&parent_name) {
+                Ok(parent) => {
+                    opened = parent;
+                    &opened
+                }
+                Err(_) => continue,
+            }
+        };
+        if let Some(output) = describe_output(holder, &leaf_name, path, &mut spent) {
+            described.push(output);
+        }
+    }
+    described
+}
+
+/// What one declared output holds, as a reference and never as a failure, or nothing when it is
+/// not there.
 ///
 /// A file is digested up to [`MAX_OUTPUT_FILE_BYTES`]; a directory is listed (path, length and
 /// instant last written of every entry beneath it, links included and never followed) up to
 /// [`MAX_OUTPUT_ENTRIES`], and its reference digests that sorted listing; a link, or anything
 /// that is not a file or a directory, is recorded as what it is. Nothing here enters the content
-/// store. The reference of a directory carries the sum of the lengths it listed.
+/// store. The reference of a directory carries the sum of the lengths it listed. A file's bytes
+/// are kept as [`DeclaredOutput::contents`] says, and `spent` counts what has been kept whole.
 fn describe_output(
     directory: &AuthorisedDirectory,
     name: &RelativeName,
     path: &str,
-) -> OutputReference {
+    spent: &mut u64,
+) -> Option<DeclaredOutput> {
     let reference = |kind: &str, bytes: &[u8], byte_len: u64| OutputReference {
         label: path.to_owned(),
         digest: crate::objects::digest_of(bytes),
         byte_len: U64::new(byte_len),
         kind: kind.to_owned(),
     };
-    match directory.probe(name) {
+    let without_contents = |reference| DeclaredOutput {
+        reference,
+        contents: None,
+    };
+    Some(match directory.probe(name) {
+        Err(kr_transfer::Escape::NotFound { .. }) => return None,
         Ok(ObjectKind::File) => match directory.open_read(name, ObjectPolicy::ReadableFile) {
             Ok(mut file) => {
                 let length = file.byte_len();
                 let mut head = Vec::new();
                 let mut bounded = file.handle_mut().take(MAX_OUTPUT_FILE_BYTES);
                 if bounded.read_to_end(&mut head).is_err() {
-                    return reference("unreadable output", b"", length);
+                    return Some(without_contents(reference(
+                        "unreadable output",
+                        b"",
+                        length,
+                    )));
                 }
                 let kind = if length > MAX_OUTPUT_FILE_BYTES {
                     "file over the byte bound"
                 } else {
                     "file"
                 };
-                reference(kind, &head, length)
+                let described = reference(kind, &head, length);
+                // The bytes are the ones the digest covers, so what a reader of them parses is
+                // what the result records.
+                let read = head.len() as u64;
+                let whole = read <= MAX_REPORT_FILE_BYTES
+                    && spent.saturating_add(read) <= MAX_REPORT_BYTES_PER_RUN
+                    && read == length;
+                if whole {
+                    *spent += read;
+                } else {
+                    head.truncate(OPENING_BYTES);
+                }
+                DeclaredOutput {
+                    reference: described,
+                    contents: Some(FileContents {
+                        bytes: head,
+                        complete: whole,
+                    }),
+                }
             }
-            Err(_) => reference("unreadable output", b"", 0),
+            Err(_) => without_contents(reference("unreadable output", b"", 0)),
         },
         Ok(ObjectKind::Directory) => match directory.subdirectory(name) {
             Ok(child) => {
@@ -1005,14 +1109,14 @@ fn describe_output(
                 } else {
                     "truncated directory listing"
                 };
-                reference(kind, text.as_bytes(), total)
+                without_contents(reference(kind, text.as_bytes(), total))
             }
-            Err(_) => reference("unreadable output", b"", 0),
+            Err(_) => without_contents(reference("unreadable output", b"", 0)),
         },
-        Ok(ObjectKind::Link) => reference("link", b"", 0),
-        Ok(_) => reference("not a file or a directory", b"", 0),
-        Err(_) => reference("unreadable output", b"", 0),
-    }
+        Ok(ObjectKind::Link) => without_contents(reference("link", b"", 0)),
+        Ok(_) => without_contents(reference("not a file or a directory", b"", 0)),
+        Err(_) => without_contents(reference("unreadable output", b"", 0)),
+    })
 }
 
 /// One entry of an output directory's listing.
@@ -1183,6 +1287,16 @@ pub struct RunReport {
     pub outputs: Vec<OutputReference>,
 }
 
+/// What recording a result left, for a caller that reads what the run wrote.
+#[derive(Clone, Debug)]
+pub struct Recorded {
+    /// The result, as it was recorded.
+    pub result: MaterialisationResult,
+    /// What the re-read read of each declared output that was there, in path order: the same
+    /// reading the result's references were taken from.
+    pub declared: Vec<DeclaredOutput>,
+}
+
 /// Records one result against one materialisation, after establishing what was tested.
 ///
 /// The run is declared to write `outputs`: those paths are left out of the comparison with the
@@ -1200,8 +1314,8 @@ pub fn record_result(
     report: &RunReport,
     outputs: &Outputs,
     binding: &RunBinding,
-) -> Result<MaterialisationResult> {
-    let (row, state, observed, found) = reread_with(service, materialisation_id, outputs)?;
+) -> Result<Recorded> {
+    let (row, state, observed, declared) = reread_with(service, materialisation_id, outputs)?;
     let input_version = VersionRef {
         change_set_id: row.change_set_id,
         version: row.version,
@@ -1292,15 +1406,15 @@ pub fn record_result(
             ),
         ),
     };
-    let attestation = if found.is_empty() {
+    let attestation = if declared.is_empty() {
         attestation
     } else {
         format!(
             "{attestation}. The declared output paths {} were left out of that comparison and are \
              recorded as references",
-            found
+            declared
                 .iter()
-                .map(|reference| reference.label.as_str())
+                .map(|output| output.reference.label.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
         )
@@ -1316,7 +1430,12 @@ pub fn record_result(
         environment_id: service.environment_id(),
         tool: report.tool.clone(),
         receipt: report.receipt.clone(),
-        outputs: report.outputs.iter().cloned().chain(found).collect(),
+        outputs: report
+            .outputs
+            .iter()
+            .cloned()
+            .chain(declared.iter().map(|output| output.reference.clone()))
+            .collect(),
         attestation,
         recorded_at_ms: kr_ipc::now_ms(),
     };
@@ -1332,7 +1451,7 @@ pub fn record_result(
         record: encode_stored(&result)?,
         recorded_at_ms: result.recorded_at_ms,
     })?;
-    Ok(result)
+    Ok(Recorded { result, declared })
 }
 
 /// Returns the latest instant anything beneath one materialisation was written, in milliseconds.
@@ -1692,6 +1811,18 @@ pub fn results(
 ) -> Result<Vec<MaterialisationResult>> {
     let rows = service.locked()?.results(change_set_id, version)?;
     rows.iter().map(|row| decode_stored(&row.record)).collect()
+}
+
+/// Returns whether a result is recorded against one materialisation.
+///
+/// # Errors
+///
+/// Returns [`ChangeSetError::StoreUnavailable`] when the read fails.
+pub fn has_result(
+    service: &ChangeSetService,
+    materialisation_id: MaterialisationId,
+) -> Result<bool> {
+    service.locked()?.has_result(materialisation_id)
 }
 
 #[cfg(test)]
