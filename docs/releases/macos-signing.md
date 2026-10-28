@@ -115,7 +115,7 @@ summary. The person who approves the `update-signing` deployment compares them w
 script printed. The files the sealing job takes are kept for three days, so the approval has to come within three
 days of the dispatch. The approval is the one approval of a release: the jobs after it run without another,
 and `publish` runs only after every archive has been verified against the root committed in
-`release/tester-channel/root.json`, installed into a store and checked on its own platform.
+`release/tester-channel/root.json`, installed into a store, and started on its own platform: the control daemon, a worker and a shell create a session and close it.
 
 ## Reading a refusal
 

@@ -440,7 +440,7 @@ jobs:
         if: runner.os == 'macOS'
         run: bash scripts/check-macos-signatures.sh "$RUNNER_TEMP/unpacked/kalareach-$TARGET-$RELEASE" notarized
 
-      - name: Install it into a store, and start it
+      - name: Install it into a store, and start the host
         run: |
           top="kalareach-$TARGET-$RELEASE"
           unpacked="$RUNNER_TEMP/unpacked/$top"
@@ -451,6 +451,7 @@ jobs:
             identity="$(cat "$root/shells/zsh/current")"
             "$root/shells/zsh/$identity/bin/zsh" -f -c 'zmodload zsh/zle && print -r -- "zle loaded from $module_path[1]"'
           done
+          bash scripts/check-host-start.sh "$store/current/bin/kr"
 
       - name: Record the digest that was checked
         run: |
