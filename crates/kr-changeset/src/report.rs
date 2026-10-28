@@ -52,7 +52,7 @@ pub const MAX_GO_LINE_BYTES: usize = 1024 * 1024;
 /// suite that redirects both into its report mixes in.
 pub const MAX_GO_STRAY_LINES: usize = 1_000;
 
-/// The most packages a `go test -json` stream may name.
+/// The most packages a `go test -json` stream may fail a test in.
 pub const MAX_GO_PACKAGES: usize = 20_000;
 
 /// Reads a declared output as a report.
@@ -246,6 +246,9 @@ fn read_junit(bytes: &[u8]) -> Result<ReportReading, UnreadableReason> {
     let mut tally = Tally::default();
     let mut depth = 0_usize;
     let mut events = 0_usize;
+    // The elements at the top of the document: a well-formed document has one, and a case outside
+    // it is no part of the report.
+    let mut roots = 0_usize;
     // The names of the `testsuite` elements around the element being read, innermost last, as
     // the group of a case that names no class.
     let mut suites: Vec<(usize, String)> = Vec::new();
@@ -270,6 +273,10 @@ fn read_junit(bytes: &[u8]) -> Result<ReportReading, UnreadableReason> {
                 }
             }
             Event::Start(element) => {
+                roots += usize::from(depth == 0);
+                if roots > 1 {
+                    return Err(UnreadableReason::Malformed);
+                }
                 depth += 1;
                 if depth > MAX_XML_DEPTH {
                     return Err(UnreadableReason::TooDeep);
@@ -277,6 +284,10 @@ fn read_junit(bytes: &[u8]) -> Result<ReportReading, UnreadableReason> {
                 open_element(&element, depth, &mut suites, &mut case)?;
             }
             Event::Empty(element) => {
+                roots += usize::from(depth == 0);
+                if roots > 1 {
+                    return Err(UnreadableReason::Malformed);
+                }
                 if depth + 1 > MAX_XML_DEPTH {
                     return Err(UnreadableReason::TooDeep);
                 }
@@ -301,10 +312,23 @@ fn read_junit(bytes: &[u8]) -> Result<ReportReading, UnreadableReason> {
                 );
                 depth = depth.saturating_sub(1);
             }
+            // Text, a CDATA section or a reference outside the root element is no part of an
+            // XML document; white space between the markup is.
+            Event::Text(text) if depth == 0 => {
+                if text
+                    .bytes()
+                    .any(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+                {
+                    return Err(UnreadableReason::Malformed);
+                }
+            }
+            Event::CData(_) | Event::GeneralRef(_) if depth == 0 => {
+                return Err(UnreadableReason::Malformed);
+            }
             _ => {}
         }
     }
-    if depth != 0 {
+    if depth != 0 || roots != 1 {
         return Err(UnreadableReason::Malformed);
     }
     Ok(tally.finish())
@@ -452,10 +476,10 @@ struct GoEvent {
 
 fn read_go(bytes: &[u8]) -> Result<ReportReading, UnreadableReason> {
     let mut tally = Tally::default();
-    // The packages a test failed in, which a package's own failure is the consequence of, and the
-    // packages that failed with no test failing, which are cases of their own.
-    let mut failed_in: HashSet<String> = HashSet::new();
-    let mut package_failures: Vec<String> = Vec::new();
+    // The packages a test failed in, which a package's own failure is the consequence of. A
+    // package is told apart by the digest of its whole name, and not by the name that is kept for
+    // display, which is cut: two packages whose names agree up to the cut are two packages.
+    let mut failed_in: HashSet<kr_protocol::scalars::Digest256> = HashSet::new();
     let mut stray = 0_usize;
     for (index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
         if index >= MAX_GO_LINES {
@@ -478,17 +502,21 @@ fn read_go(bytes: &[u8]) -> Result<ReportReading, UnreadableReason> {
             }
         };
         let group = event.package.as_deref().map(kept);
+        let package = event
+            .package
+            .as_deref()
+            .map(|name| crate::objects::digest_of(name.as_bytes()));
         match (event.action.as_deref(), event.test.as_deref()) {
             (Some("pass"), Some(_)) => tally.passed_plainly(),
             (Some(action @ ("fail" | "skip")), Some(test)) => {
                 let outcome = if action == "fail" {
-                    if let Some(package) = &group
-                        && !failed_in.contains(package)
+                    if let Some(package) = package
+                        && !failed_in.contains(&package)
                     {
                         if failed_in.len() >= MAX_GO_PACKAGES {
                             return Err(UnreadableReason::TooLarge);
                         }
-                        failed_in.insert(package.clone());
+                        failed_in.insert(package);
                     }
                     ReportOutcome::Failed
                 } else {
@@ -503,13 +531,19 @@ fn read_go(bytes: &[u8]) -> Result<ReportReading, UnreadableReason> {
             }
             // A package that failed, with no name of a test: the consequence of a failed test, the
             // consequence of a build that failed (which names it, and has a case of its own), or a
-            // failure of the package itself.
+            // failure of the package itself. The package's own events come before this last one,
+            // so a package with no failed test by now failed by itself, and its case stands where
+            // the failure is in the stream.
             (Some("fail"), None) if event.failed_build.is_none() => {
-                if let Some(package) = group {
-                    if package_failures.len() >= MAX_GO_PACKAGES {
-                        return Err(UnreadableReason::TooLarge);
-                    }
-                    package_failures.push(package);
+                if let (Some(name), Some(package)) = (group, package)
+                    && !failed_in.contains(&package)
+                {
+                    tally.count(ReportCase {
+                        name,
+                        group: Nullable::null(),
+                        outcome: ReportOutcome::Errored,
+                        duration_ms: Nullable::null(),
+                    });
                 }
             }
             (Some("build-fail"), _) => tally.count(ReportCase {
@@ -519,16 +553,6 @@ fn read_go(bytes: &[u8]) -> Result<ReportReading, UnreadableReason> {
                 duration_ms: Nullable::null(),
             }),
             _ => {}
-        }
-    }
-    for package in package_failures {
-        if !failed_in.contains(&package) {
-            tally.count(ReportCase {
-                name: package,
-                group: Nullable::null(),
-                outcome: ReportOutcome::Errored,
-                duration_ms: Nullable::null(),
-            });
         }
     }
     Ok(tally.finish())
