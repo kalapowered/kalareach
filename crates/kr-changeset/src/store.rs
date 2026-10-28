@@ -1427,18 +1427,22 @@ impl Store {
         transaction.commit().map_err(ChangeSetError::store)
     }
 
-    /// Returns whether a result is recorded against one materialisation.
+    /// Returns every materialisation a result is recorded against, in one read of the table.
     ///
     /// # Errors
     ///
     /// Returns [`ChangeSetError::StoreUnavailable`] when the read fails.
-    pub fn has_result(&self, materialisation_id: MaterialisationId) -> Result<bool> {
-        self.connection
-            .query_row(
-                "SELECT EXISTS (SELECT 1 FROM results WHERE materialisation_id = ?1)",
-                params![uuid_bytes(materialisation_id.get())],
-                |row| row.get(0),
-            )
+    pub fn materialisations_with_a_result(
+        &self,
+    ) -> Result<std::collections::HashSet<MaterialisationId>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT DISTINCT materialisation_id FROM results")
+            .map_err(ChangeSetError::store)?;
+        statement
+            .query_map([], |row| Ok(MaterialisationId::new(uuid_column(row, 0)?)))
+            .map_err(ChangeSetError::store)?
+            .collect::<std::result::Result<_, _>>()
             .map_err(ChangeSetError::store)
     }
 
