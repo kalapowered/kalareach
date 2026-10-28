@@ -657,6 +657,13 @@ pub(super) fn write(plan: &SettingsPlan) -> Result<(), (ProfileError, bool)> {
             return Err((ProfileError::NotPersisted(spec.terminal), !undo(&written)));
         }
     }
+    // The last look before the list is written: a key kr does not write that the person set while
+    // the keys were written makes the profile theirs, and the keys written are put back.
+    let last = Held::of(gsettings, spec, &plan.wrote.schema, &plan.wrote.path)
+        .map_err(|error| (error, !undo(&written)))?;
+    if !last.others_unset(&plan.wrote.keys) {
+        return Err((changed(), !undo(&written)));
+    }
     if let Err(error) = change_list(gsettings, spec, &plan.uuid, true) {
         // The write of the list may have landed before it failed to read back: the identifier is
         // taken out again, unless it was in the list before this write, and if that fails too the
@@ -834,16 +841,18 @@ pub(super) enum TakenOut {
 }
 
 /// Takes an unchanged profile out: its identifier leaves the shared list and its keys are reset.
-/// Every key is read before the first write and again just before it is reset. One that holds a
-/// value the person put there stops the removal: the keys already reset and the place in the list
-/// (if the profile was in it) are put back, and the profile is left as it was. `in_list` says
-/// whether it was. Each reset is read back by another process: a
-/// key that still holds its value is a failure.
+/// Every key of the profile is read before the first write, once more when the profile is out of the
+/// list, and a last time after the resets; a key of kr's is read again just before it is reset. A
+/// key that holds a value the person put there stops the removal: the keys already reset and the
+/// place in the list (if the profile was in it) are put back, and the profile is left as it was.
+/// `in_list` says whether it was. Each reset is read back by another process: a key that still
+/// holds its value is a failure, and one that holds another writer's value is that writer's.
 ///
 /// # Errors
 ///
-/// Returns why it could not be; what was reset stays reset, and the caller keeps the record's
-/// entry.
+/// Returns why it could not be, and the caller keeps the record's entry: [`ProfileError::Changing`]
+/// where another writer's edit stopped it and what it changed could not be put back, or was; a key
+/// whose reset was not kept leaves what was reset reset.
 pub(super) fn take_out(
     gsettings: &Gsettings,
     spec: Spec,
@@ -932,6 +941,16 @@ pub(super) fn take_out(
         reset.pop();
         put_back(&reset);
         return Err(ProfileError::Changing(spec.terminal));
+    }
+    // The last look: a key kr does not write that the person set while the resets ran makes the
+    // profile theirs, and everything this removal did is put back.
+    let last = Held::of(gsettings, &spec, &wrote.schema, &wrote.path)?;
+    if !last.others_unset(&wrote.keys) {
+        return if put_back(&reset) {
+            Ok(TakenOut::Changed)
+        } else {
+            Err(ProfileError::Changing(spec.terminal))
+        };
     }
     Ok(TakenOut::Removed)
 }
