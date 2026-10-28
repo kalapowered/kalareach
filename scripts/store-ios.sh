@@ -39,7 +39,8 @@
 # Profiles`, and leaves logs that hold request tokens made from the key: the script removes
 # `export/Packaging.log` and the log in the temporary directory, and every run ends by searching
 # its output directory for the key's text and for signed tokens. The application's `Info.plist`
-# says it uses encryption (`ITSAppUsesNonExemptEncryption`), which the checker requires.
+# says it needs no export documentation (`ITSAppUsesNonExemptEncryption` false), which the checker
+# requires.
 #
 # The build number is recorded only for a build that passed every check. A failed one leaves its
 # files and a `store-build.json` whose `holds` is false: that file is not to be uploaded.
