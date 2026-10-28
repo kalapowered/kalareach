@@ -6009,7 +6009,7 @@ pub mod configuration {
     /// host describes, or where the endpoint's relay checks and lookups go. It is not an inventory
     /// of every variable a process in this tree ever looks at, and it does not claim to be one. A
     /// name that is in neither this table nor [`ALLOWLIST`] takes no part in the precedence.
-    pub const UNGOVERNED: [UngovernedVariable; 25] = [
+    pub const UNGOVERNED: [UngovernedVariable; 26] = [
         UngovernedVariable {
             variable: "TMPDIR",
             locates: true,
@@ -6144,6 +6144,15 @@ pub mod configuration {
             locates: false,
             selects: "where the network endpoint reads the Windows hosts file, which may name an \
                       address for a relay or a discovery service",
+        },
+        UngovernedVariable {
+            variable: "KR_TERMINAL_PREFERENCES_DIR",
+            locates: false,
+            selects: "the preference files `kr host terminal-profile` reads and writes in place of \
+                      Terminal's and iTerm2's own preferences, for a run (a test's, an isolated \
+                      setup's) that must not reach the person's own; it names no authority, origin \
+                      or trust, and only the command reads it, so a daemon an update starts again \
+                      is not given it",
         },
     ];
 
@@ -9480,6 +9489,14 @@ mod tests {
         assert!(configuration::still_current(&prepared, &absent).is_ok());
     }
 
+    /// The variables of this product's own that a command, never a daemon, reads outside the
+    /// precedence, each listed with why: a variable that selects authority, an origin or a place a
+    /// daemon keeps something takes part in the precedence or is not read at all.
+    ///
+    /// `KR_TERMINAL_PREFERENCES_DIR` points the terminal profile commands at preference files of
+    /// the caller's own, which only a test or an isolated setup does.
+    const PRODUCT_VARIABLES_READ_BY_A_COMMAND: [&str; 1] = ["KR_TERMINAL_PREFERENCES_DIR"];
+
     /// KR-REQ-26.14: what this build reads outside the precedence is written down, not implied:
     /// the platform's own naming of its locations and its login, and what the endpoint's library
     /// reads for its relay checks and lookups. A variable of this product's own either takes part
@@ -9498,7 +9515,8 @@ mod tests {
                 entry.variable
             );
             assert!(
-                !entry.variable.starts_with("KR_"),
+                !entry.variable.starts_with("KR_")
+                    || PRODUCT_VARIABLES_READ_BY_A_COMMAND.contains(&entry.variable),
                 "{} is this product's own variable, read outside the precedence",
                 entry.variable
             );
@@ -9542,6 +9560,18 @@ mod tests {
                     .iter()
                     .any(|entry| entry.variable == variable),
                 "{variable} is read and is named"
+            );
+        }
+        // The variables of this product's own that a command reads are named, and none of them
+        // is a place a daemon keeps something (a daemon an update starts again is given those).
+        for variable in PRODUCT_VARIABLES_READ_BY_A_COMMAND {
+            let entry = configuration::UNGOVERNED
+                .iter()
+                .find(|entry| entry.variable == variable)
+                .unwrap_or_else(|| panic!("{variable} is read and is named"));
+            assert!(
+                !entry.locates,
+                "{variable} is no place a daemon keeps something"
             );
         }
         // A certificate store is never the environment's to choose: those variables are in
