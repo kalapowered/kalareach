@@ -410,7 +410,7 @@ run is suspected, or signing access must be revoked immediately:
      3. The Azure subscription owner or User Access Administrator grants `Artifact Signing Certificate
         Profile Signer` to the *new* service principal at the certificate profile scope.
      4. The GitHub repository administrator updates the `AZURE_CLIENT_ID` repository variable to the new
-        application ID, and updates the `environment` name in both workflows to the new environment.
+        application ID, and updates the `environment` name in `release-windows.yml` to the new environment.
      5. The operator completes explicit denial verification before initiating production releases under
         the new environment:
         - Verify that OIDC token exchange requests using the old environment subject are rejected by

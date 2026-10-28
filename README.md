@@ -207,15 +207,19 @@ cargo run -p kr-shell-integration --bin kr-shell-fixtures
 
 ## Releases
 
-There are two kinds of release, both initiated by creating a tag.
+There are two kinds of release. A package release is initiated by creating a tag, and a host release by running a workflow.
 
 - A tag `packages/v<version>+<commit>` releases the generated `@kalareach/protocol` and
   `@kalareach/plugin-sdk` packages as immutable archives on a GitHub release, through
   `.github/workflows/package-release.yml`. [docs/releases/packages.md](docs/releases/packages.md)
   says what a release carries, how a consumer pins one and how to reproduce it, and sets the
   managed shell packages' update target.
-- A tag that starts with `host/v` builds the Windows host executables and PowerShell packages,
-  signs each of them and publishes them as a release, through
+- A macOS and Linux host release is built by `.github/workflows/release-tree.yml`, signed and
+  notarised on the machine that holds the Developer ID, and sealed and published as a pre-release
+  `host/v<version>+<commit>` by `.github/workflows/release-host.yml`.
+  [docs/releases/macos-signing.md](docs/releases/macos-signing.md) says what each step does and checks.
+- A tag that starts with `host/v` also builds the Windows host executables and PowerShell packages and,
+  once a Windows host is released, signs each of them and publishes them as a release, through
   `.github/workflows/release-windows.yml`.
   [docs/releases/windows-signing.md](docs/releases/windows-signing.md) says what signs, what the
   release carries and how the signing identity is kept.
