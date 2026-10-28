@@ -1829,7 +1829,10 @@ pub struct NewArguments {
     /// and a detach. So it holds when the session could not be created or attached, when a signal
     /// ended the shell, when the shell never started, when the worker went, when the desktop login
     /// ended or the host shut down, when the connection to the session ended, when another
-    /// attachment took the input lease, and when input may not have reached the session.
+    /// attachment took the input lease, and when input may not have reached the session. A detach
+    /// is not a failure: the session goes on, and a detach of any origin (Ctrl-D at an empty root
+    /// prompt, `kr detach` typed here, `kr detach --attachment` run elsewhere) ends the command at
+    /// once, because the command cannot tell where a detach came from.
     #[arg(long)]
     pub hold_on_failure: bool,
 }
