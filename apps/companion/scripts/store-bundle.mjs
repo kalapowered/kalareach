@@ -359,10 +359,24 @@ export function secretsUnder(directory, needles) {
   return places
 }
 
-/** A message with nothing of it left when it quotes a secret. */
+/** A message with nothing of it left when it quotes a secret or a signed token. */
 export function withheldIfSecret(message, needles) {
-  const bytes = Buffer.from(message, 'utf8')
-  return needles.some((needle) => bytes.includes(needle)) ? 'the details are withheld: they quote a secret file' : message
+  return holdsSecret(Buffer.from(message, 'utf8'), needles) ? 'the details are withheld: they quote a secret file' : message
+}
+
+/**
+ * The text of a failure, for a log: an error from reading a bundle or a directory can quote a name
+ * or a value out of it, so it goes through the same filter as every other message. A secret file
+ * that cannot be read cannot be quoted, and the message then stands as it is.
+ */
+function failureText(failure, secretFiles) {
+  let needles = []
+  try {
+    needles = needlesOf(secretFiles)
+  } catch {
+    // A secret that cannot be read cannot be quoted.
+  }
+  return withheldIfSecret(String(failure.message), needles)
 }
 
 /**
@@ -482,6 +496,46 @@ export function profileFromXml(xml) {
 }
 
 /** What is wrong with the signature an exported bundle carries, given its profile. */
+/**
+ * What is wrong with the signature of a framework or dylib inside a bundle: it is signed with a
+ * distribution certificate of the team, and the same one as the bundle that holds it, which its own
+ * profile has already been held to.
+ */
+export function problemsInEmbeddedSignature({ described, leafSha1, hostLeafSha1, team }) {
+  const problems = []
+  if (/Signature=adhoc/.test(described)) problems.push('is signed ad hoc, not with a distribution certificate')
+  if (!/Authority=Apple Distribution: /.test(described)) problems.push('is not signed with an Apple Distribution certificate')
+  if (!new RegExp(`TeamIdentifier=${team}$`, 'm').test(described)) problems.push(`is not signed under the team ${team}`)
+  if (leafSha1 === '' || leafSha1 !== hostLeafSha1) problems.push('is not signed with the certificate of the bundle that holds it')
+  return problems
+}
+
+/** The frameworks and dylibs inside a bundle's `Frameworks` directory, each with its name and path. */
+export function embeddedCode(bundle) {
+  const directory = join(bundle, 'Frameworks')
+  if (!existsSync(directory)) return []
+  return readdirSync(directory)
+    .filter((entry) => entry.endsWith('.framework') || entry.endsWith('.dylib'))
+    .sort()
+    .map((entry) => ({ name: entry, path: join(directory, entry) }))
+}
+
+/** What `codesign` describes of a signed bundle or file, and the SHA-1 of its leaf certificate ('' when it is signed ad hoc). */
+export function signerOf(path) {
+  const described = run('codesign', ['-dvv', path])
+  const certificates = mkdtempSync(join(tmpdir(), 'kr-store-cert-'))
+  let leafSha1 = ''
+  try {
+    run('codesign', ['-d', `--extract-certificates=${join(certificates, 'cert')}`, path])
+    leafSha1 = createHash('sha1').update(readFileSync(join(certificates, 'cert0'))).digest('hex').toUpperCase()
+  } catch {
+    // No certificate to read is an ad hoc signature, which the description names.
+  } finally {
+    rmSync(certificates, { recursive: true, force: true })
+  }
+  return { described: described.stderr, leafSha1 }
+}
+
 export function problemsInExportSignature({ described, leafSha1, profile, entitlements, team }) {
   const problems = []
   if (/Signature=adhoc/.test(described)) problems.push('is signed ad hoc, not with a distribution certificate')
@@ -509,11 +563,19 @@ function filesUnder(root) {
   return found
 }
 
-/** What is wrong with the application's export-compliance key: it must say that the application needs no export documentation. */
+/**
+ * What is wrong with the application's export-compliance key: it must say that the application needs
+ * no export documentation, and carry no code, which Apple issues only for documentation.
+ */
 export function problemsInEncryptionKey(info) {
-  return info.ITSAppUsesNonExemptEncryption === false
-    ? []
-    : ["the application's Info.plist does not carry ITSAppUsesNonExemptEncryption set to false"]
+  const problems =
+    info.ITSAppUsesNonExemptEncryption === false
+      ? []
+      : ["the application's Info.plist does not carry ITSAppUsesNonExemptEncryption set to false"]
+  if (info.ITSEncryptionExportComplianceCode !== undefined) {
+    problems.push("the application's Info.plist carries an ITSEncryptionExportComplianceCode, which a key of false has no use for")
+  }
+  return problems
 }
 
 /** The lines a check printed after the one that counts its problems, or its last lines. */
@@ -597,25 +659,15 @@ export function checkIos(options) {
           continue
         }
         const profile = readProfile(profilePath)
-        const described = run('codesign', ['-dvv', bundle.path])
-        const certificates = mkdtempSync(join(tmpdir(), 'kr-store-cert-'))
-        let leafSha1 = ''
-        try {
-          run('codesign', ['-d', `--extract-certificates=${join(certificates, 'cert')}`, bundle.path])
-          leafSha1 = createHash('sha1').update(readFileSync(join(certificates, 'cert0'))).digest('hex').toUpperCase()
-        } catch {
-          // No certificate to read is an ad hoc signature, which the description names.
-        } finally {
-          rmSync(certificates, { recursive: true, force: true })
-        }
-        for (const each of problemsInExportSignature({
-          described: described.stderr,
-          leafSha1,
-          profile,
-          entitlements,
-          team: want.team
-        })) {
+        const { described, leafSha1 } = signerOf(bundle.path)
+        for (const each of problemsInExportSignature({ described, leafSha1, profile, entitlements, team: want.team })) {
           problems.push(`${bundle.name} ${each}`)
+        }
+        for (const code of embeddedCode(bundle.path)) {
+          const signer = signerOf(code.path)
+          for (const each of problemsInEmbeddedSignature({ ...signer, hostLeafSha1: leafSha1, team: want.team })) {
+            problems.push(`${code.name} in ${bundle.name} ${each}`)
+          }
         }
         for (const each of problemsInProfile(profile, { team: want.team, identifier: info.CFBundleIdentifier, push: index === 0 })) {
           problems.push(`${bundle.name}'s profile: ${each}`)
@@ -712,7 +764,7 @@ if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) 
     try {
       places = secretsUnder(options.scanDir, needlesOf(options.secretFiles))
     } catch (failure) {
-      console.error(`could not scan ${options.scanDir}: ${failure.message}`)
+      console.error(`could not scan ${options.scanDir}: ${failureText(failure, options.secretFiles)}`)
       process.exit(2)
     }
     if (places > 0) {
@@ -726,13 +778,7 @@ if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) 
   try {
     result = options.platform === 'android' ? checkAndroid(options) : checkIos(options)
   } catch (failure) {
-    let needles = []
-    try {
-      needles = needlesOf(options.secretFiles)
-    } catch {
-      // A secret that cannot be read cannot be quoted.
-    }
-    console.error(`could not read ${options.path}: ${withheldIfSecret(String(failure.message), needles)}`)
+    console.error(`could not read ${options.path}: ${failureText(failure, options.secretFiles)}`)
     process.exit(2)
   }
   if (options.scanDir && !(result.facts.secretsFound > 0)) {
@@ -740,7 +786,7 @@ if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) 
     try {
       found = secretsUnder(options.scanDir, needlesOf(options.secretFiles))
     } catch (failure) {
-      console.error(`could not scan ${options.scanDir}: ${failure.message}`)
+      console.error(`could not scan ${options.scanDir}: ${failureText(failure, options.secretFiles)}`)
       process.exit(2)
     }
     if (found > 0) result = secretFirst(found)

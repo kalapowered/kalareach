@@ -38,7 +38,8 @@
 # export also saves two profiles of its own under `~/Library/Developer/Xcode/UserData/Provisioning
 # Profiles`, and leaves logs that hold request tokens made from the key: the script removes
 # `export/Packaging.log` and the log in the temporary directory, and every run ends by searching
-# its output directory for the key's text and for signed tokens. The application's `Info.plist`
+# its output directory for the key's text and for signed tokens, a signal during the export
+# included. The application's `Info.plist`
 # says it needs no export documentation (`ITSAppUsesNonExemptEncryption` false), which the checker
 # requires.
 #
@@ -91,9 +92,26 @@ out="$KR_STORE_ROOT/$version-$number-ios"
 kr_store_claim_number ios "$number" || exit 2
 kr_store_claim "$out" || exit 2
 kr_store_guard_begin "$here" "$apple" || exit 2
-# A signal puts the project back too. An ordinary end does it below, where its failure is the
-# script's failure.
-trap 'kr_store_guard_end; exit 130' INT TERM HUP
+
+# What a run owes however it ends: Xcode's credential logs are removed, the output directory is
+# searched for the key's text and for signed tokens, and the Apple project is put back. A normal
+# end and a signal take this one path; it fails when any part of it does.
+finish() {
+    local result=0
+    kr_store_remove_token_logs "$out" || result=2
+    if [ -n "$key_file" ]; then
+        node "$companion/scripts/store-bundle.mjs" --scan-dir "$out" --secret-file "$key_file" 2>&1 | tee -a "$out/scan.log"
+        [ "${PIPESTATUS[0]}" = 0 ] || result=2
+    fi
+    kr_store_guard_end || result=2
+    return "$result"
+}
+interrupted() {
+    trap '' INT TERM HUP
+    finish
+    exit 130
+}
+trap interrupted INT TERM HUP
 kr_store_say "version $version, build number $number, team $team, into $out"
 
 # What the build is of, taken before it rewrites tracked project files.
@@ -188,7 +206,7 @@ PLIST
         -authenticationKeyIssuerID "$issuer" >"$out/export.log" 2>&1
     local exported=$?
     snapshot >"$out/keychain-after.txt"
-    remove_token_logs || return 2
+    kr_store_remove_token_logs "$out" || return 2
     if ! cmp -s "$out/keychain-before.txt" "$out/keychain-after.txt"; then
         kr_store_say "the login keychain's identities or the search list changed during the export (see $out/keychain-*.txt); stopping"
         return 2
@@ -203,37 +221,11 @@ PLIST
     [ "${PIPESTATUS[0]}" = 0 ] || { kr_store_say "the exported build does not hold; $out/store-build.json is not to be uploaded"; return 2; }
 }
 
-# Xcode keeps request tokens made from the key in two places: a log bundle in the temporary
-# directory (the export log names it) and `Packaging.log` beside the exported build. Neither is of
-# use after the export, and a token is not a secret file the scan could match, so both go.
-remove_token_logs() {
-    local named tmp parent
-    rm -f -- "${out:?}/export/Packaging.log"
-    named="$(sed -n 's/.*Created bundle at path "\(.*\.xcdistributionlogs\)".*/\1/p' "$out/export.log" 2>/dev/null | head -1)"
-    [ -n "$named" ] || return 0
-    tmp="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
-    parent="$(cd "$(dirname "$named")" 2>/dev/null && pwd -P)"
-    if [ "$parent" != "$tmp" ]; then
-        kr_store_say "Xcode's export log $named is outside the temporary directory $tmp and was not removed; remove it by hand" >&2
-        return 2
-    fi
-    [ ! -d "$named" ] || rm -rf -- "${named:?}"
-    if [ -d "$named" ]; then
-        kr_store_say "Xcode's export log $named could not be removed" >&2
-        return 2
-    fi
-}
-
 build
 status=$?
 
-# However the build ended, its output directory is searched for the key's text and for signed
-# tokens, and the Apple project is put back; a failure of either fails the script.
-if [ -n "$key_file" ]; then
-    node "$companion/scripts/store-bundle.mjs" --scan-dir "$out" --secret-file "$key_file" 2>&1 | tee -a "$out/scan.log"
-    [ "${PIPESTATUS[0]}" = 0 ] || status=2
-fi
-kr_store_guard_end || status=2
+# However the build ended, the run's debts are paid; a failure of any of them fails the script.
+finish || status=2
 trap - INT TERM HUP
 if [ "$status" != 0 ]; then
     kr_store_say "failed; no build number was recorded as built, and what is in $out is not to be uploaded"

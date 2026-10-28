@@ -25,7 +25,9 @@ import {
   ANDROID_PERMISSIONS,
   certificateFingerprint,
   declaresSignInLink,
+  embeddedCode,
   problemsInBundleConfig,
+  problemsInEmbeddedSignature,
   problemsInEncryptionKey,
   withheldIfSecret,
   problemsInExportSignature,
@@ -40,7 +42,8 @@ import {
   problemsInSignature,
   problemsInVersions,
   profileFromXml,
-  secretNeedles
+  secretNeedles,
+  signerOf
 } from './store-bundle.mjs'
 import { entitlementsOf } from './identifiers.mjs'
 import { ENTITLEMENT_SOURCES, entitlementsOfArchive, signArchive } from './store-ios-sign.mjs'
@@ -215,9 +218,23 @@ held('a secret text in a compressed member of a real archive is found', 1, (() =
   spawnSync('jar', ['cf', join(work, 'compressed.aab'), '-C', dir, 'a.txt'])
   return withArchive(join(work, 'compressed.aab'), (members, read) => placesWithSecret(members.map((member) => read(member)), secretNeedles(Buffer.from('correct-horse-battery-staple\n'))))
 })())
+const TOKEN = `eyJ${'a'.repeat(12)}.eyJ${'b'.repeat(12)}.${'c'.repeat(12)}`
 const suppressed = suppressedIfSecret({ problems: ['the version name is "the-secret-itself"'], facts: { secretsFound: 1 } })
 held('a bundle that holds a secret is reported by its count, with nothing quoted from it', [1, true], [suppressed.facts.secretsFound, !JSON.stringify(suppressed).includes('the-secret-itself')])
 held('an error message that quotes a secret is withheld, and one that does not is kept', ['the details are withheld: they quote a secret file', 'no such file'], [withheldIfSecret('could not read /x/the-secret-itself', secretNeedles(Buffer.from('the-secret-itself\n'))), withheldIfSecret('no such file', secretNeedles(Buffer.from('the-secret-itself\n')))])
+held('an error message that quotes a signed token is withheld too', 'the details are withheld: they quote a secret file', withheldIfSecret(`could not read /x/${TOKEN}`, secretNeedles(Buffer.from('the-secret-itself\n'))))
+{
+  // A member whose name holds the secret and whose compression the reader refuses: the reader's own
+  // error quotes the member's name, and the scan must not pass that on.
+  const scanned = join(work, 'unreadable'); mkdirSync(scanned)
+  const named = zip([{ name: 'before-correct-horse-battery-staple-after.txt', bytes: Buffer.from('x') }])
+  named.writeUInt16LE(99, named.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02])) + 10)
+  named.writeUInt16LE(99, 8)
+  writeFileSync(join(scanned, 'broken.aab'), named)
+  const secretFile = join(work, 'unreadable-secret'); writeFileSync(secretFile, 'correct-horse-battery-staple\n')
+  const scan = spawnSync(process.execPath, [join(import.meta.dirname, 'store-bundle.mjs'), '--scan-dir', scanned, '--secret-file', secretFile], { encoding: 'utf8' })
+  held('a directory scan that fails prints nothing of the secret it was looking for', [2, false], [scan.status, `${scan.stdout}${scan.stderr}`.includes('correct-horse-battery-staple')])
+}
 held('a directory with a secret in a log is found, and a clean one is not', [1, 0], (() => {
   const dirty = join(work, 'dirty'); mkdirSync(dirty); writeFileSync(join(dirty, 'run.log'), 'x correct-horse-battery-staple y')
   const clean = join(work, 'clean'); mkdirSync(clean); writeFileSync(join(clean, 'run.log'), 'nothing here')
@@ -370,11 +387,23 @@ heldProblems(
   ['allows no com.apple.developer.associated-domains']
 )
 
+const embeddedFine = { described: 'Authority=Apple Distribution: Kala Holdings Inc (L775WGST9V)\nTeamIdentifier=L775WGST9V\n', leafSha1: 'AB'.repeat(20), hostLeafSha1: 'AB'.repeat(20), team: TEAM }
+held('a framework signed by its host\'s distribution certificate passes', [], problemsInEmbeddedSignature(embeddedFine))
+heldProblems('a framework signed ad hoc is refused', problemsInEmbeddedSignature({ ...embeddedFine, described: 'Signature=adhoc\nTeamIdentifier=not set\n', leafSha1: '' }), ['signed ad hoc', 'not signed with an Apple Distribution', 'not signed under the team'])
+heldProblems(
+  'a framework signed with a development certificate is refused',
+  problemsInEmbeddedSignature({ ...embeddedFine, described: 'Authority=Apple Development: A Person (X)\nTeamIdentifier=L775WGST9V\n', leafSha1: 'CD'.repeat(20) }),
+  ['not signed with an Apple Distribution', 'not signed with the certificate of the bundle that holds it']
+)
+heldProblems('a framework of another team is refused', problemsInEmbeddedSignature({ ...embeddedFine, described: 'Authority=Apple Distribution: Other (ZZZZZZZZZZ)\nTeamIdentifier=ZZZZZZZZZZ\n' }), ['not signed under the team'])
+heldProblems('a framework signed with another distribution certificate is refused', problemsInEmbeddedSignature({ ...embeddedFine, leafSha1: 'EF'.repeat(20) }), ['not signed with the certificate of the bundle that holds it'])
+
 held('an application that says it needs no export documentation passes, and one that is silent or says it does not', [0, 1, 1], [
   problemsInEncryptionKey({ ITSAppUsesNonExemptEncryption: false }).length,
   problemsInEncryptionKey({}).length,
   problemsInEncryptionKey({ ITSAppUsesNonExemptEncryption: true }).length
 ])
+held('a key of false that comes with an export compliance code is refused', 1, problemsInEncryptionKey({ ITSAppUsesNonExemptEncryption: false, ITSEncryptionExportComplianceCode: 'a1b2c3' }).length)
 
 const versions = { versionCode: 39800, versionName: '0.1.0' }
 const info = (code, name) => ({ CFBundleVersion: code, CFBundleShortVersionString: name })
@@ -439,6 +468,14 @@ if (codesign.error || process.platform !== 'darwin') {
   const application = sealed(join(signed, 'KalaReach'))
   const notification = sealed(join(extension, 'KalaReachNotificationService'))
   held('the application is sealed with production push and its two keychain groups', ['production', [`${TEAM}.to.kala.reach`, `${TEAM}.to.kala.reach.shared`]], [application['aps-environment'], application['keychain-access-groups']])
+  const frameworks = join(signed, 'Frameworks'); mkdirSync(join(frameworks, 'Inner.framework'), { recursive: true })
+  copyFileSync('/usr/bin/true', join(frameworks, 'Plain.dylib'))
+  spawnSync('codesign', ['-f', '-s', '-', join(frameworks, 'Plain.dylib')])
+  writeFileSync(join(frameworks, 'notes.txt'), 'not code')
+  held('the code embedded in a bundle is its frameworks and dylibs, and nothing else', ['Inner.framework', 'Plain.dylib'], embeddedCode(signed).map((each) => each.name))
+  const adHoc = signerOf(join(frameworks, 'Plain.dylib'))
+  heldProblems('a real ad hoc signature on embedded code is read and refused', problemsInEmbeddedSignature({ ...adHoc, hostLeafSha1: 'AB'.repeat(20), team: TEAM }), ['signed ad hoc', 'not signed with an Apple Distribution'])
+  held('the application and the extension carry no embedded code of their own here', [], embeddedCode(extension))
   held('the extension is sealed with the shared group alone and no push', [[`${TEAM}.to.kala.reach.shared`], undefined], [notification['keychain-access-groups'], notification['aps-environment']])
 }
 
@@ -446,7 +483,7 @@ if (codesign.error || process.platform !== 'darwin') {
 
 const library = join(import.meta.dirname, '..', '..', '..', 'scripts', 'lib', 'store-build.sh')
 const shell = (script, environment = {}) =>
-  spawnSync('bash', ['-c', `set -u; . "${library}"; ${script}`], { encoding: 'utf8', env: { ...process.env, ...environment } })
+  spawnSync('bash', ['-c', `set -u; . "${library}"; ${script}`], { encoding: 'utf8', env: { ...process.env, ...environment }, timeout: 60000, killSignal: 'SIGKILL' })
 const repository = join(work, 'repository')
 const appleDirectory = join(repository, 'apps', 'companion', 'src-tauri', 'gen', 'apple')
 mkdirSync(appleDirectory, { recursive: true })
@@ -485,6 +522,7 @@ const number = (value) => shell(`kr_store_number ios ${value}`, { KR_STORE_ROOT:
 held('a build number at or below the receipt is refused', [2, 2], [number(39000).status, number(38999).status])
 held('a build number above the receipt is taken', [0, '39001\n'], [number(39001).status, number(39001).stdout])
 held('a number of eleven digits, or no number, is refused', [2, 2], [number(12345678901).status, number("'abc'").status])
+held('a number with a leading zero is refused, since it would claim a number of its own', 2, number('039900').status)
 shell('kr_store_receipt ios 39500; kr_store_receipt ios 39200', { KR_STORE_ROOT: root })
 held('the receipt keeps the larger number when two builds finish out of order', '39500\n', readFileSync(join(receipts, 'ios'), 'utf8'))
 held('a second claim on one output directory fails', [0, 2], [shell(`kr_store_claim "${join(root, 'out')}"`).status, shell(`kr_store_claim "${join(root, 'out')}"`).status])
@@ -508,6 +546,50 @@ held('when the project cannot be put back the guard fails, and keeps the copy an
 ])
 spawnSync('chmod', ['0644', localConfig])
 rmSync(localConfig, { force: true })
+
+// A lock goes only when the run that holds it is gone: a lock that is old but whose owner still runs
+// stays, and one whose owner has ended, or that names no owner and has aged, is taken over.
+const lockCase = (setup) => {
+  const base = join(work, `lock-${Math.random().toString(36).slice(2)}`)
+  mkdirSync(join(base, 'receipts'), { recursive: true })
+  const lock = join(base, 'receipts', 'ios.lock')
+  const answer = shell(`${setup.replaceAll('$LOCK', `"${lock}"`)}; kr_store_receipt ios 39900; status=$?; [ -z "\${owner:-}" ] || kill "$owner" 2>/dev/null; echo "status=$status lock=$([ -d "${lock}" ] && echo kept || echo gone)"`, {
+    KR_STORE_ROOT: base,
+    KR_STORE_LOCK_WAIT: '2'
+  })
+  let receipt = 'none'
+  try { receipt = readFileSync(join(base, 'receipts', 'ios'), 'utf8').trim() } catch { /* no receipt */ }
+  return { text: answer.stdout.trim().split('\n').pop(), receipt }
+}
+const aged = 'touch -t 202001010000 $LOCK'
+const liveOwner = lockCase(`sleep 30 & owner=$!; mkdir $LOCK; printf '%s\\n' "$owner" > $LOCK/owner; ${aged}`)
+held('an old lock whose owner is still running is not taken, and no receipt is written', ['status=2 lock=kept', 'none'], [liveOwner.text, liveOwner.receipt])
+const deadOwner = lockCase(`sleep 0 & owner=$!; wait $owner; mkdir $LOCK; printf '%s\\n' "$owner" > $LOCK/owner`)
+held('a lock whose owner has ended is taken over at once', ['status=0 lock=gone', '39900'], [deadOwner.text, deadOwner.receipt])
+const ownerless = lockCase(`mkdir $LOCK; ${aged}`)
+held('a lock that names no owner and has aged is taken over', ['status=0 lock=gone', '39900'], [ownerless.text, ownerless.receipt])
+
+// The logs Xcode keeps request tokens in: Packaging.log beside the export, and a log bundle in the
+// temporary directory that the export log names.
+const tokenLogs = (temporary, where) => {
+  const base = mkdtempSync(join(work, 'tokens-'))
+  mkdirSync(join(base, 'export'), { recursive: true })
+  writeFileSync(join(base, 'export', 'Packaging.log'), 'a token')
+  const bundle = where(base)
+  mkdirSync(bundle, { recursive: true }); writeFileSync(join(bundle, 'IDEDistribution.log'), 'a token')
+  writeFileSync(join(base, 'export.log'), `Created bundle at path "${bundle}".\n`)
+  const answer = shell(`${temporary}; kr_store_remove_token_logs "${base}"; echo "status=$?"`, {})
+  const exists = (path) => spawnSync('test', ['-e', path]).status === 0
+  const removed = answer.stdout.trim().split('\n').pop()
+  const result = [removed, exists(join(base, 'export', 'Packaging.log')), exists(bundle)]
+  rmSync(bundle, { recursive: true, force: true })
+  return result
+}
+const userTemporary = spawnSync('getconf', ['DARWIN_USER_TEMP_DIR'], { encoding: 'utf8' }).stdout.trim()
+const temporaryHere = join(work, 'xcode-temp'); mkdirSync(temporaryHere)
+held('Xcode\'s two token logs are removed when the temporary directory is named', ['status=0', false, false], tokenLogs(`export TMPDIR="${temporaryHere}"`, () => join(temporaryHere, 'a.xcdistributionlogs')))
+held('Xcode\'s two token logs are removed when TMPDIR is not set', ['status=0', false, false], tokenLogs('unset TMPDIR', () => join(userTemporary, `kr-selftest-${process.pid}.xcdistributionlogs`)))
+held('a log bundle outside the temporary directory is kept, and the failure says so', ['status=2', false, true], tokenLogs(`export TMPDIR="${temporaryHere}"`, (base) => join(base, 'elsewhere', 'a.xcdistributionlogs')))
 
 const racing = join(work, 'racing'); mkdirSync(racing)
 shell('for n in $(seq 39100 39139); do kr_store_receipt ios $n & done; wait', { KR_STORE_ROOT: racing })

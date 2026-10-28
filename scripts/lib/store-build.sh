@@ -42,7 +42,7 @@ kr_store_number() {
     local platform=$1 given=${2:-} number receipt last=0
     if [ -n "$given" ]; then
         case "$given" in
-            '' | *[!0-9]*) kr_store_say "the build number must be a whole number, not '$given'" >&2; return 2 ;;
+            '' | *[!0-9]* | 0*) kr_store_say "the build number must be a whole number without a leading zero, not '$given'" >&2; return 2 ;;
         esac
         number=$given
     else
@@ -77,14 +77,17 @@ kr_store_receipt() {
     receipt="$KR_STORE_ROOT/receipts/$platform"
     mkdir -p "$KR_STORE_ROOT/receipts" || return 2
     lock="$receipt.lock"
-    # One writer at a time: the lock is a directory, and one that is more than a minute old is a
-    # writer that died.
+    # One writer at a time: the lock is a directory that holds its owner's process id. A lock is
+    # taken over only when its owner has ended, never because it is old, so a writer that is slow
+    # keeps its lock. (Two waiters that find the same dead owner can both take it over; that needs
+    # an owner that died inside its few milliseconds of work.)
     until mkdir "$lock" 2>/dev/null; do
-        if [ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then rmdir "$lock" 2>/dev/null; continue; fi
+        if kr_store_lock_abandoned "$lock" && rm -f -- "$lock/owner" && rmdir "$lock" 2>/dev/null; then continue; fi
         waited=$((waited + 1))
-        if [ "$waited" -gt 60 ]; then kr_store_say "the receipt for $platform is locked by another run" >&2; return 2; fi
+        if [ "$waited" -gt "${KR_STORE_LOCK_WAIT:-60}" ]; then kr_store_say "the receipt for $platform is locked by another run" >&2; return 2; fi
         sleep 1
     done
+    printf '%s\n' "${BASHPID:-$$}" >"$lock/owner"
     [ ! -f "$receipt" ] || old="$(tr -d '[:space:]' <"$receipt")"
     if [ "$old" -gt "$number" ] 2>/dev/null; then number=$old; fi
     if temporary="$(mktemp "$receipt.XXXXXX")" && printf '%s\n' "$number" >"$temporary" && mv -f "$temporary" "$receipt"; then
@@ -93,8 +96,21 @@ kr_store_receipt() {
         rm -f -- "${temporary:-$receipt.none}"
         status=2
     fi
+    rm -f -- "$lock/owner"
     rmdir "$lock" 2>/dev/null
     return "$status"
+}
+
+# kr_store_lock_abandoned <lock>: whether the run that made a receipt lock has ended. The owner file
+# holds that run's process id. A lock with no readable owner is abandoned once it is a minute old,
+# far longer than a writer takes between making the directory and naming itself.
+kr_store_lock_abandoned() {
+    local owner
+    owner="$(tr -d '[:space:]' <"$1/owner" 2>/dev/null)"
+    case "$owner" in
+        '' | *[!0-9]*) [ -n "$(find "$1" -maxdepth 0 -mmin +1 2>/dev/null)" ]; return ;;
+    esac
+    ! kill -0 "$owner" 2>/dev/null
 }
 
 # kr_store_claim_number <platform> <number>: reserves a build number for a platform, whatever the
@@ -114,6 +130,30 @@ kr_store_claim() {
     mkdir -p "$(dirname "$1")" || return 2
     if ! mkdir "$1" 2>/dev/null; then
         kr_store_say "$1 exists already, or cannot be made" >&2
+        return 2
+    fi
+}
+
+# kr_store_remove_token_logs <output directory>: Xcode keeps request tokens made from the API key in
+# two places, `Packaging.log` beside the exported build and a log bundle in the temporary directory
+# that the export log names. Neither is of use after the export, and a token is not a secret file a
+# scan could match, so both go. It fails when a log cannot be removed, or is outside the temporary
+# directory, which it does not clear. Xcode writes to the per-user temporary directory when `TMPDIR`
+# is not set.
+kr_store_remove_token_logs() {
+    local named tmp parent
+    rm -f -- "${1:?}/export/Packaging.log"
+    named="$(sed -n 's/.*Created bundle at path "\(.*\.xcdistributionlogs\)".*/\1/p' "$1/export.log" 2>/dev/null | head -1)"
+    [ -n "$named" ] || return 0
+    tmp="$(cd "${TMPDIR:-$(getconf DARWIN_USER_TEMP_DIR)}" 2>/dev/null && pwd -P)"
+    parent="$(cd "$(dirname "$named")" 2>/dev/null && pwd -P)"
+    if [ -z "$tmp" ] || [ "$parent" != "$tmp" ]; then
+        kr_store_say "Xcode's export log $named is outside the temporary directory $tmp and was not removed; remove it by hand" >&2
+        return 2
+    fi
+    [ ! -d "$named" ] || rm -rf -- "${named:?}"
+    if [ -d "$named" ]; then
+        kr_store_say "Xcode's export log $named could not be removed" >&2
         return 2
     fi
 }
