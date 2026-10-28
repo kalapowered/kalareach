@@ -815,13 +815,6 @@ function Enable-KalaReachHooks {
     $script:Hooks.Wrapped = $installed
 }
 
-# Puts this module in front of every key the editor has a binding for.
-#
-# This is where the reader reaches its own queue: the wrapper runs the editor's own function and
-# then reads the mailbox, so a request the worker sent is answered after the next key has run, on
-# the reader's own thread, with the editor between operations. The few operations that run an inner
-# read loop also record the state they wait in. A handler the person wrote themselves is left
-# exactly as it is.
 # How the editor stores a binding made with this chord, or nothing when it does not say.
 #
 # The editor keys its table by the key a terminal sends, which is not always the chord as it is
@@ -853,6 +846,13 @@ function Test-KrKeySpelling {
     }
 }
 
+# Puts this module in front of every key the editor has a binding for.
+#
+# This is where the reader reaches its own queue: the wrapper runs the editor's own function and
+# then reads the mailbox, so a request the worker sent is answered after the next key has run, on
+# the reader's own thread, with the editor between operations. The few operations that run an inner
+# read loop also record the state they wait in. A handler the person wrote themselves is left
+# exactly as it is.
 function Install-KrObservedHandlers {
     $wrapped = [System.Collections.Generic.List[hashtable]]::new()
     $bound = try { Get-PSReadLineKeyHandler -Bound } catch { @() }
@@ -890,15 +890,59 @@ function Install-KrObservedHandlers {
     $wrapped
 }
 
-# The binding the editor holds on a chord in the mode it is in, or nothing. The Vi editor lists the
-# chord's command-mode binding beside it, spelled in angle brackets, and that one is not the key
-# this module binds.
+# The editor's tables of bindings in the place this module binds into: the keys, and the chords of
+# two keys.
+#
+# `Set-PSReadLineKeyHandler` and `Remove-PSReadLineKeyHandler` work on the Vi editor's insert tables
+# whichever tables the editor is in, while the editor's own listing is of the tables it is in, with
+# the command table's bindings beside them spelled in angle brackets. A lookup through the listing
+# would read the command table once the editor is in command mode, and would give the command
+# table's binding for a key that has none in the insert table. So the tables are read from the
+# editor, and the insert ones are taken when it is in command mode.
+function Get-KrBindingTables {
+    $type = [Microsoft.PowerShell.PSConsoleReadLine]
+    if ($type::InViCommandMode()) {
+        return @{
+            Keys   = $type.GetField('_viInsKeyMap', 'NonPublic,Static').GetValue($null)
+            Chords = $type.GetField('_viInsChordTable', 'NonPublic,Static').GetValue($null)
+        }
+    }
+    $singleton = $type.GetField('_singleton', 'NonPublic,Static').GetValue($null)
+    @{
+        Keys   = $type.GetField('_dispatchTable', 'NonPublic,Instance').GetValue($singleton)
+        Chords = $type.GetField('_chordDispatchTable', 'NonPublic,Instance').GetValue($singleton)
+    }
+}
+
+# The binding the editor holds on a chord in the tables this module binds into, or nothing.
 function Get-KrBindingOn {
     param([string]$Chord)
-    $found = try { @(Get-PSReadLineKeyHandler -Chord $Chord -ErrorAction SilentlyContinue) } catch { @() }
-    $own = @($found | Where-Object { "$($_.Key)" -ceq $Chord })
-    if ($own.Count -gt 0) { return $own[0] }
-    if ($found.Count -gt 0) { return $found[0] }
+    try {
+        $tables = Get-KrBindingTables
+        # The chord is a key of the table when the table spells it so. Otherwise it is two keys, and
+        # the first of them stays a key of the table for as long as the chord is bound.
+        $handler = $null
+        foreach ($entry in $tables.Keys.GetEnumerator()) {
+            if ("$($entry.Key)" -ceq $Chord) { $handler = $entry.Value; break }
+        }
+        if ($null -eq $handler) {
+            foreach ($first in $tables.Chords.GetEnumerator()) {
+                if (-not $tables.Keys.ContainsKey($first.Key)) { continue }
+                foreach ($entry in $first.Value.GetEnumerator()) {
+                    if ("$($first.Key),$($entry.Key)" -ceq $Chord) { $handler = $entry.Value; break }
+                }
+                if ($null -ne $handler) { break }
+            }
+        }
+        if ($null -eq $handler) { return $null }
+        return [pscustomobject]@{
+            Key         = $Chord
+            Function    = "$($handler.BriefDescription)"
+            Description = "$($handler.LongDescription)"
+        }
+    } catch {
+        Write-KrTrace "binding lookup failed $Chord : $($_.Exception.Message)"
+    }
     $null
 }
 
@@ -974,16 +1018,13 @@ function Install-KrGestureHandler {
 function Get-KrScriptChords {
     $chords = @{}
     try {
-        $type = [Microsoft.PowerShell.PSConsoleReadLine]
-        $singleton = $type.GetField('_singleton', 'NonPublic,Static').GetValue($null)
-        $table = $type.GetField('_dispatchTable', 'NonPublic,Instance').GetValue($singleton)
-        foreach ($entry in $table.GetEnumerator()) {
+        $tables = Get-KrBindingTables
+        foreach ($entry in $tables.Keys.GetEnumerator()) {
             if ($null -ne $entry.Value.ScriptBlock) { $chords["$($entry.Key)"] = $entry.Value.ScriptBlock }
         }
         # The two-key chords are a table of their own, and a script of the person's on one of them
         # is theirs in the same way.
-        $chordTable = $type.GetField('_chordDispatchTable', 'NonPublic,Instance').GetValue($singleton)
-        foreach ($first in $chordTable.GetEnumerator()) {
+        foreach ($first in $tables.Chords.GetEnumerator()) {
             foreach ($second in $first.Value.GetEnumerator()) {
                 if ($null -ne $second.Value.ScriptBlock) {
                     $chords["$($first.Key),$($second.Key)"] = $second.Value.ScriptBlock

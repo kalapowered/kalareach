@@ -747,6 +747,21 @@ fn a_chord_the_editor_spells_as_another_key_never_takes_that_key_over() {
     );
 }
 
+/// Runs `body` with the Vi editor in command mode, and puts the editor back in insert mode after.
+///
+/// The host has no console to switch the mode through, so the table the editor reads its keys from
+/// is set to the command table, which is all the mode is.
+fn in_vi_command_mode(body: &str) -> String {
+    const ENTER: &str = r#"$editor = [Microsoft.PowerShell.PSConsoleReadLine];
+           $singleton = $editor.GetField('_singleton', 'NonPublic,Static').GetValue($null);
+           $table = $editor.GetField('_dispatchTable', 'NonPublic,Instance');
+           $insert = $table.GetValue($singleton);
+           $table.SetValue($singleton, $editor.GetField('_viCmdKeyMap', 'NonPublic,Static').GetValue($null));
+           "#;
+    const LEAVE: &str = "; $table.SetValue($singleton, $insert);\n";
+    [ENTER, body, LEAVE].concat()
+}
+
 /// KR-REQ-07.37: what the module put on the gesture key comes off again, and a key the person has
 /// bound since is theirs.
 ///
@@ -754,8 +769,9 @@ fn a_chord_the_editor_spells_as_another_key_never_takes_that_key_over() {
 /// then puts its decision on that key over the wrapper it finds there. What goes back is the
 /// editor's own operation, in the Emacs and in the Vi edit mode alike, and not the wrapper. A
 /// binding the person made on the key after the decision went on is theirs, and taking the hooks off
-/// leaves it as it is. Each case is a host of its own, because what one binds is what the next
-/// reads.
+/// leaves it as it is. The Vi editor's insert table is the one the module binds into, whichever
+/// table the editor is in when the hooks go, and a key that table leaves unbound stays unbound. Each
+/// case is a host of its own, because what one binds is what the next reads.
 #[test]
 #[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
 fn the_gesture_key_goes_back_to_the_editors_own_operation_and_a_later_binding_stays_the_persons() {
@@ -820,6 +836,124 @@ fn the_gesture_key_goes_back_to_the_editors_own_operation_and_a_later_binding_st
         said(&script, "script"),
         "theirs|the person wrote this",
         "a script the person bound after the decision went on was written over:\n{script}"
+    );
+
+    // A chord of two keys is found in the editor's table of chords and goes back as well.
+    let chord = in_the_package_host(
+        r#"Set-PSReadLineOption -EditMode Emacs;
+           & $module { $script:Hooks.Wrapped = Install-KrObservedHandlers };
+           $during = Get-PSReadLineKeyHandler -Chord 'Escape,b';
+           Write-Output "kr-key[chord-during]=[$($during.Description -like 'KalaReach*')]";
+           & $module { Restore-KrObservedHandlers };
+           $held = Get-PSReadLineKeyHandler -Chord 'Escape,b';
+           Write-Output "kr-key[chord]=[$($held.Function)|$($held.Description -like 'KalaReach*')]""#,
+    );
+    assert_eq!(
+        said(&chord, "chord-during"),
+        "True",
+        "the module was not in front of a chord of two keys while it was installed:\n{chord}"
+    );
+    assert_eq!(
+        said(&chord, "chord"),
+        "BackwardWord|False",
+        "a chord of two keys did not go back to the editor's own operation:\n{chord}"
+    );
+
+    // A key the Vi insert table does not bind is unbound, whatever the command table holds on it.
+    let unbound = in_the_package_host(
+        r#"Set-PSReadLineOption -EditMode Vi;
+           Remove-PSReadLineKeyHandler -Chord 'Ctrl+d';
+           & $module { $script:Kr.GestureChord = 'Ctrl+d'; $script:Kr.GestureDisabled = $false;
+                       $null = Install-KrGestureHandler; Restore-KrGestureHandler };
+           $held = Get-PSReadLineKeyHandler -Chord 'Ctrl+d' | Where-Object { $_.Key -ceq 'Ctrl+d' };
+           Write-Output "kr-key[unbound]=[$($held.Function)]""#,
+    );
+    assert_eq!(
+        said(&unbound, "unbound"),
+        "",
+        "a key the person left unbound in the Vi insert table was bound to the command table's operation:\n{unbound}"
+    );
+
+    // The Vi editor in command mode lists its command table, and what the module bound is in the
+    // insert table: the key still goes back to the editor's own operation.
+    let command = in_the_package_host(&format!(
+        "{}{}{}",
+        r#"Set-PSReadLineOption -EditMode Vi;
+           & $module { $script:Kr.GestureChord = 'Ctrl+d'; $script:Kr.GestureDisabled = $false;
+                       $null = Install-KrGestureHandler };
+           "#,
+        in_vi_command_mode("& $module { Restore-KrGestureHandler }"),
+        r#"$held = Get-PSReadLineKeyHandler -Chord 'Ctrl+d' | Where-Object { $_.Key -ceq 'Ctrl+d' };
+           Write-Output "kr-key[command]=[$($held.Function)|$($held.Description -like 'KalaReach*')]""#,
+    ));
+    assert_eq!(
+        said(&command, "command"),
+        "ViAcceptLineOrExit|False",
+        "the module's decision stayed on the gesture key after it went, in command mode:\n{command}"
+    );
+
+    // A script the person put on the key is theirs in command mode too, and goes back as they
+    // described it.
+    let command_script = in_the_package_host(&format!(
+        "{}{}{}",
+        r#"Set-PSReadLineOption -EditMode Vi;
+           Set-PSReadLineKeyHandler -Chord 'Ctrl+d' -ScriptBlock { param($key, $arg) } `
+               -BriefDescription 'theirs' -Description 'the person wrote this';
+           "#,
+        in_vi_command_mode(
+            r#"& $module { $script:Kr.GestureChord = 'Ctrl+d'; $script:Kr.GestureDisabled = $false;
+                           $null = Install-KrGestureHandler; Restore-KrGestureHandler }"#
+        ),
+        r#"$held = Get-PSReadLineKeyHandler -Chord 'Ctrl+d' | Where-Object { $_.Key -ceq 'Ctrl+d' };
+           Write-Output "kr-key[command-script]=[$($held.Function)|$($held.Description)]""#,
+    ));
+    assert_eq!(
+        said(&command_script, "command-script"),
+        "theirs|the person wrote this",
+        "a script the person bound was not found, or not put back, in command mode:\n{command_script}"
+    );
+
+    // A key spelled with a comma, and a chord whose first key is one, go back like any other.
+    let comma = in_the_package_host(
+        r#"Set-PSReadLineOption -EditMode Emacs;
+           Set-PSReadLineKeyHandler -Chord ',' -Function ForwardWord;
+           & $module { $script:Hooks.Wrapped = Install-KrObservedHandlers };
+           & $module { Restore-KrObservedHandlers };
+           $held = Get-PSReadLineKeyHandler -Chord ',' | Where-Object { $_.Key -ceq ',' };
+           Write-Output "kr-key[comma]=[$($held.Function)|$($held.Description -like 'KalaReach*')]""#,
+    );
+    assert_eq!(
+        said(&comma, "comma"),
+        "ForwardWord|False",
+        "a key spelled with a comma did not go back to the editor's own operation:\n{comma}"
+    );
+    let comma_chord = in_the_package_host(
+        r#"Set-PSReadLineOption -EditMode Emacs;
+           Set-PSReadLineKeyHandler -Chord ',,b' -Function BackwardWord;
+           & $module { $script:Hooks.Wrapped = Install-KrObservedHandlers };
+           & $module { Restore-KrObservedHandlers };
+           $held = Get-PSReadLineKeyHandler -Chord ',,b';
+           Write-Output "kr-key[comma-chord]=[$($held.Function)|$($held.Description -like 'KalaReach*')]""#,
+    );
+    assert_eq!(
+        said(&comma_chord, "comma-chord"),
+        "BackwardWord|False",
+        "a chord whose first key is a comma did not go back to the editor's own operation:\n{comma_chord}"
+    );
+
+    // A first key the person has unbound since is gone, and a chord of it is not bound again.
+    let prefix = in_the_package_host(
+        r#"Set-PSReadLineOption -EditMode Emacs;
+           & $module { $script:Hooks.Wrapped = Install-KrObservedHandlers };
+           Remove-PSReadLineKeyHandler -Chord 'Escape';
+           & $module { Restore-KrObservedHandlers };
+           $held = Get-PSReadLineKeyHandler -Chord 'Escape,b';
+           Write-Output "kr-key[prefix]=[$($held.Function)]""#,
+    );
+    assert_eq!(
+        said(&prefix, "prefix"),
+        "",
+        "a chord's first key the person had unbound was bound again:\n{prefix}"
     );
 }
 
