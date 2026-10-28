@@ -599,6 +599,23 @@
     },
     {
       "entry": {
+        "store": "test-reports",
+        "scope": "environment",
+        "path": "test-reports.sqlite3",
+        "recording": {
+          "kind": "sqlite_table",
+          "table": "test_reports_schema"
+        },
+        "version": 1,
+        "migrates_from": 1
+      },
+      "digest": "fcb8426ae97e0534b1cf48bb503f4f68ba3a6d3fb4fde1549c67f6221bd97e02",
+      "kept": [
+        "TestReport"
+      ]
+    },
+    {
+      "entry": {
         "store": "transfers",
         "scope": "environment",
         "path": "transfers/transfers.sqlite",

@@ -66,6 +66,7 @@ fn record_a_run(
 ) -> kr_changeset::Result<kr_protocol::changeset::MaterialisationResult> {
     let binding = binding::bind_run(fixture.service(), id, outputs);
     materialise::record_result(fixture.service(), id, report, outputs, &binding)
+        .map(|recorded| recorded.result)
 }
 
 /// KR-REQ-14.34: a materialisation is an independent copy of one exact version, and the agent
@@ -987,6 +988,7 @@ fn a_run_in(
         &binding,
     )
     .expect("the result is recorded")
+    .result
 }
 
 /// Changes a file to something else and puts back its bytes and the instant it was last modified,
@@ -1253,7 +1255,8 @@ fn a_result_without_a_binding_it_could_establish_attests_nothing() {
         &outputs,
         &nowhere,
     )
-    .expect("the result is recorded");
+    .expect("the result is recorded")
+    .result;
     assert_eq!(result.tested_source, TestedSource::Indeterminate);
     assert!(result.tested_version.0.is_none());
 }
