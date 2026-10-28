@@ -52,6 +52,11 @@ kr_store_number() {
     if [ -f "$receipt" ]; then
         last="$(tr -d '[:space:]' <"$receipt")"
         case "$last" in '' | *[!0-9]*) kr_store_say "the receipt $receipt does not hold a number" >&2; return 2 ;; esac
+        if [ "${#last}" -gt 10 ]; then kr_store_say "the receipt $receipt holds a number longer than ten digits" >&2; return 2; fi
+    fi
+    if [ "${#number}" -gt 10 ]; then
+        kr_store_say "build number $number is longer than ten digits" >&2
+        return 2
     fi
     if [ "$number" -le "$last" ]; then
         kr_store_say "build number $number is not above $last, the highest $platform has built; wait a minute or name a higher one" >&2
@@ -64,10 +69,30 @@ kr_store_number() {
     printf '%s\n' "$number"
 }
 
-# kr_store_receipt <platform> <number>: records a build that passed its checks.
+# kr_store_receipt <platform> <number>: records a build that passed its checks. The receipt keeps
+# the larger of the number it holds and this one, so two runs that overlap cannot lower it, and a
+# failure to write it is the caller's failure.
 kr_store_receipt() {
-    mkdir -p "$KR_STORE_ROOT/receipts"
-    printf '%s\n' "$2" >"$KR_STORE_ROOT/receipts/$1"
+    local platform=$1 number=$2 receipt old=0 temporary
+    receipt="$KR_STORE_ROOT/receipts/$platform"
+    mkdir -p "$KR_STORE_ROOT/receipts" || return 2
+    [ ! -f "$receipt" ] || old="$(tr -d '[:space:]' <"$receipt")"
+    if [ "$old" -gt "$number" ] 2>/dev/null; then number=$old; fi
+    temporary="$(mktemp "$receipt.XXXXXX")" || return 2
+    if ! { printf '%s\n' "$number" >"$temporary" && mv -f "$temporary" "$receipt"; }; then
+        rm -f -- "${temporary:?}"
+        return 2
+    fi
+}
+
+# kr_store_claim <directory>: makes the output directory of one build, and fails when it exists, so
+# that two builds of one number (two worktrees in the same minute) cannot share a directory.
+kr_store_claim() {
+    mkdir -p "$(dirname "$1")" || return 2
+    if ! mkdir "$1" 2>/dev/null; then
+        kr_store_say "$1 exists already, or cannot be made" >&2
+        return 2
+    fi
 }
 
 # kr_store_require_file <path> <what>: a regular file, and one that only its owner can read.
@@ -105,4 +130,63 @@ kr_store_cargo_target() {
     local name
     name="$(basename "$1")"
     printf '%s\n' "$(dirname "$1")/.targets/$name"
+}
+
+# The iOS build rewrites tracked files under the Apple project (`Info.plist`, the entitlements
+# files, the project itself) and reads one ignored file there, `Local.xcconfig`. These two
+# functions put all of it back, and they never touch work a person has not committed:
+#
+#   kr_store_guard_begin <repository> <apple directory>   refuses unless the tracked files under the
+#                          directory are clean (the trial override of `kr_store_clean_tree` does not
+#                          lift this one, because putting them back is a checkout), and keeps a copy
+#                          of a `Local.xcconfig` that exists;
+#   kr_store_guard_write_local <text>   writes `Local.xcconfig`, which `kr_store_guard_end` removes
+#                          again (or replaces by the saved copy);
+#   kr_store_guard_end     checks out the tracked files and restores `Local.xcconfig`. When it cannot
+#                          put something back it keeps the saved copy and names where it is.
+kr_store_guard_begin() {
+    kr_guard_repo=$1
+    kr_guard_relative=${2#"$1"/}
+    kr_guard_local="$2/Local.xcconfig"
+    kr_guard_kept=""
+    kr_guard_had=0
+    kr_guard_wrote=0
+    if [ -n "$(git -C "$kr_guard_repo" status --porcelain -- "$kr_guard_relative")" ]; then
+        kr_store_say "the Apple project has uncommitted changes under $kr_guard_relative; the build puts that directory back when it ends, so commit or discard them first" >&2
+        return 2
+    fi
+    kr_guard_kept="$(mktemp -d "${TMPDIR:-/tmp}/kr-store-guard.XXXXXX")" || return 2
+    if [ -f "$kr_guard_local" ]; then
+        if ! cp -p "$kr_guard_local" "$kr_guard_kept/Local.xcconfig"; then
+            kr_store_say "could not keep $kr_guard_local; nothing was changed" >&2
+            rm -rf -- "${kr_guard_kept:?}"
+            return 2
+        fi
+        kr_guard_had=1
+    fi
+}
+
+kr_store_guard_write_local() {
+    kr_guard_wrote=1
+    printf '%s\n' "$1" >"$kr_guard_local"
+}
+
+kr_store_guard_end() {
+    local failed=0
+    [ -n "${kr_guard_repo:-}" ] || return 0
+    git -C "$kr_guard_repo" checkout -- "$kr_guard_relative" 2>/dev/null || failed=1
+    if [ "$kr_guard_wrote" = 1 ]; then
+        if [ "$kr_guard_had" = 1 ]; then
+            cp -p "$kr_guard_kept/Local.xcconfig" "$kr_guard_local" || failed=1
+        else
+            rm -f -- "${kr_guard_local:?}" || failed=1
+        fi
+    fi
+    if [ "$failed" = 0 ]; then
+        rm -rf -- "${kr_guard_kept:?}"
+    else
+        kr_store_say "could not put the Apple project back; check git status for $kr_guard_relative, and the copy of Local.xcconfig, if there was one, is in $kr_guard_kept" >&2
+    fi
+    kr_guard_repo=""
+    return "$failed"
 }

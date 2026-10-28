@@ -16,21 +16,29 @@
 #      Xcode makes or finds the cloud-managed distribution certificate and the App Store profiles
 #      of both identifiers. `store-bundle.mjs` then reads the exported `.ipa`.
 #
-# `--unsigned-archive` stops after step 2. Tauri is run with no Apple credential in its
-# environment, on purpose: with the API key in it, the CLI switches signing off and leaves an
-# archive with no entitlements.
+# `--unsigned-archive` stops after step 2. Tauri is run with no `APPLE_*` or `IOS_*` variable in its
+# environment, on purpose. With the API key in it the CLI switches signing off and leaves an archive
+# with no entitlements; with a certificate in it the CLI imports that certificate into a keychain it
+# makes and writes its identity into the project. Neither belongs in an archive that is signed in
+# step 3.
 #
 # The API key is the file `apple/asc-api-key.json` under `~/.config/kalareach-secrets` (its key
 # identifier and issuer, which are identifiers and not secrets, and the path of the `.p8`). The
 # `.p8` is passed to Xcode by path and is never copied or printed. The Firebase configuration is
 # `firebase-apps/GoogleService-Info.plist` in the same directory (`KR_GOOGLE_SERVICE_INFO` names
-# another); it goes into the application as its configuration and nowhere else.
+# another); it goes into the application as its configuration, and the build directories keep a
+# copy of it as they do of every resource.
 #
-# The export must leave the login keychain and the keychain search list as they were: a signing
-# identity Xcode made locally instead of in the cloud would change `find-identity`, and the script
-# fails when either differs. Export compliance (`ITSAppUsesNonExemptEncryption`) is not set here.
+# The build rewrites tracked files under `gen/apple`, so the script refuses to start when any has
+# uncommitted changes, and puts the directory back when it ends. The export must leave the login
+# keychain and the keychain search list as they were: a signing identity Xcode made locally instead
+# of in the cloud would change `find-identity`, and the script fails when either differs. The
+# export also saves two profiles of its own under `~/Library/Developer/Xcode/UserData/Provisioning
+# Profiles`. Export compliance (`ITSAppUsesNonExemptEncryption`) is not set here.
 #
-# Nothing is uploaded. A build is a heavy step:
+# The build number is recorded only for a build that passed every check. A failed one leaves its
+# files and a `store-build.json` whose `holds` is false: that file is not to be uploaded.
+# Nothing is uploaded by this script. A build is a heavy step:
 #
 #   bash lead-scripts/with-slot.sh <label> scripts/store-ios.sh
 #
@@ -74,43 +82,28 @@ fi
 version="$(kr_store_version "$here")" || exit 2
 number="$(kr_store_number ios "$number_given")" || exit 2
 out="$KR_STORE_ROOT/$version-$number-ios"
-[ ! -e "$out" ] || { kr_store_say "$out exists already"; exit 2; }
-mkdir -p "$out"
+kr_store_guard_begin "$here" "$apple" || exit 2
+trap kr_store_guard_end EXIT
+kr_store_claim "$out" || exit 2
 kr_store_say "version $version, build number $number, team $team, into $out"
 
-# What the build writes into the tracked files of the project and the one ignored file it reads,
-# put back when the script ends, whichever way it ends.
-local_config="$apple/Local.xcconfig"
-kept="$(mktemp -d "${TMPDIR:-/tmp}/kr-store-ios.XXXXXX")" || exit 2
-had_local=0
-restore() {
-    local failed=0
-    git -C "$here" checkout -- "apps/companion/src-tauri/gen/apple" 2>/dev/null || failed=1
-    if [ "$had_local" = 1 ]; then
-        cp -p "$kept/Local.xcconfig" "$local_config" || failed=1
-    else
-        rm -f -- "${local_config:?}" || failed=1
-    fi
-    rm -rf -- "${kept:?}"
-    [ "$failed" = 0 ] || kr_store_say "could not put the project files back; check git status and $local_config" >&2
-}
-trap restore EXIT
-if [ -f "$local_config" ]; then
-    cp -p "$local_config" "$kept/Local.xcconfig" || { kr_store_say "could not keep $local_config"; exit 2; }
-    had_local=1
-fi
 # The Firebase file for the build phase, and the team's prefix, which a build with signing off
 # cannot take from a provisioning profile (Build.xcconfig says so).
-printf 'KR_GOOGLE_SERVICE_INFO = %s\nAppIdentifierPrefix = %s.\n' "$firebase" "$team" >"$local_config" \
-    || { kr_store_say "could not write $local_config"; exit 2; }
+kr_store_guard_write_local "$(printf 'KR_GOOGLE_SERVICE_INFO = %s\nAppIdentifierPrefix = %s.' "$firebase" "$team")" \
+    || { kr_store_say "could not write $apple/Local.xcconfig"; exit 2; }
 
 # ---- 1. The archive ----------------------------------------------------------------------------
 
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$(kr_store_cargo_target "$here")}"
 rm -rf -- "${apple:?}/build"
 kr_store_say "archiving (no signing, no Apple credential in the environment)"
-( cd "$companion" && env -u APPLE_API_KEY -u APPLE_API_ISSUER -u APPLE_API_KEY_PATH -u APPLE_CERTIFICATE \
-    -u APPLE_CERTIFICATE_PASSWORD -u APPLE_SIGNING_IDENTITY -u APPLE_PROVISIONING_PROFILE -u IOS_MOBILE_PROVISION \
+# Every APPLE_* and IOS_* variable is taken out, whatever its name: the CLI reads several of them
+# before it looks at `--no-sign`.
+unset_arguments=()
+while IFS= read -r name; do
+    unset_arguments+=(-u "$name")
+done < <(compgen -e | grep -E '^(APPLE_|IOS_)' || true)
+( cd "$companion" && env ${unset_arguments[@]+"${unset_arguments[@]}"} \
     pnpm tauri ios build --ci --target aarch64 --archive-only --no-sign \
     --config "{\"bundle\":{\"iOS\":{\"bundleVersion\":\"$number\"}}}" ) \
     || { kr_store_say "the archive failed"; exit 2; }
@@ -124,9 +117,12 @@ kr_store_say "signing the archive ad hoc with the entitlements of the applicatio
 node "$companion/scripts/store-ios-sign.mjs" "$app" "$team" >"$out/archive-entitlements.json" \
     || { kr_store_say "the archive could not be signed"; exit 2; }
 commit="$(git -C "$here" rev-parse HEAD)"
+dirty=false
+[ -z "$(git -C "$here" status --porcelain --untracked-files=no)" ] || dirty=true
 common=(--version-code "$number" --version-name "$version")
 [ -z "$key_file" ] || common+=(--secret-file "$key_file")
-notes=(--note "commit=$commit" --note "xcode=$(xcodebuild -version | tr '\n' ' ')" --note "builtAt=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+notes=(--note "commit=$commit" --note "uncommittedChanges=$dirty" --note "xcode=$(xcodebuild -version | tr '\n' ' ')"
+    --note "builtAt=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     --note "tauriCli=$(node -e 'process.stdout.write(require(process.argv[1]).version)' "$companion/node_modules/@tauri-apps/cli/package.json")")
 kr_store_say "checking the archive"
 node "$companion/scripts/store-bundle.mjs" --ios "$app" --stage archive --skip-app-checks "${common[@]}" "${notes[@]}" \
@@ -178,6 +174,13 @@ xcodebuild -exportArchive -archivePath "$archive" -exportPath "$out/export" -exp
     -authenticationKeyIssuerID "$issuer" >"$out/export.log" 2>&1
 exported=$?
 snapshot >"$out/keychain-after.txt"
+# Xcode's own log of the export holds the request tokens it made from the key. It is in the
+# temporary directory and the export log names it; it is of no use after the export.
+distribution_logs="$(sed -n 's/.*Created bundle at path "\(.*\.xcdistributionlogs\)".*/\1/p' "$out/export.log" | head -1)"
+case "$distribution_logs" in
+    /private/var/folders/*.xcdistributionlogs | /var/folders/*.xcdistributionlogs)
+        [ ! -d "$distribution_logs" ] || rm -rf -- "${distribution_logs:?}" ;;
+esac
 if ! cmp -s "$out/keychain-before.txt" "$out/keychain-after.txt"; then
     kr_store_say "the login keychain's identities or the search list changed during the export (see $out/keychain-*.txt); stopping"
     exit 2
@@ -189,8 +192,11 @@ ipa="$(find "$out/export" -maxdepth 1 -name '*.ipa' | head -1)"
 kr_store_say "checking the exported build"
 node "$companion/scripts/store-bundle.mjs" --ios "$ipa" --stage export "${common[@]}" "${notes[@]}" \
     --record "$out/store-build.json" 2>&1 | tee "$out/check.log"
-[ "${PIPESTATUS[0]}" = 0 ] || { kr_store_say "the exported build does not hold; no build number was recorded as built (the record is $out/store-build.json)"; exit 2; }
+checked=${PIPESTATUS[0]}
+node "$companion/scripts/store-bundle.mjs" --scan-dir "$out" --secret-file "$key_file" 2>&1 | tee -a "$out/check.log"
+scanned=${PIPESTATUS[0]}
+[ "$checked" = 0 ] && [ "$scanned" = 0 ] || { kr_store_say "the exported build does not hold; no build number was recorded as built, and $out/store-build.json is not to be uploaded"; exit 2; }
 
-kr_store_receipt ios "$number"
+kr_store_receipt ios "$number" || { kr_store_say "the build number could not be recorded"; exit 2; }
 kr_store_say "built and checked: $ipa"
 kr_store_say "sha256 $(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).sha256)' "$out/store-build.json")"
