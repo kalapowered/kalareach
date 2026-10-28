@@ -487,6 +487,58 @@ impl Held {
             .is_some_and(|default| same_value(value, default))
     }
 
+    /// The value the key held when this was read, or `None` where it was not set.
+    fn was(&self, key: &str) -> Option<&str> {
+        self.value(key).filter(|value| !self.is_unset(key, value))
+    }
+
+    /// Puts one key back to what it held when this was read, and says whether it is back, read by
+    /// another process. `kr_state` is what kr left in the key: a value it wrote, or `None` for a
+    /// reset. A key that holds neither that nor what it held before is another writer's, changed
+    /// since kr wrote it: it is left, and nothing of kr's is in it, so it counts as back. A key
+    /// that cannot be read is not written, and does not count as back.
+    fn restore(
+        &self,
+        gsettings: &Gsettings,
+        target: &str,
+        key: &str,
+        kr_state: Option<&str>,
+    ) -> bool {
+        let Ok(now) = gsettings.get(target, key) else {
+            return false;
+        };
+        let was = self.was(key);
+        let kept = match kr_state {
+            Some(wrote) => same_value(&now, wrote),
+            None => self.is_unset(key, &now),
+        };
+        let already = match was {
+            Some(was) => same_value(&now, was),
+            None => self.is_unset(key, &now),
+        };
+        if already {
+            return true;
+        }
+        if !kept {
+            return true;
+        }
+        match was {
+            Some(was) => {
+                gsettings.set(target, key, was).is_ok()
+                    && gsettings
+                        .get(target, key)
+                        .is_ok_and(|read| same_value(&read, was))
+            }
+            None => {
+                gsettings.reset(target, key).is_ok()
+                    && gsettings.get(target, key).is_ok_and(|read| {
+                        self.default(key)
+                            .is_some_and(|default| same_value(&read, default))
+                    })
+            }
+        }
+    }
+
     /// Whether `value` is one kr may write over or take out: the key is not set, or it holds one of
     /// `known`, or `also`.
     fn is_kr_s(&self, key: &str, value: &str, known: &[RecordedKey], also: Option<&str>) -> bool {
@@ -538,41 +590,12 @@ pub(super) fn write(plan: &SettingsPlan) -> Result<(), (ProfileError, bool)> {
             return Err((changed(), false));
         }
     }
-    // Puts back the keys written so far, and says whether each is back, read by another process. A
-    // key that holds neither what kr wrote nor what it held before is the person's, changed since
-    // kr wrote it: it is left, and nothing of kr's is in it. A key that cannot be put back does not
-    // stop the others.
+    // Puts back the keys written so far, and says whether each is back (see `Held::restore`). A key
+    // that cannot be put back does not stop the others.
     let undo = |written: &[RecordedKey]| {
         let mut all_back = true;
         for key in written {
-            let value = held
-                .value(&key.key)
-                .filter(|value| !held.is_unset(&key.key, value));
-            let now = gsettings.get(&target, &key.key);
-            let ours = match (&now, value) {
-                (Ok(now), Some(value)) => same_value(now, &key.value) || same_value(now, value),
-                (Ok(now), None) => same_value(now, &key.value) || held.is_unset(&key.key, now),
-                (Err(_), _) => true,
-            };
-            if !ours {
-                continue;
-            }
-            let back = match value {
-                Some(value) => {
-                    gsettings.set(&target, &key.key, value).is_ok()
-                        && gsettings
-                            .get(&target, &key.key)
-                            .is_ok_and(|read| same_value(&read, value))
-                }
-                None => {
-                    gsettings.reset(&target, &key.key).is_ok()
-                        && gsettings.get(&target, &key.key).is_ok_and(|read| {
-                            held.default(&key.key)
-                                .is_some_and(|default| same_value(&read, default))
-                        })
-                }
-            };
-            all_back &= back;
+            all_back &= held.restore(gsettings, &target, &key.key, Some(&key.value));
         }
         all_back
     };
@@ -596,9 +619,24 @@ pub(super) fn write(plan: &SettingsPlan) -> Result<(), (ProfileError, bool)> {
     // Read back by a process of its own: a backend that keeps a write only in the process that
     // made it (a session with no settings service) shows nothing here.
     for key in &plan.wrote.keys {
-        let kept = gsettings
-            .get(&target, &key.key)
-            .is_ok_and(|read| same_value(&read, &key.value));
+        let kept = match gsettings.get(&target, &key.key) {
+            Ok(read) if same_value(&read, &key.value) => true,
+            // The key reads as it did before the write: the write was not kept. Anything else was
+            // put there by another writer since.
+            Ok(read) => {
+                let unkept = match held.was(&key.key) {
+                    Some(was) => same_value(&read, was),
+                    None => held.is_unset(&key.key, &read),
+                };
+                let error = if unkept {
+                    ProfileError::NotPersisted(spec.terminal)
+                } else {
+                    changed()
+                };
+                return Err((error, !undo(&written)));
+            }
+            Err(_) => false,
+        };
         if !kept {
             return Err((ProfileError::NotPersisted(spec.terminal), !undo(&written)));
         }
@@ -782,7 +820,8 @@ pub(super) enum TakenOut {
 /// Takes an unchanged profile out: its identifier leaves the shared list and its keys are reset.
 /// Every key is read before the first write and again just before it is reset. One that holds a
 /// value the person put there stops the removal: the keys already reset and the place in the list
-/// are put back, and the profile is left as it was. Each reset is read back by another process: a
+/// (if the profile was in it) are put back, and the profile is left as it was. `in_list` says
+/// whether it was. Each reset is read back by another process: a
 /// key that still holds its value is a failure.
 ///
 /// # Errors
@@ -793,6 +832,7 @@ pub(super) fn take_out(
     gsettings: &Gsettings,
     spec: Spec,
     wrote: &SettingsWrote,
+    in_list: bool,
 ) -> Result<TakenOut, ProfileError> {
     let target = format!("{}:{}", wrote.schema, wrote.path);
     let known = known_values(wrote);
@@ -819,14 +859,11 @@ pub(super) fn take_out(
             // when it is back is it left, with nothing recorded.
             let mut back = true;
             for earlier in &reset {
-                if let Some(value) = held.value(&earlier.key) {
-                    back &= gsettings.set(&target, &earlier.key, value).is_ok()
-                        && gsettings
-                            .get(&target, &earlier.key)
-                            .is_ok_and(|read| same_value(&read, value));
-                }
+                back &= held.restore(gsettings, &target, &earlier.key, None);
             }
-            back &= change_list(gsettings, &spec, &wrote.list.member, true).is_ok();
+            if in_list {
+                back &= change_list(gsettings, &spec, &wrote.list.member, true).is_ok();
+            }
             return if back {
                 Ok(TakenOut::Changed)
             } else {
@@ -899,6 +936,48 @@ mod tests {
         assert_eq!(parse_strings("'x'"), None);
         let strings = vec!["a".to_owned(), "it's".to_owned()];
         assert_eq!(parse_strings(&variant_strings(&strings)), Some(strings));
+    }
+
+    /// KR-REQ-01.21: a key that cannot be read is not written back, because whether it holds kr's
+    /// value is not known: `gsettings` is run, and no `set` or `reset` reaches it.
+    #[cfg(unix)]
+    #[test]
+    fn a_key_that_cannot_be_read_is_not_written_back() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = std::env::temp_dir().join(format!("kr-gsettings-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("a directory");
+        let program = directory.join("gsettings");
+        let log = directory.join("calls");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\necho \"$1\" >> '{}'\n[ \"$1\" = get ] && exit 1\nexit 0\n",
+                log.display()
+            ),
+        )
+        .expect("a program");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("executable");
+        let gsettings = Gsettings {
+            program,
+            environment: Vec::new(),
+        };
+        let held = Held {
+            values: vec![("custom-command".to_owned(), "'/bin/kr'".to_owned())],
+            defaults: vec![("custom-command".to_owned(), "''".to_owned())],
+        };
+        assert!(!held.restore(
+            &gsettings,
+            "schema:/path/",
+            "custom-command",
+            Some("'/bin/x'")
+        ));
+        let calls = std::fs::read_to_string(&log).expect("the calls");
+        assert!(
+            calls.lines().all(|call| call == "get"),
+            "only reads reached it: {calls}"
+        );
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     /// Two readings of one string are one value whatever quotes they are printed in.
