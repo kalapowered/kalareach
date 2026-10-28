@@ -23,7 +23,7 @@
 	<key>FirebaseMessagingAutoInitEnabled</key>
 	<false/>
 	<key>ITSAppUsesNonExemptEncryption</key>
-	<true/>
+	<false/>
 	<key>KRPrivateKeychainGroup</key>
 	<string>$(AppIdentifierPrefix)to.kala.reach</string>
 	<key>KRSharedKeychainGroup</key>

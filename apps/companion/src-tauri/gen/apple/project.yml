@@ -241,9 +241,10 @@ targets:
         # library, and makes no registration token until the person has agreed to notifications.
         FirebaseAppDelegateProxyEnabled: false
         FirebaseMessagingAutoInitEnabled: false
-        # Export compliance: the application uses encryption, and only standard algorithms. App Store
-        # Connect reads this key from the application's Info.plist and then asks which kind.
-        ITSAppUsesNonExemptEncryption: true
+        # Export compliance: the key says whether the application needs export documentation. It uses
+        # only standard algorithms, and the one document those need is the French declaration, which
+        # matters only for the App Store in France, where the application is not offered.
+        ITSAppUsesNonExemptEncryption: false
         UIBackgroundModes:
           - remote-notification
           # An explicitly started voice call keeps running when the screen locks. Section 15

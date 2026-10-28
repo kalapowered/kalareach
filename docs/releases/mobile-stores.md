@@ -134,8 +134,8 @@ and a log bundle in the temporary directory, and the script removes both.
 - each bundle has an App Store profile of the team with no device list, and the application's
   profile carries the production push environment;
 - the application and the extension have the same `CFBundleVersion` and `CFBundleShortVersionString`;
-- the application carries `GoogleService-Info.plist` and says it uses encryption
-  (`ITSAppUsesNonExemptEncryption` set to true);
+- the application carries `GoogleService-Info.plist` and says it needs no export documentation
+  (`ITSAppUsesNonExemptEncryption` set to false);
 - `privacy-manifest.mjs` and `debug-code.mjs` hold the exported application. The device build is the
   one that is uploaded, and it can link code the Simulator build leaves out, which is why these
   two run on it and not on the Simulator's. The privacy check carries one recorded exception, the
@@ -146,11 +146,21 @@ and a log bundle in the temporary directory, and the script removes both.
 
 ## Export compliance
 
-The owner's answer is that the application uses encryption, and only standard algorithms. The
-application's `Info.plist` therefore carries `ITSAppUsesNonExemptEncryption` set to true, in
-`project.yml` and in the generated file, and the checker refuses a build without it. App Store
-Connect then asks about the kind of encryption on the first build, and the answer is "standard
-encryption algorithms", with France not selected. Later builds use the same declaration.
+`ITSAppUsesNonExemptEncryption` answers whether the application needs export documentation. Apple's
+documentation sets it to NO for an application that uses no encryption or only forms that are
+exempt from that documentation. YES needs a code that Apple issues after it has reviewed a
+document, and the code goes in `ITSEncryptionExportComplianceCode`.
+
+The application ships industry standard algorithms that the operating system does not provide.
+For those, App Store Connect's table of required documentation names one document, the French
+encryption declaration, and only for distribution on the App Store in France. France is not
+selected, so the key is false in `project.yml` and in the generated `Info.plist`, and the plist has
+no `ITSEncryptionExportComplianceCode`. The checker refuses a build whose key is anything else.
+With the key false, App Store Connect asks no encryption question about the build. A build that
+says YES without a code is refused at upload for an invalid export compliance code.
+
+Before France is selected for the application, the French declaration has to be uploaded, and the
+key is checked again against the same two pages.
 
 ## What a person does
 
@@ -158,6 +168,6 @@ The scripts stop at a checked file. A build that failed a check, or whose output
 secret, leaves its files and a `store-build.json` whose `holds` is false, and no receipt: it is not
 uploaded. A run that stops before its check leaves no record, and no receipt either. Uploading is
 separate: the first Android bundle through Play Console, and the iOS build with
-`xcrun altool --upload-app` and the same API key. The store forms, the testers' lists and the
-export-compliance answer to App Store Connect are entered in the stores' own consoles. The
-app-signing fingerprint goes into the web service's configuration, as above.
+`xcrun altool --upload-app` and the same API key. The store forms and the testers' lists are
+entered in the stores' own consoles. The app-signing fingerprint goes into the web service's
+configuration, as above.
