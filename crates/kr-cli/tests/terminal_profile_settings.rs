@@ -1345,8 +1345,9 @@ fn a_removal_that_stops_leaves_every_key_the_person_changed() {
 /// set after kr read the profile makes it theirs: an install again and a removal both stop with
 /// nothing written (or what a removal changed put back), the person's key stays, and the profile
 /// stays in the list. Read 2 is the plan's last; read 4 is the write's or the removal's own first
-/// (keys, then defaults); the second look comes after the list is written in a removal, and just
-/// before the first key is set in an install.
+/// (keys, then defaults); read 6 is the second look, which comes just before the first key is set in
+/// an install and after the list is written in a removal, and the last look comes after the keys
+/// are written or reset.
 #[test]
 fn a_key_kr_does_not_write_that_the_person_set_stops_an_install_and_a_removal() {
     for_each_application(|person| {
@@ -1358,7 +1359,7 @@ fn a_key_kr_does_not_write_that_the_person_set_stops_an_install_and_a_removal() 
         let value = person.application.other_value;
         let command_before = person.get(&target, "custom-command");
         let name = person.get(&target, person.application.name_key);
-        for after in [2, 4] {
+        for after in [2, 4, 6] {
             let mut again = person.command();
             again.push(format!("round {after}"));
             let changing = through_a_person_who_sets(person, &uuid, after, other, value);
@@ -1378,7 +1379,7 @@ fn a_key_kr_does_not_write_that_the_person_set_stops_an_install_and_a_removal() 
         }
         assert_eq!(person.remove(&places).expect("removes"), Removed::Removed);
         let list_before = person.list();
-        for after in [2, 4] {
+        for after in [2, 4, 6] {
             person.install(&places).expect("installs");
             let uuid = person.recorded_uuid().expect("recorded");
             let target = target_of(person, &uuid);
