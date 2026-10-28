@@ -18,7 +18,8 @@ pub(super) enum Presence {
     Missing,
     /// A regular file with this SHA-256.
     File(String),
-    /// A regular file that could not be read, for this reason: what it holds is not known.
+    /// Something that could not be looked at or read (a folder that cannot be searched, a file that
+    /// cannot be read), for this reason: what is there is not known.
     Unreadable(std::io::ErrorKind),
     /// Something else: a directory, a link.
     Other,
@@ -28,7 +29,7 @@ pub(super) enum Presence {
 pub(super) fn presence(path: &Path) -> Presence {
     match path.symlink_metadata() {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Presence::Missing,
-        Err(_) => Presence::Other,
+        Err(error) => Presence::Unreadable(error.kind()),
         Ok(data) if data.is_file() => std::fs::read(path).map_or_else(
             |error| Presence::Unreadable(error.kind()),
             |bytes| Presence::File(sha256_hex(&bytes)),

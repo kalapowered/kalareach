@@ -565,6 +565,46 @@ fn a_profile_that_is_the_default_is_left_and_kept_in_the_record() {
     }
 }
 
+/// KR-REQ-01.21: a profile that cannot be looked at (the folder it is in cannot be searched) is not
+/// a profile that changed: a removal fails and the record keeps it, and once it can be looked at
+/// the removal takes it out.
+#[cfg(unix)]
+#[test]
+fn a_profile_that_cannot_be_looked_at_is_neither_changed_nor_forgotten() {
+    use std::os::unix::fs::PermissionsExt as _;
+    for application in applications() {
+        let person = Person::with(&application);
+        (application.seed)(&person);
+        person
+            .install(application.terminal, &command_in(person.tree.root()))
+            .expect("installs");
+        let file = (application.profile)(&person);
+        let folder = file.parent().expect("a folder").to_path_buf();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o000))
+            .expect("a folder nobody can search");
+        let refused = person.remove(application.terminal);
+        let recorded = person.record().profiles().expect("reads").len();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755))
+            .expect("the folder can be searched again");
+        assert!(
+            matches!(refused, Err(ProfileError::Io { .. })),
+            "{:?}: {refused:?}",
+            application.terminal
+        );
+        assert_eq!(
+            recorded, 1,
+            "{:?}: the record keeps it",
+            application.terminal
+        );
+        assert!(file.is_file());
+        assert_eq!(
+            person.remove(application.terminal).expect("removes"),
+            Removed::Removed
+        );
+        assert!(!file.exists());
+    }
+}
+
 /// KR-REQ-01.21: Windows Terminal's settings name the default profile by the identifier its
 /// settings page writes, in a file with comments and trailing commas. Such a default is left on
 /// removal. Settings that do not read stop the removal, with the profile left and the record kept:
