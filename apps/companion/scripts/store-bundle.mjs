@@ -28,6 +28,8 @@
 //   node scripts/store-bundle.mjs --android <app.aab> --version-code <n> --version-name <v>
 //        --certificate <upload-certificate.pem> [--abis arm64-v8a,x86_64] [--secret-file <path> ...]
 //        [--firebase <google-services.json>] [--record <store-build.json>] [--note key=value ...]
+//   node scripts/store-bundle.mjs --scan-dir <directory> --secret-file <path> [--secret-file <path> ...]
+//        (how many files under the directory hold a secret's text; bundles are read by the checks above)
 //   node scripts/store-bundle.mjs --ios <app.ipa | KalaReach.app> --stage archive|export
 //        --version-code <n> --version-name <v> [--skip-app-checks] [--secret-file <path> ...] [--record <file>]
 //   `--skip-app-checks` leaves out the privacy-manifest and debug-code checks, which a caller runs on its own.
@@ -50,6 +52,7 @@ import {
   problemsInBundle,
   problemsInPackage
 } from './identifiers.mjs'
+import { problemsOfFit } from './sign-ios.mjs'
 
 const SCRIPTS = import.meta.dirname
 
@@ -59,8 +62,9 @@ export const ANDROID_TARGET_SDK = '36'
 
 /**
  * Every permission the release manifest ends up with once the libraries' own are merged in, in
- * the order they sort. A permission nobody here asked for is a library that started to want one,
- * and the store shows it to the person who installs the application.
+ * the order they sort: the application's own and the ones its libraries add. A permission that is
+ * not listed is a library that started to want one, and the store shows it to the person who
+ * installs the application; a listed one that is gone is a change worth a look.
  */
 export const ANDROID_PERMISSIONS = [
   'android.permission.ACCESS_NETWORK_STATE',
@@ -129,10 +133,19 @@ export function problemsInAndroidManifest(facts, want) {
   const found = [...new Set(permissions)].sort()
   const wanted = [...ANDROID_PERMISSIONS].sort()
   for (const each of found.filter((name) => !wanted.includes(name))) {
-    problems.push(`the manifest asks for ${each}, which the application does not declare`)
+    problems.push(`the manifest asks for ${each}, which this check does not list`)
   }
   for (const each of wanted.filter((name) => !found.includes(name))) {
-    problems.push(`the manifest does not ask for ${each}, which the application declares`)
+    problems.push(`the manifest does not ask for ${each}, which this check lists`)
+  }
+  // The sign-in's answer returns through this verified link; without the filter it opens a browser.
+  const declares = (element, name, value) => facts.values.some(([e, k, v]) => e === element && k === name && v === value)
+  if (
+    !declares('data', 'host', 'reach.kala.to') ||
+    !declares('data', 'path', '/app/oauth/callback') ||
+    !declares('intent-filter', 'autoVerify', 'true')
+  ) {
+    problems.push('the manifest does not declare the verified sign-in link https://reach.kala.to/app/oauth/callback')
   }
   return problems
 }
@@ -190,13 +203,14 @@ export function problemsInAndroidLibraries(members, read, abis) {
 // -- secrets ---------------------------------------------------------------------------------
 
 /**
- * The strings that stand for a secret file: its whole content, trimmed, and each of its long
- * lines, so a key block pasted anywhere is found by any 32 characters of it.
+ * The strings that stand for a secret file: its whole content, trimmed, and each of its lines of 32
+ * characters or more, so a key block pasted in pieces is found by any whole line of it. A secret
+ * shorter than 8 characters is refused: it would match anything.
  */
 export function secretNeedles(content) {
   const text = content.toString('utf8').trim()
-  const needles = new Set()
-  if (text.length >= 8) needles.add(text)
+  if (text.length < 8) throw new Error('a secret file holds fewer than 8 characters, too few to search for')
+  const needles = new Set([text])
   for (const line of text.split(/\r?\n/)) {
     const trimmed = line.trim()
     if (trimmed.length >= 32 && !trimmed.startsWith('-----')) needles.add(trimmed)
@@ -234,6 +248,11 @@ export function problemsInSignature(path, certificatePem) {
     problems.push(`jarsigner does not verify the bundle: ${(verified.stdout + verified.stderr).trim().split('\n')[0]}`)
     return { problems, signer: null }
   }
+  // `jarsigner -verify` answers "jar verified" for an archive that also holds entries nobody
+  // signed, and says so only in a warning.
+  if (/unsigned entries/.test(verified.stdout + verified.stderr)) {
+    problems.push('the bundle holds entries that are not signed')
+  }
   const printed = run('keytool', ['-printcert', '-jarfile', path])
   const signers = [...printed.stdout.matchAll(/SHA256:\s*([0-9A-F:]{95})/g)].map((each) => each[1])
   if (printed.status !== 0 || signers.length === 0) {
@@ -246,6 +265,11 @@ export function problemsInSignature(path, certificatePem) {
   return { problems, signer: signers[0] }
 }
 
+/** What is wrong with the bundle's configuration as `bundletool dump config` prints it. */
+export function problemsInBundleConfig(text) {
+  return /PAGE_ALIGNMENT_16K/.test(text) ? [] : ['the bundle configuration does not ask for 16 KB page alignment']
+}
+
 /** The bundle tool's own validation, and whether it laid the libraries out for 16 KB pages. */
 export function problemsInBundletool(path, bundletool) {
   const problems = []
@@ -255,7 +279,7 @@ export function problemsInBundletool(path, bundletool) {
   }
   const config = run(bundletool, ['dump', 'config', `--bundle=${path}`])
   if (config.status !== 0) problems.push('bundletool could not print the bundle configuration')
-  else if (!/PAGE_ALIGNMENT_16K/.test(config.stdout)) problems.push('the bundle configuration does not ask for 16 KB page alignment')
+  else problems.push(...problemsInBundleConfig(config.stdout))
   return problems
 }
 
@@ -280,6 +304,23 @@ export function problemsInFirebase(resources, configuration, identifier) {
   }
   const missing = wanted.filter((each) => !resources.includes(Buffer.from(each, 'utf8')))
   return missing.length === 0 ? [] : ['the bundle does not carry the Firebase configuration of the application']
+}
+
+/**
+ * A bundle that holds a secret is reported by that fact alone: every other problem quotes values
+ * out of the bundle (a version name, a manifest value), and a quoted value could be the secret.
+ */
+export function suppressedIfSecret(result) {
+  if (!(result.facts.secretsFound > 0)) return result
+  const found = result.facts.secretsFound
+  return { problems: [`a secret file's text is in ${found} place${found === 1 ? '' : 's'} of the bundle; nothing else is reported`], facts: { secretsFound: found } }
+}
+
+/** How many files under a directory hold any secret, bundles aside (they are read member by member). */
+export function secretsUnder(directory, needles) {
+  const skipped = /\.(aab|ipa|apks|apk)$/
+  const files = filesUnder(directory).filter((file) => !skipped.test(file))
+  return placesWithSecret(files.map((file) => readFileSync(file)), needles)
 }
 
 export function checkAndroid(options) {
@@ -322,7 +363,7 @@ export function checkAndroid(options) {
     facts.bundletool = bundletoolVersion(options.bundletool)
   }
   problems.push(...problemsInPackage(options.path))
-  return { problems, facts }
+  return suppressedIfSecret({ problems, facts })
 }
 
 // -- iOS -------------------------------------------------------------------------------------
@@ -380,10 +421,28 @@ export function profileFromXml(xml) {
     ProvisionedDevices: take('ProvisionedDevices', 'json'),
     ProvisionsAllDevices: take('ProvisionsAllDevices', 'raw') === 'true' ? true : undefined
   }
+  // The certificates a profile lets sign for it, each as the SHA-1 of its DER form.
+  profile.CertificateSha1s = []
+  for (let at = 0; ; at += 1) {
+    const one = spawnSync('plutil', ['-extract', `DeveloperCertificates.${at}`, 'raw', '-o', '-', '-'], { input: xml, encoding: 'utf8' })
+    if (one.error || one.status !== 0) break
+    profile.CertificateSha1s.push(createHash('sha1').update(Buffer.from(one.stdout.trim(), 'base64')).digest('hex').toUpperCase())
+  }
   if (profile.Entitlements === undefined || profile.TeamIdentifier === undefined) {
     throw new Error('a provisioning profile has no entitlements or no team')
   }
   return profile
+}
+
+/** What is wrong with the signature an exported bundle carries, given its profile. */
+export function problemsInExportSignature({ described, leafSha1, profile, entitlements, team }) {
+  const problems = []
+  if (/Signature=adhoc/.test(described)) problems.push('is signed ad hoc, not with a distribution certificate')
+  if (!/Authority=Apple Distribution: /.test(described)) problems.push('is not signed with an Apple Distribution certificate')
+  if (!new RegExp(`TeamIdentifier=${team}$`, 'm').test(described)) problems.push(`is not signed under the team ${team}`)
+  if (!(profile.CertificateSha1s ?? []).includes(leafSha1)) problems.push('is signed with a certificate its profile does not list')
+  problems.push(...problemsOfFit(entitlements, { entitlements: profile.Entitlements }))
+  return problems
 }
 
 function readProfile(path) {
@@ -479,6 +538,26 @@ export function checkIos(options) {
           continue
         }
         const profile = readProfile(profilePath)
+        const described = run('codesign', ['-dvv', bundle.path])
+        const certificates = mkdtempSync(join(tmpdir(), 'kr-store-cert-'))
+        let leafSha1 = ''
+        try {
+          run('codesign', ['-d', `--extract-certificates=${join(certificates, 'cert')}`, bundle.path])
+          leafSha1 = createHash('sha1').update(readFileSync(join(certificates, 'cert0'))).digest('hex').toUpperCase()
+        } catch {
+          // No certificate to read is an ad hoc signature, which the description names.
+        } finally {
+          rmSync(certificates, { recursive: true, force: true })
+        }
+        for (const each of problemsInExportSignature({
+          described: described.stderr,
+          leafSha1,
+          profile,
+          entitlements,
+          team: want.team
+        })) {
+          problems.push(`${bundle.name} ${each}`)
+        }
         for (const each of problemsInProfile(profile, { team: want.team, identifier: info.CFBundleIdentifier, push: index === 0 })) {
           problems.push(`${bundle.name}'s profile: ${each}`)
         }
@@ -502,7 +581,7 @@ export function checkIos(options) {
   } finally {
     if (unpacked) rmSync(unpacked.root, { recursive: true, force: true })
   }
-  return { problems, facts }
+  return suppressedIfSecret({ problems, facts })
 }
 
 // -- the command ----------------------------------------------------------------------------
@@ -533,6 +612,9 @@ function parse(argv) {
     } else if (VALUE_FLAGS[flag]) {
       options[VALUE_FLAGS[flag]] = take(index)
       index += 1
+    } else if (flag === '--scan-dir') {
+      options.scanDir = take(index)
+      index += 1
     } else if (flag === '--skip-app-checks') {
       options.skipAppChecks = true
     } else if (flag === '--abis') {
@@ -548,6 +630,10 @@ function parse(argv) {
     } else {
       throw new Error(`unknown option ${flag}`)
     }
+  }
+  if (options.scanDir) {
+    if (options.secretFiles.length === 0) throw new Error('--scan-dir needs a --secret-file')
+    return options
   }
   if (!options.platform) throw new Error('give --android <bundle> or --ios <ipa or app>')
   if (!/^[0-9]+$/.test(options.versionCode ?? '')) throw new Error('--version-code must be a whole number')
@@ -565,6 +651,21 @@ if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) 
   } catch (failure) {
     console.error(failure.message)
     process.exit(2)
+  }
+  if (options.scanDir) {
+    let places
+    try {
+      places = secretsUnder(options.scanDir, needlesOf(options.secretFiles))
+    } catch (failure) {
+      console.error(`could not scan ${options.scanDir}: ${failure.message}`)
+      process.exit(2)
+    }
+    if (places > 0) {
+      console.error(`a secret file's text is in ${places} file${places === 1 ? '' : 's'} under ${options.scanDir}`)
+      process.exit(1)
+    }
+    console.log(`no secret file's text is in the files under ${options.scanDir}`)
+    process.exit(0)
   }
   let result
   try {

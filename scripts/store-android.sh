@@ -79,8 +79,12 @@ kr_store_require_file "$password_file" "the upload keystore's password file" || 
 # ---- The emulator leg --------------------------------------------------------------------------
 
 if [ "$mode" = device ]; then
+    # The one emulator this task may use, whatever the environment names.
+    export KR_ANDROID_AVD=KalaReach_API_36_Play
     record="$device_dir/store-build.json"
     [ -f "$record" ] || { kr_store_say "no store-build.json in $device_dir"; exit 2; }
+    [ "$(node -e 'process.stdout.write(String(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).holds))' "$record")" = true ] \
+        || { kr_store_say "the record in $device_dir says the bundle does not hold; it is not run"; exit 2; }
     version_code="$(node -e 'process.stdout.write(String(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).versionCode))' "$record")"
     bundle="$device_dir/$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).file)' "$record")"
     [ -f "$bundle" ] || { kr_store_say "no bundle at $bundle"; exit 2; }
@@ -99,6 +103,7 @@ if [ "$mode" = device ]; then
         say "$avd"
         exit 3
     fi
+    [ "$avd" = KalaReach_API_36_Play ] || { say "the emulator is $avd, not KalaReach_API_36_Play"; exit 3; }
 
     # The universal package: one installable file made from the bundle, signed with the same key.
     say "making the universal package from the bundle"
@@ -128,7 +133,8 @@ if [ "$mode" = device ]; then
     serial="emulator-$serial_port"
     emulator_pid=""
     finish() {
-        if [ -n "$emulator_pid" ] && kill -0 "$emulator_pid" 2>/dev/null; then
+        [ -n "$emulator_pid" ] || return 0
+        if kill -0 "$emulator_pid" 2>/dev/null; then
             "$adb" -s "$serial" uninstall "$app_id" >/dev/null 2>&1
             "$adb" -s "$serial" emu kill >/dev/null 2>&1
             local stopped=0
@@ -136,8 +142,20 @@ if [ "$mode" = device ]; then
                 sleep 1
                 stopped=$((stopped + 1))
             done
-            kill -0 "$emulator_pid" 2>/dev/null && kill "$emulator_pid" 2>/dev/null
+            if kill -0 "$emulator_pid" 2>/dev/null; then
+                kill "$emulator_pid" 2>/dev/null
+                stopped=0
+                while kill -0 "$emulator_pid" 2>/dev/null && [ "$stopped" -lt 30 ]; do
+                    sleep 1
+                    stopped=$((stopped + 1))
+                done
+            fi
+            if kill -0 "$emulator_pid" 2>/dev/null; then
+                say "the emulator (pid $emulator_pid) did not stop"
+                return 1
+            fi
         fi
+        emulator_pid=""
     }
     trap finish EXIT
     if "$adb" devices 2>/dev/null | awk '{print $1}' | grep -qx "$serial"; then
@@ -166,14 +184,16 @@ if [ "$mode" = device ]; then
     # says whether the activity came up, and the process is then looked for until it appears.
     started="$("$adb" -s "$serial" shell am start -W -n "$app_id/.MainActivity" 2>&1 | tr -d '\r')"
     printf '%s\n' "$started" >"$leg/am-start.txt"
+    # The application is up when it is the activity on top and has a process.
     pid=""
-    for _ in $(seq 1 30); do
+    for _ in $(seq 1 60); do
         pid="$("$adb" -s "$serial" shell pidof "$app_id" 2>/dev/null | tr -d '\r')"
-        [ -n "$pid" ] && break
+        if [ -n "$pid" ] && "$adb" -s "$serial" shell dumpsys activity activities 2>/dev/null | grep -E 'topResumedActivity|ResumedActivity' | grep -q "$app_id"; then
+            break
+        fi
+        pid=""
         sleep 1
     done
-    sleep 10
-    pid="$("$adb" -s "$serial" shell pidof "$app_id" 2>/dev/null | tr -d '\r')"
     "$adb" -s "$serial" exec-out screencap -p >"$shots/store-launch-$version_code.png" 2>/dev/null
     "$adb" -s "$serial" logcat -d -b crash >"$leg/crash.log" 2>&1
     "$adb" -s "$serial" logcat -d 2>/dev/null | grep -v -E 'CompositionEngine|AccessibilityNodeInfoDumper' | tail -3000 >"$leg/logcat.log"
@@ -198,8 +218,7 @@ if [ "$mode" = device ]; then
         status=2
     fi
     say "app links as the platform reports them: $(tr -s ' ' <"$leg/app-links.txt" | grep -E 'reach.kala.to|Domain verification state' | head -3 | tr '\n' ';')"
-    finish
-    emulator_pid=""
+    finish || { say "the first emulator is still running; the TLS check is not started"; exit 3; }
     trap - EXIT
 
     # The release TLS check on exactly this package, in the same device session. It starts its own
@@ -213,6 +232,11 @@ if [ "$mode" = device ]; then
     grep -E '^== \[release-tls\]' "$leg/e2e-release.log" | tee -a "$log"
     if [ "$e2e" = 0 ]; then say "check=the release TLS check passed on the store-signed package ok=1"
     else say "check=the release TLS check passed on the store-signed package ok=0 detail=exit $e2e"; status=2; fi
+    if node "$companion/scripts/store-bundle.mjs" --scan-dir "$device_dir" --secret-file "$password_file" 2>&1 | tee -a "$log"; then
+        :
+    else
+        status=2
+    fi
     exit "$status"
 fi
 
@@ -228,8 +252,7 @@ ndk="$sdk/ndk/$ndk_version"
 version="$(kr_store_version "$here")" || exit 2
 number="$(kr_store_number android "$number_given")" || exit 2
 out="$KR_STORE_ROOT/$version-$number"
-[ ! -e "$out" ] || { kr_store_say "$out exists already"; exit 2; }
-mkdir -p "$out"
+kr_store_claim "$out" || exit 2
 kr_store_say "version $version, build number $number, into $out"
 
 # The shell's own NDK may be an older one: a release linked by it would not be laid out for 16 KB
@@ -268,8 +291,10 @@ node "$companion/scripts/store-bundle.mjs" --android "$signed" --version-code "$
     2>&1 | tee "$out/check.log"
 checked=${PIPESTATUS[0]}
 rm -f -- "${marker:?}"
-[ "$checked" = 0 ] || { kr_store_say "the bundle does not hold; nothing was recorded as built"; exit 2; }
+node "$companion/scripts/store-bundle.mjs" --scan-dir "$out" --secret-file "$password_file" 2>&1 | tee -a "$out/check.log"
+scanned=${PIPESTATUS[0]}
+[ "$checked" = 0 ] && [ "$scanned" = 0 ] || { kr_store_say "the bundle does not hold; no build number was recorded as built, and $out/store-build.json is not to be uploaded"; exit 2; }
 
-kr_store_receipt android "$number"
+kr_store_receipt android "$number" || { kr_store_say "the build number could not be recorded"; exit 2; }
 kr_store_say "built and checked: $signed"
 kr_store_say "sha256 $(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).sha256)' "$out/store-build.json")"
