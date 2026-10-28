@@ -17,9 +17,10 @@ name: release-tree
 # On macOS the tree is signed ad hoc before its manifest is written, since a signature changes the
 # bytes a manifest covers, and each file is held to it. The plugin host, which runs Wasmtime, is
 # signed with the hardened runtime and the one entitlement a Developer ID release gives it, and the
-# `entitlement` step shows both halves on each macOS target: without the entitlement a program that
-# makes code at run time is ended, and with it the same program runs. An ad hoc signature has no
-# team, so the other programs carry no hardened runtime, which a Developer ID signature does.
+# "Show what the plugin host's entitlement is for" step shows both halves on each macOS target:
+# without the entitlement a program that makes code at run time is ended, and with it the same
+# program runs. An ad hoc signature has no team, so the other programs carry no hardened runtime,
+# which a Developer ID signature does.
 #
 # Each run keeps the tree of each target as it was before this run's signature was put on it, for
 # three days. A release is made from those trees by the steps that follow, none of which is in this
@@ -29,12 +30,6 @@ name: release-tree
 # produces.
 on:
   workflow_dispatch:
-    inputs:
-      ref:
-        description: The commit, branch or tag to build. Defaults to the ref this run was started from.
-        required: false
-        default: ''
-        type: string
 
 permissions:
   contents: read
@@ -55,10 +50,10 @@ defaults:
     shell: bash
 
 jobs:
-  # Settles which commit this run is about, once. Every job after it checks that commit out by its
-  # identifier and not by the ref, so a branch that moves while the trees build, or while the signing
-  # waits for approval, cannot change what is built or signed, and the person approving sees the
-  # commit in the run's summary.
+  # Settles which commit this run is about, once: the commit the run was started on. Every job after
+  # it checks that commit out by its identifier and not by the ref, so a branch that moves while the
+  # trees build cannot change what is built. A release is made only from the trees of a run started on
+  # `main`, and no input can make a run build another commit than the one it records.
   source:
     name: the commit of this run
     runs-on: ubuntu-24.04
@@ -71,7 +66,7 @@ jobs:
       - name: Check out
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          ref: ${{ github.sha }}
 
       - name: Settle which commit this run is about
         id: settle
@@ -213,7 +208,8 @@ jobs:
       # `com.apple.security.cs.allow-unsigned-executable-memory`. The test executable that compiles
       # and calls a component's exports is signed three ways on this target's own processor: without the
       # runtime it succeeds, with the runtime and no entitlement it is ended, and with the runtime
-      # and the plugin host's one entitlement it succeeds.
+      # and the plugin host's one entitlement it succeeds. The plugin host's own `service` suite is
+      # then run against the plugin host signed the same three ways.
       - name: Show what the plugin host's entitlement is for
         if: runner.os == 'macOS'
         run: |
@@ -223,6 +219,13 @@ jobs:
             | python3 -c 'import json, sys; print(next(m["executable"] for m in map(json.loads, sys.stdin) if m.get("reason") == "compiler-artifact" and m.get("executable") and m["target"]["name"] == "execution"))')"
           KR_REQUIRE_PLUGIN_FIXTURES=1 bash scripts/check-plugin-host-entitlement.sh "$executable" \
             kr_req_11_01_a_vendor_component_adds_detection_events_and_controls --exact
+          # The same three ways for the plugin host itself: the `service` suite starts the plugin host
+          # program as its own process and has a component run in it, so it is that program that is
+          # signed, in place, for each run.
+          service="$(cargo test --locked -p kr-plugin-host --test service --no-run --message-format=json \
+            | python3 -c 'import json, sys; print(next(m["executable"] for m in map(json.loads, sys.stdin) if m.get("reason") == "compiler-artifact" and m.get("executable") and m["target"]["name"] == "service"))')"
+          KR_REQUIRE_PLUGIN_FIXTURES=1 bash scripts/check-plugin-host-entitlement.sh --host target/debug/kr-plugin-host "$service" \
+            kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs --exact
 
       # What the shells are built from is pinned: the upstream sources are placed by digest, and the
       # fish package then builds offline, with proxy variables that point at a port nothing listens
@@ -335,7 +338,7 @@ jobs:
       - name: Keep the tree for a release
         run: |
           mkdir -p "$RUNNER_TEMP/unsigned"
-          COPYFILE_DISABLE=1 tar -C "$RUNNER_TEMP/tree" -cf "$RUNNER_TEMP/unsigned/$TOP.tar" "$TOP"
+          COPYFILE_DISABLE=1 tar --no-xattrs -C "$RUNNER_TEMP/tree" -cf "$RUNNER_TEMP/unsigned/$TOP.tar" "$TOP"
           (cd "$RUNNER_TEMP/unsigned" && { sha256sum "$TOP.tar" 2>/dev/null || shasum -a 256 "$TOP.tar"; } > "$TOP.tar.sha256")
           {
             echo "### The tree of $TARGET before it is sealed"
