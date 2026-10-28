@@ -257,12 +257,20 @@ out="$KR_STORE_ROOT/$version-$number"
 kr_store_claim_number android "$number" || exit 2
 kr_store_claim "$out" || exit 2
 # However the run ends, its output directory is searched for the password's text and for signed
-# tokens; a run that got to its check has been held to that search already.
+# tokens, and a search that fails, or finds either, fails the run. A run that succeeds is searched
+# once, before its receipt is written.
+searched=no
 final_scan() {
+    searched=yes
     node "$companion/scripts/store-bundle.mjs" --scan-dir "$out" --secret-file "$password_file" >>"$out/scan.log" 2>&1 \
-        || kr_store_say "the password's text, or a signed token, is in $out (see $out/scan.log); nothing in it is to be uploaded"
+        || { kr_store_say "the password's text, or a signed token, is in $out, or the search failed (see $out/scan.log); nothing in it is to be uploaded"; return 2; }
 }
-trap final_scan EXIT
+exit_scan() {
+    local status=$?
+    [ "$searched" = yes ] || final_scan || status=2
+    exit "$status"
+}
+trap exit_scan EXIT
 kr_store_say "version $version, build number $number, into $out"
 
 # The shell's own NDK may be an older one: a release linked by it would not be laid out for 16 KB
@@ -302,6 +310,7 @@ node "$companion/scripts/store-bundle.mjs" --android "$signed" --version-code "$
 checked=${PIPESTATUS[0]}
 rm -f -- "${marker:?}"
 [ "$checked" = 0 ] || { kr_store_say "the bundle does not hold; no build number was recorded as built, and what is in $out is not to be uploaded"; exit 2; }
+final_scan || exit 2
 
 kr_store_receipt android "$number" || { kr_store_say "the build number could not be recorded"; exit 2; }
 kr_store_say "built and checked: $signed"
