@@ -23141,6 +23141,11 @@
           "type": "string"
         },
         {
+          "const": "changeset.test_reports",
+          "description": "Read what this host made of the test reports the suites that ran against one exact change-set version wrote: for each declared output in a documented format, the format, the counts taken from the cases, and the cases that did not pass plainly, by name. A reading is labelled parsed; a document that opened as a documented format and could not be read says why. The answer is the local owner's and holds no failure text.",
+          "type": "string"
+        },
+        {
           "const": "changeset.materialize",
           "description": "Materialise an exact change-set version into an independent workspace.",
           "type": "string"
@@ -34075,6 +34080,184 @@
       "pattern": "^https://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*|\\[[0-9a-f:]+\\])(:[1-9][0-9]{0,4})?$",
       "type": "string"
     },
+    "ReportCase": {
+      "additionalProperties": false,
+      "description": "One case that did not pass plainly.",
+      "properties": {
+        "duration_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How long it ran, in milliseconds, when the tool said."
+        },
+        "group": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The class, suite or package the tool put it in, bounded in the same way."
+        },
+        "name": {
+          "description": "The test's name as the tool wrote it, at most [`MAX_REPORT_NAME_BYTES`] bytes. It is report\ncontent: a parameterised test's name can carry the value it ran with.",
+          "type": "string"
+        },
+        "outcome": {
+          "$ref": "#/$defs/ReportOutcome",
+          "description": "What became of it."
+        }
+      },
+      "required": [
+        "name",
+        "group",
+        "outcome",
+        "duration_ms"
+      ],
+      "type": "object"
+    },
+    "ReportFormat": {
+      "description": "The documented format a report was read as.",
+      "oneOf": [
+        {
+          "const": "junit_xml",
+          "description": "JUnit XML as the Jenkins plugin documents it: `testsuites` or `testsuite` holding\n`testcase` elements, each with an optional `failure`, `error` or `skipped`, and the rerun\nand flaky elements of the tools that write them.",
+          "type": "string"
+        },
+        {
+          "const": "go_test_json",
+          "description": "The event stream `go test -json` writes: `TestEvent` objects, and the `BuildEvent` objects\nthe go command interleaves with them.",
+          "type": "string"
+        }
+      ]
+    },
+    "ReportOutcome": {
+      "description": "What became of a case that did not pass plainly.",
+      "oneOf": [
+        {
+          "const": "failed",
+          "description": "The test ran and its assertion failed.",
+          "type": "string"
+        },
+        {
+          "const": "errored",
+          "description": "The test or its setup met an unexpected problem, or the package or build it belongs to\nfailed.",
+          "type": "string"
+        },
+        {
+          "const": "skipped",
+          "description": "The test did not run.",
+          "type": "string"
+        },
+        {
+          "const": "flaky",
+          "description": "The test failed and then passed on a rerun.",
+          "type": "string"
+        }
+      ]
+    },
+    "ReportReading": {
+      "description": "What this host made of the document.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The host read the document as its format and counted the cases itself.",
+          "properties": {
+            "cases": {
+              "description": "The first [`MAX_REPORT_CASES`] cases that did not pass plainly, in document order.",
+              "items": {
+                "$ref": "#/$defs/ReportCase"
+              },
+              "type": "array"
+            },
+            "cases_omitted": {
+              "$ref": "#/$defs/U64",
+              "description": "How many such cases there were beyond those listed."
+            },
+            "state": {
+              "const": "parsed",
+              "type": "string"
+            },
+            "totals": {
+              "$ref": "#/$defs/ReportTotals",
+              "description": "The counts, taken from the cases."
+            }
+          },
+          "required": [
+            "state",
+            "totals",
+            "cases",
+            "cases_omitted"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The document opened as a documented format and could not be read as one.",
+          "properties": {
+            "reason": {
+              "$ref": "#/$defs/UnreadableReason",
+              "description": "Why."
+            },
+            "state": {
+              "const": "unreadable",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "reason"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ReportTotals": {
+      "additionalProperties": false,
+      "description": "What a case count says, counted from the cases themselves.",
+      "properties": {
+        "errored": {
+          "$ref": "#/$defs/U64",
+          "description": "The cases that errored."
+        },
+        "failed": {
+          "$ref": "#/$defs/U64",
+          "description": "The cases that failed."
+        },
+        "flaky": {
+          "$ref": "#/$defs/U64",
+          "description": "The cases that passed only after a rerun. They are also in `passed`."
+        },
+        "passed": {
+          "$ref": "#/$defs/U64",
+          "description": "The cases that passed, those that passed after a rerun included."
+        },
+        "skipped": {
+          "$ref": "#/$defs/U64",
+          "description": "The cases that were skipped."
+        },
+        "tests": {
+          "$ref": "#/$defs/U64",
+          "description": "Every case."
+        }
+      },
+      "required": [
+        "tests",
+        "passed",
+        "failed",
+        "errored",
+        "skipped",
+        "flaky"
+      ],
+      "type": "object"
+    },
     "ReportedLocation": {
       "additionalProperties": false,
       "description": "One native OS-appropriate location, as this build documents it.\n\nThe rule rather than one machine's answer: `$XDG_STATE_HOME/kalareach` says where a state\ndirectory belongs on every Linux host, and `/home/someone/.local/state/kalareach` says where\none person's is and carries their account name out of this host to say it.",
@@ -38947,6 +39130,115 @@
       ],
       "type": "object"
     },
+    "TestReport": {
+      "additionalProperties": false,
+      "description": "What this host read out of one declared output of one run.",
+      "properties": {
+        "format": {
+          "$ref": "#/$defs/ReportFormat",
+          "description": "The format the document opened as."
+        },
+        "materialisation_id": {
+          "$ref": "#/$defs/MaterialisationId",
+          "description": "The run it belongs to: the materialisation the suite ran in, which names the version."
+        },
+        "output_bytes": {
+          "$ref": "#/$defs/U64",
+          "description": "The file's length in bytes."
+        },
+        "output_digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The digest of the file, as the run's result records it for this output."
+        },
+        "output_path": {
+          "description": "The declared output the document was, relative to the copy's root.",
+          "type": "string"
+        },
+        "reading": {
+          "$ref": "#/$defs/ReportReading",
+          "description": "What this host made of it."
+        },
+        "recorded_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When this host recorded it."
+        }
+      },
+      "required": [
+        "materialisation_id",
+        "output_path",
+        "output_digest",
+        "output_bytes",
+        "format",
+        "reading",
+        "recorded_at_ms"
+      ],
+      "type": "object"
+    },
+    "TestReportsParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `changeset.test_reports`.",
+      "properties": {
+        "change_set_id": {
+          "$ref": "#/$defs/ChangeSetId",
+          "description": "The change set to read."
+        },
+        "materialisation_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MaterialisationId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "One run of the version, to read the reports of that run alone, or nothing for the newest\nruns of the version."
+        },
+        "version": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChangeSetVersion"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The version to read, or nothing for the latest."
+        }
+      },
+      "required": [
+        "change_set_id",
+        "version",
+        "materialisation_id"
+      ],
+      "type": "object"
+    },
+    "TestReportsResult": {
+      "additionalProperties": false,
+      "description": "Result of `changeset.test_reports`.",
+      "properties": {
+        "omitted": {
+          "$ref": "#/$defs/U64",
+          "description": "How many reports the version has beyond those listed."
+        },
+        "reports": {
+          "description": "The reports of the version's runs, the newest result's first, at most\n[`MAX_REPORTS_PER_ANSWER`].",
+          "items": {
+            "$ref": "#/$defs/TestReport"
+          },
+          "type": "array"
+        },
+        "version": {
+          "$ref": "#/$defs/VersionRef",
+          "description": "The version that was asked for."
+        }
+      },
+      "required": [
+        "version",
+        "reports",
+        "omitted"
+      ],
+      "type": "object"
+    },
     "TestSuite": {
       "additionalProperties": false,
       "description": "One test suite a workflow can run.",
@@ -39431,6 +39723,36 @@
       "description": "An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.",
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
+    },
+    "UnreadableReason": {
+      "description": "Why a document a suite wrote in a documented format was not read.",
+      "oneOf": [
+        {
+          "const": "over_size",
+          "description": "The file is longer than this host reads of one report, or the run's reports together are.",
+          "type": "string"
+        },
+        {
+          "const": "too_deep",
+          "description": "The document nests deeper than this host reads.",
+          "type": "string"
+        },
+        {
+          "const": "too_large",
+          "description": "The document holds more elements, events or lines than this host reads.",
+          "type": "string"
+        },
+        {
+          "const": "not_supported",
+          "description": "The document uses something this host does not read: a document type declaration, or an\nencoding other than UTF-8.",
+          "type": "string"
+        },
+        {
+          "const": "malformed",
+          "description": "The document is not well formed in the format its opening showed.",
+          "type": "string"
+        }
+      ]
     },
     "UploadBeginParams": {
       "additionalProperties": false,
@@ -45367,6 +45689,15 @@
     },
     "terminal_resize_params": {
       "$ref": "#/$defs/TerminalResizeParams"
+    },
+    "test_report": {
+      "$ref": "#/$defs/TestReport"
+    },
+    "test_reports_params": {
+      "$ref": "#/$defs/TestReportsParams"
+    },
+    "test_reports_result": {
+      "$ref": "#/$defs/TestReportsResult"
     },
     "time_adapter_reading": {
       "$ref": "#/$defs/TimeAdapterReading"

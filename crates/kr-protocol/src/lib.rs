@@ -179,6 +179,7 @@ pub mod session;
 pub mod sharing;
 pub mod skill;
 pub mod sync;
+pub mod test_report;
 pub mod transfer;
 pub mod update;
 pub mod vectors;
