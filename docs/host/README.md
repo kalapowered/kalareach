@@ -7114,7 +7114,11 @@ whose target is not live does not count toward the 512: it gives its place to a 
 adds by the lowest sequence, the scan does not count as read through, and the refusal says that the
 list is full; revoking some lets the next scan find the others. A target that is not live and finds
 no room is left out, and the list does not read as full for it. A host that reads no feed, or whose feed
-removed it, reads a list of 512 entries as full, whichever of them are live.
+removed it, reads a list of 512 entries as full, whichever of them are live. When the full list
+names every owner device, the scan has read the feed to its end and the host has caught up, so the
+refusal and the doctor give no catch-up remedy and no steps that remove the record: they say to
+revoke the other targets at the machine, keeping one owner device, and the steps that keep it come
+once the list has room.
 
 Each finding restarts the scan at the first record: the registry found behind the feed, put back
 again while the host runs, or found behind the feed again after a confirmation, whether or not the

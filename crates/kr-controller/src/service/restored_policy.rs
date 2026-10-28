@@ -97,6 +97,24 @@ const OWNER_ROUTE_REMEDY: &str = concat!(
     exclusive_note!()
 );
 
+/// As [`WAITS_REMEDY`], for a list that names every live owner device and is full: the scan has read
+/// the feed to its end and the host has caught up, and what is left is to revoke other targets,
+/// keeping one owner device, until the list has room for the rest.
+const FULL_OWNER_REMEDY: &str = concat!(
+    "The devices and shares this check names are every owner device of this host and what else the \
+     authority feed's requests name, and the list this host keeps is full, so more is owed than it \
+     names. Do not revoke every owner device, and do not remove the file `restored-policy.cbor` \
+     yet. Revoke the other devices and shares at this machine with `kr device revoke` and `kr \
+     share revoke`, which need no confirmation and work while this stands, keeping one owner \
+     device: read `kr device list` and `kr share list` for what this host holds, and revoke each \
+     one that the owners of the feed did not mean to keep. This host asks its feed again by \
+     itself, and as the revoked targets make room it finds the rest. Once the list is no longer \
+     full, this check gives the steps that keep the owner device, and the refusal of `kr host \
+     policy --confirm` gives the record's full path. ",
+    feed_note!(),
+    exclusive_note!()
+);
+
 /// What a person who finds the restored-policy check while the host is still catching up with its
 /// feed does. The steps that remove the record come after the catch-up: removed before it, the
 /// record is written again at the next start.
@@ -140,6 +158,10 @@ struct OwedNow {
     /// steps that remove the record are not given then, since a host that starts below its feed
     /// finds the restore again and writes a new record.
     catching_up: bool,
+    /// Whether a scan of this run has read the feed to its end and the host has caught up, and the
+    /// cap kept an entry out of the list: what is left is to make room by revoking targets, not to
+    /// wait for the host.
+    making_room: bool,
 }
 
 /// Names a target in a refusal.
@@ -248,6 +270,15 @@ fn the_refusal_while_the_wait_is_owed(
                      up with its authority feed, and a record removed before it has is written \
                      again at the next start. The steps that keep an owner device are given \
                      once it has caught up",
+                );
+            } else if owed.every_owner && owed.making_room {
+                said.push_str(
+                    "; these are every owner device of this host, so do not revoke all of them, \
+                     and do not remove the record of the restore yet: revoke the other devices \
+                     and shares at this machine, keeping one owner device (`kr device list` and \
+                     `kr share list` show what this host holds), and this host, which asks its \
+                     feed again by itself, finds the rest as the revoked ones make room. The \
+                     steps that keep that owner device are given once the list is no longer full",
                 );
             } else if owed.every_owner {
                 said.push_str("; ");
@@ -643,6 +674,7 @@ impl Controller {
             full: full_in_memory || held_count >= most,
             every_owner,
             catching_up: self.may_be_catching_up(),
+            making_room: self.is_making_room(),
         })
     }
 
@@ -650,9 +682,18 @@ impl Controller {
     /// this run has read through. A host that reads no feed, or whose feed removed it, is not.
     fn may_be_catching_up(&self) -> bool {
         self.policy().behind_its_feed()
-            || self
-                .feed_runtime()
-                .is_some_and(|feed| !feed.has_read_the_feed_through())
+            || self.feed_runtime().is_some_and(|feed| {
+                !feed.has_read_the_feed_through() && !feed.has_scanned_the_feed_to_its_end()
+            })
+    }
+
+    /// Whether a scan of this run has read a feed that has not removed this host to its end, the
+    /// host has caught up with it, and the cap kept an entry out of the list.
+    fn is_making_room(&self) -> bool {
+        !self.policy().behind_its_feed()
+            && self.feed_runtime().is_some_and(|feed| {
+                feed.has_scanned_the_feed_to_its_end() && !feed.has_read_the_feed_through()
+            })
     }
 
     /// A feed that removed this host is read no more, so a pass that found the registry behind it
@@ -743,6 +784,7 @@ impl Controller {
         };
         let owing = self.what_the_confirmation_waits_for(held, restored::MOST_OWED);
         let every_owner = matches!(&owing, Some(Owing::Targets(owed)) if owed.every_owner);
+        let making_room = matches!(&owing, Some(Owing::Targets(owed)) if owed.making_room);
         // The steps that remove the record come only once the host has caught up with its feed: a
         // record removed before that is written again at the next start.
         let behind = policy.behind_its_feed();
@@ -793,6 +835,12 @@ impl Controller {
                          them: the steps that keep one are given once a scan of this run has read \
                          the authority feed through and the host has caught up with it",
                     )
+                } else if owed.every_owner && owed.making_room {
+                    detail.stated(
+                        "; these are every owner device of this host and the list is full, so do \
+                         not revoke all of them: the remedy says how to revoke the others while \
+                         keeping one",
+                    )
                 } else if owed.every_owner {
                     detail.stated(
                         "; these are every owner device of this host, so revoking all of them \
@@ -815,6 +863,8 @@ impl Controller {
             // whenever the list names every owner device, a record that cannot be read included.
             Some(if behind || (not_compared && every_owner) {
                 BEHIND_REMEDY
+            } else if every_owner && making_room {
+                FULL_OWNER_REMEDY
             } else if every_owner {
                 OWNER_ROUTE_REMEDY
             } else if unreadable {

@@ -7489,6 +7489,90 @@ async fn when_every_owner_device_is_owed_the_route_in_the_refusal_keeps_an_owner
         .expect("the new owner device is served once the kept one is gone");
 }
 
+/// KR-REQ-24.15: a list the cap keeps an entry out of, with every owner device among the targets,
+/// is not a catch-up that has not ended: the scan has read the feed to its end and the host has
+/// caught up. The refusal and the doctor say the list is full and how to revoke the other targets
+/// while keeping one owner device, and give no steps that remove the record; once room is made and
+/// the scan has found the rest, the steps that keep an owner come.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_full_list_that_names_every_owner_device_is_given_the_way_to_make_room_and_not_a_catch_up_remedy()
+ {
+    let rig = Rig::start().await;
+    let mut others = Vec::new();
+    for _ in 0..3 {
+        others.push(rig.pairs(&[ActionRight::SessionView]).await);
+    }
+    rig.until_the_carrier_is_idle().await;
+    let kept = rig.owner_device();
+    let key = AuthorisationKeyPair::generate().expect("a key");
+    let request = rig.request_of(
+        &key,
+        DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([0x0f; 16])),
+        0xd1,
+        RevocationTarget::Devices {
+            device_ids: others
+                .iter()
+                .map(|paired| paired.1.device_id)
+                .chain([kept])
+                .collect::<CanonicalSet<_>>(),
+        },
+    );
+    rig.published_as(&key, &request).await;
+
+    // The cap is lowered once the run has started and before its first read is answered.
+    let reads = rig.arrivals("read");
+    rig.served
+        .web()
+        .fail_with_member(AUTHORITY, "read", 1, Moment::Hold);
+    let rig = rig.restarted(false, a_restore_was_found).await;
+    rig.until_arrivals("read", reads + 1).await;
+    rig.host.controller().limit_the_owed_list_to(3).await;
+    rig.served.web().release_held();
+    rig.until_the_carrier_is_idle().await;
+    rig.until_the_carrier_is_idle().await;
+    let file = restored::file_beside(&rig.host.tree().environment().registry_database());
+    assert!(
+        !rig.runtime().has_read_the_feed_through(),
+        "the cap kept an entry out, so the scan does not count as read through"
+    );
+
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains("is full")
+            && !refused.message.contains("not caught up")
+            && !refused.message.contains(&file.display().to_string()),
+        "the refusal says the list is full, not that the host is catching up, and gives no removal steps: {refused:?}"
+    );
+    let check = rig
+        .the_restored_policy_check()
+        .await
+        .expect("the doctor says the host waits");
+    assert!(
+        check
+            .remedy()
+            .is_some_and(|remedy| remedy.contains("keeping one owner device")
+                && !remedy.contains("cannot be reached")),
+        "the doctor says how to make room while keeping an owner, and names no catch-up cause: {:?}",
+        check.remedy()
+    );
+
+    // The person revokes the other targets and keeps the owner; the next scan finds the rest.
+    for paired in &others {
+        rig.revokes_at_the_machine(paired.1.device_id).await;
+    }
+    within("a pass reads the feed through", async {
+        while !rig.runtime().has_read_the_feed_through() {
+            rig.poll().await;
+        }
+    })
+    .await;
+    let refused = rig.the_confirmation_is_refused().await;
+    assert!(
+        refused.message.contains(&file.display().to_string()),
+        "with room made, the steps that keep the owner come: {refused:?}"
+    );
+}
+
 /// KR-REQ-24.15: after a restart, before this run has compared its registry with its feed, the
 /// doctor and the confirmation do not give the steps that remove the record: a host that starts
 /// below its feed finds the restore again and writes a new record, whatever the retained one owes.

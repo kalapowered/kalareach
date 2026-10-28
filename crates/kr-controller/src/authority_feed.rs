@@ -368,6 +368,10 @@ struct Shared {
     /// being one from another registry: a second restore between two runs leaves the file in place,
     /// and its list does not describe what this run's scan has yet to learn.
     read_through: AtomicBool,
+    /// Whether a scan of this run has read the feed to its end since the last finding and written
+    /// what it owes, whether or not the cap kept an entry out: the host has then caught up, and
+    /// `read_through` is the narrower fact that nothing is left out. Held in memory only.
+    scan_ended: AtomicBool,
     /// The cutoff of a wait: the highest sequence the first scan of this run that read the feed
     /// through while a wait stood saw, or the maximum before it. A request above it was published
     /// after the run read the feed, and is judged as today. A finding resets it.
@@ -459,6 +463,7 @@ fn handle_findings(shared: &Shared, controller: &Controller) -> bool {
     shared.run_names().settled.clear();
     shared.owing_full.store(false, Ordering::SeqCst);
     shared.read_through.store(false, Ordering::SeqCst);
+    shared.scan_ended.store(false, Ordering::SeqCst);
     shared.finding_through.store(u64::MAX, Ordering::SeqCst);
     true
 }
@@ -544,6 +549,7 @@ async fn reconcile(shared: &Shared, controller: &Controller) -> std::result::Res
             }
             shared.owing_full.store(full, Ordering::SeqCst);
             shared.read_through.store(!full, Ordering::SeqCst);
+            shared.scan_ended.store(true, Ordering::SeqCst);
         }
         // The record could not be read at the start and is not written over: what the run owes
         // stays in memory, where a confirmation reads it.
@@ -615,6 +621,7 @@ impl FeedRuntime {
                 wakes: AtomicU64::new(0),
                 removed: AtomicBool::new(false),
                 read_through: AtomicBool::new(false),
+                scan_ended: AtomicBool::new(false),
                 finding_through: AtomicU64::new(u64::MAX),
                 scan_highest: AtomicU64::new(0),
                 findings_seen: AtomicU64::new(0),
@@ -651,6 +658,15 @@ impl FeedRuntime {
     pub fn has_read_the_feed_through(&self) -> bool {
         self.shared.read_through.load(Ordering::SeqCst)
             || self.shared.removed.load(Ordering::SeqCst)
+    }
+
+    /// Whether a scan of this run has read the feed to its end and written what it owes, even if
+    /// the cap kept an entry out of the record. The host has then caught up with its feed unless it
+    /// is still behind it ([`Controller::policy`]'s `behind_its_feed`), and the list is what is
+    /// left to make room in.
+    #[must_use]
+    pub fn has_scanned_the_feed_to_its_end(&self) -> bool {
+        self.shared.scan_ended.load(Ordering::SeqCst)
     }
 
     /// Whether the feed removed this host, so that no scan will ask it for more.
