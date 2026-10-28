@@ -112,6 +112,12 @@ The sealing is started by hand:
 gh workflow run release-host.yml --ref main -f commit=<sha> -f build_run=<run id> -f staged_sums_sha256=<hex>
 ```
 
+The publish job refuses to make a draft unless something shows that the repository makes releases
+immutable: the repository setting, when the token can read it and it says enabled, or otherwise the
+newest published release of the repository reporting itself immutable. After it publishes, it confirms
+that the tag is at the commit and that the release is immutable, and that the public release holds
+what it checked.
+
 Its `source` job holds the inputs to what they name before anything is approved: the commit is on
 `main`, the run is a successful `release-tree.yml` run on that commit, each tree is the artefact whose
 digest GitHub states, and the staged files hash to the input. It prints every digest in the run's
