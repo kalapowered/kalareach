@@ -1186,6 +1186,10 @@ async fn run(cli: Cli) -> Result<Completion> {
                 kr_cli::startup::run(&paths, &startup, cli.json)?;
                 Ok(Completion::Done)
             }
+            HostCommand::Network(network) => {
+                kr_cli::network::run(&paths, &network, cli.json).await?;
+                Ok(Completion::Done)
+            }
             HostCommand::ImportJournals => kr_cli::import::run(&paths, cli.json),
             HostCommand::Install(install) => {
                 let installed = kr_cli::update::install(

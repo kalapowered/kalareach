@@ -1332,6 +1332,9 @@ pub enum HostCommand {
     Terminal(TerminalArguments),
     /// Show or choose how `kr new` starts this environment's control daemon when none is running.
     Startup(StartupArguments),
+    /// Show which network and services this host selects, join the service that publishes a
+    /// description of itself, or leave it.
+    Network(NetworkArguments),
     /// Show what session descriptions offer on this host, turn them on or off, and fetch or stop
     /// fetching the model's files.
     Descriptions(DescriptionsArguments),
@@ -1509,6 +1512,42 @@ pub struct RollbackArguments {
     /// it, the release this host was on before its last switch.
     #[arg(long)]
     pub to: Option<String>,
+}
+
+/// `kr host network`.
+#[derive(Args)]
+pub struct NetworkArguments {
+    /// Join a service: read the description it publishes of itself and write the relay map, the
+    /// discovery servers and the service origins it names into this host's configuration document.
+    /// Without it, what the document selects is shown and nothing is fetched. The settings apply
+    /// when the control daemon next starts.
+    #[arg(long, conflicts_with = "clear")]
+    pub join: bool,
+    /// The origin of the service to join, instead of the KalaReach service: an `https` address with
+    /// no path, or an `http` address on this machine. A service you run is verified with `--key`, or
+    /// taken on the connection alone with `--unsigned`.
+    #[arg(long, requires = "join", value_name = "ORIGIN")]
+    pub service: Option<String>,
+    /// The public key a service you run signs its description with, as 43 characters of unpadded
+    /// base64url. Its description is read only when it verifies under this key.
+    #[arg(
+        long,
+        requires = "service",
+        conflicts_with = "unsigned",
+        value_name = "KEY"
+    )]
+    pub key: Option<String>,
+    /// Take the description of a service you run on the connection alone, with no signature. It is
+    /// then as trustworthy as that connection and the service that answered it.
+    #[arg(long, requires = "service")]
+    pub unsigned: bool,
+    /// Take the service's values for the settings a join writes even where this host's document
+    /// holds others, which a join otherwise names and leaves alone.
+    #[arg(long, requires = "join")]
+    pub replace: bool,
+    /// Take out the settings a join writes. The rest of the document stays as it is.
+    #[arg(long)]
+    pub clear: bool,
 }
 
 /// `kr host startup`.

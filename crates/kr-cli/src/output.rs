@@ -84,6 +84,9 @@ pub enum Request {
     /// The lines on a session's screen, shown to the person who is about to share it: `kr share
     /// invite --live`.
     Screen,
+    /// What a service describes of itself, and what this host selects where the two differ:
+    /// `kr host network`.
+    Network,
     /// The names of the profiles whose variables or command integrations a restore left out of
     /// the configuration it applied, so that the person can add them again: `kr backup restore`.
     Restore,

@@ -136,7 +136,8 @@ pub fn apply_over(
 }
 
 /// What a refused edit says: the configuration's own sentences, as its export rule says them.
-fn refusal(refused: &configuration::EditRefused) -> CliError {
+#[must_use]
+pub fn refusal(refused: &configuration::EditRefused) -> CliError {
     CliError::Usage(match refused {
         configuration::EditRefused::NotOurs(sentence) => Shown::sentence(sentence),
         configuration::EditRefused::Invalid(sentences) => {

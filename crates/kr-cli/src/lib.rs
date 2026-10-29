@@ -67,6 +67,7 @@ pub mod export;
 pub mod helper;
 pub mod import;
 pub mod machine;
+pub mod network;
 pub mod organisation;
 pub mod output;
 pub mod pair;
