@@ -83,6 +83,7 @@ export type DeletionProblem =
   | { readonly kind: 'unsure' }
   | { readonly kind: 'unreachable' }
   | { readonly kind: 'account_changed' }
+  | { readonly kind: 'in_progress' }
 
 /** Why a code was refused. */
 export type CodeRefusal = 'wrong' | 'expired' | 'spent'
@@ -112,7 +113,8 @@ export type DeletionConfirmAnswer =
 
 /**
  * How the removal is going. `unsettled` is a confirmation that left and has no answer yet, here or
- * at the service: it may still close the account.
+ * at the service: it may still close the account. `none` says this device follows no deletion of
+ * the person's, which says nothing of what became of one.
  */
 export type DeletionStatusAnswer =
   | { readonly state: 'none' | 'unsettled' | 'open' | 'done' }
@@ -258,6 +260,8 @@ export function describeProblem(problem: DeletionProblem, stage: Stage = 'before
       return describeUnreachable(stage)
     case 'account_changed':
       return 'A different account is signed in now. Start again.'
+    case 'in_progress':
+      return 'KalaReach is already working on this deletion, in another window. Wait a moment, then check again.'
   }
 }
 
@@ -309,5 +313,6 @@ export const RESULT_DONE = 'Your account is deleted.'
 export const RESULT_NO_EMAIL = 'You will not get an email.'
 export const UNSETTLED_LINE = 'We could not tell whether the deletion went through.'
 export const STILL_UNKNOWN_LINE = 'It is still not known whether the deletion went through.'
-export const NOT_DONE_LINE = 'The service has no record of that deletion, so it did not go through.'
+export const GIVE_UP_LINE =
+  'Close stops KalaReach asking. If the account was deleted, this device finds out the next time it uses the account.'
 export const ACKNOWLEDGE_LINE = 'These organisations will lose their owner.'

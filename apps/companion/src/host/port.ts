@@ -2162,6 +2162,12 @@ export interface HostPort {
   accountDeletionStatus(): Promise<DeletionStatusAnswer>
 
   /**
+   * Gives up on a confirmation that has no answer: this device stops asking after it. Answers
+   * `none` once it has, and a problem when another window is working on the deletion.
+   */
+  accountDeletionForget(): Promise<DeletionStatusAnswer>
+
+  /**
    * Tells `listener` where the device stands each time that changes by itself. Resolves, with the
    * function that stops it, once the listener is registered: nothing published before then
    * reaches it.

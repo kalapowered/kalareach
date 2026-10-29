@@ -28,8 +28,8 @@ import {
   CANNOT_SHOW_LINE,
   CODE_DIGITS,
   DEVICE_LINE,
+  GIVE_UP_LINE,
   MONEY_LINES,
-  NOT_DONE_LINE,
   POLICY_LINE,
   RESULT_CLOSED,
   RESULT_DONE,
@@ -70,7 +70,6 @@ export type DeletionStep =
   | { readonly name: 'confirming' }
   | { readonly name: 'acknowledge'; readonly organisations: readonly OwnedOrganisation[] }
   | { readonly name: 'unsettled' }
-  | { readonly name: 'notdone' }
   | { readonly name: 'result'; readonly progress: 'open' | 'done' | 'still' }
 
 /** The steps a person can still walk away from: nothing has been sent that cannot be taken back. */
@@ -114,6 +113,7 @@ export interface DeletionFlow {
   readonly acknowledgeAll: () => void
   readonly back: () => void
   readonly checkAgain: () => void
+  readonly giveUp: () => void
   readonly finish: () => void
 }
 
@@ -320,9 +320,9 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
           setSaid(null)
           next({ name: 'result', progress: answer.state })
         } else if (answer.state === 'none') {
-          unresolved.current = false
-          setSaid(null)
-          next({ name: 'notdone' })
+          // This device follows no deletion of theirs any more. That is not an answer about the
+          // one that was out, so the step ends without a claim about it.
+          cancel()
         } else {
           setSaid({ text: STILL_UNKNOWN_LINE })
         }
@@ -331,7 +331,29 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
         setChecking(false)
         if (ask.current === mine) problemOf({ kind: 'unreachable' }, 'unknown')
       })
-  }, [checking, next, port, problemOf])
+  }, [cancel, checking, next, port, problemOf])
+
+  // The way out of the unsettled step: the backend stops asking after the confirmation, and the
+  // person is back at the Account panel. A sign-in the confirmation closed is found out the next
+  // time the account is used.
+  const giveUp = useCallback(() => {
+    const mine = (ask.current += 1)
+    setChecking(false)
+    port
+      .accountDeletionForget()
+      .then((answer) => {
+        if (ask.current !== mine) return
+        if (answer.state === 'problem') {
+          problemOf(answer.problem, 'unknown')
+        } else {
+          cancel()
+        }
+      })
+      .catch((error: unknown) => {
+        if (ask.current !== mine) return
+        failure(error)
+      })
+  }, [cancel, failure, port, problemOf])
 
   const finish = useCallback(() => {
     ask.current += 1
@@ -431,9 +453,9 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
     }
   }, [next, port, progress])
 
-  // An unsettled confirmation is looked at again by itself for about two minutes, since by then
-  // nothing can still be running: it ends as the closed account, or as a deletion that did not go
-  // through. After that the person's own Check again is what is left.
+  // An unsettled confirmation is looked at again by itself for about two minutes: it may close the
+  // account at any moment, and then the result is shown. After that the person's own Check again is
+  // what is left, and Close.
   const unsettled = step.name === 'unsettled'
   useEffect(() => {
     if (!unsettled) return
@@ -454,14 +476,7 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
             next({ name: 'result', progress: answer.state })
             return
           }
-          if (answer.state === 'none') {
-            ask.current += 1
-            unresolved.current = false
-            setChecking(false)
-            setSaid(null)
-            next({ name: 'notdone' })
-            return
-          }
+          // A `none` is no answer about the confirmation that was out: it is left to the person.
           if (Date.now() - began < STATUS_FOR_MS) timer = setTimeout(look, STATUS_EVERY_MS)
         })
         .catch(() => {
@@ -492,6 +507,7 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
     acknowledgeAll,
     back,
     checkAgain,
+    giveUp,
     finish
   }
 }
@@ -686,6 +702,7 @@ export function DeleteAccount({
       break
     case 'unsettled':
       lead = UNSETTLED_LINE
+      body = <p className="account-note">{GIVE_UP_LINE}</p>
       actions = (
         <>
           <Button
@@ -709,23 +726,14 @@ export function DeleteAccount({
               Try again
             </Button>
           ) : null}
-        </>
-      )
-      break
-    case 'notdone':
-      lead = NOT_DONE_LINE
-      actions = (
-        <>
           <Button
             data-wraps
-            tone="primary"
-            data-testid="delete-account-restart"
+            data-testid="delete-account-close"
             style={{ minBlockSize: target }}
-            onClick={flow.begin}
+            onClick={flow.giveUp}
           >
-            Start again
+            Close
           </Button>
-          {cancel}
         </>
       )
       break

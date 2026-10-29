@@ -423,7 +423,7 @@ describe('the result', () => {
     await within(setup.panel).findByTestId('delete-account-done')
   })
 
-  it('says the deletion did not go through when the service has no trace of it, and starts again', async () => {
+  it('leaves the step, claiming nothing, when a check finds this device follows no deletion', async () => {
     const setup = await phone()
     const { deletion } = setup.controls.account
     deletion.answerConfirm({ state: 'unsettled' })
@@ -434,12 +434,40 @@ describe('the result', () => {
     deletion.answerStatus({ state: 'none' })
     await setup.person.click(within(setup.panel).getByTestId('delete-account-check'))
     await waitFor(() => {
-      expect(step(setup.panel)).toBe('notdone')
+      expect(within(setup.panel).queryByTestId('delete-account')).toBeNull()
     })
-    expect(within(setup.panel).getByTestId('delete-account-lead')).toHaveTextContent('did not go through')
-    await setup.person.click(within(setup.panel).getByTestId('delete-account-restart'))
-    await within(setup.panel).findByTestId('delete-account-before')
-    expect(deletion.views).toBe(2)
+    expect(setup.panel).not.toHaveTextContent('did not go through')
+    expect(within(setup.panel).getByTestId('delete-account-open')).toBeVisible()
+  })
+
+  it('has a way out: Close stops the asking and puts the panel back', async () => {
+    const setup = await phone()
+    const { deletion } = setup.controls.account
+    deletion.answerConfirm({ state: 'unsettled' })
+    const field = await atTheField(setup)
+    await setup.person.type(field, CODE)
+    await setup.person.keyboard('{Enter}')
+    await setup.person.click(await within(setup.panel).findByTestId('delete-account-close'))
+    await waitFor(() => {
+      expect(within(setup.panel).queryByTestId('delete-account')).toBeNull()
+    })
+    expect(deletion.forgets).toBe(1)
+    expect(within(setup.panel).getByText('Signed in as sam@example.com.')).toBeVisible()
+    expect(within(setup.panel).getByTestId('delete-account-open')).toHaveFocus()
+  })
+
+  it('stays at the step, with the reason, when another window holds the deletion', async () => {
+    const setup = await phone()
+    const { deletion } = setup.controls.account
+    deletion.answerConfirm({ state: 'unsettled' })
+    deletion.answerForget({ state: 'problem', problem: { kind: 'in_progress' } })
+    const field = await atTheField(setup)
+    await setup.person.type(field, CODE)
+    await setup.person.keyboard('{Enter}')
+    await setup.person.click(await within(setup.panel).findByTestId('delete-account-close'))
+    const said = await within(setup.panel).findByTestId('delete-account-problem')
+    expect(said).toHaveAttribute('data-kind', 'in_progress')
+    expect(step(setup.panel)).toBe('unsettled')
   })
 
   it('does not say nothing changed when a try after an unsettled answer cannot reach the service', async () => {
@@ -688,18 +716,19 @@ describe('a confirmation that is still out when the panel opens', () => {
     expect(within(panel).getByTestId('delete-account')).toHaveAttribute('data-step', 'result')
   })
 
-  it('ends as a deletion that did not go through when the service never had it', async () => {
+  it('does not end on its own because the device follows no deletion: that is left to the person', async () => {
     const { controls, panel } = await mounted()
     controls.account.deletion.answerStatus({ state: 'none' })
     await act(async () => {
       await vi.advanceTimersByTimeAsync(3000)
     })
-    expect(within(panel).getByTestId('delete-account')).toHaveAttribute('data-step', 'notdone')
+    expect(within(panel).getByTestId('delete-account')).toHaveAttribute('data-step', 'unsettled')
+    expect(panel).not.toHaveTextContent('did not go through')
   })
 
   it.each([
     ['done', 'none', 'result'],
-    ['none', 'open', 'notdone']
+    ['open', 'none', 'result']
   ] as const)(
     'is not undone by a look the person asked for that answers after the automatic one found %s',
     async (decided, late, step) => {
@@ -726,7 +755,7 @@ describe('a confirmation that is still out when the panel opens', () => {
     }
   )
 
-  it('still tells a person whose sign-in ended meanwhile that the deletion did not go through', async () => {
+  it('keeps the step for a person whose sign-in ended meanwhile, and says nothing of the outcome', async () => {
     const { controls, panel } = await mounted()
     act(() => {
       controls.account.set({ state: 'ended' })
@@ -735,11 +764,8 @@ describe('a confirmation that is still out when the panel opens', () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(3000)
     })
-    expect(within(panel).getByTestId('delete-account')).toHaveAttribute('data-step', 'notdone')
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(3000)
-    })
-    expect(within(panel).getByTestId('delete-account')).toHaveAttribute('data-step', 'notdone')
+    expect(within(panel).getByTestId('delete-account')).toHaveAttribute('data-step', 'unsettled')
+    expect(panel).not.toHaveTextContent('did not go through')
   })
 
   it('stops looking by itself after about two minutes', async () => {
@@ -940,7 +966,8 @@ describe('the step names nothing to buy and links nowhere (the store-build rule)
     { kind: 'mail_failed' },
     { kind: 'unsure' },
     { kind: 'unreachable' },
-    { kind: 'account_changed' }
+    { kind: 'account_changed' },
+    { kind: 'in_progress' }
   ]
   const noop = () => undefined
   const flowAt = (at: DeletionStep, over: Partial<DeletionFlow> = {}): DeletionFlow => ({
@@ -960,6 +987,7 @@ describe('the step names nothing to buy and links nowhere (the store-build rule)
     acknowledgeAll: noop,
     back: noop,
     checkAgain: noop,
+    giveUp: noop,
     finish: noop,
     ...over
   })
@@ -978,7 +1006,6 @@ describe('the step names nothing to buy and links nowhere (the store-build rule)
         organisations: [{ organisation_id: 'org-1', name: 'Acme', members: 4 }]
       },
       { name: 'unsettled' },
-      { name: 'notdone' },
       { name: 'result', progress: 'open' },
       { name: 'result', progress: 'still' },
       { name: 'result', progress: 'done' }

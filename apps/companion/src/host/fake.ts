@@ -331,6 +331,8 @@ export interface FakeDeletion {
   readonly confirms: readonly { readonly code: string; readonly acknowledged: readonly string[] }[]
   /** How many times the page asked how the removal goes. */
   readonly statusReads: number
+  /** How many times the page gave up on a confirmation that had no answer. */
+  readonly forgets: number
   /** What reading what deleting would do answers. */
   answerView(answer: DeletionViewAnswer): void
   /** What asking for the code answers. */
@@ -339,6 +341,8 @@ export interface FakeDeletion {
   answerConfirm(...answers: readonly DeletionConfirmAnswer[]): void
   /** What asking how the removal goes answers. */
   answerStatus(answer: DeletionStatusAnswer): void
+  /** What giving up on a confirmation that has no answer answers. */
+  answerForget(answer: DeletionStatusAnswer): void
   /** The next confirmation waits until the test releases it. */
   holdConfirm(): void
   /** Answers the confirmation that waits. */
@@ -1364,10 +1368,12 @@ export function fakeHost(
   let deletionViews = 0
   let deletionCodes = 0
   let deletionStatusReads = 0
+  let deletionForgets = 0
   const deletionConfirms: { readonly code: string; readonly acknowledged: readonly string[] }[] = []
   let deletionView: DeletionViewAnswer = { state: 'ready', preview: PLAIN_DELETION_PREVIEW }
   let deletionSend: DeletionSendAnswer = { state: 'sent' }
   let deletionStatus: DeletionStatusAnswer = { state: 'none' }
+  let deletionForget: DeletionStatusAnswer = { state: 'none' }
   let deletionConfirmAnswers: readonly DeletionConfirmAnswer[] = [{ state: 'closed', finished: false }]
   let deletionConfirmHeld = false
   let releaseDeletionConfirm: (() => void) | null = null
@@ -2864,6 +2870,10 @@ export function fakeHost(
         }
       })
     },
+    accountDeletionForget: () => {
+      deletionForgets += 1
+      return Promise.resolve(deletionForget)
+    },
     onAccount: (listener) => register(accountListeners, listener),
 
     syncServiceView: () => {
@@ -3252,6 +3262,9 @@ export function fakeHost(
         get statusReads() {
           return deletionStatusReads
         },
+        get forgets() {
+          return deletionForgets
+        },
         answerView(answer) {
           deletionView = answer
         },
@@ -3263,6 +3276,9 @@ export function fakeHost(
         },
         answerStatus(answer) {
           deletionStatus = answer
+        },
+        answerForget(answer) {
+          deletionForget = answer
         },
         holdConfirm() {
           deletionConfirmHeld = true
