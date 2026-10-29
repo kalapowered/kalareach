@@ -19,9 +19,11 @@
 //!    interprets it from the table's own decision destination; without one it stays recorded,
 //!    visible and unanswerable here.
 //! 4. **Answer.** An admitted answer is written on the channel by the channel's own writer, in the
-//!    order admitted. A message into the session, a steer, a cancellation and a package's action
-//!    are refused: nothing establishes that the application received a message and no sender
-//!    stands behind one, and the table names no method for the others.
+//!    order admitted, and recorded as an authenticated bridge response: the bridge delivers the
+//!    verdict, and the application made no typed call that the verdict answers. A message into the
+//!    session, a steer, a cancellation and a package's action are refused: nothing establishes
+//!    that the application received a message and no sender stands behind one, and the table names
+//!    no method for the others.
 //! 5. **Close.** However it ends (the channel closing, a frame it should not have sent, the backend
 //!    retiring), it is closed through [`Broker::close_bridge_channel`], which settles what it
 //!    relayed and discharges what a recovery owes for it.
@@ -402,7 +404,7 @@ impl UpstreamDispatch for ChannelDispatch {
                     return Ok(UpstreamOutcome {
                         upstream_request_id: Some(upstream_request_id),
                         turn_id: None,
-                        provenance: ActionProvenance::UpstreamTypedRpc,
+                        provenance: ActionProvenance::AuthenticatedHookResponse,
                     });
                 }
                 Ok(Err(error)) => error,

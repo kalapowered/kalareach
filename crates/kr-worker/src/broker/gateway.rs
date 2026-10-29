@@ -411,13 +411,21 @@ impl Gateway {
     /// Returns how one connection's answers are recorded.
     ///
     /// A connection into the gateway reaches the upstream over its own typed protocol, so its
-    /// answers are typed results. Terminal input is the other provenance section 12 names, and it
-    /// never arrives here: bytes written into a terminal are written by the input path, which
-    /// records them as what they are.
+    /// answers are typed results. A channel is the host's own authenticated bridge into the
+    /// application: what is written on it is the application's verdict delivered by the bridge,
+    /// not a reply to a call the application made, so its answers are authenticated bridge
+    /// responses. Terminal input is the other provenance section 12 names, and it never arrives
+    /// here: bytes written into a terminal are written by the input path, which records them as
+    /// what they are.
     #[must_use]
     pub fn provenance(&self, connection: GatewayConnectionId) -> Option<ActionProvenance> {
-        self.contains(connection)
-            .then_some(ActionProvenance::UpstreamTypedRpc)
+        if self.connections.contains_key(&connection) {
+            Some(ActionProvenance::UpstreamTypedRpc)
+        } else if self.channels.contains_key(&connection) {
+            Some(ActionProvenance::AuthenticatedHookResponse)
+        } else {
+            None
+        }
     }
 
     /// Returns every connection of either kind to one instance, so a resolution can be fanned
