@@ -242,9 +242,9 @@ A release that has been published is never changed: a correction is a new commit
 
 `release-windows.yml` builds and checks the two Windows trees. Its `release` job, which signs them
 behind its own environment, runs only when the repository variable `WINDOWS_HOST_RELEASE` is `true`,
-and asks for no approval when it does not. It signs the files that carry a signature, and the step that
-writes each manifest again and signs it takes the release keys of the production update channel, which are
-made at a key ceremony.
+and asks for no approval when it does not. It signs the files that carry a signature. Its step that
+writes each manifest again and signs it takes no key and ends the job with an error, so the job publishes
+no release.
 
 ## Package managers
 
