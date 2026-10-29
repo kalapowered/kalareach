@@ -585,28 +585,46 @@ fn a_manifest_signed_by_an_untrusted_writer_stops_the_restore() {
     let sealed = seal(&parties, 1, &objects);
 
     assert!(
-        open_archive(
-            &ArchiveReader::Device(&parties.device),
-            &parties.sender_key(),
-            &[trusted(&impostor)],
-            &expecting(),
-            &sealed.descriptor_bytes,
-            &sealed.encrypted_manifest
-        )
-        .is_err(),
+        matches!(
+            open_archive(
+                &ArchiveReader::Device(&parties.device),
+                &parties.sender_key(),
+                &[trusted(&impostor)],
+                &expecting(),
+                &sealed.descriptor_bytes,
+                &sealed.encrypted_manifest
+            ),
+            Err(CryptoError::BindingMismatch { .. })
+        ),
         "a writer the bundle does not name is not trusted"
     );
+    assert!(
+        matches!(
+            open_archive(
+                &ArchiveReader::Device(&parties.device),
+                &parties.sender_key(),
+                &[],
+                &expecting(),
+                &sealed.descriptor_bytes,
+                &sealed.encrypted_manifest
+            ),
+            Err(CryptoError::BindingMismatch { .. })
+        ),
+        "an empty trusted set trusts nothing"
+    );
+    // The same archive opens for the writer the bundle does name, so the refusals above are the
+    // signature's and not a descriptor or a wrap that was never good.
     assert!(
         open_archive(
             &ArchiveReader::Device(&parties.device),
             &parties.sender_key(),
-            &[],
+            &[trusted(&parties.writer)],
             &expecting(),
             &sealed.descriptor_bytes,
             &sealed.encrypted_manifest
         )
-        .is_err(),
-        "an empty trusted set trusts nothing"
+        .is_ok(),
+        "the trusted writer's manifest opens"
     );
 }
 
