@@ -123,8 +123,11 @@ the remote produces no event at all.
 
 Every job that publishes a release first asks whether the signed release matrix the managed service
 publishes lists a tier for the package version the release carries. The package release, the Windows
-host release and the signed host trees each run `kr-release-matrix-check --origin
-https://reach.kala.to` after they build it and before they publish or sign anything. The program
+host release and the macOS and Linux host release each run `kr-release-matrix-check --origin
+https://reach.kala.to` after they build it. The package release and the Windows host release run it
+before they publish or sign anything; the macOS and Linux host release runs it in the `matrix` job of
+`release-host.yml`, which both the job that uses the update channel's release keys and the job that
+publishes wait for. The program
 verifies the matrix under the key the commit pins, as a host's daemon does, and exits 0 when a tier
 serves the release, 1 when it is refused (in no tier, a reply that does not verify, a service that
 publishes no matrix (a 501), or any status other than the ones below), and 2 when the service did
