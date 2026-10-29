@@ -1497,6 +1497,101 @@ pub fn the_gesture_follows_the_line_discipline(kind: ShellKind) {
     assert!(session.alive());
 }
 
+/// KR-REQ-07.73's package half for an editor whose host puts a terminal setting back after every
+/// command, and `veof-change`, `veof-disabled`.
+///
+/// A person who changes the end-of-file character from inside such a shell loses the change when
+/// the command ends, so the character the shell finds is the one the terminal had when the shell
+/// started. The terminal is set up first, and the reader announces what it found at the first
+/// prompt: a gesture that moved, or none at all. A key that is not the gesture is the editor's own,
+/// and with no end-of-file character no key is one.
+pub fn the_gesture_a_terminal_starts_with_is_the_one_the_reader_announces(kind: ShellKind) {
+    let package = Package::built(kind);
+    let started_with = |eof: &'static str| {
+        let mut session = Session::start_with_profile(
+            &package,
+            Profile {
+                terminal_eof: Some(eof),
+                ..Profile::ORDINARY
+            },
+        );
+        // The gesture is announced before the first entry, so the entry is waited for after it.
+        session.expect_event("hooks_activated", |event| {
+            matches!(event, BridgeEvent::HooksActivated(_))
+        });
+        let (_, event) = session.expect_event("the gesture the terminal started with", |event| {
+            matches!(event, BridgeEvent::GestureChanged(_))
+        });
+        let BridgeEvent::GestureChanged(announced) = event else {
+            unreachable!()
+        };
+        let (_, event) = session.expect_event("the first editor entry", |event| {
+            matches!(event, BridgeEvent::EditorEnter(_))
+        });
+        session.reading = true;
+        session.last_entry = Some(as_enter(&event).clone());
+        (session, announced.gesture)
+    };
+
+    // The terminal's character moved: the key it names detaches, and the default does not.
+    let (mut session, gesture) = started_with("^g");
+    assert_eq!(
+        gesture,
+        EofGesture::TerminalEof {
+            byte: U64::new(0x07)
+        },
+        "the gesture the terminal started with was announced as another"
+    );
+    session.forget_events();
+    assert!(session.answered("kr-ready"));
+    let (_, fence) = session.fenced_prompt(6);
+    // Nothing of the editor's own ends a shell whose buffer is not empty.
+    session.type_bytes(b"kr");
+    std::thread::sleep(Duration::from_millis(80));
+    session.type_bytes(CTRL_D);
+    assert!(
+        !session.saw_event(Duration::from_millis(500), |event| matches!(
+            event,
+            BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
+        )),
+        "a character that is not the terminal's end-of-file character was treated as the gesture"
+    );
+    session.clear_line();
+    session.type_bytes(CTRL_G);
+    let (id, event) = session.expect_event("eof_detach", |event| {
+        matches!(event, BridgeEvent::EofDetach(_))
+    });
+    let BridgeEvent::EofDetach(detach) = event else {
+        unreachable!()
+    };
+    assert_eq!(detach.fence_id, fence.fence_id);
+    session.answer_event(id, detached(attachment_id(1)));
+    assert!(session.alive());
+
+    // The terminal started with no end-of-file character: no key is the gesture.
+    let (mut session, gesture) = started_with("undef");
+    assert_eq!(
+        gesture,
+        EofGesture::Disabled,
+        "a terminal with no end-of-file character was announced as having a gesture"
+    );
+    session.forget_events();
+    assert!(session.answered("kr-ready"));
+    let (_, _fence) = session.fenced_prompt(7);
+    session.type_bytes(b"kr");
+    std::thread::sleep(Duration::from_millis(80));
+    session.type_bytes(CTRL_D);
+    session.type_bytes(CTRL_G);
+    assert!(
+        !session.saw_event(Duration::from_millis(500), |event| matches!(
+            event,
+            BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
+        )),
+        "a terminal with no end-of-file character still produced a gesture"
+    );
+    assert!(session.alive());
+}
+
 /// The budget a case gives a launch whose subject is not the deadline.
 ///
 /// The product's budget is 200 ms of the reader's own clock, from reading the request to deciding

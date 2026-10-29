@@ -342,6 +342,16 @@ fn a_cancellation_during_an_unanswered_acceptance_leaves_the_prompt_working() {
     shellpkg::a_cancellation_during_an_unanswered_acceptance_leaves_the_prompt_working(PWSH);
 }
 
+/// KR-REQ-07.73: the gesture follows the terminal's own end-of-file character. This editor's host
+/// puts the terminal's settings back after every command, so a character the person changes from
+/// inside the shell does not last, and the reader announces the one the terminal started with: a
+/// moved gesture takes the key it names, and a terminal with none has no gesture.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn the_gesture_follows_the_end_of_file_character_the_terminal_started_with() {
+    shellpkg::the_gesture_a_terminal_starts_with_is_the_one_the_reader_announces(PWSH);
+}
+
 /// The editors this suite stands in for the real one with: each is a .NET type with the two fields
 /// the module reads its queue from, or something short of that.
 ///
@@ -427,6 +437,109 @@ fn the_package_refuses_an_editor_whose_key_queue_it_cannot_read() {
             ("psreadline_queue_unreadable".to_owned(), "0".to_owned()),
             "{stand_in} keeps no queue the module can read, and the package qualified it anyway"
         );
+    }
+}
+
+/// KR-REQ-07.87: the package qualifies an editor only inside the versions it was qualified against,
+/// and names the refusal when it is outside them.
+///
+/// The range runs from 2.3.4 to below 3.0.0, compared as the editor's four-part version, which has
+/// no pre-release part: the pre-release of a version reads as that version, so a pre-release of
+/// 3.0.0 is refused and one of 2.3.4 is not. A version inside the range gets past this check and is
+/// then judged against the editor the package published; the real editor is the one installed
+/// here, so each version is put in the place of what the module reads the editor's version from,
+/// and the version of the editor itself is the control that is accepted whole. The refusal is
+/// `psreadline_version_unqualified` for every version outside the range, and never for one inside.
+#[test]
+#[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_package_refuses_an_editor_version_outside_the_range_it_was_qualified_against() {
+    let package = shellpkg::Package::built(PWSH);
+    let module = package
+        .directory()
+        .join("modules/KalaReach.ShellBridge/KalaReach.ShellBridge.psd1")
+        .display()
+        .to_string();
+    // The table below is drawn around these two bounds, so a package qualified over another range
+    // is a reason to redraw it and not a reason for a silent pass.
+    let qualified = &package.record["qualified"];
+    assert_eq!(
+        (
+            qualified["psreadline_from"].as_str(),
+            qualified["psreadline_before"].as_str()
+        ),
+        (Some("2.3.4"), Some("3.0.0")),
+        "the package was qualified over another range of editor versions than this case draws"
+    );
+    let real = qualified["psreadline_found"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let versions = [
+        "1.2.3",
+        "2.3.3",
+        "2.3.3.65535",
+        "2.3.4",
+        "2.3.4.1",
+        "2.9.9.9",
+        "3.0.0",
+        "3.0.0.1",
+        "3.1.0",
+        "10.0.0",
+    ];
+    let listed = versions
+        .iter()
+        .map(|version| format!("'{version}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'; Import-Module PSReadLine; Import-Module '{module}'; \
+         $module = Get-Module KalaReach.ShellBridge; \
+         $control = & $module {{ (Test-KrQualifiedEditor).Reason }}; \
+         Write-Output \"kr-version[real]=[$control]\"; \
+         foreach ($v in @({listed})) {{ \
+             $reason = & $module {{ param($v) \
+                 $script:ShadowVersion = $v; \
+                 Set-Item function:script:Get-KrPSReadLineVersion -Value {{ [version]$script:ShadowVersion }}; \
+                 (Test-KrQualifiedEditor).Reason }} $v; \
+             Write-Output \"kr-version[$v]=[$reason]\" }}"
+    );
+    let asked = package.ask(&script);
+    let said = String::from_utf8_lossy(&asked.stdout).into_owned();
+    let told = String::from_utf8_lossy(&asked.stderr);
+    let reason = |name: &str| -> String {
+        said.lines()
+            .find_map(|line| line.strip_prefix(&format!("kr-version[{name}]=[")))
+            .unwrap_or_else(|| panic!("the module said nothing about {name}:\n{said}\n{told}"))
+            .trim_end_matches(']')
+            .to_owned()
+    };
+
+    assert_eq!(
+        reason("real"),
+        "",
+        "the editor the package was qualified against ({real}) is accepted whole"
+    );
+    for version in versions {
+        let outside = matches!(
+            version,
+            "1.2.3" | "2.3.3" | "2.3.3.65535" | "3.0.0" | "3.0.0.1" | "3.1.0" | "10.0.0"
+        );
+        let found = reason(version);
+        if outside {
+            assert_eq!(
+                found, "psreadline_version_unqualified",
+                "PSReadLine {version} is outside the qualified range and was not refused for it"
+            );
+        } else {
+            assert_ne!(
+                found, "psreadline_version_unqualified",
+                "PSReadLine {version} is inside the qualified range and was refused as outside it"
+            );
+            assert_eq!(
+                found, "psreadline_not_the_qualified_editor",
+                "PSReadLine {version} is inside the range, so it is judged against the published editor"
+            );
+        }
     }
 }
 
