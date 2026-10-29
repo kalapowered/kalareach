@@ -968,6 +968,44 @@ mod tests {
         );
     }
 
+    /// KR-REQ-03.26, the part about selecting a Windows desktop: whatever facility the host has,
+    /// selecting a Windows desktop alone never reports screen capture, input injection or the
+    /// accessibility tree as available, because nothing here takes an image of a screen somebody
+    /// may be looking at or sends it input. Launching an application is the launcher's own answer,
+    /// and no facility at all is a missing installation for every capability.
+    #[test]
+    fn selecting_a_windows_desktop_never_reports_capture_or_injection_as_available() {
+        let tool = || Some(r"C:\Windows\System32\powershell.exe".to_owned());
+        for capability in [
+            capabilities::SCREEN_CAPTURE,
+            capabilities::INPUT_INJECTION,
+            capabilities::ACCESSIBILITY,
+        ] {
+            let answer = decide_windows(capability, tool());
+            assert!(
+                !answer.state.is_available(),
+                "{capability} was reported available on a desktop selection alone: {answer:?}"
+            );
+            assert_eq!(answer.state, CapabilityState::NotTested, "{capability}");
+            assert_eq!(answer.evidence, CapabilityEvidenceSource::NotProbed);
+            assert!(answer.reason.is_some(), "{capability} says why");
+        }
+        let launch = decide_windows(capabilities::APPLICATION_LAUNCH, tool());
+        assert!(launch.state.is_available(), "{launch:?}");
+        for capability in [
+            capabilities::SCREEN_CAPTURE,
+            capabilities::INPUT_INJECTION,
+            capabilities::ACCESSIBILITY,
+            capabilities::APPLICATION_LAUNCH,
+        ] {
+            assert_eq!(
+                decide_windows(capability, None).state,
+                CapabilityState::MissingInstallation,
+                "{capability} with no facility installed"
+            );
+        }
+    }
+
     /// A path of this test's own, in this host's temporary directory.
     fn temporary(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
