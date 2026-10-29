@@ -3049,6 +3049,96 @@ fn an_archive_is_refused_at_its_first_entry_that_is_not_a_release_file() {
     assert!(refused.contains("is not a regular file"), "{refused}");
 }
 
+/// A release that cannot be staged or sealed says which step failed. An archive whose compressed
+/// stream is corrupt where a file's contents are, which is what a download cut short or a disk that
+/// did not keep what it was given leaves, fails in reading the contents, not in making or writing
+/// the file; a file that is already in the staging directory fails in creating it; and a release
+/// that cannot be listed fails in listing it.
+#[cfg(unix)]
+#[test]
+fn a_failure_to_stage_or_seal_a_release_names_the_step_that_failed() {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    let scratch = tempfile::tempdir().expect("a directory");
+    // Owner-only, as the store's own staging directory is.
+    let staging = |name: &str| {
+        let path = scratch.path().join(name);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .expect("a staging directory");
+        path
+    };
+    let mut header = tar::Header::new_gnu();
+    header.set_path("release/bin/kr").expect("a path");
+    header.set_size(4096);
+    header.set_mode(0o644);
+    header.set_cksum();
+
+    // The control: an archive that is whole unpacks.
+    let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+        Vec::new(),
+        flate2::Compression::fast(),
+    ));
+    builder
+        .append(&header, &[b'x'; 4096][..])
+        .expect("an entry");
+    let whole = scratch.path().join("whole.tar.gz");
+    std::fs::write(
+        &whole,
+        builder
+            .into_inner()
+            .and_then(flate2::write::GzEncoder::finish)
+            .expect("written"),
+    )
+    .expect("an archive");
+    let target = staging("whole");
+    kr_cli::update::release::unpack(&whole, &target).expect("an archive that is whole unpacks");
+
+    // A gzip stream written by hand so that it is corrupt inside the file whatever the compressor:
+    // a stored block that holds the entry's header and the first part of its contents, and then a
+    // block of the reserved type, which no decompressor reads. The block is longer than the 32 KiB
+    // the decompressor reads ahead, so the corruption is not met while the entry's header is read:
+    // the archive is unreadable only once the file is being written, and what is said is the
+    // failure to read its contents.
+    let mut header = tar::Header::new_gnu();
+    header.set_path("release/bin/kr").expect("a path");
+    header.set_size(1024 * 1024);
+    header.set_mode(0o644);
+    header.set_cksum();
+    let mut inflated = header.as_bytes().to_vec();
+    inflated.extend_from_slice(&[b'x'; 40_000]);
+    let length = u16::try_from(inflated.len()).expect("a stored block holds it");
+    let mut stream = vec![0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 0xff];
+    stream.push(0b0000_0000);
+    stream.extend_from_slice(&length.to_le_bytes());
+    stream.extend_from_slice(&(!length).to_le_bytes());
+    stream.extend_from_slice(&inflated);
+    stream.push(0b0000_0110);
+    let corrupt = scratch.path().join("corrupt.tar.gz");
+    std::fs::write(&corrupt, &stream).expect("a corrupt archive");
+    let said = kr_cli::update::release::unpack(&corrupt, &staging("corrupt"))
+        .expect_err("the stream is corrupt")
+        .to_string();
+    assert!(
+        said.contains("could not be staged") && said.contains("reading its contents"),
+        "{said}"
+    );
+
+    // The same archive into the same directory: the file is there, and creating it is what fails.
+    let said = kr_cli::update::release::unpack(&whole, &target)
+        .expect_err("the file is already there")
+        .to_string();
+    assert!(said.contains("creating the file"), "{said}");
+
+    // A release that is not there cannot be listed, and sealing says that is what failed.
+    let release = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let said = kr_cli::update::release::seal(&scratch.path().join("absent"), &release.manifest)
+        .expect_err("there is nothing to seal")
+        .to_string();
+    assert!(said.contains("listing it"), "{said}");
+}
+
 /// KR-REQ-26.09: a sparse entry, a file written with its holes left out, which the tar crate's
 /// builder writes of a file that has some on the systems that report holes, is refused, and said to
 /// be a sparse entry, not taken for a link or a device; a file with holes written whole is taken.

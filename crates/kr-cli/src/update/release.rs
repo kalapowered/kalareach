@@ -555,7 +555,7 @@ pub fn unpack(archive: &Path, staging: &Path) -> Result<(PathBuf, Written)> {
         }
         ensure_space(staging, entry.size())?;
         let summary = write_new(&destination, &mut entry)
-            .map_err(|error| write_failure(&destination, &error))?;
+            .map_err(|failure| write_failure(&destination, &failure))?;
         if written.insert(relative.join("/"), summary).is_some() {
             return Err(refused_archive(archive, "has the same file twice"));
         }
@@ -667,7 +667,7 @@ pub fn copy_tree(tree: &Path, staging: &Path) -> Result<(PathBuf, Written)> {
                 let length = opened.metadata().map(|about| about.len()).unwrap_or(0);
                 ensure_space(staging, length)?;
                 let summary = write_new(&destination, &mut opened)
-                    .map_err(|error| write_failure(&destination, &error))?;
+                    .map_err(|failure| write_failure(&destination, &failure))?;
                 written.insert(path.join("/"), summary);
             } else {
                 return Err(refused_tree(
@@ -711,11 +711,50 @@ pub(super) fn create_directories(staging: &Path, directory: &Path) -> Result<()>
     })
 }
 
+/// The step of writing a staged file that failed, so that a failure names what went wrong: the file
+/// is created, its contents are read from where they come from, written, and flushed to disk.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Step {
+    Create,
+    Read,
+    Write,
+    Flush,
+}
+
+impl Step {
+    const fn failed(self) -> &'static str {
+        match self {
+            Self::Create => "creating the file",
+            Self::Read => "reading its contents from the release",
+            Self::Write => "writing it",
+            Self::Flush => "flushing it to disk",
+        }
+    }
+}
+
+/// A staged file that could not be written, and the step that failed.
+#[derive(Debug)]
+pub(super) struct WriteFailure {
+    step: Step,
+    error: std::io::Error,
+}
+
+impl WriteFailure {
+    fn at(step: Step) -> impl FnOnce(std::io::Error) -> Self {
+        move |error| Self { step, error }
+    }
+}
+
 /// Writes a new file from `source`, owner-only, and returns its length and digest.
+///
+/// # Errors
+///
+/// Returns the failure and the step it happened in: a failure of `source` is a failure to read, one
+/// of the new file a failure to create, write or flush it.
 pub(super) fn write_new(
     destination: &Path,
     source: &mut impl std::io::Read,
-) -> std::io::Result<(u64, Digest256)> {
+) -> std::result::Result<(u64, Digest256), WriteFailure> {
     use std::io::Write as _;
 
     let mut options = std::fs::OpenOptions::new();
@@ -728,20 +767,25 @@ pub(super) fn write_new(
 
         options.mode(kr_ipc::paths::OWNER_ONLY_FILE_MODE);
     }
-    let mut file = options.open(destination)?;
+    let mut file = options
+        .open(destination)
+        .map_err(WriteFailure::at(Step::Create))?;
     let mut hasher = sha2::Sha256::new();
     let mut length = 0_u64;
     let mut buffer = vec![0_u8; 256 * 1024];
     loop {
-        let read = source.read(&mut buffer)?;
+        let read = source
+            .read(&mut buffer)
+            .map_err(WriteFailure::at(Step::Read))?;
         if read == 0 {
             break;
         }
         hasher.update(&buffer[..read]);
-        file.write_all(&buffer[..read])?;
+        file.write_all(&buffer[..read])
+            .map_err(WriteFailure::at(Step::Write))?;
         length += read as u64;
     }
-    file.sync_all()?;
+    file.sync_all().map_err(WriteFailure::at(Step::Flush))?;
     let digest: [u8; 32] = hasher.finalize().into();
     Ok((length, Digest256::from_bytes(digest)))
 }
@@ -869,14 +913,15 @@ pub fn seal(release: &Path, manifest: &ReleaseManifest) -> Result<()> {
     let mut pending: Vec<(PathBuf, Vec<String>)> = vec![(release.to_path_buf(), Vec::new())];
     while let Some((directory, relative)) = pending.pop() {
         directories.push(directory.clone());
-        let entries = std::fs::read_dir(&directory).map_err(|error| sealing(&directory, &error))?;
+        let entries = std::fs::read_dir(&directory)
+            .map_err(|error| sealing(&directory, Sealing::List, &error))?;
         for entry in entries {
-            let entry = entry.map_err(|error| sealing(&directory, &error))?;
+            let entry = entry.map_err(|error| sealing(&directory, Sealing::List, &error))?;
             let mut path = relative.clone();
             path.push(entry.file_name().to_string_lossy().into_owned());
             let kind = entry
                 .file_type()
-                .map_err(|error| sealing(&entry.path(), &error))?;
+                .map_err(|error| sealing(&entry.path(), Sealing::List, &error))?;
             if kind.is_dir() {
                 pending.push((entry.path(), path));
                 continue;
@@ -887,22 +932,23 @@ pub fn seal(release: &Path, manifest: &ReleaseManifest) -> Result<()> {
             };
             let file = entry.path();
             std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode))
-                .and_then(|()| std::fs::File::open(&file).and_then(|opened| opened.sync_all()))
-                .map_err(|error| sealing(&file, &error))?;
+                .map_err(|error| sealing(&file, Sealing::Permissions, &error))?;
+            std::fs::File::open(&file)
+                .map_err(|error| sealing(&file, Sealing::Open, &error))?
+                .sync_all()
+                .map_err(|error| sealing(&file, Sealing::Flush, &error))?;
         }
     }
     // Deepest first, so a directory is flushed after everything in it and made read-only last.
     for directory in directories.iter().rev() {
         std::fs::File::open(directory)
-            .and_then(|opened| opened.sync_all())
-            .and_then(|()| {
-                if directory == release {
-                    Ok(())
-                } else {
-                    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o555))
-                }
-            })
-            .map_err(|error| sealing(directory, &error))?;
+            .map_err(|error| sealing(directory, Sealing::Open, &error))?
+            .sync_all()
+            .map_err(|error| sealing(directory, Sealing::Flush, &error))?;
+        if directory != release {
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o555))
+                .map_err(|error| sealing(directory, Sealing::Permissions, &error))?;
+        }
     }
     Ok(())
 }
@@ -925,12 +971,13 @@ pub fn seal(release: &Path, _manifest: &ReleaseManifest) -> Result<()> {
     let mut pending: Vec<PathBuf> = vec![release.to_path_buf()];
     while let Some(directory) = pending.pop() {
         directories.push(directory.clone());
-        let entries = std::fs::read_dir(&directory).map_err(|error| sealing(&directory, &error))?;
+        let entries = std::fs::read_dir(&directory)
+            .map_err(|error| sealing(&directory, Sealing::List, &error))?;
         for entry in entries {
-            let entry = entry.map_err(|error| sealing(&directory, &error))?;
+            let entry = entry.map_err(|error| sealing(&directory, Sealing::List, &error))?;
             let kind = entry
                 .file_type()
-                .map_err(|error| sealing(&entry.path(), &error))?;
+                .map_err(|error| sealing(&entry.path(), Sealing::List, &error))?;
             if kind.is_dir() {
                 pending.push(entry.path());
                 continue;
@@ -941,22 +988,21 @@ pub fn seal(release: &Path, _manifest: &ReleaseManifest) -> Result<()> {
             std::fs::OpenOptions::new()
                 .write(true)
                 .open(&file)
-                .and_then(|opened| opened.sync_all())
-                .and_then(|()| kr_ipc::install::seal_file(&file))
-                .map_err(|error| sealing(&file, &error))?;
+                .map_err(|error| sealing(&file, Sealing::Open, &error))?
+                .sync_all()
+                .map_err(|error| sealing(&file, Sealing::Flush, &error))?;
+            kr_ipc::install::seal_file(&file)
+                .map_err(|error| sealing(&file, Sealing::Permissions, &error))?;
         }
     }
     // Deepest first, so a directory is flushed after everything in it and sealed last.
     for directory in directories.iter().rev() {
         kr_flush::flush_directory(directory, kr_flush::NameKind::Directory)
-            .and_then(|()| {
-                if directory == release {
-                    Ok(())
-                } else {
-                    kr_ipc::install::seal_directory(directory)
-                }
-            })
-            .map_err(|error| sealing(directory, &error))?;
+            .map_err(|error| sealing(directory, Sealing::Flush, &error))?;
+        if directory != release {
+            kr_ipc::install::seal_directory(directory)
+                .map_err(|error| sealing(directory, Sealing::Permissions, &error))?;
+        }
     }
     Ok(())
 }
@@ -983,15 +1029,20 @@ pub fn admit(
             crate::shown::release(release)
         )));
     }
-    std::fs::rename(staged, &destination).map_err(|error| sealing(&destination, &error))?;
+    std::fs::rename(staged, &destination)
+        .map_err(|error| sealing(&destination, Sealing::Move, &error))?;
     std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o555))
-        .and_then(|()| std::fs::File::open(store.versions()).and_then(|opened| opened.sync_all()))
-        .and_then(|()| {
-            staged.parent().map_or(Ok(()), |parent| {
-                std::fs::File::open(parent).and_then(|opened| opened.sync_all())
-            })
-        })
-        .map_err(|error| sealing(&destination, &error))?;
+        .map_err(|error| sealing(&destination, Sealing::Permissions, &error))?;
+    let flushed = |directory: &Path| {
+        std::fs::File::open(directory)
+            .map_err(|error| sealing(directory, Sealing::Open, &error))?
+            .sync_all()
+            .map_err(|error| sealing(directory, Sealing::Flush, &error))
+    };
+    flushed(&store.versions())?;
+    if let Some(parent) = staged.parent() {
+        flushed(parent)?;
+    }
     Ok(destination)
 }
 
@@ -1015,22 +1066,48 @@ pub fn admit(
             crate::shown::release(release)
         )));
     }
-    std::fs::rename(staged, &destination).map_err(|error| sealing(&destination, &error))?;
+    std::fs::rename(staged, &destination)
+        .map_err(|error| sealing(&destination, Sealing::Move, &error))?;
     kr_ipc::install::seal_directory(&destination)
-        .and_then(|()| kr_flush::flush_directory(&store.versions(), kr_flush::NameKind::Directory))
-        .and_then(|()| {
-            staged.parent().map_or(Ok(()), |parent| {
-                kr_flush::flush_directory(parent, kr_flush::NameKind::Directory)
-            })
-        })
-        .map_err(|error| sealing(&destination, &error))?;
+        .map_err(|error| sealing(&destination, Sealing::Permissions, &error))?;
+    let flushed = |directory: &Path| {
+        kr_flush::flush_directory(directory, kr_flush::NameKind::Directory)
+            .map_err(|error| sealing(directory, Sealing::Flush, &error))
+    };
+    flushed(&store.versions())?;
+    if let Some(parent) = staged.parent() {
+        flushed(parent)?;
+    }
     Ok(destination)
 }
 
-fn sealing(path: &Path, error: &std::io::Error) -> CliError {
+/// The step of sealing a staged release that failed.
+#[derive(Clone, Copy, Debug)]
+enum Sealing {
+    List,
+    Open,
+    Permissions,
+    Flush,
+    Move,
+}
+
+impl Sealing {
+    const fn failed(self) -> &'static str {
+        match self {
+            Self::List => "listing it",
+            Self::Open => "opening it",
+            Self::Permissions => "making it read-only",
+            Self::Flush => "flushing it to disk",
+            Self::Move => "moving it into the store",
+        }
+    }
+}
+
+fn sealing(path: &Path, step: Sealing, error: &std::io::Error) -> CliError {
     CliError::Other(shown!(
-        "the staged release could not be made read-only at {}: {}",
+        "the staged release could not be sealed at {}: {} failed: {}",
         Shown::root(path),
+        step.failed(),
         Shown::io(error)
     ))
 }
@@ -1082,11 +1159,12 @@ fn refused_tree(tree: &Path, reason: &'static str) -> CliError {
     ))
 }
 
-pub(super) fn write_failure(path: &Path, error: &std::io::Error) -> CliError {
+pub(super) fn write_failure(path: &Path, failure: &WriteFailure) -> CliError {
     CliError::Other(shown!(
-        "the release could not be staged at {}: {}",
+        "the release could not be staged at {}: {} failed: {}",
         Shown::root(path),
-        Shown::io(error)
+        failure.step.failed(),
+        Shown::io(&failure.error)
     ))
 }
 

@@ -231,7 +231,7 @@ pub fn unpack(
         // No more than the entry says is written. A byte read past it, which writes nothing, shows
         // that the entry holds more than it says.
         let summary = write_new(&destination, &mut (&mut member).take(entry.size))
-            .map_err(|error| write_failure(&destination, &error))?;
+            .map_err(|failure| write_failure(&destination, &failure))?;
         let mut past = [0_u8; 1];
         let more = member
             .read(&mut past)
