@@ -19,8 +19,9 @@ fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// Runs the scan's script with `arguments`, from `directory`. Git reads no configuration of the
-/// person who runs the case, since a scan of tracked files asks it which files they are.
+/// Runs the scan's script with `arguments`, from `directory`. Git reads neither the system's nor
+/// the person's global configuration file, since a scan of tracked files asks it which files they
+/// are.
 fn scan_script_in(directory: &Path, arguments: &[&str]) -> Output {
     Command::new("python3")
         .arg("-I")
@@ -226,7 +227,8 @@ fn a_repository_with_a_tracked_private_key_is_refused() {
     let clean = scan_script_in(repository, &["scan", "--tracked", path_text(repository)]);
     assert!(clean.status.success(), "{}", stderr_of(&clean));
 
-    git(&["add", "untracked.pem"]);
+    // Forced: an excludes file of the person who runs the case may name `*.pem`.
+    git(&["add", "-f", "untracked.pem"]);
     let refused = scan_script_in(repository, &["scan", "--tracked", path_text(repository)]);
     assert!(
         !refused.status.success(),
@@ -377,15 +379,24 @@ fn sealing_refuses_an_archive_that_holds_a_private_key_the_scan_of_the_tree_did_
 
 // The release workflows.
 //
-// The case reads each workflow as the text it is, and cannot run it. It holds what reading shows:
-// that each scan is the exact command, alone in its step or in a plain run of commands, on the
-// exact path, with nothing that lets the step pass when the scan fails, and that every step that
-// keeps what the job assembled comes after the scan of it and runs only while the job has not
-// failed. What reading does not show, and the case does not claim: a loop that runs no time, a
-// function, an alias or a search path that takes the place of a command, a step of another job or
-// workflow that takes what this job assembled, and that the runner runs the file as written
-// (`actionlint` and a run of the workflow show that). The cases after it put a workflow changed to
-// break each rule to the case, which has to refuse it by that rule.
+// The case holds the three workflows in the plain style they are written in today, reading each
+// line as it stands. In that style it refuses every change the cases after it make: a scan or a
+// sealing that is not the exact command on the exact path, one that can fail without stopping its
+// step (an optional or conditional step or job, another shell, `set +`, `||`, `&&`, `;`, `&`, a
+// branch, a loop or a group around it, an `exit` before it), a value of `run`, `shell`, `if` or
+// `path` that goes on to the next line, a step that keeps or uploads before its scan, after a
+// failure, or from a wider path than the scan read, and an upload that the case does not name.
+//
+// It is not a YAML parser and not a shell parser, and it does not hold what they would read
+// differently: a value continued on the next line under another key, an anchor or an alias, an
+// escape in a double-quoted value, a folded scalar, an inline mapping; shell quoting (a quoted
+// string that makes a comment of the scan), and the shell's grammar (`true; if false; then`, a
+// function nothing calls, `exec`, a backslash before a command). Nor does it hold a loop that runs
+// no time, a function, an alias or a search path that takes the place of a command, a step between
+// a scan and a step that keeps, which can change what is there, a step that keeps by another
+// action than `actions/upload-artifact`, a step of another job or workflow that takes what a job
+// assembled, or that the runner runs the file as written (`actionlint` and a run of the workflow
+// show that). A check that parses the YAML replaces it when it is built.
 
 /// What a workflow can do that lets a private key past its scan. Each is refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -417,9 +428,15 @@ enum Refusal {
     UnknownUpload,
     /// A step that keeps what a job assembled, before the scan it has to come after.
     KeptBeforeScan,
-    /// A status function (`always()`, `failure()`, `cancelled()`, `success()`) on a step that keeps
-    /// what a job assembled: it would run after the scan failed.
+    /// A status function that lets a step run after a failure (`always()`, `failure()`,
+    /// `cancelled()`, or `!success()`) on a step that keeps what a job assembled. `success()` is
+    /// what a step without a condition has, and is not refused.
     KeptOnFailure,
+    /// A step that keeps what a job assembled from another path than the one its scan read.
+    KeptPath,
+    /// A value of `run`, `shell`, `if` or `path` that goes on to the next line, where the case reads
+    /// the first line only.
+    Continued,
 }
 
 /// A step that refuses a private key.
@@ -555,6 +572,88 @@ static KEPT: [(&str, &str, &[&str]); 7] = [
     ),
 ];
 
+/// What a step that keeps is held to, so that it keeps what its scan read and no more.
+enum Holds {
+    /// The `path:` of an upload, as a whole.
+    Path(&'static str),
+    /// A command of the step, as a whole.
+    Command(&'static str),
+}
+
+/// The steps that keep, and what each keeps: the path its scan read, or the command that packs
+/// the tree it scanned.
+static HOLDS: [(&str, &str, Holds); 13] = [
+    (
+        "release-tree.yml",
+        "Keep the tree for a release",
+        Holds::Command(
+            r#"COPYFILE_DISABLE=1 tar --no-xattrs -C "$RUNNER_TEMP/tree" -cf "$RUNNER_TEMP/unsigned/$TOP.tar" "$TOP""#,
+        ),
+    ),
+    (
+        "release-tree.yml",
+        "Keep the tree a release is made from",
+        Holds::Path("${{ runner.temp }}/unsigned"),
+    ),
+    (
+        "release-tree.yml",
+        "Keep the release for the formula",
+        Holds::Path("${{ runner.temp }}/archive/${{ env.TOP }}.tar.gz"),
+    ),
+    (
+        "release-tree.yml",
+        "Make the release after this one",
+        Holds::Command(
+            r#"echo "NEXT_ARCHIVE=$RUNNER_TEMP/next-archive/$top.tar.gz" >> "$GITHUB_ENV""#,
+        ),
+    ),
+    (
+        "release-tree.yml",
+        "Keep the release after it for the formula",
+        Holds::Path("${{ env.NEXT_ARCHIVE }}"),
+    ),
+    (
+        "release-tree.yml",
+        "Keep the archive this run proved",
+        Holds::Path("${{ runner.temp }}/archive"),
+    ),
+    (
+        "release-host.yml",
+        "Keep the sealed archive of aarch64-apple-darwin",
+        Holds::Path("${{ runner.temp }}/sealed/aarch64-apple-darwin"),
+    ),
+    (
+        "release-host.yml",
+        "Keep the sealed archive of x86_64-apple-darwin",
+        Holds::Path("${{ runner.temp }}/sealed/x86_64-apple-darwin"),
+    ),
+    (
+        "release-host.yml",
+        "Keep the sealed archive of aarch64-unknown-linux-gnu",
+        Holds::Path("${{ runner.temp }}/sealed/aarch64-unknown-linux-gnu"),
+    ),
+    (
+        "release-host.yml",
+        "Keep the sealed archive of x86_64-unknown-linux-gnu",
+        Holds::Path("${{ runner.temp }}/sealed/x86_64-unknown-linux-gnu"),
+    ),
+    (
+        "release-host.yml",
+        "Keep the digest that was checked",
+        Holds::Path("${{ runner.temp }}/verified"),
+    ),
+    (
+        "release-windows.yml",
+        "Keep the tree for signing",
+        Holds::Path(r"${{ runner.temp }}\tree"),
+    ),
+    (
+        "release-windows.yml",
+        "Keep the archive this run proved",
+        Holds::Path("${{ runner.temp }}/archive"),
+    ),
+];
+
 /// A workflow's text.
 fn workflow_text(workflow: &str) -> String {
     let path = root().join(".github/workflows").join(workflow);
@@ -681,6 +780,39 @@ impl<'a> Workflow<'a> {
             .collect()
     }
 
+    /// The line and the value of a key under a step's `with:`.
+    fn with_value(&self, step: &Range<usize>, key: &str) -> Option<(usize, &'a str)> {
+        let keys = self.keys(step);
+        let (with, ..) = keys.iter().find(|(_, found, _)| *found == "with")?;
+        let end = keys.iter().map(|(line, ..)| *line).find(|line| line > with);
+        (with + 1..end.unwrap_or(step.end)).find_map(|at| {
+            let line = self.lines[at];
+            let (found, value) = pair(line).filter(|_| is_code(line) && indent(line) == 10)?;
+            (found == key).then_some((at, value))
+        })
+    }
+
+    /// Whether the value of the key on line `at` goes on to the next line, where the case reads the
+    /// first only: the next line of code is indented further than the key, or the value is a folded
+    /// block, or a literal one for any key but `run`.
+    fn goes_on(&self, at: usize) -> bool {
+        let line = self.lines[at];
+        let Some((key, value)) = pair(line.trim_start().trim_start_matches("- ")) else {
+            return false;
+        };
+        if value.starts_with('|') {
+            return key != "run";
+        }
+        let column = indent(line)
+            + if line.trim_start().starts_with("- ") {
+                2
+            } else {
+                0
+            };
+        let next = (at + 1..self.lines.len()).find(|&next| is_code(self.lines[next]));
+        value.starts_with('>') || next.is_some_and(|next| indent(self.lines[next]) > column)
+    }
+
     fn name_of(&self, step: &Step) -> Option<&'a str> {
         let keys = self.keys(&step.range);
         keys.iter()
@@ -799,6 +931,14 @@ fn turns_errexit_off(words: &[&str]) -> bool {
         .any(|(at, _)| words[at + 1..].iter().any(|word| word.starts_with('+')))
 }
 
+/// Whether a branch or a loop on one line ends on that line: `if [ -d x ]; then echo x; fi`.
+fn ends_on_its_line(text: &str) -> bool {
+    let text = text.trim_end().trim_end_matches(';').trim_end();
+    ["fi", "done", "esac"]
+        .iter()
+        .any(|end| text.ends_with(&format!(";{end}")) || text.ends_with(&format!("; {end}")))
+}
+
 /// The branches, loops and groups still open where the command at `at` starts, by their first word.
 fn open_before(commands: &[Statement], at: usize) -> Vec<String> {
     let mut open: Vec<String> = Vec::new();
@@ -809,7 +949,9 @@ fn open_before(commands: &[Statement], at: usize) -> Vec<String> {
             text.matches(opening).count() != text.matches(closing).count()
         };
         if ["if", "for", "while", "until", "case", "select"].contains(&word) {
-            open.push(word.to_owned());
+            if !ends_on_its_line(text) {
+                open.push(word.to_owned());
+            }
         } else if matches!(word, "fi" | "done" | "esac") || text == ")" || text == "}" {
             open.pop();
         } else if (text.starts_with('(') && unbalanced('(', ')'))
@@ -831,9 +973,16 @@ fn names_a_status_function(lines: &[&str]) -> bool {
         .filter(|character| !character.is_whitespace())
         .flat_map(char::to_lowercase)
         .collect();
-    ["always(", "failure(", "cancelled(", "success("]
-        .iter()
-        .any(|name| squeezed.contains(name))
+    // `success()` is what a step without a condition has; its negation is a failure.
+    [
+        "always(",
+        "failure(",
+        "cancelled(",
+        "!success(",
+        "!(success(",
+    ]
+    .iter()
+    .any(|name| squeezed.contains(name))
 }
 
 /// One thing a workflow does that the case refuses: the rule, and the line (1-based; 0 for a
@@ -991,6 +1140,9 @@ fn problems_in(name: &str, text: &str) -> Vec<Problem> {
         if starts_differently || value.is_some_and(|value| !matches!(value, "bash" | "pwsh")) {
             refuse(&mut found, Refusal::Shell, at, line);
         }
+        if value.is_some() && workflow.goes_on(at) {
+            refuse(&mut found, Refusal::Continued, at, line);
+        }
     }
 
     // Each scan and sealing is a step the case knows, and is what it must be.
@@ -1036,6 +1188,15 @@ fn problems_in(name: &str, text: &str) -> Vec<Problem> {
             }
         }
         for step in workflow.steps.iter().filter(|step| step.job == job) {
+            let keys = workflow.keys(&step.range);
+            let long = keys
+                .iter()
+                .filter(|(_, key, _)| matches!(*key, "run" | "shell" | "if"))
+                .map(|(at, ..)| *at)
+                .chain(workflow.with_value(&step.range, "path").map(|(at, _)| at));
+            for at in long.filter(|&at| workflow.goes_on(at)) {
+                refuse(&mut found, Refusal::Continued, at, workflow.lines[at]);
+            }
             let uploads = workflow
                 .code(&step.range)
                 .iter()
@@ -1084,13 +1245,39 @@ fn problems_in(name: &str, text: &str) -> Vec<Problem> {
             }
         }
     }
+
+    // Each step that keeps keeps what its scan read: the path, or the command that packs it.
+    for (_, step_name, holds) in HOLDS.iter().filter(|(file, ..)| mine(file)) {
+        let Some(step) = workflow.find(step_name) else {
+            refuse_step(&mut found, Refusal::Unregistered, step_name);
+            continue;
+        };
+        let (at, held) = match holds {
+            Holds::Path(path) => match workflow.with_value(&step.range, "path") {
+                Some((at, value)) => (at, value == *path),
+                None => (step.range.start, false),
+            },
+            Holds::Command(command) => {
+                let commands = workflow.run(&step.range);
+                (
+                    step.range.start,
+                    commands.iter().any(|c| c.text == *command),
+                )
+            }
+        };
+        if !held {
+            refuse(&mut found, Refusal::KeptPath, at, workflow.lines[at]);
+        }
+    }
     found
 }
 
-/// KR-REQ-26.41: the release workflows scan what they assemble for a private key before the step
-/// that seals or keeps it, in the same job, and nothing the case can read makes a scan optional or
-/// lets a failed scan go on to a step that keeps the tree or the archive. The macOS and Linux trees
-/// are sealed by the script above, which the workflows run.
+/// KR-REQ-26.41: the release workflows, in the plain style they are written in, scan what they
+/// assemble for a private key before the step that seals or keeps it, in the same job; nothing in
+/// that style makes a scan optional, or lets a failed scan go on to a step that keeps the tree or
+/// the archive, or lets a step keep more than the scan read. The case is not a YAML or a shell
+/// parser, and the comment above it names what it does not hold. The macOS and Linux trees are
+/// sealed by the script above, which the workflows run.
 #[test]
 fn the_release_workflows_scan_what_they_assemble_before_they_keep_it() {
     for workflow in [
@@ -1305,6 +1492,55 @@ impl Mutant {
         self.lines[at] = format!("    shell: {shell}");
     }
 
+    /// Puts a line under line `at` that goes on from it: indented further than it.
+    fn continue_line(&mut self, at: usize) {
+        self.changes
+            .push(format!("line {} goes on to the next line", at + 1));
+        let pad = " ".repeat(indent(&self.lines[at]) + 2);
+        self.lines.insert(at + 1, format!("{pad}|| true"));
+    }
+
+    /// Makes the value of a key of a step go on to the next line.
+    fn continue_key(&mut self, name: &str, key: &str) {
+        let (at, _) = self
+            .key(name, key)
+            .unwrap_or_else(|| panic!("no key {key:?} in {name:?}"));
+        self.continue_line(at);
+    }
+
+    /// Makes the `path` of a step go on to the next line.
+    fn continue_path(&mut self, name: &str) {
+        let (range, _) = self.step(name);
+        let text = self.text();
+        let (at, _) = Workflow::parse(&text)
+            .with_value(&range, "path")
+            .unwrap_or_else(|| panic!("no path in {name:?}"));
+        self.continue_line(at);
+    }
+
+    /// Makes the default shell go on to the next line.
+    fn continue_default_shell(&mut self) {
+        let is_shell = |line: &String| pair(line).is_some_and(|(key, _)| key == "shell");
+        let at = self
+            .lines
+            .iter()
+            .position(is_shell)
+            .expect("a default shell");
+        self.continue_line(at);
+    }
+
+    /// Asserts that the case does not refuse the workflow so changed by this rule.
+    fn is_not_refused_as(&self, refusal: Refusal) {
+        let found = problems_in(self.workflow, &self.text());
+        assert!(
+            found.iter().all(|problem| problem.refusal != refusal),
+            "{}: {} was refused as {refusal:?}; the case found:\n{}",
+            self.workflow,
+            self.changes.join(", "),
+            describe(self.workflow, &found)
+        );
+    }
+
     /// Asserts that the case refuses the workflow so changed, by this rule.
     fn is_refused_as(&self, refusal: Refusal) {
         let found = problems_in(self.workflow, &self.text());
@@ -1352,10 +1588,17 @@ fn a_workflow_that_keeps_what_a_failed_scan_refused_is_refused() {
                 "failure()",
                 "${{ cancelled() }}",
                 "${{ !cancelled() }}",
+                "${{ !success() }}",
             ] {
                 let mut mutant = Mutant::of(workflow);
                 mutant.set_key(step, "if", condition);
                 mutant.is_refused_as(Refusal::KeptOnFailure);
+            }
+            // The control: the status a step without a condition has is not a failure.
+            for condition in ["success()", "${{ success() && runner.os == 'Linux' }}"] {
+                let mut mutant = Mutant::of(workflow);
+                mutant.set_key(step, "if", condition);
+                mutant.is_not_refused_as(Refusal::KeptOnFailure);
             }
             let mut mutant = Mutant::of(workflow);
             mutant.move_step_before(step, scan);
@@ -1367,6 +1610,89 @@ fn a_workflow_that_keeps_what_a_failed_scan_refused_is_refused() {
             let mut mutant = Mutant::of(workflow);
             mutant.insert_step_before(step, upload);
             mutant.is_refused_as(Refusal::UnknownUpload);
+        }
+    }
+}
+
+/// KR-REQ-26.41: a step that keeps more than its scan read is refused: an upload from a wider path,
+/// and the command that packs the tree from another place.
+#[test]
+fn a_step_that_keeps_more_than_its_scan_read_is_refused() {
+    for (workflow, step, holds) in &HOLDS {
+        let mut mutant = Mutant::of(workflow);
+        match holds {
+            Holds::Path(path) => {
+                mutant.replace_in_step(step, &format!("path: {path}"), "path: ${{ runner.temp }}");
+            }
+            Holds::Command(command) => {
+                mutant.replace_in_step(
+                    step,
+                    command,
+                    &command.replacen("$RUNNER_TEMP", "$HOME", 1),
+                );
+            }
+        }
+        mutant.is_refused_as(Refusal::KeptPath);
+    }
+}
+
+/// KR-REQ-26.41: a value of `run`, `shell`, `if` or `path` that goes on to the next line is refused
+/// in a job that scans, and so is a default shell that does. The case reads the first line of a
+/// value, and YAML reads the lines under it as part of it.
+#[test]
+fn a_value_that_goes_on_to_the_next_line_is_refused() {
+    for (workflow, step, guard) in guards() {
+        for key in ["shell", "if"] {
+            let mut mutant = Mutant::of(workflow);
+            mutant.set_key(step, key, "bash");
+            mutant.continue_key(step, key);
+            mutant.is_refused_as(Refusal::Continued);
+        }
+        if matches!(guard, Guard::Scan(_, true)) {
+            let mut mutant = Mutant::of(workflow);
+            mutant.continue_key(step, "run");
+            mutant.is_refused_as(Refusal::Continued);
+        }
+    }
+    for (workflow, _, kept) in KEPT {
+        for step in kept {
+            let mut mutant = Mutant::of(workflow);
+            mutant.set_key(step, "if", "success()");
+            mutant.continue_key(step, "if");
+            mutant.is_refused_as(Refusal::Continued);
+        }
+    }
+    for (workflow, step, holds) in &HOLDS {
+        if matches!(holds, Holds::Path(_)) {
+            let mut mutant = Mutant::of(workflow);
+            mutant.continue_path(step);
+            mutant.is_refused_as(Refusal::Continued);
+        }
+    }
+    for workflow in [
+        "release-tree.yml",
+        "release-host.yml",
+        "release-windows.yml",
+    ] {
+        let mut mutant = Mutant::of(workflow);
+        mutant.continue_default_shell();
+        mutant.is_refused_as(Refusal::Continued);
+    }
+}
+
+/// KR-REQ-26.41: a branch that ends on its own line, before a scan or a sealing, does not hide it.
+#[test]
+fn a_branch_that_ends_on_its_line_before_a_scan_is_not_taken_for_one_that_hides_it() {
+    for (workflow, step, guard) in guards() {
+        if !matches!(guard, Guard::Scan(_, true)) {
+            let mut mutant = Mutant::of(workflow);
+            mutant.wrap(
+                step,
+                guard.start(),
+                &["if [ ! -d x ]; then mkdir -p x; fi"],
+                &[],
+            );
+            mutant.is_not_refused_as(Refusal::Skippable);
         }
     }
 }
