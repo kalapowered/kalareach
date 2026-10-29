@@ -166,12 +166,12 @@ async fn paste_and_land(session: &mut Session, path: &Path, samples: &[&str]) ->
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     let mut landings = Vec::new();
-    for index in 0..samples.len() {
+    for (index, sample) in samples.iter().enumerate() {
         let line = index as u64 + 1;
         // The cursor on the marker's `|`: the line, then the start of it, then the marker. Neovim
         // can draw after any of those keys, so the wait is for the ruler to name the marker's own
         // byte, the one after the sample, and not for the line alone.
-        let marker = samples[index].len() as u64 + 1;
+        let marker = sample.len() as u64 + 1;
         session.type_bytes(format!("{line}G0f|").as_bytes());
         let screen = session
             .wait_for("the cursor on the marker", |screen| {
