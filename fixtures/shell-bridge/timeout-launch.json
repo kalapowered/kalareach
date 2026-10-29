@@ -1,6 +1,6 @@
 {
   "id": "timeout-launch",
-  "purpose": "A launch transaction the reader does not answer within 250 ms: the reader is told the transaction is over, the caller gets EDITOR_BUSY, the held input is released in order, and an acceptance that arrives afterwards is a qualification breach rather than an install.",
+  "purpose": "A launch transaction the reader does not answer within 250 ms: the reader is told the transaction is over and the held input is released in order. The caller's answer waits for the reader's word, not for the timer: here the reader had installed the command before it saw the revocation, so the caller is told what was installed and the session records the late installation.",
   "covers": [
     "KR-REQ-07.83",
     "KR-REQ-07.33"

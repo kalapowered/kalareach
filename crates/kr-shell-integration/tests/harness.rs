@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use kr_shell_integration::contract::events::{NativeReason, PreEofDecision};
+use kr_shell_integration::contract::fence::ActionShape;
 use kr_shell_integration::contract::fixtures::{
     FIXTURES_DIRECTORY, PreEofStep, Scenario, Script, render, replay, scenarios,
 };
@@ -169,6 +170,43 @@ fn the_ten_exclusions_each_have_their_own_case() {
     names.sort();
     names.dedup();
     assert_eq!(names.len(), count, "two cases share a name");
+}
+
+/// KR-REQ-07.33: a scenario that ends in a reader's late acceptance of a launch the worker had
+/// already revoked says so in its purpose.
+///
+/// The caller's answer to a cancelled launch waits for the reader's word, and the reader can have
+/// installed the command before it saw the revocation. The machine then tells the caller what was
+/// installed and records the late installation, and a purpose that says the caller gets
+/// `EDITOR_BUSY` in that scenario describes a different machine than the one the steps replay.
+#[test]
+fn a_scenario_that_ends_in_a_late_installation_says_so_in_its_purpose() {
+    let mut showing = Vec::new();
+    for scenario in load() {
+        let Script::Fence(script) = &scenario.script else {
+            continue;
+        };
+        let late = script.steps.iter().any(|step| {
+            step.expect
+                .actions
+                .iter()
+                .any(|action| matches!(action, ActionShape::LateInstallation { .. }))
+        });
+        if !late {
+            continue;
+        }
+        assert!(
+            scenario.purpose.contains("late installation"),
+            "{} replays a reader's late installation and its purpose does not say so: {}",
+            scenario.id,
+            scenario.purpose
+        );
+        showing.push(scenario.id);
+    }
+    assert!(
+        showing.len() >= 4,
+        "the scenarios that show a late installation have shrunk to {showing:?}"
+    );
 }
 
 #[test]

@@ -1,6 +1,6 @@
 {
   "id": "launch-cancelled-by-lease-change",
-  "purpose": "The input lease changes during the transaction: the reader is told to install nothing, the fence is invalidated before the lease change is acknowledged, and a late acceptance is a qualification breach rather than an install.",
+  "purpose": "The input lease changes during the transaction: the reader is told to install nothing and the fence is invalidated before the lease change is acknowledged. The caller's answer waits for the reader's word: here the reader had installed the command before it saw the revocation, so the caller is told what was installed and the session records the late installation.",
   "covers": [
     "KR-REQ-07.83",
     "KR-REQ-07.33"

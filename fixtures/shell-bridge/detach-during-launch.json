@@ -1,6 +1,6 @@
 {
   "id": "detach-during-launch",
-  "purpose": "An eligible gesture arrives while a launch holds the fence: the attachment the fence names is going away, so the transaction loses its fence and the detach is validated and acknowledged rather than refused.",
+  "purpose": "An eligible gesture arrives while a launch holds the fence: the attachment the fence names is going away, so the transaction loses its fence and the detach is validated and acknowledged rather than refused. The reader had installed the command before it saw the revocation, so the caller is told what was installed and the session records the late installation.",
   "covers": [
     "KR-REQ-07.81",
     "KR-REQ-07.83"

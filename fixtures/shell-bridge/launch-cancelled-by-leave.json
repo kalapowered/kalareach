@@ -1,6 +1,6 @@
 {
   "id": "launch-cancelled-by-leave",
-  "purpose": "The reader leaves while the launch is in its mailbox: the reader is told, the caller gets EDITOR_BUSY, the fence is invalidated, and the input held for the transaction goes to whatever is reading the terminal now rather than waiting for a reader that has gone.",
+  "purpose": "The reader leaves while the launch is in its mailbox: the reader is told, the fence is invalidated, and the input held for the transaction goes to whatever is reading the terminal now rather than waiting for a reader that has gone. The caller's answer waits for the reader's word: here the reader had installed the command before it saw the revocation, so the caller is told what was installed and the session records the late installation.",
   "covers": [
     "KR-REQ-07.83",
     "KR-REQ-07.33"

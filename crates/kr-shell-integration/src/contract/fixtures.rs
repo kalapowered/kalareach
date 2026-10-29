@@ -2236,8 +2236,10 @@ fn timeout_launch() -> Scenario {
     fence_scenario(
         "timeout-launch",
         "A launch transaction the reader does not answer within 250 ms: the reader is told the \
-         transaction is over, the caller gets EDITOR_BUSY, the held input is released in order, and \
-         an acceptance that arrives afterwards is a qualification breach rather than an install.",
+         transaction is over and the held input is released in order. The caller's answer waits for \
+         the reader's word, not for the timer: here the reader had installed the command before it \
+         saw the revocation, so the caller is told what was installed and the session records the \
+         late installation.",
         &["KR-REQ-07.83", "KR-REQ-07.33"],
         every_shell(),
         held_by_a(),
@@ -2421,9 +2423,11 @@ fn launch_cancelled_by_leave() -> Scenario {
     ));
     fence_scenario(
         "launch-cancelled-by-leave",
-        "The reader leaves while the launch is in its mailbox: the reader is told, the caller gets \
-         EDITOR_BUSY, the fence is invalidated, and the input held for the transaction goes to \
-         whatever is reading the terminal now rather than waiting for a reader that has gone.",
+        "The reader leaves while the launch is in its mailbox: the reader is told, the fence is \
+         invalidated, and the input held for the transaction goes to whatever is reading the \
+         terminal now rather than waiting for a reader that has gone. The caller's answer waits for \
+         the reader's word: here the reader had installed the command before it saw the revocation, \
+         so the caller is told what was installed and the session records the late installation.",
         &["KR-REQ-07.83", "KR-REQ-07.33"],
         every_shell(),
         held_by_a(),
@@ -2487,9 +2491,11 @@ fn launch_cancelled_by_lease_change() -> Scenario {
     ));
     fence_scenario(
         "launch-cancelled-by-lease-change",
-        "The input lease changes during the transaction: the reader is told to install nothing, the \
-         fence is invalidated before the lease change is acknowledged, and a late acceptance is a \
-         qualification breach rather than an install.",
+        "The input lease changes during the transaction: the reader is told to install nothing and \
+         the fence is invalidated before the lease change is acknowledged. The caller's answer waits \
+         for the reader's word: here the reader had installed the command before it saw the \
+         revocation, so the caller is told what was installed and the session records the late \
+         installation.",
         &["KR-REQ-07.83", "KR-REQ-07.33"],
         every_shell(),
         held_by_a(),
@@ -2620,7 +2626,9 @@ fn detach_during_launch() -> Scenario {
         "detach-during-launch",
         "An eligible gesture arrives while a launch holds the fence: the attachment the fence names \
          is going away, so the transaction loses its fence and the detach is validated and \
-         acknowledged rather than refused.",
+         acknowledged rather than refused. The reader had installed the command before it saw the \
+         revocation, so the caller is told what was installed and the session records the late \
+         installation.",
         &["KR-REQ-07.81", "KR-REQ-07.83"],
         every_shell(),
         held_by_a(),
