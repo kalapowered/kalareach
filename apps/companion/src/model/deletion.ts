@@ -261,7 +261,7 @@ export function describeProblem(problem: DeletionProblem, stage: Stage = 'before
     case 'account_changed':
       return 'A different account is signed in now. Start again.'
     case 'in_progress':
-      return 'KalaReach is already working on this deletion, in another window. Wait a moment, then check again.'
+      return 'KalaReach is already working on this deletion. Wait a moment, then check again.'
   }
 }
 
@@ -314,5 +314,5 @@ export const RESULT_NO_EMAIL = 'You will not get an email.'
 export const UNSETTLED_LINE = 'We could not tell whether the deletion went through.'
 export const STILL_UNKNOWN_LINE = 'It is still not known whether the deletion went through.'
 export const GIVE_UP_LINE =
-  'Close stops KalaReach asking. If the account was deleted, this device finds out the next time it uses the account.'
+  'Close stops KalaReach asking. If the account was deleted, the sign-in on this device ends the next time it is used.'
 export const ACKNOWLEDGE_LINE = 'These organisations will lose their owner.'

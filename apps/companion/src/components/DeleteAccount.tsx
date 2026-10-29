@@ -143,6 +143,19 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
     setStep(to)
   }, [])
 
+  // The backend works on one deletion at a time and turns away a second ask while it does, so the
+  // page makes its asks of it (a look, Close, a confirmation) one after another and never while
+  // another of its own is out.
+  const line = useRef<Promise<unknown>>(Promise.resolve())
+  const inOrder = useCallback(<T,>(ask: () => Promise<T>): Promise<T> => {
+    const run = line.current.then(ask, ask)
+    line.current = run.then(
+      () => undefined,
+      () => undefined
+    )
+    return run
+  }, [])
+
   const problemOf = useCallback((problem: DeletionProblem, stage: Stage = 'before') => {
     setSaid({ problem, stage })
   }, [])
@@ -245,8 +258,7 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
       setSaid(null)
       setRefusal(null)
       next({ name: 'confirming' })
-      port
-        .accountDeletionConfirm(typed, accept)
+      inOrder(() => port.accountDeletionConfirm(typed, accept))
         .then((answer) => {
           if (ask.current !== mine) return
           switch (answer.state) {
@@ -279,7 +291,7 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
           next(failedAt())
         })
     },
-    [failedAt, failure, next, port, problemOf]
+    [failedAt, failure, inOrder, next, port, problemOf]
   )
 
   const confirm = useCallback(() => {
@@ -307,8 +319,7 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
     if (checking) return
     const mine = ask.current
     setChecking(true)
-    port
-      .accountDeletionStatus()
+    inOrder(() => port.accountDeletionStatus(true))
       .then((answer) => {
         setChecking(false)
         if (ask.current !== mine) return
@@ -331,18 +342,19 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
         setChecking(false)
         if (ask.current === mine) problemOf({ kind: 'unreachable' }, 'unknown')
       })
-  }, [cancel, checking, next, port, problemOf])
+  }, [cancel, checking, inOrder, next, port, problemOf])
 
   // The way out of the unsettled step: the backend stops asking after the confirmation, and the
   // person is back at the Account panel. A sign-in the confirmation closed is found out the next
   // time the account is used.
   const giveUp = useCallback(() => {
     const mine = (ask.current += 1)
-    setChecking(false)
-    port
-      .accountDeletionForget()
+    // Nothing else is sent while this is out, so Close is not turned away by the page's own look.
+    setChecking(true)
+    inOrder(() => port.accountDeletionForget())
       .then((answer) => {
         if (ask.current !== mine) return
+        setChecking(false)
         if (answer.state === 'problem') {
           problemOf(answer.problem, 'unknown')
         } else {
@@ -351,9 +363,10 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
       })
       .catch((error: unknown) => {
         if (ask.current !== mine) return
+        setChecking(false)
         failure(error)
       })
-  }, [cancel, failure, port, problemOf])
+  }, [cancel, failure, inOrder, port, problemOf])
 
   const finish = useCallback(() => {
     ask.current += 1
@@ -365,19 +378,18 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
     next({ name: 'idle' })
   }, [next])
 
-  // A look when the panel opens, and again when the account changes under it: a deletion that was
-  // under way when the application last ran is shown as the result it is, and a confirmation that
-  // is still out, or whose answer is not known, is shown as that. Only when nothing else has begun.
+  // A look when the panel opens, and again when the account changes under it: a confirmation that
+  // is still out, or whose answer is not known, is shown as that. Only when nothing else has begun,
+  // and not if the person has done anything since the look was asked. The panel is only opening, so
+  // it is told of nothing that has closed the account: that is shown to the page that follows it.
   const standing = view === null ? null : view.state === 'signed_in' ? view.generation : view.state
   useEffect(() => {
     let live = true
-    port
-      .accountDeletionStatus()
+    const mine = ask.current
+    inOrder(() => port.accountDeletionStatus(false))
       .then((answer) => {
-        if (!live || current.current.name !== 'idle') return
-        if (answer.state === 'open' || answer.state === 'done') {
-          next({ name: 'result', progress: answer.state })
-        } else if (answer.state === 'unsettled') {
+        if (!live || ask.current !== mine || current.current.name !== 'idle') return
+        if (answer.state === 'unsettled') {
           unresolved.current = true
           next({ name: 'unsettled' })
         }
@@ -386,7 +398,7 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
     return () => {
       live = false
     }
-  }, [next, port, standing])
+  }, [inOrder, next, port, standing])
 
   // The sign-in the step began under is the one it goes on under: a different sign-in, or none,
   // ends it before a code is sent, and never while a confirmation is out or after the account is
@@ -419,8 +431,7 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
     let timer: ReturnType<typeof setTimeout> | undefined
     let live = true
     const look = () => {
-      port
-        .accountDeletionStatus()
+      inOrder(() => port.accountDeletionStatus(true))
         .then((answer) => {
           if (!live) return
           if (answer.state === 'done') {
@@ -451,7 +462,7 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
       live = false
       if (timer !== undefined) clearTimeout(timer)
     }
-  }, [next, port, progress])
+  }, [inOrder, next, port, progress])
 
   // An unsettled confirmation is looked at again by itself for about two minutes: it may close the
   // account at any moment, and then the result is shown. After that the person's own Check again is
@@ -463,8 +474,7 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
     let timer: ReturnType<typeof setTimeout> | undefined
     let live = true
     const look = () => {
-      port
-        .accountDeletionStatus()
+      inOrder(() => port.accountDeletionStatus(true))
         .then((answer) => {
           if (!live) return
           // This look decides the step, so a Check again that is out is no longer the one that does.
@@ -488,7 +498,7 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
       live = false
       if (timer !== undefined) clearTimeout(timer)
     }
-  }, [next, port, unsettled])
+  }, [inOrder, next, port, unsettled])
 
   return {
     step,
@@ -729,6 +739,7 @@ export function DeleteAccount({
           <Button
             data-wraps
             data-testid="delete-account-close"
+            disabled={checking}
             style={{ minBlockSize: target }}
             onClick={flow.giveUp}
           >

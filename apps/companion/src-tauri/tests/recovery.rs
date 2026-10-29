@@ -87,6 +87,15 @@ impl Carrier for NoBrowser {
 
 /// An account signed in to the service at `origin` with `scopes`, or none signed in.
 async fn account(origin: &GatewayOrigin, scopes: Option<&[&str]>) -> Arc<Account> {
+    account_named(origin, scopes, "account-one").await
+}
+
+/// [`account`], for the account whose subject is `subject`.
+async fn account_named(
+    origin: &GatewayOrigin,
+    scopes: Option<&[&str]>,
+    subject: &str,
+) -> Arc<Account> {
     let service: Arc<dyn kr_client::services::account::AccountService> = Arc::new(NullService);
     let signed_in = Arc::new(SignedInAccount::new(
         Arc::clone(&service),
@@ -101,7 +110,7 @@ async fn account(origin: &GatewayOrigin, scopes: Option<&[&str]>) -> Arc<Account
                     expires_in_seconds: 600,
                     refresh_token: RefreshToken::new("a-refresh-token").expect("a token"),
                     scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
-                    subject: "account-one".to_owned(),
+                    subject: subject.to_owned(),
                 },
                 "a-nonce",
             )
@@ -1804,12 +1813,12 @@ async fn a_closed_account_clears_the_recovery_record_once_and_a_later_look_leave
     let closed = closing::closed_account_at(computer.served.origin()).await;
     let state = page.app.state::<AppState>();
 
-    closed.deletion_status(&state).await.expect("a look");
+    closed.deletion_status(&state, true).await.expect("a look");
     assert_eq!(page.view()["state"], "off");
 
     page.call("recovery_turn_on", json!({})).expect("on again");
     assert_eq!(page.view()["state"], "on");
-    closed.deletion_status(&state).await.expect("a look");
+    closed.deletion_status(&state, true).await.expect("a look");
     assert_eq!(page.view()["state"], "on");
 }
 
@@ -1840,7 +1849,7 @@ async fn a_look_that_cannot_reach_the_service_still_clears_what_a_closed_account
     );
 
     let answer = page
-        .call("account_deletion_status", json!({}))
+        .call("account_deletion_status", json!({ "following": true }))
         .expect("an answer");
     assert_eq!(answer["state"], "problem");
     assert_eq!(page.view()["state"], "off");
@@ -1867,4 +1876,73 @@ async fn the_start_clears_what_a_closed_account_left_with_no_look_from_the_page(
 
     companion_tauri::account::deletion::resume(&page.app.state::<AppState>(), &closed).await;
     assert_eq!(page.view()["state"], "off");
+}
+
+/// The record is noted as the account's whose token wrote the bundle, not the account's that began
+/// it: one account's start that did not finish, and another account's turning it on, leaves the
+/// record the second account's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_record_is_noted_as_the_account_that_wrote_its_bundle_and_not_the_one_that_began_it() {
+    let computer = Computer::new().await;
+    let first = computer.page().await;
+    computer.served.web().fail(SYNC_PATH, 1, Moment::Before);
+    first
+        .call("recovery_turn_on", json!({}))
+        .expect_err("no answer");
+    let began = first.account_mark(&computer);
+    first.call("recovery_settle", json!({})).expect("settled");
+    assert_eq!(first.view()["state"], "unfinished");
+    drop(first);
+
+    let second = computer.start(
+        account_named(
+            &computer.origin(),
+            Some(&RECOVERY_BACKUP_SCOPES),
+            "account-two",
+        )
+        .await,
+    );
+    second
+        .call(
+            "sync_service_set",
+            json!({ "origin": computer.served.origin() }),
+        )
+        .expect("the service is chosen");
+    second.call("recovery_turn_on", json!({})).expect("on");
+    assert_eq!(second.view()["state"], "on");
+
+    second
+        .recovery
+        .account_deleted(began)
+        .await
+        .expect("nothing to clear");
+    assert_eq!(
+        second.view()["state"],
+        "on",
+        "the account that only began it does not own the bundle another wrote"
+    );
+    second
+        .recovery
+        .account_deleted(second.account_mark(&computer))
+        .await
+        .expect("cleared");
+    assert_eq!(second.view()["state"], "off");
+}
+
+/// A bundle this computer adopts from an earlier run was written by no account anyone knows, so
+/// deleting the account that adopted it leaves the record: it may be the bundle of another.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bundle_adopted_from_an_earlier_run_has_no_owner_and_is_left_by_a_deletion() {
+    let computer = Computer::new().await;
+    let seed = RecoverySeed::generate().expect("a seed");
+    left_by_an_earlier_run(&computer, &seed, &seed).await;
+    let page = computer.page().await;
+    page.call("recovery_turn_on", json!({})).expect("on");
+    assert_eq!(page.view()["state"], "on");
+
+    page.recovery
+        .account_deleted(page.account_mark(&computer))
+        .await
+        .expect("nothing to clear");
+    assert_eq!(page.view()["state"], "on");
 }

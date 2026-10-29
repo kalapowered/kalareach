@@ -2158,8 +2158,12 @@ export interface HostPort {
     acknowledged: readonly string[]
   ): Promise<DeletionConfirmAnswer>
 
-  /** How the removal is going, for the deletion this device holds a record of. */
-  accountDeletionStatus(): Promise<DeletionStatusAnswer>
+  /**
+   * How the removal is going, for the deletion this device holds a record of. `following` says the
+   * page is showing the result of a deletion and asks how it goes; a page that has only opened is
+   * told of a deletion that has not closed the account, and of nothing else.
+   */
+  accountDeletionStatus(following: boolean): Promise<DeletionStatusAnswer>
 
   /**
    * Gives up on a confirmation that has no answer: this device stops asking after it. Answers

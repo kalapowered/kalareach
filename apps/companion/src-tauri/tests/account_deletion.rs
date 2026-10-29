@@ -476,10 +476,15 @@ async fn a_status_asked_after_a_lost_answer_says_it_is_unsettled_and_nothing_is_
  {
     let rig = rig().await;
     let account = Arc::clone(&rig.account);
-    let nothing =
-        tokio::task::spawn_blocking(move || invoke(&account, "account_deletion_status", json!({})))
-            .await
-            .expect("joined");
+    let nothing = tokio::task::spawn_blocking(move || {
+        invoke(
+            &account,
+            "account_deletion_status",
+            json!({ "following": true }),
+        )
+    })
+    .await
+    .expect("joined");
     assert_eq!(nothing["state"], "none");
 
     // The confirmation's answer is lost and the receipt knows nothing of it yet.
@@ -496,10 +501,15 @@ async fn a_status_asked_after_a_lost_answer_says_it_is_unsettled_and_nothing_is_
     assert_eq!(confirmed["state"], "unsettled");
     rig.wire.then(&["status_unknown"]);
     let account = Arc::clone(&rig.account);
-    let status =
-        tokio::task::spawn_blocking(move || invoke(&account, "account_deletion_status", json!({})))
-            .await
-            .expect("joined");
+    let status = tokio::task::spawn_blocking(move || {
+        invoke(
+            &account,
+            "account_deletion_status",
+            json!({ "following": true }),
+        )
+    })
+    .await
+    .expect("joined");
     assert_eq!(status["state"], "unsettled");
     assert!(
         session(&rig),
@@ -529,10 +539,15 @@ async fn the_person_can_give_up_on_a_confirmation_that_has_no_answer() {
             .expect("joined");
     assert_eq!(given_up["state"], "none");
     let account = Arc::clone(&rig.account);
-    let status =
-        tokio::task::spawn_blocking(move || invoke(&account, "account_deletion_status", json!({})))
-            .await
-            .expect("joined");
+    let status = tokio::task::spawn_blocking(move || {
+        invoke(
+            &account,
+            "account_deletion_status",
+            json!({ "following": true }),
+        )
+    })
+    .await
+    .expect("joined");
     assert_eq!(status["state"], "none");
     assert!(session(&rig), "the sign-in is as it was");
 }

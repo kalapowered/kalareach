@@ -1654,15 +1654,22 @@ impl fmt::Debug for AccountMark {
 /// The domain the mark of an account at a service is hashed under.
 const ACCOUNT_MARK_DOMAIN: &str = "kalareach-account-mark/1";
 
-impl StoredGrant {
-    /// The mark of this grant's account at the service at `origin`.
-    fn mark_at(&self, origin: &str) -> AccountMark {
+impl AccountMark {
+    /// The mark of the account `subject` at the service at `origin`.
+    fn of(subject: &str, origin: &str) -> Self {
         let mut digest = sha2::Sha256::new();
-        for part in [ACCOUNT_MARK_DOMAIN, ISSUER, self.subject.as_str(), origin] {
+        for part in [ACCOUNT_MARK_DOMAIN, ISSUER, subject, origin] {
             digest.update((part.len() as u64).to_be_bytes());
             digest.update(part.as_bytes());
         }
-        AccountMark(digest.finalize().into())
+        Self(digest.finalize().into())
+    }
+}
+
+impl StoredGrant {
+    /// The mark of this grant's account at the service at `origin`.
+    fn mark_at(&self, origin: &str) -> AccountMark {
+        AccountMark::of(&self.subject, origin)
     }
 
     /// A new grant from an exchange's tokens, with an identifier of its own.
@@ -1958,6 +1965,9 @@ pub struct SignedInAccount {
     item_scope: Option<String>,
     clock_ms: fn() -> u64,
     ended: AtomicBool,
+    /// The account whose sign-in the note above is about, so that whoever settles one account's
+    /// closure does not let go of another account's note.
+    ended_subject: Mutex<Option<String>>,
     /// Tokens that wait to be ended and that the queue could not take, kept in memory until a send
     /// can queue them or the service acknowledges them: a sign-in token whose grant the store holds
     /// is the sign-in and is let go of, and any other is ended at the service.
@@ -2025,6 +2035,7 @@ impl SignedInAccount {
             item_scope: None,
             clock_ms: system_milliseconds,
             ended: AtomicBool::new(false),
+            ended_subject: Mutex::new(None),
             unsettled: Mutex::new(Vec::new()),
             status,
         }
@@ -2099,6 +2110,15 @@ impl SignedInAccount {
             scopes: grant.scopes.clone(),
             generation: generation(grant),
         }
+    }
+
+    /// Notes that the sign-in of the account `subject` has ended.
+    fn note_ended(&self, subject: &str) {
+        *self
+            .ended_subject
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(subject.to_owned());
+        self.ended.store(true, Ordering::SeqCst);
     }
 
     fn publish(&self) {
@@ -2856,7 +2876,7 @@ impl SignedInAccount {
                 }
                 Refreshed::Ended => {
                     self.delete_grant()?;
-                    self.ended.store(true, Ordering::SeqCst);
+                    self.note_ended(&stored.subject);
                     self.publish();
                     false
                 }
@@ -2866,7 +2886,7 @@ impl SignedInAccount {
                         self.queue(&stored.grant_id, leftover)?;
                     }
                     self.delete_grant()?;
-                    self.ended.store(true, Ordering::SeqCst);
+                    self.note_ended(&stored.subject);
                     self.publish();
                     queued
                 }

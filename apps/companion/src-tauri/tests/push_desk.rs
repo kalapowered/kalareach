@@ -4331,8 +4331,8 @@ async fn a_closed_account_marks_each_host_once_however_many_looks_find_it() {
     let account = closing::closed_account().await;
 
     let (first, second) = tokio::join!(
-        account.deletion_status(&state),
-        account.deletion_status(&state)
+        account.deletion_status(&state, true),
+        account.deletion_status(&state, true)
     );
     first.expect("a look");
     second.expect("a look");
@@ -4343,7 +4343,7 @@ async fn a_closed_account_marks_each_host_once_however_many_looks_find_it() {
         .enable(&reference)
         .expect("the person turns it on again");
     phone.until(|states| states == [PushState::On]).await;
-    account.deletion_status(&state).await.expect("a look");
+    account.deletion_status(&state, true).await.expect("a look");
     assert_eq!(
         phone.view().hosts[0].state,
         PushState::On,

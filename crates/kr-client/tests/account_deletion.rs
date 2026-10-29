@@ -539,7 +539,10 @@ async fn every_request_carries_the_bearer_and_no_cookie_and_the_status_carries_n
         .await
         .expect("a confirmation");
     rig.wire.then([recorded("status_open")]);
-    rig.deletion.status(&rig.steps).await.expect("a status");
+    rig.deletion
+        .status(true, &rig.steps)
+        .await
+        .expect("a status");
 
     let seen = rig.wire.seen();
     assert_eq!(
@@ -742,7 +745,7 @@ async fn nothing_the_client_renders_carries_the_code_a_token_the_receipt_or_the_
         rig.deletion,
         DeletionFault::Local(kr_client::Shown::said("a fault")),
         DeletionFault::Busy { seconds: 5 },
-        rig.deletion.status(&rig.steps).await,
+        rig.deletion.status(true, &rig.steps).await,
     );
     for secret in [
         "r***@ts.org",
@@ -762,9 +765,9 @@ async fn a_closure_whose_record_could_not_be_written_still_ends_the_sign_in() {
     let flaky = Arc::new(Flaky {
         inner: MemoryStore::new(),
         fail_session_delete: Mutex::new(false),
-        // The receipt is kept and kept again as the request leaves; the write that says the account
-        // is closed is refused.
-        fail_record_write: Mutex::new(Some(2)),
+        // The receipt is kept as the request leaves; the write that says the account is closed is
+        // refused.
+        fail_record_write: Mutex::new(Some(1)),
     });
     let rig = rig_over(Arc::clone(&flaky) as Arc<dyn SecretStore>).await;
     rig.wire.then([recorded("confirm_closed_closing")]);
@@ -889,10 +892,20 @@ async fn a_closed_account_ends_the_stored_sign_in_with_no_call_to_revoke_it() {
             [account],
             "the recovery step is told whose account was deleted"
         );
-        assert_eq!(
+        assert!(
             record(&rig).is_some(),
-            !finished,
-            "the record stays until the removal is done and the device has settled"
+            "the record stays for the look that tells a page opened meanwhile"
+        );
+        rig.wire.then([recorded("status_open")]);
+        let status = rig.deletion.status(true, &rig.steps).await.expect("a look");
+        assert_eq!(
+            (status.progress, record(&rig).is_some()),
+            if finished {
+                (DeletionProgress::Done, false)
+            } else {
+                (DeletionProgress::Open, true)
+            },
+            "it goes with the look that finds the removal done and the device settled"
         );
     }
 }
@@ -1010,7 +1023,11 @@ async fn a_sign_in_that_was_dead_before_the_request_ran_leaves_no_deletion_unset
             "renewal ends: {renewal_ends}"
         );
         let before = rig.wire.seen().len();
-        let status = rig.deletion.status(&rig.steps).await.expect("a status");
+        let status = rig
+            .deletion
+            .status(true, &rig.steps)
+            .await
+            .expect("a status");
         assert_eq!(
             status.progress,
             DeletionProgress::None,
@@ -1226,13 +1243,21 @@ async fn an_unresolved_record_is_kept_for_a_week_and_is_never_judged_by_the_serv
     for after in [30_000, 60 * 60_000, KEPT_FOR_MS - 1] {
         at(after);
         rig.wire.then([recorded("status_unknown")]);
-        let status = rig.deletion.status(&rig.steps).await.expect("a status");
+        let status = rig
+            .deletion
+            .status(true, &rig.steps)
+            .await
+            .expect("a status");
         assert_eq!(status.progress, DeletionProgress::Unsettled, "{after}");
         assert!(record(&rig).is_some(), "{after}");
     }
     at(KEPT_FOR_MS + 1);
     let before = rig.wire.seen().len();
-    let status = rig.deletion.status(&rig.steps).await.expect("a status");
+    let status = rig
+        .deletion
+        .status(true, &rig.steps)
+        .await
+        .expect("a status");
     assert_eq!(status.progress, DeletionProgress::None);
     assert!(record(&rig).is_none());
     assert_eq!(rig.wire.seen().len(), before, "no request was made");
@@ -1252,14 +1277,14 @@ async fn a_closed_record_lives_until_the_removal_is_done_and_the_device_has_sett
 
     // An unknown is only lag once the account is closed; the recovery step is tried again.
     rig.wire.then([recorded("status_unknown")]);
-    let status = rig.deletion.status(&steps).await.expect("a status");
+    let status = rig.deletion.status(true, &steps).await.expect("a status");
     assert_eq!(status.progress, DeletionProgress::Open);
     assert!(!status.closed_now);
     assert_eq!(steps.ran(), (1, 2));
 
     // Done is reported, and the record outlives it while a step is not done.
     rig.wire.then([recorded("status_done")]);
-    let status = rig.deletion.status(&steps).await.expect("a status");
+    let status = rig.deletion.status(true, &steps).await.expect("a status");
     assert_eq!(status.progress, DeletionProgress::Done);
     assert!(record(&rig).is_some());
     assert_eq!(steps.ran(), (1, 3));
@@ -1267,14 +1292,14 @@ async fn a_closed_record_lives_until_the_removal_is_done_and_the_device_has_sett
     // The step is done at last: the record goes, and the service is not asked again.
     *steps.recovery_done.lock().expect("done") = true;
     let before = rig.wire.seen().len();
-    let status = rig.deletion.status(&steps).await.expect("a status");
+    let status = rig.deletion.status(true, &steps).await.expect("a status");
     assert_eq!(status.progress, DeletionProgress::Done);
     assert!(record(&rig).is_none());
     assert_eq!(rig.wire.seen().len(), before);
     assert_eq!(steps.ran(), (1, 4));
     assert_eq!(
         rig.deletion
-            .status(&steps)
+            .status(true, &steps)
             .await
             .expect("a status")
             .progress,
@@ -1295,7 +1320,7 @@ async fn a_closed_record_a_week_old_still_settles_the_device_once_more_before_it
     assert_eq!(steps.ran(), (1, 1));
     at(KEPT_FOR_MS + 1);
     rig.wire.then([recorded("status_open")]);
-    let status = rig.deletion.status(&steps).await.expect("a status");
+    let status = rig.deletion.status(true, &steps).await.expect("a status");
     assert_eq!(status.progress, DeletionProgress::None);
     assert_eq!(
         steps.ran(),
@@ -1320,15 +1345,15 @@ async fn status_failures_keep_the_record_and_a_rate_limit_says_when() {
         recorded("gateway_page"),
     ]);
     assert_eq!(
-        rig.deletion.status(&rig.steps).await,
+        rig.deletion.status(true, &rig.steps).await,
         Err(DeletionFault::Busy { seconds: 60 })
     );
     assert_eq!(
-        rig.deletion.status(&rig.steps).await,
+        rig.deletion.status(true, &rig.steps).await,
         Err(DeletionFault::Unreachable)
     );
     assert_eq!(
-        rig.deletion.status(&rig.steps).await,
+        rig.deletion.status(true, &rig.steps).await,
         Err(DeletionFault::Unreachable)
     );
     assert!(record(&rig).is_some());
@@ -1350,10 +1375,10 @@ async fn a_device_step_that_is_not_done_is_tried_again_and_one_that_is_done_is_n
     // The next look runs the recovery step again and the notifications step not at all.
     *steps.recovery_done.lock().expect("done") = true;
     rig.wire.then([recorded("status_open")]);
-    rig.deletion.status(&steps).await.expect("a status");
+    rig.deletion.status(true, &steps).await.expect("a status");
     assert_eq!(steps.ran(), (1, 2));
     rig.wire.then([recorded("status_done")]);
-    rig.deletion.status(&steps).await.expect("a status");
+    rig.deletion.status(true, &steps).await.expect("a status");
     assert_eq!(steps.ran(), (1, 2));
     assert!(record(&rig).is_none(), "done and settled: the record goes");
 }
@@ -1361,7 +1386,8 @@ async fn a_device_step_that_is_not_done_is_tried_again_and_one_that_is_done_is_n
 /* ---- Whose it is to see -------------------------------------------------------------------- */
 
 #[tokio::test]
-async fn a_closed_deletion_is_not_shown_to_a_person_who_signed_in_and_out_as_another_account() {
+async fn a_closed_deletion_is_shown_to_the_page_that_follows_it_and_to_no_page_that_has_only_opened()
+ {
     let _clock = CLOCK.lock().await;
     let rig = new_rig().await;
     rig.wire.then([recorded("confirm_closed_closing")]);
@@ -1372,12 +1398,23 @@ async fn a_closed_deletion_is_not_shown_to_a_person_who_signed_in_and_out_as_ano
     rig.wire.then([recorded("status_open")]);
     assert_eq!(
         rig.deletion
-            .status(&rig.steps)
+            .status(true, &rig.steps)
             .await
             .expect("a status")
             .progress,
         DeletionProgress::Open,
-        "the person who deleted it is told how it goes"
+        "the page that is showing the result is told how it goes"
+    );
+    // A panel that only opens is told nothing of a closed account's deletion, whoever signed in
+    // and out in between.
+    rig.wire.then([recorded("status_open")]);
+    assert_eq!(
+        rig.deletion
+            .status(false, &rig.steps)
+            .await
+            .expect("a status")
+            .progress,
+        DeletionProgress::None
     );
     rig.account
         .commit(issued("account-2", "second"), "n")
@@ -1386,18 +1423,18 @@ async fn a_closed_deletion_is_not_shown_to_a_person_who_signed_in_and_out_as_ano
     rig.wire.then([recorded("status_open")]);
     assert_eq!(
         rig.deletion
-            .status(&rig.steps)
+            .status(true, &rig.steps)
             .await
             .expect("a status")
             .progress,
         DeletionProgress::None,
-        "the other account is not told about it"
+        "the other account is not told about it, even by a page that follows it"
     );
     rig.account.sign_out().await.expect("and out");
     rig.wire.then([recorded("status_open")]);
     assert_eq!(
         rig.deletion
-            .status(&rig.steps)
+            .status(false, &rig.steps)
             .await
             .expect("a status")
             .progress,
@@ -1419,7 +1456,7 @@ async fn an_unresolved_deletion_is_shown_to_its_own_account_and_to_no_other() {
     rig.wire.then([recorded("status_unknown")]);
     assert_eq!(
         rig.deletion
-            .status(&rig.steps)
+            .status(true, &rig.steps)
             .await
             .expect("a status")
             .progress,
@@ -1430,7 +1467,11 @@ async fn an_unresolved_deletion_is_shown_to_its_own_account_and_to_no_other() {
     let again = deletion(&rig.account, &rig.wire);
     rig.wire.then([recorded("status_unknown")]);
     assert_eq!(
-        again.status(&rig.steps).await.expect("a status").progress,
+        again
+            .status(false, &rig.steps)
+            .await
+            .expect("a status")
+            .progress,
         DeletionProgress::Unsettled
     );
 
@@ -1441,7 +1482,11 @@ async fn an_unresolved_deletion_is_shown_to_its_own_account_and_to_no_other() {
         .expect("another account signs in");
     rig.wire.then([recorded("status_unknown")]);
     assert_eq!(
-        again.status(&rig.steps).await.expect("a status").progress,
+        again
+            .status(false, &rig.steps)
+            .await
+            .expect("a status")
+            .progress,
         DeletionProgress::None
     );
     again.forget().await.expect("nothing to give up");
@@ -1503,7 +1548,11 @@ async fn a_closure_learned_for_one_account_never_ends_or_edits_another_accounts(
         .await
         .expect("a sign-in");
     rig.wire.then([recorded("status_open")]);
-    let status = rig.deletion.status(&rig.steps).await.expect("a status");
+    let status = rig
+        .deletion
+        .status(true, &rig.steps)
+        .await
+        .expect("a status");
     assert!(session(&rig), "the second account's sign-in stays");
     assert!(matches!(
         rig.account.status().expect("a status"),
@@ -1528,7 +1577,11 @@ async fn a_closure_learned_for_one_account_never_ends_or_edits_another_accounts(
         .await
         .expect("unsettled");
     rig.wire.then([recorded("status_open")]);
-    let status = rig.deletion.status(&rig.steps).await.expect("a status");
+    let status = rig
+        .deletion
+        .status(true, &rig.steps)
+        .await
+        .expect("a status");
     assert_eq!(status.progress, DeletionProgress::Open);
     assert!(status.closed_now);
     assert!(!session(&rig));
@@ -1548,7 +1601,7 @@ async fn the_person_can_give_up_on_a_deletion_that_may_have_run_and_not_on_a_clo
     assert!(record(&rig).is_none());
     assert_eq!(
         rig.deletion
-            .status(&rig.steps)
+            .status(true, &rig.steps)
             .await
             .expect("a status")
             .progress,
@@ -1603,6 +1656,134 @@ async fn a_new_deletion_looks_after_an_old_closed_one_as_far_as_it_goes_and_then
     assert!(!session(&rig), "the second account's sign-in ended too");
 }
 
+#[tokio::test]
+async fn a_closure_does_not_let_go_of_the_note_that_another_accounts_sign_in_ended() {
+    let _clock = CLOCK.lock().await;
+    let rig = new_rig().await;
+    rig.wire.then([recorded("confirm_closed_closing")]);
+    rig.deletion
+        .confirm(CODE, &[], &rig.steps)
+        .await
+        .expect("closed");
+    // Another account signs in, and its sign-in ends by itself.
+    rig.account
+        .commit(issued("account-2", "second"), "n")
+        .await
+        .expect("a sign-in");
+    *rig.service.ends.lock().expect("ends") = true;
+    at(11 * 60_000);
+    rig.account
+        .token_marked("openid", ACCOUNT_ORIGIN, false)
+        .await
+        .expect_err("the sign-in has ended");
+    assert_eq!(
+        rig.account.status().expect("a status"),
+        AccountStatus::Ended
+    );
+
+    // The panel looks again when the account changes, as a panel that has only opened does.
+    rig.wire.then([recorded("status_open")]);
+    let status = rig
+        .deletion
+        .status(false, &rig.steps)
+        .await
+        .expect("a status");
+    assert_eq!(status.progress, DeletionProgress::None);
+    assert!(!status.closed_now);
+    assert_eq!(
+        rig.account.status().expect("a status"),
+        AccountStatus::Ended,
+        "the other account's note stays, and is not taken for the closed account's"
+    );
+}
+
+#[tokio::test]
+async fn a_closure_whose_sign_in_could_not_be_removed_is_not_forgotten_when_the_removal_is_done() {
+    let _clock = CLOCK.lock().await;
+    let flaky = Arc::new(Flaky {
+        inner: MemoryStore::new(),
+        fail_session_delete: Mutex::new(true),
+        fail_record_write: Mutex::new(None),
+    });
+    let rig = rig_over(Arc::clone(&flaky) as Arc<dyn SecretStore>).await;
+    rig.wire.then([recorded("confirm_closed_deleted")]);
+    assert_eq!(
+        rig.deletion.confirm(CODE, &[], &rig.steps).await,
+        Ok(DeletionOutcome::Closed { finished: true })
+    );
+    assert!(session(&rig), "the disk refused");
+    assert!(record(&rig).is_some());
+
+    // The removal is done and the device's steps are, but the sign-in is still stored: the look
+    // that cannot end it keeps the record, and the next one ends it and lets the record go.
+    *flaky.fail_session_delete.lock().expect("flaky") = true;
+    let status = rig
+        .deletion
+        .status(true, &rig.steps)
+        .await
+        .expect("a status");
+    assert_eq!(status.progress, DeletionProgress::Done);
+    assert!(session(&rig));
+    assert!(
+        record(&rig).is_some(),
+        "the record is how the sign-in is ended"
+    );
+    rig.deletion
+        .status(true, &rig.steps)
+        .await
+        .expect("a status");
+    assert!(!session(&rig));
+    assert!(record(&rig).is_none());
+}
+
+#[tokio::test]
+async fn a_confirmation_sends_the_receipt_of_the_account_it_began_for_whoever_the_page_previewed_since()
+ {
+    let _clock = CLOCK.lock().await;
+    let rig = new_rig().await;
+    rig.wire
+        .then([Step::Lost, Step::Lost, Step::Lost, Step::Lost]);
+    assert_eq!(
+        rig.deletion.confirm(CODE, &[], &rig.steps).await,
+        Ok(DeletionOutcome::Unsettled)
+    );
+    // A second account confirms: it first asks about the first account's receipt, and that look is
+    // held while another process signs in a third account and this page previews it.
+    rig.account
+        .commit(issued("account-2", "second"), "n")
+        .await
+        .expect("a sign-in");
+    rig.wire.then([recorded("preview")]);
+    rig.deletion.preview().await.expect("a preview");
+    let (entered, release) = rig.wire.hold_next("/api/account/deletion/status");
+    rig.wire.then([
+        recorded("status_unknown"),
+        recorded("preview"),
+        recorded("confirm_wrong"),
+    ]);
+    let confirming = rig.deletion.confirm(CODE, &[], &rig.steps);
+    let meanwhile = async {
+        entered.notified().await;
+        rig.account
+            .commit(issued("account-3", "third"), "m")
+            .await
+            .expect("a sign-in");
+        rig.deletion.preview().await.expect("a preview");
+        release.notify_one();
+    };
+    let (confirmed, ()) = tokio::join!(confirming, meanwhile);
+    assert_eq!(confirmed, Err(DeletionFault::AccountChanged));
+    assert_eq!(
+        receipts(&rig.wire).len(),
+        1,
+        "only the first account's own confirmation was ever sent"
+    );
+    assert!(
+        record(&rig).is_none(),
+        "and the record made for it is taken back"
+    );
+}
+
 /* ---- One owner ------------------------------------------------------------------------------ */
 
 #[tokio::test]
@@ -1622,7 +1803,7 @@ async fn a_confirmation_in_flight_holds_the_deletion_and_a_second_caller_neither
         assert_eq!(rig.deletion.forget().await, Err(DeletionFault::InProgress));
         assert_eq!(
             rig.deletion
-                .status(&rig.steps)
+                .status(true, &rig.steps)
                 .await
                 .expect("a status")
                 .progress,
@@ -1675,7 +1856,11 @@ async fn a_second_process_neither_begins_confirms_nor_gives_up_while_another_hol
         );
         assert_eq!(second.forget().await, Err(DeletionFault::InProgress));
         assert_eq!(
-            second.status(&rig.steps).await.expect("a status").progress,
+            second
+                .status(false, &rig.steps)
+                .await
+                .expect("a status")
+                .progress,
             DeletionProgress::Unsettled,
             "the signed-in account is told that a confirmation is out"
         );
@@ -1690,13 +1875,21 @@ async fn a_second_process_neither_begins_confirms_nor_gives_up_while_another_hol
     // they share.
     wire.then([recorded("status_open")]);
     assert_eq!(
-        second.status(&rig.steps).await.expect("a status").progress,
+        second
+            .status(true, &rig.steps)
+            .await
+            .expect("a status")
+            .progress,
         DeletionProgress::Open
     );
     let third = deletion(&account, &wire);
     wire.then([recorded("status_open")]);
     assert_eq!(
-        third.status(&rig.steps).await.expect("a status").progress,
+        third
+            .status(true, &rig.steps)
+            .await
+            .expect("a status")
+            .progress,
         DeletionProgress::None
     );
     assert_eq!(

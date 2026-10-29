@@ -235,13 +235,15 @@ impl Account {
     }
 
     /// How the removal is going, for the person whose deletion it is. A look that finds the account
-    /// closed settles what this device holds of it.
+    /// closed settles what this device holds of it. `following` says the page is showing the result
+    /// of a deletion and asks how it goes; a page that has only opened is told of a deletion that
+    /// has not closed the account, and of nothing else.
     ///
     /// # Errors
     ///
     /// Returns a local failure when this device's records could not be read or kept.
-    pub async fn deletion_status(&self, state: &AppState) -> Result<StatusAnswer> {
-        Ok(match self.deletion.status(&Steps(state)).await {
+    pub async fn deletion_status(&self, state: &AppState, following: bool) -> Result<StatusAnswer> {
+        Ok(match self.deletion.status(following, &Steps(state)).await {
             Ok(status) => {
                 if status.closed_now {
                     self.after_deletion().await;
@@ -331,7 +333,7 @@ impl DeviceSteps for Steps<'_> {
 /// open: the account's closure is learned and settled if it has not been, and a step that was not
 /// done is done.
 pub async fn resume(state: &AppState, account: &Account) {
-    if let Err(error) = account.deletion_status(state).await {
+    if let Err(error) = account.deletion_status(state, false).await {
         tracing::warn!(
             %error,
             "what the closed account left on this device could not be settled"

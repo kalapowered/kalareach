@@ -39,10 +39,13 @@
 //!
 //! # Whose it is to see
 //!
-//! The record of a deletion is the person's who began it. It is reported to the account that is
-//! signed in when that account is the record's, and, when nobody is signed in, to the flow in this
-//! process that began it for as long as nobody has signed in or out since. A sign-out of another
-//! account does not bring a closed account's deletion back.
+//! The record of a deletion is the person's who began it. A look reports it to the account that is
+//! signed in when that account is the record's. When nobody is signed in, which is what a closed
+//! account leaves behind, a look reports it only to a caller that says it is following the deletion
+//! (the page that is showing its result) and only in the process whose flow began it. A look that
+//! only wants to know what is going on, as a panel does when it opens, never learns of a closed
+//! account's deletion: a sign-out of another account does not bring it back, in this process or
+//! in another.
 //!
 //! # What is never rendered
 //!
@@ -60,7 +63,7 @@ use kr_protocol::error::ErrorCode;
 use kr_protocol::service::GatewayOrigin;
 use serde::{Deserialize, Serialize};
 
-use super::{AccountMark, AccountStatus, SignedInAccount, storage};
+use super::{AccountMark, SignedInAccount, storage};
 use crate::error::{ClientError, Result};
 use crate::services::signed::{Repeat, data_or_refusal};
 use crate::services::{ServiceHttp, ServiceHttpAnswer};
@@ -526,9 +529,9 @@ impl SignedInAccount {
     }
 
     /// Ends the stored grant if it is still the grant of the closed account `mark`, without telling
-    /// the service, and lets go of a note that the sign-in ended: the account is closed, and a
-    /// sign-in that ended with it is not a separate event. Once, and again if it was interrupted.
-    /// Says whether it changed anything.
+    /// the service, and lets go of a note that that account's sign-in ended: the account is closed,
+    /// and a sign-in that ended with it is not a separate event. Another account's note is left
+    /// where it is. Once, and again if it was interrupted. Says whether it changed anything.
     async fn end_closed_grant(&self, origin: &str, mark: &str) -> Result<bool> {
         let _held = self.hold().await?;
         let grant = self.read_grant()?;
@@ -538,7 +541,14 @@ impl SignedInAccount {
         if ours {
             self.delete_grant()?;
         }
-        let noted = (ours || grant.is_none()) && self.ended.swap(false, Ordering::SeqCst);
+        let theirs = grant.is_none()
+            && self
+                .ended_subject
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_deref()
+                .is_some_and(|subject| AccountMark::of(subject, origin).to_hex() == mark);
+        let noted = (ours || theirs) && self.ended.swap(false, Ordering::SeqCst);
         if ours || noted {
             self.publish();
         }
@@ -593,13 +603,6 @@ impl Route {
     }
 }
 
-/// The account the deletion in front of the person is for, and whether anyone has signed in or out
-/// since it was last followed.
-struct Flow {
-    mark: Option<AccountMark>,
-    seen: tokio::sync::watch::Receiver<AccountStatus>,
-}
-
 /// The one owner of a deletion, held. The shared file goes first, so it is let go of before the lock
 /// in this process.
 struct Owner<'a> {
@@ -639,7 +642,8 @@ pub struct ManagedAccountDeletion {
     owner: tokio::sync::Mutex<()>,
     /// The file the owner is also held on, for another process on this machine.
     shared_lock: Option<PathBuf>,
-    flow: Mutex<Flow>,
+    /// The account the deletion in front of the person is for.
+    flow: Mutex<Option<AccountMark>>,
     look_every: Duration,
 }
 
@@ -660,14 +664,13 @@ impl ManagedAccountDeletion {
         http: Arc<dyn ServiceHttp>,
         account: Arc<SignedInAccount>,
     ) -> Self {
-        let seen = account.subscribe();
         Self {
             origin: origin.as_str().to_owned(),
             http,
             account,
             owner: tokio::sync::Mutex::new(()),
             shared_lock: None,
-            flow: Mutex::new(Flow { mark: None, seen }),
+            flow: Mutex::new(None),
             look_every: LOOK_EVERY,
         }
     }
@@ -764,12 +767,10 @@ impl ManagedAccountDeletion {
     /// Binds the deletion in front of the person to one account, and refuses another.
     fn bind(&self, mark: AccountMark, begin: bool) -> std::result::Result<(), DeletionFault> {
         let mut flow = held(&self.flow);
-        match flow.mark {
+        match *flow {
             Some(bound) if bound != mark && !begin => Err(DeletionFault::AccountChanged),
-            Some(bound) if bound == mark && !begin => Ok(()),
             _ => {
-                flow.mark = Some(mark);
-                flow.seen.borrow_and_update();
+                *flow = Some(mark);
                 Ok(())
             }
         }
@@ -777,13 +778,12 @@ impl ManagedAccountDeletion {
 
     /// Whether the deletion in front of the person began for the account `mark` names.
     fn is_flow(&self, mark: &str) -> bool {
-        held(&self.flow)
-            .mark
-            .is_some_and(|bound| bound.to_hex() == mark)
+        held(&self.flow).is_some_and(|bound| bound.to_hex() == mark)
     }
 
     /// The record of the account that is signed in is followed by this flow from now on, so that a
-    /// closure learned meanwhile, which ends the very sign-in that says whose it is, is still shown.
+    /// closure learned meanwhile, which ends the very sign-in that says whose it is, is still shown
+    /// to a caller that follows it.
     fn follow_if_signed_in(&self, mark: &str) -> std::result::Result<(), DeletionFault> {
         let signed_in = self
             .account
@@ -791,19 +791,19 @@ impl ManagedAccountDeletion {
             .map_err(local)?
             .map(AccountMark::to_hex);
         if signed_in.as_deref() == Some(mark) {
-            let mut flow = held(&self.flow);
-            flow.mark = AccountMark::from_hex(mark);
-            flow.seen.borrow_and_update();
+            *held(&self.flow) = AccountMark::from_hex(mark);
         }
         Ok(())
     }
 
     /// `progress`, if the deletion it is of is the person's: the signed-in account's, or, when no one
-    /// is signed in, that of the flow in this process that began it, until someone signs in or out.
+    /// is signed in and the caller `following` the deletion, that of the flow in this process that
+    /// began it.
     fn shown(
         &self,
         mark: &str,
         progress: DeletionProgress,
+        following: bool,
     ) -> std::result::Result<DeletionProgress, DeletionFault> {
         let signed_in = self
             .account
@@ -812,11 +812,7 @@ impl ManagedAccountDeletion {
             .map(AccountMark::to_hex);
         let theirs = match signed_in {
             Some(signed_in) => signed_in == mark,
-            None => {
-                let flow = held(&self.flow);
-                flow.mark.is_some_and(|bound| bound.to_hex() == mark)
-                    && !flow.seen.has_changed().unwrap_or(true)
-            }
+            None => following && self.is_flow(mark),
         };
         Ok(if theirs {
             progress
@@ -875,11 +871,23 @@ impl ManagedAccountDeletion {
 
     /// Sends a request that needs the bearer token, renewing the token once on a 401 and repeating
     /// the request once for the same account. A 401 means the request was refused before it ran.
-    async fn send_bearer(&self, route: Route, body: Option<&[u8]>, begin: bool) -> Sent {
+    ///
+    /// With `expected`, a token of another account is refused: a confirmation sends the receipt of
+    /// the account it began for, whatever the flow in front of the person was bound to meanwhile.
+    async fn send_bearer(
+        &self,
+        route: Route,
+        body: Option<&[u8]>,
+        begin: bool,
+        expected: Option<AccountMark>,
+    ) -> Sent {
         let (mut authorisation, mark) = match self.authorise(false).await {
             Ok(held) => held,
             Err(fault) => return Sent::Fault(fault),
         };
+        if expected.is_some_and(|wanted| wanted != mark) {
+            return Sent::Fault(DeletionFault::AccountChanged);
+        }
         if let Err(fault) = self.bind(mark, begin) {
             return Sent::Fault(fault);
         }
@@ -909,7 +917,7 @@ impl ManagedAccountDeletion {
     ///
     /// Returns the fault that stopped it.
     pub async fn preview(&self) -> std::result::Result<DeletionRead, DeletionFault> {
-        match self.send_bearer(Route::View, None, true).await {
+        match self.send_bearer(Route::View, None, true, None).await {
             Sent::Data(data) => Ok(read_preview(&data)),
             Sent::Refusal {
                 code,
@@ -933,7 +941,10 @@ impl ManagedAccountDeletion {
     ///
     /// Returns the fault that stopped it. [`DeletionFault::Unsure`] means the email may have been sent.
     pub async fn send_code(&self) -> std::result::Result<(), DeletionFault> {
-        match self.send_bearer(Route::Code, Some(b"{}"), false).await {
+        match self
+            .send_bearer(Route::Code, Some(b"{}"), false, None)
+            .await
+        {
             Sent::Data(data) if data.get("sent") == Some(&serde_json::Value::Bool(true)) => Ok(()),
             Sent::Data(_) | Sent::Lost => Err(DeletionFault::Unsure),
             Sent::Refusal {
@@ -982,7 +993,10 @@ impl ManagedAccountDeletion {
         self.bind(mark, false)?;
         let begun = self.begin(mark, steps).await.map_err(local)?;
         let body = confirmation(code, &begun.receipt, acknowledged);
-        match self.send_bearer(Route::Confirm, Some(&body), false).await {
+        match self
+            .send_bearer(Route::Confirm, Some(&body), false, Some(mark))
+            .await
+        {
             Sent::Data(data) => match read_confirmed(&data) {
                 Some(Confirmed::Closed { finished }) => {
                     self.closed(&begun.mark, &begun.receipt, finished, steps)
@@ -1076,7 +1090,9 @@ impl ManagedAccountDeletion {
         record.closed = true;
         record.done |= done;
         record.since_ms = now;
-        let _ = self.settle_closed(record, false, steps, false).await;
+        // The record stays for the next look: a page that was opened again while this confirmation
+        // was out is waiting to be told, and the look is what tells it.
+        let _ = self.settle_closed(record, false, steps, false, false).await;
     }
 
     /// Looks for a lost answer by receipt. An account found closed is settled as if the answer had
@@ -1175,12 +1191,16 @@ impl ManagedAccountDeletion {
     ///
     /// The progress is the person's own: the record of another account's deletion is looked after,
     /// and its closure ends that account's grant and no other, but it is not shown as this one's.
+    /// A caller that is `following` the deletion (the page that is showing its result) is also told
+    /// of a closed account's, if it is the flow in this process that began it; one that is not
+    /// (a panel that has just opened) is told of it only while that account is signed in.
     ///
     /// # Errors
     ///
     /// Returns the fault that stopped it; the record is kept.
     pub async fn status(
         &self,
+        following: bool,
         steps: &dyn DeviceSteps,
     ) -> std::result::Result<DeletionStatus, DeletionFault> {
         let nothing = DeletionStatus {
@@ -1210,7 +1230,7 @@ impl ManagedAccountDeletion {
                 closed_now: false,
             }
         };
-        let progress = self.shown(&mark, advanced.progress)?;
+        let progress = self.shown(&mark, advanced.progress, following)?;
         Ok(DeletionStatus {
             progress,
             // Only the person whose deletion it is is told of the closure.
@@ -1227,7 +1247,7 @@ impl ManagedAccountDeletion {
     ) -> std::result::Result<Advanced, DeletionFault> {
         if record.closed {
             return Ok(Advanced {
-                progress: self.settle_closed(record, true, steps, true).await?,
+                progress: self.settle_closed(record, true, steps, true, true).await?,
                 closed_now: false,
             });
         }
@@ -1249,7 +1269,9 @@ impl ManagedAccountDeletion {
                 record.done = done;
                 record.since_ms = now;
                 Ok(Advanced {
-                    progress: self.settle_closed(record, false, steps, false).await?,
+                    progress: self
+                        .settle_closed(record, false, steps, false, true)
+                        .await?,
                     closed_now: true,
                 })
             }
@@ -1259,8 +1281,9 @@ impl ManagedAccountDeletion {
     /// The account of a closed record: the closure is written (when `kept` says it is not in the
     /// store yet), the stored grant is ended, the application's own steps run, and the service is
     /// asked whether the removal is done (when `look` and it was not known). The record is dropped
-    /// once the removal is done and the steps are, or after [`KEPT_FOR_MS`], whatever the steps came
-    /// to. A write that fails is not an answer for the person: the account is closed whatever this
+    /// once the removal is done, the steps are and the grant is gone (when `last`: the caller is not
+    /// leaving it for a look that tells someone else), or after [`KEPT_FOR_MS`], whatever the steps
+    /// came to. A write that fails is not an answer for the person: the account is closed whatever this
     /// device manages to keep, and the next look does the work again.
     ///
     /// # Errors
@@ -1272,21 +1295,16 @@ impl ManagedAccountDeletion {
         kept: bool,
         steps: &dyn DeviceSteps,
         look: bool,
+        last: bool,
     ) -> std::result::Result<DeletionProgress, DeletionFault> {
         let mut written =
             (kept || self.account.write_deletion(&record).is_ok()).then(|| record.clone());
-        let ended = self
+        // A grant that could not be ended keeps the record, which is what the next look ends it by.
+        let grant_ended = self
             .account
             .end_closed_grant(&self.origin, &record.mark)
             .await
-            .unwrap_or(false);
-        if ended {
-            // The sign-in this ended is not a sign-in or out since the flow was followed.
-            let mut flow = held(&self.flow);
-            if flow.mark.is_some_and(|bound| bound.to_hex() == record.mark) {
-                flow.seen.borrow_and_update();
-            }
-        }
+            .is_ok();
         if !record.notifications && steps.notifications().await {
             record.notifications = true;
             self.keep(&record, &mut written);
@@ -1310,7 +1328,7 @@ impl ManagedAccountDeletion {
             record.done = done;
         }
         let expired = record.expired(self.account.deletion_clock());
-        if (record.done && record.settled()) || expired {
+        if (record.done && record.settled() && grant_ended && last) || expired {
             let _ = self.account.drop_deletion();
         } else {
             self.keep(&record, &mut written);
@@ -1346,7 +1364,9 @@ impl ManagedAccountDeletion {
             && !record.closed
         {
             self.follow_if_signed_in(&record.mark)?;
-            if self.shown(&record.mark, DeletionProgress::Unsettled)? != DeletionProgress::None {
+            if self.shown(&record.mark, DeletionProgress::Unsettled, true)?
+                != DeletionProgress::None
+            {
                 self.account.drop_deletion().map_err(local)?;
             }
         }

@@ -331,6 +331,8 @@ export interface FakeDeletion {
   readonly confirms: readonly { readonly code: string; readonly acknowledged: readonly string[] }[]
   /** How many times the page asked how the removal goes. */
   readonly statusReads: number
+  /** Whether each of those asks said the page was following a deletion, in order. */
+  readonly statusFollowing: readonly boolean[]
   /** How many times the page gave up on a confirmation that had no answer. */
   readonly forgets: number
   /** What reading what deleting would do answers. */
@@ -1368,6 +1370,7 @@ export function fakeHost(
   let deletionViews = 0
   let deletionCodes = 0
   let deletionStatusReads = 0
+  const deletionStatusFollowing: boolean[] = []
   let deletionForgets = 0
   const deletionConfirms: { readonly code: string; readonly acknowledged: readonly string[] }[] = []
   let deletionView: DeletionViewAnswer = { state: 'ready', preview: PLAIN_DELETION_PREVIEW }
@@ -2860,8 +2863,9 @@ export function fakeHost(
         }
       })
     },
-    accountDeletionStatus: () => {
+    accountDeletionStatus: (following) => {
       deletionStatusReads += 1
+      deletionStatusFollowing.push(following)
       if (!deletionStatusHeld) return Promise.resolve(deletionStatus)
       deletionStatusHeld = false
       return new Promise<DeletionStatusAnswer>((resolve) => {
@@ -3261,6 +3265,9 @@ export function fakeHost(
         },
         get statusReads() {
           return deletionStatusReads
+        },
+        get statusFollowing() {
+          return deletionStatusFollowing
         },
         get forgets() {
           return deletionForgets

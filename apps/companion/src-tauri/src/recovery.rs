@@ -510,29 +510,34 @@ impl Recovery {
                     kept: false,
                 };
                 self.keep(&record)?;
-                self.keep_owner(&record, account);
                 record
             }
         };
         refuse_if_blocked(account, &record.origin()?)?;
         let seed = self.seed(true)?;
         let now = now();
-        {
+        let written_here = {
             let mut store = self.store(&record, account)?;
             match store.commit(&seed, &mut BundleStore::empty(now), now).await {
-                Ok(_) => {}
+                Ok(_) => true,
                 // Something is at the locator already: this device's own first write, whose
                 // landing was never recorded. Reading it with the seed adopts it if the seed
                 // opens it, and refuses it if it does not, so another's bundle is never written
                 // over.
                 Err(RecoveryError::BundleConflict { .. }) => {
                     store.fetch(&seed).await.map_err(said)?;
+                    false
                 }
                 Err(error) => return Err(said(error)),
             }
-        }
+        };
         record.kept = true;
         self.keep(&record)?;
+        // Whose the bundle is: the account whose token wrote it. A bundle adopted from an earlier
+        // write has no owner anyone knows, and is left so.
+        if written_here {
+            self.keep_owner(&record, account);
+        }
         self.view_of(account)
     }
 
@@ -884,7 +889,7 @@ impl Recovery {
         })
     }
 
-    /// Notes whose `record` is: the account that is signed in as it is made. Nothing depends on the
+    /// Notes whose `record` is: the account that is signed in as its bundle is written. Nothing depends on the
     /// note being kept, so a failure to keep it is told to the log and not to the person: the record
     /// then has an owner no one knows.
     fn keep_owner(&self, record: &Record, account: &Account) {

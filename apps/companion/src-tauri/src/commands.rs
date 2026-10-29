@@ -4889,13 +4889,19 @@ pub async fn account_deletion_confirm(
         .await
 }
 
-/// How the removal is going, for the deletion this device holds a record of.
+/// How the removal is going, for the deletion this device holds a record of. The page says whether
+/// it is following a deletion whose result it shows.
 #[tauri::command]
 pub async fn account_deletion_status(
     account: State<'_, crate::account::AccountSlot>,
     state: State<'_, AppState>,
+    following: bool,
 ) -> Result<crate::account::deletion::StatusAnswer> {
-    account.get().await?.deletion_status(&state).await
+    account
+        .get()
+        .await?
+        .deletion_status(&state, following)
+        .await
 }
 
 /// Gives up on a confirmation that has no answer, so that this device stops asking after it.
