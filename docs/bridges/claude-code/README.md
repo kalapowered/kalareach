@@ -191,7 +191,8 @@ by the match rules of the catalogue: the worker reads every rule as a guess, a r
 the installation location outranks one that names only the executable among the packages of one
 publisher through one repository, and a program two packages recognise equally well is adopted
 bound to neither. It records the process as a native terminal
-instance and binds it to the package that recognises it in the same step. The record holds the executable and argument
+instance and, when exactly one package recognises it, binds it to that package in the same step.
+The record holds the executable and argument
 vector the kernel reports, the executable's digest, and the reason the shell's question about it was
 answered with a bypass, where the line running it asked one.
 
@@ -202,9 +203,9 @@ places the questions it asks, and the ones its programs ask, under its instance,
 else. The instance ends when its process exits, and its binding with it.
 
 Every instance, launched or adopted, is announced to the session's attached views when it starts,
-when its bridges are refused and when it ends, with its mode, its plugin and profile, and the reason
-its bridges are refused where they are. An adopted instance's announcement says that none of its
-bridges is admitted. When the session closes, its instances end with it and the views are told
+when its bridges are refused and when it ends, with its mode, its plugin where one recognised it
+and its profile, and the reason its bridges are refused where they are. An adopted instance's
+announcement says that none of its bridges is admitted. When the session closes, its instances end with it and the views are told
 before they detach.
 
 ## Admission

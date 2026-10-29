@@ -151,8 +151,8 @@ names the installation location, by the path segments the program's directory en
 one that names only the executable, when one publisher published all the packages left through one
 repository. Two products of one publisher that share a command name are told apart this way, while
 both packages are admitted. Packages of different publishers, or of one publisher's name from
-different repositories, that recognise a program equally well are a
-conflict, and neither is bound. The worker still records such a program it finds running as a
+different repositories, and packages of one publisher whose rules name no location, that recognise
+a program equally well are a conflict, and neither is bound. The worker still records such a program it finds running as a
 native terminal instance, and its announcement names the packages that tie.
 
 ### Command integration

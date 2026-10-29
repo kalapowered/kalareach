@@ -7856,7 +7856,9 @@ at another application, another environment or another user. How it is performed
 Every action records how it reached the upstream: a typed remote procedure call, an authenticated
 hook response, or terminal input. Terminal input is never an authoritative typed result, and the
 vocabulary says so rather than leaving it to a caller's judgement. An approval answered on a Claude
-Code Channels channel records the hook response, because the host's bridge delivers the verdict.
+Code Channels channel records `authenticated_hook_response`, the value for an installed hook or
+bridge, because the verdict goes to the host's own bridge and nothing in the application
+acknowledges it.
 
 ### A terminal served by a gateway
 

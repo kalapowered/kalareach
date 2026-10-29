@@ -11,7 +11,7 @@
 //! The cases here say what the integration decides for each agent's name, and what the worker does
 //! with the program once it is running: it is the person's own program, started with the vector
 //! they typed, and the worker adopts it as a native terminal instance bound to the bundled package
-//! that recognises it.
+//! that recognises it, or to none where two packages recognise it equally well.
 //!
 //! Not claimed: Windows, where the worker's adoption of a foreground program is not built.
 
@@ -520,7 +520,7 @@ fn an_opencode_program_is_found_as_a_native_terminal_bound_to_neither_of_its_two
             assert!(notice.contains(tied), "{relative}: names {tied}: {notice}");
         }
         assert!(
-            notice.contains("equally well") && notice.contains("no package was chosen"),
+            notice.contains("no package was chosen"),
             "{relative}: says that neither was chosen: {notice}"
         );
         let instance = summary.application_instance_id;

@@ -657,9 +657,11 @@ pub struct DispatchAdmission {
     pub response: crate::broker::gateway::PreparedResponse,
     /// How this answer reaches the upstream, and therefore how it is recorded.
     ///
-    /// Section 12 requires every action to record its provenance. An answer admitted here goes
-    /// over the gateway's typed connection, so it is a typed result; the app may also offer a
-    /// terminal convenience, and that one records itself as terminal input and never as this.
+    /// Section 12 requires every action to record its provenance. It follows the kind of
+    /// connection the answer goes by: a gateway connection reaches the upstream over its typed
+    /// protocol, so its answer is a typed result, and a channel is the host's own authenticated
+    /// bridge, so its answer is a bridge response. The app may also offer a terminal convenience,
+    /// and that one records itself as terminal input and never as this.
     pub provenance: ActionProvenance,
 }
 

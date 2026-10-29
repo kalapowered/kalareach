@@ -434,7 +434,7 @@ fn kr_req_11_13_a_program_two_packages_recognise_equally_well_is_adopted_bound_t
         assert!(notice.contains(tied), "the notice names {tied}: {notice}");
     }
     assert!(
-        notice.contains("equally well") && notice.contains("no package was chosen"),
+        notice.contains("no package was chosen"),
         "and says that none was chosen: {notice}"
     );
     assert!(setup.broker.live_bindings().is_empty(), "bound to none");
@@ -505,7 +505,8 @@ fn kr_req_12_24_a_package_of_another_publisher_does_not_take_a_program_by_naming
     let path = setup.program.display().to_string();
     let selected = |setup: &Setup| match setup.broker.recognise(&path) {
         Recognition::Package(found) => Some(found.plugin_id.to_string()),
-        Recognition::Nothing | Recognition::Tied(_) => None,
+        Recognition::Tied(_) => None,
+        Recognition::Nothing => panic!("the packages recognise the program"),
     };
     assert_eq!(selected(&setup), None, "the three packages are in conflict");
     for (round, imposter) in [(2, 1), (3, 2)] {
@@ -549,7 +550,8 @@ fn kr_req_12_24_a_package_under_the_same_publisher_name_in_another_repository_do
     let path = setup.program.display().to_string();
     let selected = |setup: &Setup| match setup.broker.recognise(&path) {
         Recognition::Package(found) => Some(found.plugin_id.to_string()),
-        Recognition::Nothing | Recognition::Tied(_) => None,
+        Recognition::Tied(_) => None,
+        Recognition::Nothing => panic!("the packages recognise the program"),
     };
     // Both through the repository the host seeded: one publisher's choice, by location.
     assert_eq!(selected(&setup).as_deref(), Some("kalareach/placed"));

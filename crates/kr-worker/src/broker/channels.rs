@@ -19,8 +19,8 @@
 //!    interprets it from the table's own decision destination; without one it stays recorded,
 //!    visible and unanswerable here.
 //! 4. **Answer.** An admitted answer is written on the channel by the channel's own writer, in the
-//!    order admitted, and recorded as an authenticated bridge response: the bridge delivers the
-//!    verdict, and the application made no typed call that the verdict answers. A message into the
+//!    order admitted, and recorded as the response of an installed bridge: the verdict goes to the
+//!    bridge's forwarder, and nothing in the application acknowledges it. A message into the
 //!    session, a steer, a cancellation and a package's action are refused: nothing establishes
 //!    that the application received a message and no sender stands behind one, and the table names
 //!    no method for the others.

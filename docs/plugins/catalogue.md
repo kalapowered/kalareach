@@ -383,9 +383,9 @@ refused any two that integrate one command. A program the command integration
 launched is bound to the connector its command resolved. A program found running that the
 integration did not launch is bound to the one admitted package that recognises it, which need not
 have a connector table. A program that two packages recognise equally well is adopted as a native
-terminal instance bound to neither, and its announcement names the packages that tie.
-An instance nothing recognised when it started is bound once a package that recognises its program
-is admitted.
+terminal instance bound to neither, and its announcement names the packages that tie. An instance
+nothing recognised when it started, or that tied, is bound once exactly one package that recognises
+its program is admitted, and the views are told what it is then.
 
 A binding records the hash it was made against and stays on it. An upgrade moves the installation
 and leaves every live binding where it is, because a running process was qualified against the bytes

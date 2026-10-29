@@ -412,9 +412,8 @@ impl Gateway {
     ///
     /// A connection into the gateway reaches the upstream over its own typed protocol, so its
     /// answers are typed results. A channel is the host's own authenticated bridge into the
-    /// application: what is written on it is the application's verdict delivered by the bridge,
-    /// not a reply to a call the application made, so its answers are authenticated bridge
-    /// responses. Terminal input is the other provenance section 12 names, and it never arrives
+    /// application: its answers are written to the bridge's forwarder, which nothing in the
+    /// application acknowledges, so they are recorded as responses of an installed bridge. Terminal input is the other provenance section 12 names, and it never arrives
     /// here: bytes written into a terminal are written by the input path, which records them as
     /// what they are.
     #[must_use]

@@ -87,9 +87,8 @@ fn tie_refusal(plugins: &[kr_protocol::ids::PluginId]) -> String {
         .map(kr_protocol::ids::PluginId::as_str)
         .collect();
     let named = match names.as_slice() {
-        [] => String::new(),
-        [only] => (*only).to_owned(),
-        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+        [rest @ .., last] if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => names.join(", "),
     };
     format!(
         "it was not launched through the integration, and {named} recognise it equally well, so \
@@ -246,8 +245,9 @@ impl Adoptions {
             .collect()
     }
 
-    /// Ends each adopted instance whose program has exited, and returns what ended, which the
-    /// session's views are told as it ends.
+    /// Ends each adopted instance whose program has exited, and tells what the instances are now
+    /// where a later snapshot has bound a tied program to the one package left. It returns what
+    /// the session's views are told: each end, and each such binding.
     #[must_use]
     pub fn sweep(&self) -> Vec<AgentInstanceSummary> {
         // Nothing adopted is nothing to end, and the session is not locked to find that out.
@@ -255,6 +255,7 @@ impl Adoptions {
             return Vec::new();
         }
         self.told(|adopted| {
+            let bound = self.bound_since_the_tie(adopted);
             let ended: Vec<ApplicationInstanceId> = adopted
                 .iter()
                 .filter(|(_, held)| {
@@ -265,12 +266,53 @@ impl Adoptions {
                 })
                 .map(|(id, _)| *id)
                 .collect();
-            ended
+            // An instance that ends in the same sweep is announced by its end, which carries what
+            // it was bound to.
+            let mut told: Vec<AgentInstanceSummary> = bound
                 .into_iter()
-                .filter_map(|id| adopted.remove(&id))
-                .map(|held| self.ended(held))
-                .collect()
+                .filter(|summary| !ended.contains(&summary.application_instance_id))
+                .collect();
+            told.extend(
+                ended
+                    .into_iter()
+                    .filter_map(|id| adopted.remove(&id))
+                    .map(|held| self.ended(held)),
+            );
+            told
         })
+    }
+
+    /// Updates each adopted instance that was recorded as a tie and is bound to a package now, and
+    /// returns what each is now. A snapshot that admits only one of the packages that tied binds
+    /// the instance to it, and what the views were told then names no package and says that none
+    /// was chosen, which is no longer so.
+    fn bound_since_the_tie(
+        &self,
+        adopted: &mut BTreeMap<ApplicationInstanceId, Adopted>,
+    ) -> Vec<AgentInstanceSummary> {
+        if adopted
+            .values()
+            .all(|held| held.summary.plugin_id.is_present())
+        {
+            return Vec::new();
+        }
+        let live = self.broker.live_bindings();
+        adopted
+            .values_mut()
+            .filter(|held| !held.summary.plugin_id.is_present())
+            .filter_map(|held| {
+                let release = live
+                    .iter()
+                    .find(|binding| {
+                        binding.application_instance_id == held.summary.application_instance_id
+                    })?
+                    .release
+                    .clone();
+                held.summary.plugin_id = Nullable::some(release.plugin_id);
+                held.summary.refusal = Nullable::some(ADOPTED_REFUSAL.to_owned());
+                Some(held.summary.clone())
+            })
+            .collect()
     }
 
     /// Ends every adopted instance and stops adopting, because the session is closing, and returns

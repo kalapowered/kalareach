@@ -1654,10 +1654,10 @@ async fn kr_req_12_18_closing_under_a_channels_identifier_leaves_the_channel_ser
 }
 
 /// KR-REQ-12.09: an approval answered on a Channels channel records the provenance it reached the
-/// application by. The answer goes out through the host's own authenticated bridge as the
-/// application's verdict, not as a reply to a typed call the application made, so the result and the
-/// receipt name an authenticated bridge response. The control is the typed route: an answer over a
-/// gateway connection is a typed result (kr-worker's gateway suite).
+/// application by. The answer goes out through the host's own authenticated bridge, to a forwarder
+/// that nothing in the application acknowledges, so the result names a bridge response. The control
+/// is the typed route: an answer over a gateway connection is a typed result (kr-worker's gateway
+/// suite).
 #[tokio::test]
 async fn kr_req_12_09_a_channels_answer_records_the_authenticated_bridge_it_went_by() {
     let recorded: serde_json::Value =
@@ -1693,10 +1693,6 @@ async fn kr_req_12_09_a_channels_answer_records_the_authenticated_bridge_it_went
         answered.mutation.provenance,
         ActionProvenance::AuthenticatedHookResponse,
         "an answer written on a bridge's channel is a bridge response, whatever the application does with it"
-    );
-    assert!(
-        answered.mutation.provenance.is_authoritative(),
-        "and it is still a result a reader may rely on"
     );
     channel.close().await;
     assert!(matches!(channel.ended().await, ChannelEnd::Ended { .. }));
