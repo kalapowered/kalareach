@@ -257,7 +257,7 @@ fn the_account_is_reached_through_eleven_named_commands() {
             "account_deletion_send_code",
             "account_deletion_confirm",
             "account_deletion_status",
-            "account_deletion_forget"
+            "account_deletion_hide"
         ]
     );
 }

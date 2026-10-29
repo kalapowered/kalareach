@@ -261,14 +261,14 @@ impl Account {
         })
     }
 
-    /// Gives up on a deletion whose request is not known to have run, so that this device stops
-    /// asking after it.
+    /// Closes the step that asks whether a request that may have run did: it is not offered again.
+    /// This device keeps the receipt and goes on looking, so a closure that lands later is settled.
     ///
     /// # Errors
     ///
     /// Returns a local failure when this device's records could not be read or kept.
-    pub async fn deletion_forget(&self) -> Result<StatusAnswer> {
-        Ok(match self.deletion.forget().await {
+    pub async fn deletion_hide(&self) -> Result<StatusAnswer> {
+        Ok(match self.deletion.hide().await {
             Ok(()) => StatusAnswer::None,
             Err(fault) => StatusAnswer::Problem {
                 problem: problem(fault)?,

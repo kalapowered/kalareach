@@ -24,10 +24,12 @@
 //!
 //! A record that exists says that a request of its deletion may have run and is not known to have:
 //! a request the service answered, or refused before it ran, is not kept. A later confirmation for
-//! the same account reuses the receipt. The record is removed when the closure is known and what
-//! this device has to settle is settled, when the person gives up on it ([`ManagedAccountDeletion::forget`]), and after
-//! [`KEPT_FOR_MS`]. It is never read as proof that a deletion did not go through: the service
-//! saying `unknown` to a receipt means no more than that.
+//! the same account reuses the receipt. The record is removed when the closure is known, what
+//! this device has to settle is settled and the page that follows the deletion has been told, and
+//! after [`KEPT_FOR_MS`]. The person closing the step that asks whether it went through
+//! ([`ManagedAccountDeletion::hide`]) stops it being offered and nothing more: the receipt stays, and
+//! a look that finds the closure settles the device as it would have. It is never read as proof that
+//! a deletion did not go through: the service saying `unknown` to a receipt means no more than that.
 //!
 //! # Learning that the account is closed
 //!
@@ -421,6 +423,9 @@ struct Record {
     notifications: bool,
     /// Whether the application has settled a computer's recovery record.
     recovery: bool,
+    /// Whether the person closed the step that asks whether the request went through. The record
+    /// stays, and a look still asks the service; only the step is not offered again.
+    hidden: bool,
 }
 
 impl Record {
@@ -434,6 +439,7 @@ impl Record {
             done: false,
             notifications: false,
             recovery: false,
+            hidden: false,
         }
     }
 
@@ -645,7 +651,18 @@ pub struct ManagedAccountDeletion {
     shared_lock: Option<PathBuf>,
     /// The account the deletion in front of the person is for.
     flow: Mutex<Option<AccountMark>>,
+    /// The device steps that ran in this process for the record of one receipt, for the case that
+    /// the store refused to keep their being done: they are not run again for it.
+    ran: Mutex<Option<Ran>>,
     look_every: Duration,
+}
+
+/// Which device steps ran for the record of `receipt`.
+#[derive(Clone)]
+struct Ran {
+    receipt: String,
+    notifications: bool,
+    recovery: bool,
 }
 
 impl fmt::Debug for ManagedAccountDeletion {
@@ -672,6 +689,7 @@ impl ManagedAccountDeletion {
             owner: tokio::sync::Mutex::new(()),
             shared_lock: None,
             flow: Mutex::new(None),
+            ran: Mutex::new(None),
             look_every: LOOK_EVERY,
         }
     }
@@ -1057,6 +1075,13 @@ impl ManagedAccountDeletion {
         let wanted = mark.to_hex();
         if let Some(record) = self.account.read_deletion()? {
             if record.mark == wanted && !record.closed && !record.expired(now) {
+                if record.hidden {
+                    // A new try brings the step back.
+                    self.account.write_deletion(&Record {
+                        hidden: false,
+                        ..record.clone()
+                    })?;
+                }
                 return Ok(Begun {
                     mark: wanted,
                     receipt: record.receipt,
@@ -1205,7 +1230,9 @@ impl ManagedAccountDeletion {
     /// A caller that is `following` the deletion (the page that is showing its result) is also told
     /// of a closed account's, if it is the flow in this process that began it; one that is not
     /// (a panel that has just opened) is told of it only if that account was signed in as the look
-    /// began. A look that tells no one leaves a finished record of the flow for the one that does.
+    /// began. A finished record goes only with a look that tells a page that follows it: a look that
+    /// tells no one, a look that tells a page that has only opened, and a look of another process
+    /// leave it for the page that is yet to show the result.
     ///
     /// # Errors
     ///
@@ -1229,13 +1256,14 @@ impl ManagedAccountDeletion {
         };
         let signed_in = self.follow_if_signed_in(&record.mark)?;
         let mark = record.mark.clone();
+        let hidden = record.hidden;
         let own = signed_in.as_deref() == Some(mark.as_str());
         let advanced = if owner.is_some() {
-            // The record is let go of only by a look that tells the person it is of, or when no
-            // page in this process is waiting to be told.
-            let told = own || (signed_in.is_none() && following && self.is_flow(&mark));
-            let last = told || !self.is_flow(&mark);
-            self.advance(record, steps, last).await?
+            // A finished record is let go of only by a look that tells the page that follows the
+            // deletion: until a page has shown the result it stays, and a look of another process,
+            // which cannot know what a page here is waiting for, does not take it.
+            let told = own || (signed_in.is_none() && self.is_flow(&mark));
+            self.advance(record, steps, following && told).await?
         } else {
             // Someone holds the deletion: what the record shows is all there is to say.
             Advanced {
@@ -1247,7 +1275,11 @@ impl ManagedAccountDeletion {
                 closed_now: false,
             }
         };
-        let progress = self.shown(&mark, advanced.progress, own, following)?;
+        let mut progress = self.shown(&mark, advanced.progress, own, following)?;
+        if hidden && progress == DeletionProgress::Unsettled {
+            // The person closed that step; a closure is still told when it comes.
+            progress = DeletionProgress::None;
+        }
         Ok(DeletionStatus {
             progress,
             // Only the person whose deletion it is is told of the closure.
@@ -1256,8 +1288,8 @@ impl ManagedAccountDeletion {
     }
 
     /// Brings a record as far as it can go: an account not yet known to be closed is asked about by
-    /// receipt; a closed one is settled. Called as the owner. `last` says that no look to come has
-    /// anyone to tell, so a finished record may go.
+    /// receipt; a closed one is settled. Called as the owner. `last` says that this look tells the page
+    /// that follows the deletion, so a finished record may go.
     async fn advance(
         &self,
         mut record: Record,
@@ -1300,8 +1332,8 @@ impl ManagedAccountDeletion {
     /// The account of a closed record: the closure is written (when `kept` says it is not in the
     /// store yet), the stored grant is ended, the application's own steps run, and the service is
     /// asked whether the removal is done (when `look` and it was not known). The record is dropped
-    /// once the removal is done, the steps are and the grant is gone (when `last`: the caller is not
-    /// leaving it for a look that tells someone else), or after [`KEPT_FOR_MS`], whatever the steps
+    /// once the removal is done, the steps are and the grant is gone (when `last`: the caller has told
+    /// the page that follows the deletion), or after [`KEPT_FOR_MS`], whatever the steps
     /// came to. A write that fails is not an answer for the person: the account is closed whatever this
     /// device manages to keep, and the next look does the work again.
     ///
@@ -1318,6 +1350,8 @@ impl ManagedAccountDeletion {
     ) -> std::result::Result<DeletionProgress, DeletionFault> {
         let mut written =
             (kept || self.account.write_deletion(&record).is_ok()).then(|| record.clone());
+        // Steps that ran here and were not kept as done are not run again for this record.
+        self.recall(&mut record);
         // A grant that could not be ended keeps the record, which is what the next look ends it by.
         let grant_ended = self
             .account
@@ -1326,6 +1360,7 @@ impl ManagedAccountDeletion {
             .is_ok();
         if !record.notifications && steps.notifications().await {
             record.notifications = true;
+            self.remember(&record);
             self.keep(&record, &mut written);
         }
         if !record.recovery {
@@ -1335,6 +1370,7 @@ impl ManagedAccountDeletion {
             };
             if done {
                 record.recovery = true;
+                self.remember(&record);
                 self.keep(&record, &mut written);
             }
         }
@@ -1362,6 +1398,25 @@ impl ManagedAccountDeletion {
         })
     }
 
+    /// Notes which device steps ran for `record`, in case the store will not keep it.
+    fn remember(&self, record: &Record) {
+        *held(&self.ran) = Some(Ran {
+            receipt: record.receipt.clone(),
+            notifications: record.notifications,
+            recovery: record.recovery,
+        });
+    }
+
+    /// Takes the device steps that ran in this process for `record` as done.
+    fn recall(&self, record: &mut Record) {
+        if let Some(ran) = held(&self.ran).as_ref()
+            && ran.receipt == record.receipt
+        {
+            record.notifications |= ran.notifications;
+            record.recovery |= ran.recovery;
+        }
+    }
+
     /// Writes `record` unless it is what `written` says the store holds already.
     fn keep(&self, record: &Record, written: &mut Option<Record>) {
         if written.as_ref() != Some(record) && self.account.write_deletion(record).is_ok() {
@@ -1369,25 +1424,29 @@ impl ManagedAccountDeletion {
         }
     }
 
-    /// Gives up on a deletion whose request is not known to have run: the record is removed, and
-    /// whatever that request does later, the sign-in on this device finds out when it next asks the
-    /// service for a token. A record of a closed account is left to settle.
+    /// Stops offering the step that asks whether a request that may have run did: the person closed
+    /// it. The record stays, because the request can still take effect, and a closure that lands
+    /// later is found by the next look and settled on this device like any other. A new
+    /// confirmation for the account brings the step back. A record of a closed account is left to
+    /// settle.
     ///
     /// # Errors
     ///
     /// Returns [`DeletionFault::InProgress`] while the deletion is held, and the fault of this
     /// device's own records.
-    pub async fn forget(&self) -> std::result::Result<(), DeletionFault> {
+    pub async fn hide(&self) -> std::result::Result<(), DeletionFault> {
         let _owner = self.own().await?;
-        if let Some(record) = self.account.read_deletion().map_err(local)?
+        if let Some(mut record) = self.account.read_deletion().map_err(local)?
             && !record.closed
+            && !record.hidden
         {
             let signed_in = self.follow_if_signed_in(&record.mark)?;
             let own = signed_in.as_deref() == Some(record.mark.as_str());
             if self.shown(&record.mark, DeletionProgress::Unsettled, own, true)?
                 != DeletionProgress::None
             {
-                self.account.drop_deletion().map_err(local)?;
+                record.hidden = true;
+                self.account.write_deletion(&record).map_err(local)?;
             }
         }
         Ok(())

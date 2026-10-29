@@ -284,7 +284,7 @@ fn invoke(account: &Arc<Account>, command: &str, args: Value) -> Value {
             companion_tauri::commands::account_deletion_send_code,
             companion_tauri::commands::account_deletion_confirm,
             companion_tauri::commands::account_deletion_status,
-            companion_tauri::commands::account_deletion_forget,
+            companion_tauri::commands::account_deletion_hide,
         ])
         .build(mock_context(noop_assets()))
         .expect("an application on the mock runtime");
@@ -518,7 +518,8 @@ async fn a_status_asked_after_a_lost_answer_says_it_is_unsettled_and_nothing_is_
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_person_can_give_up_on_a_confirmation_that_has_no_answer() {
+async fn the_person_can_close_the_step_of_a_confirmation_that_has_no_answer_and_the_receipt_stays()
+{
     let rig = rig().await;
     let account = Arc::clone(&rig.account);
     let confirmed = tokio::task::spawn_blocking(move || {
@@ -533,11 +534,12 @@ async fn the_person_can_give_up_on_a_confirmation_that_has_no_answer() {
     assert_eq!(confirmed["state"], "unsettled");
 
     let account = Arc::clone(&rig.account);
-    let given_up =
-        tokio::task::spawn_blocking(move || invoke(&account, "account_deletion_forget", json!({})))
+    let closed =
+        tokio::task::spawn_blocking(move || invoke(&account, "account_deletion_hide", json!({})))
             .await
             .expect("joined");
-    assert_eq!(given_up["state"], "none");
+    assert_eq!(closed["state"], "none");
+    rig.wire.then(&["status_unknown"]);
     let account = Arc::clone(&rig.account);
     let status = tokio::task::spawn_blocking(move || {
         invoke(
@@ -550,6 +552,13 @@ async fn the_person_can_give_up_on_a_confirmation_that_has_no_answer() {
     .expect("joined");
     assert_eq!(status["state"], "none");
     assert!(session(&rig), "the sign-in is as it was");
+    assert!(
+        rig.store
+            .get(&SecretName::new("account/deletion").expect("a name"))
+            .expect("a read")
+            .is_some(),
+        "the request can still take effect, so the receipt stays"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
