@@ -23,9 +23,16 @@ pub fn resolve(requested: Option<&str>) -> String {
 /// session uses too. A value that names nothing runnable is ignored rather than launched.
 #[must_use]
 pub fn configured() -> Option<String> {
-    let configured = std::env::var("SHELL").ok()?;
-    let configured = configured.trim();
-    (!configured.is_empty() && Path::new(configured).is_file()).then(|| configured.to_owned())
+    named_shell(&std::env::var("SHELL").ok()?)
+}
+
+/// The shell a configured value names: an absolute path to a file, and nothing else. A relative
+/// value would name a file in whatever directory the worker happens to run in.
+fn named_shell(value: &str) -> Option<String> {
+    let path = Path::new(value.trim());
+    (path.is_absolute() && path.is_file())
+        .then(|| path.to_str().map(str::to_owned))
+        .flatten()
 }
 
 /// The shell a platform falls back to when nothing else names one.
@@ -41,8 +48,19 @@ pub fn platform_default() -> String {
     }
     #[cfg(not(unix))]
     {
-        windows_default(&WindowsPlaces::from_environment(), Path::is_file)
+        windows_default(&WindowsPlaces::from_environment(), launchable)
     }
+}
+
+/// Whether a Windows program can be started from this path.
+///
+/// PowerShell 7 installed from the Store appears on the search path as an application execution
+/// alias. Opening one fails, so a test that opens the file calls it missing; the entry itself is
+/// a file the system starts, so the entry is read when the file cannot be.
+#[cfg(not(unix))]
+fn launchable(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+        || std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
 }
 
 /// Where the Windows default shell is looked for.
@@ -79,22 +97,23 @@ impl WindowsPlaces {
 
 /// Returns the shell a Windows session starts when nothing names one.
 ///
-/// PowerShell 7 comes first: `pwsh.exe` on the search path, then the directory its installer
-/// uses. Windows PowerShell 5.1, which every supported Windows has, is next, and the command
+/// PowerShell 7 comes first: the directory its installer uses, which names the version and which
+/// an administrator owns, then `pwsh.exe` on the search path for an installation elsewhere (a
+/// per-user one). Windows PowerShell 5.1, which every supported Windows has, is next, and the command
 /// interpreter is the last resort, so a machine that has either of the others never gets it.
 /// A search-path entry that is empty or relative is not searched: it would name the directory the
 /// worker happens to run in, and a program placed there would become the user's shell.
 #[must_use]
 pub fn windows_default(places: &WindowsPlaces, is_file: impl Fn(&Path) -> bool) -> String {
     let seven = places
-        .search_path
+        .program_files
         .iter()
-        .map(|directory| directory.join("pwsh.exe"))
+        .map(|directory| directory.join("PowerShell").join("7").join("pwsh.exe"))
         .chain(
             places
-                .program_files
+                .search_path
                 .iter()
-                .map(|directory| directory.join("PowerShell").join("7").join("pwsh.exe")),
+                .map(|directory| directory.join("pwsh.exe")),
         );
     let five = places.system_root.iter().map(|root| {
         root.join("System32")
@@ -171,13 +190,13 @@ mod tests {
         let everything = [seven_on_the_path(), seven_installed(), five()];
         assert_eq!(
             windows_default(&places(), present(&everything)),
-            seven_on_the_path().to_str().unwrap(),
-            "the search path is read first"
+            seven_installed().to_str().unwrap(),
+            "the directory its installer uses is read first"
         );
         assert_eq!(
-            windows_default(&places(), present(&everything[1..])),
-            seven_installed().to_str().unwrap(),
-            "and then the directory its installer uses"
+            windows_default(&places(), present(&[seven_on_the_path(), five()])),
+            seven_on_the_path().to_str().unwrap(),
+            "and then the search path, for an installation elsewhere"
         );
     }
 
@@ -214,10 +233,41 @@ mod tests {
             search_path: vec![PathBuf::new(), relative, PathBuf::from(".")],
             ..places()
         };
+        let in_the_current_directory = Path::new(".").join("pwsh.exe");
         assert_eq!(
             windows_default(&places, |path| path == planted
-                || path == Path::new("pwsh.exe")),
+                || path == Path::new("pwsh.exe")
+                || path == in_the_current_directory),
             places.command_interpreter.expect("the places name one")
+        );
+    }
+
+    /// A configured shell is an absolute path to a file: a relative one would name whatever the
+    /// worker's current directory holds.
+    #[test]
+    fn a_configured_shell_is_an_absolute_path_to_a_file() {
+        let this_program = std::env::current_exe().expect("this test's program");
+        assert_eq!(
+            named_shell(this_program.to_str().expect("text")),
+            this_program.to_str().map(str::to_owned)
+        );
+        let name = this_program
+            .file_name()
+            .expect("a name")
+            .to_str()
+            .expect("text");
+        assert_eq!(named_shell(name), None, "a bare name");
+        assert_eq!(named_shell(""), None, "nothing");
+        assert_eq!(
+            named_shell(
+                this_program
+                    .parent()
+                    .expect("a directory")
+                    .to_str()
+                    .expect("text")
+            ),
+            None,
+            "a directory"
         );
     }
 }
