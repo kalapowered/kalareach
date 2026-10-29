@@ -106,6 +106,8 @@ fn numbered_lines(text: &str) -> usize {
 struct Attached {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     output: ConsoleOutput,
+    /// The console's input, as a terminal emulator writes it.
+    keyboard: Arc<Mutex<Box<dyn Write + Send>>>,
     /// Held so the console stays open for as long as the command runs.
     _master: Box<dyn portable_pty::MasterPty + Send>,
 }
@@ -146,8 +148,21 @@ impl Attached {
         Self {
             child,
             output,
+            keyboard: writer,
             _master: pty.master,
         }
+    }
+
+    /// Writes `bytes` to the console's input the way a terminal emulator hosting it does.
+    fn press(&self, bytes: &[u8]) {
+        let mut keyboard = self
+            .keyboard
+            .lock()
+            .expect("the console input is not poisoned");
+        keyboard
+            .write_all(bytes)
+            .expect("writes the console's input");
+        keyboard.flush().expect("flushes the console's input");
     }
 
     /// Waits until `count` finds at least `times` of what it counts in the console's output; it
@@ -259,4 +274,56 @@ async fn a_console_attached_with_kr_attach_shows_what_the_session_writes() {
         "{}",
         String::from_utf8_lossy(&closed.stdout)
     );
+}
+
+/// KR-REQ-08.53: a key typed at the console `kr attach` runs in reaches the session's application
+/// as the key the console reported, with its modifier state, and not as the bytes the console
+/// would have spelled it with.
+///
+/// The session's root shell starts PowerShell, which reads one key with the console's own call and
+/// prints what it was given. The console that `kr attach` runs in is written Shift and Return in the
+/// documented record sequence, which its host turns into the console record of that key. Spelled as
+/// legacy input the key is a bare carriage return, which the application reads back as Return with
+/// nothing held; an application that is told Shift was held was given the record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_key_typed_at_an_attached_console_reaches_the_application_as_the_console_reported_it() {
+    let host = WorkerHost::start().await;
+    let (session_id, dimensions) = host
+        .kr_new(&["--shell-mode", "native_compat", "--shell", &command_shell()])
+        .await
+        .session();
+    let environment = host.tree.environment();
+    let mut typist = WorkerTerminal::attach(&environment, session_id, dimensions).await;
+    // The line the shell echoes holds the two halves of each marker apart, so that only what the
+    // program prints holds a whole one.
+    typist
+        .type_line(
+            "powershell -NoProfile -Command \"Write-Host ('kr-rea' + 'dy.'); \
+             $key = [Console]::ReadKey($true); \
+             Write-Host (('kr-key:{0}:{1}:{2}:kr-' -f [int]$key.Key, [int]$key.KeyChar, $key.Modifiers) + 'end'); \
+             Start-Sleep -Seconds 300\"",
+        )
+        .await;
+    typist
+        .shown("kr-ready.", "the application is waiting for a key")
+        .await;
+
+    let mut console = Attached::start(&host, &session_id.to_string(), dimensions);
+    console.shows(
+        "the session's screen",
+        |text| text.matches("kr-ready.").count(),
+        1,
+    );
+    // Shift and Return: virtual key 13, scan code 0x1c, the carriage return, Shift held.
+    console.press(b"\x1b[13;28;13;1;16;1_");
+    let seen = typist
+        .shown(":kr-end", "the application printed the key it was given")
+        .await;
+    assert!(
+        seen.contains("kr-key:13:13:Shift:kr-end"),
+        "the application was given Return with Shift held: {seen:?}"
+    );
+
+    let _ = console.child.kill();
+    drop(typist);
 }
