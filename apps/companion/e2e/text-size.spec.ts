@@ -761,7 +761,7 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
     ['the attention inbox', 'attention', '.m-row'],
     ['the session list', 'sessions', '.m-row'],
     ['the hosts', 'hosts', '.m-row'],
-    ['the account', 'account', '.account-panel > .card']
+    ['the account', 'account', '.account-panel-body > .card']
   ] as const
 
   for (const surface of ['ios', 'android'] as const) {
