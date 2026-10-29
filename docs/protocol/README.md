@@ -814,9 +814,11 @@ cancelling belongs to the reader, in the step where it reads its mailbox: the fr
 endpoint are ordered, the worker revokes the transaction when its hold expires, and the reader
 checks for a revocation that it has read in the same atomic step in which it would install. One
 still in transit is not seen, and the reader's acceptance that follows is recorded as a late
-installation. The caller's answer then waits for the reader's word: `EDITOR_BUSY` when it
-installed nothing, the installed result when it had already installed, and `OUTCOME_UNKNOWN` when
-the reader can no longer answer at all. The host installs no command by any other means.
+installation. The caller's answer then waits for the reader's word: the code of the reader's own
+reason when it installed nothing (`EDITOR_BUSY` for a revocation and for every transition failure,
+`DRAFT_CONFLICT` where the editor's own state had moved), the installed result when it had already
+installed, and `OUTCOME_UNKNOWN` when the reader can no longer answer at all. The host installs no
+command by any other means.
 
 Section 23's other preconditions of `shell.launch`, the current input lease, the qualified root
 editor with its fence and empty prompt, the working-directory revision and the launch profile, are
