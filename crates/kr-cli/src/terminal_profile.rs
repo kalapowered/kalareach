@@ -85,17 +85,13 @@ fn this_user() -> Result<ProfileHome> {
 }
 
 /// The argument vector a profile runs: this installation's own `kr`, through the store's
-/// `current` where it is a release of one, so an update keeps what the profile names.
+/// `current` where it is a release of one, so an update keeps what the profile names. The release
+/// this process is would be gone once an update replaced it, which a window opened later must
+/// not meet, so the program named is the one an update replaces (`stable`), not this release's own.
 fn command() -> Result<Vec<String>> {
-    let program = match kr_ipc::install::this_process() {
-        Ok(running) => running.stable(kr_ipc::install::Program::Kr),
-        Err(_) => std::env::current_exe().map_err(|error| {
-            CliError::Other(shown!(
-                "kr cannot find its own program: {}",
-                Shown::io(&error)
-            ))
-        })?,
-    };
+    let running = kr_ipc::install::this_process()
+        .map_err(|error| CliError::Other(crate::update::said(error)))?;
+    let program = running.stable(kr_ipc::install::Program::Kr);
     let program = program.to_str().ok_or_else(|| {
         CliError::Usage(shown!(
             "{} is not text, which a terminal application's profile cannot name",
