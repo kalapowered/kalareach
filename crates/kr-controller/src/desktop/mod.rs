@@ -110,7 +110,19 @@ mod platform {
     /// So the answer names the mechanism and says the lifetime is not established. A definite
     /// answer this host has not established would be worse than none, because somebody would plan
     /// around it.
+    ///
+    /// A Mac with no graphical login session has no domain to put a job in, so this host uses a
+    /// detached process there, and says so rather than naming a mechanism it did not select.
     pub(super) fn headless_persistence() -> (LogoutPersistence, &'static str, &'static str) {
+        if !crate::supervision::LaunchdSupervisor::available() {
+            return (
+                LogoutPersistence::NoServiceManager,
+                "a detached process, reparented to the system's first process",
+                "This host has no graphical login session to put a job in, so a session's worker \
+                 is a detached process rather than a launchd job. What a logout does to it is the \
+                 platform's own behaviour and this host does not claim to know it.",
+            );
+        }
         (
             LogoutPersistence::NotEstablished,
             "launchd, a per-user job in the background domain",

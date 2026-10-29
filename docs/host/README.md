@@ -1223,9 +1223,10 @@ that started perfectly well.
 The profile decides which login context a worker is started in, not only which variables it is
 given. On macOS a desktop-bound worker's job goes into the user's graphical domain and a headless
 one's into the background domain, because a headless worker inside the graphical login would have
-that login's access however little of its environment it was given. On Windows a worker is a child
-of this daemon and runs in the logon session this daemon runs in, so a headless session there is one
-with no desktop handles and no promise about the desktop rather than one that cannot reach it.
+that login's access however little of its environment it was given. On Windows the starter of
+the environment's scheduled task creates the worker in the logon session of the user the task logs
+on as, so a headless session there is one with no desktop handles and no promise about the desktop
+rather than one that cannot reach it.
 
 Linux places a job in no login session at all: a user service manager started at boot has no
 display, no compositor socket and no session message bus, because those belong to a graphical login
