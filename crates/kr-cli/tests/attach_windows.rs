@@ -276,6 +276,30 @@ async fn a_console_attached_with_kr_attach_shows_what_the_session_writes() {
     );
 }
 
+/// A session whose application is PowerShell running `script`, with a terminal attached to it that
+/// has seen the application say it is ready.
+///
+/// The line the shell echoes holds the two halves of each marker apart, so that only what the
+/// program prints holds a whole one, and `script` prints `kr-ready.` when it waits for keys.
+async fn session_waiting_for_keys(
+    host: &WorkerHost,
+    script: &str,
+) -> (WorkerTerminal, kr_protocol::ids::SessionId, Dimensions) {
+    let (session_id, dimensions) = host
+        .kr_new(&["--shell-mode", "native_compat", "--shell", &command_shell()])
+        .await
+        .session();
+    let environment = host.tree.environment();
+    let mut typist = WorkerTerminal::attach(&environment, session_id, dimensions).await;
+    typist
+        .type_line(&format!("powershell -NoProfile -Command \"{script}\""))
+        .await;
+    typist
+        .shown("kr-ready.", "the application is waiting for a key")
+        .await;
+    (typist, session_id, dimensions)
+}
+
 /// KR-REQ-08.53: a key typed at the console `kr attach` runs in reaches the session's application
 /// as the key the console reported, with its modifier state, and not as the bytes the console
 /// would have spelled it with.
@@ -288,25 +312,14 @@ async fn a_console_attached_with_kr_attach_shows_what_the_session_writes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_key_typed_at_an_attached_console_reaches_the_application_as_the_console_reported_it() {
     let host = WorkerHost::start().await;
-    let (session_id, dimensions) = host
-        .kr_new(&["--shell-mode", "native_compat", "--shell", &command_shell()])
-        .await
-        .session();
-    let environment = host.tree.environment();
-    let mut typist = WorkerTerminal::attach(&environment, session_id, dimensions).await;
-    // The line the shell echoes holds the two halves of each marker apart, so that only what the
-    // program prints holds a whole one.
-    typist
-        .type_line(
-            "powershell -NoProfile -Command \"Write-Host ('kr-rea' + 'dy.'); \
-             $key = [Console]::ReadKey($true); \
-             Write-Host (('kr-key:{0}:{1}:{2}:kr-' -f [int]$key.Key, [int]$key.KeyChar, $key.Modifiers) + 'end'); \
-             Start-Sleep -Seconds 300\"",
-        )
-        .await;
-    typist
-        .shown("kr-ready.", "the application is waiting for a key")
-        .await;
+    let (mut typist, session_id, dimensions) = session_waiting_for_keys(
+        &host,
+        "Write-Host ('kr-rea' + 'dy.'); \
+         $key = [Console]::ReadKey($true); \
+         Write-Host (('kr-key:{0}:{1}:{2}:kr-' -f [int]$key.Key, [int]$key.KeyChar, $key.Modifiers) + 'end'); \
+         Start-Sleep -Seconds 300",
+    )
+    .await;
 
     let mut console = Attached::start(&host, &session_id.to_string(), dimensions);
     console.shows(
@@ -322,6 +335,52 @@ async fn a_key_typed_at_an_attached_console_reaches_the_application_as_the_conso
     assert!(
         seen.contains("kr-key:13:13:Shift:kr-end"),
         "the application was given Return with Shift held: {seen:?}"
+    );
+
+    let _ = console.child.kill();
+    drop(typist);
+}
+
+/// KR-REQ-08.53: the records of a key going down and coming up, and of a modifier on its own,
+/// reach the application one by one, each in the console's own record, as the console reported them
+/// one by one.
+///
+/// Legacy input has no spelling for a key coming up or for Shift alone, so an application that is
+/// told of all four was given records. The application reads four events with the console's own
+/// call, key releases included, and prints what each was. The console that `kr attach` runs in is
+/// written the four in separate writes, which is how a person's key presses reach a console: Shift
+/// going down, the letter going down, the letter coming up, Shift coming up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_releases_and_modifiers_of_an_attached_console_reach_the_application_one_by_one() {
+    let host = WorkerHost::start().await;
+    let (mut typist, session_id, dimensions) = session_waiting_for_keys(
+        &host,
+        "Write-Host ('kr-rea' + 'dy.'); \
+         $seen = @(); \
+         for ($i = 0; $i -lt 4; $i++) { \
+           $key = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown,IncludeKeyUp'); \
+           $seen += ('{0}{1}' -f $key.VirtualKeyCode, $(if ($key.KeyDown) { 'd' } else { 'u' })) }; \
+         Write-Host (('kr-events:' + ($seen -join ',') + ':kr-') + 'end'); \
+         Start-Sleep -Seconds 300",
+    )
+    .await;
+
+    let mut console = Attached::start(&host, &session_id.to_string(), dimensions);
+    console.shows(
+        "the session's screen",
+        |text| text.matches("kr-ready.").count(),
+        1,
+    );
+    console.press(b"\x1b[16;42;0;1;16;1_");
+    console.press(b"\x1b[65;30;65;1;16;1_");
+    console.press(b"\x1b[65;30;65;0;16;1_");
+    console.press(b"\x1b[16;42;0;0;0;1_");
+    let seen = typist
+        .shown(":kr-end", "the application printed the events it was given")
+        .await;
+    assert!(
+        seen.contains("kr-events:16d,65d,65u,16u:kr-end"),
+        "the application was given Shift and A going down and coming up: {seen:?}"
     );
 
     let _ = console.child.kill();
