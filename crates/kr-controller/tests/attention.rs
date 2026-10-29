@@ -2102,7 +2102,12 @@ async fn a_revocation_before_the_store_s_transaction_writes_nothing() {
     assert!(
         controller
             .attention()
-            .retained(&owner(), &mutation, Method::AttentionAcknowledge)
+            .retained(
+                &Caller::Owner,
+                &owner(),
+                &mutation,
+                Method::AttentionAcknowledge
+            )
             .is_none(),
         "no record of the action was kept"
     );
@@ -2416,7 +2421,12 @@ async fn a_value_the_store_could_not_write_down_as_it_was_given_is_refused() {
     assert!(
         host.controller()
             .attention()
-            .retained(&visited.actor_id, &refused, Method::VisitAcknowledge)
+            .retained(
+                &Caller::Owner,
+                &visited.actor_id,
+                &refused,
+                Method::VisitAcknowledge
+            )
             .is_none(),
         "no record of the action was kept"
     );
@@ -2642,7 +2652,12 @@ async fn a_deadline_that_passes_while_the_action_waits_for_the_store_refuses_it(
     assert!(
         controller
             .attention()
-            .retained(&owner(), &mutation, Method::AttentionAcknowledge)
+            .retained(
+                &Caller::Owner,
+                &owner(),
+                &mutation,
+                Method::AttentionAcknowledge
+            )
             .is_none()
     );
     host.stop().await;

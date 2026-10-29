@@ -1670,8 +1670,9 @@ fn a_turn_s_change_set_carries_its_own_version() {
 // ----- Changed since the last visit --------------------------------------------------------
 
 /// KR-REQ-10.49: the changed-since-last-visit view of a viewer whose history starts after some of
-/// the changes does not hold them. The owner is shown all of them, and the cursors of the view are
-/// the same, so a viewer that acknowledges what it was shown has seen up to the same place.
+/// the changes does not hold them. The owner is shown all of them, and the view of the viewer ends
+/// after the last change, as the owner's does, so a viewer that acknowledges what it was shown has
+/// seen up to the same place.
 #[test]
 fn a_viewer_is_shown_the_changes_its_history_reaches_and_no_earlier_ones() {
     let mut attention = engine();
@@ -1724,8 +1725,16 @@ fn a_viewer_is_shown_the_changes_its_history_reaches_and_no_earlier_ones() {
         "{:?}",
         later.result.changes
     );
-    assert_eq!(later.result.from_cursor.get(), all.from_cursor);
-    assert_eq!(later.result.to_cursor.get(), all.to_cursor);
+    assert_eq!(
+        later.result.from_cursor, later.result.changes[0].cursor,
+        "the view starts at the first change the viewer is shown"
+    );
+    assert_eq!(
+        later.result.to_cursor.get(),
+        later.result.changes[3].cursor.get() + 1,
+        "and ends after the last, which is the end of the whole log"
+    );
+    assert_eq!(all.to_cursor, 6);
 
     // A page holds the changes the viewer reaches, so earlier ones take none of its places.
     let page = attention
@@ -1802,13 +1811,15 @@ fn a_change_the_viewer_does_not_reach_at_the_end_of_the_log_leaves_nothing_more_
         .expect("the store is this owner's");
     assert_eq!(
         page.result.to_cursor.get(),
-        6,
+        page.result.changes[3].cursor.get() + 1,
         "and the view ends after the last change it was shown"
     );
-    assert!(
-        page.result.to_cursor.get() < all.to_cursor,
+    assert_eq!(
+        page.result.to_cursor.get() - page.result.from_cursor.get(),
+        4,
         "not where the whole log does, which counts a change it may not be told of"
     );
+    assert_eq!(all.to_cursor, 8);
 }
 
 /// A device that sees session 1, whose history reaches back to `history_from_ms`.
@@ -1914,6 +1925,60 @@ fn a_bounded_viewer_is_not_shown_how_many_changes_came_before_its_history() {
     assert!(
         none.from_cursor.get() >= 1 << 60 && none.to_cursor == none.from_cursor,
         "{none:?}"
+    );
+}
+
+/// KR-REQ-10.49: a viewer with a bound sends back the number it was shown and the store takes the
+/// log's own cursor for it. A number that is not one it was given is none: the log's own cursor,
+/// one below the offset, and one past where the log ends. The owner, and a viewer whose history
+/// reaches every moment, are not numbered.
+#[test]
+fn a_number_a_viewer_is_shown_is_the_one_it_sends_back() {
+    let mut attention = engine();
+    for sequence in 1_u64..=3 {
+        attention
+            .apply(
+                &turn_completed(sequence, 1_000 * sequence, sequence),
+                reading(0),
+            )
+            .expect("the store records the decision");
+    }
+    let admits_one = |candidate: SessionId| candidate == session(1);
+    let viewer = device_from(&admits_one, NOON + 2_000);
+    let numbering = attention
+        .numbering(&viewer, session(1))
+        .expect("the store is this owner's")
+        .expect("a viewer with a bound is numbered");
+    // Reaches the last two turns: the log's cursors 2 to 5, and the log ends at 6.
+    for cursor in 2..=6 {
+        assert_eq!(numbering.cursor(numbering.shown(cursor)), Some(cursor));
+    }
+    assert_eq!(
+        numbering.shown(0),
+        numbering.shown(2),
+        "no number is shown for a place before the viewer's history"
+    );
+    assert_eq!(numbering.cursor(4), None, "the log's own cursor");
+    assert_eq!(
+        numbering.cursor(numbering.shown(6) + 1),
+        None,
+        "past the end"
+    );
+    assert_eq!(numbering.cursor(numbering.shown(2) - 1_000_000_000), None);
+
+    assert!(
+        attention
+            .numbering(&Viewer::Owner, session(1))
+            .expect("the store is this owner's")
+            .is_none(),
+        "the owner is shown the log's own"
+    );
+    assert!(
+        attention
+            .numbering(&device_from(&admits_one, 0), session(1))
+            .expect("the store is this owner's")
+            .is_none(),
+        "so is a viewer whose history reaches every moment"
     );
 }
 
@@ -2037,7 +2102,13 @@ fn more_is_true_only_while_a_change_the_viewer_reaches_follows() {
         let page = attention
             .changed(&phone, &viewer, session(1), 1, 0, Content::Narrowed)
             .expect("the store is this owner's");
-        let next = page.result.to_cursor.get();
+        // The number the viewer was shown is the one it sends back, and the store takes the log's.
+        let next = attention
+            .numbering(&viewer, session(1))
+            .expect("the store is this owner's")
+            .expect("a viewer with a bound is numbered")
+            .cursor(page.result.to_cursor.get())
+            .expect("the number was given to this viewer");
         let more = page.result.more;
         pages.push((page.result.changes.len(), more));
         attention
@@ -2075,7 +2146,16 @@ fn an_acknowledgement_by_a_viewer_with_a_bound_is_stored_no_further_than_it_was_
     let next = attention
         .changed(&phone, &viewer, session(1), 100, 0, Content::Narrowed)
         .expect("the store is this owner's");
-    assert_eq!(next.result.from_cursor.get(), 4);
+    let numbering = attention
+        .numbering(&viewer, session(1))
+        .expect("the store is this owner's")
+        .expect("a viewer with a bound is numbered");
+    assert_eq!(
+        next.result.from_cursor.get(),
+        numbering.shown(4),
+        "the next view starts where it was stored, in the numbers the viewer is shown"
+    );
+    assert_eq!(numbering.cursor(next.result.from_cursor.get()), Some(4));
 
     // A viewer that reaches every moment is stored where it says, up to the end of the log.
     let everyone = actor("device:tablet");

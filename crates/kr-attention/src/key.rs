@@ -43,6 +43,11 @@ pub const DIGEST_CHARS: usize = 32;
 /// How many bytes the secret a store derives its keys under is.
 pub const SECRET_BYTES: usize = 32;
 
+/// The least offset a reader's cursors are numbered by ([`KeySecret::cursor_offset`]): 2^60. A
+/// cursor counts changes one session's log recorded, so no log reaches an offset's size, and a
+/// number a reader sends back that is not an offset's sum with a cursor is told by that.
+pub const CURSOR_OFFSET_FLOOR: u64 = 1 << 60;
+
 /// The secret one store derives its keys under.
 ///
 /// It is random, it is written down with the rest of the state, and it never leaves the host: a
@@ -106,6 +111,30 @@ impl KeySecret {
             Hmac::<Sha256>::new_from_slice(&self.0).expect("this length is one HMAC accepts");
         mac.update(subject.as_bytes());
         crate::event::Fingerprint::from_bytes(mac.finalize().into_bytes().into())
+    }
+
+    /// Returns the offset that numbers one session's cursors for readers whose history reaches back
+    /// to `history_from_ms`.
+    ///
+    /// The offset is a keyed digest of the session and the moment, drawn into
+    /// `[CURSOR_OFFSET_FLOOR, 2 * CURSOR_OFFSET_FLOOR)`, so it is the same whenever it is asked for
+    /// under this secret, another under another store's, and not one a reader can work out. A
+    /// cursor a reader is shown is the log's own plus this offset.
+    #[must_use]
+    pub fn cursor_offset(
+        &self,
+        session_id: kr_protocol::ids::SessionId,
+        history_from_ms: u64,
+    ) -> u64 {
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(&self.0).expect("this length is one HMAC accepts");
+        mac.update(b"kr-attention/cursor-offset/1");
+        mac.update(session_id.to_string().as_bytes());
+        mac.update(&history_from_ms.to_be_bytes());
+        let digest = mac.finalize().into_bytes();
+        let mut head = [0u8; 8];
+        head.copy_from_slice(&digest[..8]);
+        CURSOR_OFFSET_FLOOR + u64::from_be_bytes(head) % CURSOR_OFFSET_FLOOR
     }
 
     /// Returns the form of `subject` a key carries: a digest under this secret, and nothing else.
@@ -228,6 +257,36 @@ mod tests {
             approval
                 .as_str()
                 .starts_with("attention.pending_approval|~")
+        );
+    }
+
+    /// KR-REQ-10.49: the offset a reader's cursors are numbered by is the same whenever it is asked
+    /// for under one secret, one session and one moment, another for any other, and always in the
+    /// range no log's cursor reaches.
+    #[test]
+    fn a_cursor_offset_is_fixed_by_the_secret_the_session_and_the_moment() {
+        use kr_protocol::ids::SessionId;
+        use kr_protocol::scalars::Uuid;
+
+        let secret = KeySecret::from_bytes([7; SECRET_BYTES]);
+        let session = SessionId::new(Uuid::from_bytes([1; 16]));
+        let offset = secret.cursor_offset(session, 5_000);
+        assert_eq!(offset, secret.cursor_offset(session, 5_000));
+        assert!((CURSOR_OFFSET_FLOOR..2 * CURSOR_OFFSET_FLOOR).contains(&offset));
+        assert_ne!(
+            offset,
+            secret.cursor_offset(session, 5_001),
+            "another moment"
+        );
+        assert_ne!(
+            offset,
+            secret.cursor_offset(SessionId::new(Uuid::from_bytes([2; 16])), 5_000),
+            "another session"
+        );
+        assert_ne!(
+            offset,
+            KeySecret::from_bytes([8; SECRET_BYTES]).cursor_offset(session, 5_000),
+            "another store"
         );
     }
 

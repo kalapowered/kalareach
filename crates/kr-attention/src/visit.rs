@@ -432,6 +432,17 @@ impl SessionLog {
         }
     }
 
+    /// The lowest cursor of a retained change that `reaches` covers, or where the log ends when
+    /// none is, and where the log ends.
+    fn numbering_bounds(&self, reaches: &dyn Fn(TimestampMs) -> bool) -> (u64, u64) {
+        let floor = self
+            .log
+            .iter()
+            .find(|change| reaches(change.at_ms))
+            .map_or(self.next_cursor, |change| change.cursor);
+        (floor, self.next_cursor)
+    }
+
     fn summary_source(&self, actor: &ActorId) -> SummarySource {
         let from = self.visits.get(actor).map_or(0, |visit| visit.cursor);
         SummarySource {
@@ -596,6 +607,17 @@ impl Visits {
             },
             |log| log.changed_since(session_id, actor, max_changes, oldest_output_cursor, reach),
         )
+    }
+
+    /// Returns where one session's log starts for a reader and where it ends: the lowest cursor of
+    /// a retained change `reach` covers, or the end of the log when it covers none, and the end.
+    ///
+    /// A session with no log yet starts and ends at 0.
+    #[must_use]
+    pub fn numbering_bounds(&self, session_id: SessionId, reach: Reach<'_>) -> (u64, u64) {
+        self.sessions
+            .get(&session_id)
+            .map_or((0, 0), |log| log.numbering_bounds(reach.reaches))
     }
 
     /// Returns what a summary of what changed in one session since one actor's last visit is

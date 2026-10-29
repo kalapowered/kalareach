@@ -655,10 +655,14 @@ impl RemoteConnection {
                 .await;
         }
         if held.is_none() && crate::attention::AttentionModule::serves(entry.method) {
+            let caller = crate::attention::Caller::device(
+                &decided.acting.grant,
+                self.started_at_ms(&decided.acting),
+            );
             held = self
                 .controller
                 .attention()
-                .retained(&actor_id, mutation, entry.method);
+                .retained(&caller, &actor_id, mutation, entry.method);
         }
         // An owner device's own confirmation answers are retained by the pairing service, and a
         // repeat of one over a new connection is answered from there.

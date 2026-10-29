@@ -51,7 +51,7 @@ use kr_protocol::attention::{
     AttentionAcknowledgeResult, AttentionGap, AttentionItem, AttentionItemRevision, AttentionKey,
     AttentionReadParams, AttentionReadResult, AttentionRule, AttentionSource, LogViewState,
     MAX_ATTENTION_ITEMS, MAX_RETAINED_ACTORS, QuietHours, ReviewAcknowledgeResult, ReviewState,
-    ReviewSubject, SemanticChangeKind, VisitAcknowledgeResult, VisitChangedResult,
+    ReviewSubject, SemanticChange, SemanticChangeKind, VisitAcknowledgeResult, VisitChangedResult,
 };
 use kr_protocol::ids::{ActorId, SessionId};
 use kr_protocol::scalars::{Nullable, U64};
@@ -59,6 +59,7 @@ use kr_protocol::scalars::{Nullable, U64};
 use crate::engine::{Announcement, Content, Engine, Item, Outcome, Restored, Text, clip_summary};
 use crate::error::Result;
 use crate::event::{EventCursor, EventKind, Origin, SourceEvent};
+use crate::numbering::Numbering;
 use crate::review::Reviews;
 use crate::scope::Viewer;
 use crate::store::{ActionRecord, Claimant, Owner, Store, StoredState};
@@ -929,6 +930,37 @@ impl Attention {
         Ok(self.state.visits.visit(actor, session_id))
     }
 
+    /// Returns how this viewer is shown one session's cursors, or none when its history reaches
+    /// every moment and it is shown the log's own ([`crate::numbering`]).
+    ///
+    /// A cursor a viewer sends back (`visit.acknowledge`) is read with [`Numbering::cursor`], and
+    /// every cursor [`Attention::changed`] answers a viewer with a bound has been through
+    /// [`Numbering::shown`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Attention::engine`].
+    pub fn numbering(
+        &self,
+        viewer: &Viewer<'_>,
+        session_id: SessionId,
+    ) -> Result<Option<Numbering>> {
+        self.live()?;
+        if viewer.reaches_every_moment() {
+            return Ok(None);
+        }
+        let (floor, head) = with_reach_of(viewer, |reach| {
+            self.state.visits.numbering_bounds(session_id, reach)
+        });
+        Ok(Some(Numbering::new(
+            &self.state.engine.key_secret(),
+            session_id,
+            viewer.history_from_ms(),
+            floor,
+            head,
+        )))
+    }
+
     /// Answers what changed in one session since one actor's last visit to it.
     ///
     /// The host's own words are in the answer. A session's text is not: when `content` lets the
@@ -953,6 +985,8 @@ impl Attention {
         content: Content,
     ) -> Result<ChangedPage> {
         self.live()?;
+        let numbering = self.numbering(viewer, session_id)?;
+        let number = |cursor: u64| numbering.map_or(cursor, |numbering| numbering.shown(cursor));
         let changed = with_reach_of(viewer, |reach| {
             self.state.visits.changed_since(
                 actor,
@@ -975,12 +1009,15 @@ impl Attention {
         Ok(ChangedPage {
             result: VisitChangedResult {
                 actor_id: actor.clone(),
-                from_cursor: U64::new(changed.from_cursor),
-                to_cursor: U64::new(changed.to_cursor),
+                from_cursor: U64::new(number(changed.from_cursor)),
+                to_cursor: U64::new(number(changed.to_cursor)),
                 changes: changed
                     .changes
                     .into_iter()
-                    .map(|(change, _)| change)
+                    .map(|(change, _)| SemanticChange {
+                        cursor: U64::new(number(change.cursor.get())),
+                        ..change
+                    })
                     .collect(),
                 omitted: changed.omitted,
                 more: changed.more,

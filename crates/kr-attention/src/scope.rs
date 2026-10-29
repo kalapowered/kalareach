@@ -116,6 +116,16 @@ impl Viewer<'_> {
         }
     }
 
+    /// The earliest moment, in UTC milliseconds, this caller's history reaches back to: none for the
+    /// owner, whose reaches back to every moment, and the grant's own for a device.
+    #[must_use]
+    pub const fn history_from_ms(&self) -> u64 {
+        match self {
+            Self::Owner => 0,
+            Self::Device(scope) => scope.history_from_ms,
+        }
+    }
+
     /// Whether this caller's history reaches back to every moment, so that nothing the host
     /// recorded lies outside what it may be shown.
     ///

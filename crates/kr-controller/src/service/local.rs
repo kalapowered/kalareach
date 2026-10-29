@@ -882,7 +882,12 @@ impl Controller {
                 .await;
         }
         if retained.is_none() && crate::attention::AttentionModule::serves(method) {
-            retained = self.attention.retained(actor_id, &mutation, method);
+            retained = self.attention.retained(
+                &crate::attention::Caller::Owner,
+                actor_id,
+                &mutation,
+                method,
+            );
         }
         if retained.is_none() && net::methods::serves(method) {
             retained = self

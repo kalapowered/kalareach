@@ -92,6 +92,7 @@ pub mod error;
 pub mod event;
 pub mod host;
 pub mod key;
+pub mod numbering;
 pub mod review;
 pub mod rule;
 pub mod scope;

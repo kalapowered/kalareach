@@ -77,7 +77,7 @@ use kr_protocol::attention::{
     MAX_ATTENTION_SOURCE_RECORDS, MAX_ATTENTION_SOURCE_WAIT_MS, MAX_ATTENTION_TEXT_RECORDS,
     MAX_LOG_VIEW_FILTER_LEN, MAX_LOG_VIEW_ID_LEN, MAX_RETAINED_ATTENTION_ITEMS,
     MAX_RETAINED_LOG_VIEWS, ReviewAcknowledgeParams, ReviewReadParams, ReviewReadResult,
-    ReviewSubject, VisitAcknowledgeParams, VisitChangedParams,
+    ReviewSubject, VisitAcknowledgeParams, VisitAcknowledgeResult, VisitChangedParams,
 };
 use kr_protocol::envelope::{
     ControlFrame, MutationRequest, Outcome, ParamsValue, Request, Response,
@@ -2119,6 +2119,7 @@ impl AttentionModule {
     /// It runs before the freshness window is considered, like every other retained action.
     pub fn retained(
         &self,
+        caller: &Caller,
         actor: &ActorId,
         mutation: &MutationRequest,
         method: Method,
@@ -2141,7 +2142,14 @@ impl AttentionModule {
                 )),
             ));
         }
-        Some(frame(mutation.request_id, decode_answer(&record.answer)))
+        let answer = decode_answer(&record.answer).and_then(|answer| {
+            if method == Method::VisitAcknowledge {
+                self.shown_visit(caller, mutation, answer)
+            } else {
+                Ok(answer)
+            }
+        });
+        Some(frame(mutation.request_id, answer))
     }
 
     /// Checks, before an action is admitted, what the store can decide about it now.
@@ -2218,7 +2226,9 @@ impl AttentionModule {
                         "this caller may not see that session",
                     ));
                 }
-                check_visit(&params)
+                check_visit(&params)?;
+                self.cursor_of(caller, params.session_id, params.acknowledged_cursor.get())
+                    .map(|_| ())
             }
             _ => Err(ProtocolError::new(
                 ErrorCode::InvalidArgument,
@@ -2325,10 +2335,25 @@ impl AttentionModule {
                                 typed(&mutation.params).map_err(|refused| {
                                     Unperformed::Refused(refusal_to_error(refused))
                                 })?;
+                            // A reader whose history has a bound sends back the number it was
+                            // shown, and the store keeps the log's own.
+                            let cursor = match store
+                                .numbering(viewer, params.session_id)
+                                .map_err(Unperformed::Store)?
+                            {
+                                None => params.acknowledged_cursor.get(),
+                                Some(numbering) => numbering
+                                    .cursor(params.acknowledged_cursor.get())
+                                    .ok_or_else(|| {
+                                        Unperformed::Refused(ControllerError::InvalidArgument(
+                                            NOT_GIVEN_CURSOR.to_owned(),
+                                        ))
+                                    })?,
+                            };
                             Mutation::Visit {
                                 viewer,
                                 session_id: params.session_id,
-                                cursor: params.acknowledged_cursor.get(),
+                                cursor,
                                 views: params.views,
                             }
                         }
@@ -2354,10 +2379,56 @@ impl AttentionModule {
             .map_err(|error| error.to_protocol_error())?;
         // A window change moves the next timer; the maintenance loop works it out again.
         self.wake.notify_one();
-        match performed {
+        let answer = match performed {
             Performed::Done(answer) => result_of(&answer, reading),
             Performed::Retained(record) => decode_answer(&record.answer),
+        }?;
+        if method == Method::VisitAcknowledge {
+            return self.shown_visit(caller, mutation, answer);
         }
+        Ok(answer)
+    }
+
+    /// Returns the log's own cursor for the number a caller sent back, or the refusal when this
+    /// host did not give the caller that number.
+    fn cursor_of(&self, caller: &Caller, session_id: SessionId, shown: u64) -> Answer<u64> {
+        let numbering = {
+            let store = self.store()?;
+            caller
+                .view(|viewer| store.numbering(viewer, session_id))
+                .map_err(refusal)?
+        };
+        match numbering {
+            None => Ok(shown),
+            Some(numbering) => numbering
+                .cursor(shown)
+                .ok_or_else(|| ProtocolError::new(ErrorCode::InvalidArgument, NOT_GIVEN_CURSOR)),
+        }
+    }
+
+    /// Writes the answer to a visit's acknowledgement in the numbers its caller is shown.
+    ///
+    /// The store and every record of an answer keep the log's own cursor, so a repeat of the action
+    /// under a later bound is shown that bound's numbers.
+    fn shown_visit(
+        &self,
+        caller: &Caller,
+        mutation: &MutationRequest,
+        answer: ParamsValue,
+    ) -> Answer<ParamsValue> {
+        let params: VisitAcknowledgeParams = typed(&mutation.params)?;
+        let numbering = {
+            let store = self.store()?;
+            caller
+                .view(|viewer| store.numbering(viewer, params.session_id))
+                .map_err(refusal)?
+        };
+        let Some(numbering) = numbering else {
+            return Ok(answer);
+        };
+        let mut result: VisitAcknowledgeResult = typed(&answer)?;
+        result.acknowledged_cursor = U64::new(numbering.shown(result.acknowledged_cursor.get()));
+        encode(&result)
     }
 
     /// Stops the next action of this group once its admission has been asked and stood, before
@@ -4300,6 +4371,9 @@ fn encode<T: serde::Serialize>(value: &T) -> Answer<ParamsValue> {
         .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))
 }
 
+/// What a caller is told when it sends back a cursor this host did not give it.
+const NOT_GIVEN_CURSOR: &str = "that cursor is not one this host gave this device";
+
 fn storable(value: u64, what: &str) -> Answer<()> {
     if value > MAX_STORED_COUNTER {
         return Err(ProtocolError::new(
@@ -5567,6 +5641,88 @@ pub(crate) mod tests {
             "the interval the log holds"
         );
         assert_eq!((asked[0].from_ms, asked[0].to_ms), (1_000, 2_000));
+    }
+
+    /// KR-REQ-10.49: an acknowledgement of a visit is kept as the log's own cursor and answered in
+    /// the numbers of the caller that asks for it, so a repeat of the action is numbered by the
+    /// bound of the caller that repeats it: the owner is answered the log's own cursor, a device the
+    /// number it was shown, and a device with a later bound that bound's number.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_repeated_acknowledgement_is_answered_in_the_numbers_of_the_caller_that_repeats_it() {
+        let world = Summarised::start();
+        world.record_commands(&[1_000, 2_000, 3_000], false);
+        let reader = ActorId::new("test:device").expect("an actor");
+        let early = device_from(1_500);
+        let late = device_from(2_500);
+        let shown_early = world.changed_for(&reader, &early).await.to_cursor;
+        let shown_late = world.changed_for(&reader, &late).await.to_cursor;
+        assert_ne!(shown_early, shown_late, "each bound has numbers of its own");
+
+        // The action is performed the way the store performs it: with the log's own cursor.
+        let mutation = MutationRequest {
+            request_id: RequestId::new(9),
+            method: Method::VisitAcknowledge.into(),
+            method_version: MethodVersion::V1,
+            action_id: kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+            grant_id: Nullable::null(),
+            target: kr_protocol::envelope::ActionTarget::environment(world.temp.environment_id()),
+            expected: ParamsValue::empty(),
+            action_window_id: kr_protocol::ids::ActionWindowId::new("test").expect("a window"),
+            requested_ttl_ms: kr_protocol::scalars::DurationMs::new(60_000),
+            params: ParamsValue::from_typed(&VisitAcknowledgeParams {
+                session_id: world.session_id,
+                acknowledged_cursor: shown_early,
+                views: Vec::new(),
+            })
+            .expect("encodes"),
+        };
+        let key = action_key(&reader, &mutation, Method::VisitAcknowledge).expect("a key");
+        let reading = world.module.reading();
+        early
+            .view(|viewer| {
+                world.module.store().expect("the store").perform(
+                    &key,
+                    Mutation::Visit {
+                        viewer,
+                        session_id: world.session_id,
+                        cursor: 3,
+                        views: Vec::new(),
+                    },
+                    reading,
+                    || Ok(()),
+                    |answer| encode_answer(answer, reading),
+                )
+            })
+            .expect("the store performs the action");
+
+        let answered = |caller: &Caller| -> u64 {
+            let ControlFrame::Response(Response {
+                outcome: Outcome::Ok(value),
+                ..
+            }) = world
+                .module
+                .retained(caller, &reader, &mutation, Method::VisitAcknowledge)
+                .expect("the store holds the action")
+            else {
+                panic!("the repeat is answered");
+            };
+            value
+                .to_typed::<VisitAcknowledgeResult>()
+                .expect("decodes")
+                .acknowledged_cursor
+                .get()
+        };
+        assert_eq!(
+            answered(&Caller::Owner),
+            3,
+            "the owner is answered the log's own"
+        );
+        assert_eq!(answered(&early), shown_early.get());
+        assert_eq!(
+            answered(&late),
+            shown_late.get(),
+            "numbered by the later bound"
+        );
     }
 
     /// KR-REQ-18.02: the callers whose history reaches every moment are the owner and a device
