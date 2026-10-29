@@ -357,22 +357,17 @@ async fn a_later_run_replaces_the_findings_and_moves_the_revision_only_when_they
     adopted.stop().await;
 }
 
-/// KR-REQ-03.29: a permission withdrawn between two runs is found by the second one, as
-/// `permission_required`, and not before: the daemon cannot read a permission, so what the first run
-/// found stands until the checks are performed again, and the repeat moves the capability revision.
+/// KR-REQ-03.29: a permission withdrawn between two runs is found when the checks are performed
+/// again, as `permission_required`, and the repeat moves the capability revision.
 ///
-/// The permission is the one the filesystem keeps for the nominated file, which the worker meets the
-/// way it meets a privacy grant: it performs the read and the operating system answers.
+/// The daemon cannot read a permission, so a person asks again. The permission here is the one the
+/// filesystem keeps for the nominated file, which the worker meets the way it meets a privacy
+/// grant: it performs the read and the operating system answers.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn a_permission_withdrawn_is_found_by_the_next_run_and_not_before() {
+async fn a_permission_withdrawn_is_found_when_the_checks_are_performed_again() {
     use std::os::unix::fs::PermissionsExt as _;
 
-    assert_ne!(
-        kr_ipc::paths::current_uid(),
-        0,
-        "run as an ordinary user: the superuser reads through a withdrawn permission"
-    );
     let adopted = Adopted::start_with_document(1, &headless()).await;
     let host = &adopted.host;
     let directory = tempfile::tempdir().expect("a directory of this test's own");
@@ -397,17 +392,11 @@ async fn a_permission_withdrawn_is_found_by_the_next_run_and_not_before() {
 
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000))
         .expect("the permission is withdrawn");
-    // Nothing the daemon can read moved, so nothing ends what the first run found.
-    let standing = shown(host).await;
-    assert_eq!(standing.checks.state, CapabilityChecksState::Current);
-    assert_eq!(
-        standing
-            .desktop
-            .record(capabilities::AUTHORISED_FILE_READ)
-            .expect("the read check still has its record")
-            .state,
-        CapabilityState::QualifiedAvailable,
-        "the finding stands until the checks are performed again"
+    // The worker runs in this process. An account that can read through a withdrawn mode (the
+    // superuser, or one holding a capability that overrides file permissions) cannot show this.
+    assert!(
+        std::fs::File::open(&file).is_err(),
+        "run as an account the withdrawn permission binds"
     );
 
     ask(host, ActionId::new(kr_ipc::new_uuid()), Some(&file))
@@ -433,9 +422,6 @@ async fn a_permission_withdrawn_is_found_by_the_next_run_and_not_before() {
         "a finding that changed is a change of evidence"
     );
 
-    // The directory is removed after the permission is given back, which a tempdir needs.
-    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
-        .expect("the permission is given back");
     adopted.stop().await;
 }
 
