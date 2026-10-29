@@ -10,6 +10,7 @@
 //! | --- | --- |
 //! | KR-REQ-19.08 | the `kr_req_19_08_` tests here |
 //! | KR-REQ-23.24 | `kr_req_23_24_a_later_prompt_after_an_unknown_one_is_admitted_only_with_the_quote_of_what_was_read` |
+//! | KR-REQ-13.03 | `kr_req_13_03_a_draft_is_the_same_after_a_visit_to_the_terminal` |
 //! | KR-REQ-13.13 | `kr_req_13_13_a_draft_outlives_the_host_being_out_of_contact_and_follows_its_conversation_only_when_retargeted` |
 //! | KR-REQ-01.01 | `kr_req_01_01_a_phone_that_exited_finds_the_session_it_left_and_attaches_again` |
 
@@ -1069,6 +1070,108 @@ async fn kr_req_13_13_a_draft_outlives_the_host_being_out_of_contact_and_follows
         upstream.prompts().is_empty(),
         "nothing was sent by the move"
     );
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.03: a draft written in a paired host's conversation is the same draft, with the same
+/// revision, while the person is in the terminal and after they are back. The terminal is a view on
+/// a connection of its own, which takes the input lease and ends with the view: opening it, typing
+/// into it and closing it leave the draft, the conversation the draft is bound to and the host's
+/// agent as they were, and send the agent nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_03_a_draft_is_the_same_after_a_visit_to_the_terminal() {
+    let adopted = Adopted::start(1).await;
+    let worker = &adopted.workers[0];
+    let upstream = Arc::new(Upstream::default());
+    let instance = worker.register_agent(Arc::clone(&upstream));
+    let session = worker.session_id;
+    let phone = phone_under(
+        &adopted,
+        pairing(&[
+            ActionRight::SessionView,
+            ActionRight::TerminalInput,
+            ActionRight::AgentPrompt,
+        ]),
+    )
+    .await;
+    let companion = &phone.companion;
+    open(companion, session, None, "screen").expect("the session opens");
+
+    // The page writes the draft for the conversation the host reports.
+    let (conversation_instance, binding) = conversation(companion, session, "screen");
+    assert_eq!(conversation_instance, instance.to_string());
+    companion
+        .call(
+            "device_draft_save",
+            json!({ "params": {
+                "id": null,
+                "expectedRevision": null,
+                "sessionId": session.to_string(),
+                "applicationInstanceId": instance.to_string(),
+                "agentBindingRevision": binding,
+                "state": "open",
+                "text": "a thought for the agent",
+                "attachments": []
+            } }),
+        )
+        .expect("the draft is kept");
+    let the_draft = || {
+        let kept = companion
+            .call("device_drafts", json!(null))
+            .expect("the drafts are read");
+        let drafts = kept["drafts"].as_array().expect("a list of drafts").clone();
+        assert_eq!(drafts.len(), 1, "{kept}");
+        drafts[0].clone()
+    };
+    let before = the_draft();
+    assert_eq!(before["text"], "a thought for the agent");
+    assert_eq!(before["state"], "open");
+
+    // The person switches to the terminal, takes control and types into the program.
+    let view = open_view(companion, session, "screen", 13).expect("the view opens");
+    companion
+        .state_where(13, |state| state["state"] == "showing")
+        .await;
+    companion
+        .call(
+            "terminal_view_input",
+            json!({ "view": view, "input": { "kind": "take", "number": 1 } }),
+        )
+        .expect("the take is taken");
+    companion
+        .state_where(13, |state| state["control"]["state"] == "controlling")
+        .await;
+    companion
+        .call(
+            "terminal_view_input",
+            json!({ "view": view, "input": { "kind": "text", "take": 1, "text": "typed in the terminal" } }),
+        )
+        .expect("the text is taken");
+    assert_eq!(
+        the_draft(),
+        before,
+        "the terminal's input is the program's and is not the draft"
+    );
+
+    // The person switches back: the view ends with its attachment, and the draft is as they left it.
+    companion
+        .call("terminal_view_close", json!({ "view": view }))
+        .expect("the view closes");
+    tokio::time::timeout(WATCHDOG, async {
+        while worker.attachments() != 0 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the daemon shows no attachment once the view is closed");
+    assert_eq!(the_draft(), before, "the draft after the terminal");
+    assert_eq!(
+        conversation(companion, session, "screen"),
+        (conversation_instance, binding.clone()),
+        "the draft is still bound to the host's conversation"
+    );
+
+    assert!(upstream.prompts().is_empty(), "the visit sent nothing");
     adopted.stop().await;
 }
 
