@@ -219,9 +219,9 @@ There are two kinds of release. A package release is initiated by creating a tag
   `host/v<version>+<commit>` by `.github/workflows/release-host.yml`.
   [docs/releases/macos-signing.md](docs/releases/macos-signing.md) says what each step does and checks.
 - A tag that starts with `host/v`, pushed to the repository, builds the Windows host executables and
-  PowerShell packages through `.github/workflows/release-windows.yml`, whose job that signs each of
-  them and publishes them as a release runs only when the repository variable `WINDOWS_HOST_RELEASE`
-  is `true`.
+  PowerShell packages through `.github/workflows/release-windows.yml`, whose `release` job signs the
+  files that carry a signature and runs only when the repository variable `WINDOWS_HOST_RELEASE` is
+  `true`. That job ends with an error at its manifest step, so the workflow publishes no release.
   [docs/releases/windows-signing.md](docs/releases/windows-signing.md) says what signs, what the
   release carries and how the signing identity is kept.
 
@@ -257,7 +257,7 @@ A host joins no network until its configuration document says so. Run `kr host s
 "relay": { "origin": "https://reach.kala.to" }
 ```
 
-Open a second terminal window before you create the first session. Create the session in the first window with `kr new`, which starts the control daemon, and pair your first phone from the second. `kr pair invite --owner` asks you to type `pair`, then shows a pairing code, a QR code and an invitation identifier; `kr pair confirm <invitation>` takes the value the phone shows. `kr new` attaches the terminal it runs in, and the first pairing is refused inside a KalaReach session; on macOS it is also refused in a window opened after a session started. If when you run `kr new` you see that the control daemon is not responding, and in `controller.log` you see `the secret store failed`, this means the control daemon can talk to your system's desktop keyring (associated with your regular login on Linux), but can't open it. The control daemon will stop at start if it can't open the keyring. If you unlock the keyring (for example, by signing into your desktop session on the machine) and run `kr new` again, it should work.
+Open a second terminal window before you create the first session. Create the session in the first window with `kr new`, which starts the control daemon, and pair your first phone from the second. `kr pair invite --owner` asks you to type `pair`, then shows a pairing code, a QR code and an invitation identifier; `kr pair confirm <invitation>` takes the value the phone shows. `kr new` attaches the terminal it runs in, and the first pairing is refused inside a KalaReach session; on macOS it is also refused in a window opened after a session started. If you get an error from a `kr new` command that the control daemon did not respond, look at the end of the `controller.log` file. If you see a line starting with `the secret store failed`, the error the keyring gave follows it on that line. When the desktop keyring of your Linux login answers but cannot be opened, the daemon stops at start. A host that has started on the keyring keeps using it and does not move to the file store by itself. You need to unlock the keyring, for example by signing in to the desktop session on that machine. Then run `kr new` again.
 
 To update to a new release, download the archive for the new release and run `kr host update --archive <archive>`. `kr host rollback` goes back to the release before it. [docs/host/updates.md](docs/host/updates.md) says what an update does to a running session, and [docs/releases/macos-signing.md](docs/releases/macos-signing.md) says how the releases are signed.
 
