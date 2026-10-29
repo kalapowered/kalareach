@@ -1,5 +1,6 @@
 //! `kr status` against a session whose reader is scripted: the launch surface it reports is the
-//! one the session's own worker answers.
+//! one the session's own worker answers, and the application it names is the one the worker was
+//! told holds the foreground.
 //!
 //! The session is a managed one, hosted by this test with a real worker and a real bridge endpoint.
 //! The reader on the other end of the bridge is the contract's reference bridge, so the test
@@ -464,5 +465,39 @@ async fn kr_req_13_11_status_reports_the_launch_surface_the_worker_answers() {
         "launch surface: verified at prompt {PROMPT} (buffer {BUFFER}, directory {DIRECTORY}); input held elsewhere"
     );
     assert!(printed.contains(&line), "{printed}");
+    hosted.close().await;
+}
+
+/// KR-REQ-13.10: a session's row names the application in its foreground, in the line a person
+/// reads and in the document a script reads, and names none once the foreground is no application.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_13_10_status_names_the_application_in_the_foreground() {
+    let hosted = hosted().await;
+
+    let at_the_prompt = hosted.status().await;
+    assert_eq!(
+        at_the_prompt["application"],
+        Value::Null,
+        "no application holds the foreground yet: {at_the_prompt}"
+    );
+
+    hosted
+        .runtime
+        .session()
+        .set_application(Some("claude".to_owned()));
+    let named = hosted.status().await;
+    assert_eq!(named["application"], "claude", "{named}");
+    let output = hosted.kr(&["status", "1"]).await;
+    assert!(output.status.success());
+    let printed = String::from_utf8_lossy(&output.stdout);
+    let row = printed
+        .lines()
+        .next()
+        .unwrap_or_else(|| panic!("a session line: {printed}"));
+    assert!(row.contains("claude"), "the line names it: {row}");
+
+    hosted.runtime.session().set_application(None);
+    let back = hosted.status().await;
+    assert_eq!(back["application"], Value::Null, "{back}");
     hosted.close().await;
 }
