@@ -129,6 +129,17 @@ days of the dispatch. The approval is the one approval of a release: the jobs af
 and `publish` runs only after every archive has been verified against the root committed in
 `release/tester-channel/root.json`, installed into a store, and started on its own platform: the control daemon, a worker and a shell create a session and close it.
 
+Its `matrix` job runs beside `source`. It builds `kr-release-matrix-check` at the commit and asks
+whether the signed release matrix the managed service publishes lists a tier for the package version
+the commit carries ([packages.md](packages.md#the-release-matrix)). It holds no key and no write
+access, and `channel` and `publish` both wait for it, so a release that the matrix does not list is
+refused before anyone is asked to approve the use of the release keys. The job comes after the
+notarisation, which takes about an hour, so run the same check at the commit before the signing starts:
+
+```sh
+cargo run --locked --release -p kr-release-matrix-check -- --origin https://reach.kala.to
+```
+
 ## Reading a refusal
 
 | Refusal | What it means | What to do |
