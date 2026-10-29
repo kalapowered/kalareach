@@ -18,8 +18,8 @@
 //! ([`StaleRefusal`]).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
@@ -282,6 +282,18 @@ struct State {
     release_matrix: Option<Vec<u8>>,
     /// The reply the service description route publishes, as the text a test gave it.
     service_description: Option<Vec<u8>>,
+    /// What runs when the service description is asked for, before the service answers.
+    while_describing: Option<Hook>,
+}
+
+/// Something a test has run at a moment of its choosing.
+#[derive(Clone)]
+struct Hook(Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for Hook {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Hook")
+    }
 }
 
 /// What the service did with one request.
@@ -914,6 +926,14 @@ impl ServiceWeb {
         self.state.lock().expect("the state").service_description = None;
     }
 
+    /// Runs `hook` each time the service description is asked for, after the request has reached the
+    /// service and before the service answers it: a test that changes something on the asking host
+    /// at that moment holds what the host does about a change made while it waited, and decides by
+    /// the request itself and not by a delay.
+    pub fn while_describing(&self, hook: impl Fn() + Send + Sync + 'static) {
+        self.state.lock().expect("the state").while_describing = Some(Hook(Arc::new(hook)));
+    }
+
     /// How many requests went to `path`, reaching the service or not.
     #[must_use]
     pub fn requests_to(&self, path: &str) -> usize {
@@ -1214,8 +1234,17 @@ impl ServiceWeb {
             return crate::matrix::answer(state.release_matrix.as_deref());
         }
         if path == crate::description::PATH {
-            let state = self.state.lock().expect("the state");
-            return crate::description::answer(state.service_description.as_deref());
+            let (hook, reply) = {
+                let state = self.state.lock().expect("the state");
+                (
+                    state.while_describing.clone(),
+                    state.service_description.clone(),
+                )
+            };
+            if let Some(Hook(hook)) = hook {
+                hook();
+            }
+            return crate::description::answer(reply.as_deref());
         }
         if path == "/api/relay/payer-authorisation/sign-in" {
             let mut state = self.state.lock().expect("the state");

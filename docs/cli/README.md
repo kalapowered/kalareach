@@ -1784,7 +1784,10 @@ other than 200, answers more than 16 KiB or publishes no description; a descript
 `schema_version` this build does not read, a member of the wrong type, a member within two edits of
 a name it reads (a misspelling), a plain `http` address where it was not read from this machine,
 or that names no relay and no discovery server; and a value the document's validator refuses. Members
-it does not know are ignored and counted. None of the service's words are repeated.
+it does not know are ignored and counted, and named only for a description taken on the connection
+alone, since a signature does not cover them. No refusal repeats what the service said: a value the
+document refuses is named by its setting and withheld, and the values that a differing document
+shows are said as `kr doctor` says a configured address.
 
 A join never replaces a value the document already holds with another one. When the document holds a
 different value for any of the eight settings, including `network.enabled: false` and a setting the

@@ -140,15 +140,21 @@ async fn join(
     let empty = ConfigurationDocument::empty();
     let document = loaded.document.as_ref().unwrap_or(&empty);
     let comparison = described.selection().compare(document);
-    if !comparison.different.is_empty() && !arguments.replace {
-        if !json {
-            show_differences(document, described.selection(), &comparison.different);
+    let change = Change::Network(Some(described.selection().clone()));
+    if !comparison.different.is_empty() {
+        // A value the document would refuse is refused as that, before any value is shown or
+        // `--replace` is suggested for an edit that would fail.
+        validate(paths, &change)?;
+        if !arguments.replace {
+            if !json {
+                show_differences(document, described.selection(), &comparison.different);
+            }
+            return Err(CliError::Usage(shown!(
+                "this host's configuration already selects other values for {}; kr host network \
+                 shows them, and --replace takes the service's instead",
+                keys(&comparison.different)
+            )));
         }
-        return Err(CliError::Usage(shown!(
-            "this host's configuration already selects other values for {}; kr host network \
-             shows them, and --replace takes the service's instead",
-            keys(&comparison.different)
-        )));
     }
     if comparison.is_current() {
         return Ok(Action::Joined {
@@ -157,7 +163,6 @@ async fn join(
         });
     }
 
-    let change = Change::Network(Some(described.selection().clone()));
     validate(paths, &change)?;
     let writers = crate::barrier::hold_for_configuration(paths)?;
     let permit = crate::barrier::permit(&writers, &WRITTEN)?;
@@ -260,15 +265,26 @@ fn show_differences(
         if !different.contains(key) {
             continue;
         }
-        let said = |value: &Option<String>| {
-            Asked::text(Request::Network, value.as_deref().unwrap_or("none"))
-        };
         output::line(&stdout_line!(
             "{}: this host selects {}; the service describes {}",
             *key,
-            said(&held[index]),
-            said(&described[index])
+            setting(index, &held[index]),
+            setting(index, &described[index])
         ));
+    }
+}
+
+/// One of the eight settings as a person reads it: `none` where it is not held, the switch as the
+/// word it is, and any other through the door `kr doctor` says a configured location by, which
+/// shows an address by its parts and anything else by its class and length.
+fn setting(index: usize, value: &Option<String>) -> Asked {
+    match value.as_deref() {
+        None => Asked::text(Request::Network, "none"),
+        Some(value) if index == 0 => Asked::text(
+            Request::Network,
+            if value == "true" { "true" } else { "false" },
+        ),
+        Some(value) => output::configured(ContentClass::Location, value),
     }
 }
 
@@ -368,11 +384,20 @@ fn note_description(description: &Description) {
     }
     let ignored: &Ignored = description.ignored();
     if ignored.count() > 0 {
-        output::line(&stdout_line!(
-            "the description names {} members this build does not read: {}",
-            ignored.count(),
-            Asked::text(Request::Network, &ignored.names().join(", "))
-        ));
+        // A signature does not cover the members this build does not read, so for a description
+        // that was verified only how many there are is said, and not what they are called.
+        if description.signed() {
+            output::line(&stdout_line!(
+                "the description names {} members this build does not read",
+                ignored.count()
+            ));
+        } else {
+            output::line(&stdout_line!(
+                "the description names {} members this build does not read: {}",
+                ignored.count(),
+                Asked::text(Request::Network, &ignored.names().join(", "))
+            ));
+        }
     }
     match description.selection().relay_origin.as_deref() {
         None => {}
@@ -432,4 +457,51 @@ fn selection_document(document: &ConfigurationDocument) -> Document {
             configuration::RELAY_ORIGIN.key,
             place(document.relay.origin()),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A public key as a service publishes one: 43 characters of unpadded base64url.
+    const KEY: &str = "ESZTt8qko94XmogxftjUh7zscthwWZ17-LP2PcbLx20";
+
+    fn arguments(key: Option<&str>, unsigned: bool) -> NetworkArguments {
+        NetworkArguments {
+            join: true,
+            service: None,
+            key: key.map(str::to_owned),
+            unsigned,
+            replace: false,
+            clear: false,
+        }
+    }
+
+    /// The managed service's description is read only under the key this build pins, whatever a flag
+    /// says, and a service a person runs names its key or says it is taken on the connection alone.
+    /// No case reaches this from outside: the commands name loopback services, since the managed
+    /// origin is not one a test can stand in for.
+    #[test]
+    fn the_managed_service_is_read_under_the_pinned_key_and_no_flag_changes_that() {
+        let managed = GatewayOrigin::new(kr_client::services::account::ACCOUNT_ORIGIN)
+            .expect("the managed origin");
+        assert!(matches!(
+            trust(&managed, &arguments(None, false)),
+            Ok(Trust::Pinned(_))
+        ));
+        assert!(trust(&managed, &arguments(None, true)).is_err());
+        assert!(trust(&managed, &arguments(Some(KEY), false)).is_err());
+
+        let own = GatewayOrigin::new("https://service.example.test").expect("an origin");
+        assert!(trust(&own, &arguments(None, false)).is_err());
+        assert!(matches!(
+            trust(&own, &arguments(None, true)),
+            Ok(Trust::TlsOnly)
+        ));
+        assert!(matches!(
+            trust(&own, &arguments(Some(KEY), false)),
+            Ok(Trust::Pinned(_))
+        ));
+        assert!(trust(&own, &arguments(Some("not a key"), false)).is_err());
+    }
 }

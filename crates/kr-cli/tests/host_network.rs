@@ -22,7 +22,7 @@
 use std::net::TcpListener as StdListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -722,6 +722,117 @@ async fn a_value_the_person_wrote_is_replaced_only_when_they_say_so() {
     assert!(
         written["mailbox"].is_null() || written.get("mailbox").is_none(),
         "the service leaves the mailbox out, so the join does: {written}"
+    );
+}
+
+/// A value the service plants that the document would refuse is refused as the document refuses it,
+/// with the setting named and the value withheld: it is not shown beside the person's own, and
+/// `--replace` is not suggested for an edit that would fail. What a service says is text from
+/// outside, and a terminal reads an escape sequence in it as a command.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_value_the_service_plants_is_refused_as_the_document_refuses_it_and_never_shown() {
+    let planted = format!("https://{PLANTED}.example.test\u{1b}[2K\u{7} not an origin");
+    let service = Service::start().await;
+    service.publish_description(&{
+        let mut description = service.description();
+        description["authority"]["origin"] = json!(planted);
+        description
+    });
+    let tree = Tree::create();
+    let origin = service.origin();
+    tree.write_document(&json!({
+        "version": 3,
+        "level": 2,
+        "revision": 2,
+        "network": {
+            "enabled": true,
+            "relay_urls": ["http://127.0.0.1:3340"],
+            "pkarr_publisher_url": "http://127.0.0.1:3341/pkarr",
+            "pkarr_resolver_url": "http://127.0.0.1:3341/pkarr",
+        },
+        "authority": { "origin": "https://other.example.test" },
+    }));
+    let before = tree.document_bytes();
+
+    let key = service.public_key();
+    for replace in [false, true] {
+        let mut arguments = join(&origin, &key);
+        if replace {
+            arguments.push("--replace");
+        }
+        let output = tree.kr(&arguments);
+        let said = said(&output);
+        assert_eq!(output.status.code(), Some(2), "replace {replace}: {said}");
+        assert!(
+            said.contains("authority.origin"),
+            "the setting is named: {said}"
+        );
+        assert!(
+            !said.contains(PLANTED) && !said.contains('\u{1b}') && !said.contains('\u{7}'),
+            "nothing the service planted reaches the terminal: {said:?}"
+        );
+        assert!(
+            !said.contains("--replace"),
+            "an edit that would fail is not met with advice to force it: {said}"
+        );
+        assert_eq!(tree.document_bytes(), before, "nothing was written");
+    }
+}
+
+/// A document that changes while the service is asked is not written over. The competing edit is
+/// kept, and the same command run again joins over it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_document_that_changes_while_the_service_is_asked_is_not_written_over() {
+    let service = Service::start().await;
+    service.publish();
+    let tree = Tree::create();
+    let origin = service.origin();
+    tree.write_document(&json!({
+        "version": 3,
+        "level": 1,
+        "revision": 1,
+        "network": { "bind_address": "127.0.0.1:0" },
+    }));
+    let competing = json!({
+        "version": 3,
+        "level": 1,
+        "revision": 2,
+        "network": { "bind_address": "127.0.0.1:4000" },
+    })
+    .to_string()
+    .into_bytes();
+
+    // At the moment the service is asked, another writer moves the document on.
+    let armed = Arc::new(AtomicBool::new(true));
+    let (path, written, bytes) = (tree.document_path(), Arc::clone(&armed), competing.clone());
+    service.served.web().while_describing(move || {
+        if written.load(Ordering::SeqCst) {
+            kr_ipc::paths::write_owner_only_file(&path, &bytes).expect("the competing edit");
+        }
+    });
+
+    let output = tree.kr(&join(&origin, &service.public_key()));
+    assert_eq!(output.status.code(), Some(2), "{}", said(&output));
+    assert_eq!(
+        tree.document_bytes().as_deref(),
+        Some(competing.as_slice()),
+        "the competing edit is what the document holds"
+    );
+
+    // The control: with nobody else writing, the same command joins, over the competing edit.
+    armed.store(false, Ordering::SeqCst);
+    let output = tree.kr(&join(&origin, &service.public_key()));
+    assert!(output.status.success(), "{}", said(&output));
+    let written = tree.document();
+    assert_eq!(written["revision"], 3, "{written}");
+    assert_eq!(
+        written["network"]["bind_address"], "127.0.0.1:4000",
+        "the competing edit survived: {written}"
+    );
+    assert_eq!(
+        written["network"]["relay_urls"],
+        json!(["http://127.0.0.1:3340"]),
+        "{written}"
     );
 }
 

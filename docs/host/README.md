@@ -202,7 +202,7 @@ section. The managed voice broker it starts its paired devices' calls at is the 
 Nothing else chooses either. No environment variable reaches them, so a daemon started with the
 variables an older build read joins nothing because of them.
 
-A host does not write these sections by hand when it joins a service. `kr host network --join` reads
+A person does not write these sections by hand to join a service. `kr host network --join` reads
 the description the service publishes of itself and writes the eight settings a join owns
 (`network.enabled`, `network.relay_urls`, the two Pkarr addresses, `network.dns_origin` and the
 origins of the authority feed, the mailbox and the relay lease service) as one validated revision
@@ -210,8 +210,10 @@ of this document, at the level the sections then need; `kr host network --clear`
 leaves `network.bind_address`, `network.relay_trust_anchors`, `network.relay_only`,
 `network.local_discovery`, `network.mainline_dht` and `network.proxy_url` and every other section as
 they are, because those are the machine's own, and it does not replace a value the document holds
-without `--replace`. Nothing is compiled into the release: a relay added to the service reaches a
-host when its person joins again with `--replace`, and the daemon never rewrites the document. The
+without `--replace`. No relay or discovery address is compiled into the release, which pins only the
+managed service's origin and the key it signs its description with: a relay added to the service
+reaches a host when its person joins again with `--replace`, and the daemon never rewrites the
+document. The
 fields below remain the whole contract for a document written by hand.
 
 ```json
