@@ -1,5 +1,5 @@
 {
-  "about": "Which addresses a host's configuration document accepts, and which the Worker publishes. `document` is what the host's validator says, checked by crates/kr-client/tests/service_description.rs against the real validators; `worker` is what workers/api/src/service-description.ts and relay/instances.ts publish, checked in workers/api/test/ops/service-description.test.ts, which holds a copy of this file at workers/api/test/ops/fixtures/host-addresses.json. A row with `worker` true and `document` false would publish an address every host refuses. Change a row only when the host's validator changes, and copy the file.",
+  "about": "Which addresses a host's configuration document accepts, and which the Worker publishes. `document` is what the host's validator says, checked by crates/kr-client/tests/service_description.rs against the real validators. `worker` is the Worker's own rule for the same address (workers/api/src/service-description.ts and relay/instances.ts), checked in workers/api/test/ops/service-description.test.ts, which holds a copy of this file at workers/api/test/ops/fixtures/host-addresses.json: for a relay it is whether `hostAcceptsRelayUrl` takes the address, and whether a deployment publishes a plain http one is a separate rule. A row with `worker` true and `document` false would publish an address every host refuses. Change a row only when the host's validator changes, and copy the file.",
   "relay_urls": [
     {
       "value": "https://relay-1.reach.kala.to",
@@ -134,6 +134,22 @@
       "worker": false
     },
     {
+      "value": "https://[::c000:201]",
+      "document": false,
+      "worker": false,
+      "note": "the form a URL parser writes for an IPv4-compatible address"
+    },
+    {
+      "value": "https://[::2]",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://[::1:0:0]",
+      "document": true,
+      "worker": true
+    },
+    {
       "value": "https://RELAY.example.test",
       "document": false,
       "worker": false
@@ -207,6 +223,18 @@
       "value": "https://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.test",
       "document": false,
       "worker": false
+    },
+    {
+      "value": "https://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "document": true,
+      "worker": true,
+      "note": "252 bytes, 253 with the / a URL with no path gains"
+    },
+    {
+      "value": "https://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "document": false,
+      "worker": false,
+      "note": "253 bytes, 254 with the /"
     }
   ],
   "origins": [
@@ -222,6 +250,16 @@
     },
     {
       "value": "https://[2001:db8::1]",
+      "document": true,
+      "worker": true
+    },
+    {
+      "value": "https://[::c000:201]",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://[::1:0:0]",
       "document": true,
       "worker": true
     },
@@ -249,8 +287,8 @@
     {
       "value": "https://xn--e1afmkfd.example.test",
       "document": true,
-      "worker": false,
-      "note": "a name in the xn-- form is an origin; the Worker publishes none, as it publishes no relay in that form"
+      "worker": true,
+      "note": "a name in the xn-- form is a service origin, though a relay in that form is not one"
     },
     {
       "value": "http://reach.kala.to",
