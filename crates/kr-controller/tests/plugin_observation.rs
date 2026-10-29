@@ -608,7 +608,7 @@ async fn kr_req_11_41_a_compile_that_is_queued_and_not_done_leaves_the_terminal_
     let Some(world) = Observing::start(Options {
         shell: ASKING_SHELL.to_owned(),
         holding_compiles: true,
-        ..Options::with(vec![Spec::semantic_only(1).shipping("slow-compile")])
+        ..Options::with(vec![Spec::semantic_only(1)])
     })
     .await
     else {

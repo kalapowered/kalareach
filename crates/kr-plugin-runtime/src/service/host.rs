@@ -153,6 +153,12 @@ pub struct PluginHost {
     /// holds to stand where a document has left the queue and not yet been written.
     #[cfg(feature = "testing")]
     notice_hold: Arc<kr_plugin_service::hold::Hold>,
+    /// The one hold on the compile pool that every registration queued behind the compile gate
+    /// shares. The pool keeps a single hold flag, so a second hold of its own that was dropped
+    /// early, by a registration whose compile was refused, would let go of the jobs the first one
+    /// holds.
+    #[cfg(feature = "testing")]
+    compile_gate_hold: std::sync::Mutex<std::sync::Weak<crate::runtime::compile::CompileHold>>,
 }
 
 impl core::fmt::Debug for PluginHost {
@@ -243,6 +249,8 @@ impl PluginHost {
             started: std::time::Instant::now(),
             #[cfg(feature = "testing")]
             notice_hold: Arc::new(kr_plugin_service::hold::Hold::default()),
+            #[cfg(feature = "testing")]
+            compile_gate_hold: std::sync::Mutex::new(std::sync::Weak::new()),
         })
     }
 
@@ -809,10 +817,17 @@ impl PluginHost {
     #[cfg(feature = "testing")]
     fn hold_compiles_at_the_gate(&self) -> Option<HeldCompiles> {
         let gate = self.config.cache_root.parent()?.join(COMPILE_GATE);
-        gate.exists().then(|| HeldCompiles {
-            hold: self.runtime.hold_compiles(),
-            gate,
-        })
+        if !gate.exists() {
+            return None;
+        }
+        // Registrations behind the gate share one hold, which goes when the last of them lets go.
+        let mut shared = self.compile_gate_hold.lock().ok()?;
+        let hold = shared.upgrade().unwrap_or_else(|| {
+            let hold = Arc::new(self.runtime.hold_compiles());
+            *shared = Arc::downgrade(&hold);
+            hold
+        });
+        Some(HeldCompiles { hold, gate })
     }
 
     /// Registers one binding inside one deadline.
@@ -978,7 +993,7 @@ impl PluginHost {
 /// The compile pool's hold, and the gate file that keeps it.
 #[cfg(feature = "testing")]
 struct HeldCompiles {
-    hold: crate::runtime::compile::CompileHold,
+    hold: Arc<crate::runtime::compile::CompileHold>,
     gate: std::path::PathBuf,
 }
 
