@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Holds a staged macOS release tree to the tree the build run made, so that signing is the only difference.
 
-    scripts/check-staged-tree.py compare <the run's tree, a tar> <the staged tree, a tar>
+    scripts/check-staged-tree.py compare <the run's tree, a tar> <the staged tree, a tar> [<tar to write>]
     scripts/check-staged-tree.py self-test
 
 The macOS trees are built on a hosted runner, signed and notarised on another machine, and sealed
@@ -16,9 +16,16 @@ check is what stops a staged tree from carrying anything but signatures:
   * every file that is not Mach-O is the run's, by those lengths and digests;
   * every Mach-O file is the run's outside its code signature. A signature is the last thing in the
     file, in the last segment, so what precedes it must be equal; the only fields of the headers that
-    signing sets are the size of the signature, and the size of the last segment that holds it, and
-    those are the ones that are allowed to differ. The signature itself is checked where the tree
-    is verified (`check-macos-signatures.sh`), against the team and the notarisation.
+    signing sets are the size of the signature, and the size of the last segment that holds it in
+    the file and in memory. The first two follow from where the signature starts and the length of the
+    file; the third has to be the second rounded up to 16 KiB, as the signer sets it, so that none of the three can be
+    set to anything else. The signature itself is checked where the tree is verified
+    (`check-macos-signatures.sh`), against the team and the notarisation.
+
+When a third argument is given and the trees agree, the staged tree is written there, member by member
+as this check read it, in the standard form every tar program reads alike. That tar, and not the staged
+one, is what the next job unpacks: a tar can be built so that one reader sees a member in one place and
+another reader in another, and the check holds only what it read.
 
 A Mach-O layout that cannot be compared exactly is refused and named: a universal file, a 32-bit or
 a big-endian file, a file with no signature, or a signature that is not at the end of the file.
@@ -43,6 +50,10 @@ MACHO_MAGICS = {
     b"\xbe\xba\xfe\xca": "universal",
     b"\xbf\xba\xfe\xca": "universal",
 }
+# The size the signer rounds the last segment up to in memory: 16 KiB, for arm64 and x86-64 files alike
+# (the sizes of the 89 files of each architecture of a release tree, in the run's ad hoc signature and
+# in the Developer ID one, are all that rounding of their sizes in the file).
+SEGMENT_ROUNDING = 0x4000
 LC_SEGMENT_64 = 0x19
 LC_CODE_SIGNATURE = 0x1D
 HEADER = 32
@@ -96,6 +107,8 @@ def signature_fields(data):
     vmsize, fileoff, filesize = struct.unpack_from("<QQQ", data, last[0] + 32)
     if fileoff + filesize != len(data):
         raise Refusal("has a last segment that does not end with the file")
+    if vmsize != (filesize + SEGMENT_ROUNDING - 1) // SEGMENT_ROUNDING * SEGMENT_ROUNDING:
+        raise Refusal("has a last segment whose size in memory is not its size in the file rounded up to 16 KiB, as the signer sets it")
     if fileoff > dataoff:
         raise Refusal("has a code signature before the start of the last segment")
     # The size of the signature and of the segment that holds it are what signing sets.
@@ -138,7 +151,7 @@ def members(path):
     for member in archive.getmembers():
         name = member.name.rstrip("/")
         parts = name.split("/")
-        if name.startswith("/") or ".." in parts or "" in parts:
+        if name.startswith("/") or ".." in parts or "." in parts or "" in parts:
             raise Refusal(f"{path}: {member.name} is not a path inside the tree")
         if top is None:
             top = parts[0]
@@ -147,6 +160,9 @@ def members(path):
         if len(parts) == 1:
             if not member.isdir():
                 raise Refusal(f"{path}: the top is not a directory")
+            if "" in found:
+                raise Refusal(f"{path}: the top directory is there twice")
+            found[""] = member
             continue
         relative = "/".join(parts[1:])
         if not (member.isreg() or member.isdir()):
@@ -159,19 +175,21 @@ def members(path):
     return archive, top, found
 
 
-def compare(built_path, staged_path):
+def compare(built_path, staged_path, out_path=None):
     problems = []
     built_archive, built_top, built = members(built_path)
     staged_archive, staged_top, staged = members(staged_path)
     if built_top != staged_top:
         problems.append(f"the staged tree is {staged_top} and the run's is {built_top}")
     for relative in sorted(set(built) - set(staged)):
-        problems.append(f"{relative} is in the run's tree and not in the staged one")
+        problems.append(f"{relative or 'the top directory'} is in the run's tree and not in the staged one")
     for relative in sorted(set(staged) - set(built)):
         problems.append(f"{relative} is in the staged tree and not in the run's")
     manifest = json.loads(built_archive.extractfile(built["release.json"]).read())["signed"]["files"]
     listed = {entry["path"]: entry for entry in manifest}
     regular = {r for r, m in built.items() if m.isreg() and r != "release.json"}
+    if not built[""].isdir() or not staged[""].isdir():
+        problems.append("the top is not a directory")
     if regular != set(listed):
         problems.append(f"the run's release.json lists {len(listed)} files and the run's tree has {len(regular)} besides it")
     for relative in sorted(set(built) & set(staged)):
@@ -180,7 +198,7 @@ def compare(built_path, staged_path):
             problems.append(f"{relative} is a directory in one tree and a file in the other")
             continue
         if (built_member.mode & 0o7777) != (staged_member.mode & 0o7777):
-            problems.append(f"{relative} has mode {oct(staged_member.mode & 0o7777)}, and the run's has {oct(built_member.mode & 0o7777)}")
+            problems.append(f"{relative or 'the top directory'} has mode {oct(staged_member.mode & 0o7777)}, and the run's has {oct(built_member.mode & 0o7777)}")
         if built_member.isdir():
             continue
         built_data = built_archive.extractfile(built_member).read()
@@ -199,19 +217,37 @@ def compare(built_path, staged_path):
             continue
         if str(len(staged_data)) != entry["length"] or digest(staged_data) != entry["sha256"]:
             problems.append(f"{relative} is not the file the run's release.json describes")
+    if out_path and not problems:
+        write(staged_archive, staged_top, staged, out_path)
     return problems
+
+
+def write(archive, top, found, out_path):
+    """The staged tree as this check read it, in the standard form."""
+    with tarfile.open(out_path, "w", format=tarfile.PAX_FORMAT) as out:
+        for relative in sorted(found, key=lambda r: (not found[r].isdir(), r)):
+            member = found[relative]
+            info = tarfile.TarInfo(f"{top}/{relative}" if relative else top)
+            info.mode, info.mtime = member.mode & 0o7777, member.mtime
+            if member.isdir():
+                info.type = tarfile.DIRTYPE
+                out.addfile(info)
+            else:
+                data = archive.extractfile(member).read()
+                info.size = len(data)
+                out.addfile(info, io.BytesIO(data))
 
 
 # --- the self-test -------------------------------------------------------------------------------
 
 
-def macho(payload, signature):
+def macho(payload, signature, vmsize=None):
     """A thin 64-bit file of a text segment, a last segment and, when there is one, a code signature at its end."""
     sig = signature or b""
     text = struct.pack("<II16sQQQQIIII", LC_SEGMENT_64, 72, b"__TEXT", 0, 0x4000, 0, 0x4000, 5, 5, 0, 0)
     link_filesize = len(payload) + len(sig)
-    link = struct.pack("<II16sQQQQIIII", LC_SEGMENT_64, 72, b"__LINKEDIT", 0x4000, (link_filesize + 0x3FFF) & ~0x3FFF,
-                       0x4000, link_filesize, 1, 1, 0, 0)
+    link = struct.pack("<II16sQQQQIIII", LC_SEGMENT_64, 72, b"__LINKEDIT", 0x4000,
+                       (link_filesize + 0x3FFF) & ~0x3FFF if vmsize is None else vmsize, 0x4000, link_filesize, 1, 1, 0, 0)
     code = struct.pack("<IIII", LC_CODE_SIGNATURE, 16, 0x4000 + len(payload), len(sig)) if signature is not None else b""
     body_commands = text + link + code
     header = struct.pack("<IIIIIIII", 0xFEEDFACF, 0x0100000C, 0, 2, 3 if signature is not None else 2, len(body_commands), 0, 0)
@@ -225,13 +261,13 @@ def release_of(files):
     return json.dumps({"signed": {"files": manifest}}).encode()
 
 
-def tree(top, files, release, dirs=("bin", "share"), extra=()):
+def tree(top, files, release, dirs=("bin", "share"), extra=(), top_mode=0o755):
     """A tree as a tar in memory: files are (path, bytes, mode), and release is the bytes of release.json."""
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w") as archive:
         for name in (top,) + tuple(f"{top}/{d}" for d in dirs):
             info = tarfile.TarInfo(name)
-            info.type, info.mode = tarfile.DIRTYPE, 0o755
+            info.type, info.mode = tarfile.DIRTYPE, top_mode if name == top else 0o755
             archive.addfile(info)
         for path, data, mode in list(files) + [("release.json", release, 0o644)]:
             info = tarfile.TarInfo(f"{top}/{path}")
@@ -240,6 +276,42 @@ def tree(top, files, release, dirs=("bin", "share"), extra=()):
         for info in extra:
             archive.addfile(info)
     return buffer.getvalue()
+
+
+def tar_readers_agree(top, files, release, work):
+    """What the next job unpacks is what was compared, even for a tar built so that readers differ."""
+    import subprocess
+
+    good = tree(top, files, release, dirs=("bin", "share"))
+    # A member in the old form, with its directory in the prefix field and no ustar magic: this check
+    # joins the prefix to the name whatever the magic says, and another reader may not.
+    raw = bytearray(good)
+    wanted = f"{top}/share/doc.txt".encode()
+    at = next(i for i in range(0, len(raw), 512) if bytes(raw[i:i + 100]).rstrip(b"\0") == wanted)
+    raw[at:at + 100] = b"doc.txt".ljust(100, b"\0")
+    raw[at + 345:at + 500] = f"{top}/share".encode().ljust(155, b"\0")
+    raw[at + 257:at + 265] = bytes(8)
+    raw[at + 148:at + 156] = b" " * 8
+    raw[at + 148:at + 156] = f"{sum(raw[at:at + 512]):06o}".encode() + b"\0 "
+    with open(f"{work}/built.tar", "wb") as handle:
+        handle.write(good)
+    with open(f"{work}/crafted.tar", "wb") as handle:
+        handle.write(bytes(raw))
+    try:
+        problems = compare(f"{work}/built.tar", f"{work}/crafted.tar", f"{work}/normalized.tar")
+    except Refusal as error:
+        problems = [str(error)]
+    if problems:
+        print(f"self-test FAILED: a tar with a member in the old form was not read as the standard form reads it ({problems})")
+        return False
+    listing = lambda path: set(subprocess.run(["tar", "-tf", path], capture_output=True, text=True).stdout.split())
+    seen_by_python = {f"{top}/share/doc.txt"}
+    if not (seen_by_python <= listing(f"{work}/normalized.tar")):
+        print("self-test FAILED: the tar written for the next job does not hold the member the check compared")
+        return False
+    note = "" if not (seen_by_python <= listing(f"{work}/crafted.tar")) else " (this tar program reads the crafted tar as the check does)"
+    print("self-test ok: the tar written for the next job holds what the check compared, in the standard form" + note)
+    return True
 
 
 def self_test():
@@ -296,6 +368,20 @@ def self_test():
             built=tree(top, bare, bare_release))
         tail = [("bin/kr", macho(payload, signed) + b"tail", 0o755)] + files()[1:]
         run("a code signature that is not at the end of the file is refused", tree(top, tail, release), "not at the end of the file")
+        for label, vm in (("zero", 0), ("a huge", 0x100000000000)):
+            odd = [("bin/kr", macho(payload, signed, vmsize=vm), 0o755)] + files()[1:]
+            run(f"a last segment of {label} size in memory is refused", tree(top, odd, release), "rounded up to 16 KiB")
+        run("a changed mode of the top directory is refused", tree(top, files(), release, top_mode=0o700), "the top directory has mode")
+        twice = tarfile.TarInfo(f"{top}/bin/extra-dir")
+        twice.type, twice.mode = tarfile.DIRTYPE, 0o755
+        run("a directory that is there twice is refused", tree(top, files(), release, extra=[twice, twice]), "is there twice")
+        hard = tarfile.TarInfo(f"{top}/bin/hard")
+        hard.type, hard.linkname = tarfile.LNKTYPE, f"{top}/bin/kr"
+        run("a hard link in the staged tree is refused", tree(top, files(), release, extra=[hard]), "is a link or a special file")
+        dotted = tarfile.TarInfo(f"{top}/./bin/aliased")
+        dotted.size = 1
+        run("a path with a . part is refused", tree(top, files(), release, extra=[dotted]), "is not a path inside the tree")
+        results.append(tar_readers_agree(top, files(), release, work))
     if not all(results):
         print(f"check-staged-tree: {results.count(False)} self-test case(s) failed", file=sys.stderr)
         return 1
@@ -306,9 +392,9 @@ def self_test():
 def main(argv):
     if argv[1:2] == ["self-test"]:
         return self_test()
-    if len(argv) == 4 and argv[1] == "compare":
+    if len(argv) in (4, 5) and argv[1] == "compare":
         try:
-            problems = compare(argv[2], argv[3])
+            problems = compare(argv[2], argv[3], argv[4] if len(argv) == 5 else None)
         except (Refusal, tarfile.TarError, KeyError, ValueError) as error:
             print(f"check-staged-tree: {error}", file=sys.stderr)
             return 1
