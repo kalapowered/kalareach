@@ -4897,7 +4897,14 @@ pub async fn account_deletion_status(
 ) -> Result<crate::account::deletion::StatusAnswer> {
     let account = account.get().await?;
     let (answer, device_pending) = account.deletion_status().await?;
-    if device_pending {
+    // What is known to be left on this device is settled whether or not the look at the service
+    // could be made: a look that failed says nothing of what a closure already left here.
+    if device_pending
+        || matches!(
+            answer,
+            crate::account::deletion::StatusAnswer::Problem { .. }
+        )
+    {
         crate::account::deletion::settle_device(&state, account).await;
     }
     Ok(answer)

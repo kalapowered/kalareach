@@ -70,6 +70,11 @@ pub const UNSETTLED_FOR_MS: u64 = 2 * 60 * 1000;
 /// receipt.
 pub const CLOSED_FOR_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
+/// How long a pass that took up a device step is given to finish it before another pass may take
+/// the step over: the steps take seconds, and a pass that ended without finishing is not waited
+/// for for ever.
+const CLAIM_FOR_MS: u64 = 60 * 1000;
+
 /// The most organisations one confirmation can accept.
 pub const ACKNOWLEDGED_MAXIMUM: usize = 50;
 
@@ -404,10 +409,13 @@ struct Record {
     closed_ms: Option<u64>,
     /// Whether the stored grant has been ended.
     grant_ended: bool,
-    /// Whether the application has settled a phone's notifications.
+    /// Whether the application has settled a phone's notifications, and when a pass took the step
+    /// up, so that no other pass runs it while that one does.
     notifications_settled: bool,
-    /// Whether the application has settled a computer's recovery record.
+    notifications_claimed_ms: Option<u64>,
+    /// The same for a computer's recovery record.
     recovery_settled: bool,
+    recovery_claimed_ms: Option<u64>,
     /// Whether the service said the removal is done.
     done_seen: bool,
 }
@@ -430,6 +438,31 @@ impl Record {
         match step {
             DeviceStep::Notifications => self.notifications_settled,
             DeviceStep::Recovery => self.recovery_settled,
+        }
+    }
+
+    const fn step_claimed(&mut self, step: DeviceStep) -> &mut Option<u64> {
+        match step {
+            DeviceStep::Notifications => &mut self.notifications_claimed_ms,
+            DeviceStep::Recovery => &mut self.recovery_claimed_ms,
+        }
+    }
+
+    /// A record for the deletion `held` names, as it is when its confirmation is about to leave.
+    fn leaving(held: &Held, now: u64) -> Self {
+        Self {
+            v: RECORD_VERSION,
+            mark: held.mark.clone(),
+            receipt: held.receipt.clone(),
+            sent_ms: now,
+            answered: false,
+            closed_ms: None,
+            grant_ended: false,
+            notifications_settled: false,
+            notifications_claimed_ms: None,
+            recovery_settled: false,
+            recovery_claimed_ms: None,
+            done_seen: false,
         }
     }
 }
@@ -544,12 +577,14 @@ impl SignedInAccount {
             && record.mark == wanted
             && record.closed_ms.is_none()
         {
-            let earlier = record.sent_ms;
+            // A request the service answered has nothing left running: only one it did not is
+            // an earlier request that may still land.
+            let earlier = (!record.answered).then_some(record.sent_ms);
             record.sent_ms = now;
             record.answered = false;
             self.write_deletion(&record)?;
             return Ok(Held {
-                earlier_ms: Some(earlier),
+                earlier_ms: earlier,
                 ..record.held()
             });
         }
@@ -561,43 +596,50 @@ impl SignedInAccount {
                 "this device has not finished settling the account it deleted before"
             )));
         }
-        let receipt = fresh_receipt()?;
-        self.write_deletion(&Record {
-            v: RECORD_VERSION,
-            mark: wanted.clone(),
-            receipt: receipt.clone(),
-            sent_ms: now,
-            answered: false,
-            closed_ms: None,
-            grant_ended: false,
-            notifications_settled: false,
-            recovery_settled: false,
-            done_seen: false,
-        })?;
-        Ok(Held {
+        let held = Held {
             mark: wanted,
-            receipt,
+            receipt: fresh_receipt()?,
             sent_ms: now,
             earlier_ms: None,
-        })
+        };
+        self.write_deletion(&Record::leaving(&held, now))?;
+        Ok(held)
     }
 
-    /// Changes the record under the lock while it is still the one with `receipt`, and removes it
-    /// once the removal is done and the application has settled its own. A record that is another
-    /// deletion's is left as it is.
+    /// Makes sure the record is in the store, and as young as the request that is about to leave,
+    /// at the last moment before it does: another process that judged the record old while this
+    /// one waited for a token must not have removed it from under a request that then goes out.
+    /// Says the time it was kept at, or that the record is another deletion's now.
+    async fn keep_deletion(&self, held: &Held) -> Result<Option<u64>> {
+        let _held = self.hold().await?;
+        let now = self.deletion_clock();
+        match self.read_deletion()? {
+            None => self.write_deletion(&Record::leaving(held, now))?,
+            Some(mut record) if record.receipt == held.receipt => {
+                record.sent_ms = now;
+                record.answered = false;
+                self.write_deletion(&record)?;
+            }
+            Some(_) => return Ok(None),
+        }
+        Ok(Some(now))
+    }
+
+    /// Changes the record under the lock while it is still the one with `receipt` and `edit` says it
+    /// changed something, and removes it once the removal is done and the application has settled
+    /// its own. A record that is another deletion's is left as it is.
     async fn edit_deletion(
         &self,
         receipt: &str,
-        edit: impl FnOnce(&mut Record),
+        edit: impl FnOnce(&mut Record) -> bool,
     ) -> Result<Option<Record>> {
         let _held = self.hold().await?;
         let Some(mut record) = self.read_deletion()? else {
             return Ok(None);
         };
-        if record.receipt != receipt {
+        if record.receipt != receipt || !edit(&mut record) {
             return Ok(Some(record));
         }
-        edit(&mut record);
         if record.done_seen && record.settled() {
             self.drop_deletion()?;
             return Ok(None);
@@ -648,6 +690,29 @@ impl SignedInAccount {
         Ok(true)
     }
 
+    /// Takes up a device step of the closed deletion `receipt` for this pass, and says whether it
+    /// was taken: not if the step is done, or another pass took it up less than the bound ago. A
+    /// claim older than that is a pass that ended without finishing, and is taken over. The claim is
+    /// written before the step runs, under the lock every process takes, so two passes never run
+    /// one step together.
+    async fn claim_step(&self, receipt: &str, step: DeviceStep) -> Result<bool> {
+        let _held = self.hold().await?;
+        let now = self.deletion_clock();
+        let Some(mut record) = self.read_deletion()? else {
+            return Ok(false);
+        };
+        if record.receipt != receipt || record.closed_ms.is_none() || record.step_settled(step) {
+            return Ok(false);
+        }
+        let claimed = record.step_claimed(step);
+        if claimed.is_some_and(|at| now.saturating_sub(at) <= CLAIM_FOR_MS) {
+            return Ok(false);
+        }
+        *claimed = Some(now);
+        self.write_deletion(&record)?;
+        Ok(true)
+    }
+
     /// Ends the stored grant if its account is closed and the grant is still that account's,
     /// without telling the service. The closure is `closure`, which the caller has just learned and
     /// may not have been able to write, else the record's own when it is closed and the grant has
@@ -656,6 +721,13 @@ impl SignedInAccount {
         let _held = self.hold().await?;
         let mut record = self.read_deletion()?;
         let (mark, receipt) = match (closure, &record) {
+            (Some(known), Some(kept))
+                if kept.receipt == known.receipt
+                    && kept.closed_ms.is_some()
+                    && kept.grant_ended =>
+            {
+                return Ok(());
+            }
             (Some(known), _) => (known.mark.clone(), known.receipt.clone()),
             (None, Some(kept)) if kept.closed_ms.is_some() && !kept.grant_ended => {
                 (kept.mark.clone(), kept.receipt.clone())
@@ -887,12 +959,25 @@ impl ManagedAccountDeletion {
 
     /// Sends a request that needs the bearer token, renewing the token once on a 401 and repeating
     /// the request once for the same account. A 401 means the request was refused before it ran.
-    async fn send_bearer(&self, route: Route, body: Option<&[u8]>, begin: bool) -> Sent {
+    ///
+    /// For a confirmation, `kept` is the deletion it carries: the record is made sure of, and as
+    /// young as the request, right before each send, since getting a token can take long enough for
+    /// the record to have been judged old.
+    async fn send_bearer(
+        &self,
+        route: Route,
+        body: Option<&[u8]>,
+        begin: bool,
+        mut kept: Option<&mut Held>,
+    ) -> Sent {
         let (mut authorisation, mark) = match self.authorise(false).await {
             Ok(held) => held,
             Err(fault) => return Sent::Fault(fault),
         };
         if let Err(fault) = self.bind(mark, begin) {
+            return Sent::Fault(fault);
+        }
+        if let Some(fault) = self.keep_for_send(kept.as_deref_mut()).await {
             return Sent::Fault(fault);
         }
         let first = self.send(route, Some(&authorisation), body).await;
@@ -910,7 +995,24 @@ impl ManagedAccountDeletion {
             Ok(_) => return Sent::Fault(DeletionFault::AccountChanged),
             Err(fault) => return Sent::Fault(fault),
         }
+        if let Some(fault) = self.keep_for_send(kept).await {
+            return Sent::Fault(fault);
+        }
         self.send(route, Some(&authorisation), body).await
+    }
+
+    /// Keeps the record of the confirmation about to leave, if it is one: a fault when it cannot be
+    /// kept, or when another deletion holds the place now.
+    async fn keep_for_send(&self, kept: Option<&mut Held>) -> Option<DeletionFault> {
+        let held = kept?;
+        match self.account.keep_deletion(held).await {
+            Ok(Some(now)) => {
+                held.sent_ms = now;
+                None
+            }
+            Ok(None) => Some(DeletionFault::AccountChanged),
+            Err(error) => Some(local(error)),
+        }
     }
 
     /* ---- What would happen ---- */
@@ -921,7 +1023,7 @@ impl ManagedAccountDeletion {
     ///
     /// Returns the fault that stopped it.
     pub async fn preview(&self) -> std::result::Result<DeletionRead, DeletionFault> {
-        match self.send_bearer(Route::View, None, true).await {
+        match self.send_bearer(Route::View, None, true, None).await {
             Sent::Data(data) => Ok(read_preview(&data)),
             Sent::Refusal {
                 code,
@@ -945,7 +1047,10 @@ impl ManagedAccountDeletion {
     ///
     /// Returns the fault that stopped it. [`DeletionFault::Unsure`] means the email may have been sent.
     pub async fn send_code(&self) -> std::result::Result<(), DeletionFault> {
-        match self.send_bearer(Route::Code, Some(b"{}"), false).await {
+        match self
+            .send_bearer(Route::Code, Some(b"{}"), false, None)
+            .await
+        {
             Sent::Data(data) if data.get("sent") == Some(&serde_json::Value::Bool(true)) => Ok(()),
             Sent::Data(_) | Sent::Lost => Err(DeletionFault::Unsure),
             Sent::Refusal {
@@ -988,12 +1093,19 @@ impl ManagedAccountDeletion {
         let mark = match self.authorise(false).await {
             Ok((_, mark)) => mark,
             Err(DeletionFault::NeedsSignIn) => {
-                let earlier = self
+                // The sign-in is gone before anything was sent. A deletion this device kept for
+                // the account the person began with may have been carried out by an earlier try;
+                // another account's is none of this one's.
+                let held = self
                     .account
                     .read_deletion()
                     .map_err(local)?
-                    .map(|record| record.sent_ms);
-                return self.after_unauthenticated(earlier).await;
+                    .filter(|record| self.is_flow(&record.mark))
+                    .map(|record| Held {
+                        earlier_ms: (!record.answered).then_some(record.sent_ms),
+                        ..record.held()
+                    });
+                return self.after_unauthenticated(held).await;
             }
             Err(fault) => return Err(fault),
         };
@@ -1006,7 +1118,10 @@ impl ManagedAccountDeletion {
         let mut replaced = false;
         loop {
             let body = confirmation(code, &held.receipt, acknowledged);
-            match self.send_bearer(Route::Confirm, Some(&body), false).await {
+            match self
+                .send_bearer(Route::Confirm, Some(&body), false, Some(&mut held))
+                .await
+            {
                 Sent::Data(data) => {
                     return match read_confirmed(&data) {
                         Some(Confirmed::Closed { finished }) => {
@@ -1014,11 +1129,9 @@ impl ManagedAccountDeletion {
                             Ok(DeletionOutcome::Closed { finished })
                         }
                         Some(Confirmed::Outcome(outcome)) => {
-                            // The service answered, and the answer says the request did nothing.
-                            let _ = self
-                                .account
-                                .edit_deletion(&held.receipt, |record| record.answered = true)
-                                .await;
+                            // The service answered, and the answer says the request did nothing:
+                            // it ran after every earlier one, so none of them is left running.
+                            self.answered(&held, false).await;
                             Ok(outcome)
                         }
                         None => self.after_lost_answer(&held).await,
@@ -1041,7 +1154,9 @@ impl ManagedAccountDeletion {
                     code: Some("UNAUTHENTICATED"),
                     ..
                 } => {
-                    return self.after_unauthenticated(held.earlier_ms).await;
+                    // Refused before it ran.
+                    self.answered(&held, true).await;
+                    return self.after_unauthenticated(Some(held)).await;
                 }
                 Sent::Refusal {
                     code,
@@ -1051,6 +1166,8 @@ impl ManagedAccountDeletion {
                     if server_side {
                         return self.after_lost_answer(&held).await;
                     }
+                    // Refused before it ran.
+                    self.answered(&held, true).await;
                     return Err(refusal_fault(
                         code,
                         retry_after_seconds,
@@ -1059,7 +1176,7 @@ impl ManagedAccountDeletion {
                 }
                 Sent::Lost => return self.after_lost_answer(&held).await,
                 Sent::Fault(DeletionFault::NeedsSignIn) => {
-                    return self.after_unauthenticated(held.earlier_ms).await;
+                    return self.after_unauthenticated(Some(held)).await;
                 }
                 Sent::Fault(fault) => return Err(fault),
             }
@@ -1076,8 +1193,10 @@ impl ManagedAccountDeletion {
         let _ = self
             .account
             .edit_deletion(&held.receipt, |record| {
+                let before = (record.closed_ms, record.done_seen);
                 record.closed_ms.get_or_insert(now);
                 record.done_seen |= finished;
+                before != (record.closed_ms, record.done_seen)
             })
             .await;
         let _ = self
@@ -1103,26 +1222,60 @@ impl ManagedAccountDeletion {
         Ok(DeletionOutcome::Unsettled)
     }
 
-    /// The service says the credential is dead. If a request of an earlier try may have closed the
-    /// account (`earlier` is when it left), the receipt is asked first: found closed, the account is
-    /// closed; not found within the margin, or not readable, whether it is closed is not known; not
-    /// found after the margin, the sign-in is what is needed. With no earlier request, it is.
+    /// Says the service answered the request `held` left with, so that nothing of it is left
+    /// running. Not if a later request has used the receipt since (its answer is the one that
+    /// says), nor, with `alone`, while an earlier request is unresolved: a refusal that came before
+    /// the request ran says nothing of that one.
+    async fn answered(&self, held: &Held, alone: bool) {
+        if alone && held.earlier_ms.is_some() {
+            return;
+        }
+        let _ = self
+            .account
+            .edit_deletion(&held.receipt, |record| {
+                let changes = record.sent_ms == held.sent_ms && !record.answered;
+                record.answered |= changes;
+                changes
+            })
+            .await;
+    }
+
+    /// Whether the deletion in front of the person began for the account `mark` names.
+    fn is_flow(&self, mark: &str) -> bool {
+        self.flow
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some_and(|held| mark_hex(held) == mark)
+    }
+
+    /// The service says the credential is dead. `held` is the deletion this confirmation carries
+    /// (none when the sign-in was gone before one was begun for it, and the account has no record
+    /// of its own). If a request of an earlier try may have closed the account, the receipt is asked
+    /// first: found closed, the account is closed; not found within the margin, or not readable,
+    /// whether it is closed is not known; not found after the margin, the sign-in is what is
+    /// needed. With no earlier request, or a record another deletion has replaced, it is.
     async fn after_unauthenticated(
         &self,
-        earlier: Option<u64>,
+        held: Option<Held>,
     ) -> std::result::Result<DeletionOutcome, DeletionFault> {
+        let Some(held) = held else {
+            return Err(DeletionFault::NeedsSignIn);
+        };
         let Some(record) = self.account.read_deletion().map_err(local)? else {
             return Err(DeletionFault::NeedsSignIn);
         };
+        if record.receipt != held.receipt {
+            return Err(DeletionFault::NeedsSignIn);
+        }
         if record.closed_ms.is_some() {
             return Ok(DeletionOutcome::Closed {
                 finished: record.done_seen,
             });
         }
-        let Some(earlier) = earlier else {
+        let Some(earlier) = held.earlier_ms else {
             return Err(DeletionFault::NeedsSignIn);
         };
-        match self.read_status(&record.held()).await {
+        match self.read_status(&held).await {
             Ok(Some(done)) => Ok(DeletionOutcome::Closed { finished: done }),
             Ok(None)
                 if self.account.deletion_clock().saturating_sub(earlier) > UNSETTLED_FOR_MS =>
@@ -1181,18 +1334,6 @@ impl ManagedAccountDeletion {
             return Ok(nothing);
         };
         let held = record.held();
-        let ours = self
-            .account
-            .current_mark(&self.origin)
-            .map_err(local)?
-            .is_none_or(|mark| mark == record.mark);
-        let shown = |progress| {
-            if ours {
-                progress
-            } else {
-                DeletionProgress::None
-            }
-        };
         if let Some(closed) = record.closed_ms
             && self.account.deletion_clock().saturating_sub(closed) > CLOSED_FOR_MS
         {
@@ -1205,7 +1346,7 @@ impl ManagedAccountDeletion {
         if record.closed_ms.is_none() && self.in_flight.load(Ordering::SeqCst) > 0 {
             // A confirmation is out in this process: its answer is not in yet.
             return Ok(DeletionStatus {
-                progress: shown(DeletionProgress::Unsettled),
+                progress: self.shown_to_signed_in(&record.mark, DeletionProgress::Unsettled)?,
                 device_pending: false,
             });
         }
@@ -1243,8 +1384,29 @@ impl ManagedAccountDeletion {
             .map_err(local)?
             .is_some_and(|kept| kept.closed_ms.is_some() && !kept.settled());
         Ok(DeletionStatus {
-            progress: shown(progress),
+            progress: self.shown_to_signed_in(&held.mark, progress)?,
             device_pending,
+        })
+    }
+
+    /// `progress`, if the deletion it is of is the signed-in account's, else none: another
+    /// account's deletion is looked after, and ends that account's grant and no other, but it is not
+    /// shown as this one's. Who is signed in is read now, after the look at the service, and not
+    /// before it: another account can sign in while the answer is out.
+    fn shown_to_signed_in(
+        &self,
+        mark: &str,
+        progress: DeletionProgress,
+    ) -> std::result::Result<DeletionProgress, DeletionFault> {
+        let ours = self
+            .account
+            .current_mark(&self.origin)
+            .map_err(local)?
+            .is_none_or(|signed_in| signed_in == mark);
+        Ok(if ours {
+            progress
+        } else {
+            DeletionProgress::None
         })
     }
 
@@ -1287,7 +1449,13 @@ impl ManagedAccountDeletion {
             .end_closed_grant(&self.origin, None)
             .await
             .map_err(local)?;
-        let Some(record) = self.account.read_deletion().map_err(local)? else {
+        let record = self.account.read_deletion().map_err(local)?;
+        // What this process remembers of finished steps is for the deletion on record, and no other.
+        self.taken
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(receipt, _)| record.as_ref().is_some_and(|kept| *receipt == kept.receipt));
+        let Some(record) = record else {
             return Ok(());
         };
         if record.closed_ms.is_none() {
@@ -1297,19 +1465,44 @@ impl ManagedAccountDeletion {
             if record.step_settled(step) {
                 continue;
             }
-            let done = self.taken(&record.receipt, step)
-                || match step {
+            // A step runs under a claim written to the record first, so that no other pass, in this
+            // process or another, runs it meanwhile; a step that came back not done gives its claim
+            // up, and one this process finished is not run again when only its finish went unwritten.
+            let done = if self.taken(&record.receipt, step) {
+                true
+            } else if self
+                .account
+                .claim_step(&record.receipt, step)
+                .await
+                .map_err(local)?
+            {
+                let done = match step {
                     DeviceStep::Notifications => steps.notifications().await,
                     DeviceStep::Recovery => steps.recovery().await,
                 };
+                if !done {
+                    let _ = self
+                        .account
+                        .edit_deletion(&record.receipt, |kept| {
+                            kept.step_claimed(step).take().is_some()
+                        })
+                        .await;
+                }
+                done
+            } else {
+                false
+            };
             if !done {
                 continue;
             }
             self.take(&record.receipt, step);
             self.account
-                .edit_deletion(&record.receipt, |kept| match step {
-                    DeviceStep::Notifications => kept.notifications_settled = true,
-                    DeviceStep::Recovery => kept.recovery_settled = true,
+                .edit_deletion(&record.receipt, |kept| {
+                    match step {
+                        DeviceStep::Notifications => kept.notifications_settled = true,
+                        DeviceStep::Recovery => kept.recovery_settled = true,
+                    }
+                    true
                 })
                 .await
                 .map_err(local)?;

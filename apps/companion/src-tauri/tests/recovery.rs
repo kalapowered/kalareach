@@ -227,6 +227,7 @@ impl Computer {
             .invoke_handler(tauri::generate_handler![
                 companion_tauri::commands::sync_service_view,
                 companion_tauri::commands::sync_service_set,
+                companion_tauri::commands::account_deletion_status,
                 companion_tauri::commands::recovery_view,
                 companion_tauri::commands::recovery_turn_on,
                 companion_tauri::commands::recovery_settle,
@@ -1763,4 +1764,36 @@ async fn a_closed_account_clears_the_recovery_record_once_and_a_later_look_leave
     assert_eq!(page.view()["state"], "on");
     settle_device(&page.app.state::<AppState>(), &closed).await;
     assert_eq!(page.view()["state"], "on");
+}
+
+/// What a closure left on this device is settled at a look even when the look at the service cannot
+/// be made: the status the page asks for says it could not, and the recovery record is cleared all
+/// the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_look_that_cannot_reach_the_service_still_clears_what_a_closed_account_left() {
+    let computer = Computer::new().await;
+    // Recovery was turned on while the account was signed in, and the application is started
+    // again after the account was closed.
+    let earlier = computer.page().await;
+    earlier
+        .call("recovery_turn_on", json!({}))
+        .expect("recovery is on");
+    drop(earlier);
+    let page = computer.start(closing::closed_account_unreachable().await);
+    page.call(
+        "sync_service_set",
+        json!({ "origin": computer.served.origin() }),
+    )
+    .expect("the service is chosen");
+    assert_eq!(
+        page.view()["state"],
+        "on",
+        "the record outlived the account"
+    );
+
+    let answer = page
+        .call("account_deletion_status", json!({}))
+        .expect("an answer");
+    assert_eq!(answer["state"], "problem");
+    assert_eq!(page.view()["state"], "off");
 }

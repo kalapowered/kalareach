@@ -19,9 +19,12 @@ use kr_client::services::{NullService, ServiceFuture, ServiceHttp, ServiceHttpAn
 use kr_crypto::store::MemoryStore;
 use kr_protocol::service::GatewayOrigin;
 
-/// The service, as it answers a confirmation that closes the account and a look at the outcome.
-#[derive(Debug)]
-struct Closing;
+/// The service, as it answers a confirmation that closes the account, and a look at the outcome
+/// until it is made unreachable.
+#[derive(Debug, Default)]
+struct Closing {
+    unreachable: std::sync::atomic::AtomicBool,
+}
 
 fn answered(body: &str) -> ServiceFuture<'static, ServiceHttpAnswer> {
     let answer = ServiceHttpAnswer {
@@ -39,6 +42,16 @@ impl ServiceHttp for Closing {
         _headers: &'a [(&'a str, &'a str)],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         if url.ends_with("/status") {
+            if self.unreachable.load(std::sync::atomic::Ordering::SeqCst) {
+                return Box::pin(async {
+                    Err(kr_client::error::ClientError::Host(
+                        kr_protocol::error::ProtocolError::new(
+                            kr_protocol::error::ErrorCode::UpstreamUnavailable,
+                            "unreachable".to_owned(),
+                        ),
+                    ))
+                });
+            }
             answered(r#"{"ok":true,"data":{"state":"open"}}"#)
         } else {
             answered(r#"{"ok":true,"data":{"result":"closed","state":"closing"}}"#)
@@ -80,6 +93,21 @@ impl Carrier for NoBrowser {
 /// An account that was signed in and has just had its deletion closed by the service: the stored
 /// sign-in is gone, and the record of the deletion waits for the device to settle what is its own.
 pub async fn closed_account() -> Arc<Account> {
+    closed_account_with(Arc::new(Closing::default())).await
+}
+
+/// [`closed_account`], over a service that cannot be reached once the account is closed: a look at
+/// how the removal goes fails.
+pub async fn closed_account_unreachable() -> Arc<Account> {
+    let service = Arc::new(Closing::default());
+    let account = closed_account_with(Arc::clone(&service)).await;
+    service
+        .unreachable
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    account
+}
+
+async fn closed_account_with(service_http: Arc<Closing>) -> Arc<Account> {
     let service: Arc<dyn AccountService> = Arc::new(NullService);
     let signed_in = Arc::new(SignedInAccount::new(
         Arc::clone(&service),
@@ -102,7 +130,7 @@ pub async fn closed_account() -> Arc<Account> {
     let origin = GatewayOrigin::new(ACCOUNT_ORIGIN).expect("an origin");
     let deletion = Arc::new(ManagedAccountDeletion::new(
         &origin,
-        Arc::new(Closing),
+        service_http,
         Arc::clone(&signed_in),
     ));
     let account = Arc::new(Account::new(
