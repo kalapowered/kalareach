@@ -697,6 +697,51 @@ describe('a confirmation that is still out when the panel opens', () => {
     expect(within(panel).getByTestId('delete-account')).toHaveAttribute('data-step', 'notdone')
   })
 
+  it.each([
+    ['done', 'none', 'result'],
+    ['none', 'open', 'notdone']
+  ] as const)(
+    'is not undone by a look the person asked for that answers after the automatic one found %s',
+    async (decided, late, step) => {
+      const { controls, panel } = await mounted()
+      const { deletion } = controls.account
+      // Check again goes out and waits; the automatic look then decides.
+      deletion.holdStatus()
+      await act(async () => {
+        within(panel).getByTestId('delete-account-check').click()
+        await vi.advanceTimersByTimeAsync(10)
+      })
+      deletion.answerStatus({ state: decided })
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3000)
+      })
+      expect(within(panel).getByTestId('delete-account')).toHaveAttribute('data-step', step)
+      // The look that waited answers now with something else.
+      deletion.answerStatus({ state: late })
+      await act(async () => {
+        deletion.releaseStatus()
+        await vi.advanceTimersByTimeAsync(10)
+      })
+      expect(within(panel).getByTestId('delete-account')).toHaveAttribute('data-step', step)
+    }
+  )
+
+  it('still tells a person whose sign-in ended meanwhile that the deletion did not go through', async () => {
+    const { controls, panel } = await mounted()
+    act(() => {
+      controls.account.set({ state: 'ended' })
+    })
+    controls.account.deletion.answerStatus({ state: 'none' })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000)
+    })
+    expect(within(panel).getByTestId('delete-account')).toHaveAttribute('data-step', 'notdone')
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000)
+    })
+    expect(within(panel).getByTestId('delete-account')).toHaveAttribute('data-step', 'notdone')
+  })
+
   it('stops looking by itself after about two minutes', async () => {
     const { controls, panel } = await mounted()
     await act(async () => {
@@ -795,10 +840,18 @@ describe('the desktop sheet', () => {
     })
   })
 
-  it('reads recovery again when the account closes and when the person leaves, since the device clears it meanwhile', async () => {
+  it('shows recovery as the device left it once the account is closed, though the signed-out view came first', async () => {
     const { port, controls } = fakeHost()
     controls.account.set(SIGNED_IN)
-    const recoveryReads = vi.spyOn(port, 'recoveryView')
+    // Until the result is on the screen, recovery still reads as on: the device clears it after the
+    // signed-out view is published and before the confirmation is answered.
+    const read = port.recoveryView.bind(port)
+    let cleared = false
+    vi.spyOn(port, 'recoveryView').mockImplementation(async () => {
+      const view = await read()
+      cleared ||= screen.queryByTestId('delete-account-done') !== null
+      return cleared ? view : { ...view, state: 'on', kept_at: 'sync.example' }
+    })
     render(
       <AppProvider port={port} initialPlace={{ view: 'attention' }}>
         <App />
@@ -806,20 +859,19 @@ describe('the desktop sheet', () => {
     )
     const person = userEvent.setup()
     const sheet = await sheetAt(person)
+    await waitFor(() => {
+      expect(within(sheet).getByTestId('recovery')).toHaveAttribute('data-state', 'on')
+    })
     await person.click(await within(sheet).findByTestId('delete-account-open'))
     await person.click(await within(sheet).findByTestId('delete-account-send-code'))
     await person.type(await within(sheet).findByTestId('delete-account-code'), CODE)
-    await waitFor(() => {
-      expect(recoveryReads).toHaveBeenCalled()
-    })
     await person.keyboard('{Enter}')
     await within(sheet).findByTestId('delete-account-done')
-    // The signed-out view arrived first; a read after the result is the one that sees the clearing.
-    const atResult = recoveryReads.mock.calls.length
-    await person.click(within(sheet).getByTestId('delete-account-done'))
     await waitFor(() => {
-      expect(recoveryReads.mock.calls.length).toBeGreaterThan(atResult)
+      expect(within(sheet).getByTestId('recovery')).toHaveAttribute('data-state', 'off')
     })
+    await person.click(within(sheet).getByTestId('delete-account-done'))
+    expect(within(sheet).getByTestId('recovery')).toHaveAttribute('data-state', 'off')
   })
 
   it('keeps Tab inside the step while the cards are hidden', async () => {

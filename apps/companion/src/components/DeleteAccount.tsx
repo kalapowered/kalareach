@@ -81,8 +81,7 @@ const LEAVABLE: readonly DeletionStep['name'][] = [
   'read',
   'sending',
   'code',
-  'acknowledge',
-  'notdone'
+  'acknowledge'
 ]
 
 /** The line a step shows under its words: a step that could not be taken, or this device's own failure. */
@@ -446,14 +445,19 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
         .accountDeletionStatus()
         .then((answer) => {
           if (!live) return
+          // This look decides the step, so a Check again that is out is no longer the one that does.
           if (answer.state === 'open' || answer.state === 'done') {
+            ask.current += 1
             unresolved.current = false
+            setChecking(false)
             setSaid(null)
             next({ name: 'result', progress: answer.state })
             return
           }
           if (answer.state === 'none') {
+            ask.current += 1
             unresolved.current = false
+            setChecking(false)
             setSaid(null)
             next({ name: 'notdone' })
             return
