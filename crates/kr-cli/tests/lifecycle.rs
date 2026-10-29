@@ -4975,10 +4975,87 @@ fn emulator_programs_are_here(programs: &[&str]) -> bool {
 
 /// A real terminal application opened on a virtual display and a bus of their own, running a shell
 /// script, and the process group it runs in, ended by its exact identifier when this is dropped.
+///
+/// The bus the application runs on starts the desktop's document portal, whose runtime directory is
+/// the case's own, and the portal mounts a file system of its own in it (`doc`). A group that is
+/// killed leaves that mount behind with no portal to serve it, and a mount under the case's tree
+/// stops anything that removes the tree. So ending the group also takes down every mount the
+/// session left under the case's tree, whichever of the applications started the portal.
 struct HeadlessEmulator {
     child: std::cell::RefCell<std::process::Child>,
     /// What the script and the application printed.
     log: PathBuf,
+    /// The case's tree, under which nothing stays mounted once the application has ended.
+    root: PathBuf,
+    /// Whether the group has been ended already, so that it is not signalled again by a number the
+    /// system may have given to another process since.
+    ended: std::cell::Cell<bool>,
+}
+
+/// The mount points under `root`, deepest first, from the kernel's table of this process's mounts.
+fn mounts_under(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let root = std::fs::canonicalize(root)?;
+    let table = std::fs::read_to_string("/proc/self/mountinfo")?;
+    let mut found: Vec<PathBuf> = table
+        .lines()
+        // The fifth field is the mount point, with a space, a tab, a line break and a backslash
+        // written as three octal digits after a backslash.
+        .filter_map(|line| line.split(' ').nth(4))
+        .map(|field| {
+            let bytes = field.as_bytes();
+            let mut decoded = Vec::with_capacity(bytes.len());
+            let mut at = 0;
+            while at < bytes.len() {
+                let octal = (bytes[at] == b'\\')
+                    .then(|| bytes.get(at + 1..at + 4))
+                    .flatten()
+                    .and_then(|digits| std::str::from_utf8(digits).ok())
+                    .and_then(|digits| u8::from_str_radix(digits, 8).ok());
+                match octal {
+                    Some(byte) => {
+                        decoded.push(byte);
+                        at += 4;
+                    }
+                    None => {
+                        decoded.push(bytes[at]);
+                        at += 1;
+                    }
+                }
+            }
+            PathBuf::from(std::ffi::OsString::from_vec(decoded))
+        })
+        .filter(|mount| mount.starts_with(&root))
+        .collect();
+    found.sort_by_key(|mount| std::cmp::Reverse(mount.components().count()));
+    Ok(found)
+}
+
+/// Takes down a mount with FUSE's own program, which lets a user unmount what is theirs, under
+/// either of the names it is installed by.
+fn unmount(mount: &Path) -> Result<(), String> {
+    let mut why = String::from("no unmount program is installed");
+    for program in ["fusermount3", "fusermount"] {
+        match std::process::Command::new(program)
+            .arg("-u")
+            .arg("--")
+            .arg(mount)
+            .stdin(std::process::Stdio::null())
+            .output()
+        {
+            Ok(output) if output.status.success() => return Ok(()),
+            Ok(output) => {
+                why = format!(
+                    "{program} -u: {} {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            Err(error) => why = format!("{program} did not start: {error}"),
+        }
+    }
+    Err(why)
 }
 
 impl HeadlessEmulator {
@@ -5026,6 +5103,46 @@ impl HeadlessEmulator {
         Self {
             child: std::cell::RefCell::new(child),
             log,
+            root: host.root().to_path_buf(),
+            ended: std::cell::Cell::new(false),
+        }
+    }
+
+    /// Ends the application's group, takes down what its session mounted under the case's tree, and
+    /// says what is still mounted there, and why, if anything is.
+    ///
+    /// # Errors
+    ///
+    /// Returns the mounts that stay, each with why it could not be taken down.
+    fn end(&self) -> Result<(), String> {
+        if !self.ended.replace(true) {
+            // The group is the child's own, named by the child's identifier.
+            let mut child = self.child.borrow_mut();
+            if let Some(group) = i32::try_from(child.id())
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+            {
+                let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+            }
+            let _ = child.wait();
+        }
+        let table =
+            |error: std::io::Error| format!("the table of mounts could not be read: {error}");
+        let mut refused = Vec::new();
+        for mount in mounts_under(&self.root).map_err(table)? {
+            if let Err(why) = unmount(&mount) {
+                refused.push(format!("{}: {why}", mount.display()));
+            }
+        }
+        // What the table shows afterwards decides, not what the program said.
+        let left = mounts_under(&self.root).map_err(table)?;
+        if left.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "still mounted: {left:?}\nnot taken down: {}",
+                refused.join("; ")
+            ))
         }
     }
 
@@ -5064,15 +5181,8 @@ impl HeadlessEmulator {
 
 impl Drop for HeadlessEmulator {
     fn drop(&mut self) {
-        // The group is the child's own, named by the child's identifier.
-        let child = self.child.get_mut();
-        if let Some(group) = i32::try_from(child.id())
-            .ok()
-            .and_then(rustix::process::Pid::from_raw)
-        {
-            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
-        }
-        let _ = child.wait();
+        // A case that failed part way ends here, with nothing mounted left under its tree either.
+        let _ = self.end();
     }
 }
 
@@ -5253,6 +5363,11 @@ fn windows_through_the_profile_create_a_session_each(
     });
     assert_eq!(removed["ok"], true, "{removed}");
     assert_eq!(removed["profiles"][0]["result"], "removed", "{removed}");
+    // The application and its bus are over, and the document portal their session started has left
+    // no mount under this case's tree: a mount there would stop the tree being removed.
+    if let Err(left) = emulator.end() {
+        panic!("a mount stays under the case's tree after the application ended:\n{left}");
+    }
 }
 
 /// KR-REQ-01.21, KR-REQ-07.42: a real GNOME Terminal opens a window and then a tab through the
