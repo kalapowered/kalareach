@@ -48,6 +48,7 @@ use kr_delivery::push::DeliveryStatus;
 use super::client::GatewayClient;
 use super::credentials::HeldCredentials;
 use super::external::ExternalSenders;
+use super::forget::{ForgetAnswer, GatewayForget};
 use super::mail::MailSubmission;
 use super::sender::GatewaySenders;
 use super::status::{GatewayStatus, StatusAllowance, StatusBudget};
@@ -180,6 +181,8 @@ struct Adapters {
     receipts: GatewayStatus,
     /// The sweep's status questions, within its share.
     unknown: GatewayStatus,
+    /// A person's request to delete what the gateway holds for a notification.
+    forgetter: GatewayForget,
     /// Every external destination's adapter: webhooks, the chat services and mail submission.
     external: ExternalSenders,
 }
@@ -385,6 +388,7 @@ impl DeliveryRuntime {
                     self.runtime.clone(),
                     self.cadence.unknown,
                 ),
+                forgetter: GatewayForget::new(Arc::clone(&transports), self.runtime.clone()),
                 external: ExternalSenders::new(
                     Arc::clone(&transports),
                     self.runtime.clone(),
@@ -396,6 +400,30 @@ impl DeliveryRuntime {
             self.credentials.attach_renewal(senders);
         }
         attached
+    }
+
+    /// Asks the gateway that gave a credential its authorisation to delete what it still holds for
+    /// one notification this host gave it.
+    ///
+    /// It is a person's request, so it takes none of the passes' shares and is not stopped by
+    /// privacy mode. It blocks on the daemon's reactor, so a caller runs it on a blocking thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns why no request was put: no transport is attached, or this host holds no credential
+    /// for the authorisation, such as a device that was unpaired since. Nothing was sent then.
+    pub fn forget_notification(
+        &self,
+        sender_record_id: kr_protocol::ids::PushSenderRecordId,
+        notification_id: kr_protocol::ids::NotificationId,
+    ) -> Result<ForgetAnswer, String> {
+        let Some(adapters) = self.adapters.get() else {
+            return Err("this host has no transport to the gateway yet".to_owned());
+        };
+        let Some(credential) = self.credentials.held(sender_record_id) else {
+            return Err("this host holds no credential for the device's gateway".to_owned());
+        };
+        Ok(adapters.forgetter.forget(&credential, notification_id))
     }
 
     /// Hands the runtime the environment's attention store, which every pass takes the

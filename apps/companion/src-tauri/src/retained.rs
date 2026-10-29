@@ -170,15 +170,21 @@ impl Deletions {
             let connection = require_this_computers_host(host)?;
             let report = read_report(connection).await?;
             let copy = the_deletable_copy(&report, reference)?;
+            let words = if copy.kind == "notification" {
+                "KalaReach asks the notification gateway to delete what it still holds for this \
+                 notification, and a queued one is not sent. It does not recall a notification a \
+                 provider already accepted, or one a device already holds."
+            } else {
+                "KalaReach asks the service that holds this copy to delete it. Nothing \
+                 restores from it afterwards. If it is the newest backup this host made, \
+                 no restore works until this host makes its next one, which it does once \
+                 privacy mode is off."
+            };
             (
                 Question {
                     kind: shown(&copy.kind),
                     reference: shown(&copy.reference),
-                    words: "KalaReach asks the service that holds this copy to delete it. Nothing \
-                         restores from it afterwards. If it is the newest backup this host made, \
-                         no restore works until this host makes its next one, which it does once \
-                         privacy mode is off."
-                        .to_owned(),
+                    words: words.to_owned(),
                 },
                 Bound::Host {
                     environment_id: connection.environment_id(),

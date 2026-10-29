@@ -129,20 +129,52 @@ async fn delete(
     match (&unconfirmed, json) {
         (None, true) => output::document(&outcome),
         (Some(error), true) => output::document(&report::with_failure(outcome, error)),
-        (None, false) => output::lines(&[
-            stdout_line!("The service has confirmed that it holds that copy no longer."),
-            stdout_line!(
-                "It keeps what it deleted for its recovery window, and the list shows the copy \
-                 until then."
-            ),
-        ]),
+        (None, false) => output::lines(&if is_notification(copy) {
+            vec![
+                stdout_line!("The gateway holds no record of that notification now."),
+                stdout_line!(
+                    "A notification a provider accepted or a device holds stays where it is, and \
+                     the list keeps showing it."
+                ),
+            ]
+        } else {
+            vec![
+                stdout_line!("The service has confirmed that it holds that copy no longer."),
+                stdout_line!(
+                    "It keeps what it deleted for its recovery window, and the list shows the \
+                     copy until then."
+                ),
+            ]
+        }),
         (Some(error), false) => report::failed(error),
     }
     Ok(unconfirmed.map_or(Completion::Done, Completion::Reported))
 }
 
+/// Whether a listed copy is a notification the push gateway was given, whose record the host asks
+/// the gateway to delete, rather than a backup generation.
+fn is_notification(copy: &PrivacyExported) -> bool {
+    copy.kind == "notification"
+}
+
 /// What a deletion asks, as lines for a person to read before they type the word.
 fn delete_summary(copy: &PrivacyExported) -> Vec<Line> {
+    if is_notification(copy) {
+        return vec![
+            stdout_line!(
+                "Delete {} {}, which left this host at {} ms.",
+                Asked::text(Request::Privacy, &copy.kind),
+                Asked::text(Request::Privacy, &copy.reference),
+                copy.left_at_ms.get()
+            ),
+            stdout_line!(
+                "This asks the notification gateway to delete what it still holds for that \
+                 notification, and a queued one is not sent. It does not recall a notification \
+                 a provider already accepted, or one a device already holds. Privacy mode stays \
+                 as it is."
+            ),
+        ];
+    }
     vec![
         stdout_line!(
             "Delete {} {}, which left this host at {} ms.",

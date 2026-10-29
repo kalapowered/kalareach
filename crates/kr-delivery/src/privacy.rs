@@ -24,9 +24,10 @@
 //! And the part section 24 is most specific about: *already uploaded archives and notifications
 //! and copies held by authorised viewers are not retroactively erased. Show those retained
 //! artifacts and offer an explicit separately authorised deletion action.* [`DeliveryOutbox::
-//! exported`] is that list. Every entry says it is not deletable by this host, because it is not:
-//! a notification a provider queued is on a device, and an external message is in somebody else's
-//! service.
+//! exported`] is that list. A notification is marked deletable, because the gateway that was given
+//! it holds a record this host can ask it to delete; that reaches nothing a provider queued, which
+//! is on a device. An external message is not, because it is in somebody else's service and this
+//! host has no route to ask that service to forget it.
 
 use kr_worker::privacy::{
     Cancelled, Exported, Fenced, KeptExplicitly, PrivacyGeneration, PrivacySubsystem, Removed,
@@ -513,8 +514,9 @@ mod tests {
         assert!(
             exported
                 .iter()
-                .any(|copy| copy.kind == "notification" && !copy.deletable),
-            "the unknown outcome is shown: {exported:?}"
+                .any(|copy| copy.kind == "notification" && copy.deletable),
+            "the unknown outcome is shown, and the gateway can be asked to delete its record: \
+             {exported:?}"
         );
         let record = journal
             .delivery(unknown)

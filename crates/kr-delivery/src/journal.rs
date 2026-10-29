@@ -695,6 +695,9 @@ impl std::fmt::Display for ClaimRefusal {
     }
 }
 
+/// The kind an [`ExportedDelivery`] names a notification the gateway was given.
+pub const NOTIFICATION_COPY: &str = "notification";
+
 /// Something that had already left this host.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExportedDelivery {
@@ -2866,7 +2869,7 @@ impl DeliveryJournal {
                 })?,
                 destination_id: DestinationId::new(destination.clone())?,
                 kind: match kind {
-                    DestinationKind::Push => "notification".to_owned(),
+                    DestinationKind::Push => NOTIFICATION_COPY.to_owned(),
                     other => format!("{other} message"),
                 },
                 reference: if detail_left == 0 {
@@ -2878,10 +2881,11 @@ impl DeliveryJournal {
                     )
                 },
                 left_at_ms: TimestampMs::new(as_u64(left_at)),
-                // A notification a provider queued is on a device this host cannot reach, and an
-                // external message is in somebody else's service. Neither has a removal this host
-                // can perform, so neither claims one.
-                deletable: false,
+                // The gateway holds a record of a notification it was given, and a host can ask it
+                // to delete what it still holds. That reaches nothing a provider already accepted,
+                // a device already holds or a mailbox keeps for the device. An external message is
+                // in somebody else's service, which this host has no route to ask.
+                deletable: matches!(kind, DestinationKind::Push),
             });
         }
         Ok(exported)

@@ -64,6 +64,7 @@ pub mod chat;
 pub mod client;
 pub mod credentials;
 pub mod external;
+pub mod forget;
 pub mod mail;
 pub mod mailbox;
 pub mod runtime;

@@ -1947,6 +1947,9 @@ impl crate::service::Controller {
     /// person asks again, and by the carrier once privacy mode is off. The registration the call
     /// was admitted under is checked in the write that records the request.
     ///
+    /// The other copy a host can ask the removal of is a notification the gateway was given, which
+    /// [`Self::privacy_notification_delete`] asks the gateway to delete the record of.
+    ///
     /// # Errors
     ///
     /// Returns [`ControllerError::InvalidArgument`] when the list holds no one copy under the
@@ -1976,8 +1979,13 @@ impl crate::service::Controller {
             detail: format!("this host cannot ask for the removal of that copy: {why}"),
         };
         let Some((archive, generation)) = backup_generation_of(&copy.reference) else {
+            if copy.deletable && copy.kind == kr_delivery::journal::NOTIFICATION_COPY {
+                return self
+                    .privacy_notification_delete(&copy.reference, carried)
+                    .await;
+            }
             return Err(refused(if copy.deletable {
-                "it is not a backup generation"
+                "it is not a backup generation or a notification"
             } else {
                 &copy.kind
             }));
@@ -2036,6 +2044,121 @@ impl crate::service::Controller {
         kr_protocol::envelope::ParamsValue::from_typed(
             &kr_protocol::privacy::PrivacyRetainedDeleteResult {
                 deleted: confirmed,
+                report,
+            },
+        )
+        .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+    }
+
+    /// Asks the gateway to delete what it still holds for one notification this host gave it.
+    ///
+    /// The person's own action, which privacy mode neither stops nor is stopped by. The copy is
+    /// found again in the delivery journal, which names the notification and the device it went
+    /// to, and the request is made under the credential the gateway gave that device's
+    /// authorisation; the gateway answers for that credential's notifications only. The answer is
+    /// that the gateway holds nothing for the notification now, which is what the gateway means
+    /// whether it removed a record, never had one or had already swept it. It says nothing of a
+    /// copy a provider accepted or a device holds, and the list keeps showing the notification as
+    /// one that may have left.
+    ///
+    /// Nothing is recorded here. A gateway that does not answer, or refuses the credential, leaves
+    /// the copy listed as it was and the error says why; the person asks again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::InvalidArgument`] when the delivery journal holds no one
+    /// notification under the reference, [`ControllerError::PermissionDenied`] for a registration
+    /// that was withdrawn, for a device this host holds no credential for and when no transport
+    /// reaches the gateway, and [`ControllerError::Storage`] when the gateway did not answer or
+    /// refused the request.
+    async fn privacy_notification_delete(
+        self: &Arc<Self>,
+        reference: &str,
+        carried: crate::authority::AdmittedMutation,
+    ) -> Result<kr_protocol::envelope::ParamsValue> {
+        let controller = Arc::clone(self);
+        let named = reference.to_owned();
+        let (notification_id, sender_record_id) = tokio::task::spawn_blocking(move || {
+            controller.delivery().with(|producer| {
+                let journal = producer.journal();
+                let mut copies = journal
+                    .exported()
+                    .map_err(|error| ControllerError::Storage {
+                        operation: "list the notifications that left this host",
+                        detail: error.to_string(),
+                    })?
+                    .into_iter()
+                    .filter(|copy| copy.reference == named);
+                let (Some(copy), None) = (copies.next(), copies.next()) else {
+                    return Err(ControllerError::InvalidArgument(
+                        "the delivery journal holds no one notification under that reference"
+                            .to_owned(),
+                    ));
+                };
+                let destination = journal.destination(&copy.destination_id).map_err(|error| {
+                    ControllerError::Storage {
+                        operation: "read the destination of a notification",
+                        detail: error.to_string(),
+                    }
+                })?;
+                let Some(kr_delivery::destination::DestinationRecord {
+                    destination: kr_delivery::destination::Destination::Push(push),
+                    ..
+                }) = destination
+                else {
+                    return Err(ControllerError::PermissionDenied {
+                        detail: "this host cannot ask for the removal of that copy: its device \
+                                 is no longer a destination of this host"
+                            .to_owned(),
+                    });
+                };
+                Ok((copy.notification_id, push.sender_record_id))
+            })
+        })
+        .await
+        .map_err(|_| ControllerError::RegistryUnavailable {
+            detail: "the deletion stopped before it could say what it did".to_owned(),
+        })??;
+        // The registration the call was admitted under is asked again immediately before the
+        // request leaves. A withdrawal that lands after it does not recall a deletion.
+        self.check_registration(&carried)?;
+        let controller = Arc::clone(self);
+        let answer = tokio::task::spawn_blocking(move || {
+            controller
+                .delivery_runtime()
+                .forget_notification(sender_record_id, notification_id)
+        })
+        .await
+        .map_err(|_| ControllerError::RegistryUnavailable {
+            detail: "the deletion stopped before it could say what it did".to_owned(),
+        })?
+        .map_err(|detail| ControllerError::PermissionDenied {
+            detail: format!("this host cannot ask for the removal of that copy: {detail}"),
+        })?;
+        let unreached = |why: String| ControllerError::Storage {
+            operation: "have the gateway delete what it holds for that notification",
+            detail: why,
+        };
+        match answer {
+            crate::push::forget::ForgetAnswer::Answered { .. } => {}
+            crate::push::forget::ForgetAnswer::CredentialRefused => {
+                return Err(unreached(
+                    "it does not take this host's credential for that device; the credential is \
+                     renewed on its own, so ask again later"
+                        .to_owned(),
+                ));
+            }
+            crate::push::forget::ForgetAnswer::Refused { code } => {
+                return Err(unreached(format!("it refused the request ({code})")));
+            }
+            crate::push::forget::ForgetAnswer::Unanswered { detail } => {
+                return Err(unreached(detail));
+            }
+        }
+        let report = self.current_privacy_report().await?;
+        kr_protocol::envelope::ParamsValue::from_typed(
+            &kr_protocol::privacy::PrivacyRetainedDeleteResult {
+                deleted: true,
                 report,
             },
         )

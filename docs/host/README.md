@@ -5106,8 +5106,11 @@ archive was ever completed from them. The backup service marks an archive deleta
 person's own deletion of it would be accepted now (below), and not deletable when it would not. The
 ciphertext of a generation whose descriptor was never published is not deletable: its store records
 no deletion of such objects, the entry's kind says so, and a person who wants that copy removed asks
-the service that holds it. A notification a provider queued is listed and is not deletable, because
-this host holds no way to ask the provider to forget it. Backup does not silently delete unrelated
+the service that holds it. A notification the push gateway was given is listed and is deletable, in
+the one sense the gateway can honour: the host asks the gateway to delete what it still holds for it
+(below). That does not reach what a provider queued or what a device holds, and the notification is
+still listed as one that may have left. An external message is listed and is not deletable, because
+this host holds no way to ask the service it went to to forget it. Backup does not silently delete unrelated
 collections and does not claim a copy somebody else holds can be recalled. Local deletion is logical
 cleanup of this host's own records rather than a claim of physical secure erase: the files are
 unlinked and the rows are cleared, and nothing here says the bytes are unrecoverable from the device
@@ -5121,6 +5124,18 @@ the `exported` list of `privacy.status` shows for it, and the host does not trus
 the list again and acts only when exactly one entry has that reference and the entry is marked
 deletable. A reference the list does not hold is refused as `INVALID_ARGUMENT`, and a copy marked
 non-deletable as `PERMISSION_DENIED`.
+
+For a notification the host asks the push gateway, under the credential the gateway gave the
+device's authorisation and over the daemon's own transport, to delete what it still holds for that
+one notification, and names no other. The registration the call was admitted under is asked again
+immediately before the request leaves. The gateway's answer says what it held: a notification still
+queued is not sent now, a recorded decision is gone, and nothing at all is also what it answers for a
+notification it never saw, one of another authorisation and one it already removed or swept. This
+host takes any of those as the gateway holding nothing now, and reports the deletion as done. It
+records nothing of its own: a gateway that does not answer, that refuses the credential, or whose
+answer is about another notification leaves the copy listed as it was and the call fails with
+`STORAGE_UNAVAILABLE`, and the person asks again. A device this host holds no credential for any
+longer, such as one unpaired since, is refused as `PERMISSION_DENIED` and nothing leaves the host.
 
 For a backup generation the host's store decides, in the write that records the request. The
 generation belongs to the archive of this host's setup, and the writer that signed it is still

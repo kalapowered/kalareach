@@ -3878,8 +3878,10 @@ fn privacy_mode_fences_the_outbox_with_work_in_flight() {
             ));
             let exported = outbox.exported().expect("a list");
             assert!(
-                exported.iter().any(|exported| !exported.deletable),
-                "what has already left is shown, and this host claims no recall"
+                exported
+                    .iter()
+                    .any(|exported| exported.kind == kr_delivery::journal::NOTIFICATION_COPY),
+                "what has already left is shown"
             );
             assert!(!outbox.kept().is_empty(), "what is kept is named");
             Ok(())
@@ -4046,9 +4048,37 @@ struct DeliveringGateway {
     delivery_fails_with: Option<u16>,
     /// Holds every delivery until a permit is given, which leaves a send on the wire.
     hold: Option<Arc<tokio::sync::Semaphore>>,
+    /// What it answers a request to delete what it holds with, when not that it removed the
+    /// record of the notification named.
+    forget: Option<ForgetScript>,
+}
+
+/// How a gateway answers a request to delete what it holds, other than by doing it.
+#[derive(Debug, Clone, Copy)]
+enum ForgetScript {
+    /// Refuses the credential, as it does one that is revoked or has run out.
+    RefusesTheCredential,
+    /// Answers about a notification that was not named.
+    AnswersAboutAnother(NotificationId),
 }
 
 impl DeliveringGateway {
+    /// A gateway that answers a request to delete what it holds as `script` says.
+    fn forgetting(script: ForgetScript) -> Self {
+        Self {
+            forget: Some(script),
+            ..Self::default()
+        }
+    }
+
+    /// The requests it was given to delete what it holds, in order.
+    fn forgets(&self) -> Vec<Asked> {
+        self.asked()
+            .into_iter()
+            .filter(|asked| asked.url.ends_with("/api/push/deliver/forget"))
+            .collect()
+    }
+
     /// A gateway that holds every delivery it is given until [`Self::release`].
     fn holding() -> Self {
         Self {
@@ -4135,6 +4165,49 @@ impl kr_client::services::ServiceHttp for DeliveringGateway {
                 Ok(kr_client::services::ServiceHttpAnswer {
                     status,
                     body: Vec::new(),
+                })
+            });
+        }
+        if url.ends_with("/api/push/deliver/forget") {
+            let asked: serde_json::Value = serde_json::from_slice(body).expect("a JSON request");
+            let named: NotificationId =
+                serde_json::from_value(asked["notification_ids"][0].clone()).expect("an id");
+            let (status, answer) = match self.forget {
+                Some(ForgetScript::RefusesTheCredential) => (
+                    401,
+                    serde_json::json!({
+                        "ok": false,
+                        "error": {
+                            "code": "UNAUTHENTICATED",
+                            "message": "That credential does not belong to an active authorisation.",
+                        },
+                    }),
+                ),
+                other => {
+                    let answered = match other {
+                        Some(ForgetScript::AnswersAboutAnother(another)) => another,
+                        _ => named,
+                    };
+                    (
+                        200,
+                        serde_json::json!({
+                            "ok": true,
+                            "data": {
+                                "removed": [{
+                                    "notification_id": answered,
+                                    "held": "settled",
+                                    "dispatched": true,
+                                }],
+                                "note": "Deletion removes what the gateway still holds.",
+                            },
+                        }),
+                    )
+                }
+            };
+            return Box::pin(async move {
+                Ok(kr_client::services::ServiceHttpAnswer {
+                    status,
+                    body: serde_json::to_vec(&answer).expect("an answer"),
                 })
             });
         }
@@ -7712,9 +7785,9 @@ fn announcements_waiting(controller: &Controller) -> Option<usize> {
 /// outboxes and no late result of an earlier generation is published, while a pending approval
 /// still alerts, with no body and no preview. A command that failed while privacy mode was on is
 /// never sent after it ends, and is settled with the store rather than held. The approval's alert
-/// is the one copy that left, and `privacy.status` lists it with its reference and says no removal
-/// is held for it. The control: a command that fails after privacy mode ends is delivered, with its
-/// preview.
+/// is the one copy that left, and `privacy.status` lists it with its reference and says the
+/// gateway can be asked to delete its record. The control: a command that fails after privacy mode
+/// ends is delivered, with its preview.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_pending_approval_alerts_without_a_preview_and_what_was_decided_in_private_is_never_sent()
 {
@@ -7769,7 +7842,8 @@ async fn a_pending_approval_alerts_without_a_preview_and_what_was_decided_in_pri
         "the alert carries no preview"
     );
 
-    // The one copy that left is listed with its reference, and no removal is held for it.
+    // The one copy that left is listed with its reference, and the gateway can be asked to delete
+    // its record.
     let report = privacy_report(&host).await;
     assert_eq!(report.exported.len(), 1, "{:?}", report.exported);
     assert_eq!(report.exported[0].kind, "notification");
@@ -7778,7 +7852,10 @@ async fn a_pending_approval_alerts_without_a_preview_and_what_was_decided_in_pri
             .reference
             .contains(&device_id.to_string())
     );
-    assert!(!report.exported[0].deletable);
+    assert!(
+        report.exported[0].deletable,
+        "the gateway can be asked to delete its record"
+    );
     assert!(report.unlisted.is_empty(), "{:?}", report.unlisted);
 
     set_privacy(&host, false).await;
@@ -7819,6 +7896,177 @@ async fn a_pending_approval_alerts_without_a_preview_and_what_was_decided_in_pri
         .with(|producer| Ok(producer.journal().deliveries().expect("a read").len()))
         .expect("a read");
     assert_eq!(rows, 2);
+    host.stop().await;
+}
+
+/// A daemon in privacy mode whose one pending approval has alerted a paired phone through
+/// `gateway`, so that `privacy.status` lists the one notification that left.
+async fn a_host_whose_alert_left(
+    gateway: &Arc<DeliveringGateway>,
+) -> (
+    net_support::Host,
+    kr_protocol::privacy::PrivacyExported,
+    PushSenderRecordId,
+) {
+    let host = net_support::Host::start_unowned().await;
+    let controller = host.controller();
+    let (_, sender, _) = pair_phone(controller, 10, SessionSelector::Any);
+    assert!(controller.attach_delivery_transport(Arc::new(OneTransport(
+        Arc::clone(gateway) as Arc<dyn kr_client::services::ServiceHttp>
+    ))));
+    set_privacy(&host, true).await;
+    controller
+        .attention()
+        .observe(&[pending_approval_in(
+            SessionId::new(uuid(90)),
+            1,
+            "req-write-hosts",
+        )])
+        .expect("the store records the approval");
+    until_holds("the alert being accepted", || {
+        controller
+            .delivery()
+            .with(|producer| {
+                Ok(producer
+                    .journal()
+                    .deliveries()
+                    .expect("a read")
+                    .iter()
+                    .any(|record| record.state == DeliveryState::Accepted))
+            })
+            .unwrap_or(false)
+    })
+    .await;
+    let report = privacy_report(&host).await;
+    assert_eq!(report.exported.len(), 1, "{:?}", report.exported);
+    let copy = report.exported[0].clone();
+    (host, copy, sender)
+}
+
+/// Asks the daemon to delete the copy `privacy.status` lists under `reference`, as a person at
+/// this machine does.
+async fn delete_retained(
+    host: &net_support::Host,
+    reference: &str,
+) -> Result<kr_protocol::privacy::PrivacyRetainedDeleteResult, kr_protocol::error::ProtocolError> {
+    let mut client = host.client().await;
+    client
+        .mutate(
+            kr_protocol::method::Method::PrivacyRetainedDelete,
+            kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &kr_protocol::privacy::PrivacyRetainedDeleteParams {
+                reference: reference.to_owned(),
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .map(|value| value.to_typed().expect("a result of the declared shape"))
+}
+
+/// KR-REQ-24.29: a notification the gateway was given is listed as a copy the host can ask the
+/// gateway to delete the record of, and the person's deletion asks the gateway under the
+/// credential of the device it went to, names that one notification and no other, and is not
+/// stopped by privacy mode. The notification is still shown as one that may have left: the
+/// deletion recalls nothing a provider accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_person_can_have_the_gateway_delete_what_it_holds_for_a_notification_that_left() {
+    let gateway = Arc::new(DeliveringGateway::default());
+    let (host, copy, _) = a_host_whose_alert_left(&gateway).await;
+    assert!(copy.deletable);
+    let delivered = gateway.delivered();
+    assert_eq!(delivered.len(), 1);
+    assert!(
+        gateway.forgets().is_empty(),
+        "nothing is asked until the person asks"
+    );
+
+    let result = delete_retained(&host, &copy.reference)
+        .await
+        .expect("the gateway answered");
+
+    assert!(result.deleted);
+    let forgets = gateway.forgets();
+    assert_eq!(forgets.len(), 1, "one request to delete");
+    let asked: serde_json::Value = serde_json::from_slice(&forgets[0].body).expect("a request");
+    assert_eq!(
+        asked["notification_ids"],
+        serde_json::json!([delivered[0]]),
+        "it names the one notification that was listed and no other"
+    );
+    let credential = forgets[0]
+        .headers
+        .iter()
+        .find(|(name, _)| name == "authorization")
+        .expect("the request carries the device's credential");
+    assert!(credential.1.starts_with("Bearer "));
+    assert!(
+        result
+            .report
+            .exported
+            .iter()
+            .any(|listed| listed.reference == copy.reference),
+        "a copy that may have left is still shown"
+    );
+    host.stop().await;
+}
+
+/// KR-REQ-24.29: a deletion the gateway did not carry out is not reported as one. A gateway that
+/// refuses the credential, and one whose answer is about another notification, leave the copy
+/// listed as it was and the person is told the gateway did not delete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deletion_the_gateway_did_not_carry_out_is_not_reported_as_one() {
+    for script in [
+        ForgetScript::RefusesTheCredential,
+        ForgetScript::AnswersAboutAnother(NotificationId::new(uuid(200))),
+    ] {
+        let gateway = Arc::new(DeliveringGateway::forgetting(script));
+        let (host, copy, _) = a_host_whose_alert_left(&gateway).await;
+
+        let error = delete_retained(&host, &copy.reference)
+            .await
+            .expect_err("the gateway did not delete");
+
+        assert_eq!(
+            error.code,
+            kr_protocol::error::ErrorCode::StorageUnavailable,
+            "{script:?}: {error:?}"
+        );
+        assert_eq!(gateway.forgets().len(), 1, "{script:?}");
+        let report = privacy_report(&host).await;
+        assert_eq!(
+            report.exported,
+            vec![copy],
+            "{script:?}: the copy is as it was"
+        );
+        host.stop().await;
+    }
+}
+
+/// KR-REQ-24.29: the host asks the gateway about what it listed and nothing else. A reference no
+/// copy carries asks nothing, and neither does a notification of a device whose credential this
+/// host no longer holds, such as one unpaired since.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_gateway_is_asked_only_about_a_listed_notification_the_host_holds_a_credential_for() {
+    let gateway = Arc::new(DeliveringGateway::default());
+    let (host, copy, sender) = a_host_whose_alert_left(&gateway).await;
+
+    let error = delete_retained(&host, "a notification nobody listed")
+        .await
+        .expect_err("no copy carries that reference");
+    assert_eq!(error.code, kr_protocol::error::ErrorCode::InvalidArgument);
+    assert!(gateway.forgets().is_empty());
+
+    host.controller()
+        .delivery_runtime()
+        .credentials()
+        .forget(sender)
+        .expect("the credential is let go of");
+    let error = delete_retained(&host, &copy.reference)
+        .await
+        .expect_err("the host holds no credential to ask under");
+    assert_eq!(error.code, kr_protocol::error::ErrorCode::PermissionDenied);
+    assert!(gateway.forgets().is_empty(), "nothing left the host");
     host.stop().await;
 }
 
