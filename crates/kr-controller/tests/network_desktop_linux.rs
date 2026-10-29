@@ -1,12 +1,15 @@
 //! The Linux desktop's display servers, over the network path.
 //!
 //! KR-REQ-03.26: what a paired device is told about a Linux desktop turns on which display server
-//! the host is on and which compositor runs it. The platform reading asks the login manager, so
-//! this runs the daemon against a login manager that answers an X11 session, a Wayland session
-//! under one compositor and a Wayland session under another, and reads what a device receives for
-//! each beside what the owner receives.
+//! the host is on and whether a compositor runs it. The platform reading asks the login manager,
+//! so this runs the daemon against a login manager that answers an X11 session, a Wayland session
+//! under one compositor and a Wayland session under another, and reads what the owner receives
+//! beside what a device receives for each. A device is told a name's class and its length, so the
+//! compositor itself is the owner's to read; which compositor and tool pair a capability answer
+//! turns on is the platform reader's own unit case.
 //!
-//! The reading's program is the process's, so these are one case in a process of their own.
+//! The reading's program is the process's, so these are one case in a process of their own. It
+//! needs a machine that is not a container, which hides the host's desktop from any reading.
 
 #![cfg(target_os = "linux")]
 
@@ -17,6 +20,7 @@ use kr_protocol::desktop::{
     DisplayServer, EnvironmentCapabilitiesParams, EnvironmentCapabilitiesResult, capabilities,
 };
 use kr_protocol::envelope::ParamsValue;
+use kr_protocol::hostinfo::export::{ContentClass, withheld};
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
 use net_support::Host;
@@ -25,46 +29,6 @@ const VIEWER: &[ActionRight] = &[ActionRight::SessionView];
 
 fn typed<T: kr_protocol::wire::WireMessage>(value: &ParamsValue) -> T {
     value.to_typed().expect("a result of the declared shape")
-}
-
-/// What one display-server record tells whoever reads it, with each name as the number of bytes it
-/// has: the owner is told the name, and a device is told its class and its length.
-#[derive(Debug, PartialEq, Eq)]
-struct Told {
-    server: DisplayServer,
-    schema_bytes: Option<usize>,
-    compositor_bytes: Option<usize>,
-    application_bytes: Option<usize>,
-}
-
-/// The length of a name as the reader of the answer is told it.
-fn bytes_of(name: &str) -> usize {
-    name.strip_prefix("[name withheld, ")
-        .and_then(|rest| rest.strip_suffix(" bytes]"))
-        .and_then(|length| length.parse().ok())
-        .unwrap_or(name.len())
-}
-
-fn told(answer: &EnvironmentCapabilitiesResult) -> Told {
-    let record = answer
-        .desktop
-        .record(capabilities::DISPLAY_SERVER)
-        .expect("the display server has a record of its own");
-    Told {
-        server: answer.desktop.desktop.display_server,
-        schema_bytes: record.identity.schema.as_ref().map(|name| bytes_of(name)),
-        compositor_bytes: answer
-            .desktop
-            .desktop
-            .compositor
-            .as_ref()
-            .map(|name| bytes_of(name)),
-        application_bytes: record
-            .subject
-            .application
-            .as_ref()
-            .map(|name| bytes_of(name)),
-    }
 }
 
 /// A login manager that answers `type` and `desktop` for the graphical session of this user.
@@ -127,14 +91,26 @@ async fn read_both(
     (locally, remotely)
 }
 
-/// KR-REQ-03.26: a device is told which display server the Linux host is on and which compositor
-/// runs it, and the answers for X11, for one Wayland compositor and for another each differ from
-/// the others. Whichever the host is on, no screen capture or input injection is reported
-/// available because a tool is installed.
+/// The display-server record's schema, as the answer gives it.
+fn schema(answer: &EnvironmentCapabilitiesResult) -> Option<String> {
+    answer
+        .desktop
+        .record(capabilities::DISPLAY_SERVER)
+        .expect("the display server has a record of its own")
+        .identity
+        .schema
+        .as_ref()
+        .cloned()
+}
+
+/// KR-REQ-03.26: the owner is told which display server a Linux host is on and which compositor
+/// runs it, and a device is told the display server, the protocol the server speaks and whether a
+/// compositor runs it, with the compositor's name as its class and length. Whichever the host is
+/// on, no screen capture or input injection is reported available because a tool is installed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_device_is_told_x11_wayland_and_the_compositor_apart() {
+async fn a_device_is_told_which_display_server_the_host_is_on_and_whether_a_compositor_runs_it() {
     let directory = tempfile::tempdir().expect("a directory of this test's own");
-    let mut answers = Vec::new();
+    let mut compositors = Vec::new();
     for (kind, desktop, server) in [
         ("x11", "", DisplayServer::X11),
         ("wayland", "sway", DisplayServer::Wayland),
@@ -142,14 +118,39 @@ async fn a_device_is_told_x11_wayland_and_the_compositor_apart() {
     ] {
         let program = login_manager(directory.path(), &session(kind, desktop));
         let (locally, remotely) = read_both(&program).await;
+        let compositor = (!desktop.is_empty()).then_some(desktop);
+
         assert_eq!(
             locally.desktop.desktop.display_server, server,
-            "the owner is told the {kind} session {desktop} is on"
+            "the owner is told the display server of the {kind} session {desktop} (this needs a \
+             machine that is not a container)"
         );
         assert_eq!(
-            told(&remotely),
-            told(&locally),
-            "the device is told what the owner is told about the {kind} session {desktop} is on"
+            locally
+                .desktop
+                .desktop
+                .compositor
+                .as_ref()
+                .map(String::as_str),
+            compositor,
+            "the owner is told the compositor of the {kind} session {desktop}"
+        );
+        assert_eq!(schema(&locally).as_deref(), Some(kind));
+
+        assert_eq!(
+            remotely.desktop.desktop.display_server, server,
+            "a device is told the display server of the {kind} session {desktop}"
+        );
+        assert_eq!(
+            remotely.desktop.desktop.compositor.as_ref().cloned(),
+            compositor.map(|name| withheld(ContentClass::Name, name)),
+            "a device is told whether a compositor runs the {kind} session {desktop}, and its \
+             class and length"
+        );
+        assert_eq!(
+            schema(&remotely),
+            Some(withheld(ContentClass::Name, kind)),
+            "and the protocol the server speaks"
         );
         for capability in [capabilities::SCREEN_CAPTURE, capabilities::INPUT_INJECTION] {
             let record = remotely
@@ -161,20 +162,14 @@ async fn a_device_is_told_x11_wayland_and_the_compositor_apart() {
                 "{capability} on {kind} {desktop} is reported available: {record:?}"
             );
         }
-        answers.push(told(&remotely));
+        compositors.push(remotely.desktop.desktop.compositor.clone());
     }
-    let [x11, sway, gnome] = &answers[..] else {
+    let [x11, sway, gnome] = &compositors[..] else {
         panic!("three sessions were read");
     };
-    assert_eq!(x11.schema_bytes, Some("x11".len()));
-    assert_eq!(sway.schema_bytes, Some("wayland".len()));
-    assert!(
-        x11.compositor_bytes.is_none()
-            && sway.compositor_bytes.is_some()
-            && gnome.compositor_bytes.is_some()
-    );
+    assert!(!x11.is_present() && sway.is_present() && gnome.is_present());
     assert_ne!(
         sway, gnome,
-        "two compositors under one display server are two answers"
+        "two compositors of different names are two answers"
     );
 }
