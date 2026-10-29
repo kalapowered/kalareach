@@ -356,11 +356,25 @@ fn build_account(
         Arc::new(account::carrier::Session::new(app.clone()));
     let emitter = app.clone();
     let signed_in = Arc::new(signed_in);
-    let deletion = Arc::new(ManagedAccountDeletion::new(
+    #[allow(
+        unused_mut,
+        reason = "a desktop also holds the deletion across processes"
+    )]
+    let mut deletion = ManagedAccountDeletion::new(
         &origin,
         http as Arc<dyn ServiceHttp>,
         Arc::clone(&signed_in),
-    ));
+    );
+    #[cfg(desktop)]
+    {
+        use tauri::Manager as _;
+        let directory = app
+            .path()
+            .app_data_dir()
+            .map_err(|error| error.to_string())?;
+        deletion = deletion.with_shared_lock(directory.join("deletion.lock"));
+    }
+    let deletion = Arc::new(deletion);
     Ok(Arc::new(account::Account::new(
         signed_in,
         service,
@@ -576,9 +590,9 @@ fn start_with_records(app: &tauri::AppHandle) {
     settle_deleted_account(app);
 }
 
-/// Finishes what a deletion that closed the account left to settle on this device, now that the
-/// notifications and the recovery record it settles are open: an earlier run may have been
-/// interrupted, or a step may not have been done.
+/// Looks after a deletion an earlier run left, now that the notifications and the recovery record
+/// its steps settle are open: a confirmation without an answer is asked about, and what a closed
+/// account left to settle on this device is settled.
 fn settle_deleted_account(app: &tauri::AppHandle) {
     use tauri::Manager as _;
 
@@ -588,7 +602,7 @@ fn settle_deleted_account(app: &tauri::AppHandle) {
         let Ok(account) = slot.get().await else {
             return;
         };
-        account::deletion::settle_device(&app.state::<AppState>(), account).await;
+        account::deletion::resume(&app.state::<AppState>(), account).await;
     });
 }
 

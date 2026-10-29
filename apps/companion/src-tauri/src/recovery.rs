@@ -41,7 +41,7 @@ use kr_client::recovery::{
     LostWrite, RecoveryError, RestoreError, RestoreSource, cover_host_archive, fresh_locator,
     qr_payload, render_kit,
 };
-use kr_client::services::account::{AccountTokenSource, BACKUP_WRITE_SCOPE};
+use kr_client::services::account::{AccountMark, AccountTokenSource, BACKUP_WRITE_SCOPE};
 use kr_client::services::{
     HttpDeadlines, HttpService, ManagedSyncService, ServiceSigner, managed_response_limits,
 };
@@ -74,6 +74,11 @@ pub const DIRECTORY: &str = "recovery";
 
 /// The record of where this computer's bundle is, in [`DIRECTORY`].
 const RECORD: &str = "recovery.json";
+
+/// Whose bundle the record is: written beside the record when it is made, so that deleting an
+/// account clears only a record that is that account's. A record with no such file, or with one that
+/// names another bundle, has an owner no one knows.
+const OWNER: &str = "recovery-owner.json";
 
 /// The file a step holds a lock on for as long as it runs, in [`DIRECTORY`].
 const LOCK: &str = "recovery.lock";
@@ -288,6 +293,22 @@ impl Record {
     }
 }
 
+/// The account a record belongs to, in [`OWNER`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Owner {
+    /// The format of this file.
+    version: u32,
+    /// The bundle the account owns.
+    bundle_locator: String,
+    /// The account's mark, as hexadecimal text.
+    account: String,
+}
+
+impl Owner {
+    const VERSION: u32 = 1;
+}
+
 /// A device's key, signing a service request as an installation.
 pub(crate) struct DeviceSigner(AuthorisationKeyPair);
 
@@ -489,6 +510,7 @@ impl Recovery {
                     kept: false,
                 };
                 self.keep(&record)?;
+                self.keep_owner(&record, account);
                 record
             }
         };
@@ -821,32 +843,83 @@ impl Recovery {
         Ok(seed)
     }
 
-    /// The account this computer kept a bundle under was deleted, and the service deleted the
-    /// bundle with it. The record that says a bundle is kept is removed, so the card reads off and
-    /// turning recovery on again starts a bundle under a locator of its own; the seed stays in the
-    /// secure store, since the kit is the person's file and a kit with no bundle behind it
-    /// restores nothing.
+    /// The account `deleted` was deleted, and the service deleted its bundle with it. If this
+    /// computer's record is that account's, the record that says a bundle is kept is removed, so the
+    /// card reads off and turning recovery on again starts a bundle under a locator of its own; the
+    /// seed stays in the secure store, since the kit is the person's file and a kit with no bundle
+    /// behind it restores nothing. A record whose owner is not known to be that account, which is
+    /// every record made before owners were noted, is left as it is: it may be another account's
+    /// bundle, which is still there.
     ///
     /// # Errors
     ///
-    /// Returns a local failure when the record cannot be removed.
-    pub async fn account_deleted(&self) -> Result<()> {
+    /// Returns a local failure when the record cannot be read or removed.
+    pub async fn account_deleted(&self, deleted: AccountMark) -> Result<()> {
         let _step = self.step().await?;
+        let Some(record) = self.record()? else {
+            return Ok(());
+        };
+        match self.owner() {
+            Some(owner)
+                if owner.bundle_locator == record.bundle_locator
+                    && owner.account == deleted.to_hex() => {}
+            _ => return Ok(()),
+        }
         let path = self.directory.join(RECORD);
         match std::fs::remove_file(&path) {
             Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(CommandError::local_failure(format!(
                     "this computer's recovery record could not be removed: {error}"
                 )));
             }
         }
+        // The note of whose it was goes with it; one left behind names a bundle no record has.
+        let _ = std::fs::remove_file(self.directory.join(OWNER));
         flush_path_names(&self.directory).map_err(|error| {
             CommandError::local_failure(format!(
                 "this computer's recovery record could not be removed: {error}"
             ))
         })
+    }
+
+    /// Notes whose `record` is: the account that is signed in as it is made. Nothing depends on the
+    /// note being kept, so a failure to keep it is told to the log and not to the person: the record
+    /// then has an owner no one knows.
+    fn keep_owner(&self, record: &Record, account: &Account) {
+        let mark = account
+            .tokens()
+            .signed_in_mark(account.origin().as_str())
+            .ok()
+            .flatten();
+        let Some(mark) = mark else {
+            return;
+        };
+        let owner = Owner {
+            version: Owner::VERSION,
+            bundle_locator: record.bundle_locator.clone(),
+            account: mark.to_hex(),
+        };
+        let kept = serde_json::to_vec_pretty(&owner)
+            .map_err(|error| error.to_string())
+            .and_then(|text| {
+                write_owner_only_file(&self.directory.join(OWNER), &text)
+                    .map_err(|error| error.to_string())
+            });
+        if let Err(error) = kept {
+            tracing::warn!(%error, "whose recovery bundle this is could not be noted");
+        }
+    }
+
+    /// Whose the record is, when the note of it can be read and is one this version reads.
+    fn owner(&self) -> Option<Owner> {
+        let bytes = read_owner_only_file(&self.directory.join(OWNER), RECORD_LIMIT)
+            .ok()
+            .flatten()?;
+        serde_json::from_slice::<Owner>(&bytes)
+            .ok()
+            .filter(|owner| owner.version == Owner::VERSION)
     }
 
     fn record(&self) -> Result<Option<Record>> {

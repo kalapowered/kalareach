@@ -19,14 +19,14 @@ use std::sync::{Arc, Mutex};
 
 use companion_tauri::AppState;
 use companion_tauri::account::carrier::{Boxed, Carrier, Ending, Plan, Unavailable};
-use companion_tauri::account::deletion::settle_device;
 use companion_tauri::account::{Account, AccountSlot};
 use companion_tauri::device::DeviceIdentity;
 use companion_tauri::recovery::{HostCoverView, LeftView, Recovery, SEED_SCOPE};
 use kr_client::recovery::{BundleStore, HostBackups, parse_kit};
 use kr_client::services::account::{
-    ACCOUNT_ORIGIN, AccountToken, AccountTokenSource, BACKUP_RESTORE_SCOPE, BACKUP_WRITE_SCOPE,
-    Client, IssuedGrant, RECOVERY_BACKUP_SCOPES, REQUESTED_SCOPES, RefreshToken, SignedInAccount,
+    ACCOUNT_ORIGIN, AccountMark, AccountToken, AccountTokenSource, BACKUP_RESTORE_SCOPE,
+    BACKUP_WRITE_SCOPE, Client, IssuedGrant, RECOVERY_BACKUP_SCOPES, REQUESTED_SCOPES,
+    RefreshToken, SignedInAccount,
 };
 use kr_client::services::{
     HttpDeadlines, HttpService, ManagedSyncService, NullService, ServiceFuture, ServiceSigner,
@@ -284,6 +284,15 @@ struct Page {
 }
 
 impl Page {
+    /// The mark of the account signed in on this page, at the sync service `computer` reaches.
+    fn account_mark(&self, computer: &Computer) -> AccountMark {
+        self.account
+            .tokens()
+            .signed_in_mark(computer.origin().as_str())
+            .expect("the grant is read")
+            .expect("an account is signed in")
+    }
+
     /// Calls `command` with `body` through the invoke path, and returns the answer the page gets,
     /// or its refusal.
     fn call(&self, command: &str, body: Value) -> Result<Value, Value> {
@@ -1718,7 +1727,11 @@ async fn a_deleted_account_leaves_recovery_off_with_the_seed_kept_and_a_new_loca
         .to_owned();
     assert_eq!(page.view()["state"], "on");
 
-    page.recovery.account_deleted().await.expect("cleared");
+    let deleted = page.account_mark(&computer);
+    page.recovery
+        .account_deleted(deleted)
+        .await
+        .expect("cleared");
     assert_eq!(page.view()["state"], "off");
     assert_eq!(page.view()["kept_at"], Value::Null);
     assert!(
@@ -1729,7 +1742,7 @@ async fn a_deleted_account_leaves_recovery_off_with_the_seed_kept_and_a_new_loca
     );
     // Clearing again changes nothing.
     page.recovery
-        .account_deleted()
+        .account_deleted(deleted)
         .await
         .expect("cleared again");
 
@@ -1747,6 +1760,39 @@ async fn a_deleted_account_leaves_recovery_off_with_the_seed_kept_and_a_new_loca
     assert_ne!(first, second, "a bundle of its own, not the deleted one's");
 }
 
+/// Another account's bundle is still at the service, so deleting an account clears only a record
+/// that is known to be its own: not one made under another account, and not one made before the
+/// application noted whose it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_an_account_leaves_a_recovery_record_that_is_not_known_to_be_its_own() {
+    let computer = Computer::new().await;
+    let page = computer.page().await;
+    page.call("recovery_turn_on", json!({})).expect("on");
+    let other = AccountMark::from_bytes([7; 32]);
+    page.recovery
+        .account_deleted(other)
+        .await
+        .expect("nothing to clear");
+    assert_eq!(
+        page.view()["state"],
+        "on",
+        "a record made under another account stays"
+    );
+
+    // A record with no note of whose it is: the note is the only thing that says.
+    let note = computer
+        .data
+        .path()
+        .join("recovery")
+        .join("recovery-owner.json");
+    std::fs::remove_file(&note).expect("the note exists");
+    page.recovery
+        .account_deleted(page.account_mark(&computer))
+        .await
+        .expect("nothing to clear");
+    assert_eq!(page.view()["state"], "on", "an unknown owner is left alone");
+}
+
 /// The device clears the recovery record of a closed account through the application's own step,
 /// and only once: recovery the person turns on afterwards is not undone by a later look.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1755,14 +1801,15 @@ async fn a_closed_account_clears_the_recovery_record_once_and_a_later_look_leave
     let page = computer.page().await;
     page.call("recovery_turn_on", json!({})).expect("on");
     assert_eq!(page.view()["state"], "on");
-    let closed = closing::closed_account().await;
+    let closed = closing::closed_account_at(computer.served.origin()).await;
+    let state = page.app.state::<AppState>();
 
-    settle_device(&page.app.state::<AppState>(), &closed).await;
+    closed.deletion_status(&state).await.expect("a look");
     assert_eq!(page.view()["state"], "off");
 
     page.call("recovery_turn_on", json!({})).expect("on again");
     assert_eq!(page.view()["state"], "on");
-    settle_device(&page.app.state::<AppState>(), &closed).await;
+    closed.deletion_status(&state).await.expect("a look");
     assert_eq!(page.view()["state"], "on");
 }
 
@@ -1779,7 +1826,8 @@ async fn a_look_that_cannot_reach_the_service_still_clears_what_a_closed_account
         .call("recovery_turn_on", json!({}))
         .expect("recovery is on");
     drop(earlier);
-    let page = computer.start(closing::closed_account_unreachable().await);
+    let page =
+        computer.start(closing::closed_account_unreachable_at(computer.served.origin()).await);
     page.call(
         "sync_service_set",
         json!({ "origin": computer.served.origin() }),

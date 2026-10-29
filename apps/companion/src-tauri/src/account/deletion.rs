@@ -15,19 +15,19 @@
 //! left is what only the application can reach: on a phone, the registration of each host's
 //! notifications, which the service removed with the account's records of the devices and which
 //! the phone would otherwise go on showing as on; and on a computer, the recovery record, which
-//! says a bundle is kept at the service when the bundle was deleted. [`settle_device`] runs both
-//! through the client, which runs each until it is done and never twice, one deletion at a time, at
-//! each start and at each look that finds one still to settle.
+//! says a bundle is kept at the service when the bundle was deleted, and which is cleared only when
+//! it is the deleted account's own. The client runs both as the one owner of the deletion, each
+//! until it says it is done, when the confirmation closes the account and at every look after.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use kr_client::services::ServiceHttp;
-use kr_client::services::account::SignedInAccount;
 use kr_client::services::account::deletion::{
     CodeRefusal, DeletionFault, DeletionOutcome, DeletionPreview, DeletionProgress, DeletionRead,
     DeviceSteps, ManagedAccountDeletion, OwnedOrganisation, StepFuture,
 };
+use kr_client::services::account::{AccountMark, SignedInAccount};
 use kr_protocol::service::GatewayOrigin;
 use serde::Serialize;
 
@@ -56,6 +56,8 @@ pub enum Problem {
     Unreachable,
     /// A different account is signed in than the one the deletion began for.
     AccountChanged,
+    /// The deletion is being worked on, here or in another window of the application.
+    InProgress,
 }
 
 /// What reading the preview came to.
@@ -156,6 +158,7 @@ fn problem(fault: DeletionFault) -> Result<Problem> {
         DeletionFault::Unsure => Problem::Unsure,
         DeletionFault::Unreachable => Problem::Unreachable,
         DeletionFault::AccountChanged => Problem::AccountChanged,
+        DeletionFault::InProgress => Problem::InProgress,
         DeletionFault::Local(said) => {
             return Err(CommandError::local_failure(said.to_string()));
         }
@@ -192,18 +195,23 @@ impl Account {
         })
     }
 
-    /// Confirms the deletion. When it closes the account, the page is told where the device now
-    /// stands.
+    /// Confirms the deletion. When it closes the account, the device settles what is its own and the
+    /// page is told where the device now stands.
     ///
     /// # Errors
     ///
     /// Returns a local failure when this device's records could not be read or kept.
     pub async fn deletion_confirm(
         &self,
+        state: &AppState,
         code: &str,
         acknowledged: &[String],
     ) -> Result<ConfirmAnswer> {
-        let answer = match self.deletion.confirm(code, acknowledged).await {
+        let answer = match self
+            .deletion
+            .confirm(code, acknowledged, &Steps(state))
+            .await
+        {
             Ok(DeletionOutcome::Closed { finished }) => ConfirmAnswer::Closed { finished },
             Ok(DeletionOutcome::CodeRefused {
                 reason,
@@ -226,31 +234,43 @@ impl Account {
         Ok(answer)
     }
 
-    /// How the removal is going, and whether this device has state of its own to settle.
+    /// How the removal is going, for the person whose deletion it is. A look that finds the account
+    /// closed settles what this device holds of it.
     ///
     /// # Errors
     ///
     /// Returns a local failure when this device's records could not be read or kept.
-    pub async fn deletion_status(&self) -> Result<(StatusAnswer, bool)> {
-        Ok(match self.deletion.status().await {
+    pub async fn deletion_status(&self, state: &AppState) -> Result<StatusAnswer> {
+        Ok(match self.deletion.status(&Steps(state)).await {
             Ok(status) => {
-                let answer = match status.progress {
+                if status.closed_now {
+                    self.after_deletion().await;
+                }
+                match status.progress {
                     DeletionProgress::None => StatusAnswer::None,
                     DeletionProgress::Unsettled => StatusAnswer::Unsettled,
                     DeletionProgress::Open => StatusAnswer::Open,
                     DeletionProgress::Done => StatusAnswer::Done,
-                };
-                if status.device_pending {
-                    self.after_deletion().await;
                 }
-                (answer, status.device_pending)
             }
-            Err(fault) => (
-                StatusAnswer::Problem {
-                    problem: problem(fault)?,
-                },
-                false,
-            ),
+            Err(fault) => StatusAnswer::Problem {
+                problem: problem(fault)?,
+            },
+        })
+    }
+
+    /// Gives up on a deletion whose request is not known to have run, so that this device stops
+    /// asking after it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a local failure when this device's records could not be read or kept.
+    pub async fn deletion_forget(&self) -> Result<StatusAnswer> {
+        Ok(match self.deletion.forget().await {
+            Ok(()) => StatusAnswer::None,
+            Err(fault) => StatusAnswer::Problem {
+                problem: problem(fault)?,
+            },
         })
     }
 
@@ -282,13 +302,15 @@ impl DeviceSteps for Steps<'_> {
         })
     }
 
-    /// The recovery record says a bundle is kept at the service, and the bundle was deleted.
-    fn recovery(&self) -> StepFuture<'_> {
+    /// The recovery record says a bundle is kept at the service, and the bundle was deleted: when it
+    /// is the deleted account's own.
+    fn recovery(&self, deleted: AccountMark) -> StepFuture<'_> {
         Box::pin(async move {
             let Ok(recovery) = self.0.recovery() else {
                 return false;
             };
-            match tokio::time::timeout(RECOVERY_STEP_WAITS, recovery.account_deleted()).await {
+            match tokio::time::timeout(RECOVERY_STEP_WAITS, recovery.account_deleted(deleted)).await
+            {
                 Ok(Ok(())) => true,
                 Ok(Err(error)) => {
                     tracing::warn!(%error, "the recovery record could not be cleared after the account was deleted");
@@ -305,15 +327,13 @@ impl DeviceSteps for Steps<'_> {
     }
 }
 
-/// Settles what this device holds of an account that is closed.
-///
-/// Called before a new deletion, when a deletion closes the account, whenever a look finds one
-/// closed whose device state is not settled yet, and at each start once the records it settles are
-/// open, so that one a start interrupted is finished.
-pub async fn settle_device(state: &AppState, account: &Account) {
-    if let Err(fault) = account.deletion().settle_device(&Steps(state)).await {
+/// Looks after a deletion an earlier run left, at each start once the records the steps settle are
+/// open: the account's closure is learned and settled if it has not been, and a step that was not
+/// done is done.
+pub async fn resume(state: &AppState, account: &Account) {
+    if let Err(error) = account.deletion_status(state).await {
         tracing::warn!(
-            ?fault,
+            %error,
             "what the closed account left on this device could not be settled"
         );
     }

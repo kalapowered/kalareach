@@ -231,10 +231,11 @@ fn the_page_opens_nothing_itself_and_a_link_goes_through_the_scheme_policy() {
 }
 
 /// KR-REQ-17.19: the account's commands are the application's own, and none of them is a host
-/// method or takes an address from the page. Deleting the account is four of them: what it would
-/// do, the emailed code, the confirmation and how the removal goes.
+/// method or takes an address from the page. Deleting the account is five of them: what it would
+/// do, the emailed code, the confirmation, how the removal goes, and giving up on a confirmation
+/// that has no answer.
 #[test]
-fn the_account_is_reached_through_ten_named_commands() {
+fn the_account_is_reached_through_eleven_named_commands() {
     let account: Vec<&str> = NAMED_COMMANDS
         .iter()
         .filter(|(command, _)| command.starts_with("account_"))
@@ -255,7 +256,8 @@ fn the_account_is_reached_through_ten_named_commands() {
             "account_deletion_view",
             "account_deletion_send_code",
             "account_deletion_confirm",
-            "account_deletion_status"
+            "account_deletion_status",
+            "account_deletion_forget"
         ]
     );
 }

@@ -254,7 +254,7 @@ impl Account {
         }
         // A deletion that closed the account and was interrupted before the stored sign-in was
         // ended is finished here, before the first view is published.
-        let _ = self.deletion.settle().await;
+        let _ = self.deletion.settle_grant().await;
         self.publish().await;
         let mut changes = self.signed_in.subscribe();
         let account = Arc::clone(self);

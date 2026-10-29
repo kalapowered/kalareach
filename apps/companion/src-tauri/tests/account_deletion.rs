@@ -277,6 +277,7 @@ fn invoke(account: &Arc<Account>, command: &str, args: Value) -> Value {
             companion_tauri::commands::account_deletion_send_code,
             companion_tauri::commands::account_deletion_confirm,
             companion_tauri::commands::account_deletion_status,
+            companion_tauri::commands::account_deletion_forget,
         ])
         .build(mock_context(noop_assets()))
         .expect("an application on the mock runtime");
@@ -389,8 +390,8 @@ async fn the_page_cannot_name_a_receipt_and_a_refused_code_leaves_the_sign_in() 
         rig.store
             .get(&SecretName::new("account/deletion").expect("a name"))
             .expect("a read")
-            .is_some(),
-        "the record is kept for the next try"
+            .is_none(),
+        "a request that did nothing leaves no receipt behind"
     );
 }
 
@@ -496,4 +497,34 @@ async fn a_status_asked_after_a_lost_answer_says_it_is_unsettled_and_nothing_is_
         session(&rig),
         "an unsettled request does not end the sign-in"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_person_can_give_up_on_a_confirmation_that_has_no_answer() {
+    let rig = rig().await;
+    let account = Arc::clone(&rig.account);
+    let confirmed = tokio::task::spawn_blocking(move || {
+        invoke(
+            &account,
+            "account_deletion_confirm",
+            json!({ "code": CODE, "acknowledged": [] }),
+        )
+    })
+    .await
+    .expect("joined");
+    assert_eq!(confirmed["state"], "unsettled");
+
+    let account = Arc::clone(&rig.account);
+    let given_up =
+        tokio::task::spawn_blocking(move || invoke(&account, "account_deletion_forget", json!({})))
+            .await
+            .expect("joined");
+    assert_eq!(given_up["state"], "none");
+    let account = Arc::clone(&rig.account);
+    let status =
+        tokio::task::spawn_blocking(move || invoke(&account, "account_deletion_status", json!({})))
+            .await
+            .expect("joined");
+    assert_eq!(status["state"], "none");
+    assert!(session(&rig), "the sign-in is as it was");
 }

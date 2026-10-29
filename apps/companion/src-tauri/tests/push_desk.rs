@@ -27,7 +27,6 @@ use std::time::Duration;
 use companion_platform::notify::{Permission, PreviewKeys};
 use companion_platform::push::{PendingRegistration, PendingState};
 use companion_tauri::AppState;
-use companion_tauri::account::deletion::settle_device;
 use companion_tauri::device::Device;
 use companion_tauri::push::{
     AskFuture, ConnectionRegistrar, HostLine, LineFuture, LineStop, Native, PushDesk, PushFuture,
@@ -4331,10 +4330,12 @@ async fn a_closed_account_marks_each_host_once_however_many_looks_find_it() {
     state.push_opened(Arc::clone(&phone.desk));
     let account = closing::closed_account().await;
 
-    tokio::join!(
-        settle_device(&state, &account),
-        settle_device(&state, &account)
+    let (first, second) = tokio::join!(
+        account.deletion_status(&state),
+        account.deletion_status(&state)
     );
+    first.expect("a look");
+    second.expect("a look");
     assert_eq!(phone.view().hosts[0].state, PushState::NeedsAttention);
 
     phone
@@ -4342,7 +4343,7 @@ async fn a_closed_account_marks_each_host_once_however_many_looks_find_it() {
         .enable(&reference)
         .expect("the person turns it on again");
     phone.until(|states| states == [PushState::On]).await;
-    settle_device(&state, &account).await;
+    account.deletion_status(&state).await.expect("a look");
     assert_eq!(
         phone.view().hosts[0].state,
         PushState::On,

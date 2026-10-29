@@ -1612,6 +1612,35 @@ impl AccountMark {
     pub const fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
+
+    /// The mark as lower-case hexadecimal text, for a record that names an account without saying
+    /// who it is.
+    #[must_use]
+    pub fn to_hex(self) -> String {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut text = String::with_capacity(64);
+        for byte in self.0 {
+            text.push(char::from(DIGITS[usize::from(byte >> 4)]));
+            text.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+        }
+        text
+    }
+
+    /// A mark read back from [`Self::to_hex`], or none for text that is not one.
+    #[must_use]
+    pub fn from_hex(text: &str) -> Option<Self> {
+        let digits = text.as_bytes();
+        if digits.len() != 64 {
+            return None;
+        }
+        let mut bytes = [0u8; 32];
+        for (byte, pair) in bytes.iter_mut().zip(digits.chunks_exact(2)) {
+            let high = char::from(pair[0]).to_digit(16)?;
+            let low = char::from(pair[1]).to_digit(16)?;
+            *byte = u8::try_from(high << 4 | low).ok()?;
+        }
+        Some(Self(bytes))
+    }
 }
 
 impl fmt::Debug for AccountMark {
