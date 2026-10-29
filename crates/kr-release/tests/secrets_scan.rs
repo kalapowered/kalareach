@@ -179,8 +179,11 @@ fn a_release_tree_and_its_archive_with_a_private_key_in_them_are_refused() {
 }
 
 /// KR-REQ-26.41: the script that seals a release tree stops at a tree that holds a private key,
-/// before it packs one, and goes on to pack the same tree without the key. The signing and the
-/// manifest are not what is under test, so `kr-release` is a stand-in that accepts every step.
+/// before it packs one, and goes on to pack the same tree without the key. `kr-release` is a
+/// stand-in that accepts every step, because its real checks hold a tree to built shell packages,
+/// which an ordinary run does not have. The case does not see the scan of the archive after the
+/// packing: the refused run stops before it, and the clean run's archive check may refuse the small
+/// stand-in tree.
 #[test]
 fn sealing_stops_at_a_tree_with_a_private_key_before_it_packs_anything() {
     let scratch = tempfile::tempdir().expect("a scratch directory");
