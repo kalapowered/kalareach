@@ -584,8 +584,9 @@ mod tests {
         store
     }
 
-    /// The challenge of the pending registration is the one thing answered, and the answer is the
-    /// vectors' own payload, signed by the installation's key under the answer's domain, in a
+    /// KR-REQ-16.06: the challenge of the pending registration is the one thing answered, and the
+    /// answer is the vectors' own payload, bound to the token digest, the registration, the gateway's
+    /// origin and the expiry, signed by the installation's key under the answer's domain, in a
     /// request whose credential covers the body's digest and verifies under the same key.
     #[test]
     fn the_challenge_of_the_pending_registration_is_answered_with_the_payload_the_vectors_record() {
@@ -677,8 +678,10 @@ mod tests {
         assert_eq!(signature.public_key, *keys.authorisation.public());
     }
 
-    /// A challenge that does not name the pending registration gets no answer, and none of the
-    /// refusals reads the key: a store that holds none answers each of them the same way.
+    /// KR-REQ-16.06: a challenge that does not name the pending registration (another registration,
+    /// another token, another gateway, an expired or malformed challenge, none pending) gets no
+    /// answer, and none of the refusals reads the key: a store that holds none answers each of them
+    /// the same way.
     #[test]
     fn a_challenge_for_anything_but_the_pending_registration_is_not_answered() {
         let now = now_ms();
@@ -784,9 +787,10 @@ mod tests {
         assert_eq!(missing["reason"], "key_missing");
     }
 
-    /// A challenge a gateway really sent, recorded from a device run, names the registration its
-    /// phone waits for and is answered until the moment the gateway stops taking an answer, and not
-    /// after it. What the vectors give a test is the payload; this is the message around it.
+    /// KR-REQ-16.06: a challenge a gateway really sent, recorded from a device run, names the
+    /// registration its phone waits for and is answered until the moment the gateway stops taking an
+    /// answer, and not after it. What the vectors give a test is the payload; this is the message
+    /// around it.
     #[test]
     fn a_challenge_a_gateway_really_sent_is_answered_until_it_lapses() {
         let recorded: Value =
