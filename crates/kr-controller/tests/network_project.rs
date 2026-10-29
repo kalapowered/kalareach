@@ -55,6 +55,17 @@ const PROJECT_RIGHTS: &[ActionRight] = &[
     ActionRight::WorkspaceManage,
 ];
 
+/// The rights a device needs to capture a working copy, read its diff, and apply or revert a
+/// version in one, beside the rights to make the working copy.
+const CHANGE_RIGHTS: &[ActionRight] = &[
+    ActionRight::SessionView,
+    ActionRight::ProjectCreate,
+    ActionRight::WorkspaceManage,
+    ActionRight::ChangesetCreate,
+    ActionRight::FilesRead,
+    ActionRight::FilesApplyDiff,
+];
+
 /// The whole of what a device is told when it asks for a repository operation on a host that
 /// cannot confine what the Git program reads.
 ///
@@ -2333,50 +2344,28 @@ async fn a_read_that_names_no_version_is_held_to_the_latest_one() {
     recorded.stop().await;
 }
 
-/// KR-REQ-23.44: capture, apply, revert and the diff of a working copy are refused to a device,
-/// each by name and for the reason that is so: each reads or writes a working tree by running the
-/// Git program, outside the boundary that confines what that program reads for a device's
-/// repository operations. The refusal comes before the subject is looked up, so a device learns
-/// nothing about which working copies exist. The control is the same host serving a recorded
-/// version, which runs no Git.
+/// KR-REQ-23.44: on a host that has not proved it confines what the Git program reads, capture,
+/// apply, revert and the diff of a working copy are refused to a device with the one sentence the
+/// repository operations are refused with, whatever the device holds. The refusal comes before the
+/// subject is looked up, so a device learns nothing about which working copies exist. The control
+/// is the same host serving a recorded version, which runs no Git.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(
     windows,
     ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
 )]
-async fn a_device_is_refused_what_runs_git_on_a_working_tree_with_the_reason() {
+async fn a_device_is_refused_what_runs_git_on_a_working_tree_where_the_host_cannot_confine_it() {
     let recorded = Recorded::start().await;
+    as_unqualified(&recorded.host);
     let env = recorded.host.environment_id;
     let (_device, session) = recorded
         .device(|grant| {
             grant.actions.insert(ActionRight::ChangesetCreate);
             grant.actions.insert(ActionRight::FilesApplyDiff);
+            grant.actions.insert(ActionRight::FilesRead);
         })
         .await;
-    let unknown = kr_protocol::ids::WorkspaceId::new(kr_ipc::new_uuid());
-    let capture = kr_protocol::changeset::ChangesetCaptureParams {
-        workspace_id: unknown,
-        change_set_id: Nullable::null(),
-        label: "a capture this host does not run for a device".to_owned(),
-        policy: InclusionPolicy {
-            dirty_files: InclusionChoice::Include,
-            untracked_files: InclusionChoice::Exclude,
-            submodules: InclusionChoice::Exclude,
-            binary_files: InclusionChoice::Exclude,
-            generated_artefacts: InclusionChoice::Exclude,
-        },
-        grant: kr_protocol::changeset::FileGrant {
-            included_paths: Vec::new(),
-            excluded_paths: Vec::new(),
-            secret_rules_applied: true,
-        },
-        quiescence_declared: false,
-        required_consistency: Nullable::null(),
-        pin: false,
-        session_id: Nullable::null(),
-        workflow_run_id: Nullable::null(),
-        note: String::new(),
-    };
+    let capture = a_capture_of(recorded.workspace);
     let apply = kr_protocol::changeset::DiffApplyParams {
         change_set_id: recorded.plain.change_set_id,
         version: recorded.plain.version,
@@ -2404,17 +2393,11 @@ async fn a_device_is_refused_what_runs_git_on_a_working_tree_with_the_reason() {
             "{}",
             method.as_str()
         );
-        let message = said(&refusal);
-        assert!(
-            message.contains(method.as_str())
-                && message.contains("is not served to a paired device")
-                && message
-                    .contains("by running the Git program, outside the boundary that confines"),
-            "the refusal names the method and the reason it is so: {message}"
-        );
-        assert!(
-            !message.contains("cannot yet") && !message.contains("no workspace"),
-            "it is not the old reason, and nothing looked the subject up: {message}"
+        assert_eq!(
+            said(&refusal),
+            REFUSAL,
+            "{} is refused as the repository operations are",
+            method.as_str()
         );
     }
     let working_copy = session
@@ -2429,11 +2412,7 @@ async fn a_device_is_refused_what_runs_git_on_a_working_tree_with_the_reason() {
         .await
         .expect_err("a working copy's diff runs Git on its working tree");
     assert_eq!(working_copy.code(), ErrorCode::PermissionDenied);
-    assert!(
-        said(&working_copy).contains("diff.read is not served to a paired device")
-            && said(&working_copy).contains("by running the Git program, outside the boundary"),
-        "{working_copy}"
-    );
+    assert_eq!(said(&working_copy), REFUSAL);
     // The control: the same session reads the recorded version, which runs none.
     session
         .read::<_, kr_protocol::changeset::DiffReadResult>(
@@ -2444,6 +2423,35 @@ async fn a_device_is_refused_what_runs_git_on_a_working_tree_with_the_reason() {
         .expect("a recorded version's diff runs no Git");
     session.close();
     recorded.stop().await;
+}
+
+/// A capture of `workspace` that keeps every class of its working tree.
+fn a_capture_of(
+    workspace: kr_protocol::ids::WorkspaceId,
+) -> kr_protocol::changeset::ChangesetCaptureParams {
+    kr_protocol::changeset::ChangesetCaptureParams {
+        workspace_id: workspace,
+        change_set_id: Nullable::null(),
+        label: "a capture over the network".to_owned(),
+        policy: InclusionPolicy {
+            dirty_files: InclusionChoice::Include,
+            untracked_files: InclusionChoice::Include,
+            submodules: InclusionChoice::Exclude,
+            binary_files: InclusionChoice::Exclude,
+            generated_artefacts: InclusionChoice::Exclude,
+        },
+        grant: kr_protocol::changeset::FileGrant {
+            included_paths: Vec::new(),
+            excluded_paths: Vec::new(),
+            secret_rules_applied: true,
+        },
+        quiescence_declared: false,
+        required_consistency: Nullable::null(),
+        pin: false,
+        session_id: Nullable::null(),
+        workflow_run_id: Nullable::null(),
+        note: String::new(),
+    }
 }
 
 /// KR-REQ-23.44 and section 9: a materialisation asked for by a device whose registration was
@@ -3350,19 +3358,19 @@ struct Granted {
 impl Granted {
     /// Sets the scene, or returns none and says so on a host that does not qualify.
     async fn on_a_qualified_host(test: &str) -> Option<Self> {
+        Self::on_a_qualified_host_holding(test, PROJECT_RIGHTS).await
+    }
+
+    /// Sets the scene for a device that holds `rights`.
+    async fn on_a_qualified_host_holding(test: &str, rights: &[ActionRight]) -> Option<Self> {
         use kr_protocol::project::LocationPurpose;
 
         let owner = DeviceKeys::generate().expect("owner keys");
         let host = qualified_host(&owner, test).await?;
         let mut control = host.client().await;
         let device = net_support::Device::create().await;
-        let record = net_support::pair_with(
-            &host,
-            &device,
-            &owner,
-            net_support::proposal(PROJECT_RIGHTS),
-        )
-        .await;
+        let record =
+            net_support::pair_with(&host, &device, &owner, net_support::proposal(rights)).await;
         let session = net_support::connect(&host, &device, &record).await;
         let grant = record.grant.grant_id;
         let root = host.work().join("granted");
@@ -3565,6 +3573,417 @@ async fn a_device_clones_makes_a_working_copy_and_removes_it_inside_its_granted_
     assert!(
         granted.root.join("src/README.md").is_file() && granted.root.join("clone/.git").is_dir(),
         "and nothing else was removed"
+    );
+    granted.stop().await;
+}
+
+/// A working copy the device made beneath its destination location, by name.
+async fn a_working_copy(granted: &Granted, name: &str) -> kr_protocol::ids::WorkspaceId {
+    let created: WorkspaceCreateResult = typed(
+        &remote_mutation(
+            &granted.session,
+            granted.host.environment_id,
+            Method::WorkspaceCreate,
+            &granted.working_copy(granted.project, name),
+        )
+        .await
+        .expect("the device makes a working copy inside its granted location"),
+    );
+    created
+        .workspace
+        .0
+        .expect("a creation returns the workspace")
+        .workspace_id
+}
+
+/// What an apply of `version` to `workspace` expects the file `README.md` to hold, as the caller
+/// read it.
+fn expecting_readme(
+    root: &Path,
+    workspace: kr_protocol::ids::WorkspaceId,
+    version: kr_protocol::changeset::VersionRef,
+    name: &str,
+) -> kr_protocol::changeset::DiffApplyParams {
+    let destination = kr_protocol::changeset::DestinationClass::SharedExisting;
+    kr_protocol::changeset::DiffApplyParams {
+        change_set_id: version.change_set_id,
+        version: version.version,
+        destination,
+        workspace_id: Nullable::some(workspace),
+        expected_reference: Nullable::null(),
+        affected: vec![kr_protocol::changeset::AffectedVersion {
+            path: "README.md".to_owned(),
+            expected_worktree_digest: Nullable::some(kr_changeset::objects::digest_of(
+                &std::fs::read(root.join(name).join("README.md")).expect("the file as it is"),
+            )),
+            expected_index_object_id: Nullable::null(),
+            expected_index_mode: Nullable::null(),
+            check_index: false,
+        }],
+        paths: Vec::new(),
+        preflight_only: false,
+        acknowledged_limitations: kr_changeset::apply::limitations(destination),
+    }
+}
+
+/// KR-REQ-23.44: on a host that proves Git's reads confined, a device that holds the rights
+/// captures a working copy, reads its diff, and applies and reverts a version in another, each
+/// inside the location the owner authorised for its grant. The answers name no path of this host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_captures_reads_applies_and_reverts_inside_the_location_its_grant_names() {
+    let Some(granted) = Granted::on_a_qualified_host_holding(
+        "a_device_captures_reads_applies_and_reverts_inside_the_location_its_grant_names",
+        CHANGE_RIGHTS,
+    )
+    .await
+    else {
+        return;
+    };
+    let env = granted.host.environment_id;
+    let review = a_working_copy(&granted, "review").await;
+    let second = a_working_copy(&granted, "second").await;
+
+    // A capture of the working copy that carries the owner's dirty file.
+    let captured: kr_protocol::changeset::ChangesetCaptureResult = typed(
+        &remote_mutation(
+            &granted.session,
+            env,
+            Method::ChangesetCapture,
+            &a_capture_of(review),
+        )
+        .await
+        .expect("the device captures a working copy inside its granted location"),
+    );
+    assert!(
+        captured
+            .version
+            .changes
+            .iter()
+            .any(|changed| changed.path == "README.md"),
+        "the version holds the dirty file: {:?}",
+        captured.version.changes
+    );
+    let version = kr_protocol::changeset::VersionRef {
+        change_set_id: captured.version.change_set_id,
+        version: captured.version.version,
+    };
+
+    // The diff of the live working copy, read through the same location.
+    let diff: kr_protocol::changeset::DiffReadResult = granted
+        .session
+        .read(
+            Method::DiffRead,
+            &kr_protocol::changeset::DiffReadParams {
+                workspace_id: Nullable::some(review),
+                change_set_id: Nullable::null(),
+                version: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the device reads a working copy's diff inside its granted location");
+    assert!(
+        diff.tracked.iter().any(|entry| entry.path == "README.md"),
+        "{:?}",
+        diff.tracked
+    );
+
+    // Another working copy, put back to the committed file, takes the version, and gives it up.
+    std::fs::write(granted.root.join("second/README.md"), "a repository\n").expect("the file");
+    let applied: kr_protocol::changeset::DiffApplyResult = typed(
+        &remote_mutation(
+            &granted.session,
+            env,
+            Method::DiffApply,
+            &expecting_readme(&granted.root, second, version, "second"),
+        )
+        .await
+        .expect("the device applies a version inside its granted location"),
+    );
+    assert_eq!(
+        applied.outcome.0,
+        Some(kr_protocol::changeset::ApplyOutcomeClass::Applied),
+        "{applied:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(granted.root.join("second/README.md")).expect("the file"),
+        "changed after the commit\n",
+        "the version's content is in the working copy"
+    );
+    let reverted: kr_protocol::changeset::DiffApplyResult = typed(
+        &remote_mutation(
+            &granted.session,
+            env,
+            Method::DiffRevert,
+            &expecting_readme(&granted.root, second, version, "second"),
+        )
+        .await
+        .expect("the device reverts a version inside its granted location"),
+    );
+    assert_eq!(
+        reverted.outcome.0,
+        Some(kr_protocol::changeset::ApplyOutcomeClass::Applied),
+        "{reverted:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(granted.root.join("second/README.md")).expect("the file"),
+        "a repository\n",
+        "the base's content is back"
+    );
+    // Nothing the device is told names a directory of this host.
+    let root = granted.root.display().to_string();
+    for told in [format!("{applied:?}"), format!("{reverted:?}")] {
+        assert!(!told.contains(&root), "{told}");
+    }
+    granted.stop().await;
+}
+
+/// KR-REQ-23.44: a device reaches a working copy through the location the owner authorised for its
+/// own grant and through nothing else. One the owner made at a path of its own, with no location,
+/// is refused for capture, diff and apply, whatever the device holds, and nothing is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_reaches_no_working_copy_through_a_location_that_is_not_its_own() {
+    let Some(mut granted) = Granted::on_a_qualified_host_holding(
+        "a_device_reaches_no_working_copy_through_a_location_that_is_not_its_own",
+        CHANGE_RIGHTS,
+    )
+    .await
+    else {
+        return;
+    };
+    let env = granted.host.environment_id;
+    // The owner's own working copy, made at a path, through no location.
+    let owners: WorkspaceCreateResult = typed(
+        &local_mutation(
+            &mut granted.control,
+            env,
+            Method::WorkspaceCreate,
+            &WorkspaceCreateParams {
+                isolation: Nullable::some(IsolationMechanism::IndependentClone),
+                ..workspace_params(&granted.host, granted.project, "owners")
+            },
+        )
+        .await
+        .expect("the owner makes a working copy at a path"),
+    );
+    let owners = owners
+        .workspace
+        .0
+        .expect("a creation returns the workspace")
+        .workspace_id;
+    let before = std::fs::read(granted.host.work().join("owners/README.md")).expect("the file");
+
+    let captured = granted
+        .refused(Method::ChangesetCapture, &a_capture_of(owners))
+        .await;
+    assert_eq!(captured.code(), ErrorCode::PermissionDenied);
+    assert!(
+        said(&captured).contains("reaches it through none"),
+        "{captured}"
+    );
+    let diff = granted
+        .session
+        .read::<_, kr_protocol::changeset::DiffReadResult>(
+            Method::DiffRead,
+            &kr_protocol::changeset::DiffReadParams {
+                workspace_id: Nullable::some(owners),
+                change_set_id: Nullable::null(),
+                version: Nullable::null(),
+            },
+        )
+        .await
+        .expect_err("the diff of a working copy no location reaches");
+    assert_eq!(diff.code(), ErrorCode::PermissionDenied);
+    assert!(said(&diff).contains("reaches it through none"), "{diff}");
+    // And a version cannot be applied onto it, whichever version it is.
+    let review = a_working_copy(&granted, "review").await;
+    let version: kr_protocol::changeset::ChangesetCaptureResult = typed(
+        &remote_mutation(
+            &granted.session,
+            env,
+            Method::ChangesetCapture,
+            &a_capture_of(review),
+        )
+        .await
+        .expect("the device captures its own working copy"),
+    );
+    let version = kr_protocol::changeset::VersionRef {
+        change_set_id: version.version.change_set_id,
+        version: version.version.version,
+    };
+    let applied = granted
+        .refused(
+            Method::DiffApply,
+            &expecting_readme(granted.host.work(), owners, version, "owners"),
+        )
+        .await;
+    assert_eq!(applied.code(), ErrorCode::PermissionDenied);
+    assert!(
+        said(&applied).contains("reaches it through none"),
+        "{applied}"
+    );
+    assert_eq!(
+        std::fs::read(granted.host.work().join("owners/README.md")).expect("the file"),
+        before,
+        "nothing was written to it"
+    );
+    granted.stop().await;
+}
+
+/// KR-REQ-23.44: the repository's own tree is reached through the source location the owner bound
+/// it to, which lends a read. A device captures it and reads its diff there, and is refused a write
+/// to it, whatever rights it holds, with the tree as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_reads_the_repositorys_own_tree_through_its_source_location_and_writes_none_of_it()
+{
+    let Some(granted) = Granted::on_a_qualified_host_holding(
+        "a_device_reads_the_repositorys_own_tree_through_its_source_location_and_writes_none_of_it",
+        CHANGE_RIGHTS,
+    )
+    .await
+    else {
+        return;
+    };
+    let env = granted.host.environment_id;
+    // The device takes the repository's own tree as a working copy.
+    let shared: WorkspaceCreateResult = typed(
+        &remote_mutation(
+            &granted.session,
+            env,
+            Method::WorkspaceCreate,
+            &WorkspaceCreateParams {
+                kind: WorkspaceKind::SharedExisting,
+                isolation: Nullable::null(),
+                destination: Nullable::null(),
+                // A shared working copy is the user's own tree, in which every class stays.
+                policy: InclusionPolicy {
+                    dirty_files: InclusionChoice::Include,
+                    untracked_files: InclusionChoice::Include,
+                    submodules: InclusionChoice::Include,
+                    binary_files: InclusionChoice::Include,
+                    generated_artefacts: InclusionChoice::Include,
+                },
+                ..workspace_params(&granted.host, granted.project, "tree")
+            },
+        )
+        .await
+        .expect("the device takes the repository's own tree through its source location"),
+    );
+    let shared = shared
+        .workspace
+        .0
+        .expect("a creation returns the workspace")
+        .workspace_id;
+    let before = std::fs::read(granted.root.join("src/README.md")).expect("the file");
+
+    let captured: kr_protocol::changeset::ChangesetCaptureResult = typed(
+        &remote_mutation(
+            &granted.session,
+            env,
+            Method::ChangesetCapture,
+            &a_capture_of(shared),
+        )
+        .await
+        .expect("a read of the tree through its source location"),
+    );
+    let version = kr_protocol::changeset::VersionRef {
+        change_set_id: captured.version.change_set_id,
+        version: captured.version.version,
+    };
+    granted
+        .session
+        .read::<_, kr_protocol::changeset::DiffReadResult>(
+            Method::DiffRead,
+            &kr_protocol::changeset::DiffReadParams {
+                workspace_id: Nullable::some(shared),
+                change_set_id: Nullable::null(),
+                version: Nullable::null(),
+            },
+        )
+        .await
+        .expect("a diff of the tree through its source location");
+    for method in [Method::DiffApply, Method::DiffRevert] {
+        let refused = granted
+            .refused(
+                method,
+                &expecting_readme(&granted.root, shared, version, "src"),
+            )
+            .await;
+        assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{method:?}");
+        assert!(
+            said(&refused).contains("does not write"),
+            "{method:?}: {refused}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(granted.root.join("src/README.md")).expect("the file"),
+        before,
+        "the repository's own tree was not written"
+    );
+    granted.stop().await;
+}
+
+/// KR-REQ-23.44: the rights decide, exactly. A device that holds the rights to make a working copy
+/// and not the right to capture, to read files or to apply a diff is refused each of the three
+/// by the right it lacks, and the working copy it made is untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_without_the_right_captures_reads_and_applies_nothing() {
+    let Some(granted) = Granted::on_a_qualified_host(
+        "a_device_without_the_right_captures_reads_and_applies_nothing",
+    )
+    .await
+    else {
+        return;
+    };
+    let env = granted.host.environment_id;
+    let review = a_working_copy(&granted, "review").await;
+    let before = std::fs::read(granted.root.join("review/README.md")).expect("the file");
+
+    let captured = granted
+        .refused(Method::ChangesetCapture, &a_capture_of(review))
+        .await;
+    assert_eq!(captured.code(), ErrorCode::PermissionDenied);
+    let diff = granted
+        .session
+        .read::<_, kr_protocol::changeset::DiffReadResult>(
+            Method::DiffRead,
+            &kr_protocol::changeset::DiffReadParams {
+                workspace_id: Nullable::some(review),
+                change_set_id: Nullable::null(),
+                version: Nullable::null(),
+            },
+        )
+        .await
+        .expect_err("a read without the right to read files");
+    assert_eq!(diff.code(), ErrorCode::PermissionDenied);
+    // A version the owner captured, applied by a device that may not apply a diff.
+    let mut control = granted.host.client().await;
+    let version: kr_protocol::changeset::ChangesetCaptureResult = typed(
+        &local_mutation(
+            &mut control,
+            env,
+            Method::ChangesetCapture,
+            &a_capture_of(review),
+        )
+        .await
+        .expect("the owner captures the working copy"),
+    );
+    let version = kr_protocol::changeset::VersionRef {
+        change_set_id: version.version.change_set_id,
+        version: version.version.version,
+    };
+    for method in [Method::DiffApply, Method::DiffRevert] {
+        let refused = granted
+            .refused(
+                method,
+                &expecting_readme(&granted.root, review, version, "review"),
+            )
+            .await;
+        assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{method:?}");
+    }
+    assert_eq!(
+        std::fs::read(granted.root.join("review/README.md")).expect("the file"),
+        before,
+        "nothing was written to the working copy"
     );
     granted.stop().await;
 }

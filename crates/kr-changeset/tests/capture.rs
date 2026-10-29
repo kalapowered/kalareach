@@ -2478,7 +2478,7 @@ fn an_independent_clone_workspace_can_be_captured() {
     std::fs::rename(substitute.join(".git"), clone.join(".git")).expect("another repository");
     let refusal = fixture
         .service()
-        .open_repository(&resolved)
+        .open_repository(&resolved, None)
         .expect_err("a repository this host did not record for the clone is refused");
     assert_eq!(refusal.code(), ErrorCode::SourceChanged, "{refusal}");
 
@@ -2503,14 +2503,14 @@ fn an_independent_clone_workspace_can_be_captured() {
     forget_the_git_directory();
     fixture
         .service()
-        .open_repository(&resolved)
+        .open_repository(&resolved, None)
         .expect("the clone is the repository this host first found behind it");
     forget_the_git_directory();
     std::fs::rename(clone.join(".git"), clone.join(".git-was")).expect("the clone's own data");
     std::fs::rename(clone.join(".git-substitute"), clone.join(".git")).expect("another repository");
     let refusal = fixture
         .service()
-        .open_repository(&resolved)
+        .open_repository(&resolved, None)
         .expect_err("a repository this host has not seen before is refused");
     assert!(
         refusal.to_string().contains("independent clone"),

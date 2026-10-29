@@ -29,7 +29,8 @@ use kr_protocol::changeset::{
     MAX_CHANGESET_ENTRIES, Provenance, SourceConsistency, VersionRef,
 };
 use kr_protocol::ids::{
-    ChangeSetId, ChangeSetVersion, EnvironmentId, ProjectRepositoryId, SessionId, WorkspaceId,
+    ChangeSetId, ChangeSetVersion, EnvironmentId, GrantId, ProjectRepositoryId, SessionId,
+    WorkspaceId,
 };
 use kr_protocol::project::{
     FilesystemIdentity, IsolationMechanism, RetainedKind, WorkspaceReadParams, WorkspaceSummary,
@@ -84,6 +85,11 @@ pub struct ResolvedWorkspace {
     pub shares_repository: bool,
 }
 
+/// Who a request is performed for: the owner, who reaches a workspace by its recorded path, or a
+/// caller bounded by one grant, who reaches it only through a location the owner authorised for
+/// that grant, with every Git invocation of the request bounded to what that location reaches.
+pub type Caller = Option<GrantId>;
+
 /// What one capture is asked for.
 #[derive(Clone)]
 pub struct CaptureOrder<'a> {
@@ -106,6 +112,8 @@ pub struct CaptureOrder<'a> {
     /// authority can run out inside that read. A request with none is one nothing arbitrates,
     /// which is what a direct in-process caller and every test are.
     pub admitted: Option<&'a dyn crate::store::StillAdmitted>,
+    /// Who the capture is performed for.
+    pub caller: Caller,
 }
 
 impl std::fmt::Debug for CaptureOrder<'_> {
@@ -117,6 +125,7 @@ impl std::fmt::Debug for CaptureOrder<'_> {
             .field("label", &self.label)
             .field("request", &self.request)
             .field("pin", &self.pin)
+            .field("caller", &self.caller)
             .field("provenance", &self.provenance)
             .field("admitted", &self.admitted.is_some())
             .finish()
@@ -382,6 +391,38 @@ impl ChangeSetService {
         })
     }
 
+    /// Refuses a write for a caller bounded by a grant to a workspace that is the repository's own
+    /// tree.
+    ///
+    /// Such a caller reaches that tree only through the source location its repository is bound
+    /// to, which the owner authorised for reading. A write is not something that location lends.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`kr_project::ProjectError::PermissionDenied`] for that workspace and caller.
+    pub fn require_a_tree_the_caller_may_write(
+        resolved: &ResolvedWorkspace,
+        caller: Caller,
+    ) -> Result<()> {
+        if let Some(grant) = caller
+            && matches!(
+                resolved.summary.kind,
+                kr_protocol::project::WorkspaceKind::SharedExisting
+            )
+        {
+            return Err(kr_project::ProjectError::PermissionDenied {
+                detail: format!(
+                    "workspace {} is the repository's own tree, which a caller bounded by grant \
+                     {grant} reaches through the source location for reading and does not write",
+                    resolved.summary.workspace_id
+                )
+                .into(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
     /// Opens one workspace's repository under the project service's profile, and writes nothing.
     ///
     /// This is the open of everything that reads, and of a preflight: a preflight that stops at a
@@ -393,13 +434,21 @@ impl ChangeSetService {
     ///
     /// Returns whatever the project service returns, including `SOURCE_CHANGED` when the objects
     /// at the recorded path are not the ones the record named.
-    pub fn open_repository(&self, resolved: &ResolvedWorkspace) -> Result<OpenedRepository> {
+    pub fn open_repository(
+        &self,
+        resolved: &ResolvedWorkspace,
+        caller: Caller,
+    ) -> Result<OpenedRepository> {
         // The workspace's tree, and the project's Git directory where the workspace shares it, are
         // held to what the project service recorded, by the rule every recorded directory is
         // decided by.
-        let opened = self
-            .project
-            .open_workspace_repository(resolved.summary.workspace_id)?;
+        let workspace_id = resolved.summary.workspace_id;
+        let opened = match caller {
+            None => self.project.open_workspace_repository(workspace_id)?,
+            Some(grant) => self
+                .project
+                .open_workspace_repository_for(workspace_id, grant)?,
+        };
         self.require_first_repository_of(resolved, opened)
     }
 
@@ -412,10 +461,17 @@ impl ChangeSetService {
     pub fn open_repository_recording(
         &self,
         resolved: &ResolvedWorkspace,
+        caller: Caller,
     ) -> Result<OpenedRepository> {
-        let opened = self
-            .project
-            .open_workspace_repository_recording(resolved.summary.workspace_id)?;
+        let workspace_id = resolved.summary.workspace_id;
+        let opened = match caller {
+            None => self
+                .project
+                .open_workspace_repository_recording(workspace_id)?,
+            Some(grant) => self
+                .project
+                .open_workspace_repository_recording_for(workspace_id, grant)?,
+        };
         self.require_first_repository_of(resolved, opened)
     }
 
@@ -558,7 +614,7 @@ impl ChangeSetService {
             ));
         }
         let resolved = self.resolve(order.workspace_id)?;
-        let repository = self.open_repository_recording(&resolved)?;
+        let repository = self.open_repository_recording(&resolved, order.caller)?;
         // A capture writes, so this is where the first observation of an independent clone's own
         // repository is fixed. Every later open is compared against it.
         self.remember_repository(&resolved, &repository, order.admitted)?;

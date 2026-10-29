@@ -69,7 +69,8 @@ fn a_diff_read_carries_identity_base_head_and_both_content_revisions() {
     write_bytes(&path, "image.bin", &[0_u8, 1, 2, 0]);
     let workspace = fixture.workspace("read");
 
-    let read = apply::read(fixture.service(), Some(workspace), None).expect("the read succeeds");
+    let read =
+        apply::read(fixture.service(), None, Some(workspace), None).expect("the read succeeds");
     assert_eq!(read.workspace_id, workspace);
     assert_eq!(read.environment_id, fixture.environment_id());
     assert!(!read.base_revision.is_empty());
@@ -114,7 +115,7 @@ fn a_diff_read_carries_identity_base_head_and_both_content_revisions() {
 
     // A read of a captured version names the version it is of.
     let record = fixture.capture(workspace, &include_everything());
-    let read = apply::read(fixture.service(), None, Some(reference(&record)))
+    let read = apply::read(fixture.service(), None, None, Some(reference(&record)))
         .expect("a version is readable");
     assert_eq!(read.source_version, Nullable(Some(reference(&record))));
     assert_eq!(read.base_revision, record.base_revision);
