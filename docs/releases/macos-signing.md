@@ -128,10 +128,11 @@ The `matrix` job runs beside `source`. It builds `kr-release-matrix-check` at th
 whether the signed release matrix the managed service publishes lists a tier for the package version
 the commit carries ([packages.md](packages.md#the-release-matrix)). It holds no key and no write
 access, and `channel` waits for it, so a release that the matrix does not list is refused before anyone is
-asked to approve the use of the release keys. The `matrix-again` job runs the program `matrix` built a
-second time, once every archive is checked and just before `publish`, because the approval between the
-two can come days later and a newer matrix revision may have dropped the version. The first job comes after
-the notarisation, which takes about an hour, so run the same check at the commit before the signing starts:
+asked to approve the use of the release keys. `publish` asks again as its first step, with the program
+`matrix` built, held to its sum and run before anything is written, because the approval between the two
+can come days later and a newer matrix revision may have dropped the version; a re-run of `publish` asks
+afresh. The program is kept for five days and the trees for three, so it outlasts them. The first job comes
+after the notarisation, which takes about an hour, so run the same check at the commit before the signing starts:
 
 ```sh
 cargo run --locked --release -p kr-release-matrix-check -- --origin https://reach.kala.to
@@ -142,13 +143,17 @@ the condition that the ref is `main`, and the `update-signing` environment accep
 only and names the maintainer as its reviewer. A dispatch on another ref runs `matrix` and nothing else.
 
 `publish` refuses to make a draft unless something shows that the repository makes releases immutable.
-A workflow's token cannot read the repository's setting, which needs the right to administer it, so the
-job reads the repository's releases and requires the most recently published one, of any kind, to report
-itself immutable, which a release published while the setting is off does not. That shows the setting as
-it was at that release. Read the setting with your own login before dispatching the workflow:
-`gh api repos/<owner>/<repo>/immutable-releases` answers 200 with `"enabled": true` when it is on. After
-`publish` publishes, it confirms that the tag is at the commit, that the release is immutable, and that the
-public release holds what it checked.
+A workflow's token cannot read the repository's setting, which needs the right to administer it, and
+the workflow holds no credential that has it. So the job reads the repository's releases and requires
+the most recently published one, of any kind, to report itself immutable, which a release published
+while the setting is off does not. That shows the setting as it was at that release, and it is kept as
+the check, with three more around it: whoever dispatches the workflow reads the setting with their own
+login first (`gh api repos/<owner>/<repo>/immutable-releases` answers 200 with `"enabled": true` when it
+is on); whoever approves the `update-signing` deployment reads it again just before approving; and
+after `publish` publishes, it confirms that the tag is at the commit, that the release is immutable, and
+that the public release holds what it checked. Another writer to the repository could replace an asset
+of the draft between the job's last check of it and its publication; the check after publication
+shows that, and it cannot undo it.
 
 ## Reading a refusal
 
@@ -163,8 +168,8 @@ public release holds what it checked.
 | `already has a release` | the tag is taken, and a published release is never replaced | release the corrected commit under its own tag |
 | `the update channel's release keys are not set up` | the environment has no key | the owner sets `RELEASE_CHANNEL_TARGETS_KEY_1` and `_2` |
 | `is not on main` | the commit is not in `main`'s history | land the commit, then build again |
-| `is in no tier of the release matrix`, or `the published release matrix was not accepted` | the matrix the managed service publishes does not list the commit's package version, or does not verify | publish a matrix revision that lists the version, and dispatch again |
-| `nothing shows that this repository makes releases immutable` | the setting reads as off, or the most recently published release is not immutable | turn the setting on, publish a package release, and dispatch again |
+| `is in no tier of the release matrix`, or `the published release matrix was not accepted` | the matrix the managed service publishes does not list the commit's package version, or does not verify | publish a matrix revision that lists the version, then re-run the failed job; its sealed archives are kept for one day, and a refusal at `matrix`, before the approval, is a new dispatch |
+| `nothing shows that this repository makes releases immutable` | the setting reads as off, or the most recently published release is not immutable | turn the setting on and publish a package release, then re-run the failed `publish` job within the day the sealed archives are kept; later, dispatch again |
 
 ## Keys, and replacing them
 
