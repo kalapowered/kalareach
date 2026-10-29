@@ -270,7 +270,7 @@ const DEADLINES: HttpDeadlines = HttpDeadlines {
 /// cannot be used, and [`Unread::ClearTextViaProxy`] for a plain `http` origin with a proxy.
 pub fn connect(origin: &GatewayOrigin, proxy: Option<&str>) -> Result<HttpService, Unread> {
     let proxy = proxy
-        .map(str::parse::<ProxyUrl>)
+        .map(|text| text.parse::<ProxyUrl>())
         .transpose()
         .map_err(|_| Unread::NoTransport)?;
     if proxy.is_some() && origin.as_str().starts_with("http://") {
