@@ -616,6 +616,42 @@ fn a_profile_that_cannot_be_looked_at_is_neither_changed_nor_forgotten() {
     }
 }
 
+/// KR-REQ-01.21: a profile whose folder was replaced by a file is not there, so a removal forgets it
+/// and leaves the file, where a profile that cannot be looked at keeps its record.
+#[test]
+fn a_profile_whose_folder_became_a_file_is_gone() {
+    for application in applications() {
+        let person = Person::with(&application);
+        (application.seed)(&person);
+        person
+            .install(application.terminal, &command_in(person.tree.root()))
+            .expect("installs");
+        let folder = (application.profile)(&person)
+            .parent()
+            .expect("a folder")
+            .to_path_buf();
+        std::fs::remove_dir_all(&folder).expect("the folder goes");
+        std::fs::write(&folder, b"not a folder").expect("a file in its place");
+        assert_eq!(
+            person.remove(application.terminal).expect("answers"),
+            Removed::AlreadyGone,
+            "{:?}",
+            application.terminal
+        );
+        assert!(
+            person.record().profiles().expect("reads").is_empty(),
+            "{:?}: the record forgets it",
+            application.terminal
+        );
+        assert_eq!(
+            std::fs::read(&folder).expect("the file"),
+            b"not a folder",
+            "{:?}: and the file is left",
+            application.terminal
+        );
+    }
+}
+
 /// KR-REQ-01.21: Windows Terminal's settings name the default profile by the identifier its
 /// settings page writes, in a file with comments and trailing commas. Such a default is left on
 /// removal. Settings that do not read stop the removal, with the profile left and the record kept:
