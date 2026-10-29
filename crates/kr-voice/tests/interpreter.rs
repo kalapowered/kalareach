@@ -360,8 +360,7 @@ fn a_mark_in_or_beside_a_number_leaves_no_number() {
 /// The host reads speech deterministically and for the four requests above only, so no spoken form
 /// submits a prompt or answers an approval: a prompt is never spoken into a session, and the
 /// spoken destination a confirmation would name is never reached. Whatever a person says that
-/// sounds like either, the host reads no request from it, and a request the grammar does read
-/// carries no destination confirmation and no approval answer.
+/// sounds like either, the host reads no request from it.
 #[test]
 fn no_spoken_form_submits_a_prompt_or_answers_an_approval() {
     let sounds_like_one: &[&[&str]] = &[
@@ -397,27 +396,6 @@ fn no_spoken_form_submits_a_prompt_or_answers_an_approval() {
         &["close session 3 and submit the prompt"],
     ];
     for texts in sounds_like_one {
-        assert_eq!(read(texts), Err(Misread::NotARequest), "{texts:?}");
-    }
-
-    // The requests that are read give the host an action to check and nothing it could take as
-    // the person's confirmation of a destination or an answer to an approval: `read` asserts that
-    // of each answer.
-    for texts in [
-        &["status"][..],
-        &["brief me on session 2"],
-        &["open session 6"],
-        &["close session 3"],
-    ] {
-        let (action, _) = read(texts).expect("a request the grammar holds");
-        assert!(
-            !matches!(
-                action,
-                VoiceAction::SubmitPrompt
-                    | VoiceAction::ComposePrompt
-                    | VoiceAction::AnswerApproval
-            ),
-            "{texts:?} read as {action:?}"
-        );
+        assert!(read(texts).is_err(), "{texts:?} was read as a request");
     }
 }

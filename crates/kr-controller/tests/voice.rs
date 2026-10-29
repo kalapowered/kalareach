@@ -19,7 +19,7 @@
 //! | KR-REQ-15.17 | `an_effect_this_host_does_not_dispatch_is_reported_as_admitted` |
 //! | KR-REQ-15.19 | `a_start_refused_for_a_changed_rate_reaches_the_device_with_the_new_rate` |
 //! | KR-REQ-15.20 | `context_is_filtered_by_the_requesting_devices_own_history_bound` |
-//! | KR-REQ-15.21 | `the_default_voice_grant_is_written_into_the_hosts_own_store` |
+//! | KR-REQ-15.21 | `the_default_voice_grant_is_written_into_the_hosts_own_store`, `speech_reaches_no_prompt_submission_under_a_grant_that_permits_one` |
 //! | KR-REQ-23.51 | `a_voice_method_is_unreachable_from_local_ipc`, `voice_needs_a_paired_device_and_a_voice_grant`, `a_second_delegation_under_one_action_identifier_is_refused_and_never_dispatched`, `a_delegation_resubmitted_after_a_lost_reply_gets_its_receipt`, `a_delegation_spent_in_an_ended_call_is_not_a_new_action_later_or_after_a_restart` |
 //!
 //! Section 23 gives the five voice methods `PairedDevice` ingress and nothing else, so a local
@@ -2823,6 +2823,59 @@ async fn speech_the_daemon_does_not_read_as_a_request_is_refused_and_spends_noth
             ),
             "{refusal:?}"
         ),
+    }
+    voice.raw.close();
+    voice.host.stop().await;
+}
+
+/// KR-REQ-15.21: the daemon reads speech with the product grammar, which holds no request that
+/// submits a prompt or answers an approval. A call whose voice grant the person broadened to permit
+/// both, on a device whose own grant carries the rights both need, reaches neither by speech:
+/// whatever is said, the host proposes nothing, so the spoken destination a prompt would need is
+/// never reached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn speech_reaches_no_prompt_submission_under_a_grant_that_permits_one() {
+    let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
+    let voice = RawVoice::prepare_with(
+        &owner,
+        Arc::new(OfflineProvider::default()),
+        &[
+            ActionRight::SessionView,
+            ActionRight::AgentPrompt,
+            ActionRight::AgentApprovalRespond,
+        ],
+        Some(&[
+            VoiceAction::Status,
+            VoiceAction::SubmitPrompt,
+            VoiceAction::AnswerApproval,
+        ]),
+    )
+    .await;
+    let call = voice.start_call().await;
+
+    for (index, words) in [
+        "send the prompt fix the failing test to session one",
+        "send it to session one",
+        "yes, send it to session one",
+        "I confirm, submit it to session one",
+        "approve the request",
+        "yes, allow it",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let answered = voice
+            .delegate(
+                ActionId::new(kr_ipc::new_uuid()),
+                &voice.saying(call, &format!("s{index}"), words),
+            )
+            .await
+            .expect("the delegation is answered");
+        let VoiceDelegationOutcome::Refused { reason, .. } = &answered.outcome else {
+            panic!("{words}: {:?}", answered.outcome);
+        };
+        assert_eq!(*reason, VoiceRefusal::NotUnderstood, "{words}");
+        assert!(answered.action.0.is_none() && answered.session_id.0.is_none());
     }
     voice.raw.close();
     voice.host.stop().await;
