@@ -1823,6 +1823,100 @@ fn device_from(admits: &dyn Fn(SessionId) -> bool, history_from_ms: u64) -> View
     })
 }
 
+/// KR-REQ-10.49: the first change a viewer with a history bound is shown does not say how many
+/// came before its history. The cursors it is shown are the log's own plus an offset it cannot
+/// know, so they count nothing, and they keep their order and their distances. The same bound is
+/// numbered the same way every time, another bound another way, and the owner is shown the log's
+/// own.
+#[test]
+fn a_bounded_viewer_is_not_shown_how_many_changes_came_before_its_history() {
+    let mut attention = engine();
+    for sequence in 1_u64..=4 {
+        attention
+            .apply(
+                &turn_completed(sequence, 1_000 * sequence, sequence),
+                reading(0),
+            )
+            .expect("the store records the decision");
+    }
+    let admits_one = |candidate: SessionId| candidate == session(1);
+    let phone = actor("device:phone");
+    let seen_from = |attention: &Attention, history_from_ms: u64| {
+        attention
+            .changed(
+                &phone,
+                &device_from(&admits_one, history_from_ms),
+                session(1),
+                100,
+                0,
+                Content::Narrowed,
+            )
+            .expect("the store is this owner's")
+            .result
+    };
+
+    let owner = attention
+        .changed_as(&phone, 100, 0, Content::Narrowed)
+        .expect("the store is this owner's");
+    assert_eq!(
+        owner
+            .changes
+            .iter()
+            .map(|change| change.cursor.get())
+            .collect::<Vec<_>>(),
+        (0..8).collect::<Vec<_>>(),
+        "the owner is shown the log's own cursors"
+    );
+
+    // Reaches the last two turns: four changes, at the log's cursors 4 to 7.
+    let later = seen_from(&attention, NOON + 3_000);
+    let shown: Vec<u64> = later
+        .changes
+        .iter()
+        .map(|change| change.cursor.get())
+        .collect();
+    assert_eq!(shown.len(), 4);
+    assert!(
+        shown.iter().all(|cursor| *cursor >= 1 << 60),
+        "a cursor that is the log's own says how many changes came before it: {shown:?}"
+    );
+    assert_eq!(
+        shown
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .collect::<Vec<_>>(),
+        vec![1, 1, 1],
+        "the order and the distances of the changes are kept"
+    );
+    assert_eq!(
+        later.from_cursor.get(),
+        shown[0],
+        "the view starts at its first change"
+    );
+    assert_eq!(
+        later.to_cursor.get(),
+        shown[3] + 1,
+        "and ends after its last"
+    );
+
+    // The same bound is numbered the same way when it is asked again, and another bound is not.
+    assert_eq!(seen_from(&attention, NOON + 3_000).changes, later.changes);
+    let earlier = seen_from(&attention, NOON + 2_000);
+    assert_eq!(earlier.changes.len(), 6, "the last three turns");
+    assert_ne!(
+        earlier.changes[2].cursor, later.changes[0].cursor,
+        "the same change is numbered another way for another bound"
+    );
+
+    // A history that reaches nothing is not told where the log ends either.
+    let none = seen_from(&attention, u64::MAX);
+    assert!(none.changes.is_empty());
+    assert!(
+        none.from_cursor.get() >= 1 << 60 && none.to_cursor == none.from_cursor,
+        "{none:?}"
+    );
+}
+
 /// KR-REQ-10.49: a viewer whose history starts after every change the log holds is told nothing of
 /// the log: its position stays where it is, and the view does not say where the log ends.
 #[test]

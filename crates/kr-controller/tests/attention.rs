@@ -1727,6 +1727,120 @@ async fn a_device_under_a_grant_with_no_cursor_is_shown_what_is_first_seen_after
     host.stop().await;
 }
 
+/// A paired device's read of what changed in a session, over the network path.
+async fn device_changes(
+    device: &kr_client::session::Session,
+    session_id: SessionId,
+) -> VisitChangedResult {
+    device
+        .read(
+            Method::VisitChanged,
+            &VisitChangedParams {
+                session_id,
+                max_changes: U64::new(50),
+                summarise: false,
+            },
+        )
+        .await
+        .expect("a device's changed view is served")
+}
+
+/// KR-REQ-10.49: a paired device whose history began at its pairing is shown the changes recorded
+/// since, in cursors that count nothing before it, and sends back the number it was shown. The log
+/// keeps its own cursor, so the owner's view of the same session is the log's. A number this host
+/// did not give the device, the log's own cursor among them, is refused, and a device that
+/// acknowledges the end of its view is next shown an empty one from there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_paired_devices_cursors_count_nothing_before_its_pairing_and_are_sent_back_as_shown() {
+    let owner_keys = DeviceKeys::generate().expect("owner keys");
+    let host = net_support::Host::start(&owner_keys).await;
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let before: Vec<_> = (1..=3).map(|version| turn(session_id, version)).collect();
+    host.controller()
+        .attention()
+        .observe(&before)
+        .expect("the store records the turns");
+    let (_phone, device) =
+        net_support::paired_device(&host, &owner_keys, &[ActionRight::SessionView]).await;
+    let after: Vec<_> = (4..=5).map(|version| turn(session_id, version)).collect();
+    host.controller()
+        .attention()
+        .observe(&after)
+        .expect("the store records the turns");
+
+    let mut control = host.client().await;
+    let owner = owner_changes(&mut control, session_id).await;
+    assert_eq!(
+        owner
+            .changes
+            .iter()
+            .map(|change| change.cursor.get())
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2, 3, 4],
+        "the owner is shown the log's own cursors"
+    );
+
+    let shown = device_changes(&device, session_id).await;
+    let cursors: Vec<u64> = shown
+        .changes
+        .iter()
+        .map(|change| change.cursor.get())
+        .collect();
+    assert_eq!(cursors.len(), 2, "the two turns since its pairing");
+    assert!(
+        cursors.iter().all(|cursor| *cursor >= 1 << 60),
+        "a cursor that is the log's own says how many changes came before the pairing: {cursors:?}"
+    );
+    assert_eq!(cursors[1], cursors[0] + 1);
+    assert_eq!(shown.from_cursor.get(), cursors[0]);
+    assert_eq!(shown.to_cursor.get(), cursors[1] + 1);
+
+    // The log's own cursor, and a number past where the log ends, are not numbers it was given.
+    for foreign in [owner.to_cursor.get(), shown.to_cursor.get() + 1_000] {
+        let refused = device_mutation::<VisitAcknowledgeResult>(
+            &device,
+            session_target(&host, session_id),
+            Method::VisitAcknowledge,
+            &VisitAcknowledgeParams {
+                session_id,
+                acknowledged_cursor: U64::new(foreign),
+                views: Vec::new(),
+            },
+        )
+        .await
+        .expect_err("a number this host did not give the device");
+        assert_eq!(refused.code(), ErrorCode::InvalidArgument, "{foreign}");
+    }
+
+    let visited: VisitAcknowledgeResult = device_mutation(
+        &device,
+        session_target(&host, session_id),
+        Method::VisitAcknowledge,
+        &VisitAcknowledgeParams {
+            session_id,
+            acknowledged_cursor: shown.to_cursor,
+            views: Vec::new(),
+        },
+    )
+    .await
+    .expect("the number it was shown is acknowledged");
+    assert_eq!(visited.acknowledged_cursor, shown.to_cursor);
+    let next = device_changes(&device, session_id).await;
+    assert!(next.changes.is_empty(), "{next:?}");
+    assert_eq!(
+        next.from_cursor, shown.to_cursor,
+        "from where it acknowledged"
+    );
+    assert_eq!(next.to_cursor, shown.to_cursor);
+
+    assert_eq!(
+        owner_changes(&mut control, session_id).await.changes.len(),
+        5,
+        "the device's acknowledgement is its own and the owner's view is the log's"
+    );
+    host.stop().await;
+}
+
 /// KR-REQ-10.49: a review subject whose current version was recorded before a device's pairing is
 /// answered to that device as one the host never held: its review read does not list it, and an
 /// acknowledgement of it, whatever version it names, is told no more than that the host holds no
