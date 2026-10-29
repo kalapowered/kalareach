@@ -529,8 +529,9 @@ Note that this does not check the lock against the one on the main branch, so if
 
 ## Windows
 
-A Windows host keeps a store and installs, updates and rolls back as the rest of this page
-describes. These are the differences.
+A Windows host installed with `kr host install` keeps a store and installs, updates and rolls back
+as the rest of this page describes. A Windows host that runs from the directory a package manager or a
+person unpacked keeps no store. These are the differences.
 
 ### The store
 

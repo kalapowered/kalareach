@@ -67,10 +67,14 @@ with an all-signed execution policy, so they are signed together or not at all. 
 keys sign `release.json`, which lists every other file with its length and digest, so the files that carry no
 Authenticode signature (the licences, the package manifest, the record, the channel's root, the terminal's
 capability manifest and its terminfo database) are held by that one wherever it is checked. A Windows
-host keeps a store of releases, and `kr host update` checks a Windows archive's manifest against the
-channel root the host trusts, as on the other platforms ([Windows](../host/updates.md#windows)). No
-Windows manifest is signed under a production channel yet, so until one is, the archive's `SHA256SUMS`
-and the package manager's digest are what hold those files for a person who installs one.
+host installed with `kr host install` keeps a store of releases, and its `kr host update` checks a
+Windows archive's manifest against the channel root the host trusts, as on the other platforms; a
+Windows host that runs from the directory a package manager or a person unpacked keeps no store and
+checks no manifest ([Windows](../host/updates.md#windows)). No Windows manifest is signed under any
+channel yet. At a first install the root is the archive's own, and `share/update-root.json` is one of
+the files that carry no Authenticode signature, so what holds these files for a person who installs a
+release is the archive's `SHA256SUMS` and the package manager's digest; the manifest protects a later
+release that `kr host update` takes into a store.
 `scripts/stage-windows-signing.py` is what says which files are which. When the release tool
 writes the manifest of a signed tree it holds each script to the checkout's text without the block of
 comment lines Authenticode appends; a script with anything but comment lines after the block's first
