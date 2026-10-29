@@ -297,7 +297,10 @@ jobs:
     name: windows
     if: github.event_name != 'workflow_dispatch' || inputs.windows
     runs-on: windows-2025
-    timeout-minutes: 180
+    # Every step has a limit of its own, and the limits add up to less than this one, so a step
+    # that hangs is ended and the steps after it still report. The job's own limit is under
+    # GitHub's six hours.
+    timeout-minutes: 355
     env:
       CARGO_INCREMENTAL: "0"
       # The plugin runtime's tests run real components, which the steps below build; a component
@@ -366,9 +369,17 @@ jobs:
       # applications are recorded as not run here, each with its reason. The report runs whatever
       # has come before, so that a component that could not be built is reported by the test that
       # needs it, by name, and not by a job that stopped before the report.
+      #
+      # The step builds and runs every suite in turn, with no build cache, and it grows with the
+      # suites. It took 102 to 143 minutes with 76 to 81 suites (16 to 25 October). With 91 suites
+      # it ran into its limit of 150 minutes on three nights in a row, and on the last one 89 suites
+      # were done after 140 minutes and the 90th was still compiling. Its limit is the most that
+      # this job's limit leaves once the other steps have theirs: the limits of the job's steps add
+      # up to 352 of its 355 minutes. That is under twice the 143 minutes of the longest run that
+      # passed, and the runs that were cut took longer.
       - name: The conformance report
         if: ${{ !cancelled() }}
-        timeout-minutes: 150
+        timeout-minutes: 285
         env:
           REPORT_GROUPS: ${{ inputs.groups }}
         run: |
