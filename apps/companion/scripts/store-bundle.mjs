@@ -26,8 +26,9 @@
 // A secret is a file whose path is given to `--secret-file`. It is read in this process, every
 // decompressed member of the bundle (or every file of the application) is searched for it, and
 // only the number of places it was found is printed. It is never part of a command line. It is
-// searched for in the forms a file can hold it in (as it is, JSON-escaped, hex, base64 and
-// base64url, and with the white space removed, so a secret split across lines is found), and in the
+// searched for in the forms a file can hold it in (as it is, as a JSON writer escapes it, in hex of
+// either case, in base64 and base64url, and with the white space removed, so a secret split across
+// lines is found), after every JSON string escape in the searched text has been read, and in the
 // names of files and archive members too. Whatever the command prints goes through one filter that
 // withholds a message quoting a secret or any part of a signed token.
 //
@@ -237,42 +238,147 @@ const TOKEN_SHAPE = /eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8
 /** Any part of a signed token that can stand alone: the start of a base64url JSON object. */
 const TOKEN_PART = /eyJ[A-Za-z0-9_-]{8,}/
 
-/** The largest JSON text that is read for the strings in it. */
-const MOST_JSON = 16 * 1024 * 1024
-
 /** No secret to search for. */
-const NO_NEEDLES = { forms: [], squashed: [] }
+const NO_NEEDLES = { forms: [], apart: [], hex: [] }
+
+/** The bytes of the escapes JSON allows a single character after a backslash, and what each stands for. */
+const SIMPLE_ESCAPES = new Map([
+  [0x22, 0x22],
+  [0x5c, 0x5c],
+  [0x2f, 0x2f],
+  [0x62, 0x08],
+  [0x66, 0x0c],
+  [0x6e, 0x0a],
+  [0x72, 0x0d],
+  [0x74, 0x09]
+])
+
+/** The value of one hexadecimal digit, or -1. */
+function digitOf(byte) {
+  if (byte >= 0x30 && byte <= 0x39) return byte - 0x30
+  const lower = byte | 0x20
+  return lower >= 0x61 && lower <= 0x66 ? lower - 0x61 + 10 : -1
+}
+
+/** The value of four hexadecimal digits from `at`, or -1. */
+function fourDigits(bytes, at) {
+  let value = 0
+  for (let index = 0; index < 4; index += 1) {
+    const digit = at + index < bytes.length ? digitOf(bytes[at + index]) : -1
+    if (digit < 0) return -1
+    value = value * 16 + digit
+  }
+  return value
+}
+
+/** Writes a code point as UTF-8 and answers how many bytes it took. */
+function putUtf8(out, at, point) {
+  if (point < 0x80) {
+    out[at] = point
+    return 1
+  }
+  if (point < 0x800) {
+    out[at] = 0xc0 | (point >> 6)
+    out[at + 1] = 0x80 | (point & 0x3f)
+    return 2
+  }
+  if (point < 0x10000) {
+    out[at] = 0xe0 | (point >> 12)
+    out[at + 1] = 0x80 | ((point >> 6) & 0x3f)
+    out[at + 2] = 0x80 | (point & 0x3f)
+    return 3
+  }
+  out[at] = 0xf0 | (point >> 18)
+  out[at + 1] = 0x80 | ((point >> 12) & 0x3f)
+  out[at + 2] = 0x80 | ((point >> 6) & 0x3f)
+  out[at + 3] = 0x80 | (point & 0x3f)
+  return 4
+}
 
 /**
- * The bytes of a text with the white space left out, and the line breaks that a JSON string or a
- * shell quote writes out (`\n`, `\r`, `\t`). A secret that was wrapped, indented or joined again is
- * the same secret once these are gone from both sides.
+ * The bytes with every escape of a JSON string read as a JSON reader reads it (`\"`, `\\`, `\/`, `\n`
+ * and the others, `\uXXXX` with a pair of surrogates joined), wherever it sits: in a JSON file whole
+ * or in a line of a log, a long file or a short message. Null when there is no escape to read.
  */
+function unescaped(bytes) {
+  if (!bytes.includes(0x5c)) return null
+  const out = Buffer.allocUnsafe(bytes.length)
+  let length = 0
+  let changed = false
+  for (let index = 0; index < bytes.length; index += 1) {
+    const byte = bytes[index]
+    if (byte !== 0x5c || index + 1 >= bytes.length) {
+      out[length] = byte
+      length += 1
+      continue
+    }
+    const next = bytes[index + 1]
+    if (SIMPLE_ESCAPES.has(next)) {
+      out[length] = SIMPLE_ESCAPES.get(next)
+      length += 1
+      index += 1
+      changed = true
+      continue
+    }
+    const code = next === 0x75 ? fourDigits(bytes, index + 2) : -1
+    if (code >= 0) {
+      let point = code
+      let width = 6
+      if (code >= 0xd800 && code <= 0xdbff && bytes[index + 6] === 0x5c && bytes[index + 7] === 0x75) {
+        const low = fourDigits(bytes, index + 8)
+        if (low >= 0xdc00 && low <= 0xdfff) {
+          point = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00)
+          width = 12
+        }
+      }
+      length += putUtf8(out, length, point)
+      index += width - 1
+      changed = true
+      continue
+    }
+    out[length] = byte
+    length += 1
+  }
+  return changed ? out.subarray(0, length) : null
+}
+
+/** The bytes as they are, and as a JSON reader would read them when that differs. */
+function viewsOf(bytes) {
+  const read = unescaped(bytes)
+  return read === null ? [bytes] : [bytes, read]
+}
+
+/** The bytes with the white space left out: a secret that was wrapped, indented or joined across lines is the same secret without it. */
 function squash(bytes) {
   const kept = Buffer.allocUnsafe(bytes.length)
   let length = 0
   for (let index = 0; index < bytes.length; index += 1) {
     const byte = bytes[index]
     if (byte === 0x20 || (byte >= 0x09 && byte <= 0x0d)) continue
-    if (byte === 0x5c && (bytes[index + 1] === 0x6e || bytes[index + 1] === 0x72 || bytes[index + 1] === 0x74)) {
-      index += 1
-      continue
-    }
     kept[length] = byte
     length += 1
   }
   return kept.subarray(0, length)
 }
 
+/** The bytes with the capital letters of ASCII made small: hex digits come in either case, or both. */
+function lowered(bytes) {
+  const out = Buffer.allocUnsafe(bytes.length)
+  for (let index = 0; index < bytes.length; index += 1) {
+    const byte = bytes[index]
+    out[index] = byte >= 0x41 && byte <= 0x5a ? byte | 0x20 : byte
+  }
+  return out
+}
+
 /**
- * The forms one piece of a secret takes in a file: as it is, escaped as JSON escapes it, in hex, and
- * in base64 and base64url. A text inside a longer one encodes differently by where it starts among
- * the groups of three bytes, so each of the three starts is taken, and only the characters that
- * the neighbouring bytes cannot change.
+ * The forms one piece of a secret takes in a file besides its hex: as it is, and in base64 and
+ * base64url. A text inside a longer one encodes differently by where it starts among the groups of
+ * three bytes, so each of the three starts is taken, and only the characters that the neighbouring
+ * bytes cannot change.
  */
 function formsOf(bytes) {
-  const hex = bytes.toString('hex')
-  const forms = [bytes, Buffer.from(JSON.stringify(bytes.toString('utf8')).slice(1, -1)), Buffer.from(hex), Buffer.from(hex.toUpperCase())]
+  const forms = [bytes]
   for (let before = 0; before < 3; before += 1) {
     const encoded = Buffer.concat([Buffer.alloc(before), bytes]).toString('base64')
     const core = encoded.slice(Math.ceil((before * 8) / 6), Math.floor(((before + bytes.length) * 8) / 6))
@@ -283,85 +389,82 @@ function formsOf(bytes) {
 
 /**
  * What stands for a secret file in a search: its whole content, trimmed, and each of its lines of 32
- * characters or more, so a key block pasted in pieces is found by any whole line of it. Each is
- * searched in every form `formsOf` lists, and again with the white space gone (`squashed`), so a
- * secret split across lines is found as well. A secret shorter than 8 characters is refused: it
- * would match anything.
+ * characters or more, so a key block pasted in pieces is found by any whole line of it. Each piece
+ * is taken as it is and as a JSON writer escapes it, and each of those in the forms `formsOf` lists
+ * and in hex. A haystack is read as it is and as a JSON reader reads it, and each reading is
+ * searched as it is, with its white space left out (`apart`, so a secret split across lines is
+ * found) and, for hex, with its capitals made small (`hex`). A secret of fewer than 8 characters, not
+ * counting white space, is refused: it would match anything.
  */
 export function secretNeedles(content) {
   const text = content.toString('utf8').trim()
-  if (text.length < 8) throw new Error('a secret file holds fewer than 8 characters, too few to search for')
+  if (squash(Buffer.from(text, 'utf8')).length < 8) {
+    throw new Error('a secret file holds fewer than 8 characters apart from white space, too few to search for')
+  }
   const pieces = new Set([text])
   for (const line of text.split(/\r?\n/)) {
     const trimmed = line.trim()
     if (trimmed.length >= 32 && !trimmed.startsWith('-----')) pieces.add(trimmed)
   }
+  for (const piece of [...pieces]) pieces.add(JSON.stringify(piece).slice(1, -1))
   const forms = new Map()
+  const hex = new Map()
   for (const piece of pieces) {
-    for (const form of formsOf(Buffer.from(piece, 'utf8'))) forms.set(form.toString('latin1'), form)
+    const bytes = Buffer.from(piece, 'utf8')
+    for (const form of formsOf(bytes)) forms.set(form.toString('latin1'), form)
+    hex.set(bytes.toString('hex'), Buffer.from(bytes.toString('hex')))
   }
-  const squashed = new Map()
+  const apart = new Map()
   for (const form of forms.values()) {
-    const apart = squash(form)
-    if (apart.length >= 8) squashed.set(apart.toString('latin1'), apart)
+    const squashed = squash(form)
+    if (squashed.length >= 8) apart.set(squashed.toString('latin1'), squashed)
   }
-  return { forms: [...forms.values()], squashed: [...squashed.values()] }
+  return { forms: [...forms.values()], apart: [...apart.values()], hex: [...hex.values()] }
 }
 
 /** The needles of several secrets as one. */
 function mergeNeedles(list) {
-  return { forms: list.flatMap((each) => each.forms), squashed: list.flatMap((each) => each.squashed) }
+  return { forms: list.flatMap((each) => each.forms), apart: list.flatMap((each) => each.apart), hex: list.flatMap((each) => each.hex) }
 }
 
-/** Whether the bytes hold any form of the secret, whole or with the white space gone. */
+/** Whether the bytes hold any form of the secret, as they are or as a JSON reader reads them, whole, with the white space gone, or in hex of either case. */
 function foundIn(bytes, needles) {
-  if (needles.forms.some((form) => bytes.includes(form))) return true
-  if (needles.squashed.length === 0) return false
-  const apart = squash(bytes)
-  return needles.squashed.some((form) => apart.includes(form))
-}
-
-/** Every key and string of a JSON text as a JSON reader recovers them, whatever escapes wrote them; none for bytes that are not JSON. */
-function jsonStrings(bytes) {
-  if (bytes.length > MOST_JSON || !/^\s*[[{]/.test(bytes.subarray(0, 64).toString('latin1'))) return []
-  let value
-  try {
-    value = JSON.parse(bytes.toString('utf8'))
-  } catch {
-    return []
-  }
-  const found = []
-  const pending = [value]
-  while (pending.length > 0) {
-    const each = pending.pop()
-    if (typeof each === 'string') {
-      found.push(each)
-    } else if (Array.isArray(each)) {
-      for (const inner of each) pending.push(inner)
-    } else if (each !== null && typeof each === 'object') {
-      for (const [key, inner] of Object.entries(each)) {
-        found.push(key)
-        pending.push(inner)
-      }
+  for (const view of viewsOf(bytes)) {
+    if (needles.forms.some((form) => view.includes(form))) return true
+    if (needles.apart.length === 0 && needles.hex.length === 0) continue
+    const apart = squash(view)
+    if (needles.apart.some((form) => apart.includes(form))) return true
+    if (needles.hex.length > 0) {
+      const small = lowered(apart)
+      if (needles.hex.some((form) => small.includes(form))) return true
     }
   }
-  return found
+  return false
 }
 
-/** Whether bytes hold the secret's text, in any form, or JSON that says it once its escapes are read. */
-function holdsText(bytes, needles) {
-  return foundIn(bytes, needles) || jsonStrings(bytes).some((each) => foundIn(Buffer.from(each, 'utf8'), needles))
+/** Whether the pattern matches the bytes as they are or as a JSON reader reads them. */
+function matches(pattern, bytes) {
+  return viewsOf(bytes).some((view) => pattern.test(view.toString('latin1')))
 }
 
-/** Whether bytes hold a secret's text or a token made from one, in the bytes or in the strings of JSON they spell. */
+/** Whether bytes hold a secret's text or a signed token. */
 function holdsSecret(bytes, needles) {
-  if (foundIn(bytes, needles) || TOKEN_SHAPE.test(bytes.toString('latin1'))) return true
-  return jsonStrings(bytes).some((each) => foundIn(Buffer.from(each, 'utf8'), needles) || TOKEN_SHAPE.test(each))
+  return foundIn(bytes, needles) || matches(TOKEN_SHAPE, bytes)
 }
 
 /** Whether a text that is to be shown or written holds a secret, or any part of a signed token. */
 function quotesSecret(text, needles) {
-  return holdsSecret(Buffer.from(text, 'utf8'), needles) || TOKEN_PART.test(text)
+  const bytes = Buffer.from(text, 'utf8')
+  return foundIn(bytes, needles) || matches(TOKEN_PART, bytes)
+}
+
+/**
+ * The first text that does not itself hold the secret: the words this check puts in place of a
+ * quotation could be the secret's, and then nothing is printed. A text of fewer than eight
+ * characters cannot be one, since no secret is shorter.
+ */
+function stand(needles, ...candidates) {
+  return candidates.find((each) => !quotesSecret(each, needles)) ?? ''
 }
 
 /** How many of the buffers hold a secret's text or a signed token. */
@@ -477,19 +580,26 @@ export function suppressedIfSecret(result) {
 /**
  * How many files under a directory hold a secret's text or a signed token, a bundle counting once
  * for each member that does (a bundle is compressed, so its bytes are searched member by member).
- * A name is searched like content: the directory's own path, the path of each file under it and the
- * name of each member, since each is printed or written somewhere. `.apks` files hold other
- * packages whole and are left out: each package is read as an `.apk`.
+ * A name is searched like content: the directory's own path, the name of each directory and file
+ * under it and of each archive member, since each is printed or written somewhere. `.apks` files hold
+ * other packages whole and are left out: each package is read as an `.apk`. A link, or anything that
+ * is neither a file nor a directory, is refused: the scan cannot say what it holds.
  */
 export function secretsUnder(directory, needles) {
-  let places = [directory, resolve(directory)].some((each) => holdsSecret(Buffer.from(each, 'utf8'), needles)) ? 1 : 0
-  for (const file of filesUnder(directory)) {
-    if (holdsSecret(Buffer.from(relative(directory, file), 'utf8'), needles)) {
+  const tree = treeUnder(directory)
+  if (tree.unread.length > 0) {
+    throw new Error(`${relative(directory, tree.unread[0])} is a link or a special file, which this scan cannot read`)
+  }
+  const holds = (text) => holdsSecret(Buffer.from(text, 'utf8'), needles)
+  let places = [directory, resolve(directory)].some(holds) ? 1 : 0
+  places += tree.folders.filter((folder) => holds(relative(directory, folder))).length
+  for (const file of tree.files) {
+    if (holds(relative(directory, file))) {
       places += 1
     } else if (/\.apks$/.test(file)) {
       continue
     } else if (/\.(aab|ipa|apk)$/.test(file)) {
-      places += withArchive(file, (members, read) => members.filter((member) => holdsSecret(Buffer.from(member.name, 'utf8'), needles) || holdsSecret(read(member), needles)).length)
+      places += withArchive(file, (members, read) => members.filter((member) => holds(member.name) || holdsSecret(read(member), needles)).length)
     } else if (holdsSecret(readFileSync(file), needles)) {
       places += 1
     }
@@ -499,40 +609,52 @@ export function secretsUnder(directory, needles) {
 
 /** A message with nothing of it left when it quotes a secret or any part of a signed token. */
 export function withheldIfSecret(message, needles) {
-  return quotesSecret(message, needles) ? 'the details are withheld: they quote a secret file' : message
+  return quotesSecret(message, needles) ? stand(needles, 'the details are withheld: they quote a secret file', 'withheld') : message
 }
 
 /**
  * Text from a log, for a person to read: all of it left out when it holds the secret in any form (a
  * log that holds it at all is not to be trusted with what is left of it), and each line that holds a
- * signed token or any part of one.
+ * signed token or any part of one, as written or as a JSON reader reads it.
  */
 export function redacted(text, needles) {
-  if (holdsText(Buffer.from(text, 'utf8'), needles)) return 'the text is withheld: it quotes a secret file\n'
+  if (foundIn(Buffer.from(text, 'utf8'), needles)) return `${stand(needles, 'the text is withheld: it quotes a secret file', 'withheld')}\n`
+  const line = stand(needles, 'a line is withheld: it quotes a signed token', 'withheld')
   return text
     .split('\n')
-    .map((line) => (TOKEN_PART.test(line) ? 'a line is withheld: it quotes a signed token' : line))
+    .map((each) => (matches(TOKEN_PART, Buffer.from(each, 'utf8')) ? line : each))
     .join('\n')
 }
+
+/** The fields of a record that the bundle's identity and the result of the check own: no note and no fact may be named like one. */
+export const RECORD_FIELDS = ['file', 'platform', 'stage', 'versionName', 'versionCode', 'bytes', 'sha256', 'holds', 'problems']
 
 /**
  * The text of a build's record and its problems. A record that would quote a secret or a signed
  * token anywhere, its identity included, is replaced by one that holds only what is safe of the
  * identity and says why, and that is a problem of its own, so the build does not hold. The record is
- * searched as the text it is written as, which JSON escapes, and as the JSON it is, which a reader
- * unescapes.
+ * searched as the text it is written as, in which JSON escapes the secret, and as a JSON reader
+ * reads it. A note or a fact named like a field of the record is refused: it would replace that
+ * field before the record is searched.
  */
 export function recordOf({ identity, problems, facts, notes }, needles) {
+  for (const key of Object.keys(facts)) {
+    if (RECORD_FIELDS.includes(key)) throw new Error(`a fact of the record is named like a field of the record: ${key}`)
+  }
+  for (const key of Object.keys(notes)) {
+    if (RECORD_FIELDS.includes(key) || Object.hasOwn(facts, key)) throw new Error(`a note of the record is named like a field or a fact of the record: ${key}`)
+  }
   const text = (value) => `${JSON.stringify(value, null, 2)}\n`
   const record = (holds, list, who, rest) => ({ ...who, holds, problems: list, ...rest })
   const whole = text(record(problems.length === 0, problems, identity, { ...facts, ...notes }))
   if (!quotesSecret(whole, needles)) return { problems, text: whole }
-  const withheld = 'the details are withheld: the record quotes a secret file'
+  const withheld = stand(needles, 'the details are withheld: the record quotes a secret file', 'withheld')
   const safe = (value) => (typeof value === 'string' ? withheldIfSecret(value, needles) : value)
   let replacement = text(record(false, [withheld], { ...identity, file: safe(identity.file), versionName: safe(identity.versionName) }, {}))
   // The rest of the identity is a platform, a stage, two numbers and a digest. Were one of them the
-  // secret, nothing of the identity is kept.
+  // secret, or the words above, nothing of the identity is kept, and then nothing but braces.
   if (quotesSecret(replacement, needles)) replacement = text({ holds: false, problems: [withheld] })
+  if (quotesSecret(replacement, needles)) replacement = '{}\n'
   return { problems: [...problems, withheld], text: replacement }
 }
 
@@ -699,10 +821,11 @@ export function codeIn(bundle, apart = []) {
   const walk = (directory) => {
     for (const entry of readdirSync(directory, { withFileTypes: true }).sort((one, other) => (one.name < other.name ? -1 : 1))) {
       const path = join(directory, entry.name)
-      if (apart.includes(path)) continue
       const name = relative(bundle, path)
       if (entry.isSymbolicLink()) {
         refused.push(`${name} is a symbolic link, which this check cannot follow`)
+      } else if (apart.includes(path)) {
+        continue
       } else if (entry.isDirectory()) {
         walk(path)
       } else if (entry.isFile()) {
@@ -751,15 +874,30 @@ function readProfile(path) {
   return profileFromXml(decoded.stdout)
 }
 
-/** The files under a directory, recursively. */
-function filesUnder(root) {
-  const found = []
-  for (const entry of readdirSync(root, { withFileTypes: true })) {
-    const path = join(root, entry.name)
-    if (entry.isDirectory()) found.push(...filesUnder(path))
-    else if (entry.isFile()) found.push(path)
+/**
+ * The files and the directories under a directory, recursively, and what is neither (a link, a pipe,
+ * a socket), which is listed and not followed: it may lead outside the tree, and a scan of the tree
+ * cannot say what it holds.
+ */
+function treeUnder(root) {
+  const files = []
+  const folders = []
+  const unread = []
+  const walk = (directory) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name)
+      if (entry.isDirectory()) {
+        folders.push(path)
+        walk(path)
+      } else if (entry.isFile()) {
+        files.push(path)
+      } else {
+        unread.push(path)
+      }
+    }
   }
-  return found
+  walk(root)
+  return { files, folders, unread }
 }
 
 /**
@@ -828,7 +966,14 @@ export function checkIos(options) {
   }
   try {
     const needles = needlesOf(options.secretFiles)
-    const first = placesWithSecret(filesUnder(app).flatMap((file) => [Buffer.from(relative(app, file), 'utf8'), readFileSync(file)]), needles)
+    // What is inside the application, names as well as contents. A link or a special file is read by its
+    // name only; the export stage refuses it as code the check cannot read.
+    const tree = treeUnder(app)
+    const named = (path) => Buffer.from(relative(app, path), 'utf8')
+    const first = placesWithSecret(
+      [...tree.files.flatMap((file) => [named(file), readFileSync(file)]), ...tree.folders.map(named), ...tree.unread.map(named)],
+      needles
+    )
     if (first > 0) return secretFirst(first)
     facts.secretsFound = 0
     problems.push(...problemsInBundle(app, want))
@@ -941,6 +1086,7 @@ function parse(argv) {
       index += 1
     } else if (flag === '--note') {
       const [key, ...value] = take(index).split('=')
+      if (RECORD_FIELDS.includes(key)) throw new Error(`--note cannot be named like a field of the record: ${key}`)
       options.notes[key] = value.join('=')
       index += 1
     } else {

@@ -29,24 +29,28 @@ searches for its text before it reads anything else from a bundle: in every deco
 the Android bundle, in every file of the iOS application, and, in a run that reaches its check, in
 every file of the output directory (the members of a `.aab`, `.ipa` or `.apk` one by one, and the
 `.apks` set through its packages). A signed token, the kind Xcode writes into its export logs from
-the API key, counts as a find as well. It searches for the secret as it is, JSON-escaped, in hex,
-in base64 and in base64url (at each of the three places a text can start among the groups of three
-bytes), and again with the white space removed from both sides, so a secret that was wrapped,
-indented or joined across lines is found; a JSON file is also read as a JSON reader reads it. A
-name counts like content: the path of the output directory, of each file under it and of each
-archive member. It prints how many places held one. When a bundle holds one it reports that and
-nothing else, because the other messages quote values out of the bundle. Everything the checker
-prints, an option or a path or an error text as much as a problem, goes through one filter that
-withholds what quotes a secret or any part of a signed token, and a record that would quote one
-fails the build instead of being written. When a failed export shows the tail of its log,
-`store-bundle.mjs --redact` drops the whole tail if it holds the secret and each line that holds a
-token, and shows nothing when it cannot read the secret. A run that ends early still searches its
-output directory and says so when it finds something. A secret shorter than eight characters is
-refused, because it would match anything. The caller's own log of a run, outside the output
-directory, is not read, and neither are other encodings of a secret (percent encoding, XML
-entities, a compressed or encrypted copy). The Firebase files are client configuration and not secrets: they go into
-the bundle as the application's configuration, and the build directories keep a copy as they do
-of every resource.
+the API key, counts as a find as well. It searches for the secret as it is, as a JSON writer escapes
+it, in hex of either case, in base64 and in base64url (at each of the three places a text can start
+among the groups of three bytes), and again with the white space removed from the searched text, so
+a secret that was wrapped, indented or joined across lines is found. Every JSON string escape (`\"`,
+`\/`, `\n`, `\u00e4`) in the searched text is read as a JSON reader reads it, wherever it sits: in a
+JSON file, a line of a log or a message. A name counts like content: the path of the output
+directory, of each directory and file under it and of each archive member; a link or a special file
+under the output directory is refused, since the scan cannot say what it holds. It prints how many
+places held one. When a bundle holds one it reports that and nothing else, because the other
+messages quote values out of the bundle. Everything the checker prints, an option or a path or an
+error text as much as a problem, goes through one filter that withholds what quotes a secret or any
+part of a signed token, and a record that would quote one fails the build instead of being written;
+a note named like a field of the record is refused. When a failed export shows the tail of its log,
+`store-bundle.mjs --redact` reads the whole log and drops all of it if it holds the secret anywhere,
+and each line that holds a token; it shows nothing when it cannot read the secret. The scripts also
+refuse to start when the output root's path holds the secret. A run that ends early still searches
+its output directory and says so when it finds something. A secret of fewer than eight characters,
+not counting white space, is refused, because it would match anything. The caller's own log of a
+run, outside the output directory, is not read, and neither are other encodings of a secret (percent
+encoding, XML entities, a compressed or encrypted copy). The Firebase files are client configuration
+and not secrets: they go into the bundle as the application's configuration, and the build
+directories keep a copy as they do of every resource.
 
 ## Version and build number
 
