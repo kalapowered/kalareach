@@ -348,8 +348,6 @@ final class PushAdapterTests: XCTestCase {
     /// KR-REQ-10.48: what the adapter files in the store the extension reads is the set of preview
     /// keys the application hands over, whole, and nothing else: the seed by the identifier of its
     /// public half, and the public key of each host that may seal a preview to it.
-    /// KR-REQ-13.24: the extension opens a notification's preview from this store in native code,
-    /// with no page running, so the keys are filed where it reads them.
     func testOnlyThePreviewKeysAreFiledInTheStoreTheExtensionReads() {
         let keys = Keys()
         let held = adapter(keys: keys)

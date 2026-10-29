@@ -1147,6 +1147,24 @@ async fn kr_req_13_03_a_draft_is_the_same_after_a_visit_to_the_terminal() {
             json!({ "view": view, "input": { "kind": "text", "take": 1, "text": "typed in the terminal" } }),
         )
         .expect("the text is taken");
+    companion
+        .call(
+            "terminal_view_input",
+            json!({ "view": view, "input": {
+                "kind": "key", "take": 1, "key": "Enter", "base": null, "keypad": null,
+                "shift": false, "alt": false, "control": false, "caps_lock": false,
+                "num_lock": false, "event": "press",
+            } }),
+        )
+        .expect("the key is taken");
+    // `cat` is the session's shell: what it writes back is what reached the program.
+    companion
+        .state_where(13, |state| {
+            text_of(state)
+                .iter()
+                .any(|line| line.contains("typed in the terminal"))
+        })
+        .await;
     assert_eq!(
         the_draft(),
         before,

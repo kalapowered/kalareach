@@ -4567,6 +4567,7 @@ test.describe("the phone's retained output", () => {
         page
       }) => {
         await onPhone(page, surface, seen, `&session=${SESSION}`)
+        await page.getByLabel('Message this session').fill('a draft the output leaves alone')
         await page.getByRole('tab', { name: 'Output' }).click()
         const output = page.getByTestId('output-scroll')
         await expect(output).toContainText('finished 900 tests')
@@ -4596,7 +4597,7 @@ test.describe("the phone's retained output", () => {
 
         // The conversation has its composer back, with what was typed in it.
         await page.getByRole('tab', { name: 'Conversation' }).click()
-        await expect(page.getByLabel('Message this session')).toBeVisible()
+        await expect(page.getByLabel('Message this session')).toHaveValue('a draft the output leaves alone')
         await still(page, `phone-output-13.15-${surface}-${seen.width}`)
       })
     }

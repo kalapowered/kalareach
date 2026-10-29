@@ -302,6 +302,8 @@ final class SealedPreviewTests: XCTestCase {
         XCTAssertEqual(handedBack.bodies, [sealed.summary], "the preview, once, and nothing after it")
     }
 
+    /// KR-REQ-13.24: the notification extension opens the host's sealed preview and shows it in
+    /// native code, with no page running anywhere.
     func testTheExtensionShowsWhatTheHostSealed() throws {
         XCTAssertEqual(try shown(holdingTheSender: true), try golden().summary)
     }
