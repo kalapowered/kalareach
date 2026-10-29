@@ -1546,8 +1546,9 @@ pub fn the_gesture_a_terminal_starts_with_is_the_one_the_reader_announces(kind: 
     assert!(session.answered("kr-ready"));
     let (_, fence) = session.fenced_prompt(6);
     // Nothing of the editor's own ends a shell whose buffer is not empty.
+    let typed = session.written();
     session.type_bytes(b"kr");
-    std::thread::sleep(Duration::from_millis(80));
+    assert!(session.wait_for_editor(typed));
     session.type_bytes(CTRL_D);
     assert!(
         !session.saw_event(Duration::from_millis(500), |event| matches!(
@@ -1578,8 +1579,9 @@ pub fn the_gesture_a_terminal_starts_with_is_the_one_the_reader_announces(kind: 
     session.forget_events();
     assert!(session.answered("kr-ready"));
     let (_, _fence) = session.fenced_prompt(7);
+    let typed = session.written();
     session.type_bytes(b"kr");
-    std::thread::sleep(Duration::from_millis(80));
+    assert!(session.wait_for_editor(typed));
     session.type_bytes(CTRL_D);
     session.type_bytes(CTRL_G);
     assert!(
