@@ -146,9 +146,10 @@ def padded(version):
 def version_key(text):
     """Where a version such as `7.7.0` or `7.7.0-preview.1+build` sorts, by semantic versioning's
     precedence: the numbers first, then a pre-release before its release, and between pre-releases
-    the dot-separated identifiers one by one (a number below a word, numbers by value, words
-    without regard to case). Build metadata after a plus sign is not part of the order. None when
-    the text is not a version, which a caller reads as a range it cannot read."""
+    the dot-separated identifiers one by one (a number below a word, numbers by value, words by
+    their ASCII codes, so that a capital sorts below every lower-case letter). Build metadata after
+    a plus sign is not part of the order. None when the text is not a version, which a caller reads
+    as a range it cannot read."""
     match = re.fullmatch(
         r"\s*v?(\d+(?:\.\d+)*)(?:-([0-9A-Za-z][0-9A-Za-z.\-]*))?(?:\+[0-9A-Za-z.\-]+)?\s*", text
     )
@@ -158,7 +159,7 @@ def version_key(text):
     label = match.group(2)
     if label is None:
         return release + (1, ())
-    return release + (0, tuple((0, int(each)) if each.isdigit() else (1, each.lower()) for each in label.split(".")))
+    return release + (0, tuple((0, int(each)) if each.isdigit() else (1, each) for each in label.split(".")))
 
 
 def after(key):
@@ -180,7 +181,10 @@ def in_range(range_text, version):
     wanted = padded(numbers(version))
     span = re.match(r"\s*([0-9][0-9.]*)\s*-\s*([0-9][0-9.]*)\s*$", range_text)
     if span:
-        return padded(numbers(span.group(1))) <= wanted <= padded(numbers(span.group(2)))
+        first, last = padded(numbers(span.group(1))), padded(numbers(span.group(2)))
+        # `7.7.0-0` is a version with a pre-release as much as a span, and a span that ends below
+        # its start covers nothing: it is a range this reading cannot judge, which counts as inside.
+        return first > last or first <= wanted <= last
     tests = []
     for comparator in range_text.split(","):
         match = re.match(r"\s*(<=|>=|<|>|=)?\s*([0-9][0-9.]*)\s*$", comparator)
@@ -210,10 +214,18 @@ def range_intervals(range_text):
         low, high = None, None
         span = re.match(r"\s*([0-9][0-9A-Za-z.+]*)\s*-\s*([0-9][0-9A-Za-z.+]*)\s*$", alternative)
         if span:
+            # `7.7.0-0` is a span from 7.7.0 to 0 and also the version 7.7.0 with the pre-release
+            # `0`. A span whose end is below its start covers nothing, so the text is the version;
+            # where a text reads both ways it counts both ways, because the safe mistake is a row
+            # too many.
             first, last = version_key(span.group(1)), version_key(span.group(2))
-            if first is None or last is None:
+            point = version_key(alternative)
+            if first is not None and last is not None and first <= last:
+                intervals.append((first, after(last)))
+            elif point is None:
                 return None
-            intervals.append((first, after(last)))
+            if point is not None:
+                intervals.append((point, after(point)))
             continue
         for comparator in alternative.split(","):
             match = re.match(r"\s*(<=|>=|<|>|=)?\s*([0-9][0-9A-Za-z.\-+]*)\s*$", comparator)
@@ -1209,6 +1221,25 @@ def run_self_test():
         )
         expect("two numbers are three", version_key("7.7") == version_key("7.7.0"))
         expect("text that is no version has no key", version_key("seven") is None)
+        # Semantic versioning orders the words of a pre-release by their ASCII codes, so a capital
+        # sorts below every lower-case letter, and a range between two spellings of one word is not
+        # empty.
+        expect(
+            "words of a pre-release are ordered by their codes, capitals first",
+            version_key("1.0.0-A") < version_key("1.0.0-B") < version_key("1.0.0-a") < version_key("1.0.0-b"),
+        )
+        # A version with a numeric pre-release is written like a span of two versions, and a span
+        # whose end is below its start is no span: the text is the version.
+        accepted_powershell = [(version_key("7.6.0"), version_key("7.8.0"))]
+        expect(
+            "a bare pre-release with a number is the version",
+            reaches("7.7.0-0", accepted_powershell)
+            and reaches("7.7.0-rc.1", accepted_powershell)
+            and not reaches("7.9.0-0", accepted_powershell)
+            and in_range("7.7.0-0", "7.7.0")
+            and not in_range("3.1.0-3.3.1", "4.9.3")
+            and in_range("3.1.0-3.3.1", "3.2"),
+        )
         powershell_route = "/repos/PowerShell/PowerShell/security-advisories"
         for text, revised, needs, name in (
             (">= 7.6.7, < 7.6.9", "2026-10-20T10:00:00Z", True, "a revised range that starts inside a series"),
@@ -1224,6 +1255,10 @@ def run_self_test():
             (">= 7.7, <= 7.7.0", "2026-10-20T10:00:00Z", True, "a revised range written with two numbers"),
             ("> 7.7.0-preview, < 7.7.0-preview.2", "2026-10-20T10:00:00Z", True, "a revised range that excludes a label and includes the previews numbered after it"),
             (">= 7.6.0-rc.1, < 7.6.6-rc.1", "2026-10-20T10:00:00Z", False, "a revised range that ends before the first fixed release"),
+            ("7.7.0-0", "2026-10-20T10:00:00Z", True, "a revised range that is one pre-release with a number"),
+            ("= 7.7.0-0", "2026-10-20T10:00:00Z", True, "a revised range that names one pre-release with a number"),
+            (">= 7.7.0-A, < 7.7.0-a", "2026-10-20T10:00:00Z", True, "a revised range between two spellings of one word"),
+            ("7.9.0-0", "2026-10-20T10:00:00Z", True, "a revised range that is one pre-release above the accepted ones"),
         ):
             outcome = attempt(
                 edited(routes(), powershell_route, old_advisory("GHSA-old1-aaaa-bbbb", text, revised)), now="2026-11-10"
