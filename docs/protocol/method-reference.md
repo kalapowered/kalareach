@@ -72,7 +72,7 @@ Every agent method names a session and the exact application instance in it, nev
 
 **`agent.turn.steer`** takes the target, the identifier of the turn being steered and the steering text. **`agent.turn.cancel`** takes the target and the upstream's own identifier for the turn to cancel. Both are refused rather than redirected when that turn is not the one running.
 
-**`agent.approval.respond`** takes the target, the pending resource and the identifier of one of the options the decoder offered. A free-form answer is not accepted, because it would be this host inventing an upstream decision. The answer gives the mutation's result, the resource and its state afterwards.
+**`agent.approval.respond`** takes the target, the pending resource and the identifier of one of the options the decoder offered. A free-form answer is not accepted, because it would be this host inventing an upstream decision. The answer gives the mutation's result, the resource and its state afterwards. A paired device can answer only an approval its grant's history reaches, or one its grant names while it can still be decided; any other is refused with the text of a resource this host does not hold, before anything is claimed. A `plugin.action.invoke` that answers an approval is held to the same rule.
 
 Each of the five mutations names the binding revision it was prepared against, in its target. A revision behind the one in force is refused with `STALE_SESSION`, and a draft that moved with `DRAFT_CONFLICT`. An accepted mutation answers the revision it was applied at, how it reached the upstream, the upstream's own request identifier where the upstream gave one, and the turn it applies to where the upstream names one.
 
