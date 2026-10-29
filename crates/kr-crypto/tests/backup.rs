@@ -574,6 +574,9 @@ fn only_the_archive_identifier_and_object_references_are_outside_the_encrypted_m
     );
 }
 
+/// KR-REQ-20.09: the signed manifest is verified before any member object is restored. A manifest
+/// signed by a writer the bundle does not name, or checked against no trusted writer at all, never
+/// opens, so there is no archive to restore a member object from.
 #[test]
 fn a_manifest_signed_by_an_untrusted_writer_stops_the_restore() {
     let parties = Parties::generate();
