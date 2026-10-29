@@ -18,9 +18,9 @@ name: release-host
 # `matrix` asks whether the signed release matrix the managed service publishes lists a tier for the
 # package version the commit carries, as every other job that publishes a release does. It holds no
 # key and no write access, and `channel` waits for it, so a release the matrix does not serve is
-# refused before anyone is asked to approve a use of the release keys. `matrix-again` asks again,
-# with the program `matrix` built, once every check has passed and just before the release is
-# written, because the approval in between can come days after the first answer.
+# refused before anyone is asked to approve a use of the release keys. `publish` asks again, with the
+# program `matrix` built, as its own first step and before it writes anything, because the approval
+# in between can come days after the first answer, and a re-run of `publish` has to ask afresh.
 #
 # `channel` is the only job that holds a key. It is behind the `update-signing` environment, which
 # puts a person in front of every use of the update channel's two release keys, it has no write
@@ -105,8 +105,8 @@ jobs:
           printf '%s' "$BUILD_RUN" | grep -Eq '^[0-9]+$' || { echo "::error::the build run is a number"; exit 1; }
           printf '%s' "$STAGED_SUMS" | grep -Eq '^[0-9a-f]{64}$' || { echo "::error::the staged sums digest is 64 hexadecimal digits"; exit 1; }
           [ "$(git rev-parse HEAD)" = "$COMMIT" ] || { echo "::error::the checkout is not $COMMIT"; exit 1; }
-          git fetch --quiet origin main
-          git merge-base --is-ancestor "$COMMIT" origin/main || { echo "::error::$COMMIT is not on main"; exit 1; }
+          bash scripts/check-commit-on-main.sh self-test
+          bash scripts/check-commit-on-main.sh "$COMMIT"
           [ -s "$CHANNEL_ROOT" ] || { echo "::error::$CHANNEL_ROOT is not in this commit: the update channel's root is committed before a release is sealed"; exit 1; }
 
       - name: Hold the build run
@@ -173,6 +173,7 @@ jobs:
         env:
           RELEASE: ${{ steps.run.outputs.release }}
         run: |
+          python3 -I scripts/check-staged-tree.py self-test
           for target in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
             top="kalareach-$target-$RELEASE"
             out="$RUNNER_TEMP/to-seal/$target"
@@ -187,12 +188,12 @@ jobs:
             (cd "$RUNNER_TEMP/$target-unzipped" && sha256sum -c "$top.tar.sha256")
             case "$target" in
               *-apple-darwin)
-                # The signed tree is the run's tree with its programs signed: the manifest of the one is
-                # the manifest of the other, since nothing signs release.json before it is sealed.
+                # The signed tree is the run's tree with its programs signed and nothing else changed:
+                # the same members at the same modes, the same release.json, every file that is not
+                # Mach-O as the run's manifest describes it, and every Mach-O file the run's outside
+                # its code signature. Sealing writes the manifest again over whatever is here.
                 cp "$RUNNER_TEMP/staged-files/signed-$top.tar" "$out/$top.tar"
-                tar -xOf "$RUNNER_TEMP/$target-unzipped/$top.tar" "$top/release.json" > "$RUNNER_TEMP/$target.run-release.json"
-                tar -xOf "$out/$top.tar" "$top/release.json" > "$RUNNER_TEMP/$target.staged-release.json"
-                cmp "$RUNNER_TEMP/$target.run-release.json" "$RUNNER_TEMP/$target.staged-release.json" || { echo "::error::the staged tree of $target is not made from the tree the run built: the manifests differ"; exit 1; }
+                python3 -I scripts/check-staged-tree.py compare "$RUNNER_TEMP/$target-unzipped/$top.tar" "$out/$top.tar" || { echo "::error::the staged tree of $target is not the tree the run built with its programs signed"; exit 1; }
                 ;;
               *)
                 cp "$RUNNER_TEMP/$target-unzipped/$top.tar" "$out/$top.tar"
@@ -287,12 +288,14 @@ jobs:
           cp target/release/kr-release-matrix-check "$RUNNER_TEMP/matrix-check/"
           (cd "$RUNNER_TEMP/matrix-check" && sha256sum kr-release-matrix-check | tee kr-release-matrix-check.sha256)
 
+      # The trees last three days, and the program is used after the last of the approval, the sealing
+      # and the checks, so it outlasts them by two more.
       - name: Keep the release matrix program
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: kr-release-matrix-check
           path: ${{ runner.temp }}/matrix-check
-          retention-days: 3
+          retention-days: 5
           if-no-files-found: error
 
   # The release tool, built by a job that holds no key, for the job that does.
@@ -518,6 +521,7 @@ jobs:
 
       - name: Install it into a store, and start the host
         run: |
+          bash scripts/check-host-start.sh self-test
           top="kalareach-$TARGET-$RELEASE"
           unpacked="$RUNNER_TEMP/unpacked/$top"
           store="$RUNNER_TEMP/store"
@@ -544,38 +548,10 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-  # The same question again, without a build and without a key, once every archive has been checked:
-  # the matrix may have changed in the days the approval took.
-  matrix-again:
-    name: the published release matrix still lists this release
-    needs: [source, channel, check]
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - name: Take the program
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: kr-release-matrix-check
-          path: ${{ runner.temp }}/matrix-check
-
-      - name: The published release matrix still lists this release
-        run: |
-          set -uo pipefail
-          (cd "$RUNNER_TEMP/matrix-check" && sha256sum -c kr-release-matrix-check.sha256) || exit 1
-          chmod +x "$RUNNER_TEMP/matrix-check/kr-release-matrix-check"
-          for attempt in 1 2 3; do
-            "$RUNNER_TEMP/matrix-check/kr-release-matrix-check" --origin https://reach.kala.to && exit 0
-            code=$?
-            [ "$code" -eq 2 ] || exit "$code"
-            [ "$attempt" -lt 3 ] && sleep 60
-          done
-          exit 2
-
   # No key and no environment: only the right to write a release, and only after every check passed.
   publish:
     name: publish the release
-    needs: [source, channel, check, matrix, matrix-again]
+    needs: [source, channel, check, matrix]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -607,6 +583,21 @@ jobs:
           pattern: verified-*
           path: ${{ runner.temp }}/verified
           merge-multiple: true
+
+      - name: Take the release matrix program
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: kr-release-matrix-check
+          path: ${{ runner.temp }}/matrix-check
+
+      # Asked here, in the job that writes the release and in every attempt of it, so that a re-run
+      # of this job never publishes on an answer an earlier attempt or an earlier job got. The program
+      # is the one `matrix` built, held to its sum by the script, which also asks again when the
+      # service does not answer; nothing is built where a release is written, and the step has no token.
+      - name: The published release matrix still lists this release
+        run: |
+          bash scripts/ask-release-matrix.sh self-test
+          bash scripts/ask-release-matrix.sh "$RUNNER_TEMP/matrix-check"
 
       - name: Publish the release
         env:
