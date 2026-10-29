@@ -2303,6 +2303,143 @@ async fn a_batch_whose_authority_ran_out_while_it_waited_is_never_written() {
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
+/// The device-status question an application asks, and the answer the host owes it.
+const STATUS_QUESTION: &[u8] = b"\x1b[5n";
+const STATUS_ANSWER: &[u8] = b"\x1b[0n";
+
+/// A running session whose application echoes its input, with its continuous clock in the test's
+/// hands, and the attachment that holds its input lease.
+async fn echoing_session() -> (
+    kr_ipc::testing::TempHost,
+    Arc<SessionRuntime>,
+    kr_ipc::clock::ManualSharedClock,
+    SessionId,
+    AttachmentId,
+    u64,
+) {
+    let host = kr_ipc::testing::TempHost::create();
+    // Raw mode with the echo off: what comes back is what the application received.
+    let config = configuration(&host, "stty raw -echo; printf 'kr-ready.'; exec cat");
+    let session_id = config.session_id;
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+    let holder = attach(&mut session, &terminal(session_id, Some("xterm-256color")));
+    let epoch = session
+        .acquire_input(holder, connection(), None)
+        .expect("the keys")
+        .lease
+        .epoch
+        .get();
+    let clock = kr_ipc::clock::ManualSharedClock::new();
+    let runtime = Arc::new(
+        SessionRuntime::start(session, std::sync::Arc::new(clock.clone())).expect("starts"),
+    );
+    retained_within(&runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
+    (host, runtime, clock, session_id, holder, epoch)
+}
+
+/// KR-REQ-08.48: a takeover ends the keystrokes of the lease that was taken, and not the host's
+/// answer to the application.
+///
+/// The writer is the last boundary before the application, and a batch can wait in front of it.
+/// Here a keystroke of the first holder and the host's answer to a question the application asked
+/// reach the writer after another attachment has taken the lease. The keystroke belongs to an
+/// epoch that has ended and is not written. The answer belongs to no lease: it needs none, never
+/// acquires one, and nothing else can give the application what it asked for.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_takeover_stops_the_keystrokes_waiting_for_the_terminal_and_not_the_hosts_answer() {
+    let (_host, runtime, _clock, session_id, holder, epoch) = echoing_session().await;
+
+    let (taker, taken_epoch) = {
+        let mut session = runtime.session();
+        session
+            .write_input(holder, epoch, 0, b"kr-stale", None, Instant::now())
+            .expect("accepted under the lease then in force");
+        session.ingest_output(STATUS_QUESTION);
+        let taker = attach(&mut session, &terminal(session_id, Some("xterm-256color")));
+        let taken = session
+            .acquire_input(taker, connection(), None)
+            .expect("the takeover is granted");
+        runtime.flush_input();
+        (taker, taken.lease.epoch.get())
+    };
+
+    // A keystroke of the new holder behind them. The writer is serial and the application echoes in
+    // order, so once this has come back, what was in front of it has come back or was never written.
+    {
+        let mut session = runtime.session();
+        session
+            .write_input(taker, taken_epoch, 0, b"kr-after", None, Instant::now())
+            .expect("the new holder types");
+        runtime.flush_input();
+    }
+    let seen = retained_within(&runtime, b"kr-after", LIVENESS_DEADLINE).await;
+    assert!(
+        contains(&seen, STATUS_ANSWER),
+        "the host's answer was dropped when the lease moved: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert!(
+        !contains(&seen, b"kr-stale"),
+        "the keystrokes of the lease that was taken reached the application: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    runtime.close(ClosureReason::CloseRequested).1.release();
+}
+
+/// KR-REQ-08.48: authority that ends while a batch waits for the terminal ends the keystrokes
+/// and not the host's answer to the application.
+///
+/// The keystroke was accepted under a grant that runs out a second later, and the answer was queued
+/// beside it. The continuous clock moves past the grant's end before the writer takes either, and
+/// short of the answer's own two seconds. The keystroke is not written. The answer is, because no
+/// caller's grant stands behind it and the only clock that bounds it is the response lane's.
+#[tokio::test(flavor = "multi_thread")]
+async fn authority_that_ends_while_a_batch_waits_stops_the_keystrokes_and_not_the_hosts_answer() {
+    let (_host, runtime, clock, _session_id, holder, epoch) = echoing_session().await;
+
+    {
+        let mut session = runtime.session();
+        let deadline = kr_ipc::clock::SharedClock::boot_elapsed_ms(&clock) + 1_000;
+        session
+            .write_input(
+                holder,
+                epoch,
+                0,
+                b"kr-expired",
+                Some(deadline),
+                Instant::now(),
+            )
+            .expect("accepted while the grant stood");
+        session.ingest_output(STATUS_QUESTION);
+        clock.advance(Duration::from_millis(1_500));
+        runtime.flush_input();
+    }
+
+    {
+        let mut session = runtime.session();
+        let later = kr_ipc::clock::SharedClock::boot_elapsed_ms(&clock) + 60_000;
+        session
+            .write_input(holder, epoch, 1, b"kr-after", Some(later), Instant::now())
+            .expect("accepted under authority that stands");
+        runtime.flush_input();
+    }
+    let seen = retained_within(&runtime, b"kr-after", LIVENESS_DEADLINE).await;
+    assert!(
+        contains(&seen, STATUS_ANSWER),
+        "the host's answer was dropped for a grant that was never its own: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert!(
+        !contains(&seen, b"kr-expired"),
+        "keystrokes written after the grant's end reached the application: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    runtime.close(ClosureReason::CloseRequested).1.release();
+}
+
 /// KR-REQ-08.62 and KR-REQ-08.64, in part.
 ///
 /// A held delimiter prefix carries the authority that admitted it. It is also the one thing a
