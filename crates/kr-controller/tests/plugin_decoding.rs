@@ -15,6 +15,7 @@
 //! | KR-ACC-016 | a decoder that names another request, offers a decision the table does not map or one twice, offers none, writes a summary over the bound, declines, or traps makes no approval and no ledger entry, the terminal answers the request, and the binding's report names the kind and none of the component's words; a request that waits for its decode is not given to a component whose binding loses the trust to decode it meanwhile |
 //! | KR-REQ-11.26 | a request answered natively while its decode is held is not interpreted afterwards; a request made in privacy mode marks the component's view as made in it whenever it is decoded; one binding's flood is refused past its share of the queue and counted |
 //! | KR-REQ-11.21 and KR-REQ-11.33 | the answer to an approval a component read is the bytes that component encoded, written to the upstream once; an approval the connector's table read is answered with the table's bytes, and no component is asked to encode it |
+//! | KR-REQ-11.38 | three approvals a component read wait for a person while the component takes another call, and are then answered in another order, once each |
 //! | KR-REQ-24.27 | the component that writes the answer to an approval made in privacy mode is marked as handed something made in it, on a replacement runtime and after privacy mode ended |
 //! | KR-REQ-11.33 | a native answer that comes while the component encodes wins, and the component's answer is not sent; the thread changing, the grant or the decoder's trust being withdrawn while it encodes each refuse the answer before the marker, and nothing is sent |
 //! | KR-REQ-11.21 and KR-ACC-016 | bytes that name another request, the right one as another JSON type, a method, an error in place of a result or beside one, a member twice or a line break are refused by the core and nothing is sent; a component that traps, declines or never returns makes no answer, the terminal answers, and the third fault disables the binding |
@@ -546,6 +547,66 @@ async fn kr_req_11_21_an_approval_the_table_read_is_answered_with_the_tables_byt
         account.starts_with("decode=0;encode=0;"),
         "no component was asked about a request the table read: {account}"
     );
+}
+
+/// KR-REQ-11.38: a long wait for a person is a resource in the worker's ledger and not a component's
+/// call that stays open.
+///
+/// Three requests the upstream waits on are each read into an approval by the component, and the
+/// person answers none of them. While the three wait, the component takes another call and has
+/// decoded each of them once: a decode that stayed open for the person would hold the binding's
+/// thread, and neither the later requests nor that call would be served. The person then answers
+/// the middle one, the first and the last, in that order, and the component, which is asked to
+/// encode each answer when it is given, has its answer written to the upstream once and for its own
+/// request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_11_38_an_approval_waiting_for_a_person_holds_no_call_of_the_component() {
+    let Some(world) =
+        Observing::start(Options::with(vec![Spec::decoder(1, "hostile-decoder")])).await
+    else {
+        return;
+    };
+    world.until_ready(1).await;
+    for number in [21, 22, 23] {
+        world.send(&request_noting(number, "!answer"));
+    }
+    let mut approvals = Vec::new();
+    for number in [21, 22, 23] {
+        let approval = approved(&world, &number.to_string()).await;
+        assert_eq!(approval.state, PendingState::Pending);
+        approvals.push(approval);
+    }
+
+    // All three wait, and the component, which has decoded each once, answers a call of its own.
+    let account = world.raw_account(1).await.expect("the component answers");
+    assert!(
+        account.starts_with("decode=3;encode=0;"),
+        "the component was asked about the three waiting requests: {account}"
+    );
+    for number in [21, 22, 23] {
+        assert!(
+            answers_to(&world, number).is_empty(),
+            "request {number} was answered with nobody having answered it"
+        );
+    }
+
+    let mut owner = world.owner().await;
+    for index in [1, 0, 2] {
+        let outcome = world
+            .respond(&mut owner, approvals[index].resource_id, "allow")
+            .await;
+        assert!(matches!(outcome, Outcome::Ok(_)), "{outcome:?}");
+        let number = 21 + u64::try_from(index).expect("a small index");
+        until_answered(&world, number).await;
+        assert_eq!(answers_to(&world, number).len(), 1);
+    }
+    for number in [21, 22, 23] {
+        assert_eq!(
+            answers_to(&world, number).len(),
+            1,
+            "request {number} was not answered exactly once"
+        );
+    }
 }
 
 /// Asks `world` to answer request `id` with its component's bytes, runs `disturb` while the
