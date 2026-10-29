@@ -116,9 +116,13 @@ gh workflow run release-host.yml --ref main -f commit=<sha> -f build_run=<run id
 ```
 
 The workflow's `source` job holds the inputs to what they name before anything is approved: the commit
-is on `main`, the run is a successful `release-tree.yml` run on that commit, each tree is the artefact
-whose digest GitHub states, and the staged files hash to the input. It prints every digest in the run's
-summary. The person who approves the `update-signing` deployment compares them with what the signing
+is on `main` (by the copy of `scripts/check-commit-on-main.sh` that `main` holds, so that no script of the
+commit runs before the commit has been held to `main`), the run is a successful `release-tree.yml` run on that
+commit, each tree is the artefact whose digest GitHub states, and the staged files hash to the input. Each staged
+macOS tree is held to the run's tree by `scripts/check-staged-tree.py`: the same directories and files at the same
+modes, the run's `release.json`, every file that is not Mach-O as that manifest describes it, and every Mach-O
+file equal to the run's outside its code signature. The job passes on the tar that check writes from what it
+read, and not the staged one. It prints every digest in the run's summary. The person who approves the `update-signing` deployment compares them with what the signing
 script printed. The files the sealing job takes are kept for three days, so the approval has to come within three
 days of the dispatch. The approval is the one approval of a release: the jobs after it run without another,
 and `publish` runs only after every archive has been verified against the root committed in
@@ -128,8 +132,8 @@ The `matrix` job runs beside `source`. It builds `kr-release-matrix-check` at th
 whether the signed release matrix the managed service publishes lists a tier for the package version
 the commit carries ([packages.md](packages.md#the-release-matrix)). It holds no key and no write
 access, and `channel` waits for it, so a release that the matrix does not list is refused before anyone is
-asked to approve the use of the release keys. `publish` asks again as its first step, with the program
-`matrix` built, held to its sum and run before anything is written, because the approval between the two
+asked to approve the use of the release keys. `publish` asks again, with the program `matrix` built,
+held to its sum and to the digest `matrix` stated, before it writes anything, because the approval between the two
 can come days later and a newer matrix revision may have dropped the version; a re-run of `publish` asks
 afresh. The program is kept for five days and the trees for three, so it outlasts them. The first job comes
 after the notarisation, which takes about an hour, so run the same check at the commit before the signing starts:
@@ -168,6 +172,8 @@ shows that, and it cannot undo it.
 | `already has a release` | the tag is taken, and a published release is never replaced | release the corrected commit under its own tag |
 | `the update channel's release keys are not set up` | the environment has no key | the owner sets `RELEASE_CHANNEL_TARGETS_KEY_1` and `_2` |
 | `is not on main` | the commit is not in `main`'s history | land the commit, then build again |
+| `is not the tree the run built with its programs signed` | a staged macOS tree differs from the run's in more than its signatures; the lines before it name where | sign a tree of the run again, from the run's own artefact |
+| `is not the pinned rcodesign` | the signer was handed a program of its own choosing for the Developer ID | unset `KR_RCODESIGN`, or give it the pinned executable |
 | `is in no tier of the release matrix`, or `the published release matrix was not accepted` | the matrix the managed service publishes does not list the commit's package version, or does not verify | publish a matrix revision that lists the version, then re-run the failed job; its sealed archives are kept for one day, and a refusal at `matrix`, before the approval, is a new dispatch |
 | `nothing shows that this repository makes releases immutable` | the setting reads as off, or the most recently published release is not immutable | turn the setting on and publish a package release, then re-run the failed `publish` job within the day the sealed archives are kept; later, dispatch again |
 

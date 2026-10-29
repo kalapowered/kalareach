@@ -128,7 +128,7 @@ they build it. The package release and the Windows host release run it in the jo
 signs, before it publishes or signs anything. The macOS and Linux host release runs it in two jobs of
 `release-host.yml`. `matrix` holds no key and no write access, builds the program and is waited for
 by the job that uses the update channel's release keys. `publish` runs the same program, held to its
-sum, as its first step in every attempt and before it writes anything, since the approval between
+sum, in every attempt and before it writes anything, since the approval between
 the two can come days after the first answer. The program
 verifies the matrix under the key the commit pins, as a host's daemon does, and exits 0 when a tier
 serves the release, 1 when it is refused (in no tier, a reply that does not verify, a service that

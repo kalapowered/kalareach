@@ -169,9 +169,7 @@ verifies each of them, puts them back, and then stops, naming the reason: the pr
 channel's release keys are not available to a workflow, so `release.json` cannot be signed again
 after the signatures changed the files. Publishing a Windows release waits for the key ceremony of
 the production channel, which is the project owner's to hold; the macOS and Linux releases are signed
-under the tester channel and do not wait for it. When the production keys can be used, that step is
-replaced by the one that signs, and the run goes on to pack both archives, hold them to what a host
-stages, and publish a release carrying them and their sums.
+under the tester channel and do not wait for it.
 
 To sign a commit without releasing it, start the workflow by hand and give it a ref. The gate job
 settles that commit and records it in the Step Summary. The reviewer in the `release-signing`
