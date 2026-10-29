@@ -168,6 +168,42 @@ contract: point `relay_urls` at your relays, `pkarr_publisher_url` and `pkarr_re
 services present certificates from a private authority, add that authority's DER certificates to
 `relay_ca_roots`; the public trust anchors stay in force alongside it.
 
+A host does not have to be given those fields by hand. A service publishes, at
+`/.well-known/kalareach-service.json` on its own origin, with no credential and for `GET` and `HEAD`
+only, the part of a host's configuration document that it can speak for, and `kr host network
+--join --service <origin>` reads it and writes it through the document's own writer. The reply is
+`{ "description": { ... }, "signature": "..." }`. The description holds `schema_version` (1) and,
+under the document's own names, `network` (`relay_urls`, `pkarr_publisher_url`,
+`pkarr_resolver_url` and `dns_origin`) and the sections `authority`, `mailbox` and `relay`, each
+with an `origin`. Every member but `schema_version` is optional and each service is its own entry,
+so an operator who runs no mailbox leaves `mailbox` out and a host then places nothing, and an
+operator who runs the relay and discovery on other hosts than the rest names each of them.
+A reply is at most 16 KiB. A member the host does not know is ignored and counted, and one within
+two edits of a name it reads is refused as a misspelling. A host reads plain `http` addresses only
+from a service on its own machine. The description is the Worker's own: `docs/deployment.md` of the
+web repository says how it builds the relay map from its registry, and a file on any HTTPS server
+that holds the same JSON is a service for this purpose.
+
+The description decides where a host sends its traffic, and the choice stays in the document until
+the person joins again, so a forged one would outlast the connection it was forged on. The managed
+service signs it. The signature is Ed25519 over canonical KR-CBOR-1 bytes built from the description
+field by field, with a service it does not name signed as null and a relay map it does not name as an
+empty list, and the one key of the map that is signed is the context
+`kalareach-service-description-v1`. The key is the one that signs the release matrix and that every
+build pins; the matrix is signed under the context `kr-release-matrix/1`, so a signature made for
+one is never valid for the other, though one key makes both. Rotating the key changes both, and a
+build refuses the managed service's description when it is unsigned or signed by another key. A
+service you run signs with a key of its own, and a person joins it with `--key <its public key>`,
+which the host verifies the description under, or with `--unsigned`, which takes the description on
+the connection alone, so it is as trustworthy as that connection and the service. The key a service
+publishes beside its matrix proves nothing and is never read. A replayed description that was once
+genuine names servers that once were, and the next `--replace` corrects it.
+
+A host presents its account token to the managed service only, so a self-hosted deployment's lease
+service is not used by it: an operator leaves `relay` out of the description, and the host then asks
+for no lease. A host reserves a pairing code at the managed rendezvous unless `kr pair invite
+--origin <service>` names the operator's.
+
 The same selection travels in a pairing invitation and a host bundle as
 `kr_protocol::pairing::NetworkConfig`, so a device pairs with and dials the same configuration.
 `EndpointConfig::from_network_config` validates every field before it becomes part of an endpoint.

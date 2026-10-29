@@ -24,6 +24,7 @@ worker directly for what a session owns.
 | `kr host shell-mode` | — | Show or choose the shell mode a new session is created in when none is named |
 | `kr host terminal` | — | Show the terminal applications this host has, and which one a new window opens in |
 | `kr host startup` | — | Show or choose how `kr new` starts this environment's control daemon when none is running |
+| `kr host network` | — | Show which network and services this host selects, join the service that publishes a description of itself, or leave it |
 | `kr host descriptions` | — | Show what session descriptions offer on this host, turn them on or off, and fetch the model's files |
 | `kr host import-journals` | — | Bring this environment's journals that are older than this build migrates forward, once, while its daemon is stopped |
 | `kr host install` | — | Put a first release into this user's store of releases and make it current |
@@ -1735,6 +1736,67 @@ diagnostics, which puts the document in force, and prints what a new session app
 gets of this package's integration: on or off, the flags and variables it adds, and the executable
 the daemon's search path resolves its command to. A profile that names its own list decides over the
 host's, and the command says when one does.
+
+## `kr host network`
+
+```sh
+kr host network                                  # what the document selects, and nothing fetched
+kr host network --join                           # join the KalaReach service
+kr host network --join --service <origin> --key <key>   # join a service you run, verified under its key
+kr host network --join --service <origin> --unsigned    # the same, on the connection alone
+kr host network --join --replace                 # also take the service's values over differing ones
+kr host network --clear                          # take out what --join writes
+```
+
+A host joins no network until its configuration document says so. `--join` reads the description a
+service publishes of itself, at `/.well-known/kalareach-service.json` on its origin, and writes what
+it describes as one validated revision of the document, through the same writer every other edit
+uses: the relay map, the Pkarr publisher and resolver, the DNS origin, and the origins of the
+authority feed, the mailbox and the relay lease service. These eight settings are `network.enabled`,
+`network.relay_urls`, `network.pkarr_publisher_url`, `network.pkarr_resolver_url`,
+`network.dns_origin`, `authority.origin`, `mailbox.origin` and `relay.origin`. The `level` member is
+whatever the sections the document then holds need, so no one writes it. Nothing else changes: the
+machine's own choices in `network` (`bind_address`, `relay_trust_anchors`, `relay_only`,
+`local_discovery`, `mainline_dht` and `proxy_url`) and every other section stay as they are. The
+settings apply when the control daemon next starts, and `kr doctor` then reports each with the
+source `host_configuration`. Run it before `kr host startup --set standalone` and `kr new`, or on a
+host that already runs, and restart the daemon.
+
+Without `--service` the command joins the KalaReach service, the origin this build pins. The managed
+service signs its description with the key that signs its release matrix and that every build pins,
+under a context of its own, and the command refuses a description of it that is unsigned or signed
+by another key; `--key` and `--unsigned` are refused for it. A service you run is named with
+`--service`, an `https` address with no path (an `http` address is read only on this machine), and
+the command wants one of two things from you. `--key` gives the public key the service signs its
+description with, as 43 characters of unpadded base64url, and the description is read only when it
+verifies under it. `--unsigned` takes the description on the connection alone, so it is as
+trustworthy as that connection and the service that answered, and the output says so. With neither,
+the command refuses. The key that the service publishes beside its release matrix proves nothing
+and is not read.
+
+The request is made through the proxy `network.proxy_url` names, and directly when it names none; it
+never goes round one. A document that this build must not rewrite, or cannot read, ends the command
+before any request is made. The command makes the request with nothing held, and takes the writers'
+lock only to write, over the document it read: a document that moved since is not written over.
+
+The command refuses, with nothing written, a service that cannot be reached, answers with a status
+other than 200, answers more than 16 KiB or publishes no description; a description with a
+`schema_version` this build does not read, a member of the wrong type, a member within two edits of
+a name it reads (a misspelling), a plain `http` address where it was not read from this machine,
+or that names no relay and no discovery server; and a value the document's validator refuses. Members
+it does not know are ignored and counted. None of the service's words are repeated.
+
+A join never replaces a value the document already holds with another one. When the document holds a
+different value for any of the eight settings, including `network.enabled: false` and a setting the
+service leaves out, the command names those settings, shows the document's value and the service's
+for each, and writes nothing; `--replace` takes the service's values for all eight. A document that
+already holds exactly what the service describes is left as it is, and the revision does not move.
+`--clear` takes out the eight settings. A document where that would leave `network.relay_only` with
+no relay is refused as the document refuses it, with the setting named, because `relay_only` is the
+machine's own; so is a `--replace` with a description that names no relay.
+
+A backup restore never applies the services a host selects, so a host restored from a backup runs
+`kr host network --join` again.
 
 ## `kr host startup`
 
