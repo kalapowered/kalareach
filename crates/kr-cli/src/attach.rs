@@ -775,11 +775,7 @@ pub fn spawn_input_reader(
     let waker = stop.clone();
     let thread = std::thread::spawn(move || {
         let mut reader = RecordReader::over(console);
-        loop {
-            match reader.wait(waker.as_deref()) {
-                Ok(true) => {}
-                Ok(false) | Err(_) => break,
-            }
+        while let Ok(true) = reader.wait(waker.as_deref()) {
             let Ok(events) = reader.read_events() else {
                 break;
             };
