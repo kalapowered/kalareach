@@ -15,8 +15,10 @@
 //! until the person joins again, so a forged one would outlast the connection it was forged on. The
 //! managed service signs it, with the key that signs its release matrix and that every build pins
 //! ([`Pins`]), under a context of its own, [`DOMAIN`], which is part of the signed bytes: a matrix
-//! signature is never a description's, and a description's is never a matrix's. [`Trust::Pinned`]
-//! requires that signature. A service a person runs names its own public key, and a description
+//! signature is never a description's, and a description's is never a matrix's. The signed bytes
+//! also hold the origin the description is served at, which this module takes from the origin it
+//! asked and no redirect changes, so a description signed for one service never verifies as
+//! another's even when one key signed both. [`Trust::Pinned`] requires that signature. A service a person runs names its own public key, and a description
 //! signed by it is read the same way. [`Trust::TlsOnly`] takes the description on the connection
 //! alone, for a person who has said so.
 //!
@@ -35,7 +37,8 @@
 //!    would otherwise drop a service without a word. Other unknown members are ignored, counted and
 //!    named in [`Ignored`], and the signature does not cover them;
 //! 4. when a key is pinned, the signature verifies over the bytes this module rebuilds from the
-//!    members it read, field by field, with an absent service signed as null;
+//!    origin it asked and the members it read, field by field, with an absent service signed as
+//!    null;
 //! 5. no relay, discovery or service address is plain `http` unless the description itself was read
 //!    from a plain `http` loopback origin and the address is on loopback too;
 //! 6. it names a relay or a discovery server, since a host that joined one that names neither would
@@ -321,9 +324,10 @@ struct Published {
 
 /// The bytes the service signs, field by field, in a fixed order: what is signed is what the
 /// service means and not whatever shape the reply had. A service the description does not name is
-/// null, and an unnamed list is empty.
+/// null, and an unnamed list is empty. `origin` is the origin the description was asked of.
 #[derive(Serialize)]
 struct Signed<'a> {
+    origin: &'a str,
     schema_version: u64,
     network: SignedNetwork<'a>,
     authority: SignedOrigin<'a>,
@@ -381,7 +385,7 @@ pub fn read(body: &[u8], origin: &GatewayOrigin, trust: &Trust) -> Result<Descri
     // that is not the service's is refused as that and for no other reason.
     let signed = match trust {
         Trust::Pinned(pins) => {
-            verify(&selection, published.signature.as_deref(), pins)?;
+            verify(&selection, published.signature.as_deref(), pins, origin)?;
             true
         }
         Trust::TlsOnly => false,
@@ -460,15 +464,17 @@ fn texts(value: Option<&Value>) -> Result<Vec<String>, Refusal> {
     }
 }
 
-/// Checks the signature over what was read.
+/// Checks the signature over what was read, for the origin it was asked of.
 fn verify(
     selection: &ServiceSelection,
     signature: Option<&str>,
     pins: &Pins,
+    origin: &GatewayOrigin,
 ) -> Result<(), Refusal> {
     let transcript = SigningTranscript::keyed(
         DOMAIN,
         &Signed {
+            origin: origin.as_str(),
             schema_version: SCHEMA_VERSION,
             network: SignedNetwork {
                 relay_urls: &selection.relay_urls,

@@ -8,7 +8,7 @@
 //! crate, and the service is the stand-in, held to the Worker's source, over loopback.
 
 use kr_client::services::description::{
-    self, Description, Refusal, Trust, Unread, fetch, is_managed, read,
+    Description, Refusal, Trust, Unread, fetch, is_managed, read,
 };
 use kr_client::services::http::HttpService;
 use kr_client::services::matrix::{Document as Matrix, Pins, Refusal as MatrixRefusal};
@@ -106,6 +106,58 @@ mod the_signing_bytes_agree_with_the_websites {
         );
     }
 
+    /// A description that names few services signs what it leaves out as null and an absent relay
+    /// map as an empty list, and the Worker's bytes for it are the bytes the client rebuilds.
+    #[test]
+    fn a_description_that_names_few_services_verifies_with_the_rest_signed_as_absent() {
+        let (pins, vector) = vector();
+        let sparse = &vector["sparse"]["published"];
+        let description = accepted(sparse, &pins).expect("the publisher's description is accepted");
+        let selection = description.selection();
+        assert!(selection.relay_urls.is_empty());
+        assert_eq!(
+            selection.dns_origin.as_deref(),
+            Some("discovery.example.test")
+        );
+        assert_eq!(selection.authority_origin, None);
+        assert_eq!(selection.relay_origin, None);
+
+        // Naming a service the signature did not cover is a different description.
+        let mut named = sparse.clone();
+        named["description"]["relay"] = json!({ "origin": "https://reach.kala.to" });
+        assert_eq!(accepted(&named, &pins).err(), Some(Refusal::Signature));
+        let mut relayed = sparse.clone();
+        relayed["description"]["network"]["relay_urls"] = json!(["https://relay.example.test"]);
+        assert_eq!(accepted(&relayed, &pins).err(), Some(Refusal::Signature));
+    }
+
+    /// The signature covers the origin the description was asked of: one signed for a service is not
+    /// that service's when it is read from another, though the same key signed both.
+    #[test]
+    fn a_description_signed_for_one_origin_is_refused_when_read_from_another() {
+        let (pins, vector) = vector();
+        assert_eq!(
+            vector["origin"], ORIGIN,
+            "the vector is for the origin it names"
+        );
+        for published in [&vector["published"], &vector["sparse"]["published"]] {
+            let body = body(published);
+            let at = |asked: &str| read(&body, &origin(asked), &Trust::Pinned(pins.clone())).err();
+            assert_eq!(
+                at(ORIGIN),
+                None,
+                "the control: read from the origin it is for"
+            );
+            for other in [
+                "https://staging.reach.kala.to",
+                "https://reach.kala.to:8443",
+                "http://127.0.0.1:8787",
+            ] {
+                assert_eq!(at(other), Some(Refusal::Signature), "{other}");
+            }
+        }
+    }
+
     #[test]
     fn nothing_the_signature_covers_can_change_and_verify() {
         let (pins, vector) = vector();
@@ -198,24 +250,6 @@ mod the_signing_bytes_agree_with_the_websites {
             Matrix::verify(&matrix_reply(&vector["published"]["signature"]), &pins).err(),
             Some(MatrixRefusal::Signature)
         );
-    }
-
-    #[test]
-    fn the_signed_bytes_begin_with_the_context() {
-        let (_, vector) = vector();
-        let bytes = hex(vector["signing_input_hex"].as_str().expect("hex"));
-        let context = description::DOMAIN.as_bytes();
-        assert!(
-            bytes.windows(context.len()).any(|window| window == context),
-            "the context is part of what is signed"
-        );
-    }
-
-    fn hex(text: &str) -> Vec<u8> {
-        (0..text.len())
-            .step_by(2)
-            .map(|at| u8::from_str_radix(&text[at..at + 2], 16).expect("hex"))
-            .collect()
     }
 }
 
@@ -398,8 +432,11 @@ mod what_a_description_must_hold {
 mod what_vouches_for_it {
     use super::*;
 
+    /// The service these cases read from, and the origin its descriptions are signed for.
+    const SERVICE: &str = "https://service.example.test";
+
     fn signed_by(key: &AuthorisationKeyPair, description: &Value) -> Vec<u8> {
-        body(&signed_service_description(description, key))
+        body(&signed_service_description(description, SERVICE, key))
     }
 
     #[test]
@@ -407,7 +444,7 @@ mod what_vouches_for_it {
         let key = AuthorisationKeyPair::generate().expect("a key pair");
         let other = AuthorisationKeyPair::generate().expect("a key pair");
         let reply = signed_by(&key, &whole());
-        let service = origin("https://service.example.test");
+        let service = origin(SERVICE);
 
         let accepted = read(
             &reply,
@@ -431,7 +468,7 @@ mod what_vouches_for_it {
     fn a_description_that_is_unsigned_or_signed_wrongly_is_refused_where_a_key_is_required() {
         let key = AuthorisationKeyPair::generate().expect("a key pair");
         let pinned = Trust::Pinned(Pins::of(vec![*key.public()]));
-        let service = origin("https://service.example.test");
+        let service = origin(SERVICE);
         let mut reply: Value = serde_json::from_slice(&signed_by(&key, &whole())).expect("a reply");
 
         assert!(
@@ -496,7 +533,7 @@ mod asking_for_it {
             "a service with no description answers 404"
         );
 
-        let reply = signed_service_description(&whole(), &key);
+        let reply = signed_service_description(&whole(), service.as_str(), &key);
         served.web().publish_service_description(&body(&reply));
         let text = fetch(&http, &service).await.expect("the reply");
         let description = read(
@@ -515,5 +552,104 @@ mod asking_for_it {
             fetch(&http, &service).await.err(),
             Some(Unread::NotPublished)
         );
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* The addresses it publishes                                                  */
+/* -------------------------------------------------------------------------- */
+
+/// The Worker decides which addresses to publish and the host's document decides which it accepts,
+/// and the two are written in two languages. A description with one address the document refuses is
+/// refused whole, so an address the Worker publishes and a document refuses takes every service
+/// the description names with it. The table is the document's verdict on each address, taken from
+/// its own validators here, and the Worker's suite holds the Worker to the same table.
+mod what_the_worker_publishes_is_what_the_document_accepts {
+    use kr_protocol::hostinfo::configuration::{self, Change, ServiceSelection};
+
+    use super::*;
+
+    const ADDRESSES: &str = include_str!("fixtures/service-description/addresses.json");
+
+    /// Whether the document accepts a join that selects this.
+    fn accepted(selection: ServiceSelection) -> bool {
+        configuration::edit(
+            &configuration::load(None),
+            &Change::Network(Some(selection)),
+        )
+        .is_ok()
+    }
+
+    /// Each row of a list of the table: the address, what the document says of it, and whether the
+    /// Worker publishes it.
+    fn rows(table: &Value, list: &str) -> Vec<(String, bool, bool)> {
+        table[list]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .map(|row| {
+                (
+                    row["value"].as_str().expect("an address").to_owned(),
+                    row["document"].as_bool().expect("a verdict"),
+                    row["worker"].as_bool().expect("a verdict"),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_address_the_worker_publishes_is_one_the_document_accepts() {
+        let table: Value = serde_json::from_str(ADDRESSES).expect("the table");
+        let relay = "https://relay.example.test".to_owned();
+
+        for (value, document, worker) in rows(&table, "relay_urls") {
+            assert!(
+                !worker || document,
+                "{value:?}: the Worker would publish what the document refuses"
+            );
+            let as_relay = ServiceSelection {
+                relay_urls: vec![value.clone()],
+                ..ServiceSelection::default()
+            };
+            let as_discovery = ServiceSelection {
+                relay_urls: vec![relay.clone()],
+                pkarr_publisher_url: Some(value.clone()),
+                pkarr_resolver_url: Some(value.clone()),
+                ..ServiceSelection::default()
+            };
+            assert_eq!(accepted(as_relay), document, "{value:?} as a relay");
+            assert_eq!(
+                accepted(as_discovery),
+                document,
+                "{value:?} as a discovery server"
+            );
+        }
+
+        for (value, document, worker) in rows(&table, "origins") {
+            assert!(
+                !worker || document,
+                "{value:?}: the Worker would publish what the document refuses"
+            );
+            assert_eq!(
+                GatewayOrigin::new(value.clone()).is_ok(),
+                document,
+                "{value:?}"
+            );
+            for place in 0..3 {
+                let named = Some(value.clone());
+                let selection = ServiceSelection {
+                    relay_urls: vec![relay.clone()],
+                    authority_origin: if place == 0 { named.clone() } else { None },
+                    mailbox_origin: if place == 1 { named.clone() } else { None },
+                    relay_origin: if place == 2 { named } else { None },
+                    ..ServiceSelection::default()
+                };
+                assert_eq!(
+                    accepted(selection),
+                    document,
+                    "{value:?} as an origin (place {place})"
+                );
+            }
+        }
     }
 }

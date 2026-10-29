@@ -165,7 +165,7 @@ impl Service {
     }
 
     fn publish_description(&self, description: &Value) {
-        let reply = signed_service_description(description, &self.key);
+        let reply = signed_service_description(description, &self.origin(), &self.key);
         self.served
             .web()
             .publish_service_description(&serde_json::to_vec(&reply).expect("a reply"));

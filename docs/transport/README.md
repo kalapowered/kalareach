@@ -186,10 +186,13 @@ that holds the same JSON is a service for this purpose.
 
 The description decides where a host sends its traffic, and the choice stays in the document until
 the person joins again, so a forged one would outlast the connection it was forged on. The managed
-service signs it. The signature is Ed25519 over canonical KR-CBOR-1 bytes built from the description
-field by field, with a service it does not name signed as null and a relay map it does not name as an
-empty list, and the one key of the map that is signed is the context
-`kalareach-service-description-v1`. The key is the one that signs the release matrix and that every
+service signs it. The signature is Ed25519 over canonical KR-CBOR-1 bytes built from the origin the
+description is served at and the description field by field, with a service it does not name signed
+as null and a relay map it does not name as an empty list, and the one key of the map that is signed
+is the context `kalareach-service-description-v1`. A host puts into those bytes the origin it asked,
+so a description signed for one service is refused when it is read from another, even when one key
+signed both; a service you run signs the origin its operator set as `PUBLIC_SITE_ORIGIN`, which is
+the one its hosts name with `--service`. The key is the one that signs the release matrix and that every
 build pins; the matrix is signed under the context `kr-release-matrix/1`, so a signature made for
 one is never valid for the other, though one key makes both. Rotating the key changes both, and a
 build refuses the managed service's description when it is unsigned or signed by another key. A

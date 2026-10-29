@@ -11,8 +11,8 @@
 // `cbor.ts` is `packages/service-contracts/src/cbor.ts` of the web repository at <web commit>,
 // which has no imports of its own. `descriptionSigningInput` below is
 // `serviceDescriptionSigningInput` of `packages/service-contracts/src/service-description.ts` at
-// the same commit, with the types removed, and `matrixSigningInput` is `signingInput` of
-// `workers/api/src/ops/release.ts`.
+// the same commit, with the types removed (the website's suite pins its bytes for both descriptions
+// below), and `matrixSigningInput` is `signingInput` of `workers/api/src/ops/release.ts`.
 
 import { createHash, createPrivateKey, createPublicKey, sign } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
@@ -39,10 +39,25 @@ const description = {
   relay: { origin: 'https://reach.kala.to' },
 };
 
-function descriptionSigningInput(held) {
-  const origin = (section) => ({ origin: section?.origin ?? null });
+// A description that names few services: no relay map, no authority feed, mailbox or lease service,
+// and a DNS origin. What it leaves out is signed as null, and an absent relay map as an empty list.
+const sparse = {
+  schema_version: 1,
+  network: {
+    pkarr_publisher_url: 'https://ns1.example.test/pkarr',
+    pkarr_resolver_url: 'https://ns1.example.test/pkarr',
+    dns_origin: 'discovery.example.test',
+  },
+};
+
+// The origin a service is served at, which its description is signed for.
+const ORIGIN = 'https://reach.kala.to';
+
+function descriptionSigningInput(held, origin) {
+  const named = (section) => ({ origin: section?.origin ?? null });
   return encodeCbor({
     [DOMAIN]: {
+      origin,
       schema_version: held.schema_version,
       network: {
         relay_urls: [...(held.network?.relay_urls ?? [])],
@@ -50,9 +65,9 @@ function descriptionSigningInput(held) {
         pkarr_resolver_url: held.network?.pkarr_resolver_url ?? null,
         dns_origin: held.network?.dns_origin ?? null,
       },
-      authority: origin(held.authority),
-      mailbox: origin(held.mailbox),
-      relay: origin(held.relay),
+      authority: named(held.authority),
+      mailbox: named(held.mailbox),
+      relay: named(held.relay),
     },
   });
 }
@@ -108,18 +123,27 @@ const publicDer = createPublicKey(privateKey).export({ format: 'der', type: 'spk
 const publicKey = publicDer.subarray(publicDer.length - 32);
 
 const base64url = (bytes) => Buffer.from(bytes).toString('base64url');
-const descriptionInput = Buffer.from(descriptionSigningInput(description));
+const descriptionInput = Buffer.from(descriptionSigningInput(description, ORIGIN));
+const sparseInput = Buffer.from(descriptionSigningInput(sparse, ORIGIN));
 const matrixInput = Buffer.from(matrixSigningInput(matrix));
 
 process.stdout.write(
   JSON.stringify(
     {
       web_commit: webCommit,
+      origin: ORIGIN,
       public_key: base64url(publicKey),
       signing_input_hex: descriptionInput.toString('hex'),
       published: {
         description,
         signature: base64url(sign(null, descriptionInput, privateKey)),
+      },
+      sparse: {
+        signing_input_hex: sparseInput.toString('hex'),
+        published: {
+          description: sparse,
+          signature: base64url(sign(null, sparseInput, privateKey)),
+        },
       },
       matrix,
       matrix_signing_input_hex: matrixInput.toString('hex'),

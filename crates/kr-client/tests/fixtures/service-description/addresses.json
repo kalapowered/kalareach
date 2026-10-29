@@ -1,0 +1,327 @@
+{
+  "about": "Which addresses a host's configuration document accepts, and which the Worker publishes. `document` is what the host's validator says, checked by crates/kr-client/tests/service_description.rs against the real validators; `worker` is what workers/api/src/service-description.ts and relay/instances.ts publish, checked in workers/api/test/ops/service-description.test.ts, which holds a copy of this file at workers/api/test/ops/fixtures/host-addresses.json. A row with `worker` true and `document` false would publish an address every host refuses. Change a row only when the host's validator changes, and copy the file.",
+  "relay_urls": [
+    {
+      "value": "https://relay-1.reach.kala.to",
+      "document": true,
+      "worker": true
+    },
+    {
+      "value": "https://relay.example.test:8443",
+      "document": true,
+      "worker": true
+    },
+    {
+      "value": "https://relay.example.test:65535",
+      "document": true,
+      "worker": true
+    },
+    {
+      "value": "https://relay.example.test/relay/v1",
+      "document": true,
+      "worker": true
+    },
+    {
+      "value": "https://localhost",
+      "document": true,
+      "worker": true
+    },
+    {
+      "value": "https://localhost:3340",
+      "document": true,
+      "worker": true
+    },
+    {
+      "value": "http://relay.example.test",
+      "document": true,
+      "worker": true,
+      "note": "the document takes http for a relay; whether a description may name one is the client's rule, not the document's"
+    },
+    {
+      "value": "http://[::1]:8080",
+      "document": true,
+      "worker": true
+    },
+    {
+      "value": "https://[::1]",
+      "document": true,
+      "worker": true
+    },
+    {
+      "value": "https://[2001:db8::1]",
+      "document": true,
+      "worker": true
+    },
+    {
+      "value": "https://[2001:db8::1]:8443",
+      "document": true,
+      "worker": true
+    },
+    {
+      "value": "https://[::]",
+      "document": true,
+      "worker": true
+    },
+    {
+      "value": "https://192.0.2.10",
+      "document": true,
+      "worker": true
+    },
+    {
+      "value": "https://relay.example.test/",
+      "document": true,
+      "worker": false,
+      "note": "a trailing slash is a second spelling; the Worker publishes the one without"
+    },
+    {
+      "value": "https://relay.example.test/a%20b",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://relay.example.test/a/../b",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://relay.example.test/a/./b",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://relay.example.test:0",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://relay.example.test:443",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://relay.example.test:08443",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://relay.example.test:65536",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://[2001:0db8::1]",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://[2001:DB8::1]",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://[::ffff:192.0.2.1]",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://[::ffff:c000:201]",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://[::192.0.2.1]",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://RELAY.example.test",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://relay_one.example.test",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://relay.example.test.",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://relay.example.123",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://192.0.2.010",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://xn--relay-9ua.example.test",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://-relay.example.test",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://relay-.example.test",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://user@relay.example.test",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://relay.example.test?x=1",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://relay.example.test#fragment",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "ftp://relay.example.test",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "relay.example.test",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example.test",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.test",
+      "document": false,
+      "worker": false
+    }
+  ],
+  "origins": [
+    {
+      "value": "https://reach.kala.to",
+      "document": true,
+      "worker": true
+    },
+    {
+      "value": "https://reach.kala.to:8443",
+      "document": true,
+      "worker": true
+    },
+    {
+      "value": "https://[2001:db8::1]",
+      "document": true,
+      "worker": true
+    },
+    {
+      "value": "https://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.test",
+      "document": true,
+      "worker": true,
+      "note": "128 bytes"
+    },
+    {
+      "value": "http://127.0.0.1:8787",
+      "document": true,
+      "worker": true
+    },
+    {
+      "value": "http://localhost:8787",
+      "document": true,
+      "worker": true
+    },
+    {
+      "value": "http://[::1]:8787",
+      "document": true,
+      "worker": true
+    },
+    {
+      "value": "https://xn--e1afmkfd.example.test",
+      "document": true,
+      "worker": false,
+      "note": "a name in the xn-- form is an origin; the Worker publishes none, as it publishes no relay in that form"
+    },
+    {
+      "value": "http://reach.kala.to",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "http://192.0.2.1",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "http://127.0.0.2",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://reach.kala.to/",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://reach.kala.to/path",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://REACH.kala.to",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://reach.kala.to:443",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://reach.kala.to:0",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://reach.kala.to.",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://service_example.test",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://user@reach.kala.to",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "https://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.test",
+      "document": false,
+      "worker": false,
+      "note": "129 bytes"
+    },
+    {
+      "value": "unknown",
+      "document": false,
+      "worker": false
+    },
+    {
+      "value": "",
+      "document": false,
+      "worker": false
+    }
+  ]
+}

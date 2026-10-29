@@ -8,9 +8,9 @@
 //!
 //! The route is held to `service-description.ts` and to the vector in
 //! `crates/kr-client/tests/fixtures/service-description`, whose bytes the Worker's own encoder
-//! made. [`signed`] rebuilds the bytes it signs from the description's JSON, field by field, and
-//! not from the client's types, so a client that rebuilt them wrongly is told so by a reply it
-//! should have accepted.
+//! made. [`signed`] rebuilds the bytes it signs from the origin and the description's JSON, field
+//! by field, and not from the client's types, so a client that rebuilt them wrongly is told so by a
+//! reply it should have accepted.
 
 use base64::Engine as _;
 use kr_client::services::ServiceHttpAnswer;
@@ -43,15 +43,16 @@ fn not_found() -> ServiceHttpAnswer {
     }
 }
 
-/// The published reply for `description`, signed with `key`: `{ description, signature }`, the
-/// signature being over the fields the Worker signs, with a service the description does not name
-/// signed as null and a relay map it does not name as an empty list.
+/// The published reply for `description`, signed with `key` for the service at `origin`:
+/// `{ description, signature }`, the signature being over that origin and the fields the Worker
+/// signs, with a service the description does not name signed as null and a relay map it does not
+/// name as an empty list.
 ///
 /// # Panics
 ///
 /// Panics when libsodium fails.
 #[must_use]
-pub fn signed(description: &Value, key: &AuthorisationKeyPair) -> Value {
+pub fn signed(description: &Value, origin: &str, key: &AuthorisationKeyPair) -> Value {
     let text = |value: &Value| {
         if value.is_string() {
             value.clone()
@@ -59,12 +60,13 @@ pub fn signed(description: &Value, key: &AuthorisationKeyPair) -> Value {
             Value::Null
         }
     };
-    let origin = |section: &str| json!({ "origin": text(&description[section]["origin"]) });
+    let named = |section: &str| json!({ "origin": text(&description[section]["origin"]) });
     let relay_urls = match &description["network"]["relay_urls"] {
         Value::Array(urls) => Value::Array(urls.clone()),
         _ => json!([]),
     };
     let signed = json!({
+        "origin": origin,
         "schema_version": description["schema_version"],
         "network": {
             "relay_urls": relay_urls,
@@ -72,9 +74,9 @@ pub fn signed(description: &Value, key: &AuthorisationKeyPair) -> Value {
             "pkarr_resolver_url": text(&description["network"]["pkarr_resolver_url"]),
             "dns_origin": text(&description["network"]["dns_origin"]),
         },
-        "authority": origin("authority"),
-        "mailbox": origin("mailbox"),
-        "relay": origin("relay"),
+        "authority": named("authority"),
+        "mailbox": named("mailbox"),
+        "relay": named("relay"),
     });
     let transcript = SigningTranscript::keyed(DOMAIN, &signed).expect("a transcript");
     let signature = sign(key, &transcript).expect("a signature");
