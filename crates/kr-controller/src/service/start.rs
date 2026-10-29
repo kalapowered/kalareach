@@ -1255,6 +1255,7 @@ impl Controller {
             release: setup.release,
             started_at_ms,
             shell_packages: setup.shell_packages,
+            host_resources: std::sync::Mutex::new(super::resources::HostResources::measured()),
             terminal: Arc::from(setup.terminal),
             presentations: Mutex::new(std::collections::HashMap::new()),
             desktop: Mutex::new(DesktopReading {

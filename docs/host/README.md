@@ -966,6 +966,23 @@ and one this build cannot read decide nothing at all, and then the number alread
 is what the report prints: a restriction an owner accepted is never lifted, or reported as lifted,
 because a later build could not read the file it was in.
 
+Whatever the number, a create is also refused when this host has no room for one more session, and
+the refusal comes before a reservation is recorded and before a worker is started. The host reads
+three resources at that moment, and a create finds the first that is short:
+
+| Resource | A create is refused when | Why |
+| --- | --- | --- |
+| `storage` | the filesystem that holds the state directory has less than 64 MiB free to this account | a session writes its history, its journal and the worker's record from its first moments, and its closure writes the final status there |
+| `terminals` | this host cannot open a pseudo-terminal | the worker opens one for the root shell, and a host out of terminals or of descriptors to open one with says so here and not in a worker that has already started |
+| `processes` | this account may start fewer than 64 more processes under its `RLIMIT_NPROC`, counted over every thread on Linux and every process on macOS | a session starts a worker and a root shell, and the shell's startup files and the person's first commands start more |
+
+The refusal is `RESOURCE_UNAVAILABLE` and names the resource and the figures it found. The three
+limits are fixed and are not configuration: a limit the owner could lower would let a create
+through on a host that cannot hold it. They do not narrow `session_limit`, which stays what the
+owner set, and `kr doctor` still reports no resource limit on that number. An account with no
+process limit has no headroom to read, and a reading this host cannot make never refuses a create
+(only a failure to open a terminal does). Windows reads none of the three.
+
 `grant_rights` is applied where a paired device's request is decided. Every request a device sends
 goes through one decision: its grant, intersected with this host's policy (the organisation lease a
 grant requires and the bounded offline validity an owner chose) and then with the rights ceiling in

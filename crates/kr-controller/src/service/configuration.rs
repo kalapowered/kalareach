@@ -596,9 +596,10 @@ impl Controller {
 
     /// The resource limits a configured ceiling is intersected with on this machine.
     ///
-    /// This host does not measure its own headroom, so nothing is established and an owner's
-    /// configured number applies. The value is here rather than at each call site so the day it is
-    /// measured there is one place to answer from.
+    /// This host does not turn its own headroom into a session number, so nothing is established
+    /// and an owner's configured number applies; a create that finds storage, terminals or
+    /// processes short is refused on its own (`service::resources`). The value is here rather than
+    /// at each call site so the day a number is measured there is one place to answer from.
     #[must_use]
     pub const fn hard_limits(&self) -> crate::config::HardLimits {
         crate::config::HardLimits {

@@ -526,6 +526,20 @@ impl Controller {
             }
             kr_protocol::session::ShellMode::NativeCompat => None,
         };
+        // What a session cannot start without is measured before the registry is locked, because
+        // it reads the file system and the process table, and a host that answers slowly must not
+        // hold up every other request in this environment. It is applied below to a token this
+        // registry has never seen, as the refusals around it are.
+        let shortfall = {
+            let resources = *self
+                .host_resources
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let state_directory = self.paths.state_root().to_path_buf();
+            tokio::task::spawn_blocking(move || resources.shortfall(&state_directory))
+                .await
+                .map_err(|error| ControllerError::supervision(error.to_string()))?
+        };
         let admission = {
             let mut registry = self.registry.lock().await;
             // The token is looked at under the same lock the reservation is taken under, and the
@@ -548,6 +562,15 @@ impl Controller {
                 // costs the caller a named error rather than a session that closes itself a moment
                 // later.
                 let _resolved = qualified?;
+            }
+            // Nor is anything reserved or spawned for a create this host has no room for: a
+            // session accepted without storage, a terminal or a process to start with would be
+            // refused by its own worker a moment later.
+            if !known && let Some(short) = shortfall {
+                return Err(ControllerError::ResourceShort {
+                    resource: short.resource,
+                    detail: short.detail,
+                });
             }
             registry.reserve(actor_id, token, digest, &intent, kr_ipc::now_ms())?
         };

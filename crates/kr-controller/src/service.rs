@@ -74,6 +74,7 @@ mod reads;
 mod recovery;
 pub(crate) mod remote_revocation;
 mod rendezvous;
+mod resources;
 mod restored_policy;
 pub use self::restored_policy::OwedWrite;
 mod revocation;
@@ -809,6 +810,11 @@ pub struct Controller {
     release: String,
     /// Where this host's qualified shell packages are, when it keeps them somewhere of its own.
     shell_packages: Option<PathBuf>,
+    /// How a create reads the storage, terminals and processes it needs before anything is spawned.
+    ///
+    /// Behind a lock only so that a test can stand a scarce reading in for a resource it cannot
+    /// make scarce; a create copies it out and holds nothing.
+    host_resources: std::sync::Mutex<resources::HostResources>,
     terminal: Arc<dyn crate::supervision::TerminalPresenter>,
     /// What came of each session's local presentation, for a create token asked twice.
     ///

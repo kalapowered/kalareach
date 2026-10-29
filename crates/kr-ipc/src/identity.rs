@@ -244,6 +244,21 @@ pub fn processes_on_terminal(terminal: u32) -> Result<Vec<u32>> {
     platform::processes_on_terminal(terminal)
 }
 
+/// Returns how many tasks the account with real user identifier `uid` holds now.
+///
+/// This is the figure the system's per-account process limit (`RLIMIT_NPROC`) is counted against: on
+/// Linux every thread of every process counts, and on macOS every process. A process that ends
+/// while the list is read is counted or not, as the kernel had it at that moment, so the figure is
+/// a reading and not a guarantee. A platform with no such limit, or that will not enumerate
+/// processes, refuses by name rather than answering nought.
+///
+/// # Errors
+///
+/// Returns [`IpcError::IdentityUnavailable`] when the platform will not enumerate processes.
+pub fn account_tasks(uid: u32) -> Result<u64> {
+    platform::account_tasks(uid)
+}
+
 /// Returns the controlling terminal of one process, when it has one.
 ///
 /// # Errors
@@ -1474,6 +1489,44 @@ mod platform {
         Ok(members)
     }
 
+    /// The tasks of one account: the threads of every process whose real user is `uid`.
+    ///
+    /// `/proc/<pid>/status` names both in one reading, so a process is counted from one file. One
+    /// that ends before it is read is not counted, as the kernel no longer counts it either.
+    pub(super) fn account_tasks(uid: u32) -> Result<u64> {
+        let entries = std::fs::read_dir("/proc")
+            .map_err(|error| unavailable("account tasks", format!("/proc: {error}")))?;
+        let mut tasks = 0_u64;
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Ok(text) = read_process_file(pid, "status") else {
+                continue;
+            };
+            let mut real = None;
+            let mut threads = 1_u64;
+            for line in text.lines() {
+                if let Some(rest) = line.strip_prefix("Uid:") {
+                    real = rest
+                        .split_whitespace()
+                        .next()
+                        .and_then(|value| value.parse::<u32>().ok());
+                } else if let Some(rest) = line.strip_prefix("Threads:") {
+                    threads = rest.trim().parse().unwrap_or(1);
+                }
+            }
+            if real == Some(uid) {
+                tasks += threads;
+            }
+        }
+        Ok(tasks)
+    }
+
     pub(super) fn boot_identity() -> Result<BootIdentity> {
         let text = std::fs::read_to_string(BOOT_ID_PATH)
             .map_err(|error| unavailable("boot identity", format!("{BOOT_ID_PATH}: {error}")))?;
@@ -1811,6 +1864,13 @@ mod platform {
     pub(super) fn processes_in_group(group: u32) -> super::Result<Vec<u32>> {
         super::macos_listing::in_group(group)
             .map_err(|error| super::unavailable("process group", format!("group {group}: {error}")))
+    }
+
+    /// The processes of one account, by real user: what the system's per-account limit counts.
+    pub(super) fn account_tasks(uid: u32) -> super::Result<u64> {
+        libproc::processes::pids_by_type(libproc::processes::ProcFilter::ByRealUID { ruid: uid })
+            .map(|pids| u64::try_from(pids.len()).unwrap_or(u64::MAX))
+            .map_err(|error| super::unavailable("account tasks", format!("user {uid}: {error}")))
     }
 
     pub(super) fn processes_on_terminal(terminal: u32) -> super::Result<Vec<u32>> {
@@ -2393,6 +2453,13 @@ mod platform {
         ))
     }
 
+    pub(super) fn account_tasks(uid: u32) -> Result<u64> {
+        Err(unavailable(
+            "account tasks",
+            format!("user {uid}: {SANDBOXED}"),
+        ))
+    }
+
     pub(super) fn processes_in_group(group: u32) -> Result<Vec<u32>> {
         Err(unavailable(
             "process group",
@@ -2450,6 +2517,14 @@ mod platform {
         BootIdentity, BootIdentitySource, ProcessQuery, ProcessStartSource, ProcessState, Result,
         WindowsReading, boot_records, process_times, unavailable, windows_boot,
     };
+
+    pub(super) fn account_tasks(_uid: u32) -> Result<u64> {
+        // Windows has no per-account process limit to count against.
+        Err(unavailable(
+            "account tasks",
+            "Windows has no per-account process limit",
+        ))
+    }
 
     pub(super) fn processes_in_group(_group: u32) -> Result<Vec<u32>> {
         // Windows has no process group to enumerate. A worker's descendants are held by its job
@@ -3161,6 +3236,35 @@ mod windows_boot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tasks an account holds include every thread of this test's own process, which is the
+    /// figure the system's per-account limit is counted against on Linux.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn an_account_holds_at_least_the_tasks_this_test_runs_in() {
+        fn own_threads() -> u64 {
+            if cfg!(target_os = "linux") {
+                std::fs::read_to_string("/proc/self/status")
+                    .ok()
+                    .and_then(|text| {
+                        text.lines()
+                            .find_map(|line| line.strip_prefix("Threads:").map(str::trim))
+                            .and_then(|count| count.parse().ok())
+                    })
+                    .unwrap_or(1)
+            } else {
+                1
+            }
+        }
+        let uid = crate::paths::current_uid();
+        let before = own_threads();
+        let held = account_tasks(uid).expect("this platform counts an account's tasks");
+        let after = own_threads();
+        assert!(
+            held >= before.min(after),
+            "the account holds {held} tasks and this process alone holds {before} to {after}"
+        );
+    }
 
     /// A control daemon's own scope is told from every other control group by its name, and is
     /// outside the service of the session only when the service is not its parent or itself, by

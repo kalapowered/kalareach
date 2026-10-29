@@ -45,9 +45,11 @@ pub struct Ceiling<T> {
 /// Section 2 makes 128 live or creating sessions the *default* admission, "configurable by the
 /// local owner and constrained by available PTY/process/storage resources". So 128 is the product
 /// default at the bottom of the ladder, and the hard limit is what those resources actually allow.
-/// This host does not measure that headroom, so it says so rather than inventing a number: with
-/// nothing established, an owner's configured number is what applies, and `kr doctor` reports that
-/// no resource limit narrowed it.
+/// This host does not turn that headroom into a session number, so it says so rather than inventing
+/// one: with nothing established, an owner's configured number is what applies, and `kr doctor`
+/// reports that no resource limit narrowed it. What it does measure is whether one more session can
+/// be carried at all: each create is refused before anything starts when the state directory's
+/// filesystem, the terminals or the account's processes are short (`service::resources`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HardLimits {
     /// The most sessions this machine's own resources allow, where this host has established it.

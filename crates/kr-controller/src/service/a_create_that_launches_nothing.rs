@@ -245,6 +245,108 @@ async fn reserved(controller: &Controller) {
     .unwrap_or_else(|_| panic!("the create wrote no reservation within {BOUND:?}"));
 }
 
+/// Creates a session on a daemon whose reading of its host has been made short by `shorten`, and
+/// shows that the create is refused with `RESOURCE_UNAVAILABLE` naming `resource`, before a
+/// reservation is taken and before the supervisor is asked for a worker.
+///
+/// The control is the same daemon with the readings it makes of its own host: the same create
+/// then reaches the supervisor, so the refusal was the resource's and not the request's.
+async fn a_create_short_of(
+    resource: &str,
+    shorten: impl FnOnce(&mut super::resources::HostResources),
+) {
+    let (temp, controller, asked) = daemon().await;
+    let environment_id = temp.environment_id();
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let accepted = AcceptedDeadline {
+        deadline: controller
+            .clock
+            .now()
+            .checked_add(Duration::from_secs(30))
+            .expect("a deadline half a minute out"),
+        bound: DeadlineBound::RequestedTtl,
+    };
+
+    let mut resources = super::resources::HostResources::measured();
+    shorten(&mut resources);
+    controller.use_host_resources(resources);
+    let error = controller
+        .session_create(
+            &actor_id,
+            &create_request(environment_id),
+            carried(&controller, connection_id, accepted),
+        )
+        .await
+        .expect_err("a host short of a resource accepted another session");
+    assert_eq!(error.code(), ErrorCode::ResourceUnavailable, "{error}");
+    assert!(
+        error.to_string().contains(resource),
+        "the refusal names the resource that is short ({resource}): {error}"
+    );
+    assert!(
+        asked.lock().expect("the record is not poisoned").is_empty(),
+        "no worker is started for a create the host has no room for"
+    );
+    let registry = controller.registry.lock().await;
+    assert_eq!(
+        registry.occupancy().expect("counts"),
+        0,
+        "and nothing is reserved for it"
+    );
+    drop(registry);
+
+    controller.use_host_resources(super::resources::HostResources::measured());
+    let _ = controller
+        .session_create(
+            &actor_id,
+            &create_request(environment_id),
+            carried(&controller, connection_id, accepted),
+        )
+        .await;
+    assert_eq!(
+        asked.lock().expect("the record is not poisoned").len(),
+        1,
+        "with the host's own readings the same create reaches the supervisor"
+    );
+}
+
+/// KR-REQ-07.14: a create is refused with `RESOURCE_UNAVAILABLE` before anything is spawned when
+/// the state directory's filesystem has less free space than a session needs. The reading is the
+/// filesystem's own, against a limit no filesystem meets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_is_refused_before_a_spawn_when_storage_is_short() {
+    a_create_short_of("storage", |resources| {
+        resources.minimum_free_storage = u64::MAX;
+    })
+    .await;
+}
+
+/// KR-REQ-07.14: a create is refused with `RESOURCE_UNAVAILABLE` before anything is spawned when
+/// this host cannot open a pseudo-terminal. A host cannot be made to run out of terminals without
+/// harm to the machine the test runs on, so the opening fails by a stand-in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_is_refused_before_a_spawn_when_no_terminal_can_be_opened() {
+    a_create_short_of("terminals", |resources| {
+        resources.open_terminal = || {
+            Err(std::io::Error::other(
+                "the host has no pseudo-terminal left",
+            ))
+        };
+    })
+    .await;
+}
+
+/// KR-REQ-07.14: a create is refused with `RESOURCE_UNAVAILABLE` before anything is spawned when
+/// the account may start fewer processes than a session needs. An account cannot be brought to its
+/// process limit without harm to the machine the test runs on, so the reading is a stand-in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_is_refused_before_a_spawn_when_the_account_is_near_its_process_limit() {
+    a_create_short_of("processes", |resources| {
+        resources.process_headroom = || Ok(Some(3));
+    })
+    .await;
+}
+
 /// KR-REQ-08.44: an invisible session has no terminal, so probed colours are refused.
 ///
 /// Before the reservation, because this is a request the host can never serve rather than one

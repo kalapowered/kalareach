@@ -28,6 +28,16 @@ pub enum ControllerError {
         /// The configured limit.
         limit: u64,
     },
+    /// The host cannot hold another session: a resource a create needs is short.
+    ///
+    /// Reported before a reservation is recorded and before anything is spawned.
+    #[error("this host cannot start another session, short of {resource}: {detail}")]
+    ResourceShort {
+        /// Which resource: `storage`, `terminals` or `processes`.
+        resource: &'static str,
+        /// What was found and what a create needs.
+        detail: String,
+    },
     /// A configuration edit was refused.
     ///
     /// An edit is validated before a revision is applied, so this is what a caller is told
@@ -193,9 +203,9 @@ impl ControllerError {
             }
             Self::AlreadyRunning { .. } => ErrorCode::ResourceUnavailable,
             Self::SessionLimit { .. } => ErrorCode::SessionLimit,
-            Self::Supervision { .. } | Self::WorkInAnotherSession { .. } => {
-                ErrorCode::ResourceUnavailable
-            }
+            Self::Supervision { .. }
+            | Self::WorkInAnotherSession { .. }
+            | Self::ResourceShort { .. } => ErrorCode::ResourceUnavailable,
             Self::RendezvousRefused { .. } | Self::Verification(_) | Self::WindowExpired { .. } => {
                 ErrorCode::PermissionDenied
             }
