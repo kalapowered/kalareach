@@ -197,9 +197,10 @@ fn a_scenario_that_ends_in_a_late_installation_says_so_in_its_purpose() {
         }
         assert!(
             scenario.purpose.contains("late installation")
-                && !scenario.purpose.contains("the caller gets EDITOR_BUSY"),
+                && !scenario.purpose.contains("the caller gets EDITOR_BUSY")
+                && !scenario.purpose.contains("qualification breach"),
             "{} replays a reader's late installation and its purpose does not say so, or says its \
-             caller gets EDITOR_BUSY: {}",
+             caller gets EDITOR_BUSY or that the acceptance is a qualification breach: {}",
             scenario.id,
             scenario.purpose
         );

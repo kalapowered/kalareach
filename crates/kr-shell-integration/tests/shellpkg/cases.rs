@@ -1417,8 +1417,8 @@ pub fn the_gesture_follows_the_line_discipline(kind: ShellKind) {
     // without a check.
     let (Some(change), Some(disable)) = (speech.veof_change, speech.veof_disable) else {
         panic!(
-            "{} follows a configured chord rather than the terminal's end-of-file character, so \
-             this case is not one of its",
+            "{} keeps no end-of-file character changed inside the shell, or follows a configured \
+             chord rather than the terminal's character, so this case is not one of its",
             kind.as_str()
         );
     };
@@ -1578,8 +1578,9 @@ pub fn the_gesture_a_terminal_starts_with_is_the_one_the_reader_announces(kind: 
     );
     drop(session);
 
-    // The terminal started with no end-of-file character: no key is the gesture, so a character
-    // that is not the editor's own answer is still its own, and the usual one ends the shell.
+    // The terminal started with no end-of-file character: no key is the gesture. Ctrl+G stays the
+    // editor's own and changes nothing, and Ctrl+D, the editor's own exit at an empty prompt, ends
+    // the shell.
     let (mut session, gesture) = started_with("undef");
     assert_eq!(
         gesture,
