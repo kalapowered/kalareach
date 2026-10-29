@@ -733,7 +733,6 @@ impl Step {
 }
 
 /// A staged file that could not be written, and the step that failed.
-#[derive(Debug)]
 pub(super) struct WriteFailure {
     step: Step,
     error: std::io::Error,
