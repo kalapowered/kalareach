@@ -244,6 +244,7 @@ impl Fixture {
             pin: false,
             provenance: provenance(),
             admitted: None,
+            caller: None,
         };
         self.changesets.capture(&order).map(|(record, _)| record)
     }
@@ -295,6 +296,7 @@ impl Fixture {
             pin: false,
             provenance: provenance(),
             admitted: None,
+            caller: None,
         };
         self.changesets.capture(&order).map(|(record, _)| record)
     }
@@ -330,6 +332,7 @@ impl Fixture {
                 ..provenance()
             },
             admitted: None,
+            caller: None,
         };
         self.changesets
             .capture(&order)
@@ -364,6 +367,7 @@ impl Fixture {
             pin: false,
             provenance: provenance(),
             admitted: Some(admitted),
+            caller: None,
         };
         self.changesets.capture(&order).map(|(record, _)| record)
     }
@@ -477,6 +481,7 @@ pub fn apply_order<'a>(
         provenance: provenance(),
         claim: None,
         admitted: None,
+        caller: None,
     }
 }
 

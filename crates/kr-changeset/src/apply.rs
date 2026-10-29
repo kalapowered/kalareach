@@ -117,6 +117,8 @@ pub struct ApplyOrder<'a> {
     ///
     /// A request with none is one nothing arbitrates, as with the claim above.
     pub admitted: Option<&'a dyn crate::store::StillAdmitted>,
+    /// Who the apply is performed for.
+    pub caller: crate::service::Caller,
 }
 
 /// What a test runs immediately before one path's rename, named by that path.
@@ -223,6 +225,7 @@ pub fn limitations(destination: DestinationClass) -> Vec<String> {
 /// [`ChangeSetError::UnknownVersion`] when a named version does not exist.
 pub fn read(
     service: &ChangeSetService,
+    caller: crate::service::Caller,
     workspace_id: Option<WorkspaceId>,
     version: Option<VersionRef>,
 ) -> Result<DiffReadResult> {
@@ -232,14 +235,18 @@ pub fn read(
              change-set version, whose captured tree it reads"
                 .into(),
         )),
-        (Some(workspace_id), None) => read_workspace(service, workspace_id),
+        (Some(workspace_id), None) => read_workspace(service, caller, workspace_id),
         (None, Some(version)) => read_version(service, version),
     }
 }
 
-fn read_workspace(service: &ChangeSetService, workspace_id: WorkspaceId) -> Result<DiffReadResult> {
+fn read_workspace(
+    service: &ChangeSetService,
+    caller: crate::service::Caller,
+    workspace_id: WorkspaceId,
+) -> Result<DiffReadResult> {
     let resolved = service.resolve(workspace_id)?;
-    let repository = service.open_repository(&resolved)?;
+    let repository = service.open_repository(&resolved, caller)?;
     let profile = service.project().profile();
     let (revision, reference) = repository.head(profile)?;
     let Some(head_revision) = revision else {
@@ -676,7 +683,8 @@ fn preflight(
         ));
     };
     let resolved = service.resolve(workspace_id)?;
-    let repository = service.open_repository(&resolved)?;
+    ChangeSetService::require_a_tree_the_caller_may_write(&resolved, order.caller)?;
+    let repository = service.open_repository(&resolved, order.caller)?;
     // What a path **is** depends on the tree it is in. A directory that was ordinary content where
     // a version was captured can be a repository's own data here, and writing a file into that
     // would put bytes where this host excludes them from every capture it takes: the recovery
@@ -908,7 +916,8 @@ fn reference(
     };
     let moves_to = object_to_move_to(order, expected)?;
     let resolved = service.resolve(workspace_id)?;
-    let repository = service.open_repository(&resolved)?;
+    ChangeSetService::require_a_tree_the_caller_may_write(&resolved, order.caller)?;
+    let repository = service.open_repository(&resolved, order.caller)?;
     let profile = service.project().profile();
     if let Some(object) = moves_to {
         check_the_object_and_the_reference(profile, &repository, &expected.name, object)?;
@@ -3051,6 +3060,7 @@ fn capture_destination(
             ..order.provenance.clone()
         },
         admitted,
+        caller: order.caller,
     };
     let (record, _) = service.capture(&captured)?;
     Ok(record)
@@ -3475,7 +3485,7 @@ fn clear_staged(
     let opened = row
         .workspace_id
         .and_then(|workspace_id| service.resolve(workspace_id).ok())
-        .and_then(|resolved| service.open_repository_recording(&resolved).ok());
+        .and_then(|resolved| service.open_repository_recording(&resolved, None).ok());
     let Some(repository) = opened else {
         cleanup.not_ours = staged.into_iter().map(|entry| entry.path).collect();
         recovery.staged_left += cleanup.not_ours.len() as u64;
@@ -4034,6 +4044,7 @@ mod tests {
             provenance,
             claim: None,
             admitted: None,
+            caller: None,
         };
         let result = clean_preflight(&order, &limitations(DestinationClass::SharedExisting));
         assert_eq!(result.outcome, Nullable(None));

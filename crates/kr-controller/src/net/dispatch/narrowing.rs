@@ -1,7 +1,7 @@
 //! Narrowing an answer to what the device's grant admits.
 
 use kr_protocol::changeset::{
-    ChangesetMaterializeParams, ChangesetMaterializeResult, DiffReadParams,
+    ChangesetMaterializeParams, ChangesetMaterializeResult, DiffApplyResult, DiffReadParams,
 };
 use kr_protocol::envelope::{
     ControlFrame, MutationRequest, Outcome, ParamsValue, Request, Response,
@@ -338,7 +338,26 @@ impl RemoteConnection {
         {
             return failure(request.request_id, error);
         }
-        without_host_text(self.controller.changesets().read_frame(request).await)
+        without_host_text(self.controller.changesets().read_frame(request, None).await)
+    }
+
+    /// Answers a device's `diff.read` of a working copy.
+    ///
+    /// It runs Git on the working tree, so it is held to the rule a repository operation is
+    /// ([`Self::check_working_tree_authority`]), and the workspace is opened through the location
+    /// the owner authorised for this device's grant, with every read bounded to it. What the
+    /// device is told is the diff without this host's own sentences.
+    pub(super) async fn working_copy_diff(&self, request: &Request) -> ControlFrame {
+        if let Err(error) = self.check_working_tree_authority() {
+            return failure(request.request_id, error);
+        }
+        let grant = self.device.grant.grant_id;
+        without_host_text(
+            self.controller
+                .changesets()
+                .read_frame(request, Some(grant))
+                .await,
+        )
     }
 
     /// Checks the version a device asks to have materialised.
@@ -432,6 +451,52 @@ pub(super) fn shown_materialisation(answer: ControlFrame) -> ControlFrame {
         ),
         // An answer that is not a materialisation's is not passed on as it is: it may carry what
         // this form exists to leave out.
+        Err(_) => failure(
+            request_id,
+            ProtocolError::new(
+                ErrorCode::OutcomeUnknown,
+                "this host performed the action and could not state its answer to a paired device",
+            ),
+        ),
+    }
+}
+
+/// Puts the answer to a capture, an apply or a revert in the form a device is shown.
+///
+/// A capture's answer is a recorded version, which names filesystem identities and no path of this
+/// host. An apply's answer names a staging directory and carries sentences of this host's own about
+/// what it found in the tree, which can quote the directory the workspace is in, so a device is
+/// told the directory's class and the sentences' lengths instead.
+pub(super) fn shown_working_tree_change(answer: ControlFrame, method: Method) -> ControlFrame {
+    let ControlFrame::Response(Response {
+        request_id,
+        outcome: Outcome::Ok(value),
+    }) = answer
+    else {
+        return without_host_text(answer);
+    };
+    if method == Method::ChangesetCapture {
+        return ControlFrame::Response(Response {
+            request_id,
+            outcome: Outcome::Ok(value),
+        });
+    }
+    match value.to_typed::<DiffApplyResult>() {
+        Ok(mut result) => {
+            use kr_protocol::hostinfo::export::{ContentClass, withheld};
+            if let Some(staged) = result.recovery.staged_path.0.take() {
+                result.recovery.staged_path =
+                    kr_protocol::scalars::Nullable::some(withheld(ContentClass::Path, &staged));
+            }
+            result.recovery.detail = withheld(ContentClass::Message, &result.recovery.detail);
+            result.detail = withheld(ContentClass::Message, &result.detail);
+            for conflict in &mut result.conflicts {
+                conflict.detail = withheld(ContentClass::Message, &conflict.detail);
+            }
+            encoded(request_id, &result)
+        }
+        // An answer that is not an apply's is not passed on as it is: it may carry what this form
+        // exists to leave out.
         Err(_) => failure(
             request_id,
             ProtocolError::new(

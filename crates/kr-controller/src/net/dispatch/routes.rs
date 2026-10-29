@@ -15,7 +15,7 @@ use super::super::proxy::Vouched;
 use crate::error::Result;
 
 use super::super::Retained;
-use super::decision::{Answered, Asked, refuses_a_working_tree};
+use super::decision::{Answered, Asked, unserved_change_set_method};
 use super::forwarding::RouteRefusal;
 use super::{RemoteConnection, failure, outcome_unknown};
 
@@ -389,7 +389,10 @@ impl RemoteConnection {
                 Ok(params) if params.change_set_id.is_present() => {
                     self.recorded_diff(request, &params).await
                 }
-                _ => return failure(request.request_id, refuses_a_working_tree(entry.method)),
+                // A working copy's diff runs Git on its working tree, so it is held to the rule
+                // the repository operations are, and is read through the location this device's
+                // grant holds.
+                _ => self.working_copy_diff(request).await,
             },
             DeviceRead::Receipt => {
                 // A catalogue action's receipt is decided again under the right its method
@@ -977,7 +980,7 @@ impl RemoteConnection {
                     let held = Arc::clone(&controller);
                     controller
                         .changesets()
-                        .write_frame(&actor_id, &mutation, method, carried, held)
+                        .write_frame(&actor_id, &mutation, method, carried, held, None)
                         .await
                 });
                 match tokio::time::timeout(EFFECT_WAIT, effect).await {
@@ -985,12 +988,49 @@ impl RemoteConnection {
                     Ok(Err(_)) | Err(_) => failure(request_id, outcome_unknown()),
                 }
             }
-            // Every other change-set mutation reads or writes a working tree by running the Git
-            // program, outside the boundary that confines what that program reads for a device's
-            // repository operations, and says so.
-            _ if crate::changeset::ChangeSetModule::serves(entry.method) => {
-                failure(mutation.request_id, refuses_a_working_tree(entry.method))
+            // Capture, apply and revert each run Git on a working tree. They are served to a
+            // device on a host that has proved it confines what that program reads, for a
+            // workspace the owner's location for this device's grant reaches, and the service is
+            // told the caller is bounded by that grant, so nothing the request carries can make
+            // it the owner. This replaces the refusal these three were given whatever the host
+            // and the grant.
+            Method::ChangesetCapture | Method::DiffApply | Method::DiffRevert => {
+                if let Err(error) = self.check_working_tree_authority() {
+                    return failure(mutation.request_id, error);
+                }
+                if let Err(refusal) = self.claim_route(mutation, None) {
+                    return failure(mutation.request_id, refusal.into_error());
+                }
+                let controller = Arc::clone(&self.controller);
+                let mutation = mutation.clone();
+                let request_id = mutation.request_id;
+                let method = entry.method;
+                let carried = crate::authority::AdmittedMutation {
+                    connection_id: self.connection_id(),
+                    admitted_revision: validated,
+                    deadline: Some(accepted.deadline),
+                };
+                let grant = self.device.grant.grant_id;
+                // On a task that outlives this connection: an apply writes a tree of files, and
+                // dropping the future part way is a cancellation.
+                let effect = tokio::spawn(async move {
+                    let held = Arc::clone(&controller);
+                    controller
+                        .changesets()
+                        .write_frame(&actor_id, &mutation, method, carried, held, Some(grant))
+                        .await
+                });
+                match tokio::time::timeout(EFFECT_WAIT, effect).await {
+                    Ok(Ok(answer)) => super::narrowing::shown_working_tree_change(answer, method),
+                    Ok(Err(_)) | Err(_) => failure(request_id, outcome_unknown()),
+                }
             }
+            // A change-set mutation the registry lists without a route above is refused rather
+            // than handed to a worker, which does not own it.
+            _ if crate::changeset::ChangeSetModule::serves(entry.method) => failure(
+                mutation.request_id,
+                unserved_change_set_method(entry.method),
+            ),
             // The ten catalogue and plugin mutations. They are the daemon's own effect: a catalogue
             // and an installed package belong to the environment, so no worker owns them and the
             // module performs them under its own lock.

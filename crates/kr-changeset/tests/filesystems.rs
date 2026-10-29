@@ -68,7 +68,7 @@ fn a_workspace_on_another_filesystem_is_not_opened_whatever_its_numbers() {
             let resolved = fixture.service().resolve(workspace).expect("it resolves");
             fixture
                 .service()
-                .open_repository(&resolved)
+                .open_repository(&resolved, None)
                 .expect("the repository on the filesystem it was recorded on");
 
             // Another filesystem takes the place of the directory the repository is in, with a
@@ -98,7 +98,7 @@ fn a_workspace_on_another_filesystem_is_not_opened_whatever_its_numbers() {
             let resolved = fixture.service().resolve(workspace).expect("it resolves");
             let refusal = fixture
                 .service()
-                .open_repository(&resolved)
+                .open_repository(&resolved, None)
                 .expect_err("another filesystem is not the one it was recorded on");
             assert_eq!(refusal.code(), ErrorCode::SourceChanged);
             volume.detach();

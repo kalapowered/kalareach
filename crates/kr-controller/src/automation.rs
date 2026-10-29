@@ -1094,7 +1094,7 @@ async fn command_directory(
                     .resolve(workspace_id)
                     .map_err(|error| error.to_string())?;
                 let opened = changesets
-                    .open_repository(&resolved)
+                    .open_repository(&resolved, None)
                     .map_err(|error| error.to_string())?;
                 Ok(opened.top_level().to_path_buf())
             })
@@ -2514,6 +2514,7 @@ fn capture(
             note: asked.note.clone(),
         },
         admitted: Some(held),
+        caller: None,
     };
     match changesets.capture(&order) {
         Ok((version, _pinned)) => Ok(ActionOutcome::Success {

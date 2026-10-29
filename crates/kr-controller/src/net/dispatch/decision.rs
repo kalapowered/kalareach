@@ -919,6 +919,26 @@ impl RemoteConnection {
         }
         Ok(())
     }
+
+    /// Refuses a change-set method that runs the Git program on a working tree for a device, on a
+    /// host that cannot confine what that program reads.
+    ///
+    /// Capture, apply, revert and a diff of a working copy each run Git on a working tree, so they
+    /// are held to the rule the five repository operations are: served to a device where this host
+    /// has proved the boundary, with every read bounded to the location the owner authorised for
+    /// the device's grant ([`kr_project::ProjectService::open_workspace_repository_for`]), and
+    /// refused with the one sentence everywhere else.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`refuses_to_run_git`] when this host has not proved the boundary.
+    pub(super) fn check_working_tree_authority(&self) -> std::result::Result<(), ProtocolError> {
+        if self.controller.qualification().qualifies() {
+            Ok(())
+        } else {
+            Err(refuses_to_run_git())
+        }
+    }
 }
 
 /// The one refusal every method that would start the Git program for a device is given where this
@@ -934,25 +954,14 @@ pub(super) fn refuses_to_run_git() -> ProtocolError {
     )
 }
 
-/// The refusal a device is given for a change-set method that reads or writes a working tree.
+/// The refusal a device is given for a change-set method this host does not serve to one.
 ///
-/// Capture, apply, revert and a diff of a working copy each run the Git program on a working tree,
-/// and that program does not run inside the boundary that confines what Git reads for a device's
-/// repository operations. So the method is not served, and the sentence says which part of what it
-/// does is the reason.
-pub(super) fn refuses_a_working_tree(method: Method) -> ProtocolError {
-    let does = match method {
-        Method::DiffApply | Method::DiffRevert => "checks and writes a working tree",
-        _ => "reads a working tree",
-    };
+/// Every change-set method the registry lists is served, so this is what a method added to the
+/// group without a route is given instead of a worker's proxy.
+pub(super) fn unserved_change_set_method(method: Method) -> ProtocolError {
     ProtocolError::new(
-        ErrorCode::PermissionDenied,
-        format!(
-            "{} is not served to a paired device: it {does} by running the Git program, outside \
-             the boundary that confines what that program reads for a device's repository \
-             operations",
-            method.as_str()
-        ),
+        ErrorCode::UnsupportedCapability,
+        format!("{} is not served to a paired device", method.as_str()),
     )
 }
 

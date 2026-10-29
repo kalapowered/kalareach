@@ -871,7 +871,7 @@ nothing ever changes what an earlier test or review was about.
 | `diff.apply` | Applies a version at a named destination class | `files.apply_diff` |
 | `diff.revert` | Puts the base's own content back for the paths a version changed | `files.apply_diff` |
 
-A paired device reaches `changeset.read`, `changeset.materialize` and `diff.read` of a recorded version, for a version inside its grant, and is never told the path of a materialisation's directory. It is refused `changeset.test_reports`, which only the local owner reads, and `changeset.capture`, `diff.apply`, `diff.revert` and `diff.read` of a working copy, which run the Git program on a working tree. `docs/host/README.md` gives the rule that decides whether a version is inside a grant.
+A paired device reaches `changeset.read`, `changeset.materialize` and `diff.read` of a recorded version, for a version inside its grant, and is never told the path of a materialisation's directory. It is refused `changeset.test_reports`, which only the local owner reads. It reaches `changeset.capture`, `diff.apply`, `diff.revert` and `diff.read` of a working copy, which run the Git program on a working tree, only on a host that has proved it confines what that program reads, and only for a workspace that a location the owner authorised for its own grant reaches. `docs/host/README.md` gives the rule that decides whether a version is inside a grant.
 
 A version whose provenance names a session is review work for that session, whether a capture
 recorded it or it was derived from a modified materialisation. The control daemon reads the newest

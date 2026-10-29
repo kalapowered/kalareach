@@ -32,7 +32,7 @@ use std::sync::Arc;
 use kr_changeset::ChangeSetService;
 use kr_changeset::apply::{self, ApplyOrder};
 use kr_changeset::materialise;
-use kr_changeset::service::CaptureOrder;
+use kr_changeset::service::{Caller, CaptureOrder};
 use kr_changeset::store::RetainedOutcome;
 use kr_project::ProjectService;
 use kr_protocol::changeset::{
@@ -264,9 +264,11 @@ impl ChangeSetModule {
     }
 
     /// Serves one change-set read and returns the frame it answers with.
+    ///
+    /// `caller` is the grant a paired device's request is bounded by, and none for the owner.
     #[must_use]
-    pub async fn read_frame(&self, request: &Request) -> ControlFrame {
-        frame(request.request_id, self.read(request).await)
+    pub async fn read_frame(&self, request: &Request, caller: Caller) -> ControlFrame {
+        frame(request.request_id, self.read(request, caller).await)
     }
 
     /// Serves one change-set mutation and returns the frame it answers with.
@@ -278,10 +280,11 @@ impl ChangeSetModule {
         method: Method,
         carried: crate::authority::AdmittedMutation,
         controller: std::sync::Arc<crate::service::Controller>,
+        caller: Caller,
     ) -> ControlFrame {
         frame(
             mutation.request_id,
-            self.write(actor_id, mutation, method, carried, controller)
+            self.write(actor_id, mutation, method, carried, controller, caller)
                 .await,
         )
     }
@@ -291,7 +294,7 @@ impl ChangeSetModule {
     /// # Errors
     ///
     /// Returns the refusal the service decided, under the service's own code.
-    pub async fn read(&self, request: &Request) -> Answer<ParamsValue> {
+    pub async fn read(&self, request: &Request, caller: Caller) -> Answer<ParamsValue> {
         let Some(method) = request.method.method() else {
             return Err(ProtocolError::new(
                 ErrorCode::PermissionDenied,
@@ -322,7 +325,12 @@ impl ChangeSetModule {
             Method::DiffRead => {
                 let params: DiffReadParams = typed(&params)?;
                 let version = version_of(&params)?;
-                encode(&apply::read(&service, params.workspace_id.0, version)?)
+                encode(&apply::read(
+                    &service,
+                    caller,
+                    params.workspace_id.0,
+                    version,
+                )?)
             }
             _ => Err(ProtocolError::new(
                 ErrorCode::InvalidArgument,
@@ -347,6 +355,7 @@ impl ChangeSetModule {
         method: Method,
         carried: crate::authority::AdmittedMutation,
         controller: std::sync::Arc<crate::service::Controller>,
+        caller: Caller,
     ) -> Answer<ParamsValue> {
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
             .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))?;
@@ -408,9 +417,13 @@ impl ChangeSetModule {
             // recorded could be performed again under the same identifier and succeed.
             let outcome = (|| -> Answer<ParamsValue> {
                 match method {
-                    Method::ChangesetCapture => {
-                        encode(&capture(&service, &actor, &typed(&params)?, &admitted)?)
-                    }
+                    Method::ChangesetCapture => encode(&capture(
+                        &service,
+                        &actor,
+                        &typed(&params)?,
+                        &admitted,
+                        caller,
+                    )?),
                     Method::ChangesetMaterialize => {
                         encode(&materialise_version(&service, &typed(&params)?, &admitted)?)
                     }
@@ -420,8 +433,11 @@ impl ChangeSetModule {
                         ActionId::new(action_id),
                         &typed(&params)?,
                         method == Method::DiffRevert,
-                        Some(&deferred),
-                        &admitted,
+                        ApplyBy {
+                            claim: Some(&deferred),
+                            admitted: &admitted,
+                            caller,
+                        },
                     )?),
                     _ => Err(ProtocolError::new(
                         ErrorCode::InvalidArgument,
@@ -696,6 +712,7 @@ fn capture(
     actor_id: &ActorId,
     params: &ChangesetCaptureParams,
     admitted: &dyn kr_changeset::store::StillAdmitted,
+    caller: Caller,
 ) -> kr_changeset::Result<ChangesetCaptureResult> {
     let order = CaptureOrder {
         workspace_id: params.workspace_id,
@@ -719,6 +736,7 @@ fn capture(
             note: params.note.clone(),
         },
         admitted: Some(admitted),
+        caller,
     };
     let (version, pinned) = service.capture(&order)?;
     Ok(ChangesetCaptureResult { version, pinned })
@@ -840,6 +858,16 @@ fn answer_from_retained(
     }
 }
 
+/// What an apply runs under besides its parameters.
+struct ApplyBy<'a> {
+    /// What takes the durable claim, after the preflight and before anything is written.
+    claim: Option<&'a dyn kr_changeset::apply::ActionClaim>,
+    /// The authority the apply arrived under.
+    admitted: &'a dyn kr_changeset::store::StillAdmitted,
+    /// Who the apply is performed for.
+    caller: Caller,
+}
+
 /// Applies or reverts one version at one destination.
 fn run_apply(
     service: &ChangeSetService,
@@ -847,8 +875,7 @@ fn run_apply(
     action_id: ActionId,
     params: &DiffApplyParams,
     revert: bool,
-    claim: Option<&dyn kr_changeset::apply::ActionClaim>,
-    admitted: &dyn kr_changeset::store::StillAdmitted,
+    by: ApplyBy<'_>,
 ) -> kr_changeset::Result<DiffApplyResult> {
     let order = ApplyOrder {
         action_id,
@@ -873,8 +900,9 @@ fn run_apply(
             derivation: String::new(),
             note: String::new(),
         },
-        claim,
-        admitted: Some(admitted),
+        claim: by.claim,
+        admitted: Some(by.admitted),
+        caller: by.caller,
     };
     apply::apply(service, &order)
 }

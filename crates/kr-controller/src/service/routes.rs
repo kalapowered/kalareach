@@ -268,7 +268,7 @@ impl Controller {
                 .await;
         }
         if crate::changeset::ChangeSetModule::serves(method) {
-            return self.changesets.read_frame(request).await;
+            return self.changesets.read_frame(request, None).await;
         }
         if crate::automation::AutomationModule::serves(method) {
             return self.automation.read_frame(request, None).await;
@@ -676,7 +676,7 @@ impl Controller {
             let controller = Arc::clone(self);
             let answered = self
                 .changesets
-                .write_frame(actor_id, mutation, method, carried, controller)
+                .write_frame(actor_id, mutation, method, carried, controller, None)
                 .await;
             // The effect and its reply are separated by everything a blocking task waits for, and
             // a revocation can land in that interval. What this host must not do is **disclose**

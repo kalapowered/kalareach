@@ -456,6 +456,7 @@ fn a_pin_against_the_workspace_holds_the_version() {
         pin: true,
         provenance: support::provenance(),
         admitted: None,
+        caller: None,
     };
     let (record, pinned) = fixture
         .service()

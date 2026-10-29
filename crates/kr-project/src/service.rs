@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use kr_ipc::paths::EnvironmentPaths;
 use kr_protocol::ids::{
-    ActionId, ActorId, ChangeSetId, EnvironmentId, ProjectLocationId, ProjectRepositoryId,
+    ActionId, ActorId, ChangeSetId, EnvironmentId, GrantId, ProjectLocationId, ProjectRepositoryId,
     SessionId, WorkspaceId,
 };
 use kr_protocol::method::Method;
@@ -1749,6 +1749,81 @@ impl ProjectService {
     ) -> Result<OpenedRepository> {
         let row = self.recorded_workspace(workspace_id)?;
         self.open_recorded_workspace_recording(&row, &TreeReach::by_path())
+    }
+
+    /// Opens the repository one workspace's working tree belongs to for a caller bounded by the
+    /// grant `grant`, like [`Self::open_workspace_repository`], and reaches it the one way such a
+    /// caller reaches anything: through a location the owner authorised for that grant.
+    ///
+    /// A workspace made through a location is reached through that location, as a destination.
+    /// A shared workspace is the repository's own tree, which is reached through the source
+    /// location the repository is bound to. A workspace made through no location is reached
+    /// through none, whatever the caller holds over the repository it is a copy of, and is
+    /// refused. Every Git invocation on the opened repository asks the location again before it
+    /// starts and runs with its reads bounded, so a grant withdrawn while the work runs stops the
+    /// next read.
+    ///
+    /// **Nothing is written**, as for [`Self::open_workspace_repository`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::PermissionDenied`] when no location the grant holds reaches the
+    /// workspace, and what [`Self::open_workspace_repository`] returns otherwise.
+    pub fn open_workspace_repository_for(
+        &self,
+        workspace_id: WorkspaceId,
+        grant: GrantId,
+    ) -> Result<OpenedRepository> {
+        let row = self.recorded_workspace(workspace_id)?;
+        let reach = self.reach_of_a_bounded_caller(&row, grant)?;
+        Ok(self.open_recorded_workspace(&row, &reach)?.opened)
+    }
+
+    /// Opens the repository one workspace's working tree belongs to for a caller bounded by the
+    /// grant `grant` like [`Self::open_workspace_repository_for`], and then writes what the
+    /// decisions make of the records, as [`Self::open_workspace_repository_recording`] does.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::open_workspace_repository_for`] returns, and
+    /// [`ProjectError::StoreUnavailable`] when a record cannot be written.
+    pub fn open_workspace_repository_recording_for(
+        &self,
+        workspace_id: WorkspaceId,
+        grant: GrantId,
+    ) -> Result<OpenedRepository> {
+        let row = self.recorded_workspace(workspace_id)?;
+        let reach = self.reach_of_a_bounded_caller(&row, grant)?;
+        self.open_recorded_workspace_recording(&row, &reach)
+    }
+
+    /// Returns how a workspace's tree is reached for a caller bounded by `grant`, which is the
+    /// rule `workspace.remove` holds such a caller to.
+    fn reach_of_a_bounded_caller(&self, row: &WorkspaceRow, grant: GrantId) -> Result<TreeReach> {
+        let admitting = Admitting::Caller(Some(grant));
+        if row.located.is_some() {
+            return self.tree_reach(row.located.as_ref(), admitting);
+        }
+        // A shared workspace is the repository's own tree, which such a caller reaches through
+        // the source location the repository is bound to; any other workspace made through no
+        // location is reached through none.
+        if !matches!(row.kind, WorkspaceKind::SharedExisting) {
+            return Err(ProjectError::PermissionDenied {
+                detail: format!(
+                    "workspace {} was made through no location, so a caller bounded by grant \
+                     {grant} reaches it through none",
+                    row.workspace_id
+                )
+                .into(),
+            });
+        }
+        let project = self
+            .locked()?
+            .project(row.project_repository_id)?
+            .ok_or_else(|| ProjectError::UnknownProject {
+                project: row.project_repository_id.to_string().into(),
+            })?;
+        self.source_reach(&project, admitting)
     }
 
     /// Returns the row the journal holds for a workspace.
