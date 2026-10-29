@@ -40,6 +40,15 @@ if [ "$(uname -s)" != Darwin ]; then
     exit 1
 fi
 
+# The signer is the pinned one. A program named in the environment is taken only for an ad hoc
+# signature of a proving run: the Developer ID signature reads the private key, and only the pinned
+# program is given it.
+if [ -n "${KR_RCODESIGN:-}" ] && [ "$identity" = developer-id ]; then
+    bash "$here/install-rcodesign.sh" --verify "$KR_RCODESIGN" || {
+        echo "sign-macos-tree: KR_RCODESIGN is not the pinned rcodesign, and the Developer ID key is read only by the pinned one" >&2
+        exit 1
+    }
+fi
 rcodesign="${KR_RCODESIGN:-$(bash "$here/install-rcodesign.sh")}"
 
 key_options=()
