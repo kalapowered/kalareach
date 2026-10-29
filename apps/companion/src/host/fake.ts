@@ -343,6 +343,10 @@ export interface FakeDeletion {
   holdConfirm(): void
   /** Answers the confirmation that waits. */
   releaseConfirm(): void
+  /** The next look at how the removal goes waits until the test releases it. */
+  holdStatus(): void
+  /** Answers the look that waits, with what the status answers now. */
+  releaseStatus(): void
 }
 
 /** What the host says of the sessions screens open, and what a test can make it say. */
@@ -1367,6 +1371,8 @@ export function fakeHost(
   let deletionConfirmAnswers: readonly DeletionConfirmAnswer[] = [{ state: 'closed', finished: false }]
   let deletionConfirmHeld = false
   let releaseDeletionConfirm: (() => void) | null = null
+  let deletionStatusHeld = false
+  let releaseDeletionStatus: (() => void) | null = null
   const accountListeners = new Set<(view: AccountView) => void>()
   const setAccount = (view: AccountView) => {
     accountView = view
@@ -2850,7 +2856,13 @@ export function fakeHost(
     },
     accountDeletionStatus: () => {
       deletionStatusReads += 1
-      return Promise.resolve(deletionStatus)
+      if (!deletionStatusHeld) return Promise.resolve(deletionStatus)
+      deletionStatusHeld = false
+      return new Promise<DeletionStatusAnswer>((resolve) => {
+        releaseDeletionStatus = () => {
+          resolve(deletionStatus)
+        }
+      })
     },
     onAccount: (listener) => register(accountListeners, listener),
 
@@ -3258,6 +3270,14 @@ export function fakeHost(
         releaseConfirm() {
           const release = releaseDeletionConfirm
           releaseDeletionConfirm = null
+          release?.()
+        },
+        holdStatus() {
+          deletionStatusHeld = true
+        },
+        releaseStatus() {
+          const release = releaseDeletionStatus
+          releaseDeletionStatus = null
           release?.()
         }
       }

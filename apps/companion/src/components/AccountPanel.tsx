@@ -261,7 +261,12 @@ export function AccountPanel({
           />
         ) : null}
 
-        <SyncPanel port={port} account={view} surface={surface} />
+        <SyncPanel
+          port={port}
+          account={view}
+          surface={surface}
+          closing={deletion.step.name === 'result'}
+        />
 
         <p className="account-section-title">Working without an account</p>
         <Card>

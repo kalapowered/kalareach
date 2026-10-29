@@ -29,6 +29,7 @@ import {
   CODE_DIGITS,
   DEVICE_LINE,
   MONEY_LINES,
+  NOT_DONE_LINE,
   POLICY_LINE,
   RESULT_CLOSED,
   RESULT_DONE,
@@ -37,6 +38,7 @@ import {
   RESULT_STILL,
   STATUS_EVERY_MS,
   STATUS_FOR_MS,
+  STILL_UNKNOWN_LINE,
   TOO_MANY_ORGANISATIONS_LINE,
   UNLISTED_LINE,
   UNSETTLED_LINE,
@@ -68,6 +70,7 @@ export type DeletionStep =
   | { readonly name: 'confirming' }
   | { readonly name: 'acknowledge'; readonly organisations: readonly OwnedOrganisation[] }
   | { readonly name: 'unsettled' }
+  | { readonly name: 'notdone' }
   | { readonly name: 'result'; readonly progress: 'open' | 'done' | 'still' }
 
 /** The steps a person can still walk away from: nothing has been sent that cannot be taken back. */
@@ -78,7 +81,8 @@ const LEAVABLE: readonly DeletionStep['name'][] = [
   'read',
   'sending',
   'code',
-  'acknowledge'
+  'acknowledge',
+  'notdone'
 ]
 
 /** The line a step shows under its words: a step that could not be taken, or this device's own failure. */
@@ -97,6 +101,10 @@ export interface DeletionFlow {
   readonly open: boolean
   readonly preview: DeletionPreview | null
   readonly code: string
+  /** Whether the code is known to have been sent, or may have been. */
+  readonly codeSure: boolean
+  /** Whether a look at how the deletion stands is out. */
+  readonly checking: boolean
   readonly refusal: { readonly reason: CodeRefusal; readonly attemptsLeft: number } | null
   readonly said: Said | null
   readonly begin: () => void
@@ -118,9 +126,14 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
   const [step, setStep] = useState<DeletionStep>({ name: 'idle' })
   const [preview, setPreview] = useState<DeletionPreview | null>(null)
   const [code, setCodeText] = useState('')
+  const [codeSure, setCodeSure] = useState(true)
+  const [checking, setChecking] = useState(false)
   const [refusal, setRefusal] = useState<DeletionFlow['refusal']>(null)
   const [said, setSaid] = useState<Said | null>(null)
   const ask = useRef(0)
+  // Whether a confirmation has left without an answer that says whether it went through: what
+  // happens after that is not "nothing changed".
+  const unresolved = useRef(false)
   const startedWith = useRef<string | null>(null)
   const accepted = useRef<readonly string[]>([])
   // Where the step stands, as the callbacks see it: every change of step goes through `next`.
@@ -135,6 +148,11 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
     setSaid({ problem, stage })
   }, [])
 
+  /** Where a failure leaves the person: with the code, or, if a confirmation is unresolved, still at the unsettled step. */
+  const failedAt = useCallback((): DeletionStep => {
+    return unresolved.current ? { name: 'unsettled' } : { name: 'code' }
+  }, [])
+
   const failure = useCallback((error: unknown) => {
     // A failure of this device's own records, in the backend's words.
     setSaid({ text: failureMessage(error) })
@@ -144,6 +162,9 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
     const mine = (ask.current += 1)
     startedWith.current = generationOf(view)
     accepted.current = []
+    unresolved.current = false
+    setChecking(false)
+    setCodeSure(true)
     setPreview(null)
     setCodeText('')
     setRefusal(null)
@@ -172,6 +193,9 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
 
   const cancel = useCallback(() => {
     ask.current += 1
+    startedWith.current = null
+    unresolved.current = false
+    setChecking(false)
     setCodeText('')
     setRefusal(null)
     setSaid(null)
@@ -193,10 +217,12 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
         if (ask.current !== mine) return
         if (answer.state === 'sent') {
           setRefusal(null)
+          setCodeSure(true)
           next({ name: 'code' })
           return
         }
         problemOf(answer.problem)
+        setCodeSure(answer.problem.kind !== 'unsure')
         // An email that may have been sent is waited for at the field; any other failure leaves
         // the person where they were.
         next(answer.problem.kind === 'unsure' ? { name: 'code' } : from.name === 'code' ? from : { name: 'read' })
@@ -226,31 +252,35 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
           if (ask.current !== mine) return
           switch (answer.state) {
             case 'closed':
+              unresolved.current = false
               next({ name: 'result', progress: answer.finished ? 'done' : 'open' })
               return
             case 'code_refused':
+              unresolved.current = false
               setRefusal({ reason: answer.reason, attemptsLeft: answer.attempts_left })
               setCodeText('')
               next({ name: 'code' })
               return
             case 'acknowledge':
+              unresolved.current = false
               next({ name: 'acknowledge', organisations: answer.organisations })
               return
             case 'unsettled':
+              unresolved.current = true
               next({ name: 'unsettled' })
               return
             case 'problem':
-              problemOf(answer.problem)
-              next({ name: 'code' })
+              problemOf(answer.problem, unresolved.current ? 'unknown' : 'before')
+              next(failedAt())
           }
         })
         .catch((error: unknown) => {
           if (ask.current !== mine) return
           failure(error)
-          next({ name: 'code' })
+          next(failedAt())
         })
     },
-    [failure, next, port, problemOf]
+    [failedAt, failure, next, port, problemOf]
   )
 
   const confirm = useCallback(() => {
@@ -271,47 +301,53 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
     next({ name: 'code' })
   }, [next])
 
-  const status = useCallback(
-    (settled: (answer: 'none' | 'open' | 'done') => void, trouble: (problem: DeletionProblem) => void) => {
-      const mine = ask.current
-      port
-        .accountDeletionStatus()
-        .then((answer) => {
-          if (ask.current !== mine) return
-          if (answer.state === 'problem') trouble(answer.problem)
-          else settled(answer.state)
-        })
-        .catch(() => {
-          if (ask.current === mine) trouble({ kind: 'unreachable' })
-        })
-    },
-    [port]
-  )
-
+  // One look at how the deletion stands, from the unsettled step. A person presses it once and
+  // waits for it: Try again is not offered while it is out, because the two together would send a
+  // confirmation while the look decides whether one is still running.
   const checkAgain = useCallback(() => {
-    status(
-      (answer) => {
-        if (answer === 'open' || answer === 'done') {
-          next({ name: 'result', progress: answer })
-        } else {
+    if (checking) return
+    const mine = ask.current
+    setChecking(true)
+    port
+      .accountDeletionStatus()
+      .then((answer) => {
+        setChecking(false)
+        if (ask.current !== mine) return
+        const stage = current.current.name === 'result' ? 'after' : 'unknown'
+        if (answer.state === 'problem') {
+          problemOf(answer.problem, stage)
+        } else if (answer.state === 'open' || answer.state === 'done') {
+          unresolved.current = false
           setSaid(null)
+          next({ name: 'result', progress: answer.state })
+        } else if (answer.state === 'none') {
+          unresolved.current = false
+          setSaid(null)
+          next({ name: 'notdone' })
+        } else {
+          setSaid({ text: STILL_UNKNOWN_LINE })
         }
-      },
-      (problem) => {
-        problemOf(problem, 'after')
-      }
-    )
-  }, [next, problemOf, status])
+      })
+      .catch(() => {
+        setChecking(false)
+        if (ask.current === mine) problemOf({ kind: 'unreachable' }, 'unknown')
+      })
+  }, [checking, next, port, problemOf])
 
   const finish = useCallback(() => {
     ask.current += 1
+    startedWith.current = null
+    unresolved.current = false
+    setChecking(false)
     setCodeText('')
     setSaid(null)
     next({ name: 'idle' })
   }, [next])
 
-  // A look when the panel opens: a deletion that was under way when the application last ran is
-  // shown as the result it is. Once, and only when nothing else has begun.
+  // A look when the panel opens, and again when the account changes under it: a deletion that was
+  // under way when the application last ran is shown as the result it is, and a confirmation that
+  // is still out, or whose answer is not known, is shown as that. Only when nothing else has begun.
+  const standing = view === null ? null : view.state === 'signed_in' ? view.generation : view.state
   useEffect(() => {
     let live = true
     port
@@ -320,13 +356,16 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
         if (!live || current.current.name !== 'idle') return
         if (answer.state === 'open' || answer.state === 'done') {
           next({ name: 'result', progress: answer.state })
+        } else if (answer.state === 'unsettled') {
+          unresolved.current = true
+          next({ name: 'unsettled' })
         }
       })
       .catch(() => undefined)
     return () => {
       live = false
     }
-  }, [next, port])
+  }, [next, port, standing])
 
   // The sign-in the step began under is the one it goes on under: a different sign-in, or none,
   // ends it before a code is sent, and never while a confirmation is out or after the account is
@@ -334,7 +373,14 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
   const generation = generationOf(view)
   useEffect(() => {
     if (!LEAVABLE.includes(step.name)) return
+    // A step that began without the person asking for it (what an unsettled confirmation came to)
+    // is under the sign-in it was first seen under.
+    if (startedWith.current === null && generation !== null) {
+      startedWith.current = generation
+      return
+    }
     if (generation === null || generation !== startedWith.current) {
+      startedWith.current = null
       ask.current += 1
       setCodeText('')
       setRefusal(null)
@@ -371,7 +417,12 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
           timer = setTimeout(look, wait)
         })
         .catch(() => {
-          if (live) timer = setTimeout(look, STATUS_EVERY_MS)
+          if (!live) return
+          if (Date.now() - began >= STATUS_FOR_MS) {
+            next({ name: 'result', progress: 'still' })
+            return
+          }
+          timer = setTimeout(look, STATUS_EVERY_MS)
         })
     }
     timer = setTimeout(look, STATUS_EVERY_MS)
@@ -381,11 +432,52 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
     }
   }, [next, port, progress])
 
+  // An unsettled confirmation is looked at again by itself for about two minutes, since by then
+  // nothing can still be running: it ends as the closed account, or as a deletion that did not go
+  // through. After that the person's own Check again is what is left.
+  const unsettled = step.name === 'unsettled'
+  useEffect(() => {
+    if (!unsettled) return
+    const began = Date.now()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let live = true
+    const look = () => {
+      port
+        .accountDeletionStatus()
+        .then((answer) => {
+          if (!live) return
+          if (answer.state === 'open' || answer.state === 'done') {
+            unresolved.current = false
+            setSaid(null)
+            next({ name: 'result', progress: answer.state })
+            return
+          }
+          if (answer.state === 'none') {
+            unresolved.current = false
+            setSaid(null)
+            next({ name: 'notdone' })
+            return
+          }
+          if (Date.now() - began < STATUS_FOR_MS) timer = setTimeout(look, STATUS_EVERY_MS)
+        })
+        .catch(() => {
+          if (live && Date.now() - began < STATUS_FOR_MS) timer = setTimeout(look, STATUS_EVERY_MS)
+        })
+    }
+    timer = setTimeout(look, STATUS_EVERY_MS)
+    return () => {
+      live = false
+      if (timer !== undefined) clearTimeout(timer)
+    }
+  }, [next, port, unsettled])
+
   return {
     step,
     open: step.name !== 'idle',
     preview,
     code,
+    codeSure,
+    checking,
     refusal,
     said,
     begin,
@@ -408,7 +500,7 @@ export function DeleteAccount({
   readonly flow: DeletionFlow
   readonly surface: Surface
 }): ReactNode {
-  const { step, preview, code, refusal, said } = flow
+  const { step, preview, code, codeSure, checking, refusal, said } = flow
   const target = minimumTarget(surface)
   const statusRef = useRef<HTMLDivElement | null>(null)
   const codeRef = useRef<HTMLInputElement | null>(null)
@@ -428,13 +520,8 @@ export function DeleteAccount({
   }, [refusal])
 
   const busy = step.name === 'reading' || step.name === 'sending' || step.name === 'confirming'
-  const stage: Stage = step.name === 'result' || step.name === 'unsettled' ? 'after' : 'before'
   const line =
-    said === null
-      ? null
-      : 'text' in said
-        ? said.text
-        : describeProblem(said.problem, said.stage === 'after' ? 'after' : stage)
+    said === null ? null : 'text' in said ? said.text : describeProblem(said.problem, said.stage)
   const kind = said !== null && 'problem' in said ? said.problem.kind : 'local'
 
   const cancel = (
@@ -480,7 +567,7 @@ export function DeleteAccount({
     case 'read':
     case 'sending':
       lead = `This deletes the account ${preview?.address ?? ''}. It cannot be undone.`
-      body = preview === null ? null : <Reading preview={preview} />
+      body = preview === null ? null : <Reading preview={preview} surface={surface} />
       actions = (
         <>
           <Button
@@ -500,7 +587,7 @@ export function DeleteAccount({
       break
     case 'code':
     case 'confirming':
-      lead = preview === null ? '' : describeCodeSent(preview)
+      lead = preview === null ? '' : describeCodeSent(preview, codeSure)
       body = (
         <div className="deletion-field">
           <label className="deletion-label" htmlFor={fieldId}>
@@ -539,6 +626,15 @@ export function DeleteAccount({
         <>
           <Button
             data-wraps
+            data-testid="delete-account-resend"
+            disabled={step.name === 'confirming'}
+            style={{ minBlockSize: target }}
+            onClick={flow.sendCode}
+          >
+            Send another code
+          </Button>
+          <Button
+            data-wraps
             tone="danger"
             data-testid="delete-account-confirm"
             disabled={code.length !== CODE_DIGITS || step.name === 'confirming'}
@@ -546,15 +642,6 @@ export function DeleteAccount({
             onClick={flow.confirm}
           >
             Delete account permanently
-          </Button>
-          <Button
-            data-wraps
-            data-testid="delete-account-resend"
-            disabled={step.name === 'confirming'}
-            style={{ minBlockSize: target }}
-            onClick={flow.sendCode}
-          >
-            Send another code
           </Button>
           {step.name === 'confirming' ? null : cancel}
         </>
@@ -589,6 +676,7 @@ export function DeleteAccount({
           >
             Back
           </Button>
+          {cancel}
         </>
       )
       break
@@ -600,19 +688,40 @@ export function DeleteAccount({
             data-wraps
             tone="primary"
             data-testid="delete-account-check"
+            disabled={checking}
             style={{ minBlockSize: target }}
             onClick={flow.checkAgain}
           >
             Check again
           </Button>
+          {code.length === CODE_DIGITS ? (
+            <Button
+              data-wraps
+              data-testid="delete-account-again"
+              disabled={checking}
+              style={{ minBlockSize: target }}
+              onClick={flow.confirm}
+            >
+              Try again
+            </Button>
+          ) : null}
+        </>
+      )
+      break
+    case 'notdone':
+      lead = NOT_DONE_LINE
+      actions = (
+        <>
           <Button
             data-wraps
-            data-testid="delete-account-again"
+            tone="primary"
+            data-testid="delete-account-restart"
             style={{ minBlockSize: target }}
-            onClick={flow.confirm}
+            onClick={flow.begin}
           >
-            Try again
+            Start again
           </Button>
+          {cancel}
         </>
       )
       break
@@ -686,23 +795,32 @@ export function DeleteAccount({
 }
 
 /** What deleting removes and keeps, in lists, with the money first. */
-function Reading({ preview }: { readonly preview: DeletionPreview }): ReactNode {
+function Reading({
+  preview,
+  surface
+}: {
+  readonly preview: DeletionPreview
+  readonly surface: Surface
+}): ReactNode {
   const warnings = preview.warnings.map(describeWarning)
+  // The sheet on a computer has its own title one level up, and a phone's screen has only the page's:
+  // the headings follow whichever is above them, so no level is skipped.
+  const Heading = surface === 'desktop' ? 'h3' : 'h2'
   return (
     <>
-      <h3 className="deletion-heading">Before you go on</h3>
+      <Heading className="deletion-heading">Before you go on</Heading>
       <ul className="deletion-list" data-testid="delete-account-before">
         {[...warnings, ...MONEY_LINES].map((text) => (
           <li key={text}>{text}</li>
         ))}
       </ul>
-      <h3 className="deletion-heading">What is deleted</h3>
+      <Heading className="deletion-heading">What is deleted</Heading>
       <ul className="deletion-list" data-testid="delete-account-deleted">
         {preview.deleted.map((kind) => (
           <li key={kind}>{describeDeleted(kind, preview)}</li>
         ))}
       </ul>
-      <h3 className="deletion-heading">What stays</h3>
+      <Heading className="deletion-heading">What stays</Heading>
       <ul className="deletion-list" data-testid="delete-account-kept">
         {preview.kept.map((kind) => (
           <li key={kind}>{describeKept(kind, preview)}</li>

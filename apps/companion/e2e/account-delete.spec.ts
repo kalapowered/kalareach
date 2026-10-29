@@ -156,6 +156,30 @@ for (const [surface, size] of [
     await settled(page)
     await page.screenshot({ path: shot(`code-${surface}-${size.toFixed(1)}`), fullPage: true })
 
+    // A confirmation whose answer is lost is told as not known, and a look that finds nothing as
+    // not gone through; each is whole at every size.
+    await page.evaluate(() => {
+      window.krTestHost?.account.deletion.answerConfirm({ state: 'unsettled' })
+      window.krTestHost?.account.deletion.answerStatus({ state: 'none' })
+    })
+    await field.fill('12345678')
+    await panel.getByTestId('delete-account-confirm').click()
+    await expect(panel.getByTestId('delete-account-check')).toBeVisible()
+    expect(await overrunning(page, '[data-testid="delete-account"]')).toEqual([])
+    await sizes(['delete-account-check', 'delete-account-again'])
+    await settled(page)
+    await page.screenshot({ path: shot(`unsettled-${surface}-${size.toFixed(1)}`), fullPage: true })
+    await panel.getByTestId('delete-account-check').click()
+    await expect(card).toHaveAttribute('data-step', 'notdone')
+    expect(await overrunning(page, '[data-testid="delete-account"]')).toEqual([])
+    await sizes(['delete-account-restart', 'delete-account-cancel'])
+    await settled(page)
+    await page.screenshot({ path: shot(`notdone-${surface}-${size.toFixed(1)}`), fullPage: true })
+    await panel.getByTestId('delete-account-restart').click()
+    await expect(panel.getByTestId('delete-account-send-code')).toBeVisible()
+    await panel.getByTestId('delete-account-send-code').click()
+    await expect(field).toBeFocused()
+
     await page.evaluate((owned) => {
       window.krTestHost?.account.deletion.answerConfirm(
         { state: 'acknowledge', organisations: [owned] },

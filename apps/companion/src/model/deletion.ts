@@ -110,9 +110,12 @@ export type DeletionConfirmAnswer =
   | { readonly state: 'unsettled' }
   | { readonly state: 'problem'; readonly problem: DeletionProblem }
 
-/** How the removal is going. */
+/**
+ * How the removal is going. `unsettled` is a confirmation that left and has no answer yet, here or
+ * at the service: it may still close the account.
+ */
 export type DeletionStatusAnswer =
-  | { readonly state: 'none' | 'open' | 'done' }
+  | { readonly state: 'none' | 'unsettled' | 'open' | 'done' }
   | { readonly state: 'problem'; readonly problem: DeletionProblem }
 
 /** How many digits the code has. */
@@ -220,8 +223,23 @@ function describeWait(seconds: number): string {
   return minutes === 1 ? 'about a minute' : `about ${String(minutes)} minutes`
 }
 
-/** Where a step is, which decides what a failure to reach the service claims. */
-export type Stage = 'before' | 'after'
+/**
+ * Where a step is, which decides what a failure to reach the service claims: before anything was
+ * sent nothing changed; once a confirmation has left without an answer, whether it went through is
+ * not known; once the account is closed, the deletion goes on without this device.
+ */
+export type Stage = 'before' | 'unknown' | 'after'
+
+/** What not reaching the service means, by where the step is. */
+function describeUnreachable(stage: Stage): string {
+  if (stage === 'before') {
+    return `KalaReach could not reach ${ACCOUNT_HOST}. Nothing changed. Try again.`
+  }
+  if (stage === 'unknown') {
+    return `KalaReach could not reach ${ACCOUNT_HOST} just now. Try again in a moment.`
+  }
+  return 'KalaReach could not check just now. The deletion goes on without it, and KalaReach checks again.'
+}
 
 /** A step that could not be taken, in words. */
 export function describeProblem(problem: DeletionProblem, stage: Stage = 'before'): string {
@@ -237,9 +255,7 @@ export function describeProblem(problem: DeletionProblem, stage: Stage = 'before
     case 'unsure':
       return 'We could not tell whether the email was sent. Check your email, or send another code.'
     case 'unreachable':
-      return stage === 'before'
-        ? `KalaReach could not reach ${ACCOUNT_HOST}. Nothing changed. Try again.`
-        : 'KalaReach could not check just now. The deletion goes on without it, and KalaReach checks again.'
+      return describeUnreachable(stage)
     case 'account_changed':
       return 'A different account is signed in now. Start again.'
   }
@@ -259,9 +275,13 @@ export function describeRefusal(reason: CodeRefusal, attemptsLeft: number): stri
   }
 }
 
-/** The line that says the code was sent. */
-export function describeCodeSent(preview: DeletionPreview): string {
-  return `We sent an ${String(CODE_DIGITS)}-digit code to ${preview.address}. It works for ${String(preview.code_lifetime_minutes)} minutes.`
+/** The line that says the code was sent, or may have been. */
+export function describeCodeSent(preview: DeletionPreview, sure: boolean): string {
+  const digits = String(CODE_DIGITS)
+  const minutes = String(preview.code_lifetime_minutes)
+  return sure
+    ? `We sent an ${digits}-digit code to ${preview.address}. It works for ${minutes} minutes.`
+    : `An ${digits}-digit code may have been sent to ${preview.address}. It works for ${minutes} minutes.`
 }
 
 /** The line that says the account owns more organisations than one request can accept. */
@@ -288,4 +308,6 @@ export const RESULT_STILL = 'Still finishing. KalaReach checks again the next ti
 export const RESULT_DONE = 'Your account is deleted.'
 export const RESULT_NO_EMAIL = 'You will not get an email.'
 export const UNSETTLED_LINE = 'We could not tell whether the deletion went through.'
+export const STILL_UNKNOWN_LINE = 'It is still not known whether the deletion went through.'
+export const NOT_DONE_LINE = 'The deletion did not go through. Your account is still open.'
 export const ACKNOWLEDGE_LINE = 'These organisations will lose their owner.'

@@ -95,11 +95,18 @@ interface Finished {
 export function SyncPanel({
   port,
   account,
-  surface
+  surface,
+  closing = false
 }: {
   readonly port: HostPort
   readonly account: AccountView | null
   readonly surface: Surface
+  /**
+   * Whether a deletion of the account has just closed it. What the device cleared when it closed
+   * (the recovery record) is read again when this changes, since the signed-out view comes before
+   * the clearing is done.
+   */
+  readonly closing?: boolean
 }): ReactNode {
   const desktop = surface === 'desktop'
   const target = minimumTarget(surface)
@@ -208,7 +215,7 @@ export function SyncPanel({
 
   useEffect(() => {
     refresh()
-  }, [refresh, standing])
+  }, [refresh, standing, closing])
 
   // The first time the settings are read with sync on, the card looks for the person's other devices
   // once: a computer that shares none finds out whether another does, and one that does sees who

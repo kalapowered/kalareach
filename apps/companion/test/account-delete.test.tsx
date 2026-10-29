@@ -25,6 +25,7 @@ import {
   describeKept,
   describeProblem,
   describeRefusal,
+  STILL_UNKNOWN_LINE,
   type DeletionConfirmAnswer,
   type DeletionPreview,
   type DeletionProblem
@@ -298,6 +299,18 @@ describe('the code', () => {
       'data-kind',
       'unsure'
     )
+    // It does not claim the email was sent beside the line that says that is not known.
+    expect(within(setup.panel).getByTestId('delete-account-lead')).toHaveTextContent('may have been sent')
+  })
+
+  it('offers the dangerous control last but for Cancel', async () => {
+    const setup = await phone()
+    await atTheField(setup)
+    const actions = within(setup.panel).getByTestId('delete-account').querySelector('.account-actions')
+    const order = Array.from(actions?.querySelectorAll('button') ?? []).map((button) =>
+      button.getAttribute('data-testid')
+    )
+    expect(order).toEqual(['delete-account-resend', 'delete-account-confirm', 'delete-account-cancel'])
   })
 
   it.each([
@@ -338,6 +351,9 @@ describe('an account that owns an organisation', () => {
     const list = await within(setup.panel).findByTestId('delete-account-organisations')
     expect(within(list).getAllByRole('listitem')).toHaveLength(2)
 
+    // Leaving from here puts the panel back as it was.
+    expect(within(setup.panel).getByTestId('delete-account-cancel')).toBeVisible()
+
     // Back goes to the field with the code still there.
     await setup.person.click(within(setup.panel).getByTestId('delete-account-back'))
     expect(within(setup.panel).getByTestId('delete-account-code')).toHaveValue(CODE)
@@ -371,10 +387,8 @@ describe('the result', () => {
       await Promise.resolve()
     })
     await within(setup.panel).findByTestId('delete-account-done')
-    expect(within(setup.panel).getByTestId('delete-account-lead')).toHaveTextContent(
-      'Your account is closed.'
-    )
-    expect(within(setup.panel).getByText('You will not get an email.')).toBeVisible()
+    expect(within(setup.panel).getByTestId('delete-account-lead')).toHaveTextContent(/is closed/)
+    expect(within(setup.panel).getByText(/not get an email/)).toBeVisible()
   })
 
   it('says the account is deleted at once when the removal had finished, and Done leaves the signed-out panel', async () => {
@@ -383,7 +397,7 @@ describe('the result', () => {
     const field = await atTheField(setup)
     await setup.person.type(field, CODE)
     await setup.person.keyboard('{Enter}')
-    expect(await within(setup.panel).findByText('Your account is deleted.')).toBeVisible()
+    expect(await within(setup.panel).findByText(/is deleted/)).toBeVisible()
     await setup.person.click(within(setup.panel).getByTestId('delete-account-done'))
     expect(within(setup.panel).queryByTestId('delete-account')).toBeNull()
     expect(within(setup.panel).getByRole('button', { name: 'Sign in' })).toBeVisible()
@@ -399,16 +413,74 @@ describe('the result', () => {
     await setup.person.type(field, CODE)
     await setup.person.keyboard('{Enter}')
     await within(setup.panel).findByTestId('delete-account-check')
-    // Nothing found: the same words stay.
-    deletion.answerStatus({ state: 'none' })
+    // Not yet known: the person is told so and stays where they are.
+    deletion.answerStatus({ state: 'unsettled' })
     await setup.person.click(within(setup.panel).getByTestId('delete-account-check'))
-    await waitFor(() => {
-      expect(deletion.statusReads).toBeGreaterThan(1)
-    })
+    expect(await within(setup.panel).findByText(/still not known/)).toBeVisible()
     expect(step(setup.panel)).toBe('unsettled')
     deletion.answerStatus({ state: 'open' })
     await setup.person.click(within(setup.panel).getByTestId('delete-account-check'))
     await within(setup.panel).findByTestId('delete-account-done')
+  })
+
+  it('says the deletion did not go through when the service has no trace of it, and starts again', async () => {
+    const setup = await phone()
+    const { deletion } = setup.controls.account
+    deletion.answerConfirm({ state: 'unsettled' })
+    const field = await atTheField(setup)
+    await setup.person.type(field, CODE)
+    await setup.person.keyboard('{Enter}')
+    await within(setup.panel).findByTestId('delete-account-check')
+    deletion.answerStatus({ state: 'none' })
+    await setup.person.click(within(setup.panel).getByTestId('delete-account-check'))
+    await waitFor(() => {
+      expect(step(setup.panel)).toBe('notdone')
+    })
+    expect(within(setup.panel).getByTestId('delete-account-lead')).toHaveTextContent('did not go through')
+    await setup.person.click(within(setup.panel).getByTestId('delete-account-restart'))
+    await within(setup.panel).findByTestId('delete-account-before')
+    expect(deletion.views).toBe(2)
+  })
+
+  it('does not say nothing changed when a try after an unsettled answer cannot reach the service', async () => {
+    const setup = await phone()
+    const { deletion } = setup.controls.account
+    deletion.answerConfirm(
+      { state: 'unsettled' },
+      { state: 'problem', problem: { kind: 'unreachable' } }
+    )
+    const field = await atTheField(setup)
+    await setup.person.type(field, CODE)
+    await setup.person.keyboard('{Enter}')
+    await setup.person.click(await within(setup.panel).findByTestId('delete-account-again'))
+    const said = await within(setup.panel).findByTestId('delete-account-problem')
+    expect(said).toHaveAttribute('data-kind', 'unreachable')
+    expect(said).not.toHaveTextContent('Nothing changed')
+    // It is still the step that says it is not known, with the way to settle it.
+    expect(step(setup.panel)).toBe('unsettled')
+    expect(within(setup.panel).getByTestId('delete-account-check')).toBeVisible()
+  })
+
+  it('does not offer to try again while it is looking, so a confirmation is not sent beside the look', async () => {
+    const setup = await phone()
+    const { deletion } = setup.controls.account
+    deletion.answerConfirm({ state: 'unsettled' })
+    const field = await atTheField(setup)
+    await setup.person.type(field, CODE)
+    await setup.person.keyboard('{Enter}')
+    await within(setup.panel).findByTestId('delete-account-check')
+    deletion.answerStatus({ state: 'unsettled' })
+    deletion.holdStatus()
+    await setup.person.click(within(setup.panel).getByTestId('delete-account-check'))
+    expect(within(setup.panel).getByTestId('delete-account-again')).toBeDisabled()
+    expect(within(setup.panel).getByTestId('delete-account-check')).toBeDisabled()
+    await act(async () => {
+      deletion.releaseStatus()
+      await Promise.resolve()
+    })
+    await waitFor(() => {
+      expect(within(setup.panel).getByTestId('delete-account-again')).toBeEnabled()
+    })
   })
 
   it('tries the same code again from an unsettled answer', async () => {
@@ -429,7 +501,7 @@ describe('the result', () => {
 
 describe('how the removal goes', () => {
   /** Mounts the panel with a deletion under way, with the clock under the test's hand. */
-  async function underWay(status: 'open' | 'done') {
+  async function underWay(status: 'open' | 'done' | 'unsettled') {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
     const { port, controls } = fakeHost()
     controls.account.set(SIGNED_IN)
@@ -466,12 +538,61 @@ describe('how the removal goes', () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(3000)
     })
-    expect(within(panel).getByText('Your account is deleted.')).toBeVisible()
+    expect(within(panel).getByText(/is deleted/)).toBeVisible()
     const after = controls.account.deletion.statusReads
     await act(async () => {
       await vi.advanceTimersByTimeAsync(10_000)
     })
     expect(controls.account.deletion.statusReads).toBe(after)
+  })
+
+  it('shows a removal that had finished when the panel opens, and asks no more', async () => {
+    const controls = await underWay('done')
+    const tab = screen.getByRole('button', { name: /^Account/ })
+    await act(async () => {
+      tab.click()
+      await vi.advanceTimersByTimeAsync(10)
+    })
+    const panel = screen.getByTestId('mobile-account')
+    expect(within(panel).getByTestId('delete-account')).toHaveAttribute('data-step', 'result')
+    expect(within(panel).getByText(/is deleted/)).toBeVisible()
+    const reads = controls.account.deletion.statusReads
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000)
+    })
+    expect(controls.account.deletion.statusReads).toBe(reads)
+  })
+
+  it('stops asking after about two minutes when the asking itself fails, too', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    const { port, controls } = fakeHost()
+    controls.account.set(SIGNED_IN)
+    controls.account.deletion.answerStatus({ state: 'open' })
+    const asked = vi.spyOn(port, 'accountDeletionStatus')
+    render(
+      <AppProvider port={port}>
+        <MobileApp surface="ios" storage={null} />
+      </AppProvider>
+    )
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10)
+    })
+    const tab = screen.getByRole('button', { name: /^Account/ })
+    await act(async () => {
+      tab.click()
+      await vi.advanceTimersByTimeAsync(10)
+    })
+    const panel = screen.getByTestId('mobile-account')
+    expect(within(panel).getByTestId('delete-account')).toHaveAttribute('data-step', 'result')
+    asked.mockRejectedValue(new Error('the host did not answer'))
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2 * 60 * 1000 + 3000)
+    })
+    const after = asked.mock.calls.length
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000)
+    })
+    expect(asked.mock.calls.length).toBe(after)
   })
 
   it('stops asking after about two minutes, and says it is still finishing', async () => {
@@ -518,6 +639,78 @@ describe('how the removal goes', () => {
   })
 })
 
+describe('a deletion another window carries out', () => {
+  it('shows its result here when the account changes under the open panel', async () => {
+    const setup = await phone()
+    expect(within(setup.panel).queryByTestId('delete-account')).toBeNull()
+    setup.controls.account.deletion.answerStatus({ state: 'open' })
+    act(() => {
+      setup.controls.account.set({ state: 'signed_out', outcome: null })
+    })
+    await waitFor(() => {
+      expect(step(setup.panel)).toBe('result')
+    })
+  })
+})
+
+describe('a confirmation that is still out when the panel opens', () => {
+  /** Mounts the panel while the backend says a confirmation has no answer yet. */
+  async function mounted() {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    const { port, controls } = fakeHost()
+    controls.account.set(SIGNED_IN)
+    controls.account.deletion.answerStatus({ state: 'unsettled' })
+    render(
+      <AppProvider port={port}>
+        <MobileApp surface="ios" storage={null} />
+      </AppProvider>
+    )
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10)
+    })
+    const tab = screen.getByRole('button', { name: /^Account/ })
+    await act(async () => {
+      tab.click()
+      await vi.advanceTimersByTimeAsync(10)
+    })
+    return { controls, panel: screen.getByTestId('mobile-account') }
+  }
+
+  it('shows that it is not known, offers no retry it has no code for, and shows the result when it comes', async () => {
+    const { controls, panel } = await mounted()
+    expect(within(panel).getByTestId('delete-account')).toHaveAttribute('data-step', 'unsettled')
+    expect(within(panel).getByTestId('delete-account-check')).toBeVisible()
+    expect(within(panel).queryByTestId('delete-account-again')).toBeNull()
+    controls.account.deletion.answerStatus({ state: 'open' })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000)
+    })
+    expect(within(panel).getByTestId('delete-account')).toHaveAttribute('data-step', 'result')
+  })
+
+  it('ends as a deletion that did not go through when the service never had it', async () => {
+    const { controls, panel } = await mounted()
+    controls.account.deletion.answerStatus({ state: 'none' })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000)
+    })
+    expect(within(panel).getByTestId('delete-account')).toHaveAttribute('data-step', 'notdone')
+  })
+
+  it('stops looking by itself after about two minutes', async () => {
+    const { controls, panel } = await mounted()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2 * 60 * 1000 + 3000)
+    })
+    const after = controls.account.deletion.statusReads
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000)
+    })
+    expect(controls.account.deletion.statusReads).toBe(after)
+    expect(within(panel).getByTestId('delete-account')).toHaveAttribute('data-step', 'unsettled')
+  })
+})
+
 describe('the desktop sheet', () => {
   async function sheetAt(person: ReturnType<typeof userEvent.setup>) {
     await person.click(screen.getByRole('button', { name: /^Account/ }))
@@ -556,6 +749,76 @@ describe('the desktop sheet', () => {
     sheet = await sheetAt(person)
     await waitFor(() => {
       expect(within(sheet).getByTestId('delete-account')).toHaveAttribute('data-step', 'result')
+    })
+  })
+
+  it('shows that the confirmation has no answer yet when the sheet is opened during it, and the result after', async () => {
+    const { port, controls } = fakeHost()
+    controls.account.set(SIGNED_IN)
+    render(
+      <AppProvider port={port} initialPlace={{ view: 'attention' }}>
+        <App />
+      </AppProvider>
+    )
+    const person = userEvent.setup()
+    let sheet = await sheetAt(person)
+    await person.click(await within(sheet).findByTestId('delete-account-open'))
+    await person.click(await within(sheet).findByTestId('delete-account-send-code'))
+    const field = await within(sheet).findByTestId('delete-account-code')
+    await person.type(field, CODE)
+    controls.account.deletion.holdConfirm()
+    await person.keyboard('{Enter}')
+    await waitFor(() => {
+      expect(controls.account.deletion.confirms).toHaveLength(1)
+    })
+    await person.keyboard('{Escape}')
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog', { name: 'Account' })).toBeNull()
+    })
+
+    // The sheet is opened while the confirmation is out: the backend says it has no answer yet.
+    controls.account.deletion.answerStatus({ state: 'unsettled' })
+    sheet = await sheetAt(person)
+    await waitFor(() => {
+      expect(within(sheet).getByTestId('delete-account')).toHaveAttribute('data-step', 'unsettled')
+    })
+
+    // The answer comes, and a look finds the account closed.
+    controls.account.deletion.answerStatus({ state: 'open' })
+    await act(async () => {
+      controls.account.deletion.releaseConfirm()
+      await Promise.resolve()
+    })
+    await person.click(within(sheet).getByTestId('delete-account-check'))
+    await waitFor(() => {
+      expect(within(sheet).getByTestId('delete-account')).toHaveAttribute('data-step', 'result')
+    })
+  })
+
+  it('reads recovery again when the account closes and when the person leaves, since the device clears it meanwhile', async () => {
+    const { port, controls } = fakeHost()
+    controls.account.set(SIGNED_IN)
+    const recoveryReads = vi.spyOn(port, 'recoveryView')
+    render(
+      <AppProvider port={port} initialPlace={{ view: 'attention' }}>
+        <App />
+      </AppProvider>
+    )
+    const person = userEvent.setup()
+    const sheet = await sheetAt(person)
+    await person.click(await within(sheet).findByTestId('delete-account-open'))
+    await person.click(await within(sheet).findByTestId('delete-account-send-code'))
+    await person.type(await within(sheet).findByTestId('delete-account-code'), CODE)
+    await waitFor(() => {
+      expect(recoveryReads).toHaveBeenCalled()
+    })
+    await person.keyboard('{Enter}')
+    await within(sheet).findByTestId('delete-account-done')
+    // The signed-out view arrived first; a read after the result is the one that sees the clearing.
+    const atResult = recoveryReads.mock.calls.length
+    await person.click(within(sheet).getByTestId('delete-account-done'))
+    await waitFor(() => {
+      expect(recoveryReads.mock.calls.length).toBeGreaterThan(atResult)
     })
   })
 
@@ -633,6 +896,8 @@ describe('the step names nothing to buy and links nowhere (the store-build rule)
     open: true,
     preview: EVERYTHING,
     code: '',
+    codeSure: true,
+    checking: false,
     refusal: null,
     said: null,
     begin: noop,
@@ -661,16 +926,19 @@ describe('the step names nothing to buy and links nowhere (the store-build rule)
         organisations: [{ organisation_id: 'org-1', name: 'Acme', members: 4 }]
       },
       { name: 'unsettled' },
+      { name: 'notdone' },
       { name: 'result', progress: 'open' },
       { name: 'result', progress: 'still' },
       { name: 'result', progress: 'done' }
     ]
     const flows: DeletionFlow[] = steps.map((at) => flowAt(at))
     for (const problem of PROBLEMS) {
-      for (const stage of ['before', 'after'] as const) {
+      for (const stage of ['before', 'unknown', 'after'] as const) {
         flows.push(flowAt({ name: 'code' }, { said: { problem, stage } }))
       }
     }
+    flows.push(flowAt({ name: 'code' }, { codeSure: false }))
+    flows.push(flowAt({ name: 'unsettled' }, { code: CODE, said: { text: STILL_UNKNOWN_LINE } }))
     for (const reason of ['wrong', 'expired', 'spent'] as const) {
       flows.push(flowAt({ name: 'code' }, { refusal: { reason, attemptsLeft: reason === 'wrong' ? 2 : 0 } }))
     }
@@ -686,7 +954,7 @@ describe('the step names nothing to buy and links nowhere (the store-build rule)
       unmount()
     }
     for (const problem of PROBLEMS) {
-      for (const stage of ['before', 'after'] as const) {
+      for (const stage of ['before', 'unknown', 'after'] as const) {
         const text = describeProblem(problem, stage).toLowerCase()
         for (const word of PURCHASE_WORDS) expect(text, `${problem.kind}: ${word}`).not.toContain(word)
       }
