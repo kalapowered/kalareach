@@ -332,6 +332,22 @@ describe('the code', () => {
       expect(within(setup.panel).getByTestId('delete-account-code')).toHaveValue(CODE)
     }
   )
+
+  it('names no button the code step lacks when another window holds the deletion', async () => {
+    const setup = await phone()
+    setup.controls.account.deletion.answerConfirm({
+      state: 'problem',
+      problem: { kind: 'in_progress' }
+    })
+    const field = await atTheField(setup)
+    await setup.person.type(field, CODE)
+    await setup.person.keyboard('{Enter}')
+    const said = await within(setup.panel).findByTestId('delete-account-problem')
+    expect(said).toHaveAttribute('data-kind', 'in_progress')
+    expect(step(setup.panel)).toBe('code')
+    expect(within(setup.panel).queryByTestId('delete-account-check')).toBeNull()
+    expect(said).not.toHaveTextContent(/check again/i)
+  })
 })
 
 describe('an account that owns an organisation', () => {
@@ -799,6 +815,30 @@ describe('a look made when the panel opened', () => {
       await Promise.resolve()
     })
     expect(within(panel).queryByTestId('delete-account')).toBeNull()
+  })
+
+  it.each([
+    ['open', /Your account is closed/],
+    ['done', /is deleted/]
+  ] as const)('shows the person the closure their own look found: %s', async (state, words) => {
+    const { port, controls } = fakeHost()
+    controls.account.set(SIGNED_IN)
+    controls.account.deletion.answerStatus({ state })
+    render(
+      <AppProvider port={port}>
+        <MobileApp surface="ios" storage={null} />
+      </AppProvider>
+    )
+    const person = userEvent.setup()
+    await person.click(await screen.findByRole('button', { name: /^Account/ }))
+    const panel = await screen.findByTestId('mobile-account')
+    const step = await within(panel).findByTestId('delete-account')
+    await waitFor(() => {
+      expect(step).toHaveAttribute('data-step', 'result')
+    })
+    expect(within(panel).getByText(words)).toBeVisible()
+    // The look only opened the panel; the looks that follow the result say so.
+    expect(controls.account.deletion.statusFollowing[0]).toBe(false)
   })
 })
 

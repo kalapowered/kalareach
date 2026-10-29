@@ -381,7 +381,8 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
   // A look when the panel opens, and again when the account changes under it: a confirmation that
   // is still out, or whose answer is not known, is shown as that. Only when nothing else has begun,
   // and not if the person has done anything since the look was asked. The panel is only opening, so
-  // it is told of nothing that has closed the account: that is shown to the page that follows it.
+  // it is told of a closed account only when it was that account's own sign-in the look ended: any
+  // other closure is shown to the page that follows it.
   const standing = view === null ? null : view.state === 'signed_in' ? view.generation : view.state
   useEffect(() => {
     let live = true
@@ -389,7 +390,9 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
     inOrder(() => port.accountDeletionStatus(false))
       .then((answer) => {
         if (!live || ask.current !== mine || current.current.name !== 'idle') return
-        if (answer.state === 'unsettled') {
+        if (answer.state === 'open' || answer.state === 'done') {
+          next({ name: 'result', progress: answer.state })
+        } else if (answer.state === 'unsettled') {
           unresolved.current = true
           next({ name: 'unsettled' })
         }

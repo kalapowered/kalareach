@@ -261,7 +261,7 @@ export function describeProblem(problem: DeletionProblem, stage: Stage = 'before
     case 'account_changed':
       return 'A different account is signed in now. Start again.'
     case 'in_progress':
-      return 'KalaReach is already working on this deletion. Wait a moment, then check again.'
+      return 'KalaReach is already working on this deletion. Wait a moment, then try again.'
   }
 }
 
