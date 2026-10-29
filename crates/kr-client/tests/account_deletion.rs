@@ -1514,6 +1514,10 @@ async fn a_closure_learned_for_one_account_never_ends_or_edits_another_accounts(
         DeletionProgress::None,
         "the closed account is not the one signed in"
     );
+    assert!(
+        !status.closed_now,
+        "and the one signed in is not told that another account closed"
+    );
 
     // Control: with no other account signed in, the same answer ends the sign-in.
     let rig = new_rig().await;

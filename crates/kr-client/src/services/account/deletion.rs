@@ -1206,9 +1206,11 @@ impl ManagedAccountDeletion {
                 closed_now: false,
             }
         };
+        let progress = self.shown(&mark, advanced.progress)?;
         Ok(DeletionStatus {
-            progress: self.shown(&mark, advanced.progress)?,
-            closed_now: advanced.closed_now,
+            progress,
+            // Only the person whose deletion it is is told of the closure.
+            closed_now: advanced.closed_now && progress != DeletionProgress::None,
         })
     }
 

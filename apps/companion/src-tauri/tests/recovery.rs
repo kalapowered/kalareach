@@ -1845,3 +1845,26 @@ async fn a_look_that_cannot_reach_the_service_still_clears_what_a_closed_account
     assert_eq!(answer["state"], "problem");
     assert_eq!(page.view()["state"], "off");
 }
+
+/// Start-up looks after a closed account's leftovers before anyone asks: the recovery record that
+/// outlived the account is cleared with no look from the page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_start_clears_what_a_closed_account_left_with_no_look_from_the_page() {
+    let computer = Computer::new().await;
+    let earlier = computer.page().await;
+    earlier
+        .call("recovery_turn_on", json!({}))
+        .expect("recovery is on");
+    drop(earlier);
+    let closed = closing::closed_account_unreachable_at(computer.served.origin()).await;
+    let page = computer.start(Arc::clone(&closed));
+    page.call(
+        "sync_service_set",
+        json!({ "origin": computer.served.origin() }),
+    )
+    .expect("the service is chosen");
+    assert_eq!(page.view()["state"], "on");
+
+    companion_tauri::account::deletion::resume(&page.app.state::<AppState>(), &closed).await;
+    assert_eq!(page.view()["state"], "off");
+}

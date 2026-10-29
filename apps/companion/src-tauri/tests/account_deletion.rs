@@ -179,10 +179,12 @@ impl Carrier for Present {
     }
 }
 
-/// A store that refuses to delete the stored sign-in for as long as it is told to.
+/// A store that refuses to delete the stored sign-in for as long as it is told to, and, when told
+/// to, to keep the deletion record.
 struct Flaky {
     inner: MemoryStore,
     fail: AtomicBool,
+    refuse_record: AtomicBool,
 }
 
 impl SecretStore for Flaky {
@@ -191,6 +193,11 @@ impl SecretStore for Flaky {
     }
 
     fn set(&self, name: &SecretName, value: &[u8]) -> CryptoResult<()> {
+        if name.as_str() == "account/deletion" && self.refuse_record.load(Ordering::SeqCst) {
+            return Err(CryptoError::SecretStore {
+                message: "the disk refused".to_owned(),
+            });
+        }
         self.inner.set(name, value)
     }
 
@@ -420,6 +427,7 @@ async fn a_start_after_an_interrupted_ending_finishes_it_before_the_first_view()
     let flaky = Arc::new(Flaky {
         inner: MemoryStore::new(),
         fail: AtomicBool::new(true),
+        refuse_record: AtomicBool::new(false),
     });
     let wire = Arc::new(Wire::default());
     wire.then(&["confirm_closed_closing"]);
@@ -527,4 +535,35 @@ async fn the_person_can_give_up_on_a_confirmation_that_has_no_answer() {
             .expect("joined");
     assert_eq!(status["state"], "none");
     assert!(session(&rig), "the sign-in is as it was");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failure_of_the_devices_own_records_tells_the_page_nothing_it_must_not_have() {
+    let flaky = Arc::new(Flaky {
+        inner: MemoryStore::new(),
+        fail: AtomicBool::new(false),
+        refuse_record: AtomicBool::new(true),
+    });
+    let rig = rig_over(
+        Arc::clone(&flaky) as Arc<dyn SecretStore>,
+        Arc::new(Wire::default()),
+    )
+    .await;
+    let account = Arc::clone(&rig.account);
+    let answer = tokio::task::spawn_blocking(move || {
+        invoke(
+            &account,
+            "account_deletion_confirm",
+            json!({ "code": CODE, "acknowledged": [] }),
+        )
+    })
+    .await
+    .expect("joined");
+    // The device could not keep the receipt, so nothing was sent and the page is told it failed.
+    assert!(answer.get("refused").is_some(), "{answer}");
+    assert!(rig.wire.bodies.lock().expect("bodies").is_empty());
+    let told = answer.to_string();
+    for secret in ["an-access-token", "first", CODE] {
+        assert!(!told.contains(secret), "{secret} in {told}");
+    }
 }
