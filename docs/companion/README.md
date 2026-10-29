@@ -93,7 +93,7 @@ why. Over a host this device is paired with, the host serves the output the devi
 from the first of it, and the view says that the output before it is not available to this device
 rather than that the host kept none; a session that has written nothing the grant reaches says so
 too. Each view keeps its own place across a change of view: the conversation and the output return
-the reader to the node or page they were reading, or to the live end if they were following it.
+the reader to the node or page they were reading, or to the live end if they were following it. On the phone the three views are the tabs under the session's header; the output fills the room under them and the composer is not drawn there, and the draft is there when the conversation comes back.
 
 A session exports two files, each where the platform's save dialog puts it. The semantic archive
 holds each entry of every live agent's history as the session's worker gives it, with its time, at
