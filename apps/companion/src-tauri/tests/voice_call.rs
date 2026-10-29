@@ -20,6 +20,7 @@
 //! | A sign of life that native code refuses as ended ends the call | `a_sign_of_life_native_code_refuses_as_ended_ends_the_call` |
 //! | A delegation is answered to the model that nothing was done, once | `a_delegation_is_answered_to_the_model_that_nothing_was_done_once` |
 //! | A mute silences the microphone here and is told to the service | `muting_the_microphone_silences_it_here_and_tells_the_service` |
+//! | What the system does to capture in a call is told, and ends nothing | `the_systems_changes_to_capture_are_told_and_do_not_end_the_call` |
 //! | A voice call is not a shell session: hanging up leaves the session a worker runs live | `hanging_up_a_call_leaves_the_terminal_session_it_was_made_over_running` |
 //! | A voice service that is down at the start, in the call or at the hang-up leaves mute, silence, the media's stop and the grant's revocation with this device and the host | `a_service_that_is_down_at_the_start_leaves_no_media_and_a_notice`, `a_service_that_goes_down_in_the_call_leaves_mute_and_silence_with_native_code`, `a_service_that_is_down_at_the_hang_up_still_stops_the_media_and_revokes_the_grant` |
 //! | A host that names another voice service gets no token | `a_host_that_names_another_voice_service_gets_no_token` |
@@ -54,7 +55,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use companion_platform::call::{CallEvent, FailureKind};
+use companion_platform::call::{CallEvent, CaptureState, FailureKind};
 use companion_tauri::account::carrier::{Boxed, Carrier, Ending, Plan, Unavailable};
 use companion_tauri::account::{Account, AccountSlot};
 use companion_tauri::voice::{Calls, Kept, Service, Timings};
@@ -720,8 +721,8 @@ async fn a_control_that_is_not_authorised_closes_the_call_the_host_started() {
     scene.stop_host().await;
 }
 
-/// The notification's stop is native code's own end of the call. No page is looking, and the call
-/// is ended in full all the same.
+/// KR-REQ-15.35: the notification's stop is native code's own end of the call, a termination the
+/// call handles. No page is looking, and the call is ended in full all the same.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_notifications_stop_ends_the_call_with_no_page() {
     let mut scene = scene().await;
@@ -835,8 +836,8 @@ async fn a_failed_connection_ends_the_call_with_no_page() {
     scene.stop_host().await;
 }
 
-/// News that was lost can be the end of the call. The device asks native code what it holds, and
-/// ends the call when it holds none.
+/// KR-REQ-15.35: news that was lost can be the end of the call. The device reconciles its state
+/// with native code's: it asks what native code holds, and ends the call when it holds none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn news_that_was_lost_is_checked_against_what_native_code_holds() {
     // No sign of life is due for an hour, so only the check of lost news can end this call.
@@ -975,8 +976,8 @@ async fn a_delegation_listed_when_the_control_attaches_has_no_offset() {
     scene.stop_host().await;
 }
 
-/// Muting the microphone is native code's, and the service is told as advice to the provider.
-/// Silencing the model's voice is native code's alone.
+/// KR-REQ-15.35: muting the microphone is native code's, and the service is told as advice to the
+/// provider. Silencing the model's voice is native code's alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn muting_the_microphone_silences_it_here_and_tells_the_service() {
     let mut scene = scene().await;
@@ -1027,6 +1028,42 @@ async fn muting_the_microphone_silences_it_here_and_tells_the_service() {
         1,
         "only the microphone's mute is advice to the provider: {tellings:?}"
     );
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// KR-REQ-15.35 and KR-REQ-15.36: what the system does to capture in the middle of a call, a phone
+/// call, a route change, a suspension of the application's audio or a microphone that is gone, is
+/// native code's news. The call tells it as the system said it, nothing of it ends the call, and
+/// capture coming back is told the same way, so a person always reads what the microphone is
+/// doing and never an unreceived hearing as a received one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_systems_changes_to_capture_are_told_and_do_not_end_the_call() {
+    let mut scene = scene().await;
+    scene.start().await;
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+
+    for (state, word) in [
+        (CaptureState::Interrupted, "interrupted"),
+        (CaptureState::RouteChanging, "route_changing"),
+        (CaptureState::SuspendedBySystem, "suspended_by_system"),
+        (CaptureState::Unavailable, "unavailable"),
+        (CaptureState::Capturing, "capturing"),
+    ] {
+        scene.platform.tell(CallEvent::Capture { state });
+        let told = scene
+            .state_where(word, |view| view["capture"] == word)
+            .await;
+        assert_eq!(
+            told["running"], true,
+            "{word} does not end the call: {told}"
+        );
+        assert_eq!(told["ended"], serde_json::Value::Null, "{told}");
+    }
     let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
     scene.stop_host().await;
 }
@@ -1347,8 +1384,9 @@ async fn a_stop_native_code_never_returns_does_not_hold_the_revocation() {
     scene.stop_host().await;
 }
 
-/// A page that is loaded again holds nothing of the call it left, and finds it where it is kept:
-/// the state names the call, and a stop that names none ends the call this device holds.
+/// KR-REQ-15.35: a page that is loaded again, as on resume, holds nothing of the call it left and
+/// finds it where it is kept: the state names the call, and a stop that names none ends the call
+/// this device holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_page_that_is_loaded_again_finds_the_call_and_ends_it() {
     let mut scene = scene().await;
@@ -3196,7 +3234,8 @@ async fn a_refusal_that_is_not_the_typed_reason_stays_owed_until_the_host_revoke
     scene.stop_host().await;
 }
 
-/// A process that ends during a call leaves its revocation owed. The host ends nothing when a
+/// KR-REQ-15.35: a process that ends during a call, as when the system terminates the application,
+/// leaves its revocation owed, and the next launch reconciles it. The host ends nothing when a
 /// phone vanishes mid-call: the grant stands until the call's own deadline, and a phone that comes
 /// back before then would know nothing of it. So the call stands on an entry in the kept file from
 /// the moment the host names it, which the end of the call replaces with what the end owes. The
