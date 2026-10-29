@@ -602,6 +602,18 @@ impl Kr {
             "{} is not built; run this with kr-cli's tests (cargo test -p kr-cli -p kr-shell-integration)",
             built.display()
         );
+        // On macOS `defaults` reads the user's own preferences unless the `kr` reads the directory
+        // the cases name for them, which only a test build does: kr-cli's tests make that build,
+        // and a `kr` from `cargo build` is not it. Refuse one that is not, before it is run.
+        assert!(
+            !cfg!(target_os = "macos")
+                || std::fs::read(&built).is_ok_and(|program| program
+                    .windows(b"KR_TERMINAL_PREFERENCES_DIR".len())
+                    .any(|name| name == b"KR_TERMINAL_PREFERENCES_DIR")),
+            "{} is not a test build of kr, which a run on macOS needs so that no preference of the \
+             user's own is read or written; build it with kr-cli's tests",
+            built.display()
+        );
         let root = tempfile::tempdir().expect("a directory on the internal disk");
         let binary = root.path().join("kr");
         kr_ipc::testing::place_and_start_once(&built, &binary, &["--version"]);
@@ -1001,10 +1013,10 @@ fn installing_beside_iterm2_and_over_unusual_files_adds_only_the_marked_entry() 
                 ("HOME".to_owned(), told(&path)),
                 ("ZDOTDIR".to_owned(), told(&path)),
                 ("XDG_CONFIG_HOME".to_owned(), told(&path.join(".config"))),
-                // `defaults` ignores HOME: the terminal preferences are files of this home's own.
+                // `defaults` ignores HOME: the terminal preferences are files of this home's own,
+                // which only a test build of `kr` reads (see `Kr::new`).
                 (
-                    kr_shell_integration::host::terminal_profile::PREFERENCES_DIRECTORY_VARIABLE
-                        .to_owned(),
+                    "KR_TERMINAL_PREFERENCES_DIR".to_owned(),
                     told(&path.join("domains")),
                 ),
                 ("TERM".to_owned(), "xterm-256color".to_owned()),

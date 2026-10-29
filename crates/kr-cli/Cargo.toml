@@ -91,6 +91,10 @@ rustix = { workspace = true, features = ["thread"] }
 aws-lc-rs.workspace = true
 # The tests act exactly when a held rename was refused, through the retry's own seam.
 kr-flush = { workspace = true, features = ["testing"] }
+# The `kr` the terminal profile tests start reads the directory of preference files they name, in
+# place of Terminal's and iTerm2's own: a build that does is a test build, since `defaults` reads
+# the user's own preferences whatever `HOME` says. No shipped build enables this.
+kr-shell-integration = { workspace = true, features = ["testing"] }
 # The Windows start and pairing tests register a test environment's scheduled task and host a
 # daemon that starts its workers through it.
 kr-controller = { workspace = true, features = ["testing"] }

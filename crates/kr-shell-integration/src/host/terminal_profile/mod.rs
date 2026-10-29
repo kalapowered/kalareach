@@ -142,16 +142,20 @@ pub struct ProfileHome {
     pub terminal_preferences: String,
     /// How the settings database is reached for the applications that keep profiles in it.
     pub settings: gsettings::Gsettings,
-    /// The directory this run is confined to, where [`PREFERENCES_DIRECTORY_VARIABLE`] is set: the
-    /// home, which is not the account's own. A record that names a profile file or a preferences
-    /// path outside it was made by a run that was not confined and is left alone, and an install
-    /// that would write a profile file outside it is refused.
+    /// The directory this run is confined to: the home, where a testing build was told to use
+    /// preference files of its own. A record that names a profile file or a preferences path
+    /// outside it was made by a run that was not confined and is left alone, and an install that
+    /// would write a profile file outside it is refused. `None` in every other run, which a shipped
+    /// build always is.
     pub confined_to: Option<PathBuf>,
 }
 
 /// The variable that names a directory of preferences files, by the name of the domain each stands
 /// in for, in place of the system's own domains. `defaults` reads the user's real domains whatever
 /// `HOME` says, so a run that must not reach them (a test's) names a directory of its own here.
+///
+/// Only a build with the `testing` feature reads it. No shipped build enables that feature, so a
+/// release build of `kr` never reads the variable, whatever its environment holds.
 ///
 /// The directory must be an absolute path inside the home the run uses, and that home must not be
 /// the account's own: a run that keeps the account's home would work on the user's real profile
@@ -162,34 +166,59 @@ pub struct ProfileHome {
 /// the variable does not move. An empty value, a relative path, a path outside the home or an own
 /// home is refused, never read as unset, since a run that sets the variable means to stay away from
 /// the user's own preferences.
+#[cfg(feature = "testing")]
 pub const PREFERENCES_DIRECTORY_VARIABLE: &str = "KR_TERMINAL_PREFERENCES_DIR";
 
 /// Why the places of this user cannot be worked out.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum HomeError {
     /// There is no absolute home directory.
-    #[error("there is no home directory to find a terminal application's profiles in")]
     NoHome,
     /// [`PREFERENCES_DIRECTORY_VARIABLE`] is set to something that is not an absolute directory
     /// inside the home.
-    #[error(
-        "{PREFERENCES_DIRECTORY_VARIABLE} must be an absolute directory inside the home this run uses; \
-         it is empty, relative or outside it, and nothing was read or written"
-    )]
+    #[cfg(feature = "testing")]
     PreferencesDirectory,
     /// [`PREFERENCES_DIRECTORY_VARIABLE`] is set and the home this run uses is the account's own,
     /// so the files kr would work on beside the scratch preferences are the user's real ones.
-    #[error(
-        "{PREFERENCES_DIRECTORY_VARIABLE} is for a run whose home is not the account's own; \
-         nothing was read or written"
-    )]
+    #[cfg(feature = "testing")]
     OwnHome,
 }
+
+impl HomeError {
+    /// What a person is told.
+    #[must_use]
+    pub const fn said(&self) -> &'static str {
+        match self {
+            Self::NoHome => {
+                "there is no home directory to find a terminal application's profiles in"
+            }
+            #[cfg(feature = "testing")]
+            Self::PreferencesDirectory => {
+                "KR_TERMINAL_PREFERENCES_DIR must be an absolute directory inside the home this \
+                 run uses; it is empty, relative or outside it, and nothing was read or written"
+            }
+            #[cfg(feature = "testing")]
+            Self::OwnHome => {
+                "KR_TERMINAL_PREFERENCES_DIR is for a run whose home is not the account's own; \
+                 nothing was read or written"
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for HomeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.said())
+    }
+}
+
+impl std::error::Error for HomeError {}
 
 /// Whether `home` is the account's own home directory. Where the system's record of the account
 /// cannot be read, a Unix home is taken to be the account's own, since a run that means to stay
 /// away from it should not go on on a guess; other platforms keep no such record and have no
 /// preferences to redirect.
+#[cfg(feature = "testing")]
 fn is_the_accounts_own(home: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -220,14 +249,43 @@ fn preferences_domain(directory: Option<&Path>, name: &str) -> String {
     )
 }
 
+/// The directory of preferences files [`PREFERENCES_DIRECTORY_VARIABLE`] names, where it is set.
+///
+/// # Errors
+///
+/// Returns [`HomeError::PreferencesDirectory`] when the value is not an absolute directory inside
+/// `home`, and [`HomeError::OwnHome`] when `home` is the account's own.
+#[cfg(feature = "testing")]
+fn preferences_directory(home: &Path) -> Result<Option<PathBuf>, HomeError> {
+    let Some(directory) = std::env::var_os(PREFERENCES_DIRECTORY_VARIABLE) else {
+        return Ok(None);
+    };
+    let directory = PathBuf::from(directory);
+    if !(directory.is_absolute()
+        && directory.starts_with(home)
+        && !directory
+            .components()
+            .any(|part| part == std::path::Component::ParentDir))
+    {
+        return Err(HomeError::PreferencesDirectory);
+    }
+    if is_the_accounts_own(home) {
+        return Err(HomeError::OwnHome);
+    }
+    Ok(Some(directory))
+}
+
 impl ProfileHome {
     /// This user's places, from the environment.
     ///
+    /// A build with the `testing` feature also reads `KR_TERMINAL_PREFERENCES_DIR`; any other
+    /// build does not look for it.
+    ///
     /// # Errors
     ///
-    /// Returns [`HomeError::NoHome`] when there is no absolute home, and
-    /// [`HomeError::PreferencesDirectory`] when [`PREFERENCES_DIRECTORY_VARIABLE`] is set and is not
-    /// an absolute directory inside the home.
+    /// Returns [`HomeError::NoHome`] when there is no absolute home. A build with the `testing`
+    /// feature also returns an error when the variable is set and is not an absolute directory
+    /// inside a home that is not the account's own.
     pub fn of_this_user() -> Result<Self, HomeError> {
         let absolute = |name: &str| {
             std::env::var_os(name)
@@ -237,24 +295,10 @@ impl ProfileHome {
         let home = absolute("HOME")
             .or_else(|| absolute("USERPROFILE"))
             .ok_or(HomeError::NoHome)?;
-        let preferences = match std::env::var_os(PREFERENCES_DIRECTORY_VARIABLE) {
-            None => None,
-            Some(directory) => {
-                let directory = PathBuf::from(directory);
-                if !(directory.is_absolute()
-                    && directory.starts_with(&home)
-                    && !directory
-                        .components()
-                        .any(|part| part == std::path::Component::ParentDir))
-                {
-                    return Err(HomeError::PreferencesDirectory);
-                }
-                if is_the_accounts_own(&home) {
-                    return Err(HomeError::OwnHome);
-                }
-                Some(directory)
-            }
-        };
+        #[cfg(feature = "testing")]
+        let preferences = preferences_directory(&home)?;
+        #[cfg(not(feature = "testing"))]
+        let preferences: Option<PathBuf> = None;
         Ok(Self {
             confined_to: preferences.as_ref().map(|_| home.clone()),
             data_home: absolute("XDG_DATA_HOME").unwrap_or_else(|| home.join(".local/share")),
@@ -395,8 +439,9 @@ pub enum ProfileError {
         /// Where the record says it is.
         recorded: PathBuf,
     },
-    /// This run is confined to a home by [`PREFERENCES_DIRECTORY_VARIABLE`], and the record names a
-    /// profile outside it: one a run that was not confined made, which this run leaves alone.
+    /// This run is confined to a home, as a testing build that was told to use preference files of
+    /// its own is, and the record names a profile outside it: one a run that was not confined made,
+    /// which this run leaves alone.
     #[error("the record names {}'s profile outside the home this run is confined to, so it was left alone", .0.name())]
     Outside(ProfileTerminal),
     /// The record names a profile for the emulator that is not of the kind this install writes.
