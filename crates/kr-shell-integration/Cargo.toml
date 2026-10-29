@@ -12,6 +12,14 @@ publish.workspace = true
 name = "kr-shell-fixtures"
 path = "src/bin/kr-shell-fixtures.rs"
 
+[features]
+# What the tests of `kr host terminal-profile` act through: a build that reads the directory
+# `KR_TERMINAL_PREFERENCES_DIR` names and takes Terminal's and iTerm2's preferences from the files
+# under it, since `defaults` reads the user's own preferences whatever `HOME` says. It compiles to
+# nothing without this feature, and no shipped build enables it. kr-cli's tests enable it through
+# their development dependency on this crate, which gives the `kr` they start the feature too.
+testing = []
+
 [dependencies]
 kr-cbor.workspace = true
 kr-crypto.workspace = true
