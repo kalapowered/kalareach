@@ -431,7 +431,7 @@ export function tauriPort(): HostPort {
       call<DeletionConfirmAnswer>('account_deletion_confirm', { code, acknowledged }),
     accountDeletionStatus: (following) =>
       call<DeletionStatusAnswer>('account_deletion_status', { following }),
-    accountDeletionForget: () => call<DeletionStatusAnswer>('account_deletion_forget', {}),
+    accountDeletionHide: () => call<DeletionStatusAnswer>('account_deletion_hide', {}),
     onAccount: (listener) => listening<AccountView>(ACCOUNT_EVENT, listener),
 
     syncServiceView: () => call<SyncServiceView>('sync_service_view', {}),

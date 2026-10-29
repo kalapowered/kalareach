@@ -457,7 +457,7 @@ describe('the result', () => {
     expect(within(setup.panel).getByTestId('delete-account-open')).toBeVisible()
   })
 
-  it('has a way out: Close stops the asking and puts the panel back', async () => {
+  it('has a way out: Close hides the step and puts the panel back', async () => {
     const setup = await phone()
     const { deletion } = setup.controls.account
     deletion.answerConfirm({ state: 'unsettled' })
@@ -468,7 +468,7 @@ describe('the result', () => {
     await waitFor(() => {
       expect(within(setup.panel).queryByTestId('delete-account')).toBeNull()
     })
-    expect(deletion.forgets).toBe(1)
+    expect(deletion.hides).toBe(1)
     expect(within(setup.panel).getByText(/sam@example\.com/)).toBeVisible()
     expect(within(setup.panel).getByTestId('delete-account-open')).toHaveFocus()
   })
@@ -477,7 +477,7 @@ describe('the result', () => {
     const setup = await phone()
     const { deletion } = setup.controls.account
     deletion.answerConfirm({ state: 'unsettled' })
-    deletion.answerForget({ state: 'problem', problem: { kind: 'in_progress' } })
+    deletion.answerHide({ state: 'problem', problem: { kind: 'in_progress' } })
     const field = await atTheField(setup)
     await setup.person.type(field, CODE)
     await setup.person.keyboard('{Enter}')
@@ -606,6 +606,11 @@ describe('how the removal goes', () => {
     expect(controls.account.deletion.statusReads).toBe(after)
   })
 
+  it('tells the backend the result was shown when it shows the removal as done', async () => {
+    const { controls } = await atTheResult(true)
+    expect(controls.account.deletion.statusFollowing.filter(Boolean)).toHaveLength(1)
+  })
+
   it('shows a removal that had finished inside the confirmation, and asks no more', async () => {
     const { controls, panel } = await atTheResult(true)
     expect(within(panel).getByTestId('delete-account')).toHaveAttribute('data-step', 'result')
@@ -723,14 +728,14 @@ describe('a confirmation that is still out when the panel opens', () => {
       within(panel).getByTestId('delete-account-close').click()
       await vi.advanceTimersByTimeAsync(10)
     })
-    expect(deletion.forgets).toBe(0)
+    expect(deletion.hides).toBe(0)
     // A second press while Close is out would be turned away; it is not offered.
     expect(within(panel).getByTestId('delete-account-close')).toBeDisabled()
     await act(async () => {
       deletion.releaseStatus()
       await vi.advanceTimersByTimeAsync(10)
     })
-    expect(deletion.forgets).toBe(1)
+    expect(deletion.hides).toBe(1)
     expect(within(panel).queryByTestId('delete-account')).toBeNull()
   })
 
@@ -840,6 +845,41 @@ describe('a look made when the panel opened', () => {
     // The look only opened the panel; the looks that follow the result say so.
     expect(controls.account.deletion.statusFollowing[0]).toBe(false)
   })
+
+  it.each([
+    ['open', /Your account is closed/],
+    ['done', /is deleted/]
+  ] as const)(
+    'shows the closure its own look found though the account change that look caused reaches the page first: %s',
+    async (state, words) => {
+      const { port, controls } = fakeHost()
+      controls.account.set(SIGNED_IN)
+      // The look finds the account closed. The look made after the sign-in ended has nothing to say.
+      controls.account.deletion.answerStatus({ state }, { state: 'none' })
+      controls.account.deletion.holdStatus()
+      render(
+        <AppProvider port={port}>
+          <MobileApp surface="ios" storage={null} />
+        </AppProvider>
+      )
+      const person = userEvent.setup()
+      await person.click(await screen.findByRole('button', { name: /^Account/ }))
+      const panel = await screen.findByTestId('mobile-account')
+      // The backend ends the sign-in, and publishes it, before it answers.
+      act(() => {
+        controls.account.set({ state: 'signed_out', outcome: null })
+      })
+      await act(async () => {
+        controls.account.deletion.releaseStatus()
+        await Promise.resolve()
+      })
+      const step = await within(panel).findByTestId('delete-account')
+      await waitFor(() => {
+        expect(step).toHaveAttribute('data-step', 'result')
+      })
+      expect(within(panel).getByText(words)).toBeVisible()
+    }
+  )
 })
 
 describe('the desktop sheet', () => {

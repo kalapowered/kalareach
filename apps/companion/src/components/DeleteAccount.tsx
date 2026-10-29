@@ -344,14 +344,14 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
       })
   }, [cancel, checking, inOrder, next, port, problemOf])
 
-  // The way out of the unsettled step: the backend stops asking after the confirmation, and the
-  // person is back at the Account panel. A sign-in the confirmation closed is found out the next
-  // time the account is used.
+  // The way out of the unsettled step: the backend does not offer it again and keeps the receipt,
+  // and the person is back at the Account panel. A closure that lands later is found by the look
+  // when Account opens, or when the sign-in is next used.
   const giveUp = useCallback(() => {
     const mine = (ask.current += 1)
     // Nothing else is sent while this is out, so Close is not turned away by the page's own look.
     setChecking(true)
-    inOrder(() => port.accountDeletionForget())
+    inOrder(() => port.accountDeletionHide())
       .then((answer) => {
         if (ask.current !== mine) return
         setChecking(false)
@@ -382,17 +382,26 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
   // is still out, or whose answer is not known, is shown as that. Only when nothing else has begun,
   // and not if the person has done anything since the look was asked. The panel is only opening, so
   // it is told of a closed account only when it was that account's own sign-in the look ended: any
-  // other closure is shown to the page that follows it.
+  // other closure is shown to the page that follows it. That look ends the sign-in, and the account
+  // change it causes reaches the page before the look's answer does: a result is shown whichever
+  // comes first, and is not the answer a change of account makes out of date.
   const standing = view === null ? null : view.state === 'signed_in' ? view.generation : view.state
+  const mounted = useRef(true)
+  useEffect(() => {
+    mounted.current = true
+    return () => {
+      mounted.current = false
+    }
+  }, [])
   useEffect(() => {
     let live = true
     const mine = ask.current
     inOrder(() => port.accountDeletionStatus(false))
       .then((answer) => {
-        if (!live || ask.current !== mine || current.current.name !== 'idle') return
+        if (!mounted.current || ask.current !== mine || current.current.name !== 'idle') return
         if (answer.state === 'open' || answer.state === 'done') {
           next({ name: 'result', progress: answer.state })
-        } else if (answer.state === 'unsettled') {
+        } else if (answer.state === 'unsettled' && live) {
           unresolved.current = true
           next({ name: 'unsettled' })
         }
@@ -428,6 +437,12 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
   // The result asks how the removal goes until it is done, for about two minutes, and then says it
   // is still finishing; the next time the panel opens it asks again.
   const progress = step.name === 'result' ? step.progress : null
+  // A result that is shown as done is told to the backend, which keeps the record of the deletion
+  // until a page has shown it.
+  useEffect(() => {
+    if (progress !== 'done') return
+    inOrder(() => port.accountDeletionStatus(true)).catch(() => undefined)
+  }, [inOrder, port, progress])
   useEffect(() => {
     if (progress !== 'open') return
     const began = Date.now()

@@ -314,5 +314,5 @@ export const RESULT_NO_EMAIL = 'You will not get an email.'
 export const UNSETTLED_LINE = 'We could not tell whether the deletion went through.'
 export const STILL_UNKNOWN_LINE = 'It is still not known whether the deletion went through.'
 export const GIVE_UP_LINE =
-  'Close stops KalaReach asking. If the account was deleted, the sign-in on this device ends the next time it is used.'
+  'Close hides this. KalaReach checks again when you open Account. If the account was deleted, the sign-in on this device ends the next time it is used.'
 export const ACKNOWLEDGE_LINE = 'These organisations will lose their owner.'
