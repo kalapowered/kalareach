@@ -555,12 +555,14 @@ async fn kr_req_11_21_an_approval_the_table_read_is_answered_with_the_tables_byt
 ///
 /// Three requests the upstream waits on are each read into an approval by the component, and the
 /// person answers none of them. Each approval is a pending resource that the broker records as
-/// durable. While the three wait, the component takes another call and has decoded each of them
-/// once and encoded none: a decode that stayed open for the person would hold the binding's thread,
-/// and neither the later requests nor that call would be served. The person then answers the middle
-/// one, the first and the last, in that order, and the component, which is asked to encode each
-/// answer when it is given, has its answer written to the upstream once and for its own request.
-/// (That an approval outlives the plugin runtime is `kr_req_24_06_...` in the observation suite.)
+/// durable, and a second connection to the session's journal file, which shares nothing with the
+/// broker's own, finds the three records there, pending and durable, under the resource
+/// identifiers the broker gave. While the three wait, the component takes another call and has
+/// decoded each of them once and encoded none: a decode that stayed open for the person would hold
+/// the binding's thread, and neither the later requests nor that call would be served. The person
+/// then answers the middle one, the first and the last, in that order, and the component, which is
+/// asked to encode each answer when it is given, has its answer written to the upstream once and
+/// for its own request.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_11_38_an_approval_waiting_for_a_person_holds_no_call_of_the_component() {
     let Some(world) =
@@ -582,6 +584,28 @@ async fn kr_req_11_38_an_approval_waiting_for_a_person_holds_no_call_of_the_comp
             "the wait for request {number} is recorded in memory only"
         );
         approvals.push(approval);
+    }
+
+    // The records are in the journal file, read by a connection of the case's own.
+    let journal = rusqlite::Connection::open(
+        world
+            .hosted
+            .environment()
+            .journal_database(world.hosted.session_id),
+    )
+    .expect("the session's journal opens");
+    for (number, approval) in [21, 22, 23].into_iter().zip(&approvals) {
+        let (resource, state, durability): (Vec<u8>, String, String) = journal
+            .query_row(
+                "SELECT resource_id, state, durability FROM broker_pending \
+                 WHERE upstream_request_id = ?1",
+                [number.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap_or_else(|error| panic!("request {number} has no record in the journal: {error}"));
+        assert_eq!(resource, approval.resource_id.get().as_bytes().as_slice());
+        assert_eq!(state, PendingState::Pending.as_str());
+        assert_eq!(durability, Durability::Durable.as_str());
     }
 
     // All three wait, and the component, which has decoded each once, answers a call of its own.
