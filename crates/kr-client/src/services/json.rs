@@ -205,7 +205,7 @@ mod tests {
     /// Decodes of JSON text under `services/` that read no answer, each named by the file it is in
     /// and the code that makes it. Each must still be there, once, so an exception cannot outlive
     /// the code it excused.
-    const NOT_AN_ANSWER: [(&str, &str); 3] = [
+    const NOT_AN_ANSWER: [(&str, &str); 4] = [
         // A header value this client sends, which is not JSON at all.
         ("http.rs", "reqwest::header::HeaderValue::from_str(value)"),
         // The sign-in this device stored.
@@ -217,6 +217,11 @@ mod tests {
         (
             "account.rs",
             "let document: PendingDocument = serde_json::from_slice(bytes.expose())",
+        ),
+        // The record of a deletion this device made, kept until the removal is done.
+        (
+            "account/deletion.rs",
+            "serde_json::from_slice::<Record>(bytes.expose())",
         ),
     ];
 
