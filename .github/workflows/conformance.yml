@@ -375,10 +375,10 @@ jobs:
       # suites. It took 102 to 143 minutes with 76 to 81 steps (16 to 25 October). With 87, 89 and
       # 91 steps it ran into its limit of 150 minutes on the next three nights, each time in the
       # build of the host-events suite, the last step but one, which started 141 to 142 minutes in.
-      # Its limit is what this job's limit leaves once the other steps have theirs, less 3 minutes
-      # for the set-up and clean-up that no step limit counts: the limits of the job's steps add up
-      # to 352 of its 355 minutes. That is under twice the 143 minutes of the longest run that
-      # passed, and the runs that were cut took longer.
+      # A run with 91 steps and the limit below took 185 minutes (29 October). The limit is what
+      # this job's limit leaves once the other steps have theirs, less 3 minutes for the set-up and
+      # clean-up that no step limit counts: the limits of the job's steps add up to 352 of its 355
+      # minutes. That is 1.5 times the longest full run; twice it, 370 minutes, does not fit in a job.
       - name: The conformance report
         if: ${{ !cancelled() }}
         timeout-minutes: 285
