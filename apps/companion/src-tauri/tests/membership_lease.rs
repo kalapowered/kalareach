@@ -2253,9 +2253,7 @@ async fn a_session_link_to_a_member_host_closes_at_a_sign_out() {
 
 /// KR-REQ-17.53: a link that serves commands made outside a session screen is kept idle for a
 /// while. A sign-out ends it as it ends every other, and the next command is told to sign in; the
-/// idle link does not answer. The link ends after the sign-out has returned, not with it, so a
-/// command that reaches the link as it ends is told that the connection ended, and the command
-/// after it, on a link opened anew, is told to sign in.
+/// idle link does not answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_ambient_link_to_a_member_host_is_not_used_after_a_sign_out() {
     let rig = Rig::start_with(SERVED, 1).await;
@@ -2274,11 +2272,7 @@ async fn an_ambient_link_to_a_member_host_is_not_used_after_a_sign_out() {
     read().expect("a link is opened beside the application's and answers");
 
     let _ = rig.tokens.sign_out().await;
-    let mut refused = read().expect_err("the link of the account that left answers nothing");
-    if !asks_to_sign_in(&refused) {
-        assert_eq!(refused["code"], "RESOURCE_UNAVAILABLE", "{refused}");
-        refused = read().expect_err("the link of the account that left answers nothing");
-    }
+    let refused = read().expect_err("the link of the account that left answers nothing");
     assert!(asks_to_sign_in(&refused), "{refused}");
 }
 
