@@ -189,10 +189,10 @@ mod console {
             }
         }
 
-        /// Puts the console into the mode a forwarded terminal needs, and returns what it replaced.
+        /// Puts the console into the mode a command that reads bytes needs, and returns what it
+        /// replaced.
         ///
-        /// Keys come back as the console's own virtual-terminal sequences, which is what a command
-        /// that reads bytes needs.
+        /// Keys come back as the console's own virtual-terminal sequences.
         ///
         /// # Errors
         ///
