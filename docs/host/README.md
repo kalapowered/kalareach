@@ -1570,7 +1570,9 @@ being created and records why; an explicit compatibility retry is a new create r
 transfer and terminal presentation, and it claims none of the managed editor: Ctrl-D follows that
 shell's own behaviour and can close the session, a launch installs no command, and `kr detach`
 remains available. It is an explicit choice and never an automatic substitution for a managed
-request that could not be served.
+request that could not be served. A request that names no shell gets the one the host is configured
+to use (`SHELL`), and otherwise the platform's own: `/bin/zsh` on macOS, `/bin/bash` on Linux, and on
+Windows PowerShell 7, then Windows PowerShell 5.1, then the command interpreter `ComSpec` names.
 
 [docs/shell-integration/host.md](../shell-integration/host.md) describes the endpoint, the handshake,
 the phases, the launch transaction and the guarded startup entries `kr shell` writes.

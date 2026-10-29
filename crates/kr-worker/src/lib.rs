@@ -13,6 +13,7 @@
 //! | [`attention_source`] | This session's attention records, as the environment's attention store reads them |
 //! | [`description_facts`] | What this session was doing, as the control daemon's descriptions read it |
 //! | [`broker`] | The trusted broker: agent processes, grants, decoding trust, action tokens, the gateway, the local listener and volatile-native mode |
+//! | [`default_shell`] | The shell a session starts when its create request names none |
 //! | [`desktop`] | The desktop a session runs on, whether it is still there, and what may be done on it |
 //! | [`environment`] | The root shell's environment: what is inherited, what is replaced, what is refused |
 //! | [`fence`] | The root editor's fence and detach machine, driven against the real clock and the real bridge |
@@ -48,6 +49,7 @@ pub mod attention_source;
 pub mod broker;
 pub mod config;
 pub mod daemon_link;
+pub mod default_shell;
 pub mod description_facts;
 pub mod desktop;
 pub mod environment;

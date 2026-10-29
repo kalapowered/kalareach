@@ -662,14 +662,7 @@ fn session_config(
     let shell_path = package.map_or_else(
         || {
             specification.root_command.as_ref().map_or_else(
-                || {
-                    create
-                        .shell
-                        .as_ref()
-                        .cloned()
-                        .or_else(configured_shell)
-                        .unwrap_or_else(default_shell)
-                },
+                || kr_worker::default_shell::resolve(create.shell.0.as_deref()),
                 |root| root.interpreter.clone(),
             )
         },
@@ -902,35 +895,6 @@ fn interactive_arguments(shell_path: &str, mode: StartupMode) -> Vec<String> {
             arguments.push("-i".to_owned());
             arguments
         }
-    }
-}
-
-/// The shell this host is configured to launch when a request names none.
-///
-/// The operating system's own record of the user's shell is what a login uses, so it is what a
-/// session uses too. A value that names nothing runnable is ignored rather than launched.
-fn configured_shell() -> Option<String> {
-    let configured = std::env::var("SHELL").ok()?;
-    let configured = configured.trim();
-    (!configured.is_empty() && std::path::Path::new(configured).is_file())
-        .then(|| configured.to_owned())
-}
-
-/// The shell a platform falls back to when nothing else names one.
-fn default_shell() -> String {
-    #[cfg(target_vendor = "apple")]
-    {
-        "/bin/zsh".to_owned()
-    }
-    #[cfg(all(unix, not(target_vendor = "apple")))]
-    {
-        "/bin/bash".to_owned()
-    }
-    #[cfg(not(unix))]
-    {
-        // Windows has no `/bin`. PowerShell is the shell a Windows user gets, and `cmd` is the
-        // fallback when it is not installed.
-        std::env::var("ComSpec").unwrap_or_else(|_| "powershell.exe".to_owned())
     }
 }
 
