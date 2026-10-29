@@ -347,9 +347,10 @@ async fn a_key_typed_at_an_attached_console_reaches_the_application_as_the_conso
 ///
 /// Legacy input has no spelling for a key coming up or for Shift alone, so an application that is
 /// told of all four was given records. The application reads four events with the console's own
-/// call, key releases included, and prints what each was. The console that `kr attach` runs in is
-/// written the four in separate writes, which is how a person's key presses reach a console: Shift
-/// going down, the letter going down, the letter coming up, Shift coming up.
+/// call, key releases included, from the first Shift it is given (the release of the Return that
+/// started it is waiting in the console before that), and prints what each was. The console that
+/// `kr attach` runs in is written the four in separate writes, which is how a person's key presses
+/// reach a console: Shift going down, the letter going down, the letter coming up, Shift coming up.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_releases_and_modifiers_of_an_attached_console_reach_the_application_one_by_one() {
     let host = WorkerHost::start().await;
@@ -357,9 +358,10 @@ async fn the_releases_and_modifiers_of_an_attached_console_reach_the_application
         &host,
         "Write-Host ('kr-rea' + 'dy.'); \
          $seen = @(); \
-         for ($i = 0; $i -lt 4; $i++) { \
+         while ($seen.Count -lt 4) { \
            $key = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown,IncludeKeyUp'); \
-           $seen += ('{0}{1}' -f $key.VirtualKeyCode, $(if ($key.KeyDown) { 'd' } else { 'u' })) }; \
+           if ($seen.Count -gt 0 -or $key.VirtualKeyCode -eq 16) { \
+             $seen += ('{0}{1}' -f $key.VirtualKeyCode, $(if ($key.KeyDown) { 'd' } else { 'u' })) } }; \
          Write-Host (('kr-events:' + ($seen -join ',') + ':kr-') + 'end'); \
          Start-Sleep -Seconds 300",
     )
