@@ -1632,7 +1632,7 @@ async fn a_look_does_not_drop_a_receipt_that_another_process_has_just_used() {
     look.expect("a status");
     assert_eq!(
         receipts(&elsewhere),
-        [first.clone()],
+        std::slice::from_ref(&first),
         "the other window sent the receipt the first try had"
     );
     assert_eq!(
