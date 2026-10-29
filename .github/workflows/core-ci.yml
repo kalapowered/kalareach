@@ -512,12 +512,12 @@ jobs:
     runs-on: windows-2025
     strategy:
       fail-fast: false
-      # Two runners, one definition, as the macos job has. They set up the same way and the daemon,
-      # the worker and the forwarder are built on both, which the suites find beside them; then
-      # each step's `if` names its leg. `first` compiles the whole workspace and its tests, runs
-      # the steps down to the forwarder's tests and builds the desktop application; `second` runs
-      # the steps after the forwarder's tests, the ARM64 compile and the documentation. A step that
-      # names neither is both's.
+      # Two runners, one definition. They set up the same way and the daemon, the worker and the
+      # forwarder are built on both, which the suites find beside them; then each step's `if` names
+      # its leg. `first` compiles the whole workspace and its tests, runs the steps down to the
+      # forwarder's tests and builds the desktop application; `second` runs the steps after the
+      # forwarder's tests, the ARM64 compile and the documentation. A step that names neither is
+      # both's.
       matrix:
         include:
           - name: windows
@@ -2310,12 +2310,12 @@ jobs:
       fail-fast: false
       # Three runners, one definition. They set up the same way and then divide the work, so that
       # the tests and the demonstrations do not wait for one another. `tests` runs the lint, the
-      # controller's tests and the cases that need a filesystem or the processors to themselves;
-      # `tests-second` runs the tests of every other package; `demonstrations` runs the end-to-end
-      # demonstrations and the performance measurements. A step that names no part is every
-      # part's. The two that run tests build the whole workspace's tests and then run their own
-      # packages. The controller's tests are 44 of the 104 minutes that the workspace's tests take
-      # to run, so they are one runner's alone; the other takes the workspace less
+      # controller's tests and the cases that need another filesystem or the processors to
+      # themselves; `tests-second` runs the tests of every other package; `demonstrations` runs the
+      # end-to-end demonstrations and the performance measurements. A step that names no part is
+      # every part's. The two that run tests build the whole workspace's tests and then run their
+      # own packages. The controller's tests are 44 of the 104 minutes that the workspace's tests
+      # take to run, so they are one runner's alone; the other takes the workspace less
       # kr-sync-integration and the controller, and so tests a package added later.
       matrix:
         include:
@@ -2584,7 +2584,7 @@ jobs:
       # - The container cases, which need podman, and this runner has none. The rust job's runner
       #   has it, and its test step runs them.
       # - The cases that need another filesystem, and the cases whose verdicts are timings, which
-      #   the two steps after the controller's run on the other runner.
+      #   run on the other runner, in the two steps after the controller's tests.
       - name: Test
         if: ${{ !cancelled() && matrix.part == 'tests-second' }}
         timeout-minutes: 125
