@@ -1929,6 +1929,57 @@ async fn a_record_is_noted_as_the_account_that_wrote_its_bundle_and_not_the_one_
     assert_eq!(second.view()["state"], "off");
 }
 
+/// The record is noted as the account's whose token wrote the bundle, though another account signs
+/// in (from another window of the application) while the write is at the service.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_record_is_noted_as_the_account_whose_token_wrote_the_bundle_though_another_signed_in_meanwhile()
+ {
+    let computer = Computer::new().await;
+    let page = computer.page().await;
+    let wrote = page.account_mark(&computer);
+    let web = Arc::clone(computer.served.web());
+    web.fail(SYNC_PATH, 1, Moment::Gate);
+    let recovery = Arc::clone(&page.recovery);
+    let account = Arc::clone(&page.account);
+    let step = tokio::spawn(async move { recovery.turn_on(&account).await });
+    web.requests_reach(SYNC_PATH, 1).await;
+    page.account
+        .tokens()
+        .commit(
+            IssuedGrant {
+                access_token: AccountToken::new(TOKEN).expect("a token"),
+                expires_in_seconds: 600,
+                refresh_token: RefreshToken::new("another-refresh-token").expect("a token"),
+                scopes: RECOVERY_BACKUP_SCOPES
+                    .iter()
+                    .map(|scope| (*scope).to_owned())
+                    .collect(),
+                subject: "account-two".to_owned(),
+            },
+            "another-nonce",
+        )
+        .await
+        .expect("another account signs in");
+    web.release_held();
+    step.await
+        .expect("the step ends")
+        .expect("the bundle is written");
+    let signed_in = page.account_mark(&computer);
+    assert_ne!(signed_in, wrote, "another account is signed in now");
+
+    page.recovery
+        .account_deleted(signed_in)
+        .await
+        .expect("nothing to clear");
+    assert_eq!(
+        page.view()["state"],
+        "on",
+        "the account that signed in meanwhile does not own the bundle"
+    );
+    page.recovery.account_deleted(wrote).await.expect("cleared");
+    assert_eq!(page.view()["state"], "off");
+}
+
 /// A bundle this computer adopts from an earlier run was written by no account anyone knows, so
 /// deleting the account that adopted it leaves the record: it may be the bundle of another.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

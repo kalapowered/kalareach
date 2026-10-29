@@ -33,7 +33,7 @@
 //! account's backup storage sends nothing either, and the page is told which of the two to mend.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use kr_client::Shown;
 use kr_client::recovery::{
@@ -41,9 +41,12 @@ use kr_client::recovery::{
     LostWrite, RecoveryError, RestoreError, RestoreSource, cover_host_archive, fresh_locator,
     qr_payload, render_kit,
 };
-use kr_client::services::account::{AccountMark, AccountTokenSource, BACKUP_WRITE_SCOPE};
+use kr_client::services::account::{
+    AccountMark, AccountToken, AccountTokenSource, BACKUP_WRITE_SCOPE, SignedInAccount,
+};
 use kr_client::services::{
-    HttpDeadlines, HttpService, ManagedSyncService, ServiceSigner, managed_response_limits,
+    HttpDeadlines, HttpService, ManagedSyncService, ServiceFuture, ServiceSigner,
+    managed_response_limits,
 };
 use kr_crypto::kdf::RecoverySeed;
 use kr_crypto::keys::AuthorisationKeyPair;
@@ -516,8 +519,9 @@ impl Recovery {
         refuse_if_blocked(account, &record.origin()?)?;
         let seed = self.seed(true)?;
         let now = now();
+        let tokens = Arc::new(MarkedTokens::new(account));
         let written_here = {
-            let mut store = self.store(&record, account)?;
+            let mut store = self.store_over(&record, Arc::clone(&tokens) as _)?;
             match store.commit(&seed, &mut BundleStore::empty(now), now).await {
                 Ok(_) => true,
                 // Something is at the locator already: this device's own first write, whose
@@ -533,10 +537,11 @@ impl Recovery {
         };
         record.kept = true;
         self.keep(&record)?;
-        // Whose the bundle is: the account whose token wrote it. A bundle adopted from an earlier
-        // write has no owner anyone knows, and is left so.
-        if written_here {
-            self.keep_owner(&record, account);
+        // Whose the bundle is: the account whose token wrote it, which another account signing in
+        // meanwhile does not change. A bundle adopted from an earlier write has no owner anyone
+        // knows, and is left so.
+        if written_here && let Some(mark) = tokens.last() {
+            self.keep_owner(&record, mark);
         }
         self.view_of(account)
     }
@@ -889,18 +894,10 @@ impl Recovery {
         })
     }
 
-    /// Notes whose `record` is: the account that is signed in as its bundle is written. Nothing depends on the
-    /// note being kept, so a failure to keep it is told to the log and not to the person: the record
-    /// then has an owner no one knows.
-    fn keep_owner(&self, record: &Record, account: &Account) {
-        let mark = account
-            .tokens()
-            .signed_in_mark(account.origin().as_str())
-            .ok()
-            .flatten();
-        let Some(mark) = mark else {
-            return;
-        };
+    /// Notes whose `record` is: the account `mark` names, whose token wrote its bundle. Nothing
+    /// depends on the note being kept, so a failure to keep it is told to the log and not to the
+    /// person: the record then has an owner no one knows.
+    fn keep_owner(&self, record: &Record, mark: AccountMark) {
         let owner = Owner {
             version: Owner::VERSION,
             bundle_locator: record.bundle_locator.clone(),
@@ -969,6 +966,15 @@ impl Recovery {
     /// it is dropped, and it opens over the record of the last write it sent, so a write whose
     /// answer never came back is still outstanding in the next step, and after a restart.
     fn store(&self, record: &Record, account: &Account) -> Result<BundleStore> {
+        self.store_over(record, account.tokens())
+    }
+
+    /// [`Self::store`], presenting the tokens of `tokens`.
+    fn store_over(
+        &self,
+        record: &Record,
+        tokens: Arc<dyn AccountTokenSource>,
+    ) -> Result<BundleStore> {
         let origin = record.origin()?;
         let http = HttpService::with(
             origin.clone(),
@@ -980,10 +986,54 @@ impl Recovery {
                 "this computer cannot reach the sync service: {error}"
             ))
         })?;
-        let tokens: Arc<dyn AccountTokenSource> = account.tokens();
         let service = ManagedSyncService::new(origin, Arc::new(http), Arc::clone(&self.signer))
             .presenting(tokens, BACKUP_WRITE_SCOPE);
         BundleStore::open(Arc::new(service), record.context(), &self.directory).map_err(said)
+    }
+}
+
+/// The account's tokens, remembering whose the last one handed out was. The token and the account it
+/// belongs to come from one read of the grant, so a note of whose bundle a write made is never of an
+/// account that signed in between the token and the answer.
+struct MarkedTokens {
+    account: Arc<SignedInAccount>,
+    origin: String,
+    last: Mutex<Option<AccountMark>>,
+}
+
+impl MarkedTokens {
+    fn new(account: &Account) -> Self {
+        Self {
+            account: account.tokens(),
+            origin: account.origin().as_str().to_owned(),
+            last: Mutex::new(None),
+        }
+    }
+
+    /// The account the last token handed out belonged to.
+    fn last(&self) -> Option<AccountMark> {
+        *self.last.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl std::fmt::Debug for MarkedTokens {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MarkedTokens")
+            .finish_non_exhaustive()
+    }
+}
+
+impl AccountTokenSource for MarkedTokens {
+    fn token<'a>(&'a self, scope: &'a str) -> ServiceFuture<'a, AccountToken> {
+        Box::pin(async move {
+            let (token, mark) = self
+                .account
+                .token_marked(scope, &self.origin, false)
+                .await?;
+            *self.last.lock().unwrap_or_else(PoisonError::into_inner) = Some(mark);
+            Ok(token)
+        })
     }
 }
 
