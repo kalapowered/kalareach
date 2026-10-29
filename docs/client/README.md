@@ -771,11 +771,10 @@ client never depends on a host crate:
 | `accepts_result` | A result is published only under the generation in force. An answer to work admitted earlier is discarded and moves nothing. |
 | `resume` | Turns production back on under a generation of its own. It reconstructs nothing that was omitted. |
 
-A pinned label is kept until the person clears it. `SyncClient::settings_to_publish` is the filter a
-caller applies when it builds the object it is about to store: it leaves the pinned labels out while
-privacy mode is on, and the device's own copy keeps them, so turning privacy mode off has nothing to
-reconstruct. `publish` does not filter anything on the way out, because what goes to the service is
-the record on disk; while privacy mode is on it refuses the whole publication instead.
+A pinned label is kept until the person clears it. `publish` does not filter anything on the way out,
+because what goes to the service is the record on disk; while privacy mode is on it refuses the whole
+publication, so no pinned label leaves, and the device's own copy keeps the labels, so turning
+privacy mode off has nothing to reconstruct.
 
 A publication that has left cannot be taken back. It is recorded as dispatched before the call
 leaves, so a cancellation counts it rather than discarding it and a restart does not take it back as

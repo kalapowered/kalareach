@@ -266,8 +266,9 @@ pub struct SyncSettings {
     /// The labels the person pinned.
     ///
     /// Section 24 keeps pinned labels locally unless they are explicitly cleared, and excludes them
-    /// from subsequent sync while privacy mode is on. [`SyncClient::settings_to_publish`] is where
-    /// that exclusion happens, and the device's own copy is untouched by it.
+    /// from subsequent sync while privacy mode is on. [`SyncClient::publish`] refuses the whole
+    /// publication while it is on, so no label leaves, and the device's own copy is untouched by
+    /// it.
     pub pinned_labels: BTreeSet<String>,
 }
 

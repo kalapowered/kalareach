@@ -480,13 +480,6 @@ async fn kr_req_24_28_privacy_enabled_while_a_settings_write_and_a_draft_publica
             sent,
             "nothing left the device once the fence was up"
         );
-        assert!(
-            one.settings_to_publish(&labelled)
-                .expect("a filter")
-                .pinned_labels
-                .is_empty(),
-            "while private, pinned labels are left out of what would be published"
-        );
         assert!(matches!(
             export_settings(one.store(), c),
             Err(RecoveryError::Sync(SyncError::Fenced { generation: 1 }))
@@ -699,10 +692,8 @@ async fn kr_req_24_28_privacy_enabled_while_a_settings_write_and_a_draft_publica
         assert_eq!(drafts.load(d.draft_id).expect("the draft"), edited_d);
         assert!(export_settings(one.store(), c).is_ok());
         let n = fresh_object_id().expect("an identity");
-        let publishable = one.settings_to_publish(&labelled).expect("a filter");
-        assert_eq!(publishable.pinned_labels.len(), 2);
         one.store()
-            .put_object(&settings_object(n, 1, publishable))
+            .put_object(&settings_object(n, 1, labelled.clone()))
             .expect("stored");
         assert!(matches!(
             one.publish(n, now()).await.expect("published"),

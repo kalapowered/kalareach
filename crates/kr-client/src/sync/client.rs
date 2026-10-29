@@ -72,7 +72,7 @@ use super::store::{
     PrivacyRecord, RequestRecord, RequestState, Result, Settled, Settlement, Standing,
     SyncCheckpoint, SyncError, SyncStore,
 };
-use super::{SyncBody, SyncObject, SyncSettings, Zeroising, sync_collection};
+use super::{SyncBody, SyncObject, Zeroising, sync_collection};
 use crate::drafts::DraftSealer;
 use crate::services::{
     SyncBackupService, SyncExchanged, SyncFetched, SyncPosition, SyncRecoveryId, SyncRequestFence,
@@ -484,33 +484,6 @@ impl SyncClient {
     }
 
     // -- publishing ---------------------------------------------------------------------------
-
-    /// Returns the settings this device would publish right now.
-    ///
-    /// It is a filter a caller applies when it builds the object it is about to store, not
-    /// something [`Self::publish`] does on the way out: what goes to the service is the record on
-    /// disk, and rewriting it in flight would publish something this device does not hold. While
-    /// privacy mode is on the whole publication is refused anyway; this is what a caller uses when
-    /// it wants to keep synchronising the rest of a person's settings.
-    ///
-    /// The pinned labels are left out while privacy mode is on, which is section 24's rule: they
-    /// are retained locally unless the person clears them, and excluded from subsequent sync while
-    /// private. The device's own copy is untouched either way, so turning privacy mode off does not
-    /// have to reconstruct them.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SyncError::Storage`] when the privacy record cannot be read.
-    pub fn settings_to_publish(&self, settings: &SyncSettings) -> Result<SyncSettings> {
-        if self.is_fenced()? {
-            Ok(SyncSettings {
-                values: settings.values.clone(),
-                pinned_labels: std::collections::BTreeSet::new(),
-            })
-        } else {
-            Ok(settings.clone())
-        }
-    }
 
     /// Publishes the object this device holds, under compare and swap.
     ///

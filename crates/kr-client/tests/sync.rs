@@ -6897,39 +6897,51 @@ async fn enabling_privacy_fences_production_and_removes_what_it_says_it_removed(
     assert!(two.store().object(object_id).expect("held").is_some());
 }
 
-/// KR-REQ-24.27, the part about pinned labels: while privacy mode is on the settings to publish
-/// leave out the pinned labels, which the device still holds; removing the retained local state
-/// does not clear one; and clearing one is explicit and the only thing that removes it.
+/// KR-REQ-24.27, the part about pinned labels, through the path the product publishes by: a
+/// settings object that holds pinned labels is refused while privacy mode is on, and the service
+/// receives nothing of it; the device keeps its labels through the removal of retained state;
+/// clearing one is explicit and the only thing that removes it; and once privacy mode is off, under
+/// a generation of its own, the same object is published, so the refusal is the fence's and the
+/// object is not lost.
 #[tokio::test]
-async fn pinned_labels_stay_on_the_device_and_are_left_out_of_what_is_published_while_private() {
+async fn a_settings_object_with_pinned_labels_is_not_published_while_private() {
     let directory = tempfile::tempdir().expect("a directory");
     let service = Arc::new(Service::default());
-    let (client, _) = device_client(directory.path(), "one", &service);
-    let mine = settings(&[("theme", "dark")], &["one", "two"]);
-
-    // Not private: the labels travel with the settings.
-    let publishable = client.settings_to_publish(&mine).expect("a filter");
-    assert_eq!(publishable.pinned_labels.len(), 2);
-
-    // Private: they are left out of what is published, and the device still holds them.
-    client.fence(3).expect("fenced");
-    let publishable = client.settings_to_publish(&mine).expect("a filter");
-    assert!(publishable.pinned_labels.is_empty());
-    assert_eq!(publishable.values, mine.values);
-    assert_eq!(mine.pinned_labels.len(), 2);
-
+    let (client, object_id) = device_client(directory.path(), "one", &service);
+    let held = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &["one", "two"])),
+        NOW,
+    );
+    client.store().put_object(&held).expect("stored");
     client
         .store()
         .pin_label("one", TimestampMs::new(NOW))
         .expect("pinned");
+
+    client.fence(3).expect("fenced");
+    assert!(matches!(
+        client.publish(object_id, TimestampMs::new(NOW + 1)).await,
+        Err(SyncError::Fenced { generation: 3 })
+    ));
+    assert!(
+        service.exchanges().await.is_empty(),
+        "nothing of the object, its labels included, left for the service"
+    );
+
     client
-        .remove_retained(3, TimestampMs::new(NOW))
+        .remove_retained(3, TimestampMs::new(NOW + 2))
         .await
         .expect("removed");
     assert_eq!(
         client.store().pinned_labels().expect("labels").len(),
         1,
         "privacy mode does not clear a pinned label"
+    );
+    assert!(
+        service.exchanges().await.is_empty(),
+        "removing what is retained sends nothing either"
     );
 
     // Clearing one is explicit, and it is the only thing that removes one.
@@ -6943,6 +6955,11 @@ async fn pinned_labels_stay_on_the_device_and_are_left_out_of_what_is_published_
     assert!(!client.is_fenced().expect("a record"));
     assert!(!client.accepts_result(3).expect("a record"));
     assert!(client.accepts_result(4).expect("a record"));
+    client
+        .publish(object_id, TimestampMs::new(NOW + 3))
+        .await
+        .expect("published once privacy mode is off");
+    assert_eq!(service.exchanges().await.len(), 1);
 }
 
 #[tokio::test]

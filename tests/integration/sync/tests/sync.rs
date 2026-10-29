@@ -973,8 +973,8 @@ async fn kr_req_20_13_a_draft_is_published_as_a_draft_and_never_as_an_execution_
     .await;
 }
 
-/// KR-REQ-24.28: a client fenced by privacy mode publishes nothing, and its pinned labels are left
-/// out of what it would publish while the device keeps them.
+/// KR-REQ-24.28: a client fenced by privacy mode publishes nothing, and the device keeps its pinned
+/// labels.
 #[tokio::test]
 async fn kr_req_24_28_a_client_fenced_by_privacy_mode_publishes_nothing_and_keeps_its_pinned_labels()
  {
@@ -997,10 +997,7 @@ async fn kr_req_24_28_a_client_fenced_by_privacy_mode_publishes_nothing_and_keep
         ));
         assert_eq!(run.sent(), before, "nothing left this device");
 
-        // The labels are left out of what would be published and stay on the device.
-        let published = client.settings_to_publish(&held).expect("filtered");
-        assert!(published.pinned_labels.is_empty());
-        assert_eq!(published.values, held.values);
+        // The labels stay on the device.
         let SyncBody::Settings(kept) = client
             .store()
             .object(object_id)
@@ -1026,7 +1023,7 @@ async fn kr_req_24_28_a_client_fenced_by_privacy_mode_publishes_nothing_and_keep
         assert!(compared.objects.is_empty() && compared.copies.is_empty());
         assert_eq!(compared.stored.objects.get(), 0);
 
-        "a client fenced by privacy mode refuses to publish before anything is sent, the deployment holds nothing for the object, and its pinned labels are left out of what it would publish while the device keeps them".to_owned()
+        "a client fenced by privacy mode refuses to publish before anything is sent, the deployment holds nothing for the object, and the device keeps its pinned labels".to_owned()
     })
     .await;
 }
