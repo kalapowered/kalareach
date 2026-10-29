@@ -372,11 +372,12 @@ jobs:
       # needs it, by name, and not by a job that stopped before the report.
       #
       # The step builds and runs every suite in turn, with no build cache, and it grows with the
-      # suites. It took 102 to 143 minutes with 76 to 81 suites (16 to 25 October). With 91 suites
-      # it ran into its limit of 150 minutes on three nights in a row, and on the last one 89 suites
-      # were done after 140 minutes and the 90th was still compiling. Its limit is the most that
-      # this job's limit leaves once the other steps have theirs: the limits of the job's steps add
-      # up to 352 of its 355 minutes. That is under twice the 143 minutes of the longest run that
+      # suites. It took 102 to 143 minutes with 76 to 81 steps (16 to 25 October). With 87, 89 and
+      # 91 steps it ran into its limit of 150 minutes on the next three nights, each time in the
+      # build of the host-events suite, the last step but one, which started 141 to 142 minutes in.
+      # Its limit is what this job's limit leaves once the other steps have theirs, less 3 minutes
+      # for the set-up and clean-up that no step limit counts: the limits of the job's steps add up
+      # to 352 of its 355 minutes. That is under twice the 143 minutes of the longest run that
       # passed, and the runs that were cut took longer.
       - name: The conformance report
         if: ${{ !cancelled() }}
