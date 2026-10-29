@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       macos:
-        description: "Run the macOS jobs (macos, macos-demonstrations, macos-reference, and the companion's macos-15 leg). Turned off, a manual run checks Linux and Windows only. A push or a pull request always runs them."
+        description: "Run the macOS jobs (macos, macos-second, macos-demonstrations, macos-reference, and the companion's macos-15 leg). Turned off, a manual run checks Linux and Windows only. A push or a pull request always runs them."
         type: boolean
         default: true
       ios:
@@ -2288,9 +2288,10 @@ jobs:
 
   # The whole workspace on macOS: the lint, the workspace's tests, the end-to-end demonstrations and
   # the performance measurements, on the platform whose service manager, process table, disk images
-  # and pseudo-terminals the host's macOS paths are written against. It runs on two runners beside
-  # the companion's macOS leg, so that none of them waits for another: the lint and the tests on
-  # one, the demonstrations and the measurements on the other.
+  # and pseudo-terminals the host's macOS paths are written against. It runs on three runners beside
+  # the companion's macOS leg, so that none of them waits for another: the lint, the controller's
+  # tests and two later steps on one, the tests of every other package on the second, and the
+  # demonstrations and the measurements on the third.
   #
   # What it leaves to the other jobs, because they run it natively and nothing in it differs on
   # macOS: formatting and the generated-file checks (rust), the TypeScript packages (typescript),
@@ -2309,21 +2310,19 @@ jobs:
       fail-fast: false
       # Three runners, one definition. They set up the same way and then divide the work, so that
       # the tests and the demonstrations do not wait for one another. `tests` runs the lint, the
-      # controller's tests and the cases that need a filesystem or a clock of their own;
+      # controller's tests and the cases that need a filesystem or the processors to themselves;
       # `tests-second` runs the tests of every other package; `demonstrations` runs the end-to-end
       # demonstrations and the performance measurements. A step that names no part is every
-      # part's. The two that run tests build the whole workspace's tests and then run the packages
-      # their `packages` names. The controller's tests are 43 of the 105 minutes that the
-      # workspace's tests take to run, so they are one runner's alone; the other takes the
-      # workspace less kr-sync-integration and the controller, and so tests a package added later.
+      # part's. The two that run tests build the whole workspace's tests and then run their own
+      # packages. The controller's tests are 44 of the 104 minutes that the workspace's tests take
+      # to run, so they are one runner's alone; the other takes the workspace less
+      # kr-sync-integration and the controller, and so tests a package added later.
       matrix:
         include:
           - name: macos
             part: tests
-            packages: -p kr-controller
           - name: macos-second
             part: tests-second
-            packages: --workspace --exclude kr-sync-integration --exclude kr-controller
           - name: macos-demonstrations
             part: demonstrations
     # Every step has a limit of its own, and the limits add up to less than this one, so a step that
@@ -2453,9 +2452,9 @@ jobs:
         with:
           name: macos
 
-      # The release profile's third-party output apart from the debug profile's, which the other leg
-      # saves: this leg is the one that builds in release, and an entry of its own keeps the debug
-      # profile's output from being saved twice.
+      # The release profile's third-party output apart from the debug profile's, which the `tests`
+      # leg saves: this leg is the one that builds in release, and an entry of its own keeps the
+      # debug profile's output from being saved twice.
       - name: Restore the release build output
         id: release-cache
         if: ${{ matrix.part == 'demonstrations' }}
@@ -2568,30 +2567,63 @@ jobs:
 
       # The workspace's tests, built whole by each of the two runners that run them. The suites
       # start programs that lie beside them and that other packages build, so a build of only the
-      # packages a runner tests would leave some out. The step after this one runs the runner's
-      # own packages. Cargo settles the features of a run from the packages it names: the second
-      # runner's packages settle them as the whole workspace does and build nothing again, and the
-      # controller's alone build the crates under its tests once more with the features its own
-      # tests ask for.
+      # packages a runner tests would leave some out. Cargo settles the features of a run from the
+      # packages it names: the second runner's packages settle them as the whole workspace does,
+      # and little is built again, while the controller's alone build the crates under its tests
+      # once more with the features its own tests ask for.
       - name: Build the workspace's tests
         if: ${{ !cancelled() && startsWith(matrix.part, 'tests') }}
-        timeout-minutes: 70
-        run: cargo test --locked --workspace --exclude kr-sync-integration --no-run
+        timeout-minutes: 76
+        run: cargo test --no-run --locked --workspace --exclude kr-sync-integration
 
-      # The tests of the packages this runner's `packages` names, less what this runner cannot run,
-      # each left out by name here:
+      # The tests of every package but the controller, less what this runner cannot run, each left
+      # out by name here:
       #
       # - kr-sync-integration, every test of which is a leg against a live deployment and does
       #   nothing without one. The rust job runs each leg against the deployment it names.
       # - The container cases, which need podman, and this runner has none. The rust job's runner
       #   has it, and its test step runs them.
       # - The cases that need another filesystem, and the cases whose verdicts are timings, which
-      #   the two steps after this one run on the first runner.
+      #   the two steps after the controller's run on the other runner.
       - name: Test
-        if: ${{ !cancelled() && startsWith(matrix.part, 'tests') }}
+        if: ${{ !cancelled() && matrix.part == 'tests-second' }}
         timeout-minutes: 125
         run: >-
-          cargo test --locked ${{ matrix.packages }} --no-fail-fast --
+          cargo test --locked --workspace --exclude kr-sync-integration --exclude kr-controller
+          --no-fail-fast --
+          --skip the_helper_inside_a_container_refuses_a_handshake_that_declares_a_network_actor
+          --skip a_running_container_is_observed_as_running_and_a_stopped_one_as_stopped
+          --skip a_reused_container_name_is_not_the_identity_that_was_enrolled
+          --skip the_argument_vector_reaches_the_container_exactly_as_it_was_built
+          --skip a_helper_path_with_a_space_in_it_is_one_argument_inside_the_container
+          --skip a_refresh_that_reached_a_running_environment_without_a_helper_scopes_no_channel
+          --skip a_repository_whose_own_data_is_on_another_filesystem_is_captured
+          --skip bind_mount_and_cross_device_grafts_are_refused
+          --skip recursive_removal_refuses_a_grafted_mount
+          --skip a_removal_stops_before_a_disk_image_attached_inside_the_tree
+          --skip a_staging_directory_on_another_filesystem_is_refused_whatever_its_numbers
+          --skip a_scope_on_another_filesystem_is_refused_whatever_its_numbers
+          --skip a_directory_on_another_filesystem_is_not_the_recorded_one_whatever_its_numbers
+          --skip a_registered_repository_on_another_filesystem_is_refused_whatever_its_numbers
+          --skip a_workspace_tree_on_another_filesystem_is_not_removed_whatever_its_numbers
+          --skip a_workspace_tree_on_another_filesystem_is_not_read_whatever_its_numbers
+          --skip a_filesystem_mounted_over_a_registered_subdirectory_is_not_read_as_it
+          --skip owner_cleanup_does_not_remove_a_staging_directory_on_another_filesystem
+          --skip a_directory_on_another_filesystem_is_not_taken_away_as_the_one_this_host_made
+          --skip a_workspace_on_another_filesystem_is_not_opened_whatever_its_numbers
+          --skip a_materialisation_on_another_filesystem_is_not_read_or_emptied_whatever_its_numbers
+          --skip a_staged_name_on_another_filesystem_is_left_where_it_is_whatever_its_numbers
+          --skip a_volume_whose_disk_is_held_is_detached_once_it_is_let_go
+          --skip kr_req_11_38_every_export_is_stopped_by_its_own_deadline
+          --skip kr_req_11_38_a_worker_is_told_when_the_queue_overflowed
+
+      # The controller's tests, which leave out the cases the step above leaves out: the two lists
+      # of cases are one list.
+      - name: Test the controller
+        if: ${{ !cancelled() && matrix.part == 'tests' }}
+        timeout-minutes: 115
+        run: >-
+          cargo test --locked -p kr-controller --no-fail-fast --
           --skip the_helper_inside_a_container_refuses_a_handshake_that_declares_a_network_actor
           --skip a_running_container_is_observed_as_running_and_a_stopped_one_as_stopped
           --skip a_reused_container_name_is_not_the_identity_that_was_enrolled
@@ -2776,9 +2808,9 @@ jobs:
 
       # Real processes, real sockets and real terminals, the suites the script names and nothing
       # else, each of which must demonstrate something, and no process of the run left behind. This
-      # leg builds the suites' test programs itself, which the other leg's test step did before the
-      # split, so with nothing cached the step carries their build as well as the demonstrations'
-      # twenty minutes.
+      # leg builds the suites' test programs itself, as the test legs' build step does for theirs,
+      # so with nothing cached the step carries their build as well as the demonstrations' twenty
+      # minutes.
       - name: End-to-end demonstrations
         if: ${{ !cancelled() && matrix.part == 'demonstrations' }}
         timeout-minutes: 75
