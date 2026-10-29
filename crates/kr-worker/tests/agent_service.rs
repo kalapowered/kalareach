@@ -3375,10 +3375,11 @@ fn channel_answer(
     }
 }
 
-/// KR-REQ-12.18 and KR-REQ-11.34: with the Claude Code package bound as the installation's binder
-/// will bind it, `plugin.action.invoke` of its answer action writes the application's own verdict
-/// on the channel, once, from the table's decision destination with no component involved, and
-/// returns the action's own result with a receipt that says it was applied.
+/// KR-REQ-12.18, KR-REQ-12.09 and KR-REQ-11.34: with the Claude Code package bound as the
+/// installation's binder will bind it, `plugin.action.invoke` of its answer action writes the
+/// application's own verdict on the channel, once, from the table's decision destination with no
+/// component involved, and returns the action's own result with a receipt that says it was applied
+/// and that it went by the host's authenticated bridge.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_12_18_a_plugin_answer_goes_out_on_the_channel_and_reports_the_action() {
     let host = host().await;
@@ -3401,7 +3402,7 @@ async fn kr_req_12_18_a_plugin_answer_goes_out_on_the_channel_and_reports_the_ac
             .as_ref()
             .expect("the answer went upstream")
             .provenance,
-        kr_protocol::broker::ActionProvenance::UpstreamTypedRpc
+        kr_protocol::broker::ActionProvenance::AuthenticatedHookResponse
     );
     assert_eq!(
         channel.next().await,
