@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use crate::attach::Attaching;
+use crate::attach::{Attaching, TerminalInput};
 use crate::bridge::link::Link;
 use kr_client::error::refusal;
 use kr_client::shown;
@@ -309,6 +309,49 @@ fn scroll_keys(bytes: &[u8]) -> Option<i64> {
         }
     }
     None
+}
+
+/// Virtual-key codes of the keys a console reports for the scroll-back chord and the modifiers
+/// that go down with it.
+const VK_PRIOR: u16 = 0x21;
+const VK_NEXT: u16 = 0x22;
+const VK_SHIFT: u16 = 0x10;
+const VK_CONTROL: u16 = 0x11;
+const VK_MENU: u16 = 0x12;
+
+/// This terminal's own scroll-back, when the keys a console reported are those chords and nothing
+/// else.
+///
+/// The records of Shift and Page Up or Page Down, as a console reports them: the modifier going
+/// down, the key going down and coming up, the modifier coming up. Only the key going down counts,
+/// by its repeat count, and a read that holds any other key is not this terminal's.
+fn scroll_chords(keys: &[kr_term::win32::KeyRecord]) -> Option<i64> {
+    use kr_term::win32::control_keys::{
+        LEFT_ALT_PRESSED, LEFT_CTRL_PRESSED, RIGHT_ALT_PRESSED, RIGHT_CTRL_PRESSED, SHIFT_PRESSED,
+    };
+
+    let mut moved: Option<(i64, i64)> = None;
+    for key in keys {
+        if !key.key_down || matches!(key.virtual_key, VK_SHIFT | VK_CONTROL | VK_MENU) {
+            continue;
+        }
+        let direction = match key.virtual_key {
+            VK_PRIOR => 1_i64,
+            VK_NEXT => -1_i64,
+            _ => return None,
+        };
+        let others = LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED | LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED;
+        if key.control_keys & SHIFT_PRESSED == 0 || key.control_keys & others != 0 {
+            return None;
+        }
+        let (going, count) = moved.unwrap_or((direction, 0));
+        // A read that goes both ways is nobody's gesture.
+        if going != direction {
+            return None;
+        }
+        moved = Some((going, count.saturating_add(i64::from(key.repeat.max(1)))));
+    }
+    moved.map(|(direction, count)| direction.saturating_mul(count))
 }
 
 /// The bytes a terminal sends when a bracketed paste begins.
@@ -1196,7 +1239,12 @@ where
         guard.learn_keyboard(&keyboard);
         guard.begin_keyboard()?;
     }
+    // A Windows console reports keys as records, which the session spells as its terminal asked
+    // for; a terminal emulator hands over bytes.
+    #[cfg(unix)]
     let raw_replaced = terminal.enter_raw_mode()?;
+    #[cfg(not(unix))]
+    let raw_replaced = terminal.enter_record_mode()?;
 
     // What the session draws goes to the terminal's output handle. On Windows that is the console's
     // output buffer, `CONOUT$`, and not its input handle, which is the one the input reader below
@@ -1343,7 +1391,7 @@ async fn drive(
     owed: &mut UndeliveredTyping,
     typed_during_the_probe: Vec<u8>,
     attached: Attached,
-    input: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    input: &mut tokio::sync::mpsc::UnboundedReceiver<TerminalInput>,
     output: &Arc<std::fs::File>,
     terminal: &ControllingTerminal,
     resized: Option<&mut WindowChanges>,
@@ -1877,8 +1925,8 @@ async fn drive(
                 }
                 outstanding.insert(request_id, Outstanding::Resize(dimensions));
             }
-            bytes = input.recv() => {
-                let Some(bytes) = bytes else {
+            read = input.recv() => {
+                let Some(read) = read else {
                     // The terminal's own input ended. Whatever the classifier was part way
                     // through is the person's, and it goes before the attachment does, unless the
                     // session is closing and would refuse it.
@@ -1912,6 +1960,66 @@ async fn drive(
                     undelivered = true;
                     continue;
                 }
+                let bytes = match read {
+                    TerminalInput::Bytes(bytes) => bytes,
+                    // A console reports keys as records. There is no paste delimiter or pointer
+                    // report in them to watch for, because those are bytes, and the records go to
+                    // the session as they are.
+                    TerminalInput::Keys(keys) => {
+                        // The scroll-back keys first, on the same terms as for bytes: they move the
+                        // window this terminal is looking through and never reach the session.
+                        let chord = (display.holds_screen() && display.showing_history_buffer())
+                            .then(|| scroll_chords(&keys))
+                            .flatten();
+                        if let Some(steps) = chord
+                            && let Ok(size) = terminal.size()
+                            && size.columns > 0
+                            && size.rows > 0
+                        {
+                            let shown = display
+                                .window_rows()
+                                .unwrap_or_else(|| u64::from(size.rows));
+                            window.pressed(
+                                steps,
+                                scroll_step(shown),
+                                Dimensions::new(u64::from(size.columns), u64::from(size.rows)),
+                            );
+                            continue;
+                        }
+                        if keys.is_empty() {
+                            continue;
+                        }
+                        // As for bytes: a person who asked to follow the live screen is taken back
+                        // to it by the first key they press.
+                        if follow_live && showing_history {
+                            window.return_to_live();
+                        }
+                        let Some(epoch) = epoch else {
+                            // This terminal may not type, and watches.
+                            continue;
+                        };
+                        let request_id = kr_protocol::ids::RequestId::new(next_request);
+                        next_request += 1;
+                        if !send_keys(
+                            client,
+                            request_id,
+                            session_id,
+                            attachment_id,
+                            epoch,
+                            sequence,
+                            keys,
+                        )
+                        .await
+                        {
+                            return AttachOutcome::DeliveryUncertain(Shown::said(
+                                "the connection ended while input was being sent",
+                            ));
+                        }
+                        outstanding.insert(request_id, Outstanding::Input(sequence));
+                        sequence += 1;
+                        continue;
+                    }
+                };
                 // The scroll-back keys first, where they are this terminal's at all. They move
                 // the window it is looking through and never reach the session, so an attachment
                 // that may not type can still read what is above the live page.
@@ -2076,14 +2184,64 @@ async fn send_input(
     sequence: u64,
     bytes: Vec<u8>,
 ) -> bool {
+    send_write(
+        client,
+        request_id,
+        session_id,
+        attachment_id,
+        epoch,
+        sequence,
+        kr_protocol::input::InputContent::Bytes {
+            bytes: kr_protocol::scalars::Bytes::new(bytes),
+        },
+    )
+    .await
+}
+
+/// Writes one run of key records on this loop's own connection, as the console reported them.
+///
+/// The records are not spelled here. What they are written to the application as is the session's
+/// to decide, where it knows what its terminal asked for; a record is never turned into a character
+/// and back with a scan code this command chose. Its answer comes back through the loop.
+async fn send_keys(
+    client: &mut impl Link,
+    request_id: kr_protocol::ids::RequestId,
+    session_id: SessionId,
+    attachment_id: kr_protocol::ids::AttachmentId,
+    epoch: InputLeaseEpoch,
+    sequence: u64,
+    keys: Vec<kr_term::win32::KeyRecord>,
+) -> bool {
+    send_write(
+        client,
+        request_id,
+        session_id,
+        attachment_id,
+        epoch,
+        sequence,
+        kr_protocol::input::InputContent::ConsoleKeys {
+            keys: keys.into_iter().map(Into::into).collect(),
+        },
+    )
+    .await
+}
+
+/// Writes one `input.write` on this loop's own connection.
+async fn send_write(
+    client: &mut impl Link,
+    request_id: kr_protocol::ids::RequestId,
+    session_id: SessionId,
+    attachment_id: kr_protocol::ids::AttachmentId,
+    epoch: InputLeaseEpoch,
+    sequence: u64,
+    input: kr_protocol::input::InputContent,
+) -> bool {
     let params = kr_protocol::input::InputWriteParams {
         session_id,
         attachment_id,
         epoch,
         sequence: kr_protocol::ids::InputSequence::new(sequence),
-        input: kr_protocol::input::InputContent::Bytes {
-            bytes: kr_protocol::scalars::Bytes::new(bytes),
-        },
+        input,
     };
     let Ok(params) = kr_protocol::envelope::ParamsValue::from_typed(&params) else {
         return false;
@@ -2177,8 +2335,8 @@ async fn wait_for_resize(_resized: &mut Option<&mut WindowChanges>) {
 mod tests {
     use super::{
         Answer, AttachOutcome, Heard, Outstanding, Ownership, SCROLL_BACK_KEY, SCROLL_FORWARD_KEY,
-        Sending, Subscriptions, WindowReports, landed, ownership, resizes_in_flight, scroll_keys,
-        scroll_step, scrolled,
+        Sending, Subscriptions, WindowReports, landed, ownership, resizes_in_flight, scroll_chords,
+        scroll_keys, scroll_step, scrolled,
     };
     use kr_client::shown::Shown;
     use kr_protocol::attachment::ViewportPosition;
@@ -2386,6 +2544,48 @@ mod tests {
     fn a_read_that_is_one_scroll_key_moves_the_window() {
         assert_eq!(scroll_keys(SCROLL_BACK_KEY), Some(1));
         assert_eq!(scroll_keys(SCROLL_FORWARD_KEY), Some(-1));
+    }
+
+    /// The same gesture from a console, which reports it as the records of the keys and not as a
+    /// sequence: Shift going down, Page Up going down and up, Shift coming up.
+    #[test]
+    fn the_scroll_keys_of_a_console_move_the_window_and_other_keys_are_the_sessions() {
+        use kr_term::win32::{KeyRecord, control_keys::SHIFT_PRESSED};
+
+        let key = |virtual_key: u16, key_down: bool, control_keys: u32, repeat: u16| KeyRecord {
+            virtual_key,
+            scan_code: 0,
+            unicode: 0,
+            key_down,
+            control_keys,
+            repeat,
+        };
+        let page = |virtual_key: u16, repeat: u16| {
+            vec![
+                key(0x10, true, SHIFT_PRESSED, 1),
+                key(virtual_key, true, SHIFT_PRESSED, repeat),
+                key(virtual_key, false, SHIFT_PRESSED, 1),
+                key(0x10, false, 0, 1),
+            ]
+        };
+        assert_eq!(scroll_chords(&page(0x21, 1)), Some(1));
+        assert_eq!(scroll_chords(&page(0x22, 3)), Some(-3));
+        assert_eq!(scroll_chords(&[]), None);
+        assert_eq!(
+            scroll_chords(&[key(0x21, true, 0, 1)]),
+            None,
+            "an unshifted Page Up is the application's"
+        );
+        let mut mixed = page(0x21, 1);
+        mixed.push(key(u16::from(b'X'), true, SHIFT_PRESSED, 1));
+        assert_eq!(scroll_chords(&mixed), None, "a key among others is theirs");
+        let mut both = page(0x21, 1);
+        both.extend(page(0x22, 1));
+        assert_eq!(
+            scroll_chords(&both),
+            None,
+            "a read that goes both ways is nobody's"
+        );
     }
 
     /// Holding the key repeats it, and a read of several is that many pages.

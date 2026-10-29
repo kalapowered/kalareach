@@ -68,23 +68,6 @@ pub const fn ignore_background_write_signal() -> std::io::Result<()> {
     Ok(())
 }
 
-/// Ends the read `thread` is blocked in on the console, so that the thread goes on to see that it
-/// has been asked to stop.
-///
-/// A read of the console cannot be woken by anything else the thread waits on. The call is a
-/// request: the thread is not joined after it, because a console that did not honour it would
-/// hold the joiner for good.
-#[cfg(not(unix))]
-pub fn cancel_blocked_read(thread: &std::thread::JoinHandle<()>) {
-    use std::os::windows::io::AsRawHandle as _;
-
-    // SAFETY: the handle is the thread's own, kept open by the `JoinHandle` this borrows, and the
-    // call only asks the system to end that thread's pending synchronous I/O.
-    let _ = unsafe {
-        windows_sys::Win32::System::IO::CancelSynchronousIo(thread.as_raw_handle().cast())
-    };
-}
-
 #[cfg(not(unix))]
 pub use console::{ControllingTerminal, SavedModes};
 
@@ -208,24 +191,48 @@ mod console {
 
         /// Puts the console into the mode a forwarded terminal needs, and returns what it replaced.
         ///
+        /// Keys come back as the console's own virtual-terminal sequences, which is what a command
+        /// that reads bytes needs.
+        ///
         /// # Errors
         ///
         /// Returns an error when the modes cannot be read or set. A console whose output mode
         /// cannot be set is given its input mode back first, so a failure leaves it as it was.
         pub fn enter_raw_mode(&self) -> Result<SavedModes> {
             use windows_sys::Win32::System::Console::{
-                DISABLE_NEWLINE_AUTO_RETURN, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT,
-                ENABLE_PROCESSED_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT,
-                ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+                ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
+                ENABLE_VIRTUAL_TERMINAL_INPUT,
+            };
+
+            self.enter_mode(|saved| {
+                (saved & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT))
+                    | ENABLE_VIRTUAL_TERMINAL_INPUT
+            })
+        }
+
+        /// Puts the console into the mode an attachment needs, and returns what it replaced.
+        ///
+        /// Keys come back as the records the console reports them as, with no translation into
+        /// sequences: the session spells them as its terminal asked for.
+        ///
+        /// # Errors
+        ///
+        /// As [`Self::enter_raw_mode`].
+        pub fn enter_record_mode(&self) -> Result<SavedModes> {
+            self.enter_mode(crate::windows::records::record_input_mode)
+        }
+
+        /// Sets the input mode `input` makes of the one the console has and the output mode a
+        /// forwarded terminal needs.
+        fn enter_mode(&self, input: impl FnOnce(u32) -> u32) -> Result<SavedModes> {
+            use windows_sys::Win32::System::Console::{
+                DISABLE_NEWLINE_AUTO_RETURN, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
             };
 
             let saved = self.modes()?;
-            let raw_input = (saved.input
-                & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT))
-                | ENABLE_VIRTUAL_TERMINAL_INPUT;
             let raw_output =
                 saved.output | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN;
-            set_console_mode(&self.input, raw_input)?;
+            set_console_mode(&self.input, input(saved.input))?;
             if let Err(error) = set_console_mode(&self.output, raw_output) {
                 let _ = set_console_mode(&self.input, saved.input);
                 return Err(error);
