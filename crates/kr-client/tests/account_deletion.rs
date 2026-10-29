@@ -899,14 +899,24 @@ async fn a_closed_account_ends_the_stored_sign_in_with_no_call_to_revoke_it() {
         rig.wire.then([recorded("status_open")]);
         let status = rig.deletion.status(true, &rig.steps).await.expect("a look");
         assert_eq!(
-            (status.progress, record(&rig).is_some()),
+            status.progress,
             if finished {
-                (DeletionProgress::Done, false)
+                DeletionProgress::Done
             } else {
-                (DeletionProgress::Open, true)
-            },
-            "it goes with the look that finds the removal done and the device settled"
+                DeletionProgress::Open
+            }
         );
+        assert!(record(&rig).is_some(), "no look takes the record");
+        if finished {
+            rig.deletion
+                .result_shown(&rig.steps)
+                .await
+                .expect("the page said so");
+            assert!(
+                record(&rig).is_none(),
+                "it goes when the page says it showed the result"
+            );
+        }
     }
 }
 
@@ -1289,11 +1299,14 @@ async fn a_closed_record_lives_until_the_removal_is_done_and_the_device_has_sett
     assert!(record(&rig).is_some());
     assert_eq!(steps.ran(), (1, 3));
 
-    // The step is done at last: the record goes, and the service is not asked again.
+    // The step is done at last, and the service is not asked again. The record goes when the page
+    // has shown the result.
     *steps.recovery_done.lock().expect("done") = true;
     let before = rig.wire.seen().len();
     let status = rig.deletion.status(true, &steps).await.expect("a status");
     assert_eq!(status.progress, DeletionProgress::Done);
+    assert!(record(&rig).is_some());
+    rig.deletion.result_shown(&steps).await.expect("shown");
     assert!(record(&rig).is_none());
     assert_eq!(rig.wire.seen().len(), before);
     assert_eq!(steps.ran(), (1, 4));
@@ -1380,7 +1393,12 @@ async fn a_device_step_that_is_not_done_is_tried_again_and_one_that_is_done_is_n
     rig.wire.then([recorded("status_done")]);
     rig.deletion.status(true, &steps).await.expect("a status");
     assert_eq!(steps.ran(), (1, 2));
-    assert!(record(&rig).is_none(), "done and settled: the record goes");
+    assert!(record(&rig).is_some(), "no look takes the record");
+    rig.deletion.result_shown(&steps).await.expect("shown");
+    assert!(
+        record(&rig).is_none(),
+        "done, settled and shown: the record goes"
+    );
 }
 
 /* ---- Whose it is to see -------------------------------------------------------------------- */
@@ -1666,7 +1684,7 @@ async fn closing_the_step_stops_offering_it_and_keeps_the_receipt_for_a_closure_
 }
 
 #[tokio::test]
-async fn a_finished_record_stays_until_a_page_that_follows_it_has_been_told() {
+async fn a_finished_record_stays_until_the_page_has_said_it_showed_the_result() {
     let _clock = CLOCK.lock().await;
     let rig = new_rig().await;
     rig.wire.then([recorded("confirm_closed_deleted")]);
@@ -1705,7 +1723,45 @@ async fn a_finished_record_stays_until_a_page_that_follows_it_has_been_told() {
             .progress,
         DeletionProgress::Done
     );
-    assert!(record(&rig).is_none(), "the page was told, and it goes");
+    assert!(
+        record(&rig).is_some(),
+        "a look that tells the page takes nothing"
+    );
+    // Another process cannot say that a page here showed the result; this one can.
+    other.result_shown(&rig.steps).await.expect("nothing to do");
+    assert!(record(&rig).is_some());
+    rig.deletion.result_shown(&rig.steps).await.expect("shown");
+    assert!(record(&rig).is_none(), "the page showed it, and it goes");
+}
+
+#[tokio::test]
+async fn a_look_that_finds_the_removal_done_leaves_the_record_for_the_try_that_was_queued_behind_it()
+ {
+    let _clock = CLOCK.lock().await;
+    let rig = new_rig().await;
+    // A confirmation whose answer was lost: the step asks by itself, and the person presses Try
+    // again while that look is out. The look is the owner first, finds the account closed and the
+    // removal done, and its answer is not shown to anyone: the page has left the step.
+    rig.wire
+        .then([Step::Lost, Step::Lost, Step::Lost, Step::Lost]);
+    assert_eq!(
+        rig.deletion.confirm(CODE, &[], &rig.steps).await,
+        Ok(DeletionOutcome::Unsettled)
+    );
+    rig.wire.then([recorded("status_done")]);
+    let looked = rig.deletion.status(true, &rig.steps).await.expect("a look");
+    assert_eq!(looked.progress, DeletionProgress::Done);
+    assert!(!session(&rig), "the look ended the sign-in");
+    assert!(
+        record(&rig).is_some(),
+        "no look takes a finished record: it stays until the page has shown the result"
+    );
+    // The try behind it has no sign-in, and is told what became of the deletion.
+    assert_eq!(
+        rig.deletion.confirm(CODE, &[], &rig.steps).await,
+        Ok(DeletionOutcome::Closed { finished: true }),
+        "not asked to sign in to delete an account that is deleted"
+    );
 }
 
 #[tokio::test]
@@ -1772,9 +1828,10 @@ async fn a_look_that_follows_nothing_leaves_a_closed_deletion_for_the_page_that_
     );
     let status = rig.deletion.status(true, &rig.steps).await.expect("a look");
     assert_eq!(status.progress, DeletionProgress::Done);
+    rig.deletion.result_shown(&rig.steps).await.expect("shown");
     assert!(
         record(&rig).is_none(),
-        "the page that follows it is told, and it goes"
+        "the page showed the result, and it goes"
     );
 }
 
@@ -1809,12 +1866,13 @@ async fn the_look_that_opens_the_panel_tells_the_person_whose_own_deletion_it_fi
         assert!(!session(&rig), "the sign-in is gone");
         assert!(
             record(&rig).is_some(),
-            "{answer}: the record stays until the page that shows the result has asked"
+            "{answer}: the record stays until the page that shows the result has said so"
         );
         if progress == DeletionProgress::Done {
             let status = rig.deletion.status(true, &rig.steps).await.expect("a look");
             assert_eq!(status.progress, DeletionProgress::Done);
-            assert!(record(&rig).is_none(), "and goes with that look");
+            rig.deletion.result_shown(&rig.steps).await.expect("shown");
+            assert!(record(&rig).is_none(), "and goes when the page says so");
         }
     }
 }
@@ -1931,6 +1989,8 @@ async fn a_closure_whose_sign_in_could_not_be_removed_is_not_forgotten_when_the_
         .await
         .expect("a status");
     assert!(!session(&rig));
+    assert!(record(&rig).is_some());
+    rig.deletion.result_shown(&rig.steps).await.expect("shown");
     assert!(record(&rig).is_none());
 }
 

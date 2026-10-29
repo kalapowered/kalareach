@@ -276,6 +276,21 @@ impl Account {
         })
     }
 
+    /// The page has shown the result of the deletion: this device lets go of its record once what it
+    /// has to settle is settled. No look does, since the answer of a look can be one nobody sees.
+    ///
+    /// # Errors
+    ///
+    /// Returns a local failure when this device's records could not be read or kept.
+    pub async fn deletion_result_shown(&self, state: &AppState) -> Result<StatusAnswer> {
+        Ok(match self.deletion.result_shown(&Steps(state)).await {
+            Ok(()) => StatusAnswer::None,
+            Err(fault) => StatusAnswer::Problem {
+                problem: problem(fault)?,
+            },
+        })
+    }
+
     /// The account is closed: no sign-out message belongs beside the signed-out view, and every
     /// window is told.
     async fn after_deletion(&self) {

@@ -285,6 +285,7 @@ fn invoke(account: &Arc<Account>, command: &str, args: Value) -> Value {
             companion_tauri::commands::account_deletion_confirm,
             companion_tauri::commands::account_deletion_status,
             companion_tauri::commands::account_deletion_hide,
+            companion_tauri::commands::account_deletion_result_shown,
         ])
         .build(mock_context(noop_assets()))
         .expect("an application on the mock runtime");
@@ -559,6 +560,44 @@ async fn the_person_can_close_the_step_of_a_confirmation_that_has_no_answer_and_
             .is_some(),
         "the request can still take effect, so the receipt stays"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_look_takes_no_record_of_a_finished_removal_and_the_page_can_say_it_showed_the_result() {
+    let rig = rig().await;
+    rig.wire.then(&["confirm_closed_deleted"]);
+    let account = Arc::clone(&rig.account);
+    let run = move |command: &'static str, args: Value| {
+        let account = Arc::clone(&account);
+        tokio::task::spawn_blocking(move || invoke(&account, command, args))
+    };
+    let confirmed = run(
+        "account_deletion_confirm",
+        json!({ "code": CODE, "acknowledged": [] }),
+    )
+    .await
+    .expect("joined");
+    assert_eq!(confirmed["state"], "closed");
+    let kept = |rig: &Rig| {
+        rig.store
+            .get(&SecretName::new("account/deletion").expect("a name"))
+            .expect("a read")
+            .is_some()
+    };
+    // A look, here asked as a page that follows the deletion, takes nothing.
+    let status = run("account_deletion_status", json!({ "following": true }))
+        .await
+        .expect("joined");
+    assert_eq!(status["state"], "done");
+    assert!(kept(&rig), "the answer of a look can be one nobody sees");
+
+    let shown = run("account_deletion_result_shown", json!({}))
+        .await
+        .expect("joined");
+    assert_eq!(shown["state"], "none");
+    // This rig has no recovery to settle, so the device is not settled and the record stays; the
+    // client's cases hold when it goes.
+    assert!(kept(&rig));
 }
 
 #[tokio::test(flavor = "multi_thread")]

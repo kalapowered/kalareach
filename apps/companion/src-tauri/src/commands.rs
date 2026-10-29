@@ -224,13 +224,15 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("account_sign_out", None),
     ("account_usage", None),
     // Deleting the account: the page reads what it would do, asks for the emailed code, confirms
-    // with it, learns how the removal goes, and can close the step for a confirmation that has no answer.
+    // with it, learns how the removal goes, can close the step for a confirmation that has no answer,
+    // and says when it has shown the result.
     // None is a host method, and none takes an address, a token or the receipt the backend keeps.
     ("account_deletion_view", None),
     ("account_deletion_send_code", None),
     ("account_deletion_confirm", None),
     ("account_deletion_status", None),
     ("account_deletion_hide", None),
+    ("account_deletion_result_shown", None),
     // The sync service this computer is set to use, and the recovery material kept on it. None is
     // a host method. The page names an origin, or a destination a save dialog returned, and is
     // never given the seed, the locator or a token.
@@ -709,6 +711,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         account_deletion_confirm,
         account_deletion_status,
         account_deletion_hide,
+        account_deletion_result_shown,
         sync_service_view,
         sync_service_set,
         recovery_view,
@@ -3890,6 +3893,7 @@ mod tests {
         "account_deletion_confirm",
         "account_deletion_status",
         "account_deletion_hide",
+        "account_deletion_result_shown",
         "account_sign_in_for_recovery",
         "sync_service_view",
         "sync_service_set",
@@ -4060,6 +4064,7 @@ mod tests {
                 "account_deletion_confirm",
                 "account_deletion_status",
                 "account_deletion_hide",
+                "account_deletion_result_shown",
                 // The sync service setting's two and recovery's five. The setting is one origin
                 // kept on this computer; recovery's seed is made, kept and written by native code,
                 // and a kit is written only where a save dialog put it. The fifth covers the host
@@ -4910,6 +4915,16 @@ pub async fn account_deletion_hide(
     account: State<'_, crate::account::AccountSlot>,
 ) -> Result<crate::account::deletion::StatusAnswer> {
     account.get().await?.deletion_hide().await
+}
+
+/// Says that the page has shown the result of the deletion, so that this device lets go of its
+/// record.
+#[tauri::command]
+pub async fn account_deletion_result_shown(
+    account: State<'_, crate::account::AccountSlot>,
+    state: State<'_, AppState>,
+) -> Result<crate::account::deletion::StatusAnswer> {
+    account.get().await?.deletion_result_shown(&state).await
 }
 
 /// The sync service this computer is set to use.
