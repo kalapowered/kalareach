@@ -53,8 +53,9 @@ case "$1" in
         echo "session 1 created"; : > "$state/open"; exit 0 ;;
     list)
         [ "$SCENARIO" = list_fails ] && exit 9
+        [ "$SCENARIO" = list_fails_after_close ] && [ -e "$state/closed" ] && exit 9
         if [ -e "$state/open" ]; then echo "1 running"; else echo "no sessions"; fi ;;
-    close) [ "$SCENARIO" = never_closes ] || rm -f "$state/open" ;;
+    close) : > "$state/closed"; [ "$SCENARIO" = never_closes ] || [ "$SCENARIO" = list_fails_after_close ] || rm -f "$state/open" ;;
     --version) echo "kr stand-in" ;;
 esac
 KR
@@ -62,7 +63,7 @@ KR
     run_case() { # <scenario> <wanted exit: 0 or 1> <text the output must hold> <whether the daemon is gone afterwards: yes or no>
         local out rc=0 gone=yes exit_ok
         mkdir -p "$work/state" "$work/tmp"
-        rm -f "$work/state/pid" "$work/state/open"
+        rm -f "$work/state/pid" "$work/state/open" "$work/state/closed"
         out="$(SCENARIO="$1" KR_STAND_IN_STATE="$work/state" CI=true TMPDIR="$work/tmp" KR_START_CLOSE_SECONDS=2 KR_START_STOP_SECONDS=2 bash "${BASH_SOURCE[0]}" "$work/kr" 2>&1)" || rc=$?
         if [ -f "$work/state/pid" ] && kill -0 "$(cat "$work/state/pid")" 2> /dev/null; then
             gone=no
@@ -85,6 +86,7 @@ KR
     run_case new_fails 1 "kr new failed" yes "a kr new that fails with the real text names its daemon, fails, and the daemon is stopped"
     run_case no_pid 1 "did not say which process" yes "a kr new that names no process fails"
     run_case list_fails 1 "kr list failed" yes "a kr list that fails is named as that"
+    run_case list_fails_after_close 1 "while the session was being closed" yes "a kr list that fails after the session was closed is named as that, and not as a session still listed"
     run_case never_closes 1 "still listed" yes "a session that stays listed after it is closed fails"
     run_case startup_fails 1 "" yes "a startup step that fails fails the check"
     run_case stuck 1 "is still running" no "a daemon that ignores the stop is named and its directories stay"
