@@ -2130,6 +2130,16 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
     },
     IgnoredRun {
         package: "kr-worker",
+        target: "--test host",
+        cases: &[
+            "a_session_in_a_service_rests_on_a_control_group_and_a_close_ends_what_left_its_tree",
+        ],
+        runs: Runs::ByHand {
+            why: "it needs a user service manager for the account (`systemctl --user`), which a hosted runner's account does not have; it runs with `--include-ignored` on a Linux host whose account has one",
+        },
+    },
+    IgnoredRun {
+        package: "kr-worker",
         target: "--test live_ownership",
         cases: &["the_worker_half_of_the_death_test"],
         runs: Runs::Helper {

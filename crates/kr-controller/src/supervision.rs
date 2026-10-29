@@ -1094,6 +1094,13 @@ impl SystemdSupervisor {
             format!("WorkingDirectory={}", launch.working_directory.display()),
             "--quiet".to_owned(),
         ];
+        // A worker's unit is delegated to the worker: it makes a control group of its own below the
+        // unit for the session's processes, and the manager leaves a group below a delegated unit
+        // alone. A plugin host has no use for the right, and keeps the manager's whole say.
+        if unit.starts_with("kr-worker-") {
+            arguments.push("-p".to_owned());
+            arguments.push("Delegate=yes".to_owned());
+        }
         // The selected desktop's own handles, passed to the unit rather than left to whatever the
         // user manager happens to hold. A manager started at boot holds none of them. They are
         // options to the launcher, so they go before the program it is told to start.
@@ -1188,12 +1195,18 @@ pub(crate) fn kill_unit(
 /// The service this host started that a process is in, when it is in one: the label of its
 /// transient unit and the reservation it was started for.
 ///
-/// Read from the process's control group, which names the service the manager runs it in. A
-/// process in any other control group, or on a platform without them, is in none.
+/// Read from the process's control group, which names the service the manager runs it in, or the
+/// group a worker made below its service for its session. A process in any other control group, or
+/// on a platform without them, is in none.
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn host_started_service_of(pid: u32) -> Option<HostStartedService> {
-    let path = kr_ipc::identity::control_group_of(pid)?;
+    let in_group = kr_ipc::identity::control_group_of(pid)?;
+    // A session's processes are in the group its worker made below the worker's service, and they
+    // are the service's all the same: the manager's end of the service ends them.
+    let path = in_group
+        .strip_suffix(&format!("/{}", kr_worker::session_group::SESSION_GROUP))
+        .map_or(in_group.clone(), str::to_owned);
     let leaf = path.rsplit('/').next()?;
     let label = leaf.strip_suffix(".service")?;
     SERVICE_LABEL_PREFIXES.iter().find_map(|prefix| {

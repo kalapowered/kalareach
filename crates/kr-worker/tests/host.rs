@@ -3029,8 +3029,8 @@ async fn a_crashed_workers_session_is_stopped_before_its_closure_is_recorded(
         let ran_in = std::fs::read_to_string(format!("/proc/{}/cgroup", drifter.pid.get()))
             .expect("its group");
         assert!(
-            ran_in.trim().ends_with(group),
-            "the drifter is in the service's control group: {ran_in} against {group}"
+            ran_in.trim().trim_start_matches("0::").starts_with(group),
+            "the drifter is in the service's control group or one below it: {ran_in} against {group}"
         );
         assert!(
             !record.processes.contains(&drifter),
@@ -3799,6 +3799,128 @@ async fn a_worker_that_dies_after_accepting_a_close_has_its_tree_stopped_by_the_
             .any(|terminated| terminated.identity == named[1].1 && terminated.forced),
         "the process that ignores the request was forced by the daemon: {closure:?}"
     );
+    drop(client);
+    daemon.stop().await;
+}
+
+/// What the root shell does at once in the control group tests: it makes `leaver`, which ignores
+/// hang-up and terminate, calls `setsid` and has its parent end, so that it is in no list of the
+/// session's tree and only the session's control group holds it.
+#[cfg(target_os = "linux")]
+const LEAVER: &str = r#"
+perl -e 'use POSIX qw(setsid); $SIG{HUP} = "IGNORE"; $SIG{TERM} = "IGNORE"; exit 0 if fork(); setsid() or die "setsid: $!"; open(F, ">leaver.pid"); print F $$; close F; exec "sleep", "607";'
+"#;
+
+/// KR-REQ-07.60: a session whose worker is the process of a service of its own rests on a control
+/// group that worker makes below the service. The root shell is placed in it before it runs, so a
+/// process that left the shell's session and lost its parent is in it, and the closure ends it
+/// with the group and says it accounted for everything.
+///
+/// The control group is the kernel's: the shell's and the leaver's own `/proc/<pid>/cgroup` name
+/// it, and the worker's record says the session rests on it.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a user service manager for this account (`systemctl --user`), which a hosted CI \
+            runner's account does not have; it runs with --ignored on a Linux host whose account \
+            has one"]
+async fn a_session_in_a_service_rests_on_a_control_group_and_a_close_ends_what_left_its_tree() {
+    let host = Host::create().through_the_platform().recording_launches();
+    let script = host.temp.root().join("leaver.sh");
+    std::fs::write(&script, LEAVER).expect("writes the script");
+    let daemon = host.start().await;
+    let mut client = host.client().await;
+    let created = create_with(
+        &mut client,
+        &host,
+        &[("ENV", script.to_str().expect("a path"))],
+    )
+    .await;
+    let session_id = created.session.session_id;
+    let root = created
+        .session
+        .root_process
+        .as_ref()
+        .cloned()
+        .expect("the session names its root shell");
+    let leaver = until("the leaver to write its number", || {
+        member_of(&host, "leaver")
+    })
+    .await;
+    let _cleanup = Members(vec![root.clone(), leaver.clone()]);
+
+    let record = until(
+        "the worker to record the leaver below a control group",
+        || recorded_by(&host, session_id).filter(|record| record.processes.contains(&leaver)),
+    )
+    .await;
+    assert!(
+        record.boundary.contains("control group") && record.boundary.ends_with("/session"),
+        "the session rests on the control group the worker made: {}",
+        record.boundary
+    );
+    for (what, who) in [("root shell", &root), ("leaver", &leaver)] {
+        let group = std::fs::read_to_string(format!("/proc/{}/cgroup", who.pid.get()))
+            .expect("the process's group");
+        assert!(
+            group.trim().ends_with("/session"),
+            "the {what} is in the session's control group: {group}"
+        );
+    }
+    let lineage = kr_ipc::identity::process_lineage(
+        u32::try_from(leaver.pid.get()).expect("a process number"),
+    )
+    .expect("the leaver's lineage");
+    assert_ne!(
+        lineage.session,
+        Some(u32::try_from(root.pid.get()).expect("a process number")),
+        "the leaver left the root shell's session, so only the group held it"
+    );
+
+    close(&mut client, &host, session_id).await;
+    let closure = closure_of(&mut client, session_id).await;
+    assert_eq!(
+        kr_ipc::identity::process_state(&leaver),
+        kr_ipc::identity::ProcessState::Ended,
+        "the closure left the leaver running: {closure:?}"
+    );
+    assert!(
+        closure
+            .terminated
+            .iter()
+            .any(|terminated| terminated.identity == leaver),
+        "the closure names the leaver among the processes it ended: {closure:?}"
+    );
+    assert_eq!(
+        closure.ownership_coverage,
+        kr_protocol::session::OwnershipCoverage::Complete,
+        "a boundary that held everything reports complete coverage: {closure:?}"
+    );
+    drop(client);
+    daemon.stop().await;
+}
+
+/// KR-REQ-07.60: a session whose worker is not the process of a service of its own, as one started
+/// as a detached process is not, has no control group to rest on, and rests on its terminal and
+/// process group as it always did. It claims no more than that.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_whose_worker_is_no_service_rests_on_its_terminal() {
+    let host = Host::create().recording_launches();
+    let daemon = host.start().await;
+    let mut client = host.client().await;
+    let created = create_with(&mut client, &host, &[]).await;
+    let session_id = created.session.session_id;
+    let record = until("the worker to record its session's boundary", || {
+        recorded_by(&host, session_id)
+    })
+    .await;
+    assert!(
+        record.boundary.contains("controlling terminal")
+            && !record.boundary.contains("control group"),
+        "the boundary is the terminal's, not a group's: {}",
+        record.boundary
+    );
+    close(&mut client, &host, session_id).await;
     drop(client);
     daemon.stop().await;
 }

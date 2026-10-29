@@ -63,6 +63,10 @@ pub struct Pty {
     /// The end the root shell is given, until it is.
     #[cfg(unix)]
     slave: Option<std::os::fd::OwnedFd>,
+    /// The control group file the root shell writes itself into before it runs, when it is to be
+    /// placed in a group of its own.
+    #[cfg(unix)]
+    session_procs: Option<std::os::fd::OwnedFd>,
     /// The end the root shell is given, until it is.
     #[cfg(windows)]
     slave: Option<crate::windows::conpty::Slave>,
@@ -119,6 +123,7 @@ impl Pty {
         Ok(Self {
             master: pair.master,
             slave: Some(slave),
+            session_procs: None,
             dimensions,
         })
     }
@@ -150,6 +155,13 @@ impl Pty {
             console_input,
             dimensions,
         })
+    }
+
+    /// Has the next start of the root shell place it in the control group whose `cgroup.procs` this
+    /// is, between the fork and the exec, so that nothing it starts is ever outside the group.
+    #[cfg(unix)]
+    pub fn place_the_shell_in(&mut self, procs: std::os::fd::OwnedFd) {
+        self.session_procs = Some(procs);
     }
 
     /// Returns the geometry the terminal is currently set to.
@@ -197,7 +209,7 @@ impl Pty {
         let slave = self.slave.take().ok_or_else(running)?;
         #[cfg(unix)]
         let child: Box<dyn portable_pty::Child + Send + Sync> = Box::new(
-            spawn::start(&slave, reads, command)
+            spawn::start(&slave, reads, command, self.session_procs.take())
                 .map_err(|error| WorkerError::pty("start the root shell", error))?,
         );
         #[cfg(windows)]

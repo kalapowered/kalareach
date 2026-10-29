@@ -1226,8 +1226,37 @@ impl OwnedProcesses {
     /// The boundaries this platform has are read through the processes they hold, which
     /// [`Self::surviving`] has already asked about.
     #[cfg(not(windows))]
-    const fn ask_the_boundary(&self) -> bool {
-        true
+    fn ask_the_boundary(&self) -> bool {
+        let OwnershipBoundary::ControlGroup { path } = &self.boundary else {
+            return true;
+        };
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        match crate::session_group::members_or_none_if_gone(path) {
+            Ok(held) if held.is_empty() => true,
+            Ok(held) => {
+                self.note_unestablished(format!(
+                    "the session's control group still held {} process(es) when the closure was \
+                     written",
+                    held.len()
+                ));
+                false
+            }
+            Err(error) => {
+                self.note_unestablished(format!(
+                    "the session's control group at {} would not say what was left in it: {error}",
+                    path.display()
+                ));
+                false
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            self.note_unestablished(format!(
+                "the session's control group at {} cannot be read on this platform",
+                path.display()
+            ));
+            false
+        }
     }
 
     /// Returns what this host could not establish, for the closure receipt.
@@ -1260,6 +1289,10 @@ impl OwnedProcesses {
         #[cfg(windows)]
         if let OwnershipBoundary::JobObject { root } = self.boundary {
             self.observe_job(root);
+            return;
+        }
+        if let OwnershipBoundary::ControlGroup { path } = self.boundary.clone() {
+            self.observe_control_group(&path);
             return;
         }
         let OwnershipBoundary::TerminalGroup { group, terminal } = self.boundary else {
@@ -1316,6 +1349,62 @@ impl OwnedProcesses {
             }
         }
         self.take(agreeing);
+    }
+
+    /// Reads what the session's control group holds, and the worker's own tree beside it.
+    ///
+    /// The group holds everything the root shell started, whatever it left: a process that gave up
+    /// the shell's session or lost its parent is in it still. The tree is read as well, because a
+    /// process can move itself out of the group and still be a descendant the session started, and
+    /// one that did is outside the boundary and recorded all the same. Each process the group lists
+    /// is recorded from one reading of it that agrees it is still in the group: a number that
+    /// passed to another process after it was listed does not.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn observe_control_group(&mut self, path: &std::path::Path) {
+        let relative = crate::session_group::relative(path);
+        let listed = relative
+            .as_deref()
+            .ok_or_else(|| {
+                std::io::Error::other("the group is not in the control group file system")
+            })
+            .and_then(|_| crate::session_group::members_or_none_if_gone(path));
+        match (listed, relative) {
+            (Ok(pids), Some(relative)) => {
+                let agreeing: Vec<ProcessStartIdentity> = pids
+                    .into_iter()
+                    .filter_map(|pid| {
+                        let lineage = kr_ipc::identity::process_lineage(pid).ok()?;
+                        crate::session_group::in_group(pid, &relative).then_some(lineage.identity)
+                    })
+                    .collect();
+                let scopes = Scopes::default();
+                for identity in &agreeing {
+                    if self.left_the_session(identity, &scopes) {
+                        self.note_left(identity);
+                    }
+                }
+                self.take(agreeing);
+            }
+            (Err(error), _) => self.note_unestablished(format!(
+                "the session's control group at {} could not be listed, so the processes begun \
+                 since the last listing are recorded only where the worker's own tree shows them: \
+                 {error}",
+                path.display()
+            )),
+            (Ok(_), None) => {}
+        }
+        if let Some(tree) = self.tree() {
+            self.take(tree);
+        }
+    }
+
+    /// A control group is only made on Linux.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn observe_control_group(&mut self, path: &std::path::Path) {
+        self.note_unestablished(format!(
+            "the session's control group at {} cannot be read on this platform",
+            path.display()
+        ));
     }
 
     /// Reads every tree below a backend root, by parentage and start identity.
@@ -1828,6 +1917,44 @@ pub fn boundary_for(group: Option<i32>, root: &ProcessStartIdentity) -> Ownershi
     OwnershipBoundary::TerminalGroup { group, terminal }
 }
 
+/// Establishes the boundary after the root shell was started, given the control group it was to be
+/// placed in, if there was one.
+///
+/// A shell that is in the group, or that has already gone so that nothing can say it was not, gives
+/// a session whose ownership rests on the group: the group holds everything the shell started, and
+/// a process that left the shell's session, group or parent is in it still. A shell that is alive
+/// and outside the group, because the write that places it was refused, gives the boundary a host
+/// without a group has, and the group that nothing entered is removed.
+#[cfg(not(windows))]
+#[must_use]
+pub fn boundary_after_placement(
+    group: Option<i32>,
+    root: &ProcessStartIdentity,
+    placed: Option<crate::session_group::SessionGroup>,
+) -> OwnershipBoundary {
+    if let Some(placed) = placed {
+        let pid = u32::try_from(root.pid.get()).unwrap_or_default();
+        if placed.placement(pid) != Some(false) {
+            return OwnershipBoundary::ControlGroup {
+                path: placed.path().to_path_buf(),
+            };
+        }
+        placed.discard();
+    }
+    boundary_for(group, root)
+}
+
+/// Establishes the boundary after the root shell was started: the job, whatever was placed.
+#[cfg(windows)]
+#[must_use]
+pub fn boundary_after_placement(
+    group: Option<i32>,
+    root: &ProcessStartIdentity,
+    _placed: Option<crate::session_group::SessionGroup>,
+) -> OwnershipBoundary {
+    boundary_for(group, root)
+}
+
 /// Makes this worker the parent of every process of its session whose own parent exits, where the
 /// platform lets it: on Linux, the child subreaper.
 ///
@@ -1863,6 +1990,20 @@ pub fn request_stop(owned: &OwnedProcesses) {
 /// Forces every process the boundary still holds to stop.
 #[cfg(unix)]
 pub fn force_stop(owned: &OwnedProcesses) {
+    // A control group ends everything in it with one write, a process that is starting among
+    // them, and not the worker, which is outside the session's group. A kernel with no such file
+    // leaves it to the processes the record names, below.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let OwnershipBoundary::ControlGroup { path } = owned.boundary() {
+        match crate::session_group::kill(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => owned.note_unestablished(format!(
+                "the session's control group at {} refused to end what it holds: {error}",
+                path.display()
+            )),
+        }
+    }
     signal_surviving(owned, kr_ipc::identity::Stop::Kill, |_| true);
 }
 

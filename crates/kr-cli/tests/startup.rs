@@ -1014,6 +1014,7 @@ fn allowed(call: &Recorded, daemons: &[u32], allowance: Allowance<'_>) -> Result
                     "-p" => rest.next().is_some_and(|value| {
                         value == &"Type=exec"
                             || value == &"Restart=no"
+                            || value == &"Delegate=yes"
                             || value.starts_with("WorkingDirectory=")
                     }),
                     "--quiet" => true,
@@ -1545,7 +1546,15 @@ fn the_allow_list_refuses_every_mutating_or_privileged_call() {
         arguments.extend([program, "--reservation", reservation]);
         arguments
     };
-    let written = ["-p", "Type=exec", "-p", "Restart=no", "--quiet"];
+    let written = [
+        "-p",
+        "Type=exec",
+        "-p",
+        "Restart=no",
+        "-p",
+        "Delegate=yes",
+        "--quiet",
+    ];
     let good = worker(&written, "/opt/kr/kr-worker", "0123");
     assert!(allowed(&call(1, daemon, "systemd-run", &good), &[daemon], inside).is_err());
     assert_eq!(
@@ -4440,9 +4449,13 @@ fn a_daemon_that_cannot_leave_the_service_it_started_in_is_named_by_the_doctor()
         recorded.iter().all(|call| call.tool != "systemd-run"),
         "a manager that does not answer is asked for nothing: {recorded:?}"
     );
-    let group = control_group_of(daemon);
+    // Its session's shell is in the group the worker made below its service, and a process it
+    // starts is in that group: the service's all the same, which a manager that answered would
+    // have the daemon leave.
+    let group = std::fs::read_to_string(format!("/proc/{daemon}/cgroup"))
+        .expect("reads the daemon's control group");
     assert!(
-        group.starts_with("kr-worker-"),
+        group.contains("/kr-worker-") && group.trim().ends_with(".service/session"),
         "the daemon stays in the service it started in: {group}"
     );
 

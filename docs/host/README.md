@@ -1203,7 +1203,7 @@ A worker's lifetime belongs to the platform, not to the control daemon.
 | Platform | How a worker starts | Where its identity comes from |
 | --- | --- | --- |
 | macOS | a per-session launchd job, bootstrapped into `gui/<uid>` and started once with `launchctl kickstart -p` | the kickstart output's process identifier, then `proc_pidinfo` |
-| Linux with systemd | a transient user *service*, `systemd-run --user --unit=... --collect -p Type=exec -p Restart=no` | `systemctl --user show -p MainPID`, then `/proc/<pid>/stat` |
+| Linux with systemd | a transient user *service*, `systemd-run --user --unit=... --collect -p Type=exec -p Restart=no`, and for a worker `-p Delegate=yes` | `systemctl --user show -p MainPID`, then `/proc/<pid>/stat` |
 | other Unix | a child that leads a session of its own, reparented when the daemon exits | the spawned child |
 | Windows | a process the starter of the environment's scheduled task creates, in the user's logon session, outside every job the daemon runs in | the identity the starter read from the handle that created it |
 
@@ -4303,6 +4303,27 @@ as failed is not counted, a group the host could not read to the end beforehand 
 and a process that ended by itself between that reading and the kill is counted: the flag is the
 host's best reading, and a process the manager ended that the worker never recorded is listed with
 the others.
+
+**A control group of the session's own.** A worker that runs as a systemd service has the service's
+control group delegated to it. It makes one group below it, `session`, before the root shell runs and
+has the shell write itself into the group between its fork and its exec, so that everything the shell
+starts is born in the group: a process that gave up the shell's session or process group, or lost its
+parent, is in it still. The session's ownership then rests on that group. While the session runs, the
+worker records the processes the group lists, each from one reading that agrees it is in the group,
+beside the worker's own tree; a closure ends the group with one write to `cgroup.kill` (and then, as
+before, the recorded processes), and its coverage is complete only when the group read empty
+afterwards. A group that is not there holds nothing, as the kernel removes only an empty group; a
+group that cannot be listed, or that holds more groups than a session makes, is something the host
+could not establish, and the closure says so. The worker itself stays in the service's group, outside
+the session's. The group is made only when the worker is the process of a service named for a
+reservation (`kr-worker-<reservation>.service`), the control groups are the unified hierarchy and the
+worker may make a group below its service. Under any other start, such as a detached process of a
+host with no service manager, a worker in a login session's scope, or a kernel without the unified
+hierarchy, there is no group and the session rests on its terminal and process group as described
+below. A shell that is alive and outside the group because the write that placed it was refused
+leaves the session on those too, and the group is removed. A control daemon a session's command
+starts is in the group and moves out of the service as it does from the service itself; the session's
+group counts as the worker's service for that and for `kr doctor`.
 
 **What it cannot reach, and what a survivor means.** On macOS, a process that left the terminal's
 session, a process the worker started outside it and a process that began after the worker's last

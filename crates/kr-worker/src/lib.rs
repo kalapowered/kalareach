@@ -82,6 +82,7 @@ pub mod render;
 pub mod runtime;
 pub mod service;
 pub mod session;
+pub mod session_group;
 pub mod snapshot;
 pub mod testing;
 pub mod trace;

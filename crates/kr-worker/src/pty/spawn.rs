@@ -111,6 +111,7 @@ pub(super) fn start(
     terminal: &OwnedFd,
     reads: Reads,
     command: &ShellCommand,
+    session_procs: Option<OwnedFd>,
 ) -> std::io::Result<std::process::Child> {
     let directory = reads.opened?;
     let mut room = reads.room;
@@ -132,6 +133,13 @@ pub(super) fn start(
     // and nothing that allocates or takes a lock, and it touches nothing the parent's threads hold.
     unsafe {
         process.pre_exec(move || {
+            // Into the session's control group before anything of the shell runs, so that every
+            // process the shell starts is born in it. A refusal is not a failed start: the group
+            // is checked once the process exists, and a shell outside it leaves the session on the
+            // boundary it had without one.
+            if let Some(procs) = &session_procs {
+                let _ = rustix::io::write(procs, b"0");
+            }
             // Nothing the worker ignores or blocks is ignored or blocked in the shell.
             for signal in [
                 libc::SIGCHLD,
