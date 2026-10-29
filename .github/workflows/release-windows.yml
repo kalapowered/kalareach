@@ -608,12 +608,12 @@ jobs:
           }
 
       # The manifest is written again, since signing changed the files, and signed by a threshold of
-      # the channel's release keys. Those keys do not exist yet: they are made at a key ceremony,
-      # held in hardware and on offline media, and no mechanism of this repository gives a run one.
-      # This is where the job stops, with the same words on every platform, until they do.
+      # the production channel's release keys. Those keys are made at a key ceremony, held in hardware
+      # and on offline media, and no mechanism of this repository gives a run one. This is where the
+      # job stops.
       - name: Write the manifest again and sign it with the channel's release keys
         run: |
-          Write-Host "::error::the channel's release keys do not exist yet, so this release cannot be signed. Publishing a release waits for the key ceremony, which is the project owner's to hold. Every step before this one ran and passed."
+          Write-Host "::error::the production channel's release keys are not available to this workflow, so this release cannot be signed. Publishing a Windows release waits for the key ceremony, which is the project owner's to hold. Every step before this one ran and passed."
           exit 1
 
       # Each tree is packed, and each archive is read as a host stages one: every member against the
