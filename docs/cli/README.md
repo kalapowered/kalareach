@@ -44,6 +44,7 @@ worker directly for what a session owns.
 | `kr diff [read/apply/revert]` | — | Read changes, or apply or revert a change-set version at a destination you name |
 | `kr workflow rearm <causal-root> --grant <id>` | — | Give a causal chain of automation workflows whose budget ran out a new budget, and continue it |
 | `kr device [list/revoke]` | — | The devices paired with this host, and revoking one |
+| `kr action read <action>` | — | Show the receipt the host keeps for an action: its state, its revision and the failure recorded for it |
 | `kr share [invite/list/revoke/transfer]` | — | Share a session with a paired device, see who holds a share, take one back, or hand a session's control to another device |
 | `kr plugin [list/install/remove/pin/enable/disable]` | — | Plugin packages and what they may do |
 | `kr plugin repo [list/add/sync/pin/remove]` | — | The repositories plugins come from, and the trust placed in them |
@@ -58,7 +59,8 @@ shell commands nor paths are assembled by interpolating text.
 
 The commands from `kr project` to `kr organisation` act in this installation's own environment, or in the
 one `--environment <id>` names. Each is a client of one method the control daemon serves, and
-the daemon decides every refusal. A command that removes or revokes something names it by its
+the daemon decides every refusal; `kr action read` of a live session is the exception, which asks
+that session's worker. A command that removes or revokes something names it by its
 identifier, never by a label or a number.
 
 A session is named by its display number or its identifier. Display numbers increase within an
@@ -1846,6 +1848,34 @@ waits for with the reason the host gives, and exits with 1 and `RESOURCE_UNAVAIL
 document is the host's whole result with the failure beside it. Running it again reports how far
 the revocation has got. A worker that has fenced it but whose evidence has not all arrived is named
 too, and so is any action a worker could not show did not run before the revocation reached it.
+
+## `kr action`
+
+`kr action read <action> [--session <session>]` shows the receipt the host keeps for an action: the
+method, the state the action stands in, the revision of that state, the failure recorded for it and
+whether a result is still retained. It changes no receipt. Reading a live session's receipt does
+have one effect: the session's worker notes, for you, the revision it showed. That note is what the
+worker checks when a later request names the action, so a worker that restarted, or that let the
+note go for room after 1,024 reads, has to be asked again. The daemon and the archive note nothing.
+
+Where the receipt is kept decides what `--session` does. An action a live session performed is kept
+by that session's worker, and the command asks the worker directly. An action a closed session
+performed is kept in the environment's archive, which the control daemon serves. A session is looked
+for in every environment of this host unless `--environment` names one, and a display number that
+two environments use is refused as `AMBIGUOUS_SESSION`. A catalogue or plugin change names no
+session, so leave `--session` out and the daemon answers. Other actions the daemon performs are not
+served by this read yet, and the daemon refuses them. A session whose worker the daemon has not published has no
+receipts to read, and the command says so. An identifier nothing holds is refused by whoever was
+asked.
+
+An action whose outcome the host could not establish, a receipt in the `unknown` state or one that
+ended in `OUTCOME_UNKNOWN`, is shown as exactly that, and the command says the host never sends it
+again under its identifier. Only a session's worker holds a later request for the same thing to a
+rule, so only a receipt read from a worker says more: a later request is a new action that has to
+name this one and the revision shown here, when this is the latest uncertain outcome of its subject.
+With `--json` the command prints `ok`, `action_id`, `method`, `revision`, `state`,
+`outcome_unknown`, `error_code` and `error_message` (null when no failure is recorded) and
+`result_retained`.
 
 ## `kr share`
 

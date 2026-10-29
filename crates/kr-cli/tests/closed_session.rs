@@ -1,10 +1,11 @@
-//! `kr attach` on a session that has closed.
+//! `kr attach` on a session that has closed, and `kr action read` on a session's receipts.
 //!
 //! A session's descriptor goes when the session closes, so attaching to one finds nothing on disk.
 //! What the command says then comes from the control daemon's registry, which keeps the closure:
 //! the session has closed, this is its record, and nothing is started. A session the registry never
 //! held is still unknown, and a daemon that cannot be reached is a host that is not running, never
-//! a closure it did not report.
+//! a closure it did not report. A session's receipts are read from its worker while it lives and
+//! from the environment's archive once it has closed.
 //!
 //! Everything here is real. The daemon is the control service, started in this process with the
 //! detached supervisor, so each session's worker is a process of its own: the one this workspace
@@ -534,6 +535,94 @@ async fn attaching_to_a_closed_session_answers_with_its_closure_and_starts_nothi
         "{document}"
     );
     assert_eq!(host.starts(), 1);
+}
+
+/// KR-REQ-23.24, the client's half: `kr action read --session` asks a live session's worker for
+/// the receipt and the environment's archive once the session has closed, by identifier and by
+/// display number. While the session lives, an identifier nothing holds is refused by its worker,
+/// in the worker's words and not the daemon's, which would not be asked. Once it has closed, the
+/// close this test sent the daemon under an identifier of its own is read back from the archive as
+/// applied, and the identifier nothing holds is still refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_receipt_is_read_from_its_worker_while_live_and_from_the_archive_once_closed() {
+    use kr_protocol::envelope::ActionTarget;
+    use kr_protocol::ids::{ActionId, SessionEpoch, SessionId};
+    use kr_protocol::method::Method;
+    use kr_protocol::scalars::Nullable;
+    use kr_protocol::session::SessionCloseParams;
+
+    let host = Host::start().await;
+    let (session, display) = host.create();
+    let session_id: SessionId = session.parse().expect("an identifier");
+    let unheld = ActionId::new(kr_ipc::new_uuid()).to_string();
+
+    // Live: the worker answers, and says it holds no such receipt.
+    let (status, refused) = host.json(&["action", "read", &unheld, "--session", &session]);
+    assert_ne!(status, Some(0), "{refused}");
+    assert_eq!(refused["ok"], Value::Bool(false), "{refused}");
+    assert_eq!(refused["code"], "INVALID_ARGUMENT", "{refused}");
+    assert!(
+        refused["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("no receipt for action")),
+        "the session's worker was asked: {refused}"
+    );
+
+    // Close it the way `kr close` does, through the daemon, under an identifier this test knows.
+    let endpoint = host
+        .temp
+        .environment()
+        .controller_endpoint()
+        .expect("an endpoint");
+    let mut daemon = kr_ipc::client::LocalClient::connect(
+        &endpoint,
+        kr_protocol::local::LocalClientKind::Cli,
+        build(),
+    )
+    .await
+    .expect("reaches the daemon");
+    let closed = ActionId::new(kr_ipc::new_uuid());
+    daemon
+        .mutate(
+            Method::SessionClose,
+            closed,
+            ActionTarget {
+                environment_id: host.temp.environment_id(),
+                session_id: Nullable::some(session_id),
+                session_epoch: Nullable::some(SessionEpoch::V1),
+                application_instance_id: Nullable::null(),
+                agent_binding_revision: Nullable::null(),
+            },
+            &SessionCloseParams { session_id },
+        )
+        .await
+        .expect("the daemon answers")
+        .expect("the daemon closes the session");
+    host.wait_for_no_descriptor(&session);
+
+    // Closed: the archive keeps the receipt, once the daemon has found the worker gone.
+    let closed = closed.to_string();
+    let started = Instant::now();
+    let read = loop {
+        let (status, document) = host.json(&["action", "read", &closed, "--session", &session]);
+        if status == Some(0) {
+            break document;
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "the archive never served the close: {document}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(read["action_id"], Value::String(closed.clone()), "{read}");
+    assert_eq!(read["method"], "session.close", "{read}");
+    assert_eq!(read["state"], "applied", "{read}");
+    assert_eq!(read["outcome_unknown"], Value::Bool(false), "{read}");
+    let by_number = host.kr_json(&["action", "read", &closed, "--session", &display]);
+    assert_eq!(by_number["action_id"], Value::String(closed), "{by_number}");
+    let (status, refused) = host.json(&["action", "read", &unheld, "--session", &session]);
+    assert_ne!(status, Some(0), "{refused}");
+    assert_eq!(refused["ok"], Value::Bool(false), "{refused}");
 }
 
 /// A stand-in for a host's worker: a program called `kr-worker` that was started with the host's

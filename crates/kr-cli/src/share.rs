@@ -279,7 +279,7 @@ fn pick_device<'a>(
 /// A line of the session's screen, with everything a terminal would act on or hide written out.
 ///
 /// The lines are what the session printed, which is whatever a program in it wrote.
-fn visibly(line: &str) -> String {
+pub(crate) fn visibly(line: &str) -> String {
     use std::fmt::Write as _;
 
     let mut out = String::with_capacity(line.len());

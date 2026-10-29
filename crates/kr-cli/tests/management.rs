@@ -2049,3 +2049,124 @@ async fn a_revocation_a_worker_has_not_fenced_is_pending_and_not_a_success() {
     );
     serving.abort();
 }
+
+/// KR-REQ-23.24, the client's half: a person is shown the earlier result of an action the host
+/// could not establish the outcome of. An agent action's receipt is the usual such receipt, kept by
+/// a session's worker with an upstream interface behind it, which this suite has no session for, so
+/// a scripted daemon answers `action.read` with one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_receipt_whose_outcome_the_host_could_not_establish_is_shown_as_that() {
+    use kr_protocol::ids::{ActionId, ActorId};
+    use kr_protocol::method::{MethodName, MethodVersion};
+    use kr_protocol::receipt::{ActionReadResult, Receipt, ReceiptState};
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let receipt = Receipt {
+        action_id: action,
+        actor_id: ActorId::new("kr:actor:owner").expect("an actor"),
+        method: MethodName::from(kr_protocol::method::Method::AgentPromptSubmit),
+        method_version: MethodVersion::V1,
+        revision: kr_protocol::scalars::U64::new(3),
+        state: ReceiptState::Unknown,
+        reason: Nullable::null(),
+        payload_digest: kr_protocol::scalars::Digest256::from_bytes([7; 32]),
+        accepted_deadline_ms: Nullable::null(),
+        error: Nullable::some(ProtocolError::new(
+            ErrorCode::OutcomeUnknown,
+            "the upstream stopped answering after the prompt was sent",
+        )),
+        error_withheld: false,
+        updated_at_ms: TimestampMs::new(kr_ipc::now_ms().get()),
+    };
+    let read = ActionReadResult {
+        receipt,
+        result: Nullable::null(),
+    };
+    let (asked, serving) = scripted_daemon(
+        &temp,
+        always(Ok(ParamsValue::from_typed(&read).expect("a receipt"))),
+    );
+    let action = action.to_string();
+    let (status, document) = json(&temp, &["action", "read", action.as_str()]);
+    assert_eq!(status, Some(0), "{document}");
+    assert_eq!(document["ok"], Value::Bool(true), "{document}");
+    assert_eq!(document["state"], "unknown", "{document}");
+    assert_eq!(document["outcome_unknown"], Value::Bool(true), "{document}");
+    assert_eq!(document["revision"], "3", "{document}");
+    assert_eq!(document["error_code"], "OUTCOME_UNKNOWN", "{document}");
+    assert_eq!(
+        document["result_retained"],
+        Value::Bool(false),
+        "{document}"
+    );
+    let output = run_kr(&temp, &["action", "read", action.as_str()]);
+    assert_eq!(output.status.code(), Some(0));
+    let said = String::from_utf8_lossy(&output.stdout);
+    assert!(said.contains("at revision 3"), "{said}");
+    assert!(
+        said.contains("could not establish whether it was performed"),
+        "{said}"
+    );
+    assert!(
+        !said.contains("name this one"),
+        "the daemon holds no later request to the rule a worker does, so it is not told one: {said}"
+    );
+    assert_eq!(
+        *asked.lock().expect("the record"),
+        ["action.read", "action.read"]
+    );
+    serving.abort();
+}
+
+/// KR-REQ-23.24, the client's half: an action the real daemon performed itself is read back by its
+/// identifier, an outcome it knows is not shown as unknown, and an identifier nothing holds is
+/// refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_receipt_a_daemon_keeps_for_its_own_action_is_read_by_its_identifier() {
+    use kr_protocol::envelope::ActionTarget;
+    use kr_protocol::ids::ActionId;
+    use kr_protocol::local::LocalClientKind;
+    use kr_protocol::method::Method;
+
+    let host = Host::start().await;
+    let environment_id = host.temp.environment_id();
+    let endpoint = host
+        .temp
+        .environment()
+        .controller_endpoint()
+        .expect("an endpoint");
+    let mut client = kr_ipc::client::LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("the daemon is reached");
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let refused = client
+        .mutate(
+            Method::CataloguePin,
+            action,
+            ActionTarget::environment(environment_id),
+            &kr_protocol::catalogue::CataloguePinParams {
+                environment_id,
+                catalogue_id: "community".to_owned(),
+                generation: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the daemon answers")
+        .expect_err("a repository nobody enrolled cannot be pinned");
+
+    let action = action.to_string();
+    let read = host.kr_json(&["action", "read", action.as_str()]);
+    assert_eq!(read["action_id"], Value::String(action.clone()), "{read}");
+    assert_eq!(read["method"], "catalogue.pin", "{read}");
+    assert_eq!(read["state"], "refused", "{read}");
+    assert_eq!(read["outcome_unknown"], Value::Bool(false), "{read}");
+    assert_eq!(
+        read["error_code"],
+        Value::String(refused.code.to_string()),
+        "the receipt keeps the failure the daemon answered with: {read}"
+    );
+
+    let nobody = host.refused(&["action", "read", NOBODY]);
+    assert_ne!(nobody["code"], Value::Null, "{nobody}");
+}
