@@ -452,8 +452,10 @@ fn signal_the_shell(session: &Session, signal: &str) {
 /// the reader meets the request. A reader takes its input a byte at a time and meets its mailbox
 /// at the first point it is free to, which is before the first byte or after the first whole key
 /// sequence, so more than one answer is waiting whichever it is, and what it reports then has to
-/// count the bytes it has not read. Once it has taken them a later exchange says the queues are
-/// drained, so a reader that counts bytes it no longer holds is not the one that passes.
+/// count the bytes it has not read. A reader that reaches its mailbox only at a step a person gives
+/// it by typing is given that step first, so the answers are behind it. Once it has taken them a
+/// later exchange says the queues are drained, so a reader that counts bytes it no longer holds is
+/// not the one that passes.
 ///
 /// # Panics
 ///
@@ -483,6 +485,9 @@ pub fn bytes_the_host_put_into_the_terminal_are_input_the_reader_has_not_taken(k
     );
 
     signal_the_shell(&session, "STOP");
+    // A reader that answers only when it steps meets its mailbox at the step a person gives it by
+    // typing, so the answers wait behind that step and not ahead of it.
+    session.type_the_step();
     session.type_bytes(HOST_REPLY);
     let id = session.ask(WorkerRequest::Fence(RootEditorFenceParams {
         session_id: session.session_id,
