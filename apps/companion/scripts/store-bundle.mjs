@@ -30,7 +30,10 @@
 // either case, in base64 and base64url, and with the white space removed, so a secret split across
 // lines is found), after every JSON string escape in the searched text has been read, and in the
 // names of files and archive members too. Whatever the command prints goes through one filter that
-// withholds a message quoting a secret or any part of a signed token.
+// withholds a message quoting a secret or any part of a signed token (all of them, when a secret
+// file can be read and cannot be searched for). Not searched for: percent encoding, XML entities,
+// compressed or encrypted copies, a second layer of encoding, hex with separators other than white
+// space, a prefix on each line of a split secret, and a JSON escape that a line break cuts in two.
 //
 // Usage:
 //   node scripts/store-bundle.mjs --android <app.aab> --version-code <n> --version-name <v>
@@ -348,13 +351,18 @@ function viewsOf(bytes) {
   return read === null ? [bytes] : [bytes, read]
 }
 
-/** The bytes with the white space left out: a secret that was wrapped, indented or joined across lines is the same secret without it. */
+/**
+ * The bytes with the white space left out, and a backslash that ends a line (the continuation of a
+ * properties file, a shell, a C string): a secret that was wrapped, indented or joined across lines
+ * is the same secret without them.
+ */
 function squash(bytes) {
   const kept = Buffer.allocUnsafe(bytes.length)
   let length = 0
   for (let index = 0; index < bytes.length; index += 1) {
     const byte = bytes[index]
     if (byte === 0x20 || (byte >= 0x09 && byte <= 0x0d)) continue
+    if (byte === 0x5c && (bytes[index + 1] === 0x0a || bytes[index + 1] === 0x0d)) continue
     kept[length] = byte
     length += 1
   }
@@ -393,13 +401,13 @@ function formsOf(bytes) {
  * is taken as it is and as a JSON writer escapes it, and each of those in the forms `formsOf` lists
  * and in hex. A haystack is read as it is and as a JSON reader reads it, and each reading is
  * searched as it is, with its white space left out (`apart`, so a secret split across lines is
- * found) and, for hex, with its capitals made small (`hex`). A secret of fewer than 8 characters, not
- * counting white space, is refused: it would match anything.
+ * found) and, for hex, with its capitals made small (`hex`). A secret of fewer than 8 bytes, not counting
+ * white space, is refused: it would match anything.
  */
 export function secretNeedles(content) {
   const text = content.toString('utf8').trim()
   if (squash(Buffer.from(text, 'utf8')).length < 8) {
-    throw new Error('a secret file holds fewer than 8 characters apart from white space, too few to search for')
+    throw new Error('a secret file holds fewer than 8 bytes apart from white space, too few to search for')
   }
   const pieces = new Set([text])
   for (const line of text.split(/\r?\n/)) {
@@ -481,17 +489,28 @@ function needlesOf(files) {
   return mergeNeedles(files.map((file) => secretNeedles(readFileSync(file))))
 }
 
-/** The needles of the secret files that can be read: a secret that cannot be read cannot be quoted. */
+/**
+ * The needles of the secret files that can be read, and whether one that was read cannot be searched
+ * for (too short). A secret that cannot be read cannot be quoted; one that was read and cannot be
+ * searched for may be quoted by anything, so nothing is to be printed that could hold it.
+ */
 function quotableNeedles(secretFiles) {
-  return mergeNeedles(
-    secretFiles.map((file) => {
-      try {
-        return secretNeedles(readFileSync(file))
-      } catch {
-        return NO_NEEDLES
-      }
-    })
-  )
+  let unusable = false
+  const list = secretFiles.map((file) => {
+    let content
+    try {
+      content = readFileSync(file)
+    } catch {
+      return NO_NEEDLES
+    }
+    try {
+      return secretNeedles(content)
+    } catch {
+      unusable = true
+      return NO_NEEDLES
+    }
+  })
+  return { needles: mergeNeedles(list), unusable }
 }
 
 // -- Android: the signature and the bundle tool ----------------------------------------------
@@ -620,10 +639,12 @@ export function withheldIfSecret(message, needles) {
 export function redacted(text, needles) {
   if (foundIn(Buffer.from(text, 'utf8'), needles)) return `${stand(needles, 'the text is withheld: it quotes a secret file', 'withheld')}\n`
   const line = stand(needles, 'a line is withheld: it quotes a signed token', 'withheld')
-  return text
+  const kept = text
     .split('\n')
     .map((each) => (matches(TOKEN_PART, Buffer.from(each, 'utf8')) ? line : each))
     .join('\n')
+  // The lines left, with the words put in place of the others, are one text again.
+  return foundIn(Buffer.from(kept, 'utf8'), needles) ? `${stand(needles, 'the text is withheld: it quotes a secret file', 'withheld')}\n` : kept
 }
 
 /** The fields of a record that the bundle's identity and the result of the check own: no note and no fact may be named like one. */
@@ -1120,9 +1141,10 @@ function secretFilesIn(argv) {
  * secret it was given.
  */
 function main(argv) {
-  const needles = quotableNeedles(secretFilesIn(argv))
-  const out = (message) => console.log(withheldIfSecret(message, needles))
-  const err = (message) => console.error(withheldIfSecret(message, needles))
+  const { needles, unusable } = quotableNeedles(secretFilesIn(argv))
+  const shown = (message) => (unusable ? 'the details are withheld: a secret file cannot be searched for' : withheldIfSecret(message, needles))
+  const out = (message) => console.log(shown(message))
+  const err = (message) => console.error(shown(message))
   try {
     return command(argv, needles, out, err)
   } catch (failure) {
