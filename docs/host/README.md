@@ -2012,15 +2012,17 @@ is whatever the owned console chose to send, and what this host records is that.
 *client's* console to the modes it had before an attachment is the attach client's own saved mode
 words, and that is what a detach writes back.
 
-**What the console path does not do.** The Windows attach client sends bytes. It reads the console as
-a byte stream, and it declares a terminal profile only from `TERM`, which a Windows console does not
-set. It asks for the input lease all the same, and the worker gives the lease to no attachment that
-declared no profile, so a session attached from a Windows console is watched and not typed into
-until `TERM` names a profile. With one, the client sends bytes on the legacy VT path, whatever the
-backend asked for. The record reader is in the client and is not called by the attach loop; only its
-console mode is tested. Nothing reports the fidelity at run time: the engine tracks which one the
-backend asked for and the worker spells records accordingly, but no receipt, diagnostic or client
-message carries the answer, so this page is where the limit is stated.
+**What the console path does.** The Windows attach client reads the console as key records and sends
+them as `console_keys`, and the worker spells them as the paragraphs above say. The client declares
+a terminal profile only from `TERM`, which a Windows console does not set. It asks for the input
+lease all the same, and the worker gives the lease to no attachment that declared no profile, so a
+session attached from a Windows console is watched and not typed into until `TERM` names a profile.
+While the application in the session has negotiated an encoding that key records cannot express,
+the worker refuses a write with `INPUT_INCOMPATIBLE` and the attach ends and says so. The client
+asks the console for no mouse or window-size records. Nothing reports the fidelity at run time: the
+engine tracks which one the backend asked for and the worker spells records accordingly, but no
+receipt, diagnostic or client message carries the answer, so this page is where the limit is
+stated.
 
 **The standalone start, and signing out.** The standalone start on Windows is one scheduled task
 per environment, `KalaReach-` and the first eight digits of the environment's identifier, in the
