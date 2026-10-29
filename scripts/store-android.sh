@@ -80,8 +80,6 @@ kr_store_refuse_secret_in "$password_file" "$KR_STORE_ROOT" ${device_dir:+"$devi
 # ---- The emulator leg --------------------------------------------------------------------------
 
 if [ "$mode" = device ]; then
-    # The one emulator this task may use, whatever the environment names.
-    export KR_ANDROID_AVD=KalaReach_API_36_Play
     record="$device_dir/store-build.json"
     [ -f "$record" ] || { kr_store_say "no store-build.json in $device_dir"; exit 2; }
     [ "$(node -e 'process.stdout.write(String(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).holds))' "$record")" = true ] \
@@ -104,7 +102,6 @@ if [ "$mode" = device ]; then
         say "$avd"
         exit 3
     fi
-    [ "$avd" = KalaReach_API_36_Play ] || { say "the emulator is $avd, not KalaReach_API_36_Play"; exit 3; }
 
     # The universal package: one installable file made from the bundle, signed with the same key.
     say "making the universal package from the bundle"

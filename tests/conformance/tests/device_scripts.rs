@@ -34,7 +34,7 @@ struct Script {
     env: &'static [(&'static str, &'static str)],
 }
 
-const SCRIPTS: [Script; 11] = [
+const SCRIPTS: [Script; 12] = [
     Script {
         path: "scripts/e2e-mobile.sh",
         args: &["android"],
@@ -104,6 +104,14 @@ const SCRIPTS: [Script; 11] = [
     Script {
         path: "scripts/e2e-push-android-receiver.sh",
         args: &[],
+        waits_for_boot: false,
+        env: &[],
+    },
+    Script {
+        // The bundle and its record are named, so the script goes no further than the device for
+        // them: it makes the package the device installs, and starts the emulator.
+        path: "scripts/store-android.sh",
+        args: &["--device", "store-output"],
         waits_for_boot: false,
         env: &[],
     },
@@ -234,6 +242,29 @@ fn run(
     fs::write(driver, "").expect("a driver");
     fs::create_dir_all(tree.join("web/apps/site/dist")).expect("a built site");
 
+    // What the store script's device run reads before it reaches the device: the record of a bundle
+    // that holds and the bundle, the upload key's files with the access they are kept with, and the
+    // Java tools and the bundle tool it looks for.
+    let output = tree.join("store-output");
+    fs::create_dir_all(&output).expect("a directory");
+    fs::write(
+        output.join("store-build.json"),
+        "{\"holds\": true, \"versionCode\": 39850, \"file\": \"KalaReach.aab\"}",
+    )
+    .expect("a record");
+    fs::write(output.join("KalaReach.aab"), "").expect("a bundle");
+    let upload = root.join("secrets/android-upload");
+    fs::create_dir_all(&upload).expect("a directory");
+    for name in ["kalareach-upload.p12", "keystore-password"] {
+        fs::write(upload.join(name), "made for the case\n").expect("a key file");
+        fs::set_permissions(upload.join(name), fs::Permissions::from_mode(0o600))
+            .expect("kept private");
+    }
+    fs::write(upload.join("upload-certificate.pem"), "").expect("a certificate");
+    for tool in ["jarsigner", "keytool"] {
+        stand_in(&root.join("java/bin"), tool, &record, "exit 0");
+    }
+
     fs::write(root.join("avds.txt"), format!("{}\n", listed.join("\n"))).expect("a list");
     if let Some((serial, name)) = running {
         fs::write(root.join("running.txt"), format!("{serial}\tdevice\n")).expect("a device");
@@ -309,12 +340,41 @@ fn run(
          esac\n\
          exec /usr/bin/python3 \"$@\"",
     );
+    // The store script's checker only filters the text it is given, and its device run reads three
+    // fields of the record of a bundle that holds.
     stand_in(
         &tools,
         "node",
         &record,
-        "if [ \"$1\" = scripts/preview-harness.mjs ]; then\n\
+        "case \"$1\" in\n\
+         -e) case \"$2\" in\n\
+         *.holds*) printf true; exit 0 ;;\n\
+         *.versionCode*) printf 39850; exit 0 ;;\n\
+         *.file*) printf KalaReach.aab; exit 0 ;;\n\
+         esac ;;\n\
+         esac\n\
+         case \"$*\" in *--redact*) cat; exit 0 ;; esac\n\
+         if [ \"$1\" = scripts/preview-harness.mjs ]; then\n\
          while kill -0 \"$3\" 2>/dev/null; do sleep 0.2; done\nexit 0\nfi\nexit 1",
+    );
+    // The bundle tool makes the set of packages that holds the universal one; the access a file is
+    // kept with is read the way macOS reads it.
+    stand_in(
+        &tools,
+        "bundletool",
+        &record,
+        "for argument in \"$@\"; do case \"$argument\" in --output=*) out=\"${argument#--output=}\" ;; esac; done\n\
+         [ -z \"${out:-}\" ] || exec /usr/bin/python3 -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1], \"w\").writestr(\"universal.apk\", \"\")' \"$out\"\n\
+         exit 0",
+    );
+    stand_in(
+        &tools,
+        "stat",
+        &record,
+        "case \"$*\" in\n\
+         *%Lp*) echo 600 ;;\n\
+         *) exec /usr/bin/stat \"$@\" ;;\n\
+         esac",
     );
     stand_in(
         &tools,
@@ -355,7 +415,11 @@ fn run(
         .env("KR_PUSH_SHOTS", root.join("scratch"))
         .env("KR_STANDING_SHOTS", root.join("scratch"))
         .env("KR_TEXT_SIZE_SHOTS", root.join("scratch"))
-        .env("KR_MOBILE_SETTLE", "0");
+        .env("KR_MOBILE_SETTLE", "0")
+        .env("KR_SECRETS_DIR", root.join("secrets"))
+        .env("KR_STORE_ROOT", root.join("store"))
+        .env("KR_JAVA_HOME", root.join("java"))
+        .env("KR_BUNDLETOOL", tools.join("bundletool"));
     for (name, value) in script.env.iter().chain(extra.iter()) {
         command.env(name, value);
     }
