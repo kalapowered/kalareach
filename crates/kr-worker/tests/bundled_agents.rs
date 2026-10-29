@@ -25,13 +25,14 @@ use std::time::Duration;
 
 use kr_plugin_sdk::capability::PluginCapability;
 use kr_protocol::broker::{BrokerGrant, IntegrationMode};
-use kr_protocol::ids::SessionId;
+use kr_protocol::ids::{PluginId, SessionId};
 use kr_protocol::projection::AgentInstanceSummary;
 use kr_protocol::root::CommandBypassReason;
 use kr_protocol::scalars::{Digest256, Uuid};
 use kr_shell_integration::host::command::{InvocationContext, Resolution, resolve};
 use kr_worker::broker::Broker;
 use kr_worker::broker::adoption::{Adoptions, Foreground};
+use kr_worker::broker::binder::Recognition;
 use kr_worker::broker::catalogue::{Admissions, testing};
 use kr_worker::broker::connectors::{ConnectorSource, ConnectorSources};
 use kr_worker::persistence::JournalHealth;
@@ -463,9 +464,10 @@ fn the_kimi_distribution_is_told_by_its_installation_location() {
     // Control: the same name anywhere else is claimed equally by both profiles, so neither is
     // chosen for it. The terminal is all such a program has.
     let elsewhere = setup.host.root().join("bin/kimi").display().to_string();
-    assert!(
-        setup.broker.admitted_match(&elsewhere).is_none(),
-        "a kimi outside the installation location is bound to no profile"
+    assert_eq!(
+        setup.broker.recognise(&elsewhere),
+        Recognition::Tied(vec![plugin("kimi-cli"), plugin("kimi-code-cli")]),
+        "a kimi outside the installation location is claimed equally by both profiles"
     );
 }
 
@@ -488,6 +490,11 @@ fn an_opencode_program_is_found_as_a_native_terminal_bound_to_neither_of_its_two
     assert_eq!(arguments, line, "the vector as typed");
     for relative in ["bin/opencode", ".opencode/bin/opencode"] {
         let (typed, program) = setup.typed_at(relative, &arguments[1..]);
+        assert_eq!(
+            setup.broker.recognise(&program.display().to_string()),
+            Recognition::Tied(vec![plugin("opencode"), plugin("opencode-attach")]),
+            "{relative}: both profiles claim it equally"
+        );
         let told = setup.adopt(&foreground(&typed, &program, reason));
         assert_eq!(told.len(), 1, "{relative} is found running: {told:?}");
         let summary = &told[0];
@@ -536,4 +543,9 @@ fn an_opencode_program_is_found_as_a_native_terminal_bound_to_neither_of_its_two
             "{relative}: the vector as typed, with nothing added"
         );
     }
+}
+
+/// The identifier of the shipped package named `name`.
+fn plugin(name: &str) -> PluginId {
+    PluginId::new(format!("kalareach/{name}")).expect("a plugin identifier")
 }

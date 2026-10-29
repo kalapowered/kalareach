@@ -70,11 +70,11 @@ pub(super) struct Admitted {
 }
 
 impl Admitted {
-    /// Returns the admitted package the software development kit's rule selects for a program at
-    /// `path`, with no selection made. The worker reads every rule as a guess, so a rule that names
-    /// the installation location outranks one that names only the executable, among the packages of
-    /// one publisher through one repository, and equal claims select nothing.
-    fn selected_for(&self, path: &str) -> Option<Digest256> {
+    /// Returns what the admitted packages make of a program at `path`, with no selection made. The
+    /// worker reads every rule as a guess, so a rule that names the installation location outranks
+    /// one that names only the executable, among the packages of one publisher through one
+    /// repository. Equal claims select nothing, and the packages that make them are named.
+    fn recognise(&self, path: &str) -> Recognised {
         let mut found: Vec<(Candidate, Digest256)> = Vec::new();
         for (digest, (package, read)) in &self.packages {
             let manifest = read.manifest();
@@ -101,10 +101,40 @@ impl Admitted {
             Resolution::Selected(chosen) => found
                 .iter()
                 .find(|(candidate, _)| candidate.plugin_id == chosen.plugin_id)
-                .map(|(_, digest)| *digest),
-            Resolution::None | Resolution::Conflict(_) => None,
+                .map_or(Recognised::Nothing, |(_, digest)| Recognised::One(*digest)),
+            Resolution::None => Recognised::Nothing,
+            Resolution::Conflict(candidates) => Recognised::Tied(
+                candidates
+                    .into_iter()
+                    .map(|candidate| candidate.plugin_id)
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
+            ),
         }
     }
+}
+
+/// What the admitted packages make of one program, before the package is looked up.
+enum Recognised {
+    /// No admitted package's rule recognises it.
+    Nothing,
+    /// One package does, by its hash.
+    One(Digest256),
+    /// Several recognise it equally well.
+    Tied(Vec<PluginId>),
+}
+
+/// What the packages a worker holds make of a program at one path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Recognition {
+    /// No admitted package recognises it, or the worker holds no admissions.
+    Nothing,
+    /// One package does: the one the software development kit's rule selects.
+    Package(AdmittedMatch),
+    /// Several packages recognise it equally well, so the host chooses none of them: their
+    /// identifiers, in order. The host does not pick one on a package's behalf.
+    Tied(Vec<PluginId>),
 }
 
 /// One transition of a package's revocation state that this session's journal records, with the
@@ -311,22 +341,32 @@ impl Broker {
         !self.state().admitted.packages.is_empty()
     }
 
-    /// Returns the admitted package the software development kit's rule selects for a program at
-    /// `path`, and the frame that admits it: of the packages that recognise it the one whose rule
-    /// names the installation location is selected, among the packages of one publisher through
-    /// one repository, and packages that recognise it equally well select none.
+    /// Returns what the admitted packages make of a program at `path`: the package the software
+    /// development kit's rule selects, with the frame that admits it, or the packages that
+    /// recognise it equally well, or nothing. Of the packages that recognise a program the one
+    /// whose rule names the installation location is selected, among the packages of one
+    /// publisher through one repository, and packages that recognise it equally well select none.
     #[must_use]
-    pub fn admitted_match(&self, path: &str) -> Option<AdmittedMatch> {
+    pub fn recognise(&self, path: &str) -> Recognition {
         let state = self.state();
-        let frame = state.admitted.frame?;
-        let digest = state.admitted.selected_for(path)?;
-        let (package, _) = state.admitted.packages.get(&digest)?;
-        Some(AdmittedMatch {
-            frame,
-            package_digest: digest,
-            plugin_id: package.plugin_id.clone(),
-            builds: package.builds.clone(),
-        })
+        let Some(frame) = state.admitted.frame else {
+            return Recognition::Nothing;
+        };
+        match state.admitted.recognise(path) {
+            Recognised::Nothing => Recognition::Nothing,
+            Recognised::Tied(plugins) => Recognition::Tied(plugins),
+            Recognised::One(digest) => {
+                let Some((package, _)) = state.admitted.packages.get(&digest) else {
+                    return Recognition::Nothing;
+                };
+                Recognition::Package(AdmittedMatch {
+                    frame,
+                    package_digest: digest,
+                    plugin_id: package.plugin_id.clone(),
+                    builds: package.builds.clone(),
+                })
+            }
+        }
     }
 
     /// Binds the admitted package of hash `package_digest` to one registered instance, for the
@@ -837,7 +877,7 @@ impl BrokerState {
             })
             .collect();
         for (application_instance_id, executable) in unbound {
-            let Some(digest) = self.admitted.selected_for(&executable.path) else {
+            let Recognised::One(digest) = self.admitted.recognise(&executable.path) else {
                 continue;
             };
             let binding_id = BrokerBindingId::new(kr_ipc::new_uuid());

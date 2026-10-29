@@ -38,7 +38,7 @@ use kr_protocol::ids::{
     UpstreamRequestId,
 };
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, U64, Uuid};
-use kr_worker::broker::binder::{AdapterNotice, MatchedExecutable};
+use kr_worker::broker::binder::{AdapterNotice, MatchedExecutable, Recognition};
 use kr_worker::broker::bridge::BridgeProcess;
 use kr_worker::broker::catalogue::Admissions;
 use kr_worker::broker::catalogue::testing::{self, Snapshot};
@@ -500,10 +500,9 @@ fn kr_req_27_09_an_executable_no_signed_build_names_keeps_the_terminal_route_and
         .expect("the launched instance is registered");
     worker.register(3);
 
-    let matched = worker
-        .broker
-        .admitted_match(&program().path)
-        .expect("the admitted package recognises the program");
+    let Recognition::Package(matched) = worker.broker.recognise(&program().path) else {
+        panic!("the admitted package recognises the program");
+    };
     let named = program().digest;
     let unnamed = Digest256::from_bytes([0x5a; 32]);
     assert_eq!(matched.version_of(&named), Some(fixture::QUALIFIED_VERSION));

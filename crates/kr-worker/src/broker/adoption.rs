@@ -9,14 +9,15 @@
 //! recorded as a native terminal instance with the profile it was observed running, and bound to
 //! that package in the same step. The package is the one the software development kit's rule
 //! selects among every package the admissions this worker holds admit, with nothing selected: the
-//! worker reads every rule as a guess, a rule that names the installation location outranks one
-//! that names only the executable among the packages of one publisher through one repository, and
-//! packages that recognise the program equally well adopt nothing. A package
-//! with no connector table is adopted and bound the same way. An adopted instance gets no
-//! registration, no endpoint and no credential, so none of its bridges is admitted, and its
-//! announcement says so; the process it was found running as places the questions it asks, and
-//! nothing more. It is watched by its identity and ended when it exits. A bind the broker refuses
-//! leaves nothing adopted, and the next look tries again.
+//! worker reads every rule as a guess, and a rule that names the installation location outranks one
+//! that names only the executable among the packages of one publisher through one repository.
+//! Packages that recognise the program equally well are not chosen between: the program is adopted
+//! as a native terminal instance bound to none of them, and its announcement names the packages
+//! that tie. A package with no connector table is adopted and bound the same way. An adopted
+//! instance gets no registration, no endpoint and no credential, so none of its bridges is
+//! admitted, and its announcement says so; the process it was found running as places the
+//! questions it asks, and nothing more. It is watched by its identity and ended when it exits. A
+//! bind the broker refuses leaves nothing adopted, and the next look tries again.
 //!
 //! A program takes the terminal when the root shell starts a command, and the session knows when
 //! that is likely: the input it accepts, the output it produces, and an invocation the shell's
@@ -58,7 +59,7 @@ use kr_protocol::root::CommandBypassReason;
 use kr_protocol::scalars::{Nullable, Uuid};
 
 use crate::broker::Broker;
-use crate::broker::binder::MatchedExecutable;
+use crate::broker::binder::{MatchedExecutable, Recognition};
 use crate::broker::image::HashedFiles;
 
 /// How often the foreground is looked at while a look is likely to find something: while a command
@@ -77,6 +78,24 @@ const QUIET_SHARE: u32 = 4;
 /// Why an adopted instance's bridges are refused, as its announcement says.
 pub const ADOPTED_REFUSAL: &str = "it was not launched through the integration, so no \
                                    registration names it and none of its bridges is admitted";
+
+/// Why a tied program's bridges are refused, as its announcement says: the packages that recognise
+/// it equally well, named, and that the host chose none of them.
+fn tie_refusal(plugins: &[kr_protocol::ids::PluginId]) -> String {
+    let names: Vec<&str> = plugins
+        .iter()
+        .map(kr_protocol::ids::PluginId::as_str)
+        .collect();
+    let named = match names.as_slice() {
+        [] => String::new(),
+        [only] => (*only).to_owned(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    };
+    format!(
+        "it was not launched through the integration, and {named} recognise it equally well, so \
+         no package was chosen for it and none of its bridges is admitted"
+    )
+}
 
 /// What one look at the foreground reads from the session.
 #[derive(Clone, Debug)]
@@ -356,7 +375,10 @@ impl Adoptions {
             return None;
         }
         let executable = crate::questions::binding::executable_of(pid)?;
-        let admitted = self.broker.admitted_match(&executable)?;
+        let recognition = match self.broker.recognise(&executable) {
+            Recognition::Nothing => return None,
+            found => found,
+        };
         // Asked only once the process runs the program: a launch registers the process that
         // presents itself before that process execs, so a program the integration launched is held
         // by now, and one it did not launch never will be.
@@ -396,10 +418,12 @@ impl Adoptions {
             binary: BinaryIdentity {
                 resolved_path: executable.clone(),
                 digest: hashed.digest,
-                version: admitted
-                    .version_of(&hashed.digest)
-                    .unwrap_or("unknown")
-                    .to_owned(),
+                version: match &recognition {
+                    Recognition::Package(admitted) => admitted.version_of(&hashed.digest),
+                    _ => None,
+                }
+                .unwrap_or("unknown")
+                .to_owned(),
                 distribution: "adopted".to_owned(),
             },
             arguments,
@@ -415,13 +439,19 @@ impl Adoptions {
             ApplicationInstanceId::new(Uuid::from_bytes(*kr_ipc::new_uuid().as_bytes()));
         let summary = AgentInstanceSummary {
             application_instance_id,
-            plugin_id: Nullable::some(admitted.plugin_id.clone()),
+            plugin_id: match &recognition {
+                Recognition::Package(admitted) => Nullable::some(admitted.plugin_id.clone()),
+                _ => Nullable::null(),
+            },
             profile_id: Nullable::some(profile.profile_id.clone()),
             mode: IntegrationMode::NativeTerminal,
             bypass: Nullable(bypass_for(&executable, &foreground.answered)),
             started_at: now,
             ended_at: Nullable::null(),
-            refusal: Nullable::some(ADOPTED_REFUSAL.to_owned()),
+            refusal: Nullable::some(match &recognition {
+                Recognition::Tied(plugins) => tie_refusal(plugins),
+                _ => ADOPTED_REFUSAL.to_owned(),
+            }),
         };
         // Recorded under the session's lock, where there is a session, so a session that closed
         // meanwhile, which stopped this set under that lock, is not entered.
@@ -436,21 +466,24 @@ impl Adoptions {
             {
                 return Vec::new();
             }
-            // Adopted and bound in one step: a bind refused leaves nothing adopted.
-            let bound = self.broker.bind(
-                kr_protocol::ids::BrokerBindingId::new(kr_ipc::new_uuid()),
-                application_instance_id,
-                admitted.package_digest,
-                admitted.frame,
-                MatchedExecutable {
-                    path: executable.clone(),
-                    digest: hashed.digest,
-                },
-                now,
-            );
-            if bound.is_err() {
-                let _ = self.broker.end(application_instance_id);
-                return Vec::new();
+            // Adopted and bound in one step: a bind refused leaves nothing adopted. A program that
+            // several packages recognise equally well is adopted bound to none of them.
+            if let Recognition::Package(admitted) = &recognition {
+                let bound = self.broker.bind(
+                    kr_protocol::ids::BrokerBindingId::new(kr_ipc::new_uuid()),
+                    application_instance_id,
+                    admitted.package_digest,
+                    admitted.frame,
+                    MatchedExecutable {
+                        path: executable.clone(),
+                        digest: hashed.digest,
+                    },
+                    now,
+                );
+                if bound.is_err() {
+                    let _ = self.broker.end(application_instance_id);
+                    return Vec::new();
+                }
             }
             adopted.insert(
                 application_instance_id,

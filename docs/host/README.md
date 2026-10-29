@@ -8390,7 +8390,9 @@ and records a process in it that the root shell started itself, that no instance
 executable an installed connector recognises. It becomes a native terminal instance with the profile
 it was observed running: the kernel's executable and argument vector, its digest, and the bypass
 the shell's question was answered with, where there was one. It has no process record and no
-credential, so none of its bridges is admitted, and it ends when its process exits. A launched
+credential, so none of its bridges is admitted, and it ends when its process exits. Where several
+connectors recognise the program equally well, the host chooses none: the instance is bound to no
+connector and its announcement names the ones that tie. A launched
 program is never adopted as well: its launch registered the process that presented itself, which
 keeps its identity when it execs the program. Reading a program's image runs on its own, so a slow
 reading delays only the next identification, and a program's exit is found at the next look

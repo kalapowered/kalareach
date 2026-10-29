@@ -189,9 +189,9 @@ the worker looks at the terminal's foreground process group. It adopts a process
 root shell started itself, that no launch holds, and whose executable an admitted package recognises,
 by the match rules of the catalogue: the worker reads every rule as a guess, a rule that names
 the installation location outranks one that names only the executable among the packages of one
-publisher through one repository, and a program two packages recognise equally well is adopted by
-neither. It records the process as a native terminal
-instance and binds it to that package in the same step. The record holds the executable and argument
+publisher through one repository, and a program two packages recognise equally well is adopted
+bound to neither. It records the process as a native terminal
+instance and binds it to the package that recognises it in the same step. The record holds the executable and argument
 vector the kernel reports, the executable's digest, and the reason the shell's question about it was
 answered with a bypass, where the line running it asked one.
 
