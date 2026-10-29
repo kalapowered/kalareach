@@ -69,8 +69,9 @@ final class DelegateMethodsTests: XCTestCase {
         XCTAssertEqual(errors.value.map(\.code), [3000])
     }
 
-    /// The system waits for the result of a push that woke the application, and the message reaches
-    /// the handler with the result as the system's own "new data" once the handler says it is done.
+    /// KR-REQ-13.24: the system waits for the result of a push that woke the application, and the
+    /// message reaches the native handler with the result as the system's own "new data" once the
+    /// handler says it is done, whatever the page is doing.
     func testAPushThatWokeTheApplicationIsHandedOnAndTheSystemIsToldWhenItIsDone() {
         let messages = Box<[String]>([])
         let results = Box<[UInt]>([])

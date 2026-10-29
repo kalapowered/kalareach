@@ -171,6 +171,11 @@ class PushReceiverTest {
         assertEquals("pending", stateOf(record))
     }
 
+    /**
+     * KR-REQ-13.24: a registration challenge is answered by the native receiver alone, with no page
+     * running: it reads the device's key from the secure store by the name the decision gave, signs,
+     * posts the answer and clears the key.
+     */
     @Test
     fun theKeyIsReadByTheNameTheDecisionGaveAndClearedOnceTheAnswerIsSigned() {
         val seed = ByteArray(32) { 5 }

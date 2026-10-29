@@ -46,6 +46,10 @@ class CallWatchTest {
         assertTrue("the shorter bound passed after the permit", watch.expired())
     }
 
+    /**
+     * KR-REQ-13.24: a call whose owner is gone ends itself in native code, once, so the microphone
+     * is never left open under an application nothing is running for.
+     */
     @Test
     fun `an owner that is gone is found once`() {
         now = 5_000L

@@ -243,6 +243,9 @@ final class CallAdapterTests: XCTestCase {
         XCTAssertEqual(ended.code, "ended", "a sign for a call that has ended says so")
     }
 
+    /// KR-REQ-13.24: a call whose owner gives no sign ends itself in native code at the bound, so the
+    /// microphone is never left open under an application nothing is running for; a sign starts the
+    /// wait again.
     func testACallWhoseOwnerGivesNoSignEndsAtTheBoundAndASignStartsTheWaitAgain() async throws {
         var now: TimeInterval = 0
         let maker = FakeMaker()
