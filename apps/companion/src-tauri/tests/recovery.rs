@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use companion_tauri::AppState;
 use companion_tauri::account::carrier::{Boxed, Carrier, Ending, Plan, Unavailable};
+use companion_tauri::account::deletion::settle_device;
 use companion_tauri::account::{Account, AccountSlot};
 use companion_tauri::device::DeviceIdentity;
 use companion_tauri::recovery::{HostCoverView, LeftView, Recovery, SEED_SCOPE};
@@ -49,6 +50,9 @@ use serde_json::{Value, json};
 use tauri::Manager as _;
 use tauri::test::{INVOKE_KEY, MockRuntime, mock_builder, mock_context, noop_assets};
 use tauri::webview::InvokeRequest;
+
+#[path = "support/closing.rs"]
+mod closing;
 
 const SYNC_PATH: &str = "/api/sync/exchange";
 
@@ -1740,4 +1744,23 @@ async fn a_deleted_account_leaves_recovery_off_with_the_seed_kept_and_a_new_loca
         .expect("a locator")
         .to_owned();
     assert_ne!(first, second, "a bundle of its own, not the deleted one's");
+}
+
+/// The device clears the recovery record of a closed account through the application's own step,
+/// and only once: recovery the person turns on afterwards is not undone by a later look.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_closed_account_clears_the_recovery_record_once_and_a_later_look_leaves_it() {
+    let computer = Computer::new().await;
+    let page = computer.page().await;
+    page.call("recovery_turn_on", json!({})).expect("on");
+    assert_eq!(page.view()["state"], "on");
+    let closed = closing::closed_account().await;
+
+    settle_device(&page.app.state::<AppState>(), &closed).await;
+    assert_eq!(page.view()["state"], "off");
+
+    page.call("recovery_turn_on", json!({})).expect("on again");
+    assert_eq!(page.view()["state"], "on");
+    settle_device(&page.app.state::<AppState>(), &closed).await;
+    assert_eq!(page.view()["state"], "on");
 }

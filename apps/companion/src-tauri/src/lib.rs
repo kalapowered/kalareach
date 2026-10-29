@@ -573,6 +573,23 @@ fn start_with_records(app: &tauri::AppHandle) {
     open_mailbox(app);
     #[cfg(mobile)]
     open_push(app);
+    settle_deleted_account(app);
+}
+
+/// Finishes what a deletion that closed the account left to settle on this device, now that the
+/// notifications and the recovery record it settles are open: an earlier run may have been
+/// interrupted, or a step may not have been done.
+fn settle_deleted_account(app: &tauri::AppHandle) {
+    use tauri::Manager as _;
+
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let slot = app.state::<account::AccountSlot>();
+        let Ok(account) = slot.get().await else {
+            return;
+        };
+        account::deletion::settle_device(&app.state::<AppState>(), account).await;
+    });
 }
 
 fn open_the_records(app: &tauri::AppHandle) -> Result<()> {

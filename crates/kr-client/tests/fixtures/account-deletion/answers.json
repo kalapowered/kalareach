@@ -290,7 +290,7 @@
       "ok": false,
       "error": {
         "code": "SERVICE_UNAVAILABLE",
-        "message": "The code could not be sent just now. Try again shortly.",
+        "message": "That could not be done just now, and nothing was changed. Try again shortly.",
         "retryAfterSeconds": 30
       }
     },
@@ -498,5 +498,60 @@
   "gateway_page": {
     "status": 502,
     "body_text": "<html><body>Bad gateway</body></html>"
+  },
+  "preview_extra_choice": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "data": {
+        "address": "r***@ts.org",
+        "warnings": [],
+        "deleted": [
+          "sign_ins",
+          "passkeys_and_address",
+          "backup_records",
+          "recovery_bundle",
+          "relay_and_voice_ended",
+          "payment_record",
+          "organisation_memberships",
+          "device_registrations"
+        ],
+        "kept": [
+          "billing_records",
+          "relay_records",
+          "call_records",
+          "reasoning_records",
+          "backup_index_rows",
+          "organisation_records",
+          "device_records",
+          "recovery_copies",
+          "other_services"
+        ],
+        "choices": {
+          "subscription": "end_at_once",
+          "refund": "none",
+          "credit": "forfeited",
+          "keptRecordsYears": 7,
+          "deposit": "held"
+        },
+        "codeDigits": 8,
+        "codeLifetimeSeconds": 300,
+        "backupFileDays": 7
+      }
+    }
+  },
+  "confirm_unreadable": {
+    "status": 200,
+    "body_text": "{\"ok\":true,\"data\":{\"result\":\"clo"
+  },
+  "confirm_closed_unknown_state": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "data": {
+        "result": "closed",
+        "state": "paused"
+      }
+    }
   }
 }

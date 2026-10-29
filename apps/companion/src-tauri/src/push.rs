@@ -1119,10 +1119,20 @@ impl PushDesk {
     /// then marked as needing the person, kept as it is until the person turns it on again, and
     /// never started by a look. The pairing, the authorisation identifier and the choice of
     /// previews are kept.
-    pub fn account_deleted(self: &Arc<Self>) {
+    ///
+    /// Says whether it is done: the paired hosts were read and what was marked is on disk. A list
+    /// that cannot be read is not an empty one, so nothing is marked on it and the caller asks
+    /// again.
+    pub fn account_deleted(self: &Arc<Self>) -> bool {
         let now = (self.wiring.clock)();
-        let hosts = self.device.pairing().hosts.list().unwrap_or_default();
-        {
+        let hosts = match self.device.pairing().hosts.list() {
+            Ok(hosts) => hosts,
+            Err(error) => {
+                tracing::warn!(%error, "the paired hosts could not be read to mark them after the account was deleted");
+                return false;
+            }
+        };
+        let kept = {
             let mut state = lock(&self.state);
             let mut marked = false;
             for host in hosts {
@@ -1152,11 +1162,13 @@ impl PushDesk {
                     marked = true;
                 }
             }
-            if marked {
-                self.keep(&state.record);
-            }
-        }
+            !marked || self.keep_checked(&state.record)
+        };
         self.tell_page();
+        // The hosts' keys are not the receivers' to open previews with while they are not on.
+        let desk = Arc::clone(self);
+        tauri::async_runtime::spawn(async move { desk.file_keys_logged().await });
+        kept
     }
 
     /// Runs `job` for `host`, which `run` holds, and runs the sequence again for as long as the token

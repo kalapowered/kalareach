@@ -8,6 +8,7 @@
 #![allow(dead_code)]
 
 pub mod call;
+pub mod closing;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};

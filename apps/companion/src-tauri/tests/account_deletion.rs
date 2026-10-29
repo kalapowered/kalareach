@@ -461,3 +461,39 @@ async fn a_start_after_an_interrupted_ending_finishes_it_before_the_first_view()
         Some(&AccountView::SignedOut { outcome: None })
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_status_asked_after_a_lost_answer_says_it_is_unsettled_and_nothing_is_shown_for_no_deletion()
+ {
+    let rig = rig().await;
+    let account = Arc::clone(&rig.account);
+    let nothing =
+        tokio::task::spawn_blocking(move || invoke(&account, "account_deletion_status", json!({})))
+            .await
+            .expect("joined");
+    assert_eq!(nothing["state"], "none");
+
+    // The confirmation's answer is lost and the receipt knows nothing of it yet.
+    let account = Arc::clone(&rig.account);
+    let confirmed = tokio::task::spawn_blocking(move || {
+        invoke(
+            &account,
+            "account_deletion_confirm",
+            json!({ "code": CODE, "acknowledged": [] }),
+        )
+    })
+    .await
+    .expect("joined");
+    assert_eq!(confirmed["state"], "unsettled");
+    rig.wire.then(&["status_unknown"]);
+    let account = Arc::clone(&rig.account);
+    let status =
+        tokio::task::spawn_blocking(move || invoke(&account, "account_deletion_status", json!({})))
+            .await
+            .expect("joined");
+    assert_eq!(status["state"], "unsettled");
+    assert!(
+        session(&rig),
+        "an unsettled request does not end the sign-in"
+    );
+}

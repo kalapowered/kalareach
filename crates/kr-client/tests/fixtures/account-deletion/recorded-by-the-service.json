@@ -1,0 +1,409 @@
+{
+  "code_rate_limited": {
+    "status": 429,
+    "headers": {
+      "content-type": "application/json",
+      "cache-control": "no-store",
+      "retry-after": "<seconds>"
+    },
+    "body": {
+      "ok": false,
+      "error": {
+        "code": "RATE_LIMITED",
+        "message": "Too many attempts. Try again shortly.",
+        "retryAfterSeconds": "<seconds>"
+      }
+    }
+  },
+  "code_sent": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json",
+      "cache-control": "no-store"
+    },
+    "body": {
+      "ok": true,
+      "data": {
+        "sent": true
+      }
+    }
+  },
+  "code_unavailable": {
+    "status": 503,
+    "headers": {
+      "content-type": "application/json",
+      "cache-control": "no-store",
+      "retry-after": "<seconds>"
+    },
+    "body": {
+      "ok": false,
+      "error": {
+        "code": "SERVICE_UNAVAILABLE",
+        "message": "That could not be done just now, and nothing was changed. Try again shortly.",
+        "retryAfterSeconds": "<seconds>"
+      }
+    }
+  },
+  "confirm_acknowledge": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json",
+      "cache-control": "no-store"
+    },
+    "body": {
+      "ok": true,
+      "data": {
+        "result": "acknowledge",
+        "organisations": [
+          {
+            "organisation_id": "<id>",
+            "name": "Recorded Owners",
+            "members": 1
+          }
+        ]
+      }
+    }
+  },
+  "confirm_closed_closing": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json",
+      "cache-control": "no-store",
+      "set-cookie": "clears the session"
+    },
+    "body": {
+      "ok": true,
+      "data": {
+        "result": "closed",
+        "state": "closing"
+      }
+    }
+  },
+  "confirm_closed_deleted": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json",
+      "cache-control": "no-store",
+      "set-cookie": "clears the session"
+    },
+    "body": {
+      "ok": true,
+      "data": {
+        "result": "closed",
+        "state": "deleted"
+      }
+    }
+  },
+  "confirm_expired": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json",
+      "cache-control": "no-store"
+    },
+    "body": {
+      "ok": true,
+      "data": {
+        "result": "code_refused",
+        "reason": "expired",
+        "attempts_left": 0
+      }
+    }
+  },
+  "confirm_malformed": {
+    "status": 400,
+    "headers": {
+      "content-type": "application/json",
+      "cache-control": "no-store"
+    },
+    "body": {
+      "ok": false,
+      "error": {
+        "code": "INVALID_REQUEST",
+        "message": "Send the code from the email and a receipt of 32 hexadecimal characters."
+      }
+    }
+  },
+  "confirm_rate_limited": {
+    "status": 429,
+    "headers": {
+      "content-type": "application/json",
+      "cache-control": "no-store",
+      "retry-after": "<seconds>"
+    },
+    "body": {
+      "ok": false,
+      "error": {
+        "code": "RATE_LIMITED",
+        "message": "Too many attempts. Try again shortly.",
+        "retryAfterSeconds": "<seconds>"
+      }
+    }
+  },
+  "confirm_receipt_taken": {
+    "status": 400,
+    "headers": {
+      "content-type": "application/json",
+      "cache-control": "no-store"
+    },
+    "body": {
+      "ok": false,
+      "error": {
+        "code": "INVALID_REQUEST",
+        "message": "That receipt was used already. Make a new one."
+      }
+    }
+  },
+  "confirm_spent": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json",
+      "cache-control": "no-store"
+    },
+    "body": {
+      "ok": true,
+      "data": {
+        "result": "code_refused",
+        "reason": "spent",
+        "attempts_left": 0
+      }
+    }
+  },
+  "confirm_unavailable": {
+    "status": 503,
+    "headers": {
+      "content-type": "application/json",
+      "cache-control": "no-store",
+      "retry-after": "<seconds>"
+    },
+    "body": {
+      "ok": false,
+      "error": {
+        "code": "SERVICE_UNAVAILABLE",
+        "message": "That could not be confirmed just now. If it was carried out, the status of your request says so; if not, try again shortly.",
+        "retryAfterSeconds": "<seconds>"
+      }
+    }
+  },
+  "confirm_wrong": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json",
+      "cache-control": "no-store"
+    },
+    "body": {
+      "ok": true,
+      "data": {
+        "result": "code_refused",
+        "reason": "wrong",
+        "attempts_left": 4
+      }
+    }
+  },
+  "dead_token": {
+    "status": 401,
+    "headers": {
+      "content-type": "application/json",
+      "cache-control": "no-store"
+    },
+    "body": {
+      "ok": false,
+      "error": {
+        "code": "UNAUTHENTICATED",
+        "message": "Sign in to continue."
+      }
+    }
+  },
+  "preview": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json",
+      "cache-control": "no-store"
+    },
+    "body": {
+      "ok": true,
+      "data": {
+        "address": "r***@example.test",
+        "warnings": [],
+        "deleted": [
+          "sign_ins",
+          "passkeys_and_address",
+          "backup_records",
+          "recovery_bundle",
+          "relay_and_voice_ended",
+          "payment_record",
+          "organisation_memberships",
+          "device_registrations"
+        ],
+        "kept": [
+          "billing_records",
+          "relay_records",
+          "call_records",
+          "reasoning_records",
+          "backup_index_rows",
+          "organisation_records",
+          "device_records",
+          "recovery_copies",
+          "other_services"
+        ],
+        "choices": {
+          "subscription": "end_at_once",
+          "refund": "none",
+          "credit": "forfeited",
+          "keptRecordsYears": 7
+        },
+        "codeDigits": 8,
+        "codeLifetimeSeconds": 300,
+        "backupFileDays": 7
+      }
+    }
+  },
+  "preview_with_warnings": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json",
+      "cache-control": "no-store"
+    },
+    "body": {
+      "ok": true,
+      "data": {
+        "address": "r***@example.test",
+        "warnings": [
+          {
+            "kind": "organisation_owner",
+            "organisation_id": "<id>",
+            "name": "Recorded Team",
+            "members": 1
+          },
+          {
+            "kind": "subscription"
+          },
+          {
+            "kind": "credit"
+          },
+          {
+            "kind": "money_owed"
+          }
+        ],
+        "deleted": [
+          "sign_ins",
+          "passkeys_and_address",
+          "backup_records",
+          "recovery_bundle",
+          "relay_and_voice_ended",
+          "payment_record",
+          "organisation_memberships",
+          "device_registrations"
+        ],
+        "kept": [
+          "billing_records",
+          "relay_records",
+          "call_records",
+          "reasoning_records",
+          "backup_index_rows",
+          "organisation_records",
+          "device_records",
+          "recovery_copies",
+          "other_services"
+        ],
+        "choices": {
+          "subscription": "end_at_once",
+          "refund": "none",
+          "credit": "forfeited",
+          "keptRecordsYears": 7
+        },
+        "codeDigits": 8,
+        "codeLifetimeSeconds": 300,
+        "backupFileDays": 7
+      }
+    }
+  },
+  "refresh_after_deletion": {
+    "status": 400,
+    "headers": {},
+    "body": {
+      "error": "invalid_grant",
+      "error_description": "The refresh token cannot be exchanged."
+    }
+  },
+  "stale_session": {
+    "status": 403,
+    "headers": {
+      "content-type": "application/json",
+      "cache-control": "no-store"
+    },
+    "body": {
+      "ok": false,
+      "error": {
+        "code": "REAUTHENTICATION_REQUIRED",
+        "message": "Sign in again to make this change."
+      }
+    }
+  },
+  "status_done": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json",
+      "cache-control": "no-store"
+    },
+    "body": {
+      "ok": true,
+      "data": {
+        "state": "done"
+      }
+    }
+  },
+  "status_malformed": {
+    "status": 400,
+    "headers": {
+      "content-type": "application/json",
+      "cache-control": "no-store"
+    },
+    "body": {
+      "ok": false,
+      "error": {
+        "code": "INVALID_REQUEST",
+        "message": "Send the receipt of 32 hexadecimal characters."
+      }
+    }
+  },
+  "status_open": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json",
+      "cache-control": "no-store"
+    },
+    "body": {
+      "ok": true,
+      "data": {
+        "state": "open"
+      }
+    }
+  },
+  "status_unknown": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json",
+      "cache-control": "no-store"
+    },
+    "body": {
+      "ok": true,
+      "data": {
+        "state": "unknown"
+      }
+    }
+  },
+  "unauthenticated": {
+    "status": 401,
+    "headers": {
+      "content-type": "application/json",
+      "cache-control": "no-store"
+    },
+    "body": {
+      "ok": false,
+      "error": {
+        "code": "UNAUTHENTICATED",
+        "message": "Sign in to continue."
+      }
+    }
+  }
+}

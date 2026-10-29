@@ -12,7 +12,7 @@ use std::time::Duration;
 use kr_client::error::ClientError;
 use kr_client::services::account::deletion::{
     CLOSED_FOR_MS, CodeRefusal, DeletionFault, DeletionOutcome, DeletionProgress, DeletionRead,
-    DeletionWarning, ManagedAccountDeletion, UNSETTLED_FOR_MS,
+    DeletionWarning, DeviceSteps, ManagedAccountDeletion, StepFuture, UNSETTLED_FOR_MS,
 };
 use kr_client::services::account::{
     ACCOUNT_ORIGIN, AccountIdentity, AccountService, AccountStatus, AccountToken, AccountUsage,
@@ -62,11 +62,20 @@ struct Seen {
 
 type Peek = Box<dyn Fn() + Send + Sync>;
 
+/// Holds the next request to a path until the test lets it go, so that another call can run while
+/// the request is out.
+struct Gate {
+    path: &'static str,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
 #[derive(Default)]
 struct Wire {
     script: Mutex<VecDeque<Step>>,
     seen: Mutex<Vec<Seen>>,
     peek: Mutex<Option<Peek>>,
+    gate: Mutex<Option<Gate>>,
 }
 
 impl std::fmt::Debug for Wire {
@@ -82,6 +91,33 @@ impl Wire {
 
     fn seen(&self) -> Vec<Seen> {
         self.seen.lock().expect("seen").clone()
+    }
+
+    /// Holds the next request to `path`: the first handle says it has arrived, the second lets it go.
+    fn hold_next(
+        &self,
+        path: &'static str,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.gate.lock().expect("gate") = Some(Gate {
+            path,
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        (entered, release)
+    }
+
+    fn take_gate(&self, url: &str) -> Option<Gate> {
+        let mut gate = self.gate.lock().expect("gate");
+        if gate
+            .as_ref()
+            .is_some_and(|held| url == format!("{ACCOUNT_ORIGIN}{}", held.path))
+        {
+            gate.take()
+        } else {
+            None
+        }
     }
 
     fn answer(
@@ -121,7 +157,14 @@ impl ServiceHttp for Wire {
         headers: &'a [(&'a str, &'a str)],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         let answer = self.answer("POST", url, headers, body);
-        Box::pin(async move { answer })
+        let gate = self.take_gate(url);
+        Box::pin(async move {
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+            answer
+        })
     }
 
     fn get_json<'a>(
@@ -130,7 +173,14 @@ impl ServiceHttp for Wire {
         headers: &'a [(&'a str, &'a str)],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         let answer = self.answer("GET", url, headers, b"");
-        Box::pin(async move { answer })
+        let gate = self.take_gate(url);
+        Box::pin(async move {
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+            answer
+        })
     }
 }
 
@@ -335,6 +385,57 @@ fn record(rig: &Rig) -> Option<serde_json::Value> {
 
 const CODE: &str = "12345678";
 
+/// The application's device steps, scripted: how often each ran, and whether each says it is done.
+struct Steps {
+    notifications: AtomicU64,
+    recovery: AtomicU64,
+    notifications_done: Mutex<bool>,
+    recovery_done: Mutex<bool>,
+    /// Whether a step gives up its turn once it is running, so that a second caller could run.
+    yields: bool,
+}
+
+impl Steps {
+    fn new(notifications_done: bool, recovery_done: bool) -> Self {
+        Self {
+            notifications: AtomicU64::new(0),
+            recovery: AtomicU64::new(0),
+            notifications_done: Mutex::new(notifications_done),
+            recovery_done: Mutex::new(recovery_done),
+            yields: false,
+        }
+    }
+
+    fn ran(&self) -> (u64, u64) {
+        (
+            self.notifications.load(Ordering::SeqCst),
+            self.recovery.load(Ordering::SeqCst),
+        )
+    }
+}
+
+impl DeviceSteps for Steps {
+    fn notifications(&self) -> StepFuture<'_> {
+        Box::pin(async move {
+            self.notifications.fetch_add(1, Ordering::SeqCst);
+            if self.yields {
+                tokio::task::yield_now().await;
+            }
+            *self.notifications_done.lock().expect("done")
+        })
+    }
+
+    fn recovery(&self) -> StepFuture<'_> {
+        Box::pin(async move {
+            self.recovery.fetch_add(1, Ordering::SeqCst);
+            if self.yields {
+                tokio::task::yield_now().await;
+            }
+            *self.recovery_done.lock().expect("done")
+        })
+    }
+}
+
 fn path_of(seen: &Seen) -> String {
     seen.url.replacen(ACCOUNT_ORIGIN, "", 1)
 }
@@ -390,7 +491,11 @@ async fn a_key_it_has_no_words_for_is_flagged_and_a_warning_or_choice_it_does_no
         };
         assert_eq!(preview.unlisted, expect_unlisted, "{answer}");
     }
-    for answer in ["preview_unknown_warning", "preview_unknown_choice"] {
+    for answer in [
+        "preview_unknown_warning",
+        "preview_unknown_choice",
+        "preview_extra_choice",
+    ] {
         let rig = new_rig().await;
         rig.wire.then([recorded(answer)]);
         assert_eq!(
@@ -519,7 +624,6 @@ async fn the_record_is_in_the_store_when_the_confirmation_leaves() {
         .expect("a record before the request left");
     let sent = body_of(&rig.wire.seen()[0]);
     assert_eq!(at_send["receipt"], sent["receipt"]);
-    assert_eq!(at_send["closed_ms"], serde_json::Value::Null);
 }
 
 /* ---- What the answers mean ----------------------------------------------------------------- */
@@ -597,9 +701,15 @@ async fn a_closed_account_ends_the_stored_sign_in_with_no_call_to_revoke_it() {
             rig.account.status().expect("a status"),
             AccountStatus::SignedOut
         );
-        let kept = record(&rig).expect("the record stays until the device has settled");
-        assert!(kept["closed_ms"].is_u64());
-        assert_eq!(kept["grant_ended"], true);
+        assert!(
+            record(&rig).is_some(),
+            "the record stays until the device has settled"
+        );
+        assert_eq!(
+            rig.deletion.settle().await,
+            Ok(true),
+            "the application still has its own state to settle"
+        );
     }
 }
 
@@ -787,8 +897,12 @@ async fn a_confirmation_whose_answer_was_lost_is_settled_by_its_receipt() {
         session(&rig),
         "an unsettled request does not end the sign-in"
     );
-    let kept = record(&rig).expect("the record is kept");
-    assert_eq!(kept["closed_ms"], serde_json::Value::Null);
+    assert!(record(&rig).is_some(), "the record is kept");
+    assert_eq!(
+        rig.deletion.settle().await,
+        Ok(false),
+        "an account not known to be closed has nothing to settle"
+    );
 
     // A retry reuses the receipt, and the service takes it.
     rig.wire.then([recorded("confirm_closed_closing")]);
@@ -910,7 +1024,11 @@ async fn the_record_is_kept_while_a_request_may_run_then_dropped_and_after_closu
     at(30_000);
     rig.wire.then([recorded("status_unknown")]);
     let status = rig.deletion.status().await.expect("a status");
-    assert_eq!(status.progress, DeletionProgress::None);
+    assert_eq!(
+        status.progress,
+        DeletionProgress::Unsettled,
+        "a request that left a moment ago may still be running"
+    );
     assert!(record(&rig).is_some(), "kept");
     at(UNSETTLED_FOR_MS + 1);
     rig.wire.then([recorded("status_unknown")]);
@@ -940,7 +1058,10 @@ async fn the_record_is_kept_while_a_request_may_run_then_dropped_and_after_closu
         record(&rig).is_some(),
         "the application has not settled its own state yet"
     );
-    rig.deletion.device_settled().await.expect("settled");
+    rig.deletion
+        .settle_device(&Steps::new(true, true))
+        .await
+        .expect("settled");
     assert!(record(&rig).is_none(), "done and settled: the record goes");
 
     // A closed record that never reaches `done` goes after the bound, without asking.
@@ -1033,10 +1154,501 @@ async fn a_closure_whose_record_could_not_be_written_still_ends_the_sign_in() {
         !session(&rig),
         "the account is closed, so the sign-in goes with it"
     );
-    let kept = record(&rig).expect("the receipt's record is there");
+    assert!(record(&rig).is_some(), "the receipt's record is there");
+}
+
+/* ---- Answers that are not what the contract says ------------------------------------------- */
+
+#[tokio::test]
+async fn a_success_the_client_cannot_read_or_a_closed_state_it_does_not_know_is_a_lost_answer() {
+    let _clock = CLOCK.lock().await;
+    for answer in ["confirm_unreadable", "confirm_closed_unknown_state"] {
+        let rig = new_rig().await;
+        rig.wire.then([recorded(answer), recorded("status_open")]);
+        assert_eq!(
+            rig.deletion.confirm(CODE, &[]).await,
+            Ok(DeletionOutcome::Closed { finished: false }),
+            "{answer}"
+        );
+        let seen = rig.wire.seen();
+        assert_eq!(
+            path_of(&seen[1]),
+            "/api/account/deletion/status",
+            "{answer}"
+        );
+        assert_eq!(body_of(&seen[1])["receipt"], body_of(&seen[0])["receipt"]);
+        assert!(
+            !session(&rig),
+            "{answer}: closure learned by receipt ends the sign-in"
+        );
+
+        // The receipt knows nothing of it: the person is not told it failed.
+        let rig = new_rig().await;
+        rig.wire.then([
+            recorded(answer),
+            recorded("status_unknown"),
+            recorded("status_unknown"),
+            recorded("status_unknown"),
+        ]);
+        assert_eq!(
+            rig.deletion.confirm(CODE, &[]).await,
+            Ok(DeletionOutcome::Unsettled),
+            "{answer}"
+        );
+    }
+}
+
+/* ---- A late answer changes only what it was asked about ------------------------------------ */
+
+#[tokio::test]
+async fn a_closure_learned_for_one_account_never_ends_or_edits_another_accounts() {
+    let _clock = CLOCK.lock().await;
+    // The first account's confirmation was lost, then another account signed in.
+    let rig = new_rig().await;
+    rig.wire
+        .then([Step::Lost, Step::Lost, Step::Lost, Step::Lost]);
     assert_eq!(
-        kept["closed_ms"],
-        serde_json::Value::Null,
-        "the closure could not be written"
+        rig.deletion.confirm(CODE, &[]).await,
+        Ok(DeletionOutcome::Unsettled)
     );
+    rig.account
+        .commit(issued("account-2", "second"), "another-nonce")
+        .await
+        .expect("a sign-in");
+    rig.wire.then([recorded("status_open")]);
+    let status = rig.deletion.status().await.expect("a status");
+    assert!(session(&rig), "the second account's sign-in stays");
+    assert!(matches!(
+        rig.account.status().expect("a status"),
+        AccountStatus::SignedIn { .. }
+    ));
+    assert_eq!(
+        status.progress,
+        DeletionProgress::None,
+        "the closed account is not the one signed in"
+    );
+
+    // Control: with no other account signed in, the same answer ends the sign-in.
+    let rig = new_rig().await;
+    rig.wire
+        .then([Step::Lost, Step::Lost, Step::Lost, Step::Lost]);
+    rig.deletion.confirm(CODE, &[]).await.expect("unsettled");
+    rig.wire.then([recorded("status_open")]);
+    rig.deletion.status().await.expect("a status");
+    assert!(!session(&rig));
+}
+
+#[tokio::test]
+async fn a_status_answer_that_comes_late_does_not_close_a_deletion_another_account_began() {
+    let _clock = CLOCK.lock().await;
+    let rig = new_rig().await;
+    rig.wire
+        .then([Step::Lost, Step::Lost, Step::Lost, Step::Lost]);
+    rig.deletion.confirm(CODE, &[]).await.expect("unsettled");
+    let first = record(&rig).expect("the first record")["receipt"].clone();
+
+    // The status of the first account's receipt is out while a second account signs in and starts
+    // its own deletion.
+    let (entered, release) = rig.wire.hold_next("/api/account/deletion/status");
+    rig.wire.then([
+        recorded("status_open"),
+        recorded("preview"),
+        recorded("confirm_wrong"),
+    ]);
+    let late = rig.deletion.status();
+    let meanwhile = async {
+        entered.notified().await;
+        rig.account
+            .commit(issued("account-2", "second"), "another-nonce")
+            .await
+            .expect("a sign-in");
+        rig.deletion.preview().await.expect("a preview");
+        rig.deletion.confirm(CODE, &[]).await.expect("an answer");
+        release.notify_one();
+    };
+    let (status, ()) = tokio::join!(late, meanwhile);
+    status.expect("a status");
+
+    assert!(session(&rig), "the second account's sign-in stays");
+    let kept = record(&rig).expect("the second account's record");
+    assert_ne!(kept["receipt"], first, "it is the second account's own");
+    // And it is not closed: a look at it does not read as a closed account.
+    rig.wire.then([recorded("status_unknown")]);
+    let status = rig.deletion.status().await.expect("a status");
+    assert_ne!(status.progress, DeletionProgress::Open);
+}
+
+#[tokio::test]
+async fn a_status_answer_of_unknown_does_not_drop_a_receipt_a_confirmation_has_just_used() {
+    let _clock = CLOCK.lock().await;
+    let rig = new_rig().await;
+    rig.wire
+        .then([Step::Lost, Step::Lost, Step::Lost, Step::Lost]);
+    rig.deletion.confirm(CODE, &[]).await.expect("unsettled");
+    let first = record(&rig).expect("the record")["receipt"].clone();
+    at(UNSETTLED_FOR_MS + 1);
+
+    // Check again is out and the person presses Try again before it answers.
+    let (entered, release) = rig.wire.hold_next("/api/account/deletion/status");
+    rig.wire
+        .then([recorded("status_unknown"), recorded("confirm_wrong")]);
+    let check = rig.deletion.status();
+    let again = async {
+        entered.notified().await;
+        rig.deletion.confirm(CODE, &[]).await.expect("an answer");
+        release.notify_one();
+    };
+    let (status, ()) = tokio::join!(check, again);
+    status.expect("a status");
+
+    let kept = record(&rig).expect("the receipt the confirmation used is still kept");
+    assert_eq!(kept["receipt"], first);
+}
+
+#[tokio::test]
+async fn a_confirmation_that_is_still_out_keeps_its_record_whatever_the_clock_says() {
+    let _clock = CLOCK.lock().await;
+    let rig = new_rig().await;
+    let (entered, release) = rig.wire.hold_next("/api/account/deletion");
+    rig.wire.then([recorded("confirm_wrong")]);
+    let confirming = rig.deletion.confirm(CODE, &[]);
+    let looking = async {
+        entered.notified().await;
+        // The device slept with the request out: the clock ran far past the margin.
+        at(UNSETTLED_FOR_MS * 3);
+        rig.wire.then([recorded("status_unknown")]);
+        let status = rig.deletion.status().await;
+        release.notify_one();
+        status
+    };
+    let (outcome, status) = tokio::join!(confirming, looking);
+    status.expect("a status");
+    assert!(matches!(outcome, Ok(DeletionOutcome::CodeRefused { .. })));
+    assert!(
+        record(&rig).is_some(),
+        "the record was not dropped under the request"
+    );
+}
+
+/* ---- A dead credential after a request may have landed ------------------------------------- */
+
+#[tokio::test]
+async fn a_refused_token_after_an_earlier_request_is_not_a_plain_prompt_to_sign_in() {
+    let _clock = CLOCK.lock().await;
+    // The earlier request's answer was lost; the retry is refused twice, and the receipt cannot be
+    // read: whether the account is closed is not known, and the person is told so.
+    for (later, script) in [
+        (
+            30_000,
+            vec![recorded("unauthenticated"), recorded("unauthenticated")],
+        ),
+        (
+            30_000,
+            vec![
+                recorded("unauthenticated"),
+                recorded("unauthenticated"),
+                recorded("status_unknown"),
+            ],
+        ),
+    ] {
+        let rig = new_rig().await;
+        rig.wire
+            .then([Step::Lost, Step::Lost, Step::Lost, Step::Lost]);
+        rig.deletion.confirm(CODE, &[]).await.expect("unsettled");
+        at(later);
+        rig.wire.then(script);
+        assert_eq!(
+            rig.deletion.confirm(CODE, &[]).await,
+            Ok(DeletionOutcome::Unsettled)
+        );
+    }
+
+    // Control: once the earlier request cannot still be running, the receipt's `unknown` means the
+    // sign-in is what is needed.
+    let rig = new_rig().await;
+    rig.wire
+        .then([Step::Lost, Step::Lost, Step::Lost, Step::Lost]);
+    rig.deletion.confirm(CODE, &[]).await.expect("unsettled");
+    at(UNSETTLED_FOR_MS + 1);
+    rig.wire.then([
+        recorded("unauthenticated"),
+        recorded("unauthenticated"),
+        recorded("status_unknown"),
+    ]);
+    assert_eq!(
+        rig.deletion.confirm(CODE, &[]).await,
+        Err(DeletionFault::NeedsSignIn)
+    );
+}
+
+/* ---- What a refused code leaves, and what an unanswered one does ---------------------------- */
+
+#[tokio::test]
+async fn a_refused_code_leaves_nothing_running_and_an_unanswered_one_may_still_be() {
+    let _clock = CLOCK.lock().await;
+    // The service answered and said nothing was done: a look inside the margin finds nothing
+    // unsettled, and the record is dropped once the margin has passed.
+    let rig = new_rig().await;
+    rig.wire.then([recorded("confirm_wrong")]);
+    rig.deletion.confirm(CODE, &[]).await.expect("an answer");
+    at(30_000);
+    rig.wire.then([recorded("status_unknown")]);
+    let status = rig.deletion.status().await.expect("a status");
+    assert_eq!(status.progress, DeletionProgress::None);
+    assert!(record(&rig).is_some(), "kept until the margin has passed");
+    at(UNSETTLED_FOR_MS + 1);
+    rig.wire.then([recorded("status_unknown")]);
+    rig.deletion.status().await.expect("a status");
+    assert!(record(&rig).is_none());
+
+    // Trying again makes a request that is not yet answered.
+    let rig = new_rig().await;
+    rig.wire.then([recorded("confirm_wrong")]);
+    rig.deletion.confirm(CODE, &[]).await.expect("an answer");
+    rig.wire
+        .then([Step::Lost, Step::Lost, Step::Lost, Step::Lost]);
+    rig.deletion.confirm(CODE, &[]).await.expect("unsettled");
+    rig.wire.then([recorded("status_unknown")]);
+    let status = rig.deletion.status().await.expect("a status");
+    assert_eq!(status.progress, DeletionProgress::Unsettled);
+}
+
+#[tokio::test]
+async fn a_status_asked_while_a_confirmation_is_out_says_it_is_unsettled() {
+    let _clock = CLOCK.lock().await;
+    let rig = new_rig().await;
+    let (entered, release) = rig.wire.hold_next("/api/account/deletion");
+    rig.wire.then([recorded("confirm_wrong")]);
+    let confirming = rig.deletion.confirm(CODE, &[]);
+    let looking = async {
+        entered.notified().await;
+        let status = rig.deletion.status().await;
+        release.notify_one();
+        status
+    };
+    let (_, status) = tokio::join!(confirming, looking);
+    assert_eq!(
+        status.expect("a status").progress,
+        DeletionProgress::Unsettled
+    );
+}
+
+/* ---- What only the application can settle -------------------------------------------------- */
+
+#[tokio::test]
+async fn a_device_step_that_is_not_done_is_tried_again_and_one_that_is_done_is_not() {
+    let _clock = CLOCK.lock().await;
+    let rig = new_rig().await;
+    rig.wire.then([recorded("confirm_closed_closing")]);
+    rig.deletion.confirm(CODE, &[]).await.expect("closed");
+
+    // The notifications are settled; the recovery record could not be cleared.
+    let steps = Steps::new(true, false);
+    rig.deletion.settle_device(&steps).await.expect("settled");
+    assert_eq!(steps.ran(), (1, 1));
+    rig.wire.then([recorded("status_open")]);
+    assert!(
+        rig.deletion
+            .status()
+            .await
+            .expect("a status")
+            .device_pending,
+        "one step is still to take"
+    );
+
+    // The next look runs the recovery step again and the notifications step not at all.
+    *steps.recovery_done.lock().expect("done") = true;
+    rig.deletion.settle_device(&steps).await.expect("settled");
+    assert_eq!(steps.ran(), (1, 2));
+    rig.wire.then([recorded("status_done")]);
+    let status = rig.deletion.status().await.expect("a status");
+    assert!(!status.device_pending);
+    assert!(record(&rig).is_none(), "done and settled: the record goes");
+}
+
+#[tokio::test]
+async fn two_looks_at_once_settle_each_device_step_once() {
+    let _clock = CLOCK.lock().await;
+    let rig = new_rig().await;
+    rig.wire.then([recorded("confirm_closed_closing")]);
+    rig.deletion.confirm(CODE, &[]).await.expect("closed");
+    let mut steps = Steps::new(true, true);
+    steps.yields = true;
+    let (first, second) = tokio::join!(
+        rig.deletion.settle_device(&steps),
+        rig.deletion.settle_device(&steps)
+    );
+    first.expect("settled");
+    second.expect("settled");
+    assert_eq!(steps.ran(), (1, 1));
+}
+
+#[tokio::test]
+async fn a_step_whose_finish_could_not_be_written_is_not_run_again() {
+    let _clock = CLOCK.lock().await;
+    let flaky = Arc::new(Flaky {
+        inner: MemoryStore::new(),
+        fail_session_delete: Mutex::new(false),
+        fail_record_write: Mutex::new(false),
+    });
+    let rig = rig_over(Arc::clone(&flaky) as Arc<dyn SecretStore>).await;
+    rig.wire.then([recorded("confirm_closed_closing")]);
+    rig.deletion.confirm(CODE, &[]).await.expect("closed");
+
+    // The disk refuses the record while the steps run: the person's own changes after the first
+    // run are not undone by a second.
+    *flaky.fail_record_write.lock().expect("flaky") = true;
+    let steps = Steps::new(true, true);
+    assert!(matches!(
+        rig.deletion.settle_device(&steps).await,
+        Err(DeletionFault::Local(_))
+    ));
+    assert!(matches!(
+        rig.deletion.settle_device(&steps).await,
+        Err(DeletionFault::Local(_))
+    ));
+    assert_eq!(
+        steps.ran(),
+        (1, 0),
+        "the first step ran once; the failed write stops the pass"
+    );
+
+    // The disk works again: the finish is written without running either step a second time.
+    *flaky.fail_record_write.lock().expect("flaky") = false;
+    rig.deletion.settle_device(&steps).await.expect("settled");
+    assert_eq!(steps.ran(), (1, 1));
+    assert_eq!(
+        rig.deletion.settle().await,
+        Ok(false),
+        "both steps are written as done"
+    );
+}
+
+#[tokio::test]
+async fn a_deletion_cannot_replace_a_closed_one_whose_device_state_is_not_settled() {
+    let _clock = CLOCK.lock().await;
+    let rig = new_rig().await;
+    rig.wire.then([recorded("confirm_closed_closing")]);
+    rig.deletion.confirm(CODE, &[]).await.expect("closed");
+    let first = record(&rig).expect("the record")["receipt"].clone();
+
+    // Another account signs in and tries to delete itself while the first's device state waits.
+    rig.account
+        .commit(issued("account-2", "second"), "another-nonce")
+        .await
+        .expect("a sign-in");
+    rig.wire.then([recorded("preview")]);
+    rig.deletion.preview().await.expect("a preview");
+    let before = rig.wire.seen().len();
+    assert!(matches!(
+        rig.deletion.confirm(CODE, &[]).await,
+        Err(DeletionFault::Local(_))
+    ));
+    assert_eq!(rig.wire.seen().len(), before, "nothing was sent");
+    assert_eq!(record(&rig).expect("kept")["receipt"], first);
+
+    // Settled, it may be replaced.
+    rig.deletion
+        .settle_device(&Steps::new(true, true))
+        .await
+        .expect("settled");
+    rig.wire.then([recorded("confirm_wrong")]);
+    rig.deletion.confirm(CODE, &[]).await.expect("an answer");
+    assert_ne!(record(&rig).expect("the new record")["receipt"], first);
+}
+
+#[tokio::test]
+async fn a_look_does_not_drop_a_receipt_that_another_process_has_just_used() {
+    let _clock = CLOCK.lock().await;
+    // Two windows of one account share the store, and each counts only its own confirmations.
+    let rig = new_rig().await;
+    rig.wire
+        .then([Step::Lost, Step::Lost, Step::Lost, Step::Lost]);
+    rig.deletion.confirm(CODE, &[]).await.expect("unsettled");
+    let first = record(&rig).expect("the record")["receipt"].clone();
+    at(UNSETTLED_FOR_MS + 1);
+
+    let elsewhere = Arc::new(Wire::default());
+    let other = deletion(&rig.account, &elsewhere);
+    let (looking, let_look_go) = rig.wire.hold_next("/api/account/deletion/status");
+    rig.wire.then([recorded("status_unknown")]);
+    let (confirming, let_confirm_go) = elsewhere.hold_next("/api/account/deletion");
+    elsewhere.then([recorded("confirm_wrong")]);
+
+    let look = rig.deletion.status();
+    let confirm = other.confirm(CODE, &[]);
+    let drive = async {
+        looking.notified().await;
+        confirming.notified().await;
+        // The device slept with both requests out, long enough for the margin to pass again.
+        at(UNSETTLED_FOR_MS * 4);
+        let_look_go.notify_one();
+        let_confirm_go.notify_one();
+    };
+    let (look, _, ()) = tokio::join!(look, confirm, drive);
+    look.expect("a status");
+    assert_eq!(
+        record(&rig).expect("the receipt the other window used is still kept")["receipt"],
+        first
+    );
+}
+
+/* ---- The recorded answers and the ones these cases replay ----------------------------------- */
+
+/// Whether `ours` is the same answer as `recorded`: the same members and kinds of value, and the
+/// same value wherever the recording kept one (it replaces an identifier or a delay with a
+/// placeholder in angle brackets, and an address or a name with an example).
+fn agrees(recorded: &serde_json::Value, ours: &serde_json::Value, path: &str) {
+    use serde_json::Value;
+    match (recorded, ours) {
+        (Value::String(text), _) if text.starts_with('<') && text.ends_with('>') => {}
+        (Value::Object(left), Value::Object(right)) => {
+            let names = |map: &serde_json::Map<String, Value>| {
+                map.keys()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>()
+            };
+            assert_eq!(names(left), names(right), "{path}: members");
+            for (name, value) in left {
+                agrees(value, &right[name], &format!("{path}.{name}"));
+            }
+        }
+        (Value::Array(left), Value::Array(right)) => {
+            assert_eq!(left.len(), right.len(), "{path}: length");
+            for (index, (one, other)) in left.iter().zip(right).enumerate() {
+                agrees(one, other, &format!("{path}[{index}]"));
+            }
+        }
+        (Value::String(_), Value::String(_))
+            if path.ends_with(".address") || path.ends_with(".name") => {}
+        (Value::Number(_), Value::Number(_)) if path.ends_with(".members") => {}
+        (left, right) => assert_eq!(left, right, "{path}"),
+    }
+}
+
+#[test]
+fn the_answers_these_cases_replay_agree_with_the_ones_the_service_recorded() {
+    let recorded: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/account-deletion/recorded-by-the-service.json"
+    ))
+    .expect("the recording");
+    let ours = answers();
+    // The recording names two answers differently.
+    fn named(name: &str) -> &str {
+        match name {
+            "code_unavailable" => "code_mail_failed",
+            "dead_token" => "unauthenticated",
+            other => other,
+        }
+    }
+    let mut compared = 0;
+    for (name, answer) in recorded.as_object().expect("answers") {
+        let Some(replayed) = ours.get(named(name)) else {
+            continue;
+        };
+        assert_eq!(answer["status"], replayed["status"], "{name}: status");
+        agrees(&answer["body"], &replayed["body"], name);
+        compared += 1;
+    }
+    assert!(compared >= 20, "{compared} answers compared");
 }

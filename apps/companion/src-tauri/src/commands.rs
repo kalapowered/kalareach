@@ -4879,6 +4879,9 @@ pub async fn account_deletion_confirm(
     acknowledged: Vec<String>,
 ) -> Result<crate::account::deletion::ConfirmAnswer> {
     let account = account.get().await?;
+    // What an earlier deletion left to settle is settled first, so that a new one is not refused
+    // for it.
+    crate::account::deletion::settle_device(&state, account).await;
     let answer = account.deletion_confirm(&code, &acknowledged).await?;
     if answer.closed() {
         crate::account::deletion::settle_device(&state, account).await;

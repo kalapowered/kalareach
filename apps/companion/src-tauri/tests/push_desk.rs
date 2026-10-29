@@ -15,6 +15,7 @@
 #[path = "../../../../crates/kr-controller/tests/net_support/mod.rs"]
 mod net_support;
 mod support;
+use support::closing;
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -25,6 +26,8 @@ use std::time::Duration;
 
 use companion_platform::notify::{Permission, PreviewKeys};
 use companion_platform::push::{PendingRegistration, PendingState};
+use companion_tauri::AppState;
+use companion_tauri::account::deletion::settle_device;
 use companion_tauri::device::Device;
 use companion_tauri::push::{
     AskFuture, ConnectionRegistrar, HostLine, LineFuture, LineStop, Native, PushDesk, PushFuture,
@@ -4219,7 +4222,10 @@ async fn an_account_that_was_deleted_leaves_each_host_needing_the_person_until_i
     phone.until(|states| states == [PushState::On]).await;
     let proposals = proposed(&phone.gateway).len();
 
-    phone.desk.account_deleted();
+    assert!(
+        phone.desk.account_deleted(),
+        "every host was marked and kept"
+    );
     assert_eq!(phone.view().hosts[0].state, PushState::NeedsAttention);
 
     // A look, even a minute later, leaves it alone; control: a host that stopped for another
@@ -4259,7 +4265,7 @@ async fn a_run_under_way_when_the_account_is_deleted_hands_the_host_nothing() {
     })
     .await;
 
-    phone.desk.account_deleted();
+    assert!(phone.desk.account_deleted());
     assert_ne!(phone.view().hosts[0].state, PushState::On);
     // The person turns it on again and the challenge of the old run is answered.
     phone
@@ -4279,4 +4285,96 @@ async fn a_run_under_way_when_the_account_is_deleted_hands_the_host_nothing() {
         1,
         "the run that lost its claim handed nothing to the host"
     );
+}
+
+/// A list of paired hosts that cannot be read is not an empty one: no host is marked on it, and the
+/// caller is told it is not done, so the marking is asked for again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deleted_account_marks_nothing_on_a_list_of_hosts_that_cannot_be_read() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
+    let reference = phone.references().remove(0);
+    phone.desk.enable(&reference).expect("the person asks");
+    phone.until(|states| states == [PushState::On]).await;
+
+    let file = find(phone._phone.data.path(), "hosts.json").expect("the paired hosts' file");
+    let kept = std::fs::read(&file).expect("the paired hosts");
+    std::fs::write(&file, b"{ not a list").expect("spoiled");
+    assert!(
+        !phone.desk.account_deleted(),
+        "a list that cannot be read is no list"
+    );
+    std::fs::write(&file, kept).expect("mended");
+    assert_eq!(
+        phone.view().hosts[0].state,
+        PushState::On,
+        "nothing was marked"
+    );
+
+    assert!(phone.desk.account_deleted());
+    assert_eq!(phone.view().hosts[0].state, PushState::NeedsAttention);
+}
+
+/// The device settles a closed account's notifications through the application's own steps: two
+/// looks that find it at once mark each host once, and a later look leaves a host the person turned
+/// on again alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_closed_account_marks_each_host_once_however_many_looks_find_it() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
+    let reference = phone.references().remove(0);
+    phone.desk.enable(&reference).expect("the person asks");
+    phone.until(|states| states == [PushState::On]).await;
+    let state = AppState::new();
+    state.push_opened(Arc::clone(&phone.desk));
+    let account = closing::closed_account().await;
+
+    tokio::join!(
+        settle_device(&state, &account),
+        settle_device(&state, &account)
+    );
+    assert_eq!(phone.view().hosts[0].state, PushState::NeedsAttention);
+
+    phone
+        .desk
+        .enable(&reference)
+        .expect("the person turns it on again");
+    phone.until(|states| states == [PushState::On]).await;
+    settle_device(&state, &account).await;
+    assert_eq!(
+        phone.view().hosts[0].state,
+        PushState::On,
+        "what the person turned on is not undone by a later look"
+    );
+}
+
+/// Only a host that has a record is marked when the account is deleted, the mark survives the
+/// application being started again, and a host the person never asked for stays as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deleted_account_marks_only_hosts_with_a_record_and_the_mark_survives_a_restart() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let first = Host::start(&owner).await;
+    let second = Host::start(&owner).await;
+    let phone = desk(&[&first, &second], &owner, Receiver::new(FIRST_TOKEN)).await;
+    let reference = phone.references().remove(0);
+    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .until(|states| states == [PushState::Off, PushState::On])
+        .await;
+
+    assert!(phone.desk.account_deleted());
+    let states: Vec<PushState> = phone.view().hosts.iter().map(|host| host.state).collect();
+    assert_eq!(states, [PushState::Off, PushState::NeedsAttention]);
+
+    let restarted = reopened(&phone);
+    let states: Vec<PushState> = restarted
+        .desk
+        .view()
+        .hosts
+        .iter()
+        .map(|host| host.state)
+        .collect();
+    assert_eq!(states, [PushState::Off, PushState::NeedsAttention]);
 }

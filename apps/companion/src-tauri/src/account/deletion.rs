@@ -15,16 +15,18 @@
 //! left is what only the application can reach: on a phone, the registration of each host's
 //! notifications, which the service removed with the account's records of the devices and which
 //! the phone would otherwise go on showing as on; and on a computer, the recovery record, which
-//! says a bundle is kept at the service when the bundle was deleted. [`settle_device`] does both,
-//! once, and again at the next look if it was interrupted.
+//! says a bundle is kept at the service when the bundle was deleted. [`settle_device`] runs both
+//! through the client, which runs each until it is done and never twice, one deletion at a time, at
+//! each start and at each look that finds one still to settle.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use kr_client::services::ServiceHttp;
 use kr_client::services::account::SignedInAccount;
 use kr_client::services::account::deletion::{
     CodeRefusal, DeletionFault, DeletionOutcome, DeletionPreview, DeletionProgress, DeletionRead,
-    ManagedAccountDeletion, OwnedOrganisation,
+    DeviceSteps, ManagedAccountDeletion, OwnedOrganisation, StepFuture,
 };
 use kr_protocol::service::GatewayOrigin;
 use serde::Serialize;
@@ -131,6 +133,8 @@ impl ConfirmAnswer {
 pub enum StatusAnswer {
     /// No deletion is in progress on this device.
     None,
+    /// A confirmation left and nothing yet says whether it arrived.
+    Unsettled,
     /// The account is closed and the removal is running.
     Open,
     /// The removal has finished.
@@ -232,6 +236,7 @@ impl Account {
             Ok(status) => {
                 let answer = match status.progress {
                     DeletionProgress::None => StatusAnswer::None,
+                    DeletionProgress::Unsettled => StatusAnswer::Unsettled,
                     DeletionProgress::Open => StatusAnswer::Open,
                     DeletionProgress::Done => StatusAnswer::Done,
                 };
@@ -257,28 +262,61 @@ impl Account {
     }
 }
 
-/// Settles what this device holds of an account that is closed, once.
+/// How long the recovery record's step waits for another step of recovery to end before it is left
+/// for the next look: an export that is saving offline copies holds it for as long as the download.
+const RECOVERY_STEP_WAITS: Duration = Duration::from_secs(5);
+
+/// This device's own state, as the client settles it once an account is closed.
+struct Steps<'a>(&'a AppState);
+
+impl DeviceSteps for Steps<'_> {
+    /// A phone's notification registrations: the service removed them with the account's records of
+    /// the devices, and this phone would go on showing them as on. A computer has none, and a phone
+    /// whose notifications are not open yet is asked again once they are.
+    fn notifications(&self) -> StepFuture<'_> {
+        Box::pin(async move {
+            match self.0.push() {
+                Some(desk) => desk.account_deleted(),
+                None => !cfg!(mobile),
+            }
+        })
+    }
+
+    /// The recovery record says a bundle is kept at the service, and the bundle was deleted.
+    fn recovery(&self) -> StepFuture<'_> {
+        Box::pin(async move {
+            let Ok(recovery) = self.0.recovery() else {
+                return false;
+            };
+            match tokio::time::timeout(RECOVERY_STEP_WAITS, recovery.account_deleted()).await {
+                Ok(Ok(())) => true,
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "the recovery record could not be cleared after the account was deleted");
+                    false
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "another step of recovery is running, so its record is cleared later"
+                    );
+                    false
+                }
+            }
+        })
+    }
+}
+
+/// Settles what this device holds of an account that is closed.
 ///
-/// Called when a deletion closes the account and whenever a look finds one closed whose device
-/// state is not settled yet, so a start that interrupted it finishes it.
+/// Called before a new deletion, when a deletion closes the account, whenever a look finds one
+/// closed whose device state is not settled yet, and at each start once the records it settles are
+/// open, so that one a start interrupted is finished.
 pub async fn settle_device(state: &AppState, account: &Account) {
-    let deletion = account.deletion();
-    if !matches!(deletion.settle().await, Ok(true)) {
-        return;
+    if let Err(fault) = account.deletion().settle_device(&Steps(state)).await {
+        tracing::warn!(
+            ?fault,
+            "what the closed account left on this device could not be settled"
+        );
     }
-    // A phone's notification registrations: the service removed them with the account's records of
-    // the devices, and this phone would go on showing them as on. A computer has none.
-    if let Some(desk) = state.push() {
-        desk.account_deleted();
-    }
-    // The recovery record says a bundle is kept at the service, and the bundle was deleted.
-    if let Ok(recovery) = state.recovery()
-        && let Err(error) = recovery.account_deleted().await
-    {
-        tracing::warn!(%error, "the recovery record could not be cleared after the account was deleted");
-        return;
-    }
-    let _ = deletion.device_settled().await;
 }
 
 /// A client for an account that never deletes in this process: it makes no request, because the
