@@ -772,7 +772,9 @@ changed after `kr` wrote it is not put back over. Before a key changes,
 install as a changed profile, with the keys it had written put back and the person's key as it is.
 So does a key `kr` does not write that the person set (a font, a colour): every key of the profile is
 read when the write begins, again just before the first is set and a last time once the keys are
-written, and an install that finds one writes nothing, or puts back what it wrote.
+written, and an install that finds one writes nothing, or puts back what it wrote. That last read
+checks the three keys `kr` writes too: one the person changed after `kr` read it back stops the
+install in the same way, and keeps the value the person set.
 For Terminal the preferences are read again by another process, and an entry that is not as written,
 or another profile that moved, puts this entry back as it was before the write (the entry, or none)
 and touches nothing else but for one case: an entry the person changed since the write is not put
@@ -816,8 +818,9 @@ holds something the person put there stops the removal as a changed profile: the
 and the profile's place in the list are put back (at the end of the list), so the profile is left as
 `kr` found it, and the record forgets it; if they cannot be put back the record keeps the entry. A
 reset that the settings say worked and did not keep is a failure, and so is a key that another writer
-set between `kr`'s reset of it and the read that checks the reset: the removal puts back what it had
-changed, leaves that key, fails, and the record keeps the entry. A key that the person sets between
+set between `kr`'s reset of it and the read that checks the reset, or after that check and before the
+last look, which reads the three keys `kr` resets too: the removal puts back what it had changed,
+leaves that key, fails, and the record keeps the entry. A key that the person sets between
 `kr`'s last read of it and its write or reset is overwritten or reset, and a key `kr` does not write
 that the person sets after the last look is not seen: named limits, as the list's are.
 
