@@ -163,11 +163,13 @@ async fn paste_and_land(session: &mut Session, path: &Path, samples: &[&str]) ->
     let mut landings = Vec::new();
     for index in 0..samples.len() {
         let line = index as u64 + 1;
-        // The cursor on the marker's `|`: the line, then the start of it, then the marker.
+        // The cursor on the marker's `|`: the line, then the start of it, then the marker. Neovim
+        // can draw after one key and before the next, so a ruler on the line may still be the
+        // line's start; the marker follows the sample and is never in the first column.
         session.type_bytes(format!("{line}G0f|").as_bytes());
         let screen = session
             .wait_for("the cursor on the marker", |screen| {
-                ruler(screen).is_some_and(|(at, _)| at == line)
+                ruler(screen).is_some_and(|(at, column)| at == line && column > 1)
             })
             .await;
         let (_, column) = ruler(&screen).expect("a ruler");
