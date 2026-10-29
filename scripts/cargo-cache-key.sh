@@ -7,9 +7,16 @@
 # One line, `<settings>-<week>-<dependencies>`, each part sixteen hex digits or an ISO week.
 #
 # settings   The toolchain, the build settings of `.cargo/config.toml`, the `[profile]` tables of the
-#            workspace's `Cargo.toml` and the `CARGO_PROFILE_*` and `RUSTFLAGS` variables of the
-#            environment, comments left out: a crate built with other settings is not the crate a
-#            cache holds, and an edit to a comment changes none.
+#            workspace's `Cargo.toml`, the `CARGO_PROFILE_*` and `RUSTFLAGS` variables of the
+#            environment, comments left out, and the runner image: a crate built with other
+#            settings is not the crate a cache holds, and an edit to a comment changes none. The
+#            image is `ImageOS` and `ImageVersion`, which a hosted runner sets. A native build
+#            leaves its configured tree in the cache (a CMake tree holds the paths of the tools
+#            and libraries it found), and on another image those paths are gone or other, so a
+#            cache built on one image is not restored on another, by an exact key or by a prefix.
+#            Where a variable is not set, or is empty, it reads `unset` in what is digested, so
+#            that a machine that is not a hosted runner has a key of its own and is not taken for
+#            one.
 # week       The ISO week, so that what a cache holds is rebuilt from nothing at least weekly. A
 #            cache that is restored and saved again only grows: Cargo never removes a unit that no
 #            build asks for, and a feature a manifest turns on changes no line of Cargo.lock.
@@ -39,7 +46,8 @@ toolchain="$(grep -h -v -E '^[[:space:]]*(#|$)' rust-toolchain.toml .cargo/confi
 profiles="$(awk '/^\[profile/ { keep = 1 } /^\[/ && !/^\[profile/ { keep = 0 } keep && !/^[[:space:]]*(#|$)/' Cargo.toml)"
 # The settings the workflow gives every build by environment variable.
 environment="$(env | grep -E '^(CARGO_PROFILE_|RUSTFLAGS=|CARGO_ENCODED_RUSTFLAGS=)' | LC_ALL=C sort || true)"
-settings="$(printf '%s\n%s\n%s\n' "$toolchain" "$profiles" "$environment" | digest)"
+image="ImageOS=${ImageOS:-unset} ImageVersion=${ImageVersion:-unset}"
+settings="$(printf '%s\n%s\n%s\n%s\n' "$toolchain" "$profiles" "$environment" "$image" | digest)"
 week="$(date -u +%G-W%V)"
 dependencies="$(awk 'BEGIN { RS = ""; ORS = "\n\n" } /\nsource = / { print }' Cargo.lock | digest)"
 
