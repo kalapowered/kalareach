@@ -94,11 +94,15 @@ publish() {
     for target in "${targets[@]}"; do ln -s "$archives/kalareach-$target-$release.tar.gz" "$work/sumcheck/"; done
     bash "$here/check-release-sums.sh" "$work/sumcheck" > /dev/null || fail "the sums are not what their checkers read"
 
-    # One tag is one release, and a release is never assembled twice.
-    local existing
-    existing="$(gh api "repos/$repo/releases" --paginate | python3 -I -c '
+    # One tag is one release, and a release is never assembled twice. The listing is read once: it
+    # names the release of this tag when there is one, and the newest published release when nothing
+    # can read the repository's setting. The token sees drafts too, and the staging draft is the
+    # newest release at this point, so a draft is never taken for evidence.
+    local existing listing="$work/releases.json" newest
+    gh api "repos/$repo/releases" --paginate > "$listing" || fail "GitHub did not list the releases of $repo"
+    existing="$(python3 -I -c '
 import json, sys
-text = sys.stdin.read()
+text = open(sys.argv[2], encoding="utf-8").read()
 decoder = json.JSONDecoder()
 index = 0
 while index < len(text):
@@ -110,7 +114,7 @@ while index < len(text):
     for release in page:
         if release["tag_name"] == sys.argv[1]:
             print(release["id"], "draft=" + str(release["draft"]).lower())
-' "$tag")"
+' "$tag" "$listing")"
     if [ -n "$existing" ]; then
         echo "$tag already has a release: $existing" >&2
         echo 'A draft left by a run that failed: delete the draft and run this again. A published release:' >&2
@@ -122,20 +126,33 @@ while index < len(text):
     fi
     # A release published where releases are not immutable has assets that can be replaced, which
     # cannot be undone, so nothing is made unless something shows they are immutable. The setting
-    # itself needs a token that can administer the repository: when the token can read it, it has to
-    # say enabled. When it cannot, the newest published release of the repository has to report
-    # itself immutable, which a release published while the setting is off does not.
-    local setting newest
+    # itself needs a token that can administer the repository, which a workflow's token never is:
+    # when the token can read it, it has to say enabled. When it cannot, the most recently published
+    # release of the repository has to report itself immutable, which a release published while the
+    # setting is off does not. That shows the setting as it was at that release, so whoever
+    # dispatches the release reads the setting with their own login first.
+    local setting
     setting="$(gh api "repos/$repo/immutable-releases" 2> /dev/null | python3 -I -c 'import json, sys; print(json.load(sys.stdin).get("enabled"))' 2> /dev/null || true)"
     case "$setting" in
         True) ;;
         False) fail "this repository does not make releases immutable, so nothing is published" ;;
         *)
-            newest="$(gh api "repos/$repo/releases?per_page=1" 2> /dev/null | python3 -I -c '
+            newest="$(python3 -I -c '
 import json, sys
-releases = [r for r in json.load(sys.stdin) if not r["draft"]]
-print(str(releases[0]["immutable"]).lower() if releases else "none")' 2> /dev/null || true)"
-            [ "$newest" = true ] || fail "nothing shows that this repository makes releases immutable (the setting cannot be read, and the newest published release answers '${newest:-nothing}'), so nothing is published"
+text = open(sys.argv[1], encoding="utf-8").read()
+decoder = json.JSONDecoder()
+index = 0
+published = []
+while index < len(text):
+    while index < len(text) and text[index].isspace():
+        index += 1
+    if index >= len(text):
+        break
+    page, index = decoder.raw_decode(text, index)
+    published += [r for r in page if not r["draft"] and r.get("published_at")]
+newest = max(published, key=lambda r: r["published_at"]) if published else None
+print(str(newest["immutable"]).lower() if newest else "none")' "$listing" 2> /dev/null || true)"
+            [ "$newest" = true ] || fail "nothing shows that this repository makes releases immutable (the setting cannot be read, and the most recently published release answers '${newest:-nothing}'), so nothing is published"
             ;;
     esac
 
@@ -368,6 +385,7 @@ def release_json(release):
     return {
         "id": release["id"], "tag_name": release["tag_name"], "draft": release["draft"],
         "prerelease": release["prerelease"], "immutable": release["immutable"],
+        "published_at": None if release["draft"] else f"2026-01-01T00:{release['id']:02d}:00Z",
         "upload_url": f"upload://{release['id']}{{?name,label}}",
         "assets": [{"id": a["id"], "name": a["name"], "size": a["size"], "digest": a["digest"],
                     "browser_download_url": f"https://example.invalid/{a['name']}"} for a in release["assets"]],
@@ -397,11 +415,11 @@ elif method == "POST" and path.startswith("upload://"):
     release["assets"].append(asset)
     release["next_asset"] += 1
     save()
-elif method == "GET" and path.startswith(f"repos/{repo}/releases?"):
-    published = [r for r in state["releases"] if not r["draft"]]
-    print(json.dumps([release_json(r) for r in sorted(published, key=lambda r: -r["id"])][:1]))
 elif method == "GET" and path == f"repos/{repo}/releases":
-    print(json.dumps([release_json(r) for r in state["releases"]]))
+    # Drafts are listed to a token with push access, and the newest release comes first: the staging
+    # draft the macOS signing made is the newest release when the publication runs. A real answer is
+    # paged, so the stand-in gives one page per release to show that every page is read.
+    print("\n".join(json.dumps([release_json(r)]) for r in sorted(state["releases"], key=lambda r: -r["id"])))
 elif method == "GET" and path == f"repos/{repo}/immutable-releases":
     # A token that cannot administer the repository is answered 404; STUB_SETTING stands for one that can.
     if os.environ.get("STUB_SETTING") in ("true", "false"):
@@ -482,18 +500,18 @@ shutil.copy(os.path.join(directory, "state.json"), os.path.join(directory, "init
 PYTHON
 }
 
-seed_release() { # <tag> <draft: true|false>: another release, part of the state a case starts from
-    python3 -I - "$STUB_STATE" "$1" "$2" "$commit" << 'PYTHON'
+seed_release() { # <tag> <draft: true|false> [<immutable: true|false>]: another release, part of the state a case starts from
+    python3 -I - "$STUB_STATE" "$1" "$2" "$commit" "${3:-true}" << 'PYTHON'
 import json
 import os
 import shutil
 import sys
 
-directory, tag, draft, commit = sys.argv[1:5]
+directory, tag, draft, commit, immutable = sys.argv[1:6]
 path = os.path.join(directory, "state.json")
 state = json.load(open(path))
 state["releases"].append({"id": state["next"], "tag_name": tag, "draft": draft == "true", "prerelease": True,
-                          "immutable": True, "assets": [], "target": commit, "next_asset": 1})
+                          "immutable": immutable == "true", "assets": [], "target": commit, "next_asset": 1})
 state["next"] += 1
 json.dump(state, open(path, "w"))
 shutil.copy(path, os.path.join(directory, "initial.json"))
@@ -512,6 +530,9 @@ case_setting_off() { ( STUB_SETTING=false go ) && return 1; [ "$(nothing_created
 case_setting_on() { STUB_SETTING=true go && state_has published "host/v$release"; }
 case_published_mutable() { ( STUB_PUBLISH_MUTABLE=1 go ) && return 1; state_has published "host/v$release"; }
 case_no_proof() { ( go ) && return 1; [ "$(nothing_created)" = yes ]; }
+case_no_proof_beside_draft() { seed_release "host-staging/v$release" true; ( go ) && return 1; [ "$(nothing_created)" = yes ]; }
+case_newer_immutable() { seed_release "host/v0.0.1+000000000001" false true; go && state_has published "host/v$release"; }
+case_newer_mutable() { seed_release "host/v0.0.1+000000000001" false false; ( go ) && return 1; [ "$(nothing_created)" = yes ]; }
 case_digest_differs() { ( go ) && return 1; [ "$(nothing_created)" = yes ]; }
 case_missing_archive() { ( go ) && return 1; [ "$(nothing_created)" = yes ]; }
 
@@ -572,6 +593,9 @@ json.dump({"signed": {"roles": {"targets": {"keyids": ["aa", "bb"]}}}}, open("'"
     run "a setting that can be read and is on is enough" pass case_setting_on
     BASE=mutable run "no readable setting and a newest release that is not immutable is refused before a draft is made" pass case_no_proof
     BASE=none run "no readable setting and no published release is refused before a draft is made" pass case_no_proof
+    BASE=mutable run "a staging draft is not evidence: the newest published release behind it is what counts, and it is not immutable" pass case_no_proof_beside_draft
+    BASE=mutable run "no readable setting and a mutable release followed by an immutable one is enough: the most recent counts" pass case_newer_immutable
+    run "no readable setting and an immutable release followed by a mutable one is refused: the most recent counts" pass case_newer_mutable
     run "a draft that serves other bytes than were packed is not published" pass case_serves_other
     run "a release that turns out to be replaceable after it is published ends the run with an error" pass case_published_mutable
 
