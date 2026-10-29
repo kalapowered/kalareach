@@ -36,7 +36,8 @@ is_pinned() { # <path>: the pinned executable, by its digest and then by what it
 }
 
 self_test() {
-    local work status=0
+    local work status=0 here
+    here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     work="$(mktemp -d "${TMPDIR:-/tmp}/kr-rcodesign-test.XXXXXX")"
     trap 'rm -rf "${work:?}"' RETURN
     # A program that says it is the pinned version and is not the pinned program.
@@ -52,7 +53,7 @@ self_test() {
     mkdir -p "$work/tree"
     : > "$work/key"; : > "$work/cert"; : > "$work/chain"
     if KR_RCODESIGN="$work/rcodesign" KR_SIGN_KEY="$work/key" KR_SIGN_CERT="$work/cert" KR_SIGN_CHAIN="$work/chain" \
-        bash "$(dirname "${BASH_SOURCE[0]}")/sign-macos-tree.sh" "$work/tree" developer-id > "$work/out" 2>&1; then
+        bash "$here/sign-macos-tree.sh" "$work/tree" developer-id > "$work/out" 2>&1; then
         echo "self-test FAILED: the signer went on with a program of its own choosing for the Developer ID"
         status=1
     elif grep -q 'pinned' "$work/out"; then
@@ -72,9 +73,12 @@ self_test() {
         printf '#!/bin/sh\n: > "%s/ran"\necho "apple-codesign %s"\n' "$work" "$version" > "$work/bin/rcodesign"
         chmod 755 "$work/bin/rcodesign"
         (cd "$work/here" && PATH="$work/bin:$PATH" KR_RCODESIGN=rcodesign KR_SIGN_KEY="$work/key" KR_SIGN_CERT="$work/cert" KR_SIGN_CHAIN="$work/chain" \
-            bash "$(dirname "${BASH_SOURCE[0]}")/sign-macos-tree.sh" "$work/tree" developer-id > /dev/null 2>&1) || true
+            bash "$here/sign-macos-tree.sh" "$work/tree" developer-id > "$work/out2" 2>&1) || true
         if [ -e "$work/ran" ]; then
             echo "self-test FAILED: a program found on PATH ran in place of the file that was hashed"
+            status=1
+        elif ! grep -q 'holds no Mach-O file' "$work/out2"; then
+            echo "self-test FAILED: the signer did not get past the check of the pin to the tree: $(head -1 "$work/out2")"
             status=1
         else
             echo "self-test ok: the file that is hashed is the file that runs, for a name with no directory"

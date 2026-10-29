@@ -289,7 +289,9 @@ fi
 
 # ---- sign, notarise, pack -------------------------------------------------------------------------
 
-# The signer reads the Developer ID key, so the check that only the pinned program is given it runs first.
+# The signer reads the Developer ID key, so the pinned program is installed and the check that only it
+# is given the key runs first, with the pinned program at hand for every case of that check.
+bash "$here/install-rcodesign.sh" > /dev/null || { echo "sign-macos-release: the pinned signer could not be installed" >&2; exit 1; }
 bash "$here/install-rcodesign.sh" self-test > /dev/null || { echo "sign-macos-release: the check that the signer is the pinned one does not pass" >&2; exit 1; }
 
 out="$work/staged"
