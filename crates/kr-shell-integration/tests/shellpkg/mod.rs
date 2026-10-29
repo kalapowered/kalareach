@@ -1700,6 +1700,18 @@ impl Session {
         self.nudge_before(deadline.0);
     }
 
+    /// Types the step a reader that answers only when it steps will take, without waiting for it.
+    ///
+    /// A shell that is stopped takes the key in its terminal's queue, ahead of anything typed after
+    /// it, and steps when it is let go. This is how a case puts input behind the reader's step.
+    pub fn type_the_step(&mut self) {
+        if !self.reading || !self.stepping || !dialect(self.package_kind).answers_at_the_next_step {
+            return;
+        }
+        let deadline = self.deadline_for(REPLY);
+        self.type_bytes_before(&[0x06], deadline.0);
+    }
+
     /// Gives the reader that step, and is over by `deadline` whatever happens.
     fn nudge_before(&mut self, deadline: Instant) {
         // A key typed before the shell has a reader is not a step for it: it goes through the
