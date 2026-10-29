@@ -391,12 +391,13 @@ fn owned_state(
     (modified(directory), names)
 }
 
-/// KR-REQ-03.30: the worker performing the checks changes no user data and sends no input. The
-/// file the person nominated and everything beside it are as they were once the checks have run,
-/// and the check that would send a keystroke is not performed, since no isolated context of its own
-/// was supplied.
+/// KR-REQ-03.30: the worker performing the checks changes no user data. The file the person
+/// nominated and everything beside it are as they were once the checks have run, and the run
+/// performed the read: a headless session is asked for that check alone, so there is no check that
+/// sends a keystroke to hold back. That the one check which sends input is withheld without an
+/// isolated context of its own is the probe's own unit cases.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn performing_the_checks_changes_nothing_the_person_owns_and_sends_no_input() {
+async fn performing_the_checks_changes_nothing_the_person_owns() {
     let host = host().await;
     let directory = tempfile::tempdir().expect("a directory of this test's own");
     let file = directory.path().join("authorised.txt");
@@ -408,24 +409,17 @@ async fn performing_the_checks_changes_nothing_the_person_owns_and_sends_no_inpu
     for id in 1..=2 {
         match ask(&mut link, request(&host, id, file.to_str())).await {
             Answer::Findings(found) => {
-                assert!(
-                    found
-                        .records
-                        .iter()
-                        .any(|record| record.capability.as_str()
-                            == capabilities::AUTHORISED_FILE_READ),
-                    "the read was performed"
+                let [record] = &found.records[..] else {
+                    panic!("the read is the one check performed: {:?}", found.records);
+                };
+                assert_eq!(
+                    record.capability.as_str(),
+                    capabilities::AUTHORISED_FILE_READ
                 );
-                // The check that sends input is performed only in a context of its own that the
-                // caller supplies. The request has no way to supply one, so no finding says
-                // that a keystroke was sent or that input injection was found to work.
-                assert!(
-                    found.records.iter().all(|record| {
-                        record.capability.as_str() != capabilities::INPUT_INJECTION
-                            || record.state != CapabilityState::QualifiedAvailable
-                    }),
-                    "{:?}",
-                    found.records
+                assert_eq!(record.state, CapabilityState::QualifiedAvailable);
+                assert_eq!(
+                    record.evidence_source,
+                    CapabilityEvidenceSource::DisclosedProbe
                 );
             }
             other => panic!("the checks were not performed: {other:?}"),
