@@ -28,7 +28,15 @@ pub(super) enum Presence {
 /// What is at `path`.
 pub(super) fn presence(path: &Path) -> Presence {
     match path.symlink_metadata() {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Presence::Missing,
+        // A folder on the way that is a file leaves no room for the profile: it is not there.
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Presence::Missing
+        }
         Err(error) => Presence::Unreadable(error.kind()),
         Ok(data) if data.is_file() => std::fs::read(path).map_or_else(
             |error| Presence::Unreadable(error.kind()),
