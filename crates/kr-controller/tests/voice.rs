@@ -2856,6 +2856,8 @@ async fn speech_reaches_no_prompt_submission_under_a_grant_that_permits_one() {
     for (index, words) in [
         "send the prompt fix the failing test to session one",
         "send it to session one",
+        "send it to this session",
+        "submit the prompt to this session",
         "yes, send it to session one",
         "I confirm, submit it to session one",
         "approve the request",

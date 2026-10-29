@@ -193,7 +193,7 @@ impl ScriptedCalls {
 
     /// Tells news the way the system does: the notification's stop, a failed connection. News of
     /// capture changes what native code then says it holds, as it does on a phone, so a sign of
-    /// life never contradicts it.
+    /// life read after the news agrees with it.
     pub fn tell(&self, event: CallEvent) {
         let mut inner = self.inner();
         if let CallEvent::Capture { state } = &event {

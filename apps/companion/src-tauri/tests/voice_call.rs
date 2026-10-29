@@ -1034,12 +1034,18 @@ async fn muting_the_microphone_silences_it_here_and_tells_the_service() {
 
 /// KR-REQ-15.35 and KR-REQ-15.36: what the system does to capture in the middle of a call, a phone
 /// call, a route change, a suspension of the application's audio or a microphone that is gone, is
-/// native code's news. The call tells it as the system said it, nothing of it ends the call, and
-/// capture coming back is told the same way, so a person reads what the microphone is doing. This
-/// is the displayed half of the row; the refusal of an authority claim has no caller yet.
+/// native code's news. The signs of life are held off for the whole case, so the news is the only
+/// way the screen can learn of it: the call tells each state as the system said it, nothing of it
+/// ends the call, and capture coming back is told the same way, so a person reads what the
+/// microphone is doing. This is the displayed half of the row; the refusal of an authority claim
+/// has no caller yet.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_systems_changes_to_capture_are_told_and_do_not_end_the_call() {
-    let mut scene = scene().await;
+    let timings = Timings {
+        tick: Duration::from_secs(3600),
+        ..quick()
+    };
+    let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
     scene.start().await;
     scene
         .state_where("an attached control", |state| {
