@@ -309,10 +309,11 @@ fn build_account(
 ) -> std::result::Result<std::sync::Arc<account::Account>, String> {
     use std::sync::Arc;
 
+    use kr_client::services::account::deletion::ManagedAccountDeletion;
     use kr_client::services::account::{
         ACCOUNT_ORIGIN, AccountHttp, AccountService, Client, ManagedAccountService, SignedInAccount,
     };
-    use kr_client::services::{HttpDeadlines, HttpService, managed_response_limits};
+    use kr_client::services::{HttpDeadlines, HttpService, ServiceHttp, managed_response_limits};
     use tauri::Emitter as _;
 
     let client = if cfg!(mobile) {
@@ -328,8 +329,9 @@ fn build_account(
         managed_response_limits(),
     )
     .map_err(|error| error.to_string())?;
+    let http = Arc::new(http);
     let service: Arc<dyn AccountService> = Arc::new(ManagedAccountService::new(
-        Arc::new(http) as Arc<dyn AccountHttp>,
+        Arc::clone(&http) as Arc<dyn AccountHttp>,
         client,
     ));
     let store = companion_platform::secrets::open(app).map_err(|error| error.to_string())?;
@@ -353,14 +355,21 @@ fn build_account(
     let carrier: Arc<dyn account::carrier::Carrier> =
         Arc::new(account::carrier::Session::new(app.clone()));
     let emitter = app.clone();
+    let signed_in = Arc::new(signed_in);
+    let deletion = Arc::new(ManagedAccountDeletion::new(
+        &origin,
+        http as Arc<dyn ServiceHttp>,
+        Arc::clone(&signed_in),
+    ));
     Ok(Arc::new(account::Account::new(
-        Arc::new(signed_in),
+        signed_in,
         service,
         origin,
         carrier,
         Arc::new(move |view| {
             let _ = emitter.emit(account::ACCOUNT_EVENT, view);
         }),
+        deletion,
     )))
 }
 

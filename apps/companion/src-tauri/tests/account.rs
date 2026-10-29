@@ -232,12 +232,16 @@ fn account_in(
     });
     let signed_in = Arc::new(SignedInAccount::new(Arc::clone(&service), store, client));
     let published = Arc::clone(views);
+    let origin =
+        kr_protocol::service::GatewayOrigin::new(ACCOUNT_ORIGIN).expect("the account's origin");
+    let deletion = companion_tauri::account::deletion::never_deleting(&origin, &signed_in);
     Arc::new(Account::new(
         signed_in,
         service,
-        kr_protocol::service::GatewayOrigin::new(ACCOUNT_ORIGIN).expect("the account's origin"),
+        origin,
         carrier,
         Arc::new(move |view| published.lock().expect("the record").push(view.clone())),
+        deletion,
     ))
 }
 

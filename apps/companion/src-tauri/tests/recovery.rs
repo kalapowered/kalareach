@@ -104,12 +104,14 @@ async fn account(origin: &GatewayOrigin, scopes: Option<&[&str]>) -> Arc<Account
             .await
             .expect("the sign-in is kept");
     }
+    let deletion = companion_tauri::account::deletion::never_deleting(origin, &signed_in);
     Arc::new(Account::new(
         signed_in,
         service,
         origin.clone(),
         Arc::new(NoBrowser),
         Arc::new(|_| {}),
+        deletion,
     ))
 }
 
@@ -1695,4 +1697,47 @@ async fn the_kit_is_written_only_where_a_save_dialog_put_it() {
     )
     .expect_err("recovery is off");
     assert!(!path.exists());
+}
+
+/// The account the bundle was kept under was deleted, and the service deleted the bundle with it.
+/// The card no longer says a bundle is kept; the seed stays, and turning recovery on again starts
+/// a bundle at a locator of its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deleted_account_leaves_recovery_off_with_the_seed_kept_and_a_new_locator_next_time() {
+    let computer = Computer::new().await;
+    let page = computer.page().await;
+    page.call("recovery_turn_on", json!({})).expect("on");
+    let first = computer.served.web().arrived()[0].body["exchange"]["locator"]
+        .as_str()
+        .expect("a locator")
+        .to_owned();
+    assert_eq!(page.view()["state"], "on");
+
+    page.recovery.account_deleted().await.expect("cleared");
+    assert_eq!(page.view()["state"], "off");
+    assert_eq!(page.view()["kept_at"], Value::Null);
+    assert!(
+        load_recovery_seed(&*computer.secrets, SEED_SCOPE)
+            .expect("the store is read")
+            .is_some(),
+        "the seed is the person's, and stays"
+    );
+    // Clearing again changes nothing.
+    page.recovery
+        .account_deleted()
+        .await
+        .expect("cleared again");
+
+    page.call("recovery_turn_on", json!({})).expect("on again");
+    let second = computer
+        .served
+        .web()
+        .arrived()
+        .last()
+        .expect("a write")
+        .body["exchange"]["locator"]
+        .as_str()
+        .expect("a locator")
+        .to_owned();
+    assert_ne!(first, second, "a bundle of its own, not the deleted one's");
 }

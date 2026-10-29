@@ -181,12 +181,16 @@ async fn signed_in(origin: &str, token: &str) -> Result<Arc<Account>, String> {
         .keep(service.grant(), "harness")
         .await
         .map_err(|error| error.to_string())?;
+    let origin =
+        kr_protocol::service::GatewayOrigin::new(origin).map_err(|error| error.to_string())?;
+    let deletion = crate::account::deletion::never_deleting(&origin, &tokens);
     Ok(Arc::new(Account::new(
         tokens,
         service,
-        kr_protocol::service::GatewayOrigin::new(origin).map_err(|error| error.to_string())?,
+        origin,
         Arc::new(NoCarrier),
         Arc::new(|_| {}),
+        deletion,
     )))
 }
 

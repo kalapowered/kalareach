@@ -821,6 +821,34 @@ impl Recovery {
         Ok(seed)
     }
 
+    /// The account this computer kept a bundle under was deleted, and the service deleted the
+    /// bundle with it. The record that says a bundle is kept is removed, so the card reads off and
+    /// turning recovery on again starts a bundle under a locator of its own; the seed stays in the
+    /// secure store, since the kit is the person's file and a kit with no bundle behind it
+    /// restores nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a local failure when the record cannot be removed.
+    pub async fn account_deleted(&self) -> Result<()> {
+        let _step = self.step().await?;
+        let path = self.directory.join(RECORD);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(CommandError::local_failure(format!(
+                    "this computer's recovery record could not be removed: {error}"
+                )));
+            }
+        }
+        flush_path_names(&self.directory).map_err(|error| {
+            CommandError::local_failure(format!(
+                "this computer's recovery record could not be removed: {error}"
+            ))
+        })
+    }
+
     fn record(&self) -> Result<Option<Record>> {
         let path = self.directory.join(RECORD);
         let Some(bytes) = read_owner_only_file(&path, RECORD_LIMIT).map_err(|error| {

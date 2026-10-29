@@ -329,12 +329,15 @@ async fn scene_over(
             .await
             .expect("the phone signs in");
     }
+    let origin = kr_protocol::service::GatewayOrigin::new(stand_in.origin()).expect("an origin");
+    let deletion = companion_tauri::account::deletion::never_deleting(&origin, &tokens);
     let account = Arc::new(Account::new(
         Arc::clone(&tokens),
         Arc::clone(&service) as Arc<dyn AccountService>,
-        kr_protocol::service::GatewayOrigin::new(stand_in.origin()).expect("an origin"),
+        origin,
         Arc::new(NoCarrier),
         Arc::new(|_| {}),
+        deletion,
     ));
     let platform = ScriptedCalls::new();
     let data = tempfile::tempdir().expect("a directory");

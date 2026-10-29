@@ -921,12 +921,14 @@ async fn signed_in_phone(
         .keep(grant_of(ACCOUNT), "a-nonce")
         .await
         .expect("the device signs in");
+    let deletion = companion_tauri::account::deletion::never_deleting(&origin, &tokens);
     let account = Arc::new(Account::new(
         Arc::clone(&tokens),
         service,
         origin,
         Arc::new(NoCarrier),
         Arc::new(|_| {}),
+        deletion,
     ));
     let desk = {
         let account = Arc::clone(&account);

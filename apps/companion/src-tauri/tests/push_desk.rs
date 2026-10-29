@@ -4205,3 +4205,78 @@ async fn a_view_read_earlier_never_reaches_the_page_after_one_read_later() {
         "a view read after them is numbered after them"
     );
 }
+
+/// The account a phone's registrations were made under was deleted, and the service removed the
+/// registrations of the devices the account's records name: a host that was on is shown as needing
+/// the person, no look starts it again by itself, and turning it on again runs the whole sequence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_account_that_was_deleted_leaves_each_host_needing_the_person_until_it_is_turned_on() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
+    let reference = phone.references().remove(0);
+    phone.desk.enable(&reference).expect("the person asks");
+    phone.until(|states| states == [PushState::On]).await;
+    let proposals = proposed(&phone.gateway).len();
+
+    phone.desk.account_deleted();
+    assert_eq!(phone.view().hosts[0].state, PushState::NeedsAttention);
+
+    // A look, even a minute later, leaves it alone; control: a host that stopped for another
+    // reason is tried again by a look.
+    look(&phone.desk).await;
+    assert_eq!(phone.view().hosts[0].state, PushState::NeedsAttention);
+    assert_eq!(
+        proposed(&phone.gateway).len(),
+        proposals,
+        "nothing was proposed"
+    );
+
+    phone
+        .desk
+        .enable(&reference)
+        .expect("the person asks again");
+    phone.until(|states| states == [PushState::On]).await;
+    assert!(
+        proposed(&phone.gateway).len() > proposals,
+        "the whole sequence ran again"
+    );
+}
+
+/// A run that is under way when the account is deleted loses its claim: it writes nothing after
+/// it, so the host is not shown as on by a registration the service may already have removed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_under_way_when_the_account_is_deleted_hands_the_host_nothing() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let receiver = Receiver::new(FIRST_TOKEN);
+    receiver.with(|state| state.answering = false);
+    let phone = desk(&[&host], &owner, receiver).await;
+    let reference = phone.references().remove(0);
+    phone.desk.enable(&reference).expect("the person asks");
+    eventually("the token was proposed", || {
+        proposed(&phone.gateway) == [FIRST_TOKEN]
+    })
+    .await;
+
+    phone.desk.account_deleted();
+    assert_ne!(phone.view().hosts[0].state, PushState::On);
+    // The person turns it on again and the challenge of the old run is answered.
+    phone
+        .desk
+        .enable(&reference)
+        .expect("the person asks again");
+    phone.receiver.with(|state| state.answering = true);
+    phone.until(|states| states == [PushState::On]).await;
+
+    assert_eq!(
+        phone
+            .registered
+            .lock()
+            .expect("what was handed")
+            .credentials
+            .len(),
+        1,
+        "the run that lost its claim handed nothing to the host"
+    );
+}

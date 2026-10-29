@@ -12,12 +12,14 @@
 //! secure store under one lock, which every managed resource then asks for tokens.
 
 pub mod carrier;
+pub mod deletion;
 pub mod navigation;
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+use kr_client::services::account::deletion::ManagedAccountDeletion;
 use kr_client::services::account::{
     AccountService, AccountStatus, AccountUsage, Answer, AnswerFault, AuthorisationGrant,
     AuthorisationRequest, BACKUP_WRITE_SCOPE, Commit, Exchanged, GrantUsage, IdentityRead,
@@ -184,11 +186,13 @@ pub struct Account {
     phase: Mutex<Phase>,
     outcome: Mutex<Option<Outcome>>,
     emit: Emit,
+    /// Deleting the account, which ends the stored sign-in itself once the account is closed.
+    deletion: Arc<ManagedAccountDeletion>,
 }
 
 impl Account {
     /// The account kept by `signed_in`, exchanging through `service` at `origin`, carried by
-    /// `carrier`.
+    /// `carrier`, and deleted through `deletion`.
     #[must_use]
     pub fn new(
         signed_in: Arc<SignedInAccount>,
@@ -196,6 +200,7 @@ impl Account {
         origin: GatewayOrigin,
         carrier: Arc<dyn Carrier>,
         emit: Emit,
+        deletion: Arc<ManagedAccountDeletion>,
     ) -> Self {
         Self {
             signed_in,
@@ -205,7 +210,14 @@ impl Account {
             phase: Mutex::new(Phase::Idle),
             outcome: Mutex::new(None),
             emit,
+            deletion,
         }
+    }
+
+    /// Deleting the account.
+    #[must_use]
+    pub const fn deletion(&self) -> &Arc<ManagedAccountDeletion> {
+        &self.deletion
     }
 
     /// The token source every managed resource on this device asks.
@@ -240,6 +252,9 @@ impl Account {
         if let Err(error) = self.signed_in.recover().await {
             tracing::warn!(%error, "the account's stored state could not be settled");
         }
+        // A deletion that closed the account and was interrupted before the stored sign-in was
+        // ended is finished here, before the first view is published.
+        let _ = self.deletion.settle().await;
         self.publish().await;
         let mut changes = self.signed_in.subscribe();
         let account = Arc::clone(self);

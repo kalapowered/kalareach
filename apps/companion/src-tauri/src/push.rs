@@ -145,6 +145,12 @@ const RECORD_LOST: &str = "This phone could not read what it had kept about noti
                            cannot say whether this host has them on. Choose Try again to start \
                            over.";
 
+/// What a host is shown as after the account its registrations were made under was deleted: the
+/// service removed the registrations of the devices the account's records name, and this phone
+/// cannot tell whether its own was one of them.
+const ACCOUNT_DELETED: &str = "Your account was deleted, which may have removed this phone's \
+                               notification registration. Choose Try again to register it again.";
+
 /// What a lost host is shown as when the record could not be set aside or read, and is still in
 /// place: nothing is changed until a start can deal with it.
 const RECORD_KEPT: &str = "This phone could not read what it had kept about notifications, so it \
@@ -1102,6 +1108,55 @@ impl PushDesk {
         // The host's key is not the receivers' to open its previews with any more.
         let desk = Arc::clone(self);
         tauri::async_runtime::spawn(async move { desk.file_keys_logged().await });
+    }
+
+    /// The account this phone's registrations were made under was deleted. The service removed the
+    /// registrations of the devices the account's records name, and this phone cannot tell whether
+    /// its own was one of them, so it must not go on showing a host as on.
+    ///
+    /// Every run that is taking a host up loses its claim and is ended where it waits, as it is
+    /// when the host is forgotten, so none writes over what follows. Each host that has a record is
+    /// then marked as needing the person, kept as it is until the person turns it on again, and
+    /// never started by a look. The pairing, the authorisation identifier and the choice of
+    /// previews are kept.
+    pub fn account_deleted(self: &Arc<Self>) {
+        let now = (self.wiring.clock)();
+        let hosts = self.device.pairing().hosts.list().unwrap_or_default();
+        {
+            let mut state = lock(&self.state);
+            let mut marked = false;
+            for host in hosts {
+                let id = host.host_device_id;
+                let key = id.to_string();
+                if !state.record.hosts.contains_key(&key) {
+                    continue;
+                }
+                state.running.remove(&id);
+                if let Some((_, cancel)) = state.cancels.remove(&id) {
+                    cancel.notify_one();
+                }
+                state.asking.remove(&id);
+                state.observed.remove(&id);
+                state.unconfirmed.remove(&id);
+                if let Some(entry) = state.record.hosts.get_mut(&key) {
+                    let kept = entry.clone();
+                    *entry = HostPush {
+                        phase: Phase::Attention,
+                        words: ACCOUNT_DELETED.to_owned(),
+                        settings: false,
+                        updated_ms: now,
+                        registered: None,
+                        lost: true,
+                        ..kept
+                    };
+                    marked = true;
+                }
+            }
+            if marked {
+                self.keep(&state.record);
+            }
+        }
+        self.tell_page();
     }
 
     /// Runs `job` for `host`, which `run` holds, and runs the sequence again for as long as the token
