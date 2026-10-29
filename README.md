@@ -243,19 +243,11 @@ kalareach-<target>-<release>/bin/kr host install
 
 `kr host install` will verify the signed manifest for the release and check every file against it before making the release current. It will then print the directory to add to your `PATH`. A first install can check the manifest only against the update channel root that the archive carries, so `SHA256SUMS` and the address you downloaded from are what vouch for the archive; the release notes list the key identifiers of that root. On macOS, every program in the archive is signed by Kala Holdings Inc. and notarised by Apple. The first time you open one that came from a browser, Apple's service is asked about it, so the first launch will require a network connection.
 
-A host joins no network until its configuration document says so. Run `kr host startup --set standalone`, which writes the document and prints its path, and add the following sections to it. You must also set `level` to `4`, as the document now contains sections at that level. The network applies when the control daemon starts. Also run `kr shell install`, so that the shells you start under KalaReach open their bridge to it.
+The host will not join any network unless instructed to via the configuration document. Run `kr host startup --set standalone`, which writes the configuration document and prints the path to it. If your network requires the use of a proxy, now is the time to set the `network.proxy_url` field of the configuration document, as the following command makes its request through it. See [docs/host/README.md](docs/host/README.md#the-network-and-the-voice-broker) for more details.
 
-```json
-"network": {
-  "enabled": true,
-  "relay_urls": ["https://relay-1.reach.kala.to"],
-  "pkarr_publisher_url": "https://ns1.reach.kala.to/pkarr",
-  "pkarr_resolver_url": "https://ns1.reach.kala.to/pkarr"
-},
-"authority": { "origin": "https://reach.kala.to" },
-"mailbox": { "origin": "https://reach.kala.to" },
-"relay": { "origin": "https://reach.kala.to" }
-```
+Then run `kr host network --join`. This will retrieve the KalaReach service's self-description, verify that it has been signed using the key embedded in this version of the software, and write the relay, discovery and service settings into the configuration document according to the description (`level` is set to match). If any of these settings are already set to different values, the command will name those settings and will not write any of them; use the `--replace` option to force the settings to be taken from the service regardless. To join a self-run service instead, see [docs/cli/README.md](docs/cli/README.md#kr-host-network) for more information.
+
+These settings will come into effect when the control daemon starts. Also run `kr shell install`, so that the shells you start under KalaReach open their bridge to it.
 
 Open a second terminal window before you create the first session. Create the session in the first window with `kr new`, which starts the control daemon, and pair your first phone from the second. `kr pair invite --owner` asks you to type `pair`, then shows a pairing code, a QR code and an invitation identifier; `kr pair confirm <invitation>` takes the value the phone shows. `kr new` attaches the terminal it runs in, and the first pairing is refused inside a KalaReach session; on macOS it is also refused in a window opened after a session started. If, when running `kr new`, it replies that the control daemon did not respond, and the last lines in `controller.log` contain a line mentioning `the secret store failed`, the secret-store error is given at the end of that line. If it is `Couldn't access platform storage` on a Linux login that uses a desktop keyring, it usually means that the keyring answers but cannot be opened, and the control daemon stops when it starts. Unlock the keyring, for example by signing in to the desktop session on that machine, and run `kr new` again. A host that has started on the keyring keeps using it, and does not move to the file store by itself. Any other secret-store error has a different cause, and its text says what failed.
 
