@@ -662,13 +662,17 @@ impl std::fmt::Debug for TerminalInput {
 /// The thread ends when the terminal's input does, when a batch has nowhere to go, or when the
 /// returned [`InputStop`] is used. Dropping the receiver alone does not end it: the thread sits in
 /// a read and takes the next key for itself.
+///
+/// # Errors
+///
+/// Never fails on this platform.
 #[cfg(unix)]
 pub fn spawn_input_reader(
     terminal: std::fs::File,
-) -> (
+) -> Result<(
     tokio::sync::mpsc::UnboundedReceiver<TerminalInput>,
     InputStop,
-) {
+)> {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -682,10 +686,10 @@ pub fn spawn_input_reader(
         Ok(ends) => ends,
         Err(_) => {
             // No pipe to wait on: the thread reads as it always did and cannot be woken.
-            return (
+            return Ok((
                 receiver,
                 InputStop::unstoppable(spawn_blocking_reader(terminal, sender)),
-            );
+            ));
         }
     };
     // Set by the thread when the terminal cannot be waited for, so that it reads without waiting
@@ -738,14 +742,14 @@ pub fn spawn_input_reader(
             }
         }
     });
-    (
+    Ok((
         receiver,
         InputStop {
             wake: Some(wake),
             unwakeable,
             thread,
         },
-    )
+    ))
 }
 
 /// Reads the console in a blocking thread and hands the keys to the caller as the records the
@@ -759,23 +763,28 @@ pub fn spawn_input_reader(
 /// The thread ends when the console's input does, when a batch has nowhere to go, or when the
 /// returned [`InputStop`] is used. It waits for the console and for the stop together, so the stop
 /// does not depend on a read being cancelled.
+///
+/// # Errors
+///
+/// Returns an error when the system will not make the event the stop is made with. No thread is
+/// started then: one that could not be stopped would take the next key for itself.
 #[cfg(not(unix))]
 pub fn spawn_input_reader(
     console: std::fs::File,
-) -> (
+) -> Result<(
     tokio::sync::mpsc::UnboundedReceiver<TerminalInput>,
     InputStop,
-) {
+)> {
     use std::sync::Arc;
 
     use crate::windows::records::{ReadEvent, RecordReader, StopEvent};
 
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-    let stop = StopEvent::new().map(Arc::new);
-    let waker = stop.clone();
+    let stop = Arc::new(StopEvent::new()?);
+    let waker = Arc::clone(&stop);
     let thread = std::thread::spawn(move || {
         let mut reader = RecordReader::over(console);
-        while let Ok(true) = reader.wait(waker.as_deref()) {
+        while let Ok(true) = reader.wait(&waker) {
             let Ok(events) = reader.read_events() else {
                 break;
             };
@@ -788,7 +797,7 @@ pub fn spawn_input_reader(
             }
         }
     });
-    (receiver, InputStop { stop, thread })
+    Ok((receiver, InputStop { stop, thread }))
 }
 
 /// The thread that reads `terminal` until its input ends or `sender` has no receiver.
@@ -859,9 +868,8 @@ impl InputStop {
 /// What ends the thread [`spawn_input_reader`] started.
 #[cfg(not(unix))]
 pub struct InputStop {
-    /// The event the thread also waits on, or nothing when the system would not make one and the
-    /// thread cannot be woken.
-    stop: Option<std::sync::Arc<crate::windows::records::StopEvent>>,
+    /// The event the thread also waits on.
+    stop: std::sync::Arc<crate::windows::records::StopEvent>,
     /// The reading thread.
     thread: std::thread::JoinHandle<()>,
 }
@@ -869,13 +877,9 @@ pub struct InputStop {
 #[cfg(not(unix))]
 impl InputStop {
     /// Wakes the thread, which has ended a moment later: it was waiting for the console and for
-    /// this together, and is not part way through a read it cannot leave. A thread that cannot be
-    /// woken is left to end with the next key.
+    /// this together, and is not part way through a read it cannot leave.
     pub fn stop(self) {
-        let Some(stop) = &self.stop else {
-            return;
-        };
-        stop.signal();
+        self.stop.signal();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         while !self.thread.is_finished() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(5));

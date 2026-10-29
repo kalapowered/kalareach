@@ -28,7 +28,7 @@ use kr_client::shown::Shown;
 use std::os::windows::io::AsRawHandle as _;
 
 use kr_term::win32::{KeyRecord, PairHold};
-use windows_sys::Win32::Foundation::{HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows_sys::Win32::System::Console::{
     ENABLE_WINDOW_INPUT, GetNumberOfConsoleInputEvents, INPUT_RECORD, KEY_EVENT, MOUSE_EVENT,
     ReadConsoleInputW, WINDOW_BUFFER_SIZE_EVENT,
@@ -53,19 +53,25 @@ const BATCH: usize = 256;
 pub struct StopEvent(std::os::windows::io::OwnedHandle);
 
 impl StopEvent {
-    /// Makes an event that is not set, or nothing when the system will not make one.
-    #[must_use]
-    pub fn new() -> Option<Self> {
+    /// Makes an event that is not set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the system will not make one.
+    pub fn new() -> Result<Self> {
         use std::os::windows::io::{FromRawHandle as _, RawHandle};
 
         // SAFETY: no attributes and no name are passed, and the handle that comes back is checked
         // before it is used.
         let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
         if event.is_null() {
-            return None;
+            return Err(CliError::Terminal(shown!(
+                "make an event to stop reading the console with: {}",
+                Shown::io(&std::io::Error::last_os_error())
+            )));
         }
         // SAFETY: the handle is a new event this call made and nothing else owns.
-        Some(Self(unsafe {
+        Ok(Self(unsafe {
             std::os::windows::io::OwnedHandle::from_raw_handle(event as RawHandle)
         }))
     }
@@ -101,31 +107,26 @@ impl RecordReader {
 
     /// Waits until the console has input, or until `stop` is set, and says whether it is input.
     ///
-    /// With no event to wait for it does not wait at all and says there is input, so the read that
-    /// follows is the wait.
+    /// A stop that is set is seen first, whatever the console holds.
     ///
     /// # Errors
     ///
     /// Returns an error when the system will not wait.
-    pub fn wait(&self, stop: Option<&StopEvent>) -> Result<bool> {
+    pub fn wait(&self, stop: &StopEvent) -> Result<bool> {
         use std::os::windows::io::AsRawHandle as _;
 
-        let Some(stop) = stop else {
-            return Ok(true);
-        };
         let handles: [HANDLE; 2] = [
-            self.handle.as_raw_handle() as HANDLE,
             stop.0.as_raw_handle() as HANDLE,
+            self.handle.as_raw_handle() as HANDLE,
         ];
-        // SAFETY: both handles are open for the call, the first this reader's own and the second
-        // the event's, and the array holds exactly the two the count names.
+        // SAFETY: both handles are open for the call, the first the event's and the second this
+        // reader's own, and the array holds exactly the two the count names.
         let woken = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) };
         if woken == WAIT_OBJECT_0 {
-            Ok(true)
-        } else if woken == WAIT_OBJECT_0 + 1 {
             Ok(false)
+        } else if woken == WAIT_OBJECT_0 + 1 {
+            Ok(true)
         } else {
-            debug_assert!(woken == WAIT_FAILED || woken > WAIT_OBJECT_0 + 1);
             Err(CliError::Terminal(shown!(
                 "wait for the console's input: {}",
                 Shown::io(&std::io::Error::last_os_error())
@@ -355,7 +356,8 @@ pub const fn record_input_mode(saved: u32) -> u32 {
 mod tests {
     use super::*;
     use windows_sys::Win32::System::Console::{
-        ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT,
+        ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_MOUSE_INPUT, ENABLE_PROCESSED_INPUT,
+        ENABLE_VIRTUAL_TERMINAL_INPUT,
     };
 
     #[test]
@@ -363,7 +365,9 @@ mod tests {
         let saved = ENABLE_LINE_INPUT
             | ENABLE_ECHO_INPUT
             | ENABLE_PROCESSED_INPUT
-            | ENABLE_VIRTUAL_TERMINAL_INPUT;
+            | ENABLE_VIRTUAL_TERMINAL_INPUT
+            | ENABLE_MOUSE_INPUT
+            | ENABLE_WINDOW_INPUT;
         let mode = record_input_mode(saved);
         assert_eq!(
             mode & ENABLE_VIRTUAL_TERMINAL_INPUT,
@@ -371,6 +375,11 @@ mod tests {
             "the console's own translation is what records exist to avoid"
         );
         assert_eq!(mode & (ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT), 0);
+        assert_eq!(
+            mode & (ENABLE_MOUSE_INPUT | ENABLE_WINDOW_INPUT),
+            0,
+            "nothing here dispatches a mouse or a window-size record, so none is asked for"
+        );
         assert_eq!(
             mode & ENABLE_PROCESSED_INPUT,
             0,

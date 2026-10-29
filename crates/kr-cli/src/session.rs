@@ -55,6 +55,9 @@ pub enum AttachOutcome {
     Disconnected,
     /// Input could not be delivered, and whether it arrived is not known.
     DeliveryUncertain(Shown),
+    /// The session refused what was typed here, and none of it was delivered: the application
+    /// asked for a keyboard encoding this terminal cannot send.
+    InputRefused(Shown),
 }
 
 impl std::fmt::Debug for AttachOutcome {
@@ -81,6 +84,9 @@ impl std::fmt::Debug for AttachOutcome {
                 .debug_tuple("DeliveryUncertain")
                 .field(detail)
                 .finish(),
+            Self::InputRefused(detail) => {
+                formatter.debug_tuple("InputRefused").field(detail).finish()
+            }
         }
     }
 }
@@ -115,6 +121,11 @@ impl AttachOutcome {
             Self::DeliveryUncertain(detail) => {
                 shown!("some input may not have reached the session: {}", *detail)
             }
+            Self::InputRefused(detail) => shown!(
+                "what was typed here was not delivered, because the application in the session \
+                 asked for a keyboard encoding this terminal cannot send: {}",
+                *detail
+            ),
         }
     }
 
@@ -139,7 +150,8 @@ impl AttachOutcome {
             Self::ClosureUnreadable { .. }
             | Self::LeaseLost
             | Self::Disconnected
-            | Self::DeliveryUncertain(_) => true,
+            | Self::DeliveryUncertain(_)
+            | Self::InputRefused(_) => true,
         }
     }
 
@@ -159,6 +171,10 @@ impl AttachOutcome {
             Self::Disconnected => Some(CliError::HostUnavailable(self.detail())),
             Self::DeliveryUncertain(_) => Some(CliError::Refused(refusal(
                 ErrorCode::OutcomeUnknown,
+                self.detail(),
+            ))),
+            Self::InputRefused(_) => Some(CliError::Refused(refusal(
+                ErrorCode::InputIncompatible,
                 self.detail(),
             ))),
         }
@@ -319,39 +335,61 @@ const VK_SHIFT: u16 = 0x10;
 const VK_CONTROL: u16 = 0x11;
 const VK_MENU: u16 = 0x12;
 
-/// This terminal's own scroll-back, when the keys a console reported are those chords and nothing
-/// else.
+/// Takes this terminal's own scroll-back out of the records a console reported, and returns the
+/// rest with how far the window is to move.
 ///
-/// The records of Shift and Page Up or Page Down, as a console reports them: the modifier going
-/// down, the key going down and coming up, the modifier coming up. Only the key going down counts,
-/// by its repeat count, and a read that holds any other key is not this terminal's.
-fn scroll_chords(keys: &[kr_term::win32::KeyRecord]) -> Option<i64> {
+/// Shift and Page Up or Page Down are the chord. A console reports pressing one as its records
+/// one by one: the modifier going down, the key going down and coming up, the modifier coming up,
+/// and nothing says they arrive in one read, so the chord is taken key by key. The key going down
+/// is taken, by its repeat count, and the same key coming up is taken after it, wherever it
+/// arrives; `taken` is the keys whose release is still to come. The modifier's own records are the
+/// session's, going down and coming up, so that what the application is told of it is balanced.
+/// Every other record is returned in its place, a release among them: a key the session was sent
+/// going down has its release sent too. When the chord is not this terminal's (`mine` is false) no
+/// key is taken, and the release of one that was is still taken.
+fn take_scroll_keys(
+    keys: Vec<kr_term::win32::KeyRecord>,
+    taken: &mut Vec<u16>,
+    mine: bool,
+) -> (Vec<kr_term::win32::KeyRecord>, i64) {
     use kr_term::win32::control_keys::{
         LEFT_ALT_PRESSED, LEFT_CTRL_PRESSED, RIGHT_ALT_PRESSED, RIGHT_CTRL_PRESSED, SHIFT_PRESSED,
     };
 
-    let mut moved: Option<(i64, i64)> = None;
+    const OTHERS: u32 =
+        LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED | LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED;
+    let mut rest = Vec::with_capacity(keys.len());
+    let mut steps = 0_i64;
     for key in keys {
-        if !key.key_down || matches!(key.virtual_key, VK_SHIFT | VK_CONTROL | VK_MENU) {
-            continue;
-        }
         let direction = match key.virtual_key {
             VK_PRIOR => 1_i64,
             VK_NEXT => -1_i64,
-            _ => return None,
+            _ => 0,
         };
-        let others = LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED | LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED;
-        if key.control_keys & SHIFT_PRESSED == 0 || key.control_keys & others != 0 {
-            return None;
+        if direction != 0
+            && key.key_down
+            && mine
+            && key.control_keys & SHIFT_PRESSED != 0
+            && key.control_keys & OTHERS == 0
+        {
+            if !taken.contains(&key.virtual_key) {
+                taken.push(key.virtual_key);
+            }
+            steps = steps.saturating_add(direction.saturating_mul(i64::from(key.repeat.max(1))));
+        } else if direction != 0 && !key.key_down && taken.contains(&key.virtual_key) {
+            taken.retain(|held| *held != key.virtual_key);
+        } else {
+            rest.push(key);
         }
-        let (going, count) = moved.unwrap_or((direction, 0));
-        // A read that goes both ways is nobody's gesture.
-        if going != direction {
-            return None;
-        }
-        moved = Some((going, count.saturating_add(i64::from(key.repeat.max(1)))));
     }
-    moved.map(|(direction, count)| direction.saturating_mul(count))
+    (rest, steps)
+}
+
+/// Whether a run of key records holds a key the person pressed: one going down that is not a
+/// modifier. A release, and a modifier on its own, are not typing.
+fn presses(keys: &[kr_term::win32::KeyRecord]) -> bool {
+    keys.iter()
+        .any(|key| key.key_down && !matches!(key.virtual_key, VK_SHIFT | VK_CONTROL | VK_MENU))
 }
 
 /// The bytes a terminal sends when a bracketed paste begins.
@@ -1259,7 +1297,7 @@ where
         .handle()
         .try_clone()
         .map_err(|error| CliError::Terminal(Shown::io(&error)))?;
-    let (mut input, input_stop) = crate::attach::spawn_input_reader(input_handle);
+    let (mut input, input_stop) = crate::attach::spawn_input_reader(input_handle)?;
 
     // The terminal's size can change while the attachment runs. The session is told, so the
     // application sees the resize the way it would in any other terminal.
@@ -1413,6 +1451,8 @@ async fn drive(
 
     // Whether a bracketed paste is open, so that nothing inside one is read as a key.
     let mut paste = PasteWatch::default();
+    // The keys of the scroll-back chord this terminal has taken whose release has not come.
+    let mut scroll_keys_taken: Vec<u16> = Vec::new();
     // The pointer reports this terminal sends while its window is above the live page, and the
     // moment a report it is part way through stops waiting for the rest of itself.
     let mut pointers = PointerReports::default();
@@ -1847,6 +1887,13 @@ async fn drive(
                                     window.close();
                                     undelivered = true;
                                 }
+                                // A refusal the session made whole: it took none of what was
+                                // sent, and says why. The terminal is told so and the attachment
+                                // ends, rather than being left typing into a session that refuses
+                                // every key.
+                                ErrorCode::InputIncompatible => {
+                                    return AttachOutcome::InputRefused(Shown::protocol(&error));
+                                }
                                 code => {
                                     return AttachOutcome::DeliveryUncertain(shown!(
                                         "{} at input {}: {}",
@@ -1957,7 +2004,11 @@ async fn drive(
                 // The session is closing and refuses input. What is typed now goes nowhere, and
                 // the line this attachment ends with says so.
                 if closing {
-                    undelivered = true;
+                    // A release or a modifier going down is not something typed.
+                    undelivered |= match &read {
+                        TerminalInput::Bytes(_) => true,
+                        TerminalInput::Keys(keys) => presses(keys),
+                    };
                     continue;
                 }
                 let bytes = match read {
@@ -1966,16 +2017,21 @@ async fn drive(
                     // report in them to watch for, because those are bytes, and the records go to
                     // the session as they are.
                     TerminalInput::Keys(keys) => {
-                        // The scroll-back keys first, on the same terms as for bytes: they move the
-                        // window this terminal is looking through and never reach the session.
-                        let chord = (display.holds_screen() && display.showing_history_buffer())
-                            .then(|| scroll_chords(&keys))
-                            .flatten();
-                        if let Some(steps) = chord
-                            && let Ok(size) = terminal.size()
-                            && size.columns > 0
-                            && size.rows > 0
-                        {
+                        // The scroll-back keys first, on the same terms as for bytes: they move
+                        // the window this terminal is looking through and never reach the
+                        // session. A console reports a key going down and coming up as two
+                        // records, often in two reads, so it is the key that is taken and not the
+                        // read: the release of a key taken goes with it, and every other record
+                        // is the session's.
+                        let size = terminal
+                            .size()
+                            .ok()
+                            .filter(|size| size.columns > 0 && size.rows > 0);
+                        let mine = size.is_some()
+                            && display.holds_screen()
+                            && display.showing_history_buffer();
+                        let (keys, steps) = take_scroll_keys(keys, &mut scroll_keys_taken, mine);
+                        if let (Some(size), true) = (size, steps != 0) {
                             let shown = display
                                 .window_rows()
                                 .unwrap_or_else(|| u64::from(size.rows));
@@ -1984,14 +2040,14 @@ async fn drive(
                                 scroll_step(shown),
                                 Dimensions::new(u64::from(size.columns), u64::from(size.rows)),
                             );
-                            continue;
                         }
                         if keys.is_empty() {
                             continue;
                         }
                         // As for bytes: a person who asked to follow the live screen is taken back
-                        // to it by the first key they press.
-                        if follow_live && showing_history {
+                        // to it by the first key they press. A key coming up, or a modifier going
+                        // down, is not one.
+                        if follow_live && showing_history && presses(&keys) {
                             window.return_to_live();
                         }
                         let Some(epoch) = epoch else {
@@ -2335,8 +2391,8 @@ async fn wait_for_resize(_resized: &mut Option<&mut WindowChanges>) {
 mod tests {
     use super::{
         Answer, AttachOutcome, Heard, Outstanding, Ownership, SCROLL_BACK_KEY, SCROLL_FORWARD_KEY,
-        Sending, Subscriptions, WindowReports, landed, ownership, resizes_in_flight, scroll_chords,
-        scroll_keys, scroll_step, scrolled,
+        Sending, Subscriptions, WindowReports, landed, ownership, presses, resizes_in_flight,
+        scroll_keys, scroll_step, scrolled, take_scroll_keys,
     };
     use kr_client::shown::Shown;
     use kr_protocol::attachment::ViewportPosition;
@@ -2547,9 +2603,11 @@ mod tests {
     }
 
     /// The same gesture from a console, which reports it as the records of the keys and not as a
-    /// sequence: Shift going down, Page Up going down and up, Shift coming up.
+    /// sequence, and not in one read: Shift going down, Page Up going down, Page Up coming up and
+    /// Shift coming up each arrive on their own. The key is taken with its release, and what is
+    /// not the chord is the session's wherever it arrives.
     #[test]
-    fn the_scroll_keys_of_a_console_move_the_window_and_other_keys_are_the_sessions() {
+    fn the_scroll_keys_of_a_console_are_taken_key_by_key_and_the_rest_is_the_sessions() {
         use kr_term::win32::{KeyRecord, control_keys::SHIFT_PRESSED};
 
         let key = |virtual_key: u16, key_down: bool, control_keys: u32, repeat: u16| KeyRecord {
@@ -2560,32 +2618,83 @@ mod tests {
             control_keys,
             repeat,
         };
-        let page = |virtual_key: u16, repeat: u16| {
-            vec![
-                key(0x10, true, SHIFT_PRESSED, 1),
-                key(virtual_key, true, SHIFT_PRESSED, repeat),
-                key(virtual_key, false, SHIFT_PRESSED, 1),
-                key(0x10, false, 0, 1),
-            ]
+        let mut taken = Vec::new();
+
+        // The modifier is the session's, going down and coming up.
+        let shift_down = key(0x10, true, SHIFT_PRESSED, 1);
+        let (rest, steps) = take_scroll_keys(vec![shift_down], &mut taken, true);
+        assert_eq!((rest, steps), (vec![shift_down], 0));
+        // Page Up going down moves the window by its repeat count and is not the session's.
+        let (rest, steps) =
+            take_scroll_keys(vec![key(0x21, true, SHIFT_PRESSED, 3)], &mut taken, true);
+        assert_eq!((rest.len(), steps), (0, 3));
+        // Its release arrives in a read of its own, and goes the same way.
+        let (rest, steps) =
+            take_scroll_keys(vec![key(0x21, false, SHIFT_PRESSED, 1)], &mut taken, true);
+        assert_eq!(
+            (rest.len(), steps),
+            (0, 0),
+            "the release of a key taken is taken"
+        );
+        assert!(taken.is_empty());
+        let shift_up = key(0x10, false, 0, 1);
+        let (rest, steps) = take_scroll_keys(vec![shift_up], &mut taken, true);
+        assert_eq!((rest, steps), (vec![shift_up], 0));
+
+        // Page Down goes the other way.
+        let (_, steps) =
+            take_scroll_keys(vec![key(0x22, true, SHIFT_PRESSED, 1)], &mut taken, true);
+        assert_eq!(steps, -1);
+        let _ = take_scroll_keys(vec![key(0x22, false, SHIFT_PRESSED, 1)], &mut taken, true);
+
+        // A key the chord shares a read with is not taken with it: a letter's release is the
+        // session's, whatever is beside it.
+        let a_up = key(u16::from(b'A'), false, SHIFT_PRESSED, 1);
+        let (rest, steps) = take_scroll_keys(
+            vec![a_up, key(0x21, true, SHIFT_PRESSED, 1)],
+            &mut taken,
+            true,
+        );
+        assert_eq!((rest, steps), (vec![a_up], 1));
+        let _ = take_scroll_keys(vec![key(0x21, false, SHIFT_PRESSED, 1)], &mut taken, true);
+
+        // Unshifted, it is the application's.
+        let plain = key(0x21, true, 0, 1);
+        let (rest, steps) = take_scroll_keys(vec![plain], &mut taken, true);
+        assert_eq!((rest, steps), (vec![plain], 0));
+        // Where the chord is not this terminal's it is the session's too, going down; and the
+        // release of a key already taken is still taken.
+        let chord = key(0x21, true, SHIFT_PRESSED, 1);
+        let (rest, steps) = take_scroll_keys(vec![chord], &mut taken, false);
+        assert_eq!((rest, steps), (vec![chord], 0));
+        let _ = take_scroll_keys(vec![chord], &mut taken, true);
+        let (rest, _) =
+            take_scroll_keys(vec![key(0x21, false, SHIFT_PRESSED, 1)], &mut taken, false);
+        assert!(rest.is_empty(), "a taken key's release goes with it");
+    }
+
+    /// A release, and a modifier on its own, are not something the person typed: they neither take
+    /// a terminal back to the live screen nor count as input a closing session refused.
+    #[test]
+    fn only_a_key_going_down_that_is_not_a_modifier_is_a_press() {
+        use kr_term::win32::KeyRecord;
+
+        let key = |virtual_key: u16, key_down: bool| KeyRecord {
+            virtual_key,
+            scan_code: 0,
+            unicode: 0,
+            key_down,
+            control_keys: 0,
+            repeat: 1,
         };
-        assert_eq!(scroll_chords(&page(0x21, 1)), Some(1));
-        assert_eq!(scroll_chords(&page(0x22, 3)), Some(-3));
-        assert_eq!(scroll_chords(&[]), None);
-        assert_eq!(
-            scroll_chords(&[key(0x21, true, 0, 1)]),
-            None,
-            "an unshifted Page Up is the application's"
+        assert!(presses(&[key(u16::from(b'A'), true)]));
+        assert!(!presses(&[key(u16::from(b'A'), false)]), "a release");
+        assert!(
+            !presses(&[key(0x10, true), key(0x11, true), key(0x12, true)]),
+            "modifiers"
         );
-        let mut mixed = page(0x21, 1);
-        mixed.push(key(u16::from(b'X'), true, SHIFT_PRESSED, 1));
-        assert_eq!(scroll_chords(&mixed), None, "a key among others is theirs");
-        let mut both = page(0x21, 1);
-        both.extend(page(0x22, 1));
-        assert_eq!(
-            scroll_chords(&both),
-            None,
-            "a read that goes both ways is nobody's"
-        );
+        assert!(presses(&[key(0x10, true), key(0x0d, true)]));
+        assert!(!presses(&[]));
     }
 
     /// Holding the key repeats it, and a read of several is that many pages.
