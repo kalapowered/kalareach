@@ -98,6 +98,9 @@ pub enum Command {
     /// Inspect the devices paired with this host, or revoke one.
     #[command(subcommand)]
     Device(DeviceCommand),
+    /// Show what the host recorded of one action.
+    #[command(subcommand)]
+    Action(ActionCommand),
     /// Share a session with a paired device, see who holds a share, take one back, or hand a
     /// session's control to another device.
     #[command(subcommand)]
@@ -617,6 +620,29 @@ pub struct DiffApplyArguments {
     /// working tree is refused until every one of them is passed back.
     #[arg(long = "acknowledge", value_name = "LIMITATION")]
     pub acknowledge: Vec<String>,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// One `kr action` operation.
+#[derive(Subcommand)]
+pub enum ActionCommand {
+    /// Show the receipt the host keeps for an action: its state, the revision of that state, and
+    /// the failure recorded for it. An action whose outcome the host could not establish is shown
+    /// as that. Reading a live session's receipt records, for you, the revision it showed.
+    Read(ActionReadArguments),
+}
+
+/// `kr action read`.
+#[derive(Args)]
+pub struct ActionReadArguments {
+    /// The action, by identifier.
+    pub action: String,
+    /// The session that performed it, by display number or identifier. Without it, the action is
+    /// one the host performed itself, such as a catalogue or plugin change.
+    #[arg(long)]
+    pub session: Option<String>,
     /// The environment.
     #[command(flatten)]
     pub selector: EnvironmentSelector,

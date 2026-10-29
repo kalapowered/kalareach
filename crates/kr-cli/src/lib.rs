@@ -10,6 +10,7 @@
 //! | [`answer`] | The host's answers printed whole with `--json`, leaf by leaf |
 //! | [`cli`] | The command surface: the commands, their short forms and the standard options |
 //! | [`account`] | `kr account`: signing this host in to the managed account service, and where that stands |
+//! | [`action`] | `kr action`: the receipt the host keeps for one action |
 //! | [`bind`] | Which session, if any, this process is inside, as the sessions' workers answer |
 //! | [`pair`] | `kr pair`: invitations, approving the device that answers one, and the first owner |
 //! | [`daemon`] | Reaching an environment's control daemon for the commands below |
@@ -46,6 +47,7 @@
 //! | [`error`] | The failures above, each with its own exit code |
 
 pub mod account;
+pub mod action;
 pub mod answer;
 pub mod attach;
 pub mod backup;

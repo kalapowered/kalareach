@@ -92,6 +92,8 @@ pub enum Request {
     Restore,
     /// The settings schema and path a terminal profile was written to: `kr host terminal-profile`.
     TerminalProfile,
+    /// A retained receipt's method and the failure recorded for it: `kr action`.
+    Actions,
 }
 
 /// Content the person asked to read.
