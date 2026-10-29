@@ -17,8 +17,10 @@ name: release-host
 #
 # `matrix` asks whether the signed release matrix the managed service publishes lists a tier for the
 # package version the commit carries, as every other job that publishes a release does. It holds no
-# key and no write access, and `channel` and `publish` both wait for it, so a release the matrix does
-# not serve is refused before anyone is asked to approve a use of the release keys.
+# key and no write access, and `channel` waits for it, so a release the matrix does not serve is
+# refused before anyone is asked to approve a use of the release keys. `matrix-again` asks again,
+# with the program `matrix` built, once every check has passed and just before the release is
+# written, because the approval in between can come days after the first answer.
 #
 # `channel` is the only job that holds a key. It is behind the `update-signing` environment, which
 # puts a person in front of every use of the update channel's two release keys, it has no write
@@ -52,8 +54,10 @@ on:
 permissions:
   contents: read
 
+# A run waits for its approval for days, so a run on a branch must never queue behind a release on
+# `main`, or cancel the one that is waiting.
 concurrency:
-  group: release-host
+  group: release-host-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -276,6 +280,20 @@ jobs:
             [ "$attempt" -lt 3 ] && sleep 60
           done
           exit 2
+
+      - name: Keep the program for the check made again before the release is written
+        run: |
+          mkdir -p "$RUNNER_TEMP/matrix-check"
+          cp target/release/kr-release-matrix-check "$RUNNER_TEMP/matrix-check/"
+          (cd "$RUNNER_TEMP/matrix-check" && sha256sum kr-release-matrix-check | tee kr-release-matrix-check.sha256)
+
+      - name: Keep the release matrix program
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kr-release-matrix-check
+          path: ${{ runner.temp }}/matrix-check
+          retention-days: 3
+          if-no-files-found: error
 
   # The release tool, built by a job that holds no key, for the job that does.
   tool:
@@ -526,10 +544,38 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+  # The same question again, without a build and without a key, once every archive has been checked:
+  # the matrix may have changed in the days the approval took.
+  matrix-again:
+    name: the published release matrix still lists this release
+    needs: [source, channel, check]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Take the program
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: kr-release-matrix-check
+          path: ${{ runner.temp }}/matrix-check
+
+      - name: The published release matrix still lists this release
+        run: |
+          set -uo pipefail
+          (cd "$RUNNER_TEMP/matrix-check" && sha256sum -c kr-release-matrix-check.sha256) || exit 1
+          chmod +x "$RUNNER_TEMP/matrix-check/kr-release-matrix-check"
+          for attempt in 1 2 3; do
+            "$RUNNER_TEMP/matrix-check/kr-release-matrix-check" --origin https://reach.kala.to && exit 0
+            code=$?
+            [ "$code" -eq 2 ] || exit "$code"
+            [ "$attempt" -lt 3 ] && sleep 60
+          done
+          exit 2
+
   # No key and no environment: only the right to write a release, and only after every check passed.
   publish:
     name: publish the release
-    needs: [source, channel, check, matrix]
+    needs: [source, channel, check, matrix, matrix-again]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
