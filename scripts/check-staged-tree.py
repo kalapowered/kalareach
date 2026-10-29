@@ -188,8 +188,6 @@ def compare(built_path, staged_path, out_path=None):
     manifest = json.loads(built_archive.extractfile(built["release.json"]).read())["signed"]["files"]
     listed = {entry["path"]: entry for entry in manifest}
     regular = {r for r, m in built.items() if m.isreg() and r != "release.json"}
-    if not built[""].isdir() or not staged[""].isdir():
-        problems.append("the top is not a directory")
     if regular != set(listed):
         problems.append(f"the run's release.json lists {len(listed)} files and the run's tree has {len(regular)} besides it")
     for relative in sorted(set(built) & set(staged)):
@@ -304,12 +302,24 @@ def tar_readers_agree(top, files, release, work):
     if problems:
         print(f"self-test FAILED: a tar with a member in the old form was not read as the standard form reads it ({problems})")
         return False
-    listing = lambda path: set(subprocess.run(["tar", "-tf", path], capture_output=True, text=True).stdout.split())
-    seen_by_python = {f"{top}/share/doc.txt"}
-    if not (seen_by_python <= listing(f"{work}/normalized.tar")):
-        print("self-test FAILED: the tar written for the next job does not hold the member the check compared")
+    def listing(path):
+        done = subprocess.run(["tar", "-tf", path], capture_output=True, text=True)
+        return set(done.stdout.split()) if done.returncode == 0 else None
+
+    # What the check read is every member of the tree; the tar written for the next job has to hold
+    # exactly those, by another program's reading, and has to be a tree the check accepts again.
+    _, _, read = members(f"{work}/crafted.tar")
+    seen_by_python = {top} | {f"{top}/{relative}" for relative in read if relative}
+    written = listing(f"{work}/normalized.tar")
+    written = None if written is None else {name.rstrip("/") for name in written}
+    if written != seen_by_python:
+        print("self-test FAILED: the tar written for the next job does not hold exactly the members the check compared")
         return False
-    note = "" if not (seen_by_python <= listing(f"{work}/crafted.tar")) else " (this tar program reads the crafted tar as the check does)"
+    if compare(f"{work}/built.tar", f"{work}/normalized.tar"):
+        print("self-test FAILED: the tar written for the next job is not a tree the check accepts")
+        return False
+    crafted = listing(f"{work}/crafted.tar")
+    note = " (this tar program reads the crafted tar as the check does)" if crafted and f"{top}/share/doc.txt" in {n.rstrip("/") for n in crafted} else ""
     print("self-test ok: the tar written for the next job holds what the check compared, in the standard form" + note)
     return True
 
@@ -375,11 +385,13 @@ def self_test():
         twice = tarfile.TarInfo(f"{top}/bin/extra-dir")
         twice.type, twice.mode = tarfile.DIRTYPE, 0o755
         run("a directory that is there twice is refused", tree(top, files(), release, extra=[twice, twice]), "is there twice")
+        top_twice = tarfile.TarInfo(top)
+        top_twice.type, top_twice.mode = tarfile.DIRTYPE, 0o755
+        run("a top directory that is there twice is refused", tree(top, files(), release, extra=[top_twice]), "top directory is there twice")
         hard = tarfile.TarInfo(f"{top}/bin/hard")
         hard.type, hard.linkname = tarfile.LNKTYPE, f"{top}/bin/kr"
         run("a hard link in the staged tree is refused", tree(top, files(), release, extra=[hard]), "is a link or a special file")
         dotted = tarfile.TarInfo(f"{top}/./bin/aliased")
-        dotted.size = 1
         run("a path with a . part is refused", tree(top, files(), release, extra=[dotted]), "is not a path inside the tree")
         results.append(tar_readers_agree(top, files(), release, work))
     if not all(results):
