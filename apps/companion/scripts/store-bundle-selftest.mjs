@@ -14,9 +14,9 @@
 // tools are missing, and the exit status says so.
 import { Buffer } from 'node:buffer'
 import { spawnSync } from 'node:child_process'
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 import { uleb, zip } from './archive-fixtures.mjs'
 import { factsFromProto } from './identifiers.mjs'
@@ -26,7 +26,7 @@ import {
   certificateFingerprint,
   checkIos,
   declaresSignInLink,
-  embeddedCode,
+  codeIn,
   problemsInBundleConfig,
   problemsInEmbeddedSignature,
   problemsInEncryptionKey,
@@ -226,8 +226,9 @@ held('a bundle that holds a secret is reported by its count, with nothing quoted
 held('an error message that quotes a secret is withheld, and one that does not is kept', ['the details are withheld: they quote a secret file', 'no such file'], [withheldIfSecret('could not read /x/the-secret-itself', secretNeedles(Buffer.from('the-secret-itself\n'))), withheldIfSecret('no such file', secretNeedles(Buffer.from('the-secret-itself\n')))])
 held('an error message that quotes a signed token is withheld too', false, withheldIfSecret(`could not read /x/${TOKEN}`, secretNeedles(Buffer.from('the-secret-itself\n'))).includes(TOKEN))
 {
-  // A member whose name holds the secret and whose compression the reader refuses: the reader's own
-  // error quotes the member's name, and the scan must not pass that on.
+  // A member whose name holds the secret and whose compression the reader refuses: its name is
+  // searched before it is read, so the scan finds the secret and the reader's own error, which
+  // would quote the name, is never raised.
   const scanned = join(work, 'unreadable'); mkdirSync(scanned)
   const named = zip([{ name: 'before-correct-horse-battery-staple-after.txt', bytes: Buffer.from('x') }])
   named.writeUInt16LE(99, named.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02])) + 10)
@@ -235,7 +236,7 @@ held('an error message that quotes a signed token is withheld too', false, withh
   writeFileSync(join(scanned, 'broken.aab'), named)
   const secretFile = join(work, 'unreadable-secret'); writeFileSync(secretFile, 'correct-horse-battery-staple\n')
   const scan = spawnSync(process.execPath, [join(import.meta.dirname, 'store-bundle.mjs'), '--scan-dir', scanned, '--secret-file', secretFile], { encoding: 'utf8' })
-  held('a directory scan that fails prints nothing of the secret it was looking for', [2, false], [scan.status, `${scan.stdout}${scan.stderr}`.includes('correct-horse-battery-staple')])
+  held('a directory scan that meets a member named with the secret finds it, unread, and prints nothing of it', [1, false], [scan.status, `${scan.stdout}${scan.stderr}`.includes('correct-horse-battery-staple')])
 }
 {
   const needles = secretNeedles(Buffer.from('correct-horse-battery-staple\n'))
@@ -273,6 +274,138 @@ held('a secret in a compressed member of a package under the directory is found,
   return [first, secretsUnder(dir, needles)]
 })())
 held('a short password file is found whole', 1, placesWithSecret([Buffer.from('prefix-hunter2hunter2-suffix')], secretNeedles(Buffer.from('hunter2hunter2\n'))))
+
+// -- a secret in every form the scan meets, and in none of what the command prints ------------------
+
+const HORSE = 'correct-horse-battery-staple'
+const horse = secretNeedles(Buffer.from(`${HORSE}\n`))
+// A password with a quote and a backslash: a JSON writer escapes both.
+const QUOTED = 'pass"word\\back-9f3k'
+const quoted = secretNeedles(Buffer.from(`${QUOTED}\n`))
+const JSON_QUOTED = JSON.stringify(QUOTED).slice(1, -1)
+const bodyLines = Buffer.from(Array.from({ length: 120 }, (_, index) => (index * 37 + 11) % 256)).toString('base64').match(/.{1,64}/g)
+const keyText = pem(bodyLines.join('\n'))
+const keyNeedles = secretNeedles(keyText)
+const squashed = (text) => text.replace(/\s+/g, '')
+
+/** How many places a directory holding these files has, by `secretsUnder`. */
+function placesIn(name, files, needles) {
+  const directory = join(work, name)
+  mkdirSync(directory)
+  for (const [file, bytes] of Object.entries(files)) writeFileSync(join(directory, file), bytes)
+  return secretsUnder(directory, needles)
+}
+
+{
+  const identity = { file: 'KalaReach.ipa', platform: 'ios', stage: 'export', versionName: '0.1.0', versionCode: 1, bytes: 1, sha256: 'ab' }
+  for (const [what, parts] of [
+    ['a file name', { identity: { ...identity, file: `${QUOTED}.ipa` } }],
+    ['a version name', { identity: { ...identity, versionName: QUOTED } }],
+    ['a note', { notes: { leak: QUOTED } }],
+    ['a fact, deep in a list', { facts: { leak: { deeper: ['x', QUOTED] } } }]
+  ]) {
+    const made = recordOf({ identity, problems: [], facts: {}, notes: {}, ...parts }, quoted)
+    held(
+      `a record that quotes a secret in ${what} fails the build, and its text holds neither the secret nor its JSON form`,
+      [1, false, false, false],
+      [made.problems.length, JSON.parse(made.text).holds, made.text.includes(QUOTED), made.text.includes(JSON_QUOTED)]
+    )
+  }
+  const alone = recordOf({ identity: { ...identity, file: `${HORSE}.ipa` }, problems: [], facts: {}, notes: {} }, horse)
+  held('a file name that is the secret fails the build, though nothing else is wrong', [1, false], [alone.problems.length, JSON.parse(alone.text).holds])
+}
+
+held('a secret written into a JSON file is found whatever the escaping, and other JSON is not', [1, 1, 0], [
+  placesIn('json-escaped', { 'a.json': JSON.stringify({ note: QUOTED }) }, quoted),
+  placesIn('json-unicode', { 'a.json': '{"note": "pass\\u0022word\\\\back-9f3k"}' }, quoted),
+  placesIn('json-other', { 'a.json': JSON.stringify({ note: 'something else' }) }, quoted)
+])
+
+{
+  // The secret inside a longer text that was encoded whole: the three ways it can sit against the
+  // groups of three bytes, in base64 and in its URL form, and in hex.
+  const forms = []
+  for (const before of [0, 1, 2]) {
+    const text = Buffer.from(`${'x'.repeat(before)}${QUOTED}yz`)
+    forms.push(text.toString('base64'), text.toString('base64url'), text.toString('hex'), text.toString('hex').toUpperCase())
+  }
+  held('a secret encoded in base64, base64url or hex is found at every alignment', forms.map(() => 1), forms.map((form, index) => placesIn(`encoded-${index}`, { 'a.txt': `before ${form} after` }, quoted)))
+  held('an encoding of something else is not found', 0, placesIn('encoded-other', { 'a.txt': Buffer.from('xx not the secret at all yz').toString('base64') }, quoted))
+}
+
+{
+  const body = bodyLines.join('')
+  const wrapped = (text, width) => text.match(new RegExp(`.{1,${width}}`, 'g')).join('\n')
+  held(
+    'a secret split across lines is found: wrapped, indented, with other line breaks, or as wrapped base64',
+    [1, 1, 1, 1, 1, 1],
+    [
+      placesIn('split-single', { 'run.log': '    correct-\n    horse-ba\n    ttery-st\n    aple' }, horse),
+      placesIn('split-key-fenced', { 'run.log': `${fence('BEGIN')}\n${wrapped(body, 20)}\n${fence('END')}\n` }, keyNeedles),
+      placesIn('split-key-body', { 'run.log': wrapped(body, 20) }, keyNeedles),
+      placesIn('split-key-crlf', { 'run.log': keyText.toString().replaceAll('\n', '\r\n') }, keyNeedles),
+      placesIn('split-key-indented', { 'run.log': keyText.toString().replaceAll('\n', '\n    ') }, keyNeedles),
+      placesIn('split-key-base64', { 'run.log': wrapped(keyText.toString('base64'), 76) }, keyNeedles)
+    ]
+  )
+}
+
+held('a secret in the name of a file, of an archive member or of the directory itself is found', [1, 1, 1], (() => {
+  const archives = join(work, 'archives'); mkdirSync(archives)
+  writeFileSync(join(archives, 'named.aab'), zip([{ name: `before-${HORSE}-after.txt`, bytes: Buffer.from('x') }]))
+  const empty = join(work, `empty-${HORSE}`); mkdirSync(empty)
+  return [placesIn('named-file', { [`before-${HORSE}-after.txt`]: 'x' }, horse), secretsUnder(archives, horse), secretsUnder(empty, horse)]
+})())
+
+{
+  // The command, run as the build scripts run it: nothing it prints holds the secret, whatever the
+  // secret has got into (a path, an option, an error).
+  const horseFile = join(work, 'horse-secret'); writeFileSync(horseFile, `${HORSE}\n`)
+  const cli = (args, input) => spawnSync(process.execPath, [join(import.meta.dirname, 'store-bundle.mjs'), ...args], { encoding: 'utf8', input })
+  const leaks = (answer) => `${answer.stdout}${answer.stderr}`.includes(HORSE)
+  const named = join(work, `dir-${HORSE}`); mkdirSync(named)
+  const scanned = cli(['--scan-dir', named, '--secret-file', horseFile])
+  held('a directory scan of a path that holds the secret finds it and prints nothing of it', [1, false], [scanned.status, leaks(scanned)])
+  const missing = cli(['--scan-dir', join(work, `missing-${HORSE}`), '--secret-file', horseFile])
+  held('a directory scan that cannot read a path that holds the secret prints nothing of it', [2, false], [missing.status, leaks(missing)])
+  const clean = join(work, 'dir-with-a-secret-inside'); mkdirSync(clean); writeFileSync(join(clean, 'run.log'), `x ${HORSE} y`)
+  const found = cli(['--scan-dir', clean, '--secret-file', horseFile])
+  held('a directory scan that finds the secret in a file says how many places and prints nothing of it', [1, false, true], [found.status, leaks(found), /in 1 place under/.test(found.stderr)])
+  const unknown = cli([`--bogus-${HORSE}`, '--secret-file', horseFile])
+  held('an option that is the secret is refused without printing it', [2, false], [unknown.status, leaks(unknown)])
+  const absent = cli(['--ios', join(work, `absent-${HORSE}.ipa`), '--stage', 'export', '--version-code', '1', '--version-name', '0.1.0', '--secret-file', horseFile])
+  held('a bundle path that holds the secret and does not exist is refused without printing it', [2, false], [absent.status, leaks(absent)])
+  const unreadable = join(work, `unreadable-${HORSE}.aab`); writeFileSync(unreadable, 'not an archive')
+  const broken = cli(['--android', unreadable, '--version-code', '1', '--version-name', '0.1.0', '--certificate', import.meta.filename, '--secret-file', horseFile])
+  held('a bundle that cannot be read, at a path that holds the secret, is reported without printing it', [2, false], [broken.status, leaks(broken)])
+
+  // What a failing export prints of its log: the secret in no form, and no part of a token.
+  const FRAGMENT = 'eyJhbGciOiJFUzI1NiIsImtpZCI6IkFCQ0QifQ'
+  const keyFile = join(work, 'tail-key'); writeFileSync(keyFile, keyText)
+  const ordinary = ['Export failed: no signing certificate was found', 'Code=1 "provisioning failed"']
+  const redact = (lines) => cli(['--redact', '--secret-file', keyFile], `${lines.join('\n')}\n`)
+  const plain = redact([...ordinary, `Bearer ${FRAGMENT}`, TOKEN, 'done'])
+  held(
+    'a log with a token or a part of one keeps its other lines and loses the token',
+    [0, true, true, false],
+    [plain.status, plain.stdout.includes(ordinary[0]), plain.stdout.includes('done'), plain.stdout.includes('eyJ')]
+  )
+  const holds = (answer) => squashed(answer.stdout).includes(squashed(bodyLines[0]))
+  const keyLines = keyText.toString().trim().split('\n')
+  const variants = [
+    redact([...ordinary, ...keyLines]),
+    redact([...ordinary, ...keyLines.map((line) => `    ${line}`)]),
+    redact([...ordinary, ...bodyLines.join('').match(/.{1,20}/g)]),
+    redact([...ordinary, `key: ${bodyLines.join('')}`])
+  ]
+  held(
+    'a log that holds the key, as written, indented, rewrapped or on one line, prints none of it',
+    [[0, 0, 0, 0], [false, false, false, false]],
+    [variants.map((answer) => answer.status), variants.map(holds)]
+  )
+  const unreadableKey = cli(['--redact', '--secret-file', join(work, 'no-such-key')], `${ordinary[0]}\n`)
+  held('a log is printed in full or in part only when the secret could be read', [2, ''], [unreadableKey.status, unreadableKey.stdout])
+}
 
 // -- the signature: the upload key and no other ---------------------------------------------------
 
@@ -414,6 +547,32 @@ heldProblems(
 heldProblems('a framework of another team is refused', problemsInEmbeddedSignature({ ...embeddedFine, described: 'Authority=Apple Distribution: Other (ZZZZZZZZZZ)\nTeamIdentifier=ZZZZZZZZZZ\n' }), ['not signed under the team'])
 heldProblems('a framework signed with another distribution certificate is refused', problemsInEmbeddedSignature({ ...embeddedFine, leafSha1: 'EF'.repeat(20) }), ['not signed with the certificate of the bundle that holds it'])
 
+{
+  // The code of a bundle is read from the first bytes of each file, so headers stand for the files.
+  const tree = join(work, 'code-tree')
+  mkdirSync(join(tree, 'A.framework', 'Frameworks', 'B.framework'), { recursive: true })
+  const header = (...bytes) => Buffer.concat([Buffer.from(bytes), Buffer.alloc(64)])
+  const thin = header(0xcf, 0xfa, 0xed, 0xfe)
+  writeFileSync(join(tree, 'A.framework', 'A'), thin)
+  writeFileSync(join(tree, 'A.framework', 'Frameworks', 'B.framework', 'B'), thin)
+  writeFileSync(join(tree, 'one-slice'), header(0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 1))
+  writeFileSync(join(tree, 'two-slices'), header(0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 2))
+  writeFileSync(join(tree, 'notes.txt'), 'text')
+  writeFileSync(join(tree, 'empty'), '')
+  symlinkSync('notes.txt', join(tree, 'link'))
+  spawnSync('mkfifo', [join(tree, 'pipe')])
+  const found = codeIn(tree)
+  held(
+    'the code of a bundle is each Mach-O file at any depth, and a link, a pipe and a universal binary of several architectures are refused, not skipped',
+    [
+      ['A.framework/A', 'A.framework/Frameworks/B.framework/B', 'one-slice'],
+      ['link is a symbolic link, which this check cannot follow', 'pipe is neither a file nor a directory', 'two-slices is a universal binary of several architectures, which this check cannot read']
+    ],
+    [found.code.map((each) => each.name), found.refused]
+  )
+  held('a bundle part that is read on its own is left out of the bundle that holds it', ['A.framework/Frameworks/B.framework/B', 'one-slice'], codeIn(tree, [join(tree, 'A.framework', 'A')]).code.map((each) => each.name))
+}
+
 held('an application that says it needs no export documentation passes, and one that is silent or says it does not', [0, 1, 1], [
   problemsInEncryptionKey({ ITSAppUsesNonExemptEncryption: false }).length,
   problemsInEncryptionKey({}).length,
@@ -484,19 +643,54 @@ if (codesign.error || process.platform !== 'darwin') {
   const application = sealed(join(signed, 'KalaReach'))
   const notification = sealed(join(extension, 'KalaReachNotificationService'))
   held('the application is sealed with production push and its two keychain groups', ['production', [`${TEAM}.to.kala.reach`, `${TEAM}.to.kala.reach.shared`]], [application['aps-environment'], application['keychain-access-groups']])
+  // A piece of code the system makes: one architecture, signed ad hoc.
+  const machO = (path) => {
+    mkdirSync(dirname(path), { recursive: true })
+    const thin = spawnSync('lipo', ['/usr/bin/true', '-thin', 'arm64e', '-output', path])
+    if (thin.status !== 0) copyFileSync('/usr/bin/true', path)
+    spawnSync('codesign', ['-f', '-s', '-', path])
+  }
   const frameworks = join(signed, 'Frameworks'); mkdirSync(join(frameworks, 'Inner.framework'), { recursive: true })
-  copyFileSync('/usr/bin/true', join(frameworks, 'Plain.dylib'))
-  spawnSync('codesign', ['-f', '-s', '-', join(frameworks, 'Plain.dylib')])
+  machO(join(frameworks, 'Plain.dylib'))
   writeFileSync(join(frameworks, 'notes.txt'), 'not code')
-  held('the code embedded in a bundle is its frameworks and dylibs, and nothing else', ['Inner.framework', 'Plain.dylib'], embeddedCode(signed).map((each) => each.name))
+  held('the code in a bundle is every Mach-O file under it and nothing else, and an extension is left to its own reading', ['Frameworks/Plain.dylib', 'KalaReach'], codeIn(signed, [extension]).code.map((each) => each.name))
+  held('read as a bundle of its own, the extension holds its executable', ['KalaReachNotificationService'], codeIn(extension).code.map((each) => each.name))
   const adHoc = signerOf(join(frameworks, 'Plain.dylib'))
   heldProblems('a real ad hoc signature on embedded code is read and refused', problemsInEmbeddedSignature({ ...adHoc, hostLeafSha1: 'AB'.repeat(20), team: TEAM }), ['signed ad hoc', 'not signed with an Apple Distribution'])
-  held('a bundle with no Frameworks directory has no embedded code', [], embeddedCode(extension))
   held('the extension is sealed with the shared group alone and no push', [[`${TEAM}.to.kala.reach.shared`], undefined], [notification['keychain-access-groups'], notification['aps-environment']])
   // The whole export-stage check on this bundle: embedded code that is signed ad hoc is named among its
   // problems, and a bundle without it is not.
   const exportCheck = () => checkIos({ path: signed, stage: 'export', versionCode: '1', versionName: '0.1.0', secretFiles: [], skipAppChecks: true }).problems
-  held('the export check names embedded code that is signed ad hoc', true, exportCheck().some((each) => each.startsWith('Plain.dylib in the application is signed ad hoc')))
+  held('the export check names embedded code that is signed ad hoc', true, exportCheck().some((each) => each.startsWith('Frameworks/Plain.dylib in the application is signed ad hoc')))
+  // Code that is not a direct entry of Frameworks: inside a framework, in a framework inside a
+  // framework, and outside Frameworks altogether. The outer seal does not make it the team's.
+  const deeper = [
+    'Frameworks/Outer.framework/Outer',
+    'Frameworks/Outer.framework/Helper.dylib',
+    'Frameworks/Outer.framework/Frameworks/Nested.framework/Nested',
+    'Helpers/tool'
+  ]
+  for (const each of deeper) machO(join(signed, each))
+  const nestedProblems = exportCheck()
+  held(
+    'the export check holds code nested in a framework, and code outside Frameworks, to the signer rules',
+    deeper.map(() => true),
+    deeper.map((each) => nestedProblems.some((problem) => problem.startsWith(`${each} in the application is signed ad hoc`)))
+  )
+  // A layout the check cannot read is refused: a link may lead anywhere, and a universal binary of
+  // several architectures has a signature for each.
+  symlinkSync('Plain.dylib', join(frameworks, 'Link.dylib'))
+  writeFileSync(join(frameworks, 'Several.dylib'), Buffer.concat([Buffer.from([0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 2]), Buffer.alloc(64)]))
+  const refusals = exportCheck()
+  held(
+    'a symbolic link, and a universal binary of several architectures, are refused as code the check cannot read',
+    [true, true],
+    [refusals.some((each) => each.includes('Frameworks/Link.dylib is a symbolic link')), refusals.some((each) => each.includes('Frameworks/Several.dylib is a universal binary'))]
+  )
+  rmSync(join(frameworks, 'Link.dylib'), { force: true })
+  rmSync(join(frameworks, 'Several.dylib'), { force: true })
+  rmSync(join(signed, 'Helpers'), { recursive: true, force: true })
+  rmSync(join(frameworks, 'Outer.framework'), { recursive: true, force: true })
   // A name in a problem line is quoted out of the bundle like a value is: the command prints it only
   // through the filter, and the record is written the same way.
   const leaking = join(frameworks, 'leak-correct-horse-battery-staple.dylib')
@@ -509,7 +703,13 @@ if (codesign.error || process.platform !== 'darwin') {
     [1, false, false],
     [named.status, `${named.stdout}${named.stderr}`.includes('correct-horse-battery-staple'), readFileSync(leakRecord, 'utf8').includes('correct-horse-battery-staple')]
   )
+  const secretNamed = checkIos({ path: signed, stage: 'export', versionCode: '1', versionName: '0.1.0', secretFiles: [leakSecret], skipAppChecks: true })
+  held('a secret in the name of a file of the application is found', true, secretNamed.facts.secretsFound > 0)
   rmSync(leaking, { force: true })
+  // A record that cannot be written is an error of the command, and the path that failed is a path
+  // like any other: it reaches the output only through the filter.
+  const lost = spawnSync(process.execPath, [join(import.meta.dirname, 'store-bundle.mjs'), '--ios', signed, '--stage', 'archive', '--version-code', '1', '--version-name', '0.1.0', '--skip-app-checks', '--secret-file', leakSecret, '--record', join(work, 'no-such-correct-horse-battery-staple', 'record.json')], { encoding: 'utf8' })
+  held('a record that cannot be written ends the command with a read error, and prints nothing of the secret in its path', [2, false], [lost.status, `${lost.stdout}${lost.stderr}`.includes('correct-horse-battery-staple')])
   rmSync(frameworks, { recursive: true, force: true })
   held('and names none once the bundle has no embedded code', false, exportCheck().some((each) => each.includes(' in the application ')))
 }
@@ -627,6 +827,44 @@ held('Xcode\'s two token logs are removed when the temporary directory is named'
 held('Xcode\'s two token logs are removed when TMPDIR is not set', ['status=0', false, false], tokenLogs('unset TMPDIR', () => join(userTemporary, `kr-selftest-${process.pid}.xcdistributionlogs`)))
 held('an export log that names no log bundle fails the cleanup, since tokens may remain', ['status=2', false, true], tokenLogs(`export TMPDIR="${temporaryHere}"`, () => join(temporaryHere, 'b.xcdistributionlogs'), false))
 held('a log bundle outside the temporary directory is kept, and the cleanup fails', ['status=2', false, true], tokenLogs(`export TMPDIR="${temporaryHere}"`, (base) => join(base, 'elsewhere', 'a.xcdistributionlogs')))
+
+// What a failed export shows of its log: the last lines, indented, through the checker, which leaves
+// out the secret in any form and any part of a token, and prints nothing when it cannot read the secret.
+{
+  const key = join(work, 'show-key'); writeFileSync(key, keyText)
+  const log = join(work, 'show-export.log')
+  const trail = [
+    'Export failed: no signing certificate was found',
+    `Bearer eyJhbGciOiJFUzI1NiIsImtpZCI6IkFCQ0QifQ`,
+    `"Authorization" = "Bearer ${TOKEN}";`,
+    'Code=1 "provisioning failed"'
+  ]
+  writeFileSync(log, [...keyText.toString().trim().split('\n'), ...Array.from({ length: 25 }, (_, index) => `line ${index}`), ...trail].join('\n'))
+  const shown = shell(`kr_store_show_tail "${log}" "${key}"`)
+  held(
+    'the tail of a log is shown indented, without a token or a part of one',
+    [0, true, true, false, false],
+    [shown.status, shown.stdout.includes('    Export failed: no signing certificate was found'), shown.stdout.includes('    Code=1 "provisioning failed"'), shown.stdout.includes('eyJ'), shown.stdout.includes(bodyLines[0])]
+  )
+  writeFileSync(log, [...Array.from({ length: 5 }, (_, index) => `line ${index}`), ...bodyLines.join('').match(/.{1,20}/g)].join('\n'))
+  held('a tail that holds the key rewrapped is not shown', false, shell(`kr_store_show_tail "${log}" "${key}"`).stdout.replace(/\s+/g, '').includes(bodyLines[0]))
+  held('a tail is not shown when the secret cannot be read', '', shell(`kr_store_show_tail "${log}" "${join(work, 'no-such-key')}"`).stdout)
+}
+
+// A path a message is about to print is searched for the secret first: a build root whose name holds
+// the password stops the build before the first message names it.
+{
+  const horseFile = join(work, 'path-secret'); writeFileSync(horseFile, 'correct-horse-battery-staple\n')
+  const stop = (...paths) => shell(`kr_store_refuse_secret_in "${horseFile}" ${paths.map((each) => `"${each}"`).join(' ')}; echo "status=$?"`)
+  const clean = stop('/var/store', '/var/other')
+  const dirty = stop('/var/store', '/var/correct-horse-battery-staple/out')
+  const unreadable = shell(`kr_store_refuse_secret_in "${join(work, 'no-such-key')}" /var/store; echo "status=$?"`)
+  held(
+    'a path that holds the secret, or a secret that cannot be read, stops the build and prints nothing of the path',
+    ['status=0', 'status=2', false, 'status=2'],
+    [clean.stdout.trim().split('\n').pop(), dirty.stdout.trim().split('\n').pop(), `${dirty.stdout}${dirty.stderr}`.includes('correct-horse-battery-staple'), unreadable.stdout.trim().split('\n').pop()]
+  )
+}
 
 const racing = join(work, 'racing'); mkdirSync(racing)
 shell('for n in $(seq 39100 39139); do kr_store_receipt ios $n & done; wait', { KR_STORE_ROOT: racing })
