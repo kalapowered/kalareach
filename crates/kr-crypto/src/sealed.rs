@@ -37,6 +37,29 @@ pub fn random_nonce() -> Result<Nonce192> {
 
 /// Seals a stored-envelope payload for one recipient.
 ///
+/// The recipient is a stored-envelope key. A notification-preview key is a different type, so a
+/// mailbox record cannot be sealed to the key the notification extension holds:
+///
+/// ```compile_fail
+/// use kr_crypto::keys::{NotificationPreviewKeyPair, StoredEnvelopeKeyPair};
+/// use kr_crypto::sealed::seal_stored_envelope;
+///
+/// fn seal(sender: &StoredEnvelopeKeyPair, preview: &NotificationPreviewKeyPair) {
+///     let _ = seal_stored_envelope(sender, preview.public(), b"a mailbox record");
+/// }
+/// ```
+///
+/// The same call to the recipient's stored-envelope key is the one that compiles:
+///
+/// ```
+/// use kr_crypto::keys::StoredEnvelopeKeyPair;
+/// use kr_crypto::sealed::seal_stored_envelope;
+///
+/// fn seal(sender: &StoredEnvelopeKeyPair, device: &StoredEnvelopeKeyPair) {
+///     let _ = seal_stored_envelope(sender, device.public(), b"a mailbox record");
+/// }
+/// ```
+///
 /// # Errors
 ///
 /// Returns an error when libsodium is unavailable or reports a failure.

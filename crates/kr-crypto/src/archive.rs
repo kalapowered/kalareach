@@ -91,6 +91,43 @@ pub fn decrypt_object(
 /// The context binds the wrap to one object, one generation and one recipient. The nonce is fresh
 /// for every wrap, so sealing the same staged ciphertext again never reuses a nonce.
 ///
+/// The recipient is a stored-envelope key. A notification-preview key is a different type, so an
+/// archive key cannot be wrapped to the key the notification extension holds:
+///
+/// ```compile_fail
+/// use kr_crypto::archive::wrap_object_key;
+/// use kr_crypto::keys::{NotificationPreviewKeyPair, StoredEnvelopeKeyPair};
+/// use kr_crypto::secret::SymmetricKey;
+/// use kr_protocol::archive::KeyWrapContext;
+///
+/// fn wrap(
+///     sender: &StoredEnvelopeKeyPair,
+///     preview: &NotificationPreviewKeyPair,
+///     context: KeyWrapContext,
+///     key: &SymmetricKey,
+/// ) {
+///     let _ = wrap_object_key(sender, preview.public(), context, key);
+/// }
+/// ```
+///
+/// The same call to the recipient's stored-envelope key is the one that compiles:
+///
+/// ```
+/// use kr_crypto::archive::wrap_object_key;
+/// use kr_crypto::keys::StoredEnvelopeKeyPair;
+/// use kr_crypto::secret::SymmetricKey;
+/// use kr_protocol::archive::KeyWrapContext;
+///
+/// fn wrap(
+///     sender: &StoredEnvelopeKeyPair,
+///     device: &StoredEnvelopeKeyPair,
+///     context: KeyWrapContext,
+///     key: &SymmetricKey,
+/// ) {
+///     let _ = wrap_object_key(sender, device.public(), context, key);
+/// }
+/// ```
+///
 /// # Errors
 ///
 /// Returns [`CryptoError::BindingMismatch`] when the context does not name the two keys actually
