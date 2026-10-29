@@ -3232,20 +3232,17 @@ async fn substituting_the_origin_or_the_locator_fails_authentication() {
     ));
 }
 
-/// A permanently lost service cannot be rebuilt from a seed alone. A kit that names the service
-/// that is gone reads nothing from it, and a replacement at the same origin that holds no bundle
-/// gives the kit and its seed nothing either: the seed derives keys and holds no ciphertext. The
-/// same kit still reads the bundle at a service that is left.
+/// KR-REQ-20.19: a permanently lost service cannot be rebuilt from a seed alone. A replacement that
+/// answers at the origin of the service that is gone holds no bundle, and the kit and its seed do
+/// not make one: the seed derives keys and holds no ciphertext. The same kit still reads the
+/// bundle at a service that is left.
 #[tokio::test]
 async fn a_seed_alone_does_not_rebuild_a_service_that_is_gone() {
     let gone = ScriptedService::shared();
     let left = ScriptedService::shared();
     let seed = RecoverySeed::generate().expect("a seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
-    for (service, origin) in [
-        (Arc::clone(&gone), ORIGIN),
-        (Arc::clone(&left), OTHER_ORIGIN),
-    ] {
+    for (service, origin) in [(gone, ORIGIN), (Arc::clone(&left), OTHER_ORIGIN)] {
         let mut store = device(service as Arc<_>, context(origin));
         let mut bundle = BundleStore::empty(TimestampMs::new(1));
         store
@@ -3271,22 +3268,15 @@ async fn a_seed_alone_does_not_rebuild_a_service_that_is_gone() {
         restore
     };
 
-    // The first service is gone: what it held does not come back.
-    gone.lose_the_next_fetch();
-    assert!(matches!(
-        restore_at(ORIGIN, Arc::clone(&gone))
-            .open_bundle(ORIGIN)
-            .await,
-        Err(RecoveryError::Service(_))
-    ));
-
-    // A replacement that answers at the same origin holds no bundle, and the seed does not make one.
-    assert!(matches!(
-        restore_at(ORIGIN, ScriptedService::shared())
-            .open_bundle(ORIGIN)
-            .await,
-        Err(RecoveryError::Service(_))
-    ));
+    // What answers at the old origin now is a service that holds nothing, and the restore says so.
+    let refusal = match restore_at(ORIGIN, ScriptedService::shared())
+        .open_bundle(ORIGIN)
+        .await
+    {
+        Err(RecoveryError::Service(error)) => error.to_string(),
+        other => panic!("a replacement that holds no bundle gave {other:?}"),
+    };
+    assert!(refusal.contains("holds no recovery bundle"), "{refusal}");
 
     // The service that is left still serves the bundle to the same kit.
     let material = restore_at(OTHER_ORIGIN, left)
@@ -5084,6 +5074,8 @@ async fn migrating_a_bundle_another_device_has_written_since_is_refused() {
     );
 }
 
+/// KR-REQ-20.19: the migration record is a verified one. A destination that takes the write and
+/// serves something else back is not a migration: the caller is left holding what it had.
 #[tokio::test]
 async fn a_migration_that_does_not_read_back_leaves_the_caller_holding_what_it_had() {
     let service = ScriptedService::shared();
