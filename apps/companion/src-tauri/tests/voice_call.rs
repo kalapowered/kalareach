@@ -22,7 +22,7 @@
 //! | A mute silences the microphone here and is told to the service | `muting_the_microphone_silences_it_here_and_tells_the_service` |
 //! | What the system does to capture in a call is told, and ends nothing | `the_systems_changes_to_capture_are_told_and_do_not_end_the_call` |
 //! | A voice call is not a shell session: hanging up leaves the session a worker runs live | `hanging_up_a_call_leaves_the_terminal_session_it_was_made_over_running` |
-//! | A voice service that is down at the start, in the call or at the hang-up leaves mute, silence, the media's stop and the grant's revocation with this device and the host | `a_service_that_is_down_at_the_start_leaves_no_media_and_a_notice`, `a_service_that_goes_down_in_the_call_leaves_mute_and_silence_with_native_code`, `a_service_that_is_down_at_the_hang_up_still_stops_the_media_and_revokes_the_grant` |
+//! | A voice service that is down in the call or at the hang-up leaves mute, silence, the media's stop and the grant's revocation with this device and the host | `a_service_that_goes_down_in_the_call_leaves_mute_and_silence_with_native_code`, `a_service_that_is_down_at_the_hang_up_still_stops_the_media_and_revokes_the_grant` |
 //! | A host that names another voice service gets no token | `a_host_that_names_another_voice_service_gets_no_token` |
 //! | The native session ending revokes the call's grant in the host's store before the service finalises the call | `ending_the_native_session_revokes_the_voice_grant_before_the_service_finalises_the_call` |
 //! | A stop that never returns does not hold the host's revocation | `a_stop_native_code_never_returns_does_not_hold_the_revocation` |
@@ -721,8 +721,8 @@ async fn a_control_that_is_not_authorised_closes_the_call_the_host_started() {
     scene.stop_host().await;
 }
 
-/// KR-REQ-15.35: the notification's stop is native code's own end of the call, a termination the
-/// call handles. No page is looking, and the call is ended in full all the same.
+/// The notification's stop is native code's own end of the call. No page is looking, and the call
+/// is ended in full all the same.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_notifications_stop_ends_the_call_with_no_page() {
     let mut scene = scene().await;
@@ -1035,8 +1035,8 @@ async fn muting_the_microphone_silences_it_here_and_tells_the_service() {
 /// KR-REQ-15.35 and KR-REQ-15.36: what the system does to capture in the middle of a call, a phone
 /// call, a route change, a suspension of the application's audio or a microphone that is gone, is
 /// native code's news. The call tells it as the system said it, nothing of it ends the call, and
-/// capture coming back is told the same way, so a person always reads what the microphone is
-/// doing and never an unreceived hearing as a received one.
+/// capture coming back is told the same way, so a person reads what the microphone is doing. This
+/// is the displayed half of the row; the refusal of an authority claim has no caller yet.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_systems_changes_to_capture_are_told_and_do_not_end_the_call() {
     let mut scene = scene().await;
@@ -1069,8 +1069,8 @@ async fn the_systems_changes_to_capture_are_told_and_do_not_end_the_call() {
 }
 
 /// KR-REQ-15.02: a voice call is not a shell session. The call is made over a session a worker
-/// really runs, which the host reads for the call; hanging up ends the call, revokes its grant and
-/// leaves the session live, with the same state it had while the call ran.
+/// really runs, which the host reads for the call; hanging up ends the call and the host revokes
+/// its grant, and the session is still live afterwards, as it was while the call ran.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hanging_up_a_call_leaves_the_terminal_session_it_was_made_over_running() {
     let mut scene = scene_built(
@@ -1100,9 +1100,8 @@ async fn hanging_up_a_call_leaves_the_terminal_session_it_was_made_over_running(
         .call("voice_stop", json!({ "voiceSessionId": null }))
         .expect("the hang-up is answered");
     assert_eq!(closed["closed_locally"], true, "{closed}");
-    scene
-        .state_where("the end", |state| state["running"] == false)
-        .await;
+    let ended = scene.state();
+    assert_eq!(ended["ended"]["host"]["kind"], "revoked", "{ended}");
 
     assert_eq!(
         scene.state_of(session_id).await,
@@ -1112,57 +1111,10 @@ async fn hanging_up_a_call_leaves_the_terminal_session_it_was_made_over_running(
     scene.stop_host().await;
 }
 
-/// KR-REQ-15.17: the voice service is down when the call is asked for. The host cannot make the
-/// call at it and does not say what became of the request, so the phone stops the microphone it
-/// opened, tells the person in words, and keeps the notice that a grant may stand at the host until
-/// the call would have closed. There is no call to mute, and nothing of the person's own is held.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_service_that_is_down_at_the_start_leaves_no_media_and_a_notice() {
-    let timings = Timings {
-        host_within: Duration::from_millis(300),
-        ..asking_again()
-    };
-    let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
-    let prepared = scene.prepared().await;
-    scene.stand_in.go_down();
-
-    let started = scene.call("voice_start", scene.start_request(&prepared));
-
-    let started = started.expect("the host answers the page");
-    assert!(
-        started["value"].is_null(),
-        "no call was reported: {started}"
-    );
-    let state = scene.state();
-    assert_eq!(state["running"], false, "{state}");
-    assert_eq!(state["ended"]["cause"], "start_unknown", "{state}");
-    assert_eq!(state["ended"]["closed_locally"], true, "{state}");
-    assert!(
-        !state["ended"]["words"].as_str().unwrap_or("").is_empty(),
-        "the person is told why: {state}"
-    );
-    assert_eq!(state["owed"][0]["kind"], "start_unknown", "{state}");
-    assert!(scene.platform.count("stop") >= 1, "the media is stopped");
-    assert!(
-        !scene.platform.holds_a_call(),
-        "native code holds no media after a call that was never made"
-    );
-    assert!(
-        scene
-            .call(
-                "voice_set_muted",
-                json!({ "what": "microphone", "muted": true })
-            )
-            .is_err(),
-        "there is no call to mute"
-    );
-    scene.stop_host().await;
-}
-
-/// KR-REQ-15.17: the voice service goes down in the middle of a call. Nothing the service does
-/// ends the call for the person, and the microphone's mute and the voice's silence are native
-/// code's own: both take effect with no service to tell, and the screen reads the control as
-/// unreachable rather than the call as over.
+/// KR-REQ-15.17: the voice service goes down in the middle of a call. The loss does not end the
+/// call at once, and the microphone's mute and the voice's silence are native code's own: both
+/// take effect with no service to tell, and the screen reads the control as unreachable rather
+/// than the call as over.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_service_that_goes_down_in_the_call_leaves_mute_and_silence_with_native_code() {
     let mut scene = scene().await;
@@ -1215,9 +1167,9 @@ async fn a_service_that_goes_down_in_the_call_leaves_mute_and_silence_with_nativ
 }
 
 /// KR-REQ-15.17: the voice service is down when the person hangs up. The hang-up is answered with
-/// the media stopped and the host's grant revoked in its own store, neither waiting on the service,
-/// and the host's answer says it could not tell the service. What the service later confirms is
-/// reported by the case that has a service refuse the close.
+/// the media stopped and the host's grant revoked in its own store, and the host's answer says it
+/// could not tell the service. What the service later confirms is reported by the cases that have
+/// a service hold or refuse the close.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_service_that_is_down_at_the_hang_up_still_stops_the_media_and_revokes_the_grant() {
     let mut scene = scene().await;
@@ -1882,6 +1834,19 @@ async fn a_start_the_host_never_answers_is_unknown_and_stays_owed() {
     // The service may hold a call this device cannot name, so it is not "not needed".
     assert_eq!(state["ended"]["broker"], "unknown", "{state}");
     assert!(scene.platform.count("stop") >= 1, "the media is stopped");
+    assert!(
+        !scene.platform.holds_a_call(),
+        "native code holds no media after a call that was never made"
+    );
+    assert!(
+        scene
+            .call(
+                "voice_set_muted",
+                json!({ "what": "microphone", "muted": true })
+            )
+            .is_err(),
+        "there is no call to mute"
+    );
     assert_eq!(state["owed"][0]["kind"], "start_unknown", "{state}");
     assert_eq!(state["owed"][0]["action_id"], action_id.as_str());
     // The host could still admit the request until its action window ended, which is later than

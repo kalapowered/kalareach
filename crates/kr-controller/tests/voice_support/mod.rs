@@ -284,9 +284,10 @@ impl StandIn {
         gate.release();
     }
 
-    /// Takes the service down, as when its process is killed: every control socket that is open is
-    /// dropped with no closing frame, and every connection made afterwards is ended as it is
-    /// accepted, so no request and no upgrade is ever answered.
+    /// Takes the service down: every control socket that is open is dropped with no closing frame,
+    /// and every connection made afterwards is accepted and ended at once, so no request and no
+    /// upgrade is ever answered. A request already accepted, held at a gate for instance, is still
+    /// answered when its gate is released.
     pub fn go_down(&self) {
         self.state.lock().expect("the stand-in's state").down = true;
         self.route.drop_sockets();
