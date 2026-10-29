@@ -513,9 +513,10 @@ fn a_profile_that_is_gone_is_forgotten() {
 /// profile's key on, says that every reset worked and does none, says the same of every write of
 /// a profile's key after the first, sets a key of the profile as the person would just after the
 /// read of a profile it is told to has been answered, just after the first write of a key or just
-/// after the reset of a key it is told to, shows no schemas, appends an element to the list just after the read it is
-/// told to has been answered (so that the answer is stale), and overwrites the list from a stale
-/// read just after the write it is told to.
+/// after the reset of a key it is told to, sets one key (or the name and the command) just after the
+/// read of a key of a profile it is told to has been answered, shows no schemas, appends an element
+/// to the list just after the read it is told to has been answered (so that the answer is stale),
+/// and overwrites the list from a stale read just after the write it is told to.
 fn wrapper(directory: &Path) -> PathBuf {
     let path = directory.join("gsettings-wrapper");
     // Placed once, by a process that starts nothing: a program this test binary writes itself is
@@ -566,8 +567,12 @@ if [ "$1" = get ] && [ -n "$KR_TEST_PERSON_AFTER_KEY_GET" ]; then
       "$real" "$@"
       status=$?
       if [ "$KR_TEST_PERSON_AFTER_KEY_GET" = "$gets" ]; then
-        "$real" set "$2" "$KR_TEST_PERSON_NAME_KEY" "'Mine'"
-        "$real" set "$2" custom-command "'/bin/theirs'"
+        if [ -n "$KR_TEST_PERSON_GET_KEY" ]; then
+          "$real" set "$2" "$KR_TEST_PERSON_GET_KEY" "$KR_TEST_PERSON_GET_VALUE"
+        else
+          "$real" set "$2" "$KR_TEST_PERSON_NAME_KEY" "'Mine'"
+          "$real" set "$2" custom-command "'/bin/theirs'"
+        fi
       fi
       exit $status
       ;;
@@ -808,8 +813,9 @@ fn the_plan_names_the_settings_it_writes() {
     });
 }
 
-/// How many calls the wrapper counted.
-fn calls_of(places: &ProfileHome) -> u32 {
+/// How many times the wrapper counted `what`: its `calls`, or the reads of one key of a profile
+/// (`key-gets`, counted while a person's edit is asked for after some read).
+fn counted(places: &ProfileHome, what: &str) -> u32 {
     let counts = places
         .settings
         .environment
@@ -817,11 +823,16 @@ fn calls_of(places: &ProfileHome) -> u32 {
         .find(|(name, _)| name == "KR_TEST_COUNTS")
         .map(|(_, value)| PathBuf::from(value))
         .expect("the counts");
-    std::fs::read_to_string(counts.join("calls"))
+    std::fs::read_to_string(counts.join(what))
         .expect("the count")
         .trim()
         .parse()
         .expect("a number")
+}
+
+/// How many calls the wrapper counted.
+fn calls_of(places: &ProfileHome) -> u32 {
+    counted(places, "calls")
 }
 
 /// KR-REQ-01.21: a removal that is interrupted at any call of `gsettings` is a failure, and keeps
@@ -1484,4 +1495,227 @@ fn a_key_set_between_its_reset_and_the_check_is_left_and_the_removal_is_taken_ba
             ),
         );
     });
+}
+
+/// One of the three keys kr writes to a profile and resets when it takes the profile out.
+#[derive(Clone, Copy)]
+enum OwnKey {
+    /// The profile's name.
+    Name,
+    /// The key that makes the profile run a command.
+    Flag,
+    /// The command.
+    Command,
+}
+
+impl OwnKey {
+    /// Its place among the keys kr writes, which is the order it writes, reads back and resets them
+    /// in.
+    const fn position(self) -> usize {
+        match self {
+            Self::Name => 0,
+            Self::Flag => 1,
+            Self::Command => 2,
+        }
+    }
+
+    /// What a person could put in the key that is not what kr wrote there. The flag has one other
+    /// value; after a removal's reset, which leaves it `false`, the one that differs is `true`.
+    const fn theirs(self, after_a_reset: bool) -> &'static str {
+        match self {
+            Self::Name => "'Mine'",
+            Self::Flag if after_a_reset => "true",
+            Self::Flag => "false",
+            Self::Command => "'/bin/theirs'",
+        }
+    }
+}
+
+/// The keys kr writes to a profile of `application`, in the order it writes them in.
+fn own_keys(application: &Application) -> [&'static str; 3] {
+    [application.name_key, "use-custom-command", "custom-command"]
+}
+
+/// What those keys hold now.
+fn own_values(person: &Person, target: &str) -> Vec<String> {
+    own_keys(person.application)
+        .iter()
+        .map(|key| person.get(target, key))
+        .collect()
+}
+
+/// KR-REQ-01.21: a key of kr's own that the person sets after the install read it back is the
+/// person's, and the last look before the list is written finds it: the install fails as a changed
+/// profile, the person's value stays, and the other two keys of kr's are back to what they held.
+/// Run on an install again, so that the record names the profile and says it is unchanged.
+fn an_install_stops_for_a_key_of_its_own_set_after_the_read_back(
+    application: &'static Application,
+    own: OwnKey,
+) {
+    let Some(person) = Person::new(application) else {
+        return;
+    };
+    let places = person.places();
+    person.install(&places).expect("installs");
+    let uuid = person.recorded_uuid().expect("recorded");
+    let target = target_of(&person, &uuid);
+    let again = |round: &str| {
+        let mut command = person.command();
+        command.push(round.to_owned());
+        command
+    };
+    // A clean install again, to count the reads of one key of the profile. The last three are the
+    // reads back of the name, the flag and the command, and nothing reads a key after them.
+    let counting =
+        through_the_wrapper(&person, &[("KR_TEST_PERSON_AFTER_KEY_GET", "0".to_owned())]);
+    person
+        .install_command(&counting, &again("counting"))
+        .expect("installs again");
+    let reads = counted(&counting, "key-gets");
+    let held = own_values(&person, &target);
+
+    let position = own.position();
+    let keys = own_keys(application);
+    let theirs = own.theirs(false);
+    let changing = through_the_wrapper(
+        &person,
+        &[
+            (
+                "KR_TEST_PERSON_AFTER_KEY_GET",
+                (reads - 2 + u32::try_from(position).expect("a small number")).to_string(),
+            ),
+            ("KR_TEST_PERSON_GET_KEY", keys[position].to_owned()),
+            ("KR_TEST_PERSON_GET_VALUE", theirs.to_owned()),
+        ],
+    );
+    let outcome = person.install_command(&changing, &again("round"));
+    assert!(
+        matches!(outcome, Err(ProfileError::Changed { .. })),
+        "{outcome:?}"
+    );
+    for (index, now) in own_values(&person, &target).iter().enumerate() {
+        if index == position {
+            assert_eq!(
+                now, theirs,
+                "{}: what the person put there stays",
+                keys[index]
+            );
+        } else {
+            assert_eq!(*now, held[index], "{}: kr's key is back", keys[index]);
+        }
+    }
+    assert_eq!(person.recorded_uuid().as_deref(), Some(uuid.as_str()));
+    // Once the person's key is kr's again the record and the profile agree.
+    person.set(&target, keys[position], &held[position]);
+    assert_eq!(person.remove(&places).expect("removes"), Removed::Removed);
+}
+
+/// KR-REQ-01.21: a key of kr's own that another writer sets after the removal checked its reset is
+/// not at its default in the last look, and that look finds it: the removal fails, the other keys it
+/// reset and the profile's place in the list are put back, the other writer's value stays, and the
+/// record keeps the entry, as it does for a key set between the reset and its check.
+fn a_removal_stops_for_a_key_of_its_own_set_after_the_reset_check(
+    application: &'static Application,
+    own: OwnKey,
+) {
+    let Some(person) = Person::new(application) else {
+        return;
+    };
+    let places = person.places();
+    let list_before = person.list();
+    person.install(&places).expect("installs");
+    // A clean removal, to count the reads of one key of the profile: the six are the read before
+    // each reset and the read that checks it, for the name, the flag and the command in turn.
+    let counting =
+        through_the_wrapper(&person, &[("KR_TEST_PERSON_AFTER_KEY_GET", "0".to_owned())]);
+    assert_eq!(person.remove(&counting).expect("removes"), Removed::Removed);
+    let reads = counted(&counting, "key-gets");
+    assert_eq!(reads, 6, "three keys, each read twice");
+    person.install(&places).expect("installs again");
+    let uuid = person.recorded_uuid().expect("recorded");
+    let target = target_of(&person, &uuid);
+    let held = own_values(&person, &target);
+
+    let position = own.position();
+    let keys = own_keys(application);
+    let theirs = own.theirs(true);
+    // The read that checks the reset of the key.
+    let checking = 2 + 2 * u32::try_from(position).expect("a small number");
+    let changing = through_the_wrapper(
+        &person,
+        &[
+            ("KR_TEST_PERSON_AFTER_KEY_GET", checking.to_string()),
+            ("KR_TEST_PERSON_GET_KEY", keys[position].to_owned()),
+            ("KR_TEST_PERSON_GET_VALUE", theirs.to_owned()),
+        ],
+    );
+    let outcome = person.remove(&changing);
+    assert!(
+        matches!(outcome, Err(ProfileError::Changing(_))),
+        "{outcome:?}"
+    );
+    for (index, now) in own_values(&person, &target).iter().enumerate() {
+        if index == position {
+            assert_eq!(
+                now, theirs,
+                "{}: what the person put there stays",
+                keys[index]
+            );
+        } else {
+            assert_eq!(*now, held[index], "{}: kr's key is back", keys[index]);
+        }
+    }
+    assert!(
+        person.list().contains(&uuid),
+        "the profile is back in the list"
+    );
+    assert_eq!(
+        person.recorded_uuid().as_deref(),
+        Some(uuid.as_str()),
+        "the record keeps the entry"
+    );
+    // The next removal reads the profile as it is: the flag the person set to what kr wrote is
+    // kr's still, and any other key is theirs.
+    let next = person.remove(&places).expect("answers");
+    if matches!(own, OwnKey::Flag) {
+        assert_eq!(next, Removed::Removed);
+        assert_eq!(person.list(), list_before);
+    } else {
+        assert!(matches!(next, Removed::Changed { .. }), "{next:?}");
+    }
+    assert!(person.recorded_uuid().is_none());
+}
+
+/// One case of each kind for a key of an application, so that a fault in one shows by name.
+macro_rules! own_key_cases {
+    ($($install:ident, $removal:ident: $application:expr, $key:expr;)*) => {$(
+        /// KR-REQ-01.21: the last look of an install finds a key of kr's own that the person set
+        /// after the install read it back.
+        #[test]
+        fn $install() {
+            an_install_stops_for_a_key_of_its_own_set_after_the_read_back(&$application, $key);
+        }
+
+        /// KR-REQ-01.21: the last look of a removal finds a key of kr's own that another writer set
+        /// after the removal checked its reset.
+        #[test]
+        fn $removal() {
+            a_removal_stops_for_a_key_of_its_own_set_after_the_reset_check(&$application, $key);
+        }
+    )*};
+}
+
+own_key_cases! {
+    a_name_set_after_the_read_back_stops_a_gnome_terminal_install,
+    a_name_set_after_the_reset_check_stops_a_gnome_terminal_removal: GNOME, OwnKey::Name;
+    a_flag_set_after_the_read_back_stops_a_gnome_terminal_install,
+    a_flag_set_after_the_reset_check_stops_a_gnome_terminal_removal: GNOME, OwnKey::Flag;
+    a_command_set_after_the_read_back_stops_a_gnome_terminal_install,
+    a_command_set_after_the_reset_check_stops_a_gnome_terminal_removal: GNOME, OwnKey::Command;
+    a_name_set_after_the_read_back_stops_a_ptyxis_install,
+    a_name_set_after_the_reset_check_stops_a_ptyxis_removal: PTYXIS, OwnKey::Name;
+    a_flag_set_after_the_read_back_stops_a_ptyxis_install,
+    a_flag_set_after_the_reset_check_stops_a_ptyxis_removal: PTYXIS, OwnKey::Flag;
+    a_command_set_after_the_read_back_stops_a_ptyxis_install,
+    a_command_set_after_the_reset_check_stops_a_ptyxis_removal: PTYXIS, OwnKey::Command;
 }

@@ -496,6 +496,22 @@ impl Held {
             .all(|(key, value)| self.is_unset(key, value))
     }
 
+    /// Whether every key in `kr_keys` still holds the value kr wrote to it.
+    fn holds_what_kr_wrote(&self, kr_keys: &[RecordedKey]) -> bool {
+        kr_keys.iter().all(|written| {
+            self.value(&written.key)
+                .is_some_and(|value| same_value(value, &written.value))
+        })
+    }
+
+    /// Whether every key in `kr_keys` is at its default, as kr leaves it when it resets it.
+    fn is_reset(&self, kr_keys: &[RecordedKey]) -> bool {
+        kr_keys.iter().all(|reset| {
+            self.value(&reset.key)
+                .is_some_and(|value| self.is_unset(&reset.key, value))
+        })
+    }
+
     /// The value the key held when this was read, or `None` where it was not set.
     fn was(&self, key: &str) -> Option<&str> {
         self.value(key).filter(|value| !self.is_unset(key, value))
@@ -657,11 +673,13 @@ pub(super) fn write(plan: &SettingsPlan) -> Result<(), (ProfileError, bool)> {
             return Err((ProfileError::NotPersisted(spec.terminal), !undo(&written)));
         }
     }
-    // The last look before the list is written: a key kr does not write that the person set while
-    // the keys were written makes the profile theirs, and the keys written are put back.
+    // The last look before the list is written reads every key of the profile once more. A key kr
+    // does not write that the person set while the keys were written makes the profile theirs, and
+    // so does a key of kr's own that no longer holds what kr wrote, which the person set after the
+    // read back above. The keys written are put back, and a key the person set is left.
     let last = Held::of(gsettings, spec, &plan.wrote.schema, &plan.wrote.path)
         .map_err(|error| (error, !undo(&written)))?;
-    if !last.others_unset(&plan.wrote.keys) {
+    if !last.others_unset(&plan.wrote.keys) || !last.holds_what_kr_wrote(&plan.wrote.keys) {
         return Err((changed(), !undo(&written)));
     }
     if let Err(error) = change_list(gsettings, spec, &plan.uuid, true) {
@@ -842,11 +860,12 @@ pub(super) enum TakenOut {
 
 /// Takes an unchanged profile out: its identifier leaves the shared list and its keys are reset.
 /// Every key of the profile is read before the first write, once more when the profile is out of the
-/// list, and a last time after the resets; a key of kr's is read again just before it is reset. A
-/// key that holds a value the person put there stops the removal: the keys already reset and the
-/// place in the list (if the profile was in it) are put back, and the profile is left as it was.
-/// `in_list` says whether it was. Each reset is read back by another process: a key that still
-/// holds its value is a failure, and one that holds another writer's value is that writer's.
+/// list, and a last time after the resets, when kr's own keys must be at their defaults too; a key of
+/// kr's is read again just before it is reset. A key that holds a value the person put there stops
+/// the removal: the keys already reset and the place in the list (if the profile was in it) are put
+/// back, and the profile is left as it was. `in_list` says whether it was. Each reset is read back
+/// by another process: a key that still holds its value is a failure, and one that holds another
+/// writer's value is that writer's, which the last look finds too if it comes after the check.
 ///
 /// # Errors
 ///
@@ -942,8 +961,11 @@ pub(super) fn take_out(
         put_back(&reset);
         return Err(ProfileError::Changing(spec.terminal));
     }
-    // The last look: a key kr does not write that the person set while the resets ran makes the
-    // profile theirs, and everything this removal did is put back.
+    // The last look reads every key of the profile once more. A key kr does not write that the
+    // person set while the resets ran makes the profile theirs, and everything this removal did is
+    // put back. A key of kr's own that is not at its default again was set by another writer after
+    // its reset was checked: that is the case the reset check handles, so it ends the same way, with
+    // everything put back except that key, and the record kept.
     let last = Held::of(gsettings, &spec, &wrote.schema, &wrote.path)?;
     if !last.others_unset(&wrote.keys) {
         return if put_back(&reset) {
@@ -951,6 +973,10 @@ pub(super) fn take_out(
         } else {
             Err(ProfileError::Changing(spec.terminal))
         };
+    }
+    if !last.is_reset(&wrote.keys) {
+        put_back(&reset);
+        return Err(ProfileError::Changing(spec.terminal));
     }
     Ok(TakenOut::Removed)
 }
