@@ -103,6 +103,80 @@ function Get-KrQueuedKeys {
     $queued
 }
 
+# The members of the runtime's own reader of the terminal, resolved once, or nothing when this
+# runtime keeps none this package can read.
+#
+# A key the editor has not queued is not necessarily one nobody has read. The runtime reads the
+# terminal in chunks: what a chunk holds beyond the key being returned stays in the runtime's own
+# buffer, and what has not been read at all is still in the terminal's queue. Both are input the
+# editor has not met yet, and neither is in the editor's queue. Asking the console whether a key is
+# available would take the lock the editor's reading thread holds while it waits for one, so the
+# runtime's buffer is read where it lies, and the terminal's queue is asked through the runtime's
+# own lock-free poll of the input it was started with.
+$script:RuntimeReader = $null
+
+function Get-KrRuntimeReader {
+    if ($null -ne $script:RuntimeReader) { return $script:RuntimeReader }
+    try {
+        $assembly = [System.Console].Assembly
+        $static = [System.Reflection.BindingFlags]'NonPublic,Static'
+        $instance = [System.Reflection.BindingFlags]'NonPublic,Instance'
+        $pal = $assembly.GetType('System.ConsolePal')
+        $sys = $assembly.GetType('Interop+Sys')
+        $synchronised = $assembly.GetType('System.IO.SyncTextReader')
+        $reader = $assembly.GetType('System.IO.StdInReader')
+        if ($null -eq $pal -or $null -eq $sys -or $null -eq $synchronised -or $null -eq $reader) { return $null }
+        $members = @{
+            Held      = $pal.GetField('s_stdInReader', $static)
+            Ready     = $sys.GetMethod('StdinReady', $static)
+            Inner     = $synchronised.GetField('_in', $instance)
+            Start     = $reader.GetField('_startIndex', $instance)
+            End       = $reader.GetField('_endIndex', $instance)
+            Available = $reader.GetField('_availableKeys', $instance)
+            Pending   = $reader.GetField('_tmpKeys', $instance)
+        }
+        foreach ($member in $members.Values) { if ($null -eq $member) { return $null } }
+        $script:RuntimeReader = $members
+        $members
+    } catch {
+        $null
+    }
+}
+
+# How many characters the runtime has read from the terminal and the editor has not been given, or
+# nothing when that cannot be read.
+#
+# The terminal's queue counts as one when it holds anything, since the runtime offers no more than
+# whether there is input. The runtime's buffer is counted by what it holds, and so are the keys it
+# has made of it and not handed over. They are read in the order the input travels, the queue first
+# and the editor's own after, so that input moving from one to the next while they are read is
+# counted at least once and never missed.
+#
+# A Windows console is read through its own records, which this does not see: there the editor's
+# queue is the only count.
+function Read-KrRuntimeUnread {
+    if ($IsWindows) { return [uint64]0 }
+    $members = Get-KrRuntimeReader
+    if ($null -eq $members) { return $null }
+    try {
+        $unread = [uint64]0
+        if ([bool]$members.Ready.Invoke($null, @())) { $unread = [uint64]1 }
+        # The runtime makes its reader on the first key it is asked for. Before that there is
+        # nothing it has read.
+        $held = $members.Held.GetValue($null)
+        if ($null -eq $held) { return $unread }
+        $inner = $members.Inner.GetValue($held)
+        if ($null -eq $inner) { return $null }
+        $buffered = [int]$members.End.GetValue($inner) - [int]$members.Start.GetValue($inner)
+        if ($buffered -gt 0) { $unread += [uint64]$buffered }
+        $unread += [uint64]([System.Collections.ICollection]$members.Available.GetValue($inner)).Count
+        $unread += [uint64]([System.Collections.ICollection]$members.Pending.GetValue($inner)).Count
+        $unread
+    } catch {
+        $null
+    }
+}
+
 $script:SearchCountField = $null
 $script:StatusPromptField = $null
 
@@ -170,7 +244,12 @@ function Get-KrReaderState {
     # its queues are not drained, so no fence is proved over keys it could not count.
     $known = Read-KrQueuedKeys
     $queued = if ($null -eq $known) { [uint64]0 } else { $known }
-    $typeahead = $queued
+    # Input the runtime has read from the terminal, or has yet to, is input the editor has not met,
+    # whoever it came from: a person, or the host answering a question an application asked. A
+    # runtime that cannot say is not read as having none.
+    $unread = Read-KrRuntimeUnread
+    if ($null -eq $unread) { $known = $null; $unread = [uint64]0 }
+    $typeahead = $queued + $unread
     $modes = Get-KrEditorModes
 
     @{

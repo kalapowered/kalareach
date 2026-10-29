@@ -778,10 +778,10 @@ acknowledged an operation in progress; or input, an interrupt, a refused launch 
 changed the worker's picture after the fence was proved. `verified` carries the prompt generation,
 the acknowledged buffer revision and the working-directory revision; a launch does not quote the
 last. The reader checks the real buffer when the launch arrives, so a read can say `verified` while
-a key waits in the terminal's queue. The Zsh, Bash and Fish readers count the terminal's unread
-bytes, and the launch is then refused with `EDITOR_BUSY`, since the queued key is input the reader
-has not read; the PowerShell reader counts only the keys its editor has queued, so a key still in
-the terminal or in .NET's input buffer is not seen and the launch is installed in front of it. An
+a key waits in the terminal's queue. The Zsh, Bash, Fish and PowerShell readers count the terminal's
+unread bytes, and the launch is then refused with `EDITOR_BUSY`, since the queued key is input the
+reader has not read; on a Windows console the PowerShell reader counts only the keys its editor has
+queued, so a key still in the console's input is not seen and the launch is installed in front of it. An
 editor whose own state had moved (the buffer, its revision, the prompt or the working directory) is
 `DRAFT_CONFLICT`.
 
