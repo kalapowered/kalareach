@@ -2570,10 +2570,14 @@ jobs:
       # packages a runner tests would leave some out. Cargo settles the features of a run from the
       # packages it names: the second runner's packages settle them as the whole workspace does,
       # and little is built again, while the controller's alone build the crates under its tests
-      # once more with the features its own tests ask for.
+      # once more with the features its own tests ask for. On a hosted runner the build takes about
+      # 39 minutes, and its limit is a little over twice that. The two steps that run the tests
+      # run only after a build that succeeded: without its programs each would report the cases
+      # that start one as failed, hundreds of them for one failed build.
       - name: Build the workspace's tests
+        id: workspace-build
         if: ${{ !cancelled() && startsWith(matrix.part, 'tests') }}
-        timeout-minutes: 76
+        timeout-minutes: 80
         run: cargo test --no-run --locked --workspace --exclude kr-sync-integration
 
       # The tests of every package but the controller, less what this runner cannot run, each left
@@ -2585,9 +2589,12 @@ jobs:
       #   has it, and its test step runs them.
       # - The cases that need another filesystem, and the cases whose verdicts are timings, which
       #   run on the other runner, in the two steps after the controller's tests.
+      #
+      # On a hosted runner the step takes about 65 minutes, and its limit is a little over twice
+      # that.
       - name: Test
-        if: ${{ !cancelled() && matrix.part == 'tests-second' }}
-        timeout-minutes: 125
+        if: ${{ !cancelled() && matrix.part == 'tests-second' && steps.workspace-build.outcome == 'success' }}
+        timeout-minutes: 130
         run: >-
           cargo test --locked --workspace --exclude kr-sync-integration --exclude kr-controller
           --no-fail-fast --
@@ -2620,7 +2627,7 @@ jobs:
       # The controller's tests, which leave out the cases the step above leaves out: the two lists
       # of cases are one list.
       - name: Test the controller
-        if: ${{ !cancelled() && matrix.part == 'tests' }}
+        if: ${{ !cancelled() && matrix.part == 'tests' && steps.workspace-build.outcome == 'success' }}
         timeout-minutes: 115
         run: >-
           cargo test --locked -p kr-controller --no-fail-fast --
