@@ -144,27 +144,38 @@ pub struct CompilePool {
     hold: Arc<HoldState>,
 }
 
-/// Whether a test holds the pool's jobs, and what a held job waits on.
+/// How many holds tests have on the pool's jobs, and what a held job waits on.
 #[cfg(feature = "testing")]
 #[derive(Debug, Default)]
 struct HoldState {
-    held: Mutex<bool>,
+    holds: Mutex<usize>,
     released: Condvar,
 }
 
 #[cfg(feature = "testing")]
 impl HoldState {
-    fn set(&self, held: bool) {
-        *self.held.lock().unwrap_or_else(PoisonError::into_inner) = held;
-        self.released.notify_all();
+    fn take(&self) {
+        *self.holds.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+    }
+
+    fn release(&self) {
+        let mut holds = self.holds.lock().unwrap_or_else(PoisonError::into_inner);
+        *holds = holds.saturating_sub(1);
+        if *holds == 0 {
+            self.released.notify_all();
+        }
+    }
+
+    fn is_held(&self) -> bool {
+        *self.holds.lock().unwrap_or_else(PoisonError::into_inner) > 0
     }
 
     fn wait_until_released(&self) {
-        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
-        while *held {
-            held = self
+        let mut holds = self.holds.lock().unwrap_or_else(PoisonError::into_inner);
+        while *holds > 0 {
+            holds = self
                 .released
-                .wait(held)
+                .wait(holds)
                 .unwrap_or_else(PoisonError::into_inner);
         }
     }
@@ -172,9 +183,9 @@ impl HoldState {
 
 /// A test's hold on the compilation pool, taken with [`CompilePool::hold`].
 ///
-/// Every job the pool takes while the hold stands waits before it compiles anything, so a caller
+/// Every job the pool takes while a hold stands waits before it compiles anything, so a caller
 /// that was told its compile was queued can be shown a compile that is not done and cannot be done.
-/// Dropping the hold lets the jobs go.
+/// Dropping a hold lets the jobs go once no other hold stands.
 #[cfg(feature = "testing")]
 #[derive(Debug)]
 pub struct CompileHold {
@@ -184,7 +195,7 @@ pub struct CompileHold {
 #[cfg(feature = "testing")]
 impl Drop for CompileHold {
     fn drop(&mut self) {
-        self.state.set(false);
+        self.state.release();
     }
 }
 
@@ -245,14 +256,22 @@ impl CompilePool {
         }
     }
 
-    /// Holds every job the pool takes until the returned hold is dropped. One hold at a time.
+    /// Holds every job the pool takes until the returned hold, and every other hold taken meanwhile,
+    /// is dropped.
     #[cfg(feature = "testing")]
     #[must_use]
     pub fn hold(&self) -> CompileHold {
-        self.hold.set(true);
+        self.hold.take();
         CompileHold {
             state: Arc::clone(&self.hold),
         }
+    }
+
+    /// Whether a hold on the pool's jobs stands.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn is_held(&self) -> bool {
+        self.hold.is_held()
     }
 
     /// Returns how many threads the pool was built with.
@@ -483,26 +502,36 @@ mod tests {
             .expect("a number")
     }
 
-    // KR-REQ-11.41: a thread that asks for background priority has the lowest priority an ordinary
-    // thread can have, in the kernel's own record of it, and not only a report that it asked.
+    // KR-REQ-11.41: a compile runs on a pool thread that the kernel holds at the lowest ordinary
+    // priority, and not only one that reports that it asked.
+    //
+    // The work is queued on the pool and reads the nice value of the thread it runs on, so a pool
+    // whose threads asked for nothing, or whose request was made on another thread, fails here.
+    // A sandbox that refuses a thread the change of its own priority makes the pool report
+    // `Declined`, which the pool allows; this case is for a host that does not refuse it.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_thread_that_lowers_its_priority_has_the_lowest_ordinary_priority_in_the_kernel() {
-        let (outcome, after) = std::thread::spawn(|| {
-            let outcome = lower_priority();
-            (outcome, nice_of_this_thread())
-        })
-        .join()
-        .expect("the thread finished");
+    fn a_compile_runs_on_a_pool_thread_the_kernel_holds_at_the_lowest_ordinary_priority() {
+        let pool = CompilePool::with_threads(1, 1);
+        let (reply, nice) = mpsc::channel();
+        pool.sender
+            .try_send(Job(Box::new(move || {
+                let _ = reply.send(nice_of_this_thread());
+            })))
+            .expect("the job is queued");
+        let held_at = nice
+            .recv_timeout(core::time::Duration::from_secs(60))
+            .expect("the pool thread ran the job");
         assert_eq!(
-            outcome,
-            BackgroundPriority::Lowered,
-            "an ordinary thread may always lower its own priority"
+            pool.background_priority(),
+            Some(BackgroundPriority::Lowered),
+            "the pool thread's request was declined, which a sandbox that refuses a thread the \
+             change of its own priority does"
         );
-        assert_eq!(after, 19, "the kernel holds this thread at nice {after}");
+        assert_eq!(held_at, 19, "the kernel holds the pool thread at nice {held_at}");
     }
 
-    // KR-REQ-11.41: a compile runs on a pool thread that has asked for background priority.
+    // KR-REQ-11.41: a pool thread reports the priority its request for background priority came to.
     #[test]
     fn a_pool_thread_asks_for_background_priority() {
         let pool = CompilePool::with_threads(1, 1);
@@ -519,6 +548,22 @@ mod tests {
             pool.background_priority(),
             Some(BackgroundPriority::Lowered | BackgroundPriority::Declined)
         ));
+    }
+
+    // KR-REQ-11.41: the jobs a held pool takes wait until the last hold is let go, however the
+    // holds are taken and dropped, so a compile cannot be released by a hold that was dropped
+    // early.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_pool_stays_held_until_the_last_hold_is_dropped() {
+        let pool = CompilePool::with_threads(1, 1);
+        assert!(!pool.is_held());
+        let first = pool.hold();
+        let second = pool.hold();
+        drop(first);
+        assert!(pool.is_held(), "the first hold's drop freed the second's");
+        drop(second);
+        assert!(!pool.is_held());
     }
 
     #[test]
