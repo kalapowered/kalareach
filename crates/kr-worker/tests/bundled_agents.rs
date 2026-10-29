@@ -469,17 +469,71 @@ fn the_kimi_distribution_is_told_by_its_installation_location() {
     );
 }
 
-/// KR-REQ-12.19, KR-REQ-12.24: the two OpenCode profiles recognise one program identically, and the
-/// worker chooses neither for it: which API family a build serves is not told by its name, its
-/// version or its location.
+/// KR-REQ-12.19, KR-REQ-12.23, KR-REQ-12.24: the two OpenCode profiles recognise one program
+/// identically, and the worker chooses neither for it: which API family a build serves is not told
+/// by its name, its version or its location. The program is still the person's own agent and
+/// still runs as typed, so it is found running as a native terminal instance bound to no package,
+/// and the announcement names the two profiles and says that none was chosen. The terminal is all
+/// that instance has: no binding, so no observation and no action is claimed for it.
 #[test]
-fn an_opencode_program_is_bound_to_neither_of_its_two_profiles() {
+fn an_opencode_program_is_found_as_a_native_terminal_bound_to_neither_of_its_two_profiles() {
     let setup = Setup::new();
+    let (line, resolution) = decided("opencode");
+    let Resolution::Bypassed {
+        arguments, reason, ..
+    } = resolution
+    else {
+        panic!("opencode is run as typed under the default configuration");
+    };
+    assert_eq!(arguments, line, "the vector as typed");
     for relative in ["bin/opencode", ".opencode/bin/opencode"] {
-        let path = setup.host.root().join(relative).display().to_string();
+        let (typed, program) = setup.typed_at(relative, &arguments[1..]);
+        let told = setup.adopt(&foreground(&typed, &program, reason));
+        assert_eq!(told.len(), 1, "{relative} is found running: {told:?}");
+        let summary = &told[0];
+        assert_eq!(
+            summary.mode,
+            IntegrationMode::NativeTerminal,
+            "{relative}: the native terminal is the default"
+        );
+        assert_eq!(
+            summary.bypass.as_ref(),
+            Some(&CommandBypassReason::NotIntegrated),
+            "{relative}: its line was answered that it is not integrated"
+        );
         assert!(
-            setup.broker.admitted_match(&path).is_none(),
-            "{relative}: both profiles claim it equally"
+            summary.plugin_id.as_ref().is_none(),
+            "{relative}: no profile is named as the one that recognised it"
+        );
+        let notice = summary
+            .refusal
+            .as_ref()
+            .unwrap_or_else(|| panic!("{relative}: the announcement says why nothing is bound"));
+        for tied in ["kalareach/opencode", "kalareach/opencode-attach"] {
+            assert!(notice.contains(tied), "{relative}: names {tied}: {notice}");
+        }
+        assert!(
+            notice.contains("equally well") && notice.contains("no package was chosen"),
+            "{relative}: says that neither was chosen: {notice}"
+        );
+        let instance = summary.application_instance_id;
+        assert!(
+            setup
+                .broker
+                .live_bindings()
+                .into_iter()
+                .all(|live| live.application_instance_id != instance),
+            "{relative}: bound to neither profile"
+        );
+        let profile = setup
+            .broker
+            .profile_of(instance)
+            .expect("the profile it was observed running");
+        assert_eq!(profile.mode, IntegrationMode::NativeTerminal);
+        assert_eq!(
+            profile.arguments.get(1..),
+            Some(&arguments[1..]),
+            "{relative}: the vector as typed, with nothing added"
         );
     }
 }

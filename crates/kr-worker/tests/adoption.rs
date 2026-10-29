@@ -11,7 +11,7 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-12.07 | a program the root shell ran that the integration did not launch is adopted as a native terminal instance with no process record, its process placing the questions it asks and admitting no bridge, with the bypass its line was answered with, its bridges refused, and ended when it exits; a program the integration launched is not adopted; a view that installs the session's list and applies the announcements after it holds each instance once; the watch finds a program the root shell starts from a typed line within two seconds of it running, at once or after four silent seconds, and its end within two seconds of its exit, and looks when the integration asks about an invocation or reports a command starting |
-//! | KR-REQ-11.13 | an adopted program is bound in the same step to the admitted package that recognises it, for the program found running, and the binding ends with it; a program two packages recognise equally well is adopted by neither, and the one left is selected; a package with no connector table adopts and binds what it recognises |
+//! | KR-REQ-11.13 | an adopted program is bound in the same step to the admitted package that recognises it, for the program found running, and the binding ends with it; a program two packages recognise equally well is adopted bound to neither, with an announcement that names them, and the one left is bound to it; a package with no connector table adopts and binds what it recognises |
 
 #![cfg(unix)]
 
@@ -377,14 +377,16 @@ fn kr_req_12_07_a_program_the_integration_did_not_launch_is_adopted_without_a_la
     );
 }
 
-/// KR-REQ-11.13: a program two admitted packages both recognise equally well is adopted by neither,
-/// because the software development kit's rule selects neither and the host does not pick one on
-/// their behalf. A rule that declares itself exact recognises a program found running no better
-/// than an inferred one does: the worker has not established where the program came from, so a name
-/// on disk is a guess whatever the rule declares. With one of the packages no longer admitted, the
-/// one left is selected, and the program is adopted and bound to it.
+/// KR-REQ-11.13, KR-REQ-12.23: a program two admitted packages both recognise equally well is
+/// adopted bound to neither, because the software development kit's rule selects neither and the
+/// host does not pick one on their behalf. A rule that declares itself exact recognises a program
+/// found running no better than an inferred one does: the worker has not established where the
+/// program came from, so a name on disk is a guess whatever the rule declares. The program is still
+/// the person's own, so it is recorded as a native terminal instance that names no package, and its
+/// announcement names every package that ties and says that none was chosen. With one of the
+/// packages no longer admitted, the next snapshot binds the one left to the instance.
 #[test]
-fn kr_req_11_13_a_program_two_packages_recognise_equally_well_is_adopted_by_neither() {
+fn kr_req_11_13_a_program_two_packages_recognise_equally_well_is_adopted_bound_to_neither() {
     let setup = Setup::with(fixture::COMMAND, |store, bin| {
         vec![
             fixture::claude_code_package(store, &bin.join("kr-hook")).expect("the package"),
@@ -413,31 +415,38 @@ fn kr_req_11_13_a_program_two_packages_recognise_equally_well_is_adopted_by_neit
     }
     let foreground = Setup::foreground(&started, Vec::new());
 
-    // Running the program the packages recognise, and looked at for two seconds.
-    let looking = std::time::Instant::now() + Duration::from_secs(2);
-    while std::time::Instant::now() < looking {
-        assert!(
-            setup.adoptions.look(&foreground).is_empty(),
-            "equal matches adopt nothing"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    assert!(setup.broker.live_bindings().is_empty());
-
-    setup.admit_only(2, &[1]);
+    // Running the program the packages recognise: found, with no package bound to it.
     let told = setup.adopt(&foreground);
-    assert_eq!(told.len(), 1, "adopted once one match is left: {told:?}");
-    assert_eq!(
-        told[0]
-            .plugin_id
-            .as_ref()
-            .map(ToString::to_string)
-            .as_deref(),
-        Some("kalareach/claude-one"),
-        "the package left is the one selected"
+    assert_eq!(told.len(), 1, "the program is found running: {told:?}");
+    let instance = told[0].application_instance_id;
+    assert_eq!(told[0].mode, IntegrationMode::NativeTerminal);
+    assert!(
+        told[0].plugin_id.as_ref().is_none(),
+        "no package is named: {told:?}"
     );
+    let notice = told[0].refusal.as_ref().expect("a notice says why");
+    for tied in [
+        "kalareach/claude-code",
+        "kalareach/claude-one",
+        "kalareach/claude-two",
+    ] {
+        assert!(notice.contains(tied), "the notice names {tied}: {notice}");
+    }
+    assert!(
+        notice.contains("equally well") && notice.contains("no package was chosen"),
+        "and says that none was chosen: {notice}"
+    );
+    assert!(setup.broker.live_bindings().is_empty(), "bound to none");
+    assert_eq!(setup.bound_to(instance), None);
+    assert!(
+        setup.adoptions.look(&foreground).is_empty(),
+        "and it is found once"
+    );
+
+    // One of the packages is no longer admitted: the one left is selected for the instance.
+    setup.admit_only(2, &[1]);
     assert_eq!(
-        setup.bound_to(told[0].application_instance_id),
+        setup.bound_to(instance),
         Some(setup.packages[1].package_digest)
     );
     started.end();
