@@ -1166,10 +1166,10 @@ mod command {
     /// enables the `testing` feature of the library for it); a value that build refuses is no value
     /// to a release build, which answers as it does without the variable. The release build is made
     /// by the list that runs this (`cargo build --release -p kr-cli --bin kr`) and named in
-    /// `KR_RELEASE_PROGRAM`; where that is not set the case is skipped, and it fails where
-    /// `KR_REQUIRE_RELEASE_PROGRAM` is set. Linux only, since a release build that did read the
-    /// variable is shown by any platform, and on macOS one that did not would read the runner's own
-    /// preferences.
+    /// `KR_RELEASE_PROGRAM`; where that is not set the case returns at once (the harness reports
+    /// it as passed), and it fails where `KR_REQUIRE_RELEASE_PROGRAM` is set. Linux only, since a
+    /// release build that did read the variable is shown by any platform, and on macOS one that
+    /// did not would read the runner's own preferences.
     #[test]
     fn a_release_build_does_not_read_the_preferences_variable() {
         let Some(release) = std::env::var_os("KR_RELEASE_PROGRAM").map(PathBuf::from) else {

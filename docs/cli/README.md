@@ -810,8 +810,8 @@ reset that the settings say worked and did not keep is a failure, and so is a ke
 set between `kr`'s reset of it and the read that checks the reset, or after that check and before the
 last look, which reads the three keys `kr` resets too: the removal puts back what it had changed,
 leaves that key, fails, and the record keeps the entry. A key that the person sets between
-`kr`'s last read of it and its write or reset is overwritten or reset, and a key `kr` does not write
-that the person sets after the last look is not seen: named limits, as the list's are.
+`kr`'s last read of it and its write or reset is overwritten or reset, and a key that the person sets
+after the last look is not seen, `kr`'s own included: named limits, as the list's are.
 
 `remove` without an application takes out every profile in the record, and `--dry-run` says what
 each would come to. A record of a later format, or one that cannot be read, is left as it is and
