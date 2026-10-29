@@ -109,9 +109,10 @@ import { admit, describeBytes, type Picked } from '../model/media'
 import { useBook } from '../../app/drafts'
 import type { Lifecycle } from '../useLifecycle'
 import { minimumTarget, type Surface } from '../platform'
+import { RetainedOutput } from '../../views/Output'
 
-/** Which of the two views is showing. */
-type Pane = 'semantic' | 'terminal'
+/** Which of the three views is showing. */
+type Pane = 'semantic' | 'terminal' | 'output'
 
 /**
  * The shortest session, in multiples of the root text size, that holds the view switch, the
@@ -234,7 +235,7 @@ export function MobileSession({
   const target = minimumTarget(surface)
   // One scroll position per view, kept across a switch: coming back to a view you were reading
   // halfway down and finding the top of it is losing your place.
-  const positions = useRef<Record<Pane, number>>({ semantic: 0, terminal: 0 })
+  const positions = useRef<Record<Pane, number>>({ semantic: 0, terminal: 0, output: 0 })
   const paneRef = useRef<HTMLDivElement | null>(null)
 
   // The clock is read once, when this screen opens. Reading it while rendering would make the
@@ -1101,7 +1102,8 @@ export function MobileSession({
           }}
           options={[
             { value: 'semantic', label: 'Conversation' },
-            { value: 'terminal', label: 'Terminal' }
+            { value: 'terminal', label: 'Terminal' },
+            { value: 'output', label: 'Output' }
           ]}
         />
       </div>
@@ -1160,6 +1162,10 @@ export function MobileSession({
               ))
             )}
           </div>
+        ) : pane === 'output' ? (
+          // What the session wrote, as the host keeps it: read as the desktop reads it, and kept
+          // where the reader left it when the view changes.
+          <RetainedOutput key={sessionId} sessionId={sessionId} />
         ) : liveScreen === false ? (
           <p className="m-empty" data-testid="no-live-screen">
             This share does not include the live screen.

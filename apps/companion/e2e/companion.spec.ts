@@ -4551,6 +4551,58 @@ test.describe("the phone's settings over a live session", () => {
   }
 })
 
+// KR-REQ-13.15: the phone's session reads the session's retained output in a view of its own. It
+// fills the room under the view switch, scrolls within it, draws no composer under it, and stays
+// whole at a person's own text size.
+test.describe("the phone's retained output", () => {
+  const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+  const SIZES: readonly Seen[] = [
+    { width: 390, height: 844, scale: '100%' },
+    { width: 320, height: 720, scale: '200%' }
+  ]
+
+  for (const surface of ['ios', 'android'] as const) {
+    for (const seen of SIZES) {
+      test(`fills the pane under the view switch on ${surface} at ${seen.width}×${seen.height} with text at ${seen.scale}`, async ({
+        page
+      }) => {
+        await onPhone(page, surface, seen, `&session=${SESSION}`)
+        await page.getByRole('tab', { name: 'Output' }).click()
+        const output = page.getByTestId('output-scroll')
+        await expect(output).toContainText('finished 900 tests')
+
+        const placed = await page.evaluate(() => {
+          const rect = (selector: string) => {
+            const element = document.querySelector(selector)
+            const box = element?.getBoundingClientRect()
+            return box ? { left: box.left, right: box.right, top: box.top, bottom: box.bottom } : null
+          }
+          return {
+            output: rect('[data-testid="output-scroll"]'),
+            tabs: rect('.m-session [role="tablist"]'),
+            sideways: document.documentElement.scrollWidth - document.documentElement.clientWidth
+          }
+        })
+        expect(placed.output, 'the output is drawn').not.toBeNull()
+        expect(placed.tabs, 'the view switch is drawn').not.toBeNull()
+        if (placed.output === null || placed.tabs === null) return
+        expect(placed.output.top, 'the output is under the view switch').toBeGreaterThanOrEqual(placed.tabs.bottom - 0.5)
+        expect(placed.output.left, 'the output starts on the screen').toBeGreaterThanOrEqual(-0.5)
+        expect(placed.output.right, 'the output ends on the screen').toBeLessThanOrEqual(seen.width + 0.5)
+        expect(placed.output.bottom, 'the output ends on the screen').toBeLessThanOrEqual(seen.height + 0.5)
+        expect(placed.sideways, 'the page does not run past the window').toBeLessThanOrEqual(0)
+        // The composer is not drawn under it, so the output has the room the composer would take.
+        await expect(page.getByLabel('Message this session')).toBeHidden()
+
+        // The conversation has its composer back, with what was typed in it.
+        await page.getByRole('tab', { name: 'Conversation' }).click()
+        await expect(page.getByLabel('Message this session')).toBeVisible()
+        await still(page, `phone-output-13.15-${surface}-${seen.width}`)
+      })
+    }
+  }
+})
+
 // KR-REQ-13.19: the inbox's rows stay inside the screen at a person's own text size, and the count
 // on the Attention tab is a circle that holds its digits at any size. At the base text size neither
 // moves.

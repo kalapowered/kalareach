@@ -614,6 +614,36 @@
   overflow: hidden;
 }
 
+/*
+ * The retained output fills the pane and scrolls within it, so the page keeps the view switch above
+ * it. The composer is not drawn under it: the draft stays in the page and is there when the
+ * conversation comes back.
+ */
+.m-session[data-pane='output'] {
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.m-session[data-pane='output'] > .m-pane {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.m-session[data-pane='output'] .retained-output {
+  flex: 1 1 auto;
+  min-block-size: 0;
+}
+
+.m-session[data-pane='output'] .output-scroll {
+  flex: 1 1 auto;
+  min-block-size: 0;
+  max-block-size: none;
+}
+
+.m-session[data-pane='output'] > .m-composer {
+  display: none;
+}
+
 /* Streamed output never animates: text that fades in is text a person cannot read as it arrives. */
 .m-stream * {
   transition: none !important;

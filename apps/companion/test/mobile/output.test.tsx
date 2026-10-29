@@ -71,7 +71,12 @@ describe("the phone's session reads the session's retained output (KR-REQ-13.15)
 
   it('returns the reader to the page they were reading after a change of view and back', async () => {
     const person = userEvent.setup()
-    const { port } = fakeHost()
+    const { port, controls } = fakeHost()
+    // More than a page of output, so that going back reads an older page.
+    controls.records.appendOutput(
+      SESSION_MAIN,
+      Array.from({ length: 6000 }, (_, line) => `output line ${String(line).padStart(5, '0')}`).join('\r\n')
+    )
     render(
       <AppProvider port={port}>
         <OnSession />
