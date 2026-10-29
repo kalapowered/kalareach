@@ -11,8 +11,10 @@
 
 set -euo pipefail
 
+# A failed fetch is a failure of its own: this runs on the left of `||`, where `set -e` does not
+# apply, and the reference that is already there would otherwise decide.
 on_main() { # <commit>
-    git fetch --quiet origin '+refs/heads/main:refs/remotes/origin/main'
+    git fetch --quiet origin '+refs/heads/main:refs/remotes/origin/main' || return 2
     git merge-base --is-ancestor "$1" refs/remotes/origin/main
 }
 
@@ -59,6 +61,15 @@ self_test() {
             exit 1
         fi
         echo "self-test ok: a commit that is not in main's history is refused, with a tag called origin/main in place"
+        # The reference the clone already holds says main has the side commit; the fetch that would
+        # correct it fails.
+        git update-ref refs/remotes/origin/main "$side_commit"
+        git remote set-url origin "$work/gone.git"
+        if on_main "$side_commit" 2> /dev/null; then
+            echo "self-test FAILED: a fetch that failed was ignored, and the reference already held decided"
+            exit 1
+        fi
+        echo "self-test ok: a fetch that fails is a refusal, whatever reference is already held"
     ) || status=1
     [ "$status" -eq 0 ] && echo "check-commit-on-main: the self-test passed"
     return "$status"
