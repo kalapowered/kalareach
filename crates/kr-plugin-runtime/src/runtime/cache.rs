@@ -600,6 +600,8 @@ mod tests {
         assert!(error.to_string().contains("engine-from-last-year"));
     }
 
+    // KR-REQ-11.41: compiled code is shared only for the target it was made for, and an entry that
+    // says another target is refused rather than loaded.
     #[test]
     fn an_entry_for_another_target_is_refused() {
         let (_directory, cache) = cache();

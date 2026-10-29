@@ -468,6 +468,7 @@ mod tests {
         assert!(matches!(error, RuntimeError::ComponentTooLarge { .. }));
     }
 
+    // KR-REQ-11.41: a compile runs on a pool thread that has asked for background priority.
     #[test]
     fn a_pool_thread_asks_for_background_priority() {
         let pool = CompilePool::with_threads(1, 1);

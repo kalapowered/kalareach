@@ -3238,7 +3238,8 @@ mod tests {
         }
     }
 
-    /// Section 9 and section 11: the queue is bounded in bytes, not in frames.
+    /// KR-REQ-11.38: broker I/O has limits of its own, apart from a component's: the write queue
+    /// is bounded in bytes, not in frames, and a full queue refuses rather than grows.
     #[tokio::test]
     async fn a_queue_that_is_full_refuses_rather_than_growing() {
         let (upstream, _client) = tokio::io::duplex(64);

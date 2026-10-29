@@ -995,6 +995,58 @@ fn kr_req_11_41_a_cache_another_engine_release_filed_is_compiled_again() {
     assert_eq!(loaded.origin, CompileOrigin::Cached);
 }
 
+// KR-REQ-11.41: compiled code another target filed is compiled again, and left alone.
+//
+// Machine code is for one instruction set, so the target is part of what an entry is filed under:
+// the same component under the same engine release, filed for another target, is another entry.
+#[test]
+fn kr_req_11_41_a_cache_another_target_filed_is_compiled_again() {
+    let Some(wasm) = components::well_behaved() else {
+        return;
+    };
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let root = directory.path().join("plugin-cache");
+    let engine = engine();
+    let current = key_for(&engine, &wasm);
+
+    let mut elsewhere = current.clone();
+    elsewhere.target = format!("another-{}", current.target);
+    assert_eq!(elsewhere.engine_version, current.engine_version);
+    assert_eq!(elsewhere.engine_compatibility, current.engine_compatibility);
+    assert_ne!(
+        elsewhere.engine_directory(),
+        current.engine_directory(),
+        "an entry for another target shares this target's directory"
+    );
+
+    let filed = kr_plugin_runtime::runtime::cache::CompiledCache::open(&root).expect("a cache");
+    filed
+        .store(&elsewhere, &compiled_by_this_host(&engine, &wasm))
+        .expect("the entry is filed");
+    let artefact = std::fs::read(filed.artefact_path(&elsewhere)).expect("its artefact");
+    let manifest = std::fs::read(filed.manifest_path(&elsewhere)).expect("its manifest");
+
+    // A host that starts afresh over that directory finds nothing under its own target, so it
+    // compiles, and the other target's entry is neither loaded, refused nor touched.
+    let restarted = kr_plugin_runtime::runtime::cache::CompiledCache::open(&root).expect("a cache");
+    let compiled = compile_or_load(&engine, &restarted, &wasm, no_compile_time_bound())
+        .expect("the component compiles");
+    assert_eq!(compiled.origin, CompileOrigin::Compiled);
+    assert_eq!(
+        std::fs::read(restarted.artefact_path(&elsewhere)).expect("its artefact"),
+        artefact
+    );
+    assert_eq!(
+        std::fs::read(restarted.manifest_path(&elsewhere)).expect("its manifest"),
+        manifest
+    );
+
+    // And this target's entry is the one it loads the next time.
+    let loaded = compile_or_load(&engine, &restarted, &wasm, no_compile_time_bound())
+        .expect("the component loads");
+    assert_eq!(loaded.origin, CompileOrigin::Cached);
+}
+
 // KR-REQ-11.41: an entry another engine release made is refused by its manifest, wherever it is
 // found, and the component is compiled again.
 #[test]
