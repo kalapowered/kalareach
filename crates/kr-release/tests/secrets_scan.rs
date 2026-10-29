@@ -259,7 +259,7 @@ fn is_a_scan(line: &str) -> bool {
     !line.starts_with('#') && line.contains("check-release-secrets.py") && line.contains(" scan ")
 }
 
-/// Whether a line of a workflow opens a job: a key at the first level under `jobs`.
+/// Whether a line opens a job: a key at the first level under `jobs`.
 fn starts_a_job(line: &str) -> bool {
     line.starts_with("  ")
         && !line.starts_with("   ")
@@ -267,13 +267,21 @@ fn starts_a_job(line: &str) -> bool {
         && !line.trim_start().starts_with('#')
 }
 
-/// The step a line of a workflow is in: the index of its first line and of its last.
-fn step_around(lines: &[(usize, String)], at: usize) -> (usize, usize) {
+/// The index of the first line of the job a line of a workflow is in.
+fn job_of(lines: &[(usize, String)], at: usize) -> usize {
+    lines[..=at]
+        .iter()
+        .rposition(|(_, line)| starts_a_job(line))
+        .expect("a line of a job")
+}
+
+/// The index of the first and of the last line of the step a line of a workflow is in.
+fn step_of(lines: &[(usize, String)], at: usize) -> (usize, usize) {
     let starts_a_step = |line: &str| line.starts_with("      - ");
-    let first = lines[..at]
+    let first = lines[..=at]
         .iter()
         .rposition(|(_, line)| starts_a_step(line))
-        .unwrap_or(0);
+        .expect("a line of a step");
     let last = lines[at + 1..]
         .iter()
         .position(|(_, line)| starts_a_step(line) || starts_a_job(line))
@@ -281,17 +289,92 @@ fn step_around(lines: &[(usize, String)], at: usize) -> (usize, usize) {
     (first, last)
 }
 
-/// The index of the first line of the job a line of a workflow is in.
-fn job_starting_before(lines: &[(usize, String)], at: usize) -> usize {
-    lines[..at]
+/// What every scan step of a workflow must be: the command itself, whose failure stops the step,
+/// in a step and a job that nothing makes optional.
+fn assert_a_scan_that_cannot_be_skipped(workflow: &str, lines: &[(usize, String)], scan: usize) {
+    let (number, text) = &lines[scan];
+    let command = text.trim_start().trim_start_matches("run:").trim_start();
+    assert!(
+        command.starts_with("python3 scripts/check-release-secrets.py scan ")
+            || command.starts_with("python scripts/check-release-secrets.py scan "),
+        "{workflow}:{number} is not the scan command on its own: {text}"
+    );
+    assert!(
+        !command.contains("||")
+            && !command.contains("&&")
+            && !command.contains(';')
+            && !command.contains('|')
+            && !command.ends_with('\\'),
+        "{workflow}:{number} lets the scan fail without stopping the step: {text}"
+    );
+    let following = lines[scan + 1..]
         .iter()
-        .rposition(|(_, line)| starts_a_job(line))
-        .expect("a scan is inside a job")
+        .map(|(_, line)| line.trim_start())
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    assert!(
+        !following.starts_with('|') && !following.starts_with('&'),
+        "{workflow}:{number} is followed by a line that joins the command to another"
+    );
+    let (first, last) = step_of(lines, scan);
+    for (at, line) in &lines[first..=last] {
+        let property = line.trim_start().trim_start_matches("- ");
+        assert!(
+            !property.starts_with("continue-on-error") && !property.contains("set +e"),
+            "{workflow}:{at} makes the scan at line {number} optional"
+        );
+        assert!(
+            !(line.starts_with("        if:") || line.starts_with("      - if:")),
+            "{workflow}:{at} makes the scan at line {number} conditional"
+        );
+    }
+    let job = job_of(lines, scan);
+    for (at, line) in lines[job..first].iter() {
+        if line.trim_start().starts_with("steps:") {
+            break;
+        }
+        assert!(
+            !line.contains("continue-on-error"),
+            "{workflow}:{at} makes the job of the scan at line {number} optional"
+        );
+    }
 }
 
-/// KR-REQ-26.41: the release workflows that assemble a tree or an archive scan it for a private key
-/// in the job that makes it, before that job keeps anything, and nothing makes a scan optional. The
-/// macOS and Linux trees are sealed by the script above, which the workflows that seal run.
+/// What each release workflow scans, and the step that keeps it: the scan of the first must come
+/// before the step named by the second, in the same job. The Windows `release` job, which signs and
+/// publishes, scans nothing it packs: the trees it takes were scanned by the `build` job, and the
+/// signing changes the files (`docs/releases/keys.md` names the gap).
+const SCANNED_BEFORE_KEPT: [(&str, &str, &str); 5] = [
+    (
+        "release-tree.yml",
+        "tree/$TOP",
+        "Seal the tree with this run's keys, and pack the archive",
+    ),
+    (
+        "release-tree.yml",
+        "tree/$TOP",
+        "Keep the tree a release is made from",
+    ),
+    (
+        "release-host.yml",
+        "sealed/$top.tar.gz",
+        "Keep the digest that was checked",
+    ),
+    (
+        "release-windows.yml",
+        "/tree/$TOP",
+        "Keep the tree for signing",
+    ),
+    (
+        "release-windows.yml",
+        "$TOP.zip",
+        "Keep the archive this run proved",
+    ),
+];
+
+/// KR-REQ-26.41: the release workflows scan what they assemble for a private key before the step
+/// that seals or keeps it, in the same job, and nothing makes a scan optional or conditional. The
+/// macOS and Linux trees are sealed by the script above, which the workflows run.
 #[test]
 fn the_release_workflows_scan_what_they_assemble_before_they_keep_it() {
     for workflow in [
@@ -310,43 +393,53 @@ fn the_release_workflows_scan_what_they_assemble_before_they_keep_it() {
             !scans.is_empty(),
             "{workflow} runs no scan for a private key"
         );
-        let mut jobs_checked = Vec::new();
-        for &scan in &scans {
-            let (number, text) = &lines[scan];
-            assert!(
-                !text.contains("||") && !text.contains(';'),
-                "{workflow}:{number} lets the scan fail without stopping the job: {text}"
-            );
-            let (first, last) = step_around(&lines, scan);
-            assert!(
-                lines[first..=last]
-                    .iter()
-                    .all(|(_, line)| !line.contains("continue-on-error")),
-                "{workflow}:{number} is in a step that continues on error"
-            );
-            // The first scan of a job comes before the job keeps anything; a later scan, of what
-            // the job packs afterwards, comes after the tree was kept and before the archive is.
-            let job_first = job_starting_before(&lines, scan);
-            if jobs_checked.contains(&job_first) {
-                continue;
-            }
-            jobs_checked.push(job_first);
-            let kept_before = lines[job_first..scan]
-                .iter()
-                .find(|(_, line)| line.contains("actions/upload-artifact"));
-            assert!(
-                kept_before.is_none(),
-                "{workflow}:{number} scans after the job kept something: {kept_before:?}"
-            );
+        for scan in scans {
+            assert_a_scan_that_cannot_be_skipped(workflow, &lines, scan);
         }
     }
-    for workflow in ["release-tree.yml", "release-host.yml"] {
+    for (workflow, scanned, kept_by) in SCANNED_BEFORE_KEPT {
+        let lines = lines_of(workflow);
+        let scan = lines
+            .iter()
+            .position(|(_, line)| is_a_scan(line) && line.contains(scanned))
+            .unwrap_or_else(|| panic!("{workflow} no longer scans {scanned}"));
+        let kept = lines
+            .iter()
+            .position(|(_, line)| line.contains("- name:") && line.contains(kept_by))
+            .unwrap_or_else(|| panic!("{workflow} has no step named {kept_by:?}"));
+        assert_eq!(
+            job_of(&lines, scan),
+            job_of(&lines, kept),
+            "{workflow} scans {scanned} in another job than the step {kept_by:?}"
+        );
         assert!(
-            lines_of(workflow).iter().any(|(_, line)| {
+            scan < kept,
+            "{workflow} scans {scanned} after the step {kept_by:?}"
+        );
+    }
+    for workflow in ["release-tree.yml", "release-host.yml"] {
+        let lines = lines_of(workflow);
+        let sealing: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, line))| {
                 let line = line.trim_start();
-                !line.starts_with('#') && line.contains("scripts/seal-release-tree.sh")
-            }),
+                !line.starts_with('#') && line.contains("bash scripts/seal-release-tree.sh")
+            })
+            .map(|(index, _)| index)
+            .collect();
+        assert!(
+            !sealing.is_empty(),
             "{workflow} no longer seals a tree with the script that scans it"
         );
+        for seal in sealing {
+            let (first, last) = step_of(&lines, seal);
+            for (at, line) in &lines[first..=last] {
+                assert!(
+                    !line.contains("continue-on-error") && !line.contains("set +e"),
+                    "{workflow}:{at} makes the sealing optional"
+                );
+            }
+        }
     }
 }
