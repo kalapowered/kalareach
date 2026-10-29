@@ -385,7 +385,9 @@ def release_json(release):
     return {
         "id": release["id"], "tag_name": release["tag_name"], "draft": release["draft"],
         "prerelease": release["prerelease"], "immutable": release["immutable"],
-        "published_at": None if release["draft"] else f"2026-01-01T00:{release['id']:02d}:00Z",
+        # A draft has a date of its own, later than every published release, so that taking it for the
+        # newest release is a mistake a case can see.
+        "published_at": "2026-01-01T00:59:00Z" if release["draft"] else f"2026-01-01T00:{release['published']:02d}:00Z",
         "upload_url": f"upload://{release['id']}{{?name,label}}",
         "assets": [{"id": a["id"], "name": a["name"], "size": a["size"], "digest": a["digest"],
                     "browser_download_url": f"https://example.invalid/{a['name']}"} for a in release["assets"]],
@@ -398,7 +400,7 @@ def find(identifier):
 
 if method == "POST" and path.endswith("/releases"):
     release = {"id": state["next"], "tag_name": fields["tag_name"], "draft": True, "prerelease": fields.get("prerelease") == "true",
-               "immutable": os.environ.get("STUB_PUBLISH_MUTABLE") != "1", "assets": [], "target": fields["target_commitish"], "next_asset": 1}
+               "immutable": os.environ.get("STUB_PUBLISH_MUTABLE") != "1", "assets": [], "target": fields["target_commitish"], "published": 40, "next_asset": 1}
     state["next"] += 1
     state["releases"].append(release)
     save()
@@ -416,10 +418,11 @@ elif method == "POST" and path.startswith("upload://"):
     release["next_asset"] += 1
     save()
 elif method == "GET" and path == f"repos/{repo}/releases":
-    # Drafts are listed to a token with push access, and the newest release comes first: the staging
-    # draft the macOS signing made is the newest release when the publication runs. A real answer is
+    # Drafts are listed to a token with push access. The order is the order the releases were made in
+    # here, oldest first, which is not the order they were published in (each carries a date of its
+    # own), so taking the first or the last of the list is a mistake a case can see. A real answer is
     # paged, so the stand-in gives one page per release to show that every page is read.
-    print("\n".join(json.dumps([release_json(r)]) for r in sorted(state["releases"], key=lambda r: -r["id"])))
+    print("\n".join(json.dumps([release_json(r)]) for r in sorted(state["releases"], key=lambda r: r["id"])))
 elif method == "GET" and path == f"repos/{repo}/immutable-releases":
     # A token that cannot administer the repository is answered 404; STUB_SETTING stands for one that can.
     if os.environ.get("STUB_SETTING") in ("true", "false"):
@@ -494,24 +497,25 @@ directory, base, commit = sys.argv[1:4]
 releases = []
 if base != "none":
     releases.append({"id": 1, "tag_name": "packages/v0.0.0+000000000000", "draft": False, "prerelease": False,
-                     "immutable": base == "immutable", "assets": [], "target": commit, "next_asset": 1})
+                     "immutable": base == "immutable", "published": int(os.environ.get("BASE_PUBLISHED", "10")),
+                     "assets": [], "target": commit, "next_asset": 1})
 json.dump({"releases": releases, "next": 2}, open(os.path.join(directory, "state.json"), "w"))
 shutil.copy(os.path.join(directory, "state.json"), os.path.join(directory, "initial.json"))
 PYTHON
 }
 
-seed_release() { # <tag> <draft: true|false> [<immutable: true|false>]: another release, part of the state a case starts from
-    python3 -I - "$STUB_STATE" "$1" "$2" "$commit" "${3:-true}" << 'PYTHON'
+seed_release() { # <tag> <draft: true|false> [<immutable: true|false> [<published: minute, later is newer>]]: another release, part of the state a case starts from
+    python3 -I - "$STUB_STATE" "$1" "$2" "$commit" "${3:-true}" "${4:-30}" << 'PYTHON'
 import json
 import os
 import shutil
 import sys
 
-directory, tag, draft, commit, immutable = sys.argv[1:6]
+directory, tag, draft, commit, immutable, published = sys.argv[1:7]
 path = os.path.join(directory, "state.json")
 state = json.load(open(path))
 state["releases"].append({"id": state["next"], "tag_name": tag, "draft": draft == "true", "prerelease": True,
-                          "immutable": immutable == "true", "assets": [], "target": commit, "next_asset": 1})
+                          "immutable": immutable == "true", "published": int(published), "assets": [], "target": commit, "next_asset": 1})
 state["next"] += 1
 json.dump(state, open(path, "w"))
 shutil.copy(path, os.path.join(directory, "initial.json"))
@@ -533,6 +537,9 @@ case_no_proof() { ( go ) && return 1; [ "$(nothing_created)" = yes ]; }
 case_no_proof_beside_draft() { seed_release "host-staging/v$release" true; ( go ) && return 1; [ "$(nothing_created)" = yes ]; }
 case_newer_immutable() { seed_release "host/v0.0.1+000000000001" false true; go && state_has published "host/v$release"; }
 case_newer_mutable() { seed_release "host/v0.0.1+000000000001" false false; ( go ) && return 1; [ "$(nothing_created)" = yes ]; }
+# The release made later in the stand-in is published earlier, so the date decides and not the order of the list.
+case_list_last_is_older() { seed_release "host/v0.0.1+000000000001" false true 5; ( go ) && return 1; [ "$(nothing_created)" = yes ]; }
+case_list_first_is_older() { seed_release "host/v0.0.1+000000000001" false false 20; ( go ) && return 1; [ "$(nothing_created)" = yes ]; }
 case_digest_differs() { ( go ) && return 1; [ "$(nothing_created)" = yes ]; }
 case_missing_archive() { ( go ) && return 1; [ "$(nothing_created)" = yes ]; }
 
@@ -596,6 +603,8 @@ json.dump({"signed": {"roles": {"targets": {"keyids": ["aa", "bb"]}}}}, open("'"
     BASE=mutable run "a staging draft is not evidence: the newest published release behind it is what counts, and it is not immutable" pass case_no_proof_beside_draft
     BASE=mutable run "no readable setting and a mutable release followed by an immutable one is enough: the most recent counts" pass case_newer_immutable
     run "no readable setting and an immutable release followed by a mutable one is refused: the most recent counts" pass case_newer_mutable
+    BASE=mutable BASE_PUBLISHED=20 run "a mutable release published after an immutable one that the list shows last is refused: the date counts, not the order of the list" pass case_list_last_is_older
+    BASE_PUBLISHED=5 run "an immutable release published before a mutable one that the list shows last is refused: the date counts, not the order of the list" pass case_list_first_is_older
     run "a draft that serves other bytes than were packed is not published" pass case_serves_other
     run "a release that turns out to be replaceable after it is published ends the run with an error" pass case_published_mutable
 
