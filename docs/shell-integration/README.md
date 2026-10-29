@@ -454,7 +454,8 @@ from the terminal and not yet handed to the editor, and whether the terminal's q
 It reads the runtime's buffer where it lies, because asking the console whether a key is available
 would take the lock the editor's reading thread holds while it waits. On a Windows console the
 runtime reads console records, which the module does not see, so there the editor's own queue is the
-only count.
+only count. The editor types an answer that reaches an idle prompt into the line, as it types any key
+it has no binding for, so the line then holds the answer.
 
 A launch is never written into the pseudo-terminal. There is no wake marker and no launch string,
 because the process reading the terminal may not be the shell. A rejection installs nothing.
