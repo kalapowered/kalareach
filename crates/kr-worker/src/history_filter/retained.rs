@@ -67,9 +67,7 @@ impl Disclosure {
                 .is_ok(),
         }
     }
-}
 
-impl Disclosure {
     /// Returns whether this reader's history reaches a pending resource as it stands now, which is
     /// what decides whether it may answer the resource.
     ///

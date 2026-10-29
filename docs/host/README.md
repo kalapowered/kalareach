@@ -3875,7 +3875,7 @@ Owning an action identifier names a receipt. It does not keep access once the gr
 
 The caller that performs an action always gets its state in the first answer: the outcome, the identifiers and the revision. A later reader is shown the state under the authority above. Content that is held back is marked as held back, except a close's description, which is left out. A question's resolution carries `question: null`. A receipt's error keeps its code, its retry category and its diagnostic identifier, and its message is replaced and `error_withheld` is set, because a message can quote an upstream or a session and has no date to hold to a bound. The errors that the daemon's own stores and the catalogue retain are the exception: they keep their message, under the decision of the method that kept them. A caller that arrives with no history scope is shown state alone. Only the local owner is shown everything.
 
-Answering a question needs more than the right to answer. The worker refuses a question the caller's history does not reach, with the refusal it gives for a question it does not hold, so the refusal says nothing about the question's state or text.
+Answering a question needs more than the right to answer. The worker refuses a question the caller's history does not reach, with the refusal it gives for a question it does not hold, so the refusal says nothing about the question's state or text. An approval answer is held the same way: the worker refuses an approval the caller's history does not reach, and that its grant does not name while it can still be decided, with the refusal it gives for an approval it does not hold, before anything is claimed.
 
 The archive follows the same rule for a closed session: its receipts go whole to the owner at this machine and as state to anyone else. A close's description of the session reaches a device only when its history reaches back to the session's start, while the daemon keeps the whole description for its own directory. A control daemon speaks to a worker only at its own compatibility level, so a worker at another compatibility level never answers a device through it. [Updating a host](updates.md) says what an update does about that worker's session.
 
@@ -8518,7 +8518,7 @@ cancellation names the turn it acts on and is refused rather than redirected whe
 the one running. An approval answer names a resource that is still open, inside the upstream's own
 deadline, interpreted at the current source generation by a decoder that still holds the
 approval-interpreter grant, with a decision that interpretation offered; it is checked against the
-retained list before the claim is taken, and it happens once.
+retained list before the claim is taken, and it happens once. A paired device is also refused an approval its grant's history does not reach, as one the host does not hold.
 
 Every refusal named above is decided before the dispatch marker, so a request this host can refuse
 leaves a rejection rather than an outcome nobody can establish. That includes an instance with no

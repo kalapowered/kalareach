@@ -6843,7 +6843,7 @@ impl WorkerService {
     /// Only the local owner reaches everything. A caller acting under a grant reaches what the
     /// history scope that came with its frame reaches, and a caller that arrives with none reaches
     /// nothing. The refusal is the text of a request this host does not hold. Checked before the
-    /// dispatch marker, so a refusal leaves nothing behind.
+    /// dispatch marker, so a refusal is recorded as a rejection and nothing is claimed or carried.
     fn check_decision_reached(
         &self,
         caller: &Caller,

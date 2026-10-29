@@ -3672,11 +3672,28 @@ fn expected_refusal(action: &str) -> ErrorCode {
 }
 
 /// Forwards one mutation as the control daemon does for a paired device acting under a grant
-/// that carries `grant_rights`.
+/// that carries `grant_rights`, and whose history reaches back to the start of time.
 async fn forward_as_device(
     daemon: &mut BoundLink,
     mutation: &MutationRequest,
     grant_rights: &[kr_protocol::rights::ActionRight],
+) -> std::result::Result<ParamsValue, kr_protocol::error::ProtocolError> {
+    forward_as_device_within(
+        daemon,
+        mutation,
+        grant_rights,
+        Some(common::a_scope_with_the_live_screen()),
+    )
+    .await
+}
+
+/// As [`forward_as_device`], under the history scope of the grant the daemon decided the mutation
+/// under, or under none when the daemon sent none.
+async fn forward_as_device_within(
+    daemon: &mut BoundLink,
+    mutation: &MutationRequest,
+    grant_rights: &[kr_protocol::rights::ActionRight],
+    history: Option<kr_protocol::grant::HistoryScope>,
 ) -> std::result::Result<ParamsValue, kr_protocol::error::ProtocolError> {
     let envelope = kr_protocol::actor::ActorEnvelope {
         actor_id: kr_protocol::ids::ActorId::new("device:a-test-phone").expect("an actor"),
@@ -3689,19 +3706,23 @@ async fn forward_as_device(
     };
     let lease =
         common::a_lease_after_the_announcement(daemon, mutation.target.environment_id, 1, 1).await;
+    let rights = grant_rights.iter().copied().collect();
+    let deadline = kr_protocol::scalars::U64::new(kr_ipc::clock::boot_elapsed_ms() + 30_000);
     // The daemon sends the history scope of the grant it decided the mutation under, and an
-    // answer to a pending request is held to it: this grant reaches back to the start of time.
-    daemon
-        .forward_within(
-            mutation,
-            &envelope,
-            &grant_rights.iter().copied().collect(),
-            kr_protocol::scalars::U64::new(kr_ipc::clock::boot_elapsed_ms() + 30_000),
-            Some(lease),
-            common::a_scope_with_the_live_screen(),
-        )
-        .await
-        .expect("the forward reaches the worker")
+    // answer to a pending request is held to it.
+    match history {
+        Some(history) => {
+            daemon
+                .forward_within(mutation, &envelope, &rights, deadline, Some(lease), history)
+                .await
+        }
+        None => {
+            daemon
+                .forward(mutation, &envelope, &rights, deadline, Some(lease))
+                .await
+        }
+    }
+    .expect("the forward reaches the worker")
 }
 
 /// Registers one action of each class a paired device could invoke on the approval tests'
@@ -4274,4 +4295,114 @@ async fn a_yes_to_a_question_leaves_the_connectors_approval_to_its_own_path() {
         broker.pending(resource_id).map(|resource| resource.state),
         Some(PendingState::Pending)
     );
+}
+
+/// KR-REQ-10.51: an answering `plugin.action.invoke` is held to the caller's history as an
+/// `agent.approval.respond` is. A device whose history begins after the request, one whose grant
+/// keeps no retained history, and one the daemon sent no scope for are each refused as the worker
+/// refuses a request it does not hold, nothing is carried and the approval stays pending. The
+/// controls are the same answer under a history that reaches the request, and under a grant that
+/// names an approval recorded before its bound while that approval can still be decided.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_51_an_answering_action_is_held_to_the_callers_history() {
+    use kr_protocol::grant::HistoryScope;
+    use kr_protocol::rights::ActionRight;
+    let host = host().await;
+    let upstream = Arc::new(CountingUpstream::default());
+    register(
+        &host,
+        Some(Arc::clone(&upstream) as Arc<dyn UpstreamDispatch>),
+    );
+    let early = offer_approval(&host, Arc::clone(&upstream));
+    let named = offer_another(&host, 12);
+    register_class_actions(&host);
+    let mut daemon = daemon(&host).await;
+    let window = || kr_protocol::ids::ActionWindowId::new("forwarded").expect("a window");
+    let rights = [ActionRight::SessionView, ActionRight::AgentApprovalRespond];
+    let decision = br#"{"decision":"allow"}"#.as_slice();
+    let carried = || upstream.carried.load(std::sync::atomic::Ordering::SeqCst);
+    let scope = |lower_bound: Option<u64>,
+                 named_approvals: &[kr_protocol::ids::PendingResourceId]| {
+        HistoryScope {
+            lower_bound_ms: Nullable(lower_bound.map(TimestampMs::new)),
+            include_live_screen: true,
+            named_questions: kr_protocol::scalars::CanonicalSet::new(),
+            named_approvals: named_approvals.iter().copied().collect(),
+        }
+    };
+    let shape = |refusal: &kr_protocol::error::ProtocolError, resource| {
+        refusal
+            .message
+            .replace(&format!("{resource}"), "<resource>")
+    };
+    let answer = |request_id: u64, resource| {
+        plugin_invocation(
+            &host,
+            request_id,
+            window(),
+            "request.answer",
+            Nullable::some(resource),
+            decision,
+        )
+    };
+
+    let absent = kr_protocol::ids::PendingResourceId::new(Uuid::from_bytes([0xab; 16]));
+    let unknown = forward_as_device_within(
+        &mut daemon,
+        &answer(300, absent),
+        &rights,
+        Some(scope(Some(1_000), &[])),
+    )
+    .await
+    .expect_err("the host holds no such approval");
+    for (request_id, history) in [
+        (301, Some(scope(Some(1_000), &[]))),
+        (302, Some(scope(None, &[]))),
+        (303, None),
+        (304, Some(scope(Some(1_000), &[named]))),
+    ] {
+        let withheld =
+            forward_as_device_within(&mut daemon, &answer(request_id, early), &rights, history)
+                .await
+                .expect_err("an approval the caller's history does not reach is not answered");
+        assert_eq!(withheld.code, unknown.code, "({request_id}) {withheld:?}");
+        assert_eq!(
+            shape(&withheld, early),
+            shape(&unknown, absent),
+            "the approval answers as one the host does not hold ({request_id})"
+        );
+    }
+    assert_eq!(
+        carried(),
+        0,
+        "nothing was carried for an answer that was refused"
+    );
+    assert_eq!(
+        host.service
+            .broker()
+            .pending(early)
+            .expect("the approval is held")
+            .state,
+        kr_protocol::gateway::PendingState::Pending,
+        "the refused answers left the approval as it was"
+    );
+
+    forward_as_device_within(
+        &mut daemon,
+        &answer(305, named),
+        &rights,
+        Some(scope(Some(1_000), &[named])),
+    )
+    .await
+    .expect("a grant that names the approval answers it while it is current");
+    assert_eq!(carried(), 1, "the named approval's answer was carried");
+    forward_as_device_within(
+        &mut daemon,
+        &answer(306, early),
+        &rights,
+        Some(scope(Some(1), &[])),
+    )
+    .await
+    .expect("a history that reaches back to the request answers it");
+    assert_eq!(carried(), 2, "the reached approval's answer was carried");
 }

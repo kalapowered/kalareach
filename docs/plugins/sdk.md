@@ -271,7 +271,9 @@ the call.
 The host checks the named resource before it marks anything. The resource must be one the host
 holds, it must belong to the application instance the call targets, it must still be pending with
 its deadline not passed, it must have a recorded interpretation, and everything the claim rechecks
-must still hold. Each refusal is a rejection with a receipt: an unknown resource is `STALE_SESSION`,
+must still hold. A paired device is also refused a resource its grant's history does not reach, and
+that its grant does not name while it can still be decided, as one the host does not hold. Each
+refusal is a rejection with a receipt: an unknown resource is `STALE_SESSION`,
 another instance's is `PERMISSION_DENIED` and an answered one is `QUESTION_RESOLVED`.
 
 The upstream identifier never comes from the caller. It is the one the host recorded with the
