@@ -8,7 +8,7 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-10.49 | `one_filter_covers_every_surface_a_grant_reaches`, `a_summary_made_now_from_pre_cutoff_content_is_withheld_or_recomputed`, `derived_data_names_the_interval_and_resources_it_was_built_from` |
-//! | KR-REQ-10.50 | `a_live_only_invitation_is_installed_the_visible_screen_only_when_the_issuer_selected_it`, `the_live_screen_exception_never_reaches_the_buffer_that_is_not_showing`, `attachment_bytes_need_their_own_file_grant`, `voice_context_intersects_the_requesting_device_scope`, `kr_req_10_50_a_previewed_screen_restoration_carries_no_title_and_no_link_target`, `kr_req_10_50_a_previewed_screen_projection_carries_no_title_and_no_link_target_now_or_later` |
+//! | KR-REQ-10.50 | `a_live_only_invitation_is_installed_the_visible_screen_only_when_the_issuer_selected_it`, `the_live_screen_exception_never_reaches_the_buffer_that_is_not_showing`, `what_the_terminal_shows_later_is_visible_to_a_live_only_viewer_and_what_stays_hidden_is_not`, `attachment_bytes_need_their_own_file_grant`, `voice_context_intersects_the_requesting_device_scope`, `kr_req_10_50_a_previewed_screen_restoration_carries_no_title_and_no_link_target`, `kr_req_10_50_a_previewed_screen_projection_carries_no_title_and_no_link_target_now_or_later` |
 //! | KR-REQ-10.51 | `a_named_question_is_permitted_and_previewed_although_it_predates_the_cutoff`, `a_named_question_is_excepted_only_while_it_is_open`, `a_named_approval_is_excepted_only_while_it_is_current`, `a_pending_resource_snapshot_does_not_bypass_the_filter_without_that_scope` |
 
 use kr_protocol::gateway::PendingState;
@@ -353,6 +353,57 @@ fn the_live_screen_exception_never_reaches_the_buffer_that_is_not_showing() {
             "{surface} served a live-only invitation"
         );
     }
+}
+
+/// KR-REQ-10.50: what the terminal shows after an invitation exists is visible to a live-only
+/// viewer, and a buffer that stays hidden stays excluded until the terminal actually shows it.
+/// While an application holds the alternate buffer the viewer is drawn that and nothing of what
+/// the shell printed before it. Once the application leaves, the buffer the shell left is the
+/// screen being shown, so that is what is drawn, with what is printed on it now, and the
+/// application's screen, hidden in its turn, is not.
+#[test]
+fn what_the_terminal_shows_later_is_visible_to_a_live_only_viewer_and_what_stays_hidden_is_not() {
+    let invited = HistoryFilter::new(ViewerScope::from_grant(&grant(
+        scope(None, true, &[], &[]),
+        &[ActionRight::SessionView],
+    )));
+    let hidden_shell_line = "printed-before-the-invitation";
+    let application_line = "the application's screen";
+    let mut engine = engine_with_two_buffers();
+
+    assert_eq!(
+        installed_buffers(&mut engine, invited.screen_scope()),
+        vec![ProjectedBuffer::Alternate]
+    );
+    let during = restored_as(&mut engine, invited.screen_scope());
+    assert!(during.contains(application_line), "{during:?}");
+    assert!(
+        !during.contains(hidden_shell_line),
+        "the buffer that is not showing is not drawn: {during:?}"
+    );
+
+    engine.feed(
+        0,
+        b"\x1b[?1049lprinted after the application left\r\n",
+        LaneGate::default(),
+    );
+    assert_eq!(
+        installed_buffers(&mut engine, invited.screen_scope()),
+        vec![ProjectedBuffer::Primary]
+    );
+    let after = restored_as(&mut engine, invited.screen_scope());
+    assert!(
+        after.contains("printed after the application left"),
+        "what the terminal shows now is visible: {after:?}"
+    );
+    assert!(
+        after.contains(hidden_shell_line),
+        "the buffer now showing is the screen, whatever it held: {after:?}"
+    );
+    assert!(
+        !after.contains(application_line),
+        "the application's screen is hidden in its turn: {after:?}"
+    );
 }
 
 /// What a screen's text hides: the titles of its window, the title it kept on the stack and the
