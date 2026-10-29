@@ -147,6 +147,14 @@ pub fn session(summary: &SessionSummary) -> Document {
         .with("cwd", Asked::text(Request::Sessions, &summary.cwd))
         .with("dimensions", dimensions(summary.dimensions))
         .with("attachments", summary.attachment_count.get())
+        // The program in the session's foreground, null when no application holds it.
+        .with(
+            "application",
+            summary
+                .application
+                .as_deref()
+                .map(|name| Asked::text(Request::Sessions, name)),
+        )
         .with("worker_profile", summary.worker_profile.as_str())
         // The desktop this session's processes run on, which is not the terminal it is shown in.
         // A session with no desktop says so with nulls rather than with a placeholder.
@@ -289,8 +297,14 @@ pub fn session_line(summary: &SessionSummary) -> Line {
         SessionState::Closing => "closing",
         SessionState::Closed => "closed",
     };
+    // The application is the name of a program, which the person who asked for the list is shown;
+    // a session with none in its foreground has a dash in its column.
+    let application = Asked::text(
+        Request::Sessions,
+        summary.application.as_deref().unwrap_or("-"),
+    );
     stdout_line!(
-        "{}  {} {} {}x{} {} attachment{}  {}",
+        "{}  {} {} {}x{} {} attachment{}  {}  {}",
         right(4, &summary.display_number.get()),
         left(8, &state),
         left(14, &summary.shell_mode.as_str()),
@@ -302,6 +316,7 @@ pub fn session_line(summary: &SessionSummary) -> Line {
         } else {
             "s"
         },
+        left(14, &application),
         Asked::text(Request::Sessions, &summary.shell_path),
     )
 }
@@ -1222,7 +1237,7 @@ mod tests {
         );
         assert_eq!(
             session_line(&summary).text(),
-            "   3  live     native_compat   120x40   1 attachment  /bin/zsh"
+            "   3  live     native_compat   120x40   1 attachment  -               /bin/zsh"
         );
     }
 
@@ -1251,7 +1266,7 @@ mod tests {
                 );
             }
         }
-        for asked in ["shell", "cwd", "closure.terminated[].name"] {
+        for asked in ["shell", "cwd", "application", "closure.terminated[].name"] {
             assert!(
                 shown.contains(asked),
                 "{asked} shows what the session holds"

@@ -14,7 +14,7 @@ worker directly for what a session owns.
 | `kr backup setup [--replace]` | — | Set this host's backups up: show a recovery kit once and turn on a backup of closed sessions and the host's configuration, made at most once a day |
 | `kr backup restore --into <folder>` | — | Open a backup of this host's data with the recovery kit and write it as readable files into a folder you made; it records the generation it verified in the recovery bundle and, only when asked, applies the backup's device configuration to this host |
 | `kr close [id]` | `kr c` | Close a session and terminate the processes it owns |
-| `kr list` | `kr l` | List sessions with their display numbers, states and shells |
+| `kr list` | `kr l` | List sessions with their display numbers, states, foreground applications and shells |
 | `kr status [id]` | `kr s` | Show one session's state |
 | `kr question [list/show/answer/cancel]` | — | Read and answer the questions agents are waiting on |
 | `kr skill [install/status/remove]` | — | Install the contact skill and its tool configuration for an agent |
@@ -2554,12 +2554,18 @@ session object:
   "cwd": "/home/example",
   "dimensions": { "columns": 120, "rows": 40 },
   "attachments": 1,
+  "application": null,
   "worker_profile": "headless_user",
   "desktop": { "desktop_session_id": null, "login_generation": null },
   "created_at_ms": 1789484611722,
   "closure": null
 }
 ```
+
+`application` is the name of the program in the session's foreground, as the session's worker reports
+it, and `null` at a shell prompt, for a closed session and for a session whose worker does not report
+one. In the lines `kr list` and `kr status` print it is the column after the attachment count, with a
+dash where there is none.
 
 A session in a desktop context names the desktop it is bound to, and `kr status --json` adds what
 the host's sleep setting is doing:
