@@ -50,6 +50,7 @@ pub mod pairing;
 #[cfg(debug_assertions)]
 pub mod probe;
 pub mod push;
+pub mod push_origin;
 pub mod questions;
 pub mod recovery;
 pub mod remote;
@@ -927,7 +928,7 @@ pub fn start_push<R: tauri::Runtime>(
         Arc::clone(&device),
         Arc::new(push::PluginNative(app.clone())),
         Arc::new(push::ConnectionRegistrar(device)),
-        push::Wiring::product(),
+        push::Wiring::product()?,
         move |view| {
             let _ = emitter.emit(push::PUSH_EVENT, view);
         },

@@ -457,8 +457,12 @@ pub trait HostLine: Send {
 pub type HttpFor =
     dyn Fn(&GatewayOrigin) -> std::result::Result<Arc<dyn ServiceHttp>, String> + Send + Sync;
 
-/// The seams a test replaces: the gateway's transport per origin, and the clock.
+/// The seams a test replaces: the gateway this build names, its transport per origin, and the
+/// clock.
 pub struct Wiring {
+    /// The push gateway this phone's requests go to, and the origin the receivers answer a
+    /// challenge for.
+    pub origin: GatewayOrigin,
     /// How the gateway at an origin is reached.
     pub http: Arc<HttpFor>,
     /// The time, in UTC milliseconds.
@@ -468,10 +472,22 @@ pub struct Wiring {
 }
 
 impl Wiring {
-    /// The product's: the managed transport, and the system clock.
-    #[must_use]
-    pub fn product() -> Self {
-        Self {
+    /// The product's: the gateway this build was given (the managed service's when it was given
+    /// none), the managed transport, and the system clock.
+    ///
+    /// # Errors
+    ///
+    /// Returns a local failure when the build's gateway origin is not one. The build step refuses
+    /// such a value, so only a library built around it reaches this.
+    pub fn product() -> Result<Self> {
+        // The input is named by `push_origin::BUILD_INPUT`; the macro takes it as a literal.
+        let origin = crate::push_origin::choose(
+            option_env!("KR_PUSH_GATEWAY_ORIGIN"),
+            kr_client::services::account::ACCOUNT_ORIGIN,
+        )
+        .map_err(|error| CommandError::local_failure(format!("the gateway's origin: {error}")))?;
+        Ok(Self {
+            origin,
             http: Arc::new(|origin| {
                 HttpService::with(
                     origin.clone(),
@@ -483,7 +499,7 @@ impl Wiring {
             }),
             clock: Arc::new(|| kr_ipc::now_ms().get()),
             keys_within: KEYS_WITHIN,
-        }
+        })
     }
 }
 
@@ -640,10 +656,7 @@ impl PushDesk {
         wiring: Wiring,
         changed: impl Fn(PushView) + Send + Sync + 'static,
     ) -> Result<Arc<Self>> {
-        let origin =
-            GatewayOrigin::new(kr_client::services::account::ACCOUNT_ORIGIN).map_err(|error| {
-                CommandError::local_failure(format!("the gateway's origin: {error}"))
-            })?;
+        let origin = wiring.origin.clone();
         let file = data.join(DIRECTORY).join(RECORD);
         let now = (wiring.clock)();
         let mut pruned = false;
@@ -2502,6 +2515,20 @@ mod probe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// KR-REQ-16.04: the product's wiring names the gateway the build was given, and the managed
+    /// service's, at the text it always had, when the build was given none.
+    #[test]
+    fn the_product_wiring_names_the_gateway_the_build_was_given_and_else_the_official_one() {
+        let wiring = Wiring::product().expect("the wiring");
+        match option_env!("KR_PUSH_GATEWAY_ORIGIN") {
+            None | Some("") => assert_eq!(
+                wiring.origin.as_str(),
+                kr_client::services::account::ACCOUNT_ORIGIN
+            ),
+            Some(given) => assert_eq!(wiring.origin.as_str(), given),
+        }
+    }
 
     fn host(phase: Phase, settings: bool) -> HostPush {
         HostPush {

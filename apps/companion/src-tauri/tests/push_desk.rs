@@ -444,6 +444,8 @@ fn vectors() -> Value {
 /// issues the credential the vectors record. It keeps the tokens it was proposed.
 struct Gateway {
     proposed: Mutex<Vec<String>>,
+    /// Every address a request was posted to.
+    urls: Mutex<Vec<String>>,
     /// Whether the answer to an authorisation request is held until released, and how many such
     /// requests have reached the gateway.
     issue: Mutex<Issue>,
@@ -459,6 +461,7 @@ impl Gateway {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             proposed: Mutex::new(Vec::new()),
+            urls: Mutex::new(Vec::new()),
             issue: Mutex::new(Issue::default()),
         })
     }
@@ -486,6 +489,7 @@ impl ServiceHttp for Gateway {
         body: &'a [u8],
         _headers: &'a [(&'a str, &'a str)],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+        self.urls.lock().expect("the urls").push(url.to_owned());
         let sent: Value = serde_json::from_slice(body).expect("a request");
         let records = vectors()["records"].clone();
         let is_issue = url.ends_with("/api/push/sender/issue");
@@ -646,13 +650,25 @@ async fn desk_reaching(
     receiver: Arc<Receiver>,
     registrar: impl FnOnce(&Arc<Device>, &Arc<Mutex<Registered>>) -> Arc<dyn Registrar>,
 ) -> Desk {
+    desk_reaching_at(official_origin(), hosts, owner, receiver, registrar).await
+}
+
+/// As [`desk_reaching`], for a build given the gateway at `origin`.
+async fn desk_reaching_at(
+    origin: kr_protocol::service::GatewayOrigin,
+    hosts: &[&Host],
+    owner: &DeviceKeys,
+    receiver: Arc<Receiver>,
+    registrar: impl FnOnce(&Arc<Device>, &Arc<Mutex<Registered>>) -> Arc<dyn Registrar>,
+) -> Desk {
     let phone = phone_paired_with(hosts[0], owner, &[ActionRight::SessionView]).await;
     for other in &hosts[1..] {
         pair(&phone, other, owner, &[ActionRight::SessionView]).await;
     }
     let device = phone.companion.device();
     let registered = Arc::new(Mutex::new(Registered::default()));
-    let opened = open_with(
+    let opened = open_at(
+        origin,
         phone.data.path(),
         &device,
         &receiver,
@@ -716,7 +732,24 @@ fn open_over(
     )
 }
 
+/// The origin the managed service is at, which a build given no gateway of its own talks to.
+fn official_origin() -> kr_protocol::service::GatewayOrigin {
+    kr_protocol::service::GatewayOrigin::new(kr_client::services::account::ACCOUNT_ORIGIN)
+        .expect("the official origin")
+}
+
 fn open_with(
+    data: &Path,
+    device: &Arc<Device>,
+    receiver: &Arc<Receiver>,
+    registrar: Arc<dyn Registrar>,
+) -> Opened {
+    open_at(official_origin(), data, device, receiver, registrar)
+}
+
+/// As [`open_with`], for a build given the gateway at `origin`.
+fn open_at(
+    origin: kr_protocol::service::GatewayOrigin,
     data: &Path,
     device: &Arc<Device>,
     receiver: &Arc<Receiver>,
@@ -738,6 +771,7 @@ fn open_with(
         Arc::clone(receiver) as Arc<dyn Native>,
         registrar,
         Wiring {
+            origin,
             http: Arc::new(move |_| Ok(Arc::clone(&http) as Arc<dyn ServiceHttp>)),
             clock: Arc::new(move || kr_ipc::now_ms().get() + ahead.load(Ordering::SeqCst)),
             keys_within: receiver.state.lock().expect("the receiver").keys_patience,
@@ -812,6 +846,106 @@ async fn a_host_the_person_asked_for_is_handed_the_credential_the_gateway_issued
         [FIRST_TOKEN],
         "the gateway was proposed the token the provider gave"
     );
+}
+
+/// KR-REQ-16.04: a build given a gateway of its own registers with that gateway and no other, and
+/// the receivers answer the challenge of that gateway and of none else.
+///
+/// The phone's requests go to the origin the build names, the registration it writes for the
+/// receivers names the same origin, and the receivers' own check of a challenge (the product's
+/// `classify`, which the Android and iOS receivers call) answers a challenge from that origin and
+/// refuses the same challenge from the managed service's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_build_given_its_own_gateway_registers_there_and_its_receivers_answer_only_that_gateway()
+{
+    let own = kr_protocol::service::GatewayOrigin::new("https://push.builder.example")
+        .expect("an origin");
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = desk_reaching_at(
+        own.clone(),
+        &[&host],
+        &owner,
+        Receiver::new(FIRST_TOKEN),
+        |_, script| Arc::new(HostLink(Arc::clone(script))) as Arc<dyn Registrar>,
+    )
+    .await;
+    let reference = phone.references().remove(0);
+    phone.desk.enable(&reference).expect("the person asks");
+    phone.until(|states| states == [PushState::On]).await;
+
+    // Every request the phone made went to the build's gateway.
+    let urls = phone.gateway.urls.lock().expect("the urls").clone();
+    assert!(!urls.is_empty(), "the phone asked the gateway");
+    for url in &urls {
+        assert!(
+            url.starts_with(own.as_str()),
+            "{url} is not at the build's gateway"
+        );
+    }
+
+    // The registration the receivers wait for names that gateway.
+    let pending = phone
+        .receiver
+        .state
+        .lock()
+        .expect("the receiver")
+        .pending
+        .clone()
+        .expect("a registration the receivers wait for");
+    assert_eq!(pending.gateway_origin, own);
+    // The scripted receiver has answered the challenge in it by now. The receivers' own check is
+    // asked as it is while the registration waits.
+    let waiting = PendingRegistration {
+        state: PendingState::Pending,
+        deadline_ms: kr_ipc::now_ms().get() + 120_000,
+        ..pending
+    };
+
+    // And a challenge is answered when it comes from that gateway, to that gateway, and refused when
+    // it comes from the managed service's, as one that is not for this build.
+    let challenge = |origin: &str| {
+        let mut data = std::collections::BTreeMap::new();
+        data.insert(
+            companion_platform::push::CHALLENGE_KEY.to_owned(),
+            "A".repeat(43),
+        );
+        data.insert(
+            companion_platform::push::EXPIRES_KEY.to_owned(),
+            (kr_ipc::now_ms().get() + 60_000).to_string(),
+        );
+        data.insert(
+            companion_platform::push::REGISTRATION_KEY.to_owned(),
+            waiting.registration_id.to_string(),
+        );
+        data.insert(
+            companion_platform::push::TOKEN_DIGEST_KEY.to_owned(),
+            serde_json::to_value(waiting.token_digest)
+                .expect("a digest")
+                .as_str()
+                .expect("text")
+                .to_owned(),
+        );
+        data.insert(
+            companion_platform::push::ORIGIN_KEY.to_owned(),
+            origin.to_owned(),
+        );
+        let verdict = companion_platform::push::classify(
+            &json!({ "data": data, "pending": waiting, "now_ms": kr_ipc::now_ms().get() })
+                .to_string(),
+        );
+        serde_json::from_str::<Value>(&verdict).expect("a verdict")
+    };
+    let ours = challenge(own.as_str());
+    assert_eq!(ours["verdict"], "answer", "{ours}");
+    assert_eq!(
+        ours["url"],
+        format!("{}/api/push/installation/register", own.as_str()),
+        "the answer goes to the gateway that sent the challenge"
+    );
+    let theirs = challenge(official_origin().as_str());
+    assert_eq!(theirs["verdict"], "refused", "{theirs}");
+    assert_eq!(theirs["reason"], "origin");
 }
 
 /// KR-REQ-16.08: a registration the phone stopped itself, as it does for an account that has left,

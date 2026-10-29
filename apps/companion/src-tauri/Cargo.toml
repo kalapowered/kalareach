@@ -30,6 +30,8 @@ name = "host_events"
 harness = false
 
 [build-dependencies]
+# The grammar of the push gateway origin a build is given, which the build step checks.
+kr-protocol.workspace = true
 tauri-build = { workspace = true, features = [] }
 
 [dependencies]
