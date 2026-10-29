@@ -1001,9 +1001,11 @@ async fn a_stop_the_phone_made_itself_is_not_shown_as_the_host_refusing() {
     );
 }
 
-/// KR-REQ-16.11: what the receivers hold is this phone's preview seed, the one the host was told the
-/// public half of, under that key's identifier, and the public key of the host that seals to it,
-/// under the identifier its previews name it by. The authorisation key's seed is not what is filed.
+/// KR-REQ-16.11 and KR-REQ-10.48: what the receivers hold is this phone's preview seed, the one the
+/// host was told the public half of, under that key's identifier, and the public key of the host
+/// that seals to it, under the identifier its previews name it by. Nothing else of the phone's keys
+/// is filed: not the seed of its transport, authorisation or stored-envelope key, nor any public key
+/// of those, its own or the host's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_keys_filed_for_the_receivers_are_the_preview_key_the_host_was_told_of_and_the_hosts() {
     let owner = DeviceKeys::generate().expect("keys");
@@ -1053,26 +1055,47 @@ async fn the_keys_filed_for_the_receivers_are_the_preview_key_the_host_was_told_
         &filed.senders[0].id,
         kr_protocol::pairing::key_id(KeyPurpose::NotificationPreview, key.as_bytes()).as_bytes()
     );
-    // The control: the installation's authorisation seed is another secret, which the phone holds
-    // and the application's secure store gives back, and it is not what is filed.
-    let authorisation = phone
-        .device
-        .identity()
-        .secrets
-        .get(
-            &SecretName::device_key(
-                companion_platform::secrets::DEVICE_SCOPE,
-                KeyPurpose::Authorisation,
-            )
-            .expect("a name"),
+    // The control: every other secret the phone holds, and the other public keys it and the host
+    // declared, are things the application's secure store and the pairing record give back, and
+    // none of them is what is filed. The receivers' store is the one an extension reads, so
+    // anything filed there is within its reach.
+    let filed_bytes: Vec<&[u8]> = filed
+        .recipients
+        .iter()
+        .flat_map(|recipient| [recipient.id.as_slice(), recipient.seed.as_slice()])
+        .chain(
+            filed
+                .senders
+                .iter()
+                .flat_map(|sender| [sender.id.as_slice(), sender.key.as_slice()]),
         )
-        .expect("the store answers")
-        .expect("the phone holds an authorisation seed");
-    assert_ne!(
-        authorisation.expose(),
-        recipient.seed.as_slice(),
-        "the authorisation seed is not what is filed"
-    );
+        .collect();
+    let identity = phone.device.identity();
+    for purpose in KeyPurpose::ALL
+        .into_iter()
+        .filter(|purpose| *purpose != KeyPurpose::NotificationPreview)
+    {
+        let name = SecretName::device_key(companion_platform::secrets::DEVICE_SCOPE, purpose)
+            .expect("a name");
+        let seed = identity
+            .secrets
+            .get(&name)
+            .expect("the store answers")
+            .unwrap_or_else(|| panic!("the phone holds a {purpose:?} seed"));
+        assert!(
+            !filed_bytes.contains(&seed.expose()),
+            "the {purpose:?} seed is not what is filed"
+        );
+        for (whose, public) in [
+            ("its own", identity.keys.raw(purpose)),
+            ("the host's", paired.host_keys.raw(purpose)),
+        ] {
+            assert!(
+                !filed_bytes.contains(&public.as_slice()),
+                "{whose} {purpose:?} key is not what is filed"
+            );
+        }
+    }
 }
 
 /// What the receivers hold now.
