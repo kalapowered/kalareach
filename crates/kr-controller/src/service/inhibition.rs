@@ -7,7 +7,7 @@ use kr_protocol::desktop::SleepInhibitionState;
 use kr_protocol::hostinfo::export::{ContentClass, Sentence};
 use kr_protocol::ids::SessionId;
 use kr_protocol::scalars::U64;
-use kr_protocol::session::SessionState;
+use kr_protocol::session::{SessionReadResult, SessionState};
 
 use crate::desktop::power;
 use crate::desktop::power::Demand;
@@ -85,6 +85,61 @@ struct SessionDemand {
     /// window the caller was given. A session that cannot have one reports null and contributes
     /// nothing here, which is not the same as reporting none.
     launches: u64,
+}
+
+impl SessionDemand {
+    /// What one worker's answer says its session has outstanding.
+    ///
+    /// `closing_before` is whether this host already had a closure for the session: a closure
+    /// counts from the first sign of one until the host has recorded it, whatever the worker says
+    /// after that.
+    fn observed(read: &SessionReadResult, closing_before: bool) -> Self {
+        let summary = &read.session;
+        let mut observed = Self {
+            // A launch the reader has not answered is work outstanding, and it stays outstanding
+            // through the revocation: A-17 bounds how long input is held, not how long the reader
+            // may take to decide. A session that cannot have one says null and adds nothing.
+            launches: read.outstanding_launches.0.map_or(0, U64::get),
+            ..Self::default()
+        };
+        if summary.application_state.as_ref()
+            == Some(&kr_protocol::session::ApplicationState::AgentBusy)
+        {
+            observed.work = true;
+        }
+        // A request an agent has put to the person is a pending request, whether it asks for a
+        // decision or for an answer: the person is on their way to it, and the host that
+        // suspends under it delays the reply. Section 3 counts "pending requests" with work.
+        if matches!(
+            summary.application_state.0,
+            Some(
+                kr_protocol::session::ApplicationState::AwaitingApproval
+                    | kr_protocol::session::ApplicationState::AwaitingInput
+            )
+        ) {
+            observed.waiting = true;
+        }
+        // A closure this host accepted and has not finished. Suspending in the middle of one is
+        // how a session's own processes stop being accounted for. The worker's part of it ends
+        // before this host's does: it reports `closing` while it stops those processes and
+        // `closed` once they are stopped, and what is left then is this host recording the
+        // closure, which is also what takes the session out of the list above. So a closure
+        // counts from the first sign of one until then.
+        observed.closing =
+            matches!(summary.state, SessionState::Closing | SessionState::Closed) || closing_before;
+        observed
+    }
+
+    /// The sessions with an agent at work, and the requests outstanding across all of them: what
+    /// is waiting for a person, what is closing, and the launches waiting for a reader.
+    fn total<'a>(seen: impl Iterator<Item = &'a Self>) -> (u64, u64) {
+        seen.fold((0, 0), |(work, outstanding), seen| {
+            (
+                work + u64::from(seen.work),
+                outstanding + u64::from(seen.waiting) + u64::from(seen.closing) + seen.launches,
+            )
+        })
+    }
 }
 
 impl Controller {
@@ -278,53 +333,15 @@ impl Controller {
                 }
                 continue;
             };
-            let summary = &read.session;
-            let mut observed = SessionDemand {
-                // A launch the reader has not answered is work outstanding, and it stays
-                // outstanding through the revocation: A-17 bounds how long input is held, not how
-                // long the reader may take to decide. A session that cannot have one says null
-                // and adds nothing.
-                launches: read.outstanding_launches.0.map_or(0, U64::get),
-                ..SessionDemand::default()
-            };
-            if summary.application_state.as_ref()
-                == Some(&kr_protocol::session::ApplicationState::AgentBusy)
-            {
-                observed.work = true;
-            }
-            // A request an agent has put to the person is a pending request, whether it asks for
-            // a decision or for an answer: the person is on their way to it, and the host that
-            // suspends under it delays the reply. Section 3 counts "pending requests" with work.
-            if matches!(
-                summary.application_state.0,
-                Some(
-                    kr_protocol::session::ApplicationState::AwaitingApproval
-                        | kr_protocol::session::ApplicationState::AwaitingInput
-                )
-            ) {
-                observed.waiting = true;
-            }
-            // A closure this host accepted and has not finished. Suspending in the middle of one
-            // is how a session's own processes stop being accounted for. The worker's part of it
-            // ends before this host's does: it reports `closing` while it stops those processes
-            // and `closed` once they are stopped, and what is left then is this host recording
-            // the closure, which is also what takes the session out of the list above. So a
-            // closure counts from the first sign of one until then.
-            observed.closing =
-                matches!(summary.state, SessionState::Closing | SessionState::Closed)
-                    || scan
-                        .seen
-                        .get(&worker.descriptor.session_id)
-                        .is_some_and(|seen| seen.closing);
+            let closing_before = scan
+                .seen
+                .get(&worker.descriptor.session_id)
+                .is_some_and(|seen| seen.closing);
+            let observed = SessionDemand::observed(&read, closing_before);
             scan.seen.insert(worker.descriptor.session_id, observed);
         }
         scan.cursor = scan.cursor.wrapping_add(asked);
-        let sessions_with_work = scan.seen.values().filter(|seen| seen.work).count() as u64;
-        let outstanding = scan
-            .seen
-            .values()
-            .map(|seen| u64::from(seen.waiting) + u64::from(seen.closing) + seen.launches)
-            .sum::<u64>();
+        let (sessions_with_work, outstanding) = SessionDemand::total(scan.seen.values());
         drop(scan);
         Demand {
             sessions_with_work,
@@ -359,5 +376,44 @@ impl Controller {
             detail = detail.stated(", ").withheld(ContentClass::Name, origin);
         }
         detail.stated(")")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kr_protocol::scalars::Nullable;
+
+    use super::*;
+    use crate::service::a_close_a_worker_never_answers::read_result;
+
+    /// What the sleep demand counts for one worker's answer, with no closure recorded before.
+    fn demand_of(read: &SessionReadResult) -> (u64, u64) {
+        SessionDemand::total([SessionDemand::observed(read, false)].iter())
+    }
+
+    /// KR-REQ-03.27: a launch confirmation the reader has not answered is a request this host has
+    /// outstanding, one for each caller waiting, so the host is not suspended under it. A session
+    /// that cannot have one says nothing and adds nothing, and a managed session with none in
+    /// flight adds none.
+    #[test]
+    fn a_launch_waiting_for_its_reader_is_counted_as_demand() {
+        let mut read = read_result(SessionId::new(kr_ipc::new_uuid()));
+        assert_eq!(
+            demand_of(&read),
+            (0, 0),
+            "a session that says nothing adds nothing"
+        );
+        read.outstanding_launches = Nullable::some(U64::new(0));
+        assert_eq!(
+            demand_of(&read),
+            (0, 0),
+            "a session with none in flight adds none"
+        );
+        read.outstanding_launches = Nullable::some(U64::new(2));
+        assert_eq!(
+            demand_of(&read),
+            (0, 2),
+            "each caller waiting for the reader's decision is a request outstanding"
+        );
     }
 }

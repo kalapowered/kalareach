@@ -264,6 +264,8 @@ describe('how KalaReach runs here', () => {
     )
   })
 
+  // KR-REQ-03.27: setup offers the mains-only setting and never turns it on, battery use is a
+  // choice of its own, and the assistant has no switch that sets either.
   it('offers the sleep setting and leaves it off', async () => {
     start()
     await screen.findByTestId('setup-identity')
