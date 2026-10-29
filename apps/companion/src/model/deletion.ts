@@ -178,23 +178,28 @@ export function describeDeleted(kind: DeletedKind, preview: DeletionPreview): st
   }
 }
 
-/** One thing a deletion leaves, in words. */
+/**
+ * One thing a deletion leaves, in words. Everything the service keeps for the account is deleted
+ * after the same number of years, which the preview carries; what belongs to an organisation stays
+ * with the organisation.
+ */
 export function describeKept(kind: KeptKind, preview: DeletionPreview): string {
+  const years = String(preview.kept_records_years)
   switch (kind) {
     case 'billing_records':
-      return `Invoices and records of what was charged stay for ${String(preview.kept_records_years)} years, under an identifier with no name or address, and are then deleted.`
+      return `Invoices and records of what was charged stay for ${years} years, under an identifier with no name or address, and are then deleted.`
     case 'relay_records':
-      return 'Records of relay leases and use stay.'
+      return `Records of relay leases and use stay for ${years} years, and are then deleted.`
     case 'call_records':
-      return 'Records of voice calls stay.'
+      return `Records of voice calls stay for ${years} years, and are then deleted.`
     case 'reasoning_records':
-      return 'Records of voice reasoning requests stay.'
+      return `Records of voice reasoning requests stay for ${years} years, and are then deleted.`
     case 'backup_index_rows':
-      return 'An index row for each backed-up object stays.'
+      return `An index row for each backed-up object stays for ${years} years, and is then deleted.`
     case 'organisation_records':
       return 'Records that belong to an organisation stay with the organisation.'
     case 'device_records':
-      return "Records that name your devices' keys stay."
+      return `Records that name your devices' keys stay for ${years} years, and are then deleted.`
     case 'recovery_copies':
       return 'Our own recovery copies of the service hold deleted data for a short time. The privacy policy gives the period.'
     case 'other_services':

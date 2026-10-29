@@ -22,6 +22,7 @@ import { minimumTarget } from '../src/mobile/platform'
 import { DeleteAccount, type DeletionFlow, type DeletionStep } from '../src/components/DeleteAccount'
 import { PURCHASE_WORDS, type AccountView } from '../src/model/account'
 import {
+  describeKept,
   describeProblem,
   describeRefusal,
   type DeletionConfirmAnswer,
@@ -140,6 +141,30 @@ describe('reading what deleting does', () => {
     await setup.person.click(within(setup.panel).getByTestId('delete-account-retry'))
     await within(setup.panel).findByTestId('delete-account-before')
     expect(deletion.views).toBe(2)
+  })
+})
+
+describe('what stays', () => {
+  it('says how long, in years, for everything the service keeps for the account', async () => {
+    const setup = await phone()
+    await reading(setup)
+    const kept = within(setup.panel).getByTestId('delete-account-kept')
+    const years = String(PLAIN_DELETION_PREVIEW.kept_records_years)
+    const items = within(kept).getAllByRole('listitem')
+    for (const kind of [
+      'billing_records',
+      'relay_records',
+      'call_records',
+      'reasoning_records',
+      'backup_index_rows',
+      'device_records'
+    ] as const) {
+      expect(describeKept(kind, PLAIN_DELETION_PREVIEW)).toContain(`${years} years`)
+      expect(items.some((item) => item.textContent === describeKept(kind, PLAIN_DELETION_PREVIEW))).toBe(true)
+    }
+    // What belongs to an organisation stays with it, and the service's own copies have their own period.
+    expect(describeKept('organisation_records', PLAIN_DELETION_PREVIEW)).not.toContain('years')
+    expect(describeKept('recovery_copies', PLAIN_DELETION_PREVIEW)).not.toContain('years')
   })
 })
 
