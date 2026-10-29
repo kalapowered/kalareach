@@ -217,6 +217,15 @@ fn derived_data_names_the_interval_and_resources_it_was_built_from() {
 // KR-REQ-10.50: the live-screen exception, through the projection
 // ---------------------------------------------------------------------------------------------
 
+/// What a terminal printed before the invitation, before it switched to an application.
+fn two_buffer_stream() -> Vec<u8> {
+    let mut stream = Vec::new();
+    stream.extend_from_slice(b"AWS_SECRET_ACCESS_KEY=printed-before-the-invitation\r\n");
+    stream.extend_from_slice(b"\x1b[?1049h");
+    stream.extend_from_slice(b"the application's screen\r\n");
+    stream
+}
+
 /// A terminal that printed something before the invitation, then switched to an application.
 fn engine_with_two_buffers() -> TerminalEngine {
     let mut engine = TerminalEngine::new(
@@ -224,11 +233,7 @@ fn engine_with_two_buffers() -> TerminalEngine {
         std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
     )
     .expect("a canonical grid");
-    let mut stream = Vec::new();
-    stream.extend_from_slice(b"AWS_SECRET_ACCESS_KEY=printed-before-the-invitation\r\n");
-    stream.extend_from_slice(b"\x1b[?1049h");
-    stream.extend_from_slice(b"the application's screen\r\n");
-    engine.feed(0, &stream, LaneGate::default());
+    engine.feed(0, &two_buffer_stream(), LaneGate::default());
     engine
 }
 
@@ -383,7 +388,7 @@ fn what_the_terminal_shows_later_is_visible_to_a_live_only_viewer_and_what_stays
     );
 
     engine.feed(
-        0,
+        two_buffer_stream().len() as u64,
         b"\x1b[?1049lprinted after the application left\r\n",
         LaneGate::default(),
     );
