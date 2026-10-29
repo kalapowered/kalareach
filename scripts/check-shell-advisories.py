@@ -143,13 +143,17 @@ def padded(version):
     return (tuple(version) + (0,) * KEY_NUMBERS)[:KEY_NUMBERS]
 
 
-def version_key(text):
+def version_key(text, fold=False):
     """Where a version such as `7.7.0` or `7.7.0-preview.1+build` sorts, by semantic versioning's
     precedence: the numbers first, then a pre-release before its release, and between pre-releases
     the dot-separated identifiers one by one (a number below a word, numbers by value, words by
-    their ASCII codes, so that a capital sorts below every lower-case letter). Build metadata after
-    a plus sign is not part of the order. None when the text is not a version, which a caller reads
-    as a range it cannot read."""
+    their ASCII codes, so that a capital sorts below every lower-case letter, or, with `fold`,
+    without regard to case, as NuGet orders them). Build metadata after a plus sign is not part of
+    the order. None when the text is not a version, which a caller reads as a range it cannot read.
+
+    The sources do not agree on case: semantic versioning and NuGet order `RC` and `preview`
+    differently, and an advisory writes `RC` for a release PowerShell tags `rc`. So a range is read
+    both ways wherever it decides whether a row is owed (see `reaches`)."""
     match = re.fullmatch(
         r"\s*v?(\d+(?:\.\d+)*)(?:-([0-9A-Za-z][0-9A-Za-z.\-]*))?(?:\+[0-9A-Za-z.\-]+)?\s*", text
     )
@@ -159,7 +163,7 @@ def version_key(text):
     label = match.group(2)
     if label is None:
         return release + (1, ())
-    return release + (0, tuple((0, int(each)) if each.isdigit() else (1, each) for each in label.split(".")))
+    return release + (0, tuple((0, int(each)) if each.isdigit() else (1, each.lower() if fold else each) for each in label.split(".")))
 
 
 def after(key):
@@ -204,11 +208,11 @@ def in_range(range_text, version):
     return True
 
 
-def range_intervals(range_text):
+def range_intervals(range_text, fold=False):
     """The versions a range covers, as half-open intervals of version keys: `low` is inside, `high`
     is not, and None is no bound. Comparators separated by a comma all hold, alternatives separated
     by `||` are each their own interval, and `a-b` is the span from a to b. Versions are ordered as
-    `version_key` orders them. None when the range cannot be read in full."""
+    `version_key` orders them, with the same `fold`. None when the range cannot be read in full."""
     intervals = []
     for alternative in range_text.split("||"):
         low, high = None, None
@@ -217,10 +221,13 @@ def range_intervals(range_text):
             # `7.7.0-0` is a span from 7.7.0 to 0 and also the version 7.7.0 with the pre-release
             # `0`. A span whose end is below its start covers nothing, so the text is the version;
             # where a text reads both ways it counts both ways, because the safe mistake is a row
-            # too many.
-            first, last = version_key(span.group(1)), version_key(span.group(2))
-            point = version_key(alternative)
-            if first is not None and last is not None and first <= last:
+            # too many. A text whose ends are not both versions (`2.0.0-2.4.x`) cannot be read.
+            first = version_key(span.group(1), fold)
+            last = version_key(span.group(2), fold)
+            if first is None or last is None:
+                return None
+            point = version_key(alternative, fold)
+            if first <= last:
                 intervals.append((first, after(last)))
             elif point is None:
                 return None
@@ -231,7 +238,7 @@ def range_intervals(range_text):
             match = re.match(r"\s*(<=|>=|<|>|=)?\s*([0-9][0-9A-Za-z.\-+]*)\s*$", comparator)
             if not match:
                 return None
-            operator, version = match.group(1) or "=", version_key(match.group(2))
+            operator, version = match.group(1) or "=", version_key(match.group(2), fold)
             if version is None:
                 return None
             if operator in (">=", "="):
@@ -254,9 +261,17 @@ def overlap(first, second):
 
 def reaches(range_text, accepted):
     """Whether a range covers any version inside the accepted intervals. A range that cannot be read
-    in full counts as reaching, because the safe mistake is a row too many."""
-    intervals = range_intervals(range_text)
-    return intervals is None or any(overlap(each, other) for each in intervals for other in accepted)
+    in full counts as reaching, because the safe mistake is a row too many. A range is read with
+    the words of a pre-release ordered by their codes and again without regard to case, and it
+    reaches when it does either way: the sources disagree on that order, and a range empty in one
+    is not in the other (`< 7.7.0-RC.1` above `7.7.0-preview.1`)."""
+    for fold in (False, True):
+        intervals = range_intervals(range_text, fold)
+        if intervals is None:
+            return True
+        if any(overlap(each, other) for each in intervals for other in accepted):
+            return True
+    return False
 
 
 def finding(source, package, identifier, aliases, published, updated=None, ranges=(), needs_row=True,
@@ -938,7 +953,9 @@ class Server:
         self.table, self.requests, self.seen = table, [], []
         self.redirects = redirects or {}
         self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread = threading.Thread(
+            target=lambda: self.httpd.serve_forever(poll_interval=0.01), daemon=True
+        )
 
     def __enter__(self):
         self.thread.start()
@@ -1232,10 +1249,12 @@ def run_self_test():
         # whose end is below its start is no span: the text is the version.
         accepted_powershell = [(version_key("7.6.0"), version_key("7.8.0"))]
         expect(
-            "a bare pre-release with a number is the version",
+            "a bare pre-release with a number is read as the version, and a span it cannot judge stays inside",
             reaches("7.7.0-0", accepted_powershell)
             and reaches("7.7.0-rc.1", accepted_powershell)
             and not reaches("7.9.0-0", accepted_powershell)
+            and reaches(">= 7.7.0-preview.1, < 7.7.0-RC.1", accepted_powershell)
+            and reaches("2.0.0-2.4.x", accepted_powershell)
             and in_range("7.7.0-0", "7.7.0")
             and not in_range("3.1.0-3.3.1", "4.9.3")
             and in_range("3.1.0-3.3.1", "3.2"),
@@ -1258,7 +1277,9 @@ def run_self_test():
             ("7.7.0-0", "2026-10-20T10:00:00Z", True, "a revised range that is one pre-release with a number"),
             ("= 7.7.0-0", "2026-10-20T10:00:00Z", True, "a revised range that names one pre-release with a number"),
             (">= 7.7.0-A, < 7.7.0-a", "2026-10-20T10:00:00Z", True, "a revised range between two spellings of one word"),
-            ("7.9.0-0", "2026-10-20T10:00:00Z", True, "a revised range that is one pre-release above the accepted ones"),
+            ("7.9.0-0", "2026-10-20T10:00:00Z", True, "a revised range that is one pre-release of a series above the listed ones"),
+            (">= 7.7.0-preview.1, < 7.7.0-RC.1", "2026-10-20T10:00:00Z", True, "a revised range whose upper word is capitalised above a lower-case lower one"),
+            (">= 7.7.0-a, < 7.7.0-B", "2026-10-20T10:00:00Z", True, "a revised range between a lower-case word and a capital that follows it without regard to case"),
         ):
             outcome = attempt(
                 edited(routes(), powershell_route, old_advisory("GHSA-old1-aaaa-bbbb", text, revised)), now="2026-11-10"
@@ -1283,6 +1304,7 @@ def run_self_test():
             ("= 2.3.4-beta1", True, "a revised range of a pre-release of the lowest PSReadLine version"),
             ("= 3.0.0-beta1", False, "a revised range of a pre-release of the version the range stops before"),
             (">= 2.3.5-beta1, < 2.3.5", True, "a revised range of previews that ends at a version the module accepts"),
+            ("2.0.0-2.4.x", True, "a revised range with an end that is no version"),
         ):
             table[reader_route] = json.dumps(old_advisory("GHSA-old2-aaaa-bbbb", text, "2026-10-20T10:00:00Z")([])).encode()
             outcome = attempt(table, now="2026-11-10")
