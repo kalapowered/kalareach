@@ -1409,9 +1409,12 @@ fn excluded_states() -> Vec<DetachExclusion> {
 /// KR-REQ-07.73's package half, and `veof-change`, `veof-disabled`.
 pub fn the_gesture_follows_the_line_discipline(kind: ShellKind) {
     let speech = dialect(kind);
-    // An editor whose gesture is a chord the worker configures, rather than the line discipline's
-    // own character, is not one this case is for: `psreadline-chord-gesture` is the scenario for
-    // that, and a suite that named this case for such an editor would pass it without a check.
+    // An editor whose host puts the terminal's settings back after every command cannot be told a
+    // new character from inside the shell, and one whose gesture is a chord the worker configures
+    // does not follow the character at all. Neither is one this case is for: the first is driven
+    // by `the_gesture_a_terminal_starts_with_is_the_one_the_reader_announces` and the second by
+    // `psreadline-chord-gesture`, and a suite that named this case for such an editor would pass it
+    // without a check.
     let (Some(change), Some(disable)) = (speech.veof_change, speech.veof_disable) else {
         panic!(
             "{} follows a configured chord rather than the terminal's end-of-file character, so \
@@ -1503,8 +1506,10 @@ pub fn the_gesture_follows_the_line_discipline(kind: ShellKind) {
 /// A person who changes the end-of-file character from inside such a shell loses the change when
 /// the command ends, so the character the shell finds is the one the terminal had when the shell
 /// started. The terminal is set up first, and the reader announces what it found at the first
-/// prompt: a gesture that moved, or none at all. A key that is not the gesture is the editor's own,
-/// and with no end-of-file character no key is one.
+/// prompt: a gesture that moved, or none at all. Each key is pressed at an empty fenced prompt,
+/// where the gesture detaches and any other key is the editor's own; the editor's own answer to the
+/// terminal's usual character at an empty prompt is to end the shell, which is what shows that no
+/// managed decision stood in its way.
 pub fn the_gesture_a_terminal_starts_with_is_the_one_the_reader_announces(kind: ShellKind) {
     let package = Package::built(kind);
     let started_with = |eof: &'static str| {
@@ -1530,34 +1535,21 @@ pub fn the_gesture_a_terminal_starts_with_is_the_one_the_reader_announces(kind: 
         });
         session.reading = true;
         session.last_entry = Some(as_enter(&event).clone());
+        session.forget_events();
+        assert!(session.answered("kr-ready"));
         (session, announced.gesture)
     };
+    let moved = EofGesture::TerminalEof {
+        byte: U64::new(0x07),
+    };
 
-    // The terminal's character moved: the key it names detaches, and the default does not.
+    // The terminal's character moved: the key it names detaches at an empty prompt.
     let (mut session, gesture) = started_with("^g");
     assert_eq!(
-        gesture,
-        EofGesture::TerminalEof {
-            byte: U64::new(0x07)
-        },
+        gesture, moved,
         "the gesture the terminal started with was announced as another"
     );
-    session.forget_events();
-    assert!(session.answered("kr-ready"));
     let (_, fence) = session.fenced_prompt(6);
-    // Nothing of the editor's own ends a shell whose buffer is not empty.
-    let typed = session.written();
-    session.type_bytes(b"kr");
-    assert!(session.wait_for_editor(typed));
-    session.type_bytes(CTRL_D);
-    assert!(
-        !session.saw_event(Duration::from_millis(500), |event| matches!(
-            event,
-            BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
-        )),
-        "a character that is not the terminal's end-of-file character was treated as the gesture"
-    );
-    session.clear_line();
     session.type_bytes(CTRL_G);
     let (id, event) = session.expect_event("eof_detach", |event| {
         matches!(event, BridgeEvent::EofDetach(_))
@@ -1568,30 +1560,44 @@ pub fn the_gesture_a_terminal_starts_with_is_the_one_the_reader_announces(kind: 
     assert_eq!(detach.fence_id, fence.fence_id);
     session.answer_event(id, detached(attachment_id(1)));
     assert!(session.alive());
+    drop(session);
 
-    // The terminal started with no end-of-file character: no key is the gesture.
+    // And the default key is no longer the gesture: the editor's own answer to it at an empty
+    // prompt, which is to end the shell, is the answer, and nothing decided before it.
+    let (mut session, _) = started_with("^g");
+    let (_enter, _fence) = session.fenced_prompt(7);
+    session.type_bytes(CTRL_D);
+    assert!(
+        session.ended_within(REPLY),
+        "the terminal's old character was kept as if it were still the gesture:\n{}",
+        session.terminal_output()
+    );
+    assert!(
+        session.no_managed_decision_before(0),
+        "the terminal's old character was decided on as the gesture"
+    );
+    drop(session);
+
+    // The terminal started with no end-of-file character: no key is the gesture, so a character
+    // that is not the editor's own answer is still its own, and the usual one ends the shell.
     let (mut session, gesture) = started_with("undef");
     assert_eq!(
         gesture,
         EofGesture::Disabled,
         "a terminal with no end-of-file character was announced as having a gesture"
     );
-    session.forget_events();
-    assert!(session.answered("kr-ready"));
-    let (_, _fence) = session.fenced_prompt(7);
-    let typed = session.written();
-    session.type_bytes(b"kr");
-    assert!(session.wait_for_editor(typed));
-    session.type_bytes(CTRL_D);
+    let (_enter, _fence) = session.fenced_prompt(8);
     session.type_bytes(CTRL_G);
+    session.type_bytes(CTRL_D);
     assert!(
-        !session.saw_event(Duration::from_millis(500), |event| matches!(
-            event,
-            BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
-        )),
+        session.ended_within(REPLY),
+        "a terminal with no end-of-file character kept a key as the gesture:\n{}",
+        session.terminal_output()
+    );
+    assert!(
+        session.no_managed_decision_before(0),
         "a terminal with no end-of-file character still produced a gesture"
     );
-    assert!(session.alive());
 }
 
 /// The budget a case gives a launch whose subject is not the deadline.

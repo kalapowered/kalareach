@@ -249,8 +249,9 @@ pub fn dialect(kind: ShellKind) -> Dialect {
             ignore_eof_on: None,
             ignore_eof_report: None,
             continuation: None,
-            // The gesture on this editor is a chord the worker configures, so the line discipline's
-            // own character is not what it follows.
+            // A character changed from inside this editor's host does not outlast the command that
+            // changed it, so the gesture cannot be driven by changing it mid-session; the case that
+            // starts the terminal with another character drives it instead.
             veof_change: None,
             veof_disable: None,
             launch_expectation: "kr launch ok|$(echo substituted)|",

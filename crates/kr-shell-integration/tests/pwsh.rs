@@ -525,7 +525,12 @@ fn the_package_refuses_an_editor_version_outside_the_range_it_was_qualified_agai
             "1.2.3" | "2.3.3" | "2.3.3.65535" | "3.0.0" | "3.0.0.1" | "3.1.0" | "10.0.0"
         );
         let found = reason(version);
-        if outside {
+        if version == real {
+            assert_eq!(
+                found, "",
+                "PSReadLine {version} is the editor the package was qualified against and is accepted whole"
+            );
+        } else if outside {
             assert_eq!(
                 found, "psreadline_version_unqualified",
                 "PSReadLine {version} is outside the qualified range and was not refused for it"
