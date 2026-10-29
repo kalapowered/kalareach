@@ -49,6 +49,13 @@ import type {
 
 import type { AccountView, UsageView } from '../model/account'
 import type {
+  DeletionConfirmAnswer,
+  DeletionPreview,
+  DeletionSendAnswer,
+  DeletionStatusAnswer,
+  DeletionViewAnswer
+} from '../model/deletion'
+import type {
   ApprovedLink,
   CameraAccess,
   ConnectionState,
@@ -275,6 +282,67 @@ export interface FakeAccount {
   answerUsage(index: number, usage: UsageView): void
   /** Makes the next sign-outs fail the way the backend reports it: still signed in. */
   failSignOut(): void
+  /** Deleting the account. */
+  readonly deletion: FakeDeletion
+}
+
+/** What deleting the account would do, for an account with nothing owed and nothing owned. */
+export const PLAIN_DELETION_PREVIEW: DeletionPreview = {
+  address: 's***@example.com',
+  warnings: [],
+  deleted: [
+    'sign_ins',
+    'passkeys_and_address',
+    'backup_records',
+    'recovery_bundle',
+    'relay_and_voice_ended',
+    'payment_record',
+    'organisation_memberships',
+    'device_registrations'
+  ],
+  kept: [
+    'billing_records',
+    'relay_records',
+    'call_records',
+    'reasoning_records',
+    'backup_index_rows',
+    'organisation_records',
+    'device_records',
+    'recovery_copies',
+    'other_services'
+  ],
+  unlisted: false,
+  kept_records_years: 7,
+  backup_file_days: 7,
+  code_lifetime_minutes: 5
+}
+
+/**
+ * The backend's deletion of the account, as a test scripts it. Each step answers what it was last
+ * told to; a confirmation answers the next one queued, and a closed account is signed out before
+ * the answer comes back, as the backend does it.
+ */
+export interface FakeDeletion {
+  /** How many times the page asked what deleting would do. */
+  readonly views: number
+  /** How many codes the page asked for. */
+  readonly codesSent: number
+  /** Every confirmation, as the page made it. */
+  readonly confirms: readonly { readonly code: string; readonly acknowledged: readonly string[] }[]
+  /** How many times the page asked how the removal goes. */
+  readonly statusReads: number
+  /** What reading what deleting would do answers. */
+  answerView(answer: DeletionViewAnswer): void
+  /** What asking for the code answers. */
+  answerSendCode(answer: DeletionSendAnswer): void
+  /** The answers the next confirmations give, in order; the last one repeats. */
+  answerConfirm(...answers: readonly DeletionConfirmAnswer[]): void
+  /** What asking how the removal goes answers. */
+  answerStatus(answer: DeletionStatusAnswer): void
+  /** The next confirmation waits until the test releases it. */
+  holdConfirm(): void
+  /** Answers the confirmation that waits. */
+  releaseConfirm(): void
 }
 
 /** What the host says of the sessions screens open, and what a test can make it say. */
@@ -1289,6 +1357,16 @@ export function fakeHost(
   let signOutFails = false
   let signIns = 0
   let pendingSignIn: ((view: AccountView) => void) | null = null
+  let deletionViews = 0
+  let deletionCodes = 0
+  let deletionStatusReads = 0
+  const deletionConfirms: { readonly code: string; readonly acknowledged: readonly string[] }[] = []
+  let deletionView: DeletionViewAnswer = { state: 'ready', preview: PLAIN_DELETION_PREVIEW }
+  let deletionSend: DeletionSendAnswer = { state: 'sent' }
+  let deletionStatus: DeletionStatusAnswer = { state: 'none' }
+  let deletionConfirmAnswers: readonly DeletionConfirmAnswer[] = [{ state: 'closed', finished: false }]
+  let deletionConfirmHeld = false
+  let releaseDeletionConfirm: (() => void) | null = null
   const accountListeners = new Set<(view: AccountView) => void>()
   const setAccount = (view: AccountView) => {
     accountView = view
@@ -2739,6 +2817,41 @@ export function fakeHost(
             heldUsage.push(resolve)
           })
         : Promise.resolve(accountUsage),
+    accountDeletionView: () => {
+      deletionViews += 1
+      return Promise.resolve(deletionView)
+    },
+    accountDeletionSendCode: () => {
+      deletionCodes += 1
+      return Promise.resolve(deletionSend)
+    },
+    accountDeletionConfirm: (code, acknowledged) => {
+      deletionConfirms.push({ code, acknowledged })
+      const answer = () => {
+        const next =
+          deletionConfirmAnswers.length > 1
+            ? deletionConfirmAnswers[0]
+            : deletionConfirmAnswers[deletionConfirmAnswers.length - 1]
+        if (deletionConfirmAnswers.length > 1) deletionConfirmAnswers = deletionConfirmAnswers.slice(1)
+        // The backend signs the device out before it answers.
+        if (next?.state === 'closed') {
+          accountUsage = { state: 'signed_out' }
+          setAccount({ state: 'signed_out', outcome: null })
+        }
+        return next ?? ({ state: 'unsettled' } as const)
+      }
+      if (!deletionConfirmHeld) return Promise.resolve(answer())
+      deletionConfirmHeld = false
+      return new Promise<DeletionConfirmAnswer>((resolve) => {
+        releaseDeletionConfirm = () => {
+          resolve(answer())
+        }
+      })
+    },
+    accountDeletionStatus: () => {
+      deletionStatusReads += 1
+      return Promise.resolve(deletionStatus)
+    },
     onAccount: (listener) => register(accountListeners, listener),
 
     syncServiceView: () => {
@@ -3113,6 +3226,40 @@ export function fakeHost(
       },
       failSignOut() {
         signOutFails = true
+      },
+      deletion: {
+        get views() {
+          return deletionViews
+        },
+        get codesSent() {
+          return deletionCodes
+        },
+        get confirms() {
+          return deletionConfirms
+        },
+        get statusReads() {
+          return deletionStatusReads
+        },
+        answerView(answer) {
+          deletionView = answer
+        },
+        answerSendCode(answer) {
+          deletionSend = answer
+        },
+        answerConfirm(...answers) {
+          deletionConfirmAnswers = answers
+        },
+        answerStatus(answer) {
+          deletionStatus = answer
+        },
+        holdConfirm() {
+          deletionConfirmHeld = true
+        },
+        releaseConfirm() {
+          const release = releaseDeletionConfirm
+          releaseDeletionConfirm = null
+          release?.()
+        }
       }
     },
     emit,

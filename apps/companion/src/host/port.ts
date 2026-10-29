@@ -109,6 +109,12 @@ import type {
 } from '@kalareach/protocol'
 
 import type { AccountView, UsageView } from '../model/account'
+import type {
+  DeletionConfirmAnswer,
+  DeletionSendAnswer,
+  DeletionStatusAnswer,
+  DeletionViewAnswer
+} from '../model/deletion'
 import type { Supersession } from '../model/receipt-reads'
 
 /** A failure a command answered with. */
@@ -2132,6 +2138,28 @@ export interface HostPort {
 
   /** The account's usage, and nothing about money. */
   accountUsage(): Promise<UsageView>
+
+  /**
+   * What deleting the account would do, as the service says it. Nothing is changed. The page
+   * names nothing: not the address, a token or a receipt.
+   */
+  accountDeletionView(): Promise<DeletionViewAnswer>
+
+  /** Asks the service to email the code that confirms the deletion to the account's own address. */
+  accountDeletionSendCode(): Promise<DeletionSendAnswer>
+
+  /**
+   * Confirms the deletion with the code from the email and the organisations the person accepted
+   * losing, by the identifiers the service named. A closed account is signed out here before the
+   * answer comes back.
+   */
+  accountDeletionConfirm(
+    code: string,
+    acknowledged: readonly string[]
+  ): Promise<DeletionConfirmAnswer>
+
+  /** How the removal is going, for the deletion this device holds a record of. */
+  accountDeletionStatus(): Promise<DeletionStatusAnswer>
 
   /**
    * Tells `listener` where the device stands each time that changes by itself. Resolves, with the

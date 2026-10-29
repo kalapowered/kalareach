@@ -14,6 +14,12 @@ import { Channel, invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 
 import type { AccountView, UsageView } from '../model/account'
+import type {
+  DeletionConfirmAnswer,
+  DeletionSendAnswer,
+  DeletionStatusAnswer,
+  DeletionViewAnswer
+} from '../model/deletion'
 
 import type {
   ApprovedLink,
@@ -419,6 +425,11 @@ export function tauriPort(): HostPort {
     accountSignInCancel: () => call<undefined>('account_sign_in_cancel', {}),
     accountSignOut: () => call<AccountView>('account_sign_out', {}),
     accountUsage: () => call<UsageView>('account_usage', {}),
+    accountDeletionView: () => call<DeletionViewAnswer>('account_deletion_view', {}),
+    accountDeletionSendCode: () => call<DeletionSendAnswer>('account_deletion_send_code', {}),
+    accountDeletionConfirm: (code, acknowledged) =>
+      call<DeletionConfirmAnswer>('account_deletion_confirm', { code, acknowledged }),
+    accountDeletionStatus: () => call<DeletionStatusAnswer>('account_deletion_status', {}),
     onAccount: (listener) => listening<AccountView>(ACCOUNT_EVENT, listener),
 
     syncServiceView: () => call<SyncServiceView>('sync_service_view', {}),

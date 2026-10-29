@@ -15,6 +15,10 @@
  * for a looping one.
  *
  * Nothing to buy: no plan, no price, no balance, no link and no form. Usage is figures and meters.
+ *
+ * A signed-in account can be deleted from the foot of the panel. The step replaces the cards while
+ * it is open and the cards stay mounted under a hidden wrapper, so cancelling leaves the panel as it
+ * was and `SyncPanel` reads nothing again.
  */
 
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react'
@@ -31,6 +35,8 @@ import {
   type AccountView,
   type UsageView
 } from '../model/account'
+import { ENTRY_NOTE } from '../model/deletion'
+import { DeleteAccount, useDeletion } from './DeleteAccount'
 import { SyncPanel } from './SyncPanel'
 import { Button, Card } from './ui'
 
@@ -154,6 +160,19 @@ export function AccountPanel({
   const statusRef = useRef<HTMLDivElement | null>(null)
   const cancelRef = useRef<HTMLButtonElement | null>(null)
   const previous = useRef<AccountView['state'] | null>(null)
+  const deletion = useDeletion(port, view)
+  const entryRef = useRef<HTMLButtonElement | null>(null)
+  const wasOpen = useRef(false)
+
+  // Leaving the deletion puts focus back where it began: on the button that opened it, or, when the
+  // account is gone and the button with it, on the status line of the panel that is left.
+  useEffect(() => {
+    if (wasOpen.current && !deletion.open) {
+      const place = entryRef.current ?? statusRef.current
+      place?.focus()
+    }
+    wasOpen.current = deletion.open
+  }, [deletion.open])
 
   // While the browser is open, Cancel is the first control. On the way back, focus goes to the
   // status line, so VoiceOver and TalkBack read how the attempt ended.
@@ -179,77 +198,100 @@ export function AccountPanel({
 
   return (
     <div className="account-panel" data-testid="account-panel">
-      <Card>
-        <div className="account-state" key={view.state}>
-          <div
-            className="account-status"
-            role="status"
-            tabIndex={-1}
-            ref={statusRef}
-            aria-busy={view.state === 'finishing'}
-          >
-            <p className="account-lead">{describeAccount(view)}</p>
-            {view.state === 'unavailable' ? (
-              <p className="account-note">{describeUnavailable(view.reason)}</p>
+      <div className="account-panel-body" hidden={deletion.open}>
+        <Card>
+          <div className="account-state" key={view.state}>
+            <div
+              className="account-status"
+              role="status"
+              tabIndex={-1}
+              ref={statusRef}
+              aria-busy={view.state === 'finishing'}
+            >
+              <p className="account-lead">{describeAccount(view)}</p>
+              {view.state === 'unavailable' ? (
+                <p className="account-note">{describeUnavailable(view.reason)}</p>
+              ) : null}
+              {outcome ? <p className="account-note">{describeOutcome(outcome)}</p> : null}
+            </div>
+            {offersSignIn ? (
+              <div className="account-actions">
+                <Button
+                  tone="primary"
+                  style={{ minBlockSize: target }}
+                  aria-describedby={helpId}
+                  onClick={account.signIn}
+                >
+                  Sign in
+                </Button>
+                <p className="account-help" id={helpId}>
+                  {SIGN_IN_HELP}
+                </p>
+              </div>
             ) : null}
-            {outcome ? <p className="account-note">{describeOutcome(outcome)}</p> : null}
+            {view.state === 'browser_open' ? (
+              <div className="account-actions">
+                <button
+                  type="button"
+                  className="btn"
+                  ref={cancelRef}
+                  style={{ minBlockSize: target }}
+                  onClick={account.cancel}
+                >
+                  Cancel
+                </button>
+              </div>
+            ) : null}
+            {view.state === 'signed_in' ? (
+              <div className="account-actions">
+                <Button style={{ minBlockSize: target }} onClick={account.signOut}>
+                  Sign out
+                </Button>
+              </div>
+            ) : null}
           </div>
-          {offersSignIn ? (
-            <div className="account-actions">
-              <Button
-                tone="primary"
-                style={{ minBlockSize: target }}
-                aria-describedby={helpId}
-                onClick={account.signIn}
-              >
-                Sign in
-              </Button>
-              <p className="account-help" id={helpId}>
-                {SIGN_IN_HELP}
-              </p>
-            </div>
-          ) : null}
-          {view.state === 'browser_open' ? (
-            <div className="account-actions">
-              <button
-                type="button"
-                className="btn"
-                ref={cancelRef}
-                style={{ minBlockSize: target }}
-                onClick={account.cancel}
-              >
-                Cancel
-              </button>
-            </div>
-          ) : null}
-          {view.state === 'signed_in' ? (
-            <div className="account-actions">
-              <Button style={{ minBlockSize: target }} onClick={account.signOut}>
-                Sign out
-              </Button>
-            </div>
-          ) : null}
-        </div>
-      </Card>
+        </Card>
 
-      {view.state === 'signed_in' ? (
-        <Usage
-          readable={view.usage_readable}
-          usage={usage}
-          target={target}
-          onRetry={account.readUsage}
-        />
-      ) : null}
+        {view.state === 'signed_in' ? (
+          <Usage
+            readable={view.usage_readable}
+            usage={usage}
+            target={target}
+            onRetry={account.readUsage}
+          />
+        ) : null}
 
-      <SyncPanel port={port} account={view} surface={surface} />
+        <SyncPanel port={port} account={view} surface={surface} />
 
-      <p className="account-section-title">Working without an account</p>
-      <Card>
-        <p className="account-note">
-          Your hosts run on your machines. Sessions, agents and terminals work the same whether this
-          device is signed in or not, and nothing here needs an account to reach a host you paired.
-        </p>
-      </Card>
+        <p className="account-section-title">Working without an account</p>
+        <Card>
+          <p className="account-note">
+            Your hosts run on your machines. Sessions, agents and terminals work the same whether this
+            device is signed in or not, and nothing here needs an account to reach a host you paired.
+          </p>
+        </Card>
+
+        {view.state === 'signed_in' ? (
+          <>
+            <p className="account-section-title">Delete account</p>
+            <Card>
+              <div className="account-actions">
+                <p className="account-note">{ENTRY_NOTE}</p>
+                <Button
+                  ref={entryRef}
+                  data-testid="delete-account-open"
+                  style={{ minBlockSize: target }}
+                  onClick={deletion.begin}
+                >
+                  Delete account
+                </Button>
+              </div>
+            </Card>
+          </>
+        ) : null}
+      </div>
+
+      {deletion.open ? <DeleteAccount flow={deletion} surface={surface} /> : null}
     </div>
   )
 }

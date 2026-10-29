@@ -1,0 +1,674 @@
+/**
+ * Deleting the account from the Account panel, as a person does it.
+ *
+ * The page asks the backend what deleting would do, asks for the emailed code, confirms with it and
+ * learns how the removal goes. The backend is the shipped interface with a host that answers
+ * without a machine (`fakeHost`), scripted with the answers the service gives. What these hold is
+ * the page's half: every step and where it leads, what a refusal does to the field, that nothing
+ * the person has not yet confirmed is lost by leaving, that the step survives the signed-out event
+ * the backend publishes before it answers, and that the page hands the backend the code and the
+ * organisations and nothing else.
+ */
+
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+
+import { App } from '../src/App'
+import { AppProvider } from '../src/app/state'
+import { PLAIN_DELETION_PREVIEW, fakeHost } from '../src/host/fake'
+import { MobileApp } from '../src/mobile/MobileApp'
+import { minimumTarget } from '../src/mobile/platform'
+import { DeleteAccount, type DeletionFlow, type DeletionStep } from '../src/components/DeleteAccount'
+import { PURCHASE_WORDS, type AccountView } from '../src/model/account'
+import {
+  describeProblem,
+  describeRefusal,
+  type DeletionConfirmAnswer,
+  type DeletionPreview,
+  type DeletionProblem
+} from '../src/model/deletion'
+
+const SIGNED_IN: AccountView = {
+  state: 'signed_in',
+  email: 'sam@example.com',
+  name: null,
+  usage_readable: false,
+  generation: 'aaaa',
+  outcome: null
+}
+
+const CODE = '12345678'
+
+/** The phone's Account screen, signed in. */
+async function phone() {
+  const { port, controls } = fakeHost()
+  controls.account.set(SIGNED_IN)
+  render(
+    <AppProvider port={port}>
+      <MobileApp surface="ios" storage={null} />
+    </AppProvider>
+  )
+  const person = userEvent.setup()
+  await person.click(await screen.findByRole('button', { name: /^Account/ }))
+  const panel = await screen.findByTestId('mobile-account')
+  return { person, controls, panel }
+}
+
+/** Opens the step and reads it. */
+async function reading(setup: Awaited<ReturnType<typeof phone>>) {
+  const { person, panel } = setup
+  await person.click(await within(panel).findByTestId('delete-account-open'))
+  await within(panel).findByTestId('delete-account-before')
+}
+
+/** Reads, asks for the code and has the field in front of it. */
+async function atTheField(setup: Awaited<ReturnType<typeof phone>>) {
+  await reading(setup)
+  await setup.person.click(within(setup.panel).getByTestId('delete-account-send-code'))
+  return await within(setup.panel).findByTestId('delete-account-code')
+}
+
+const step = (panel: HTMLElement) => within(panel).getByTestId('delete-account').getAttribute('data-step')
+
+afterEach(() => {
+  vi.useRealTimers()
+})
+
+describe('reading what deleting does', () => {
+  it('shows the money before the button that sends the code, whether or not a warning came', async () => {
+    const setup = await phone()
+    await reading(setup)
+    const before = within(setup.panel).getByTestId('delete-account-before')
+    const send = within(setup.panel).getByTestId('delete-account-send-code')
+    // Document order: what is lost comes before the control that goes on.
+    expect(before.compareDocumentPosition(send) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(within(before).getAllByRole('listitem')).toHaveLength(3)
+    // Everything the service listed is shown, and the lists are real lists.
+    expect(
+      within(within(setup.panel).getByTestId('delete-account-deleted')).getAllByRole('listitem')
+    ).toHaveLength(PLAIN_DELETION_PREVIEW.deleted.length)
+    expect(
+      within(within(setup.panel).getByTestId('delete-account-kept')).getAllByRole('listitem')
+    ).toHaveLength(PLAIN_DELETION_PREVIEW.kept.length + 1)
+  })
+
+  it('adds a line for each warning, the organisation owner first', async () => {
+    const setup = await phone()
+    setup.controls.account.deletion.answerView({
+      state: 'ready',
+      preview: {
+        ...PLAIN_DELETION_PREVIEW,
+        warnings: [
+          { kind: 'organisation_owner', organisation_id: 'org-1', name: 'Acme', members: 4 },
+          { kind: 'subscription' },
+          { kind: 'credit' },
+          { kind: 'money_owed' }
+        ]
+      }
+    })
+    await reading(setup)
+    const items = within(within(setup.panel).getByTestId('delete-account-before')).getAllByRole(
+      'listitem'
+    )
+    expect(items).toHaveLength(7)
+    expect(items[0]).toHaveTextContent('Acme')
+    expect(items[0]).toHaveTextContent('4 members')
+  })
+
+  it('goes no further when it cannot show what a warning or a choice means', async () => {
+    const setup = await phone()
+    setup.controls.account.deletion.answerView({ state: 'cannot_show' })
+    await setup.person.click(await within(setup.panel).findByTestId('delete-account-open'))
+    await waitFor(() => {
+      expect(step(setup.panel)).toBe('cannot_show')
+    })
+    expect(within(setup.panel).queryByTestId('delete-account-send-code')).toBeNull()
+    await setup.person.click(within(setup.panel).getByTestId('delete-account-cancel'))
+    expect(within(setup.panel).getByTestId('delete-account-open')).toHaveFocus()
+  })
+
+  it('says why it could not read, and tries again', async () => {
+    const setup = await phone()
+    const { deletion } = setup.controls.account
+    deletion.answerView({ state: 'problem', problem: { kind: 'unreachable' } })
+    await setup.person.click(await within(setup.panel).findByTestId('delete-account-open'))
+    const problem = await within(setup.panel).findByTestId('delete-account-problem')
+    expect(problem).toHaveAttribute('data-kind', 'unreachable')
+    expect(problem).toHaveTextContent('Nothing changed')
+    deletion.answerView({ state: 'ready', preview: PLAIN_DELETION_PREVIEW })
+    await setup.person.click(within(setup.panel).getByTestId('delete-account-retry'))
+    await within(setup.panel).findByTestId('delete-account-before')
+    expect(deletion.views).toBe(2)
+  })
+})
+
+describe('leaving before the code is sent', () => {
+  it('puts the panel back as it was, and focus on the button that opened the step', async () => {
+    const setup = await phone()
+    await reading(setup)
+    expect(within(setup.panel).getByRole('status')).toHaveFocus()
+    await setup.person.click(within(setup.panel).getByTestId('delete-account-cancel'))
+    expect(within(setup.panel).queryByTestId('delete-account')).toBeNull()
+    expect(within(setup.panel).getByText('Signed in as sam@example.com.')).toBeVisible()
+    expect(within(setup.panel).getByTestId('delete-account-open')).toHaveFocus()
+    expect(setup.controls.account.deletion.codesSent).toBe(0)
+  })
+
+  it('ends by itself when a different sign-in takes the place of the one it began under', async () => {
+    const setup = await phone()
+    await reading(setup)
+    act(() => {
+      setup.controls.account.set({ ...SIGNED_IN, generation: 'bbbb' })
+    })
+    await waitFor(() => {
+      expect(within(setup.panel).queryByTestId('delete-account')).toBeNull()
+    })
+  })
+
+  it('ends by itself when the sign-in ends while the field is open', async () => {
+    const setup = await phone()
+    await atTheField(setup)
+    act(() => {
+      setup.controls.account.set({ state: 'ended' })
+    })
+    await waitFor(() => {
+      expect(within(setup.panel).queryByTestId('delete-account')).toBeNull()
+    })
+  })
+})
+
+describe('the code', () => {
+  it('takes digits only, from a paste with a space in it, and goes on only with all eight', async () => {
+    const setup = await phone()
+    const field = await atTheField(setup)
+    const { person, panel } = setup
+    expect(field).toHaveFocus()
+    expect(field).toHaveAttribute('autocomplete', 'one-time-code')
+    expect(field).toHaveAttribute('inputmode', 'numeric')
+    const confirm = within(panel).getByTestId('delete-account-confirm')
+    expect(confirm).toBeDisabled()
+    await person.click(field)
+    await person.paste('1234 5678 99')
+    expect(field).toHaveValue(CODE)
+    expect(confirm).toBeEnabled()
+    await person.clear(field)
+    await person.type(field, '1234567')
+    expect(confirm).toBeDisabled()
+    await person.keyboard('{Enter}')
+    expect(setup.controls.account.deletion.confirms).toEqual([])
+  })
+
+  it('hands the backend the code and the organisations accepted, and nothing else', async () => {
+    const setup = await phone()
+    const field = await atTheField(setup)
+    await setup.person.type(field, CODE)
+    await setup.person.keyboard('{Enter}')
+    await within(setup.panel).findByTestId('delete-account-done')
+    expect(setup.controls.account.deletion.confirms).toEqual([{ code: CODE, acknowledged: [] }])
+  })
+
+  it('is told a refusal beside the field, which is emptied and focused', async () => {
+    const setup = await phone()
+    const { deletion } = setup.controls.account
+    deletion.answerConfirm({ state: 'code_refused', reason: 'wrong', attempts_left: 4 })
+    const field = await atTheField(setup)
+    await setup.person.type(field, CODE)
+    await setup.person.click(within(setup.panel).getByTestId('delete-account-confirm'))
+    const refusal = await within(setup.panel).findByTestId('delete-account-refusal')
+    expect(refusal).toHaveAttribute('data-reason', 'wrong')
+    expect(refusal).toHaveAttribute('data-left', '4')
+    expect(refusal).toHaveTextContent('4 tries')
+    const again = within(setup.panel).getByTestId('delete-account-code')
+    expect(again).toHaveValue('')
+    expect(again).toHaveFocus()
+    expect(again).toHaveAttribute('aria-invalid', 'true')
+    expect(within(setup.panel).getByTestId('delete-account').querySelector('[role="status"]')).toContainElement(
+      refusal
+    )
+    expect(again).toHaveAccessibleDescription(/not right/)
+  })
+
+  it.each(['expired', 'spent'] as const)('says a code that is %s must be replaced', async (reason) => {
+    const setup = await phone()
+    const { deletion } = setup.controls.account
+    deletion.answerConfirm({ state: 'code_refused', reason, attempts_left: 0 })
+    const field = await atTheField(setup)
+    await setup.person.type(field, CODE)
+    await setup.person.keyboard('{Enter}')
+    const refusal = await within(setup.panel).findByTestId('delete-account-refusal')
+    expect(refusal).toHaveAttribute('data-reason', reason)
+    await setup.person.click(within(setup.panel).getByTestId('delete-account-resend'))
+    await waitFor(() => {
+      expect(deletion.codesSent).toBe(2)
+    })
+  })
+
+  it.each([
+    [{ kind: 'busy', seconds: 600 }, 'busy', '10 minutes'],
+    [{ kind: 'mail_failed' }, 'mail_failed', 'could not be sent'],
+    [{ kind: 'needs_sign_in' }, 'needs_sign_in', 'Sign in again']
+  ] satisfies [DeletionProblem, string, string][])(
+    'tells a failure to send it (%j)',
+    async (problem, kind, fact) => {
+      const setup = await phone()
+      setup.controls.account.deletion.answerSendCode({ state: 'problem', problem })
+      await reading(setup)
+      await setup.person.click(within(setup.panel).getByTestId('delete-account-send-code'))
+      const said = await within(setup.panel).findByTestId('delete-account-problem')
+      expect(said).toHaveAttribute('data-kind', kind)
+      expect(said).toHaveTextContent(fact)
+      // The person is where they were, with the lists in front of them.
+      expect(step(setup.panel)).toBe('read')
+    }
+  )
+
+  it('waits at the field when the email may have been sent', async () => {
+    const setup = await phone()
+    setup.controls.account.deletion.answerSendCode({ state: 'problem', problem: { kind: 'unsure' } })
+    await reading(setup)
+    await setup.person.click(within(setup.panel).getByTestId('delete-account-send-code'))
+    expect(await within(setup.panel).findByTestId('delete-account-code')).toBeVisible()
+    expect(within(setup.panel).getByTestId('delete-account-problem')).toHaveAttribute(
+      'data-kind',
+      'unsure'
+    )
+  })
+
+  it.each([
+    [{ kind: 'unreachable' }, 'unreachable'],
+    [{ kind: 'busy', seconds: 30 }, 'busy'],
+    [{ kind: 'refused' }, 'refused']
+  ] satisfies [DeletionProblem, string][])(
+    'keeps what was typed when the confirmation could not be made (%j)',
+    async (problem, kind) => {
+      const setup = await phone()
+      setup.controls.account.deletion.answerConfirm({ state: 'problem', problem })
+      const field = await atTheField(setup)
+      await setup.person.type(field, CODE)
+      await setup.person.keyboard('{Enter}')
+      const said = await within(setup.panel).findByTestId('delete-account-problem')
+      expect(said).toHaveAttribute('data-kind', kind)
+      expect(within(setup.panel).getByTestId('delete-account-code')).toHaveValue(CODE)
+    }
+  )
+})
+
+describe('an account that owns an organisation', () => {
+  it('asks once more, names them, and sends the same code with their identifiers', async () => {
+    const setup = await phone()
+    const { deletion } = setup.controls.account
+    const owned: DeletionConfirmAnswer = {
+      state: 'acknowledge',
+      organisations: [
+        { organisation_id: 'org-1', name: 'Acme', members: 4 },
+        { organisation_id: 'org-2', name: 'Initech', members: 1 }
+      ]
+    }
+    // Asked for twice, since the person goes back once; the third try accepts them.
+    deletion.answerConfirm(owned, owned, { state: 'closed', finished: true })
+    const field = await atTheField(setup)
+    await setup.person.type(field, CODE)
+    await setup.person.keyboard('{Enter}')
+    const list = await within(setup.panel).findByTestId('delete-account-organisations')
+    expect(within(list).getAllByRole('listitem')).toHaveLength(2)
+
+    // Back goes to the field with the code still there.
+    await setup.person.click(within(setup.panel).getByTestId('delete-account-back'))
+    expect(within(setup.panel).getByTestId('delete-account-code')).toHaveValue(CODE)
+    await setup.person.keyboard('{Enter}')
+    await setup.person.click(await within(setup.panel).findByTestId('delete-account-acknowledge'))
+    await within(setup.panel).findByTestId('delete-account-done')
+    expect(deletion.confirms.at(-1)).toEqual({ code: CODE, acknowledged: ['org-1', 'org-2'] })
+  })
+})
+
+describe('the result', () => {
+  it('survives the signed-out view the backend publishes before it answers', async () => {
+    const setup = await phone()
+    const { deletion } = setup.controls.account
+    const field = await atTheField(setup)
+    await setup.person.type(field, CODE)
+    deletion.holdConfirm()
+    await setup.person.keyboard('{Enter}')
+    await waitFor(() => {
+      expect(step(setup.panel)).toBe('confirming')
+    })
+    expect(within(setup.panel).getByTestId('delete-account-confirm')).toBeDisabled()
+    expect(within(setup.panel).queryByTestId('delete-account-cancel')).toBeNull()
+    // The device is signed out while the confirmation is out, as the backend does it.
+    act(() => {
+      setup.controls.account.set({ state: 'signed_out', outcome: null })
+    })
+    expect(step(setup.panel)).toBe('confirming')
+    await act(async () => {
+      deletion.releaseConfirm()
+      await Promise.resolve()
+    })
+    await within(setup.panel).findByTestId('delete-account-done')
+    expect(within(setup.panel).getByTestId('delete-account-lead')).toHaveTextContent(
+      'Your account is closed.'
+    )
+    expect(within(setup.panel).getByText('You will not get an email.')).toBeVisible()
+  })
+
+  it('says the account is deleted at once when the removal had finished, and Done leaves the signed-out panel', async () => {
+    const setup = await phone()
+    setup.controls.account.deletion.answerConfirm({ state: 'closed', finished: true })
+    const field = await atTheField(setup)
+    await setup.person.type(field, CODE)
+    await setup.person.keyboard('{Enter}')
+    expect(await within(setup.panel).findByText('Your account is deleted.')).toBeVisible()
+    await setup.person.click(within(setup.panel).getByTestId('delete-account-done'))
+    expect(within(setup.panel).queryByTestId('delete-account')).toBeNull()
+    expect(within(setup.panel).getByRole('button', { name: 'Sign in' })).toBeVisible()
+    expect(within(setup.panel).getByRole('status')).toHaveFocus()
+    expect(within(setup.panel).queryByTestId('delete-account-open')).toBeNull()
+  })
+
+  it('settles a lost answer: check again finds the account closed', async () => {
+    const setup = await phone()
+    const { deletion } = setup.controls.account
+    deletion.answerConfirm({ state: 'unsettled' })
+    const field = await atTheField(setup)
+    await setup.person.type(field, CODE)
+    await setup.person.keyboard('{Enter}')
+    await within(setup.panel).findByTestId('delete-account-check')
+    // Nothing found: the same words stay.
+    deletion.answerStatus({ state: 'none' })
+    await setup.person.click(within(setup.panel).getByTestId('delete-account-check'))
+    await waitFor(() => {
+      expect(deletion.statusReads).toBeGreaterThan(1)
+    })
+    expect(step(setup.panel)).toBe('unsettled')
+    deletion.answerStatus({ state: 'open' })
+    await setup.person.click(within(setup.panel).getByTestId('delete-account-check'))
+    await within(setup.panel).findByTestId('delete-account-done')
+  })
+
+  it('tries the same code again from an unsettled answer', async () => {
+    const setup = await phone()
+    const { deletion } = setup.controls.account
+    deletion.answerConfirm({ state: 'unsettled' }, { state: 'closed', finished: false })
+    const field = await atTheField(setup)
+    await setup.person.type(field, CODE)
+    await setup.person.keyboard('{Enter}')
+    await setup.person.click(await within(setup.panel).findByTestId('delete-account-again'))
+    await within(setup.panel).findByTestId('delete-account-done')
+    expect(deletion.confirms).toEqual([
+      { code: CODE, acknowledged: [] },
+      { code: CODE, acknowledged: [] }
+    ])
+  })
+})
+
+describe('how the removal goes', () => {
+  /** Mounts the panel with a deletion under way, with the clock under the test's hand. */
+  async function underWay(status: 'open' | 'done') {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    const { port, controls } = fakeHost()
+    controls.account.set(SIGNED_IN)
+    controls.account.deletion.answerStatus({ state: status })
+    render(
+      <AppProvider port={port}>
+        <MobileApp surface="ios" storage={null} />
+      </AppProvider>
+    )
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10)
+    })
+    return controls
+  }
+
+  it('shows a deletion that was under way when the panel opens, and asks again every three seconds until it is done', async () => {
+    const controls = await underWay('open')
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    const tab = screen.getByRole('button', { name: /^Account/ })
+    await act(async () => {
+      tab.click()
+      await vi.advanceTimersByTimeAsync(10)
+    })
+    const panel = screen.getByTestId('mobile-account')
+    expect(within(panel).getByTestId('delete-account')).toHaveAttribute('data-step', 'result')
+    const reads = controls.account.deletion.statusReads
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000)
+    })
+    expect(controls.account.deletion.statusReads).toBe(reads + 1)
+    controls.account.deletion.answerStatus({ state: 'done' })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000)
+    })
+    expect(within(panel).getByText('Your account is deleted.')).toBeVisible()
+    const after = controls.account.deletion.statusReads
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000)
+    })
+    expect(controls.account.deletion.statusReads).toBe(after)
+  })
+
+  it('stops asking after about two minutes, and says it is still finishing', async () => {
+    const controls = await underWay('open')
+    const tab = screen.getByRole('button', { name: /^Account/ })
+    await act(async () => {
+      tab.click()
+      await vi.advanceTimersByTimeAsync(10)
+    })
+    const panel = screen.getByTestId('mobile-account')
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2 * 60 * 1000 + 3000)
+    })
+    expect(within(panel).getByText(/Still finishing/)).toBeVisible()
+    const after = controls.account.deletion.statusReads
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000)
+    })
+    expect(controls.account.deletion.statusReads).toBe(after)
+  })
+
+  it('waits as long as the service asks when it says too many tries, without a message', async () => {
+    const controls = await underWay('open')
+    const tab = screen.getByRole('button', { name: /^Account/ })
+    await act(async () => {
+      tab.click()
+      await vi.advanceTimersByTimeAsync(10)
+    })
+    const panel = screen.getByTestId('mobile-account')
+    controls.account.deletion.answerStatus({ state: 'problem', problem: { kind: 'busy', seconds: 20 } })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000)
+    })
+    const reads = controls.account.deletion.statusReads
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(15_000)
+    })
+    expect(controls.account.deletion.statusReads).toBe(reads)
+    expect(within(panel).queryByTestId('delete-account-problem')).toBeNull()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(6000)
+    })
+    expect(controls.account.deletion.statusReads).toBeGreaterThan(reads)
+  })
+})
+
+describe('the desktop sheet', () => {
+  async function sheetAt(person: ReturnType<typeof userEvent.setup>) {
+    await person.click(screen.getByRole('button', { name: /^Account/ }))
+    return await screen.findByRole('dialog', { name: 'Account' })
+  }
+
+  it('shows the result from the record when the sheet is closed and opened during the confirmation', async () => {
+    const { port, controls } = fakeHost()
+    controls.account.set(SIGNED_IN)
+    render(
+      <AppProvider port={port} initialPlace={{ view: 'attention' }}>
+        <App />
+      </AppProvider>
+    )
+    const person = userEvent.setup()
+    let sheet = await sheetAt(person)
+    await person.click(await within(sheet).findByTestId('delete-account-open'))
+    await person.click(await within(sheet).findByTestId('delete-account-send-code'))
+    const field = await within(sheet).findByTestId('delete-account-code')
+    await person.type(field, CODE)
+    controls.account.deletion.holdConfirm()
+    await person.keyboard('{Enter}')
+    await waitFor(() => {
+      expect(controls.account.deletion.confirms).toHaveLength(1)
+    })
+    await person.keyboard('{Escape}')
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog', { name: 'Account' })).toBeNull()
+    })
+    // The backend answered while the sheet was closed; the record says the account is closing.
+    controls.account.deletion.answerStatus({ state: 'open' })
+    await act(async () => {
+      controls.account.deletion.releaseConfirm()
+      await Promise.resolve()
+    })
+    sheet = await sheetAt(person)
+    await waitFor(() => {
+      expect(within(sheet).getByTestId('delete-account')).toHaveAttribute('data-step', 'result')
+    })
+  })
+
+  it('keeps Tab inside the step while the cards are hidden', async () => {
+    const { port, controls } = fakeHost()
+    controls.account.set(SIGNED_IN)
+    render(
+      <AppProvider port={port} initialPlace={{ view: 'attention' }}>
+        <App />
+      </AppProvider>
+    )
+    const person = userEvent.setup()
+    const sheet = await sheetAt(person)
+    await person.click(await within(sheet).findByTestId('delete-account-open'))
+    await within(sheet).findByTestId('delete-account-before')
+    const inside = (element: Element | null) => element !== null && sheet.contains(element)
+    for (let presses = 0; presses < 12; presses += 1) {
+      await person.tab()
+      expect(inside(document.activeElement), `Tab ${String(presses)}`).toBe(true)
+      expect(
+        document.activeElement?.closest('[hidden]'),
+        `Tab ${String(presses)} is on a hidden control`
+      ).toBeNull()
+    }
+    await person.tab({ shift: true })
+    expect(inside(document.activeElement)).toBe(true)
+  })
+})
+
+describe('every control meets the minimum target of its surface', () => {
+  it('sets it on the buttons and the field of each step', async () => {
+    const setup = await phone()
+    const target = minimumTarget('ios')
+    const sized = (element: HTMLElement) => Number.parseInt(element.style.minBlockSize || '0', 10)
+    await reading(setup)
+    for (const id of ['delete-account-send-code', 'delete-account-cancel']) {
+      expect(sized(within(setup.panel).getByTestId(id)), id).toBeGreaterThanOrEqual(target)
+    }
+    await setup.person.click(within(setup.panel).getByTestId('delete-account-send-code'))
+    for (const id of [
+      'delete-account-code',
+      'delete-account-confirm',
+      'delete-account-resend',
+      'delete-account-cancel'
+    ]) {
+      expect(sized(await within(setup.panel).findByTestId(id)), id).toBeGreaterThanOrEqual(target)
+    }
+  })
+})
+
+describe('the step names nothing to buy and links nowhere (the store-build rule)', () => {
+  const EVERYTHING: DeletionPreview = {
+    ...PLAIN_DELETION_PREVIEW,
+    warnings: [
+      { kind: 'organisation_owner', organisation_id: 'org-1', name: 'Acme', members: 4 },
+      { kind: 'subscription' },
+      { kind: 'credit' },
+      { kind: 'money_owed' }
+    ],
+    unlisted: true
+  }
+  const PROBLEMS: DeletionProblem[] = [
+    { kind: 'needs_sign_in' },
+    { kind: 'refused' },
+    { kind: 'busy', seconds: 20 },
+    { kind: 'busy', seconds: 600 },
+    { kind: 'mail_failed' },
+    { kind: 'unsure' },
+    { kind: 'unreachable' },
+    { kind: 'account_changed' }
+  ]
+  const noop = () => undefined
+  const flowAt = (at: DeletionStep, over: Partial<DeletionFlow> = {}): DeletionFlow => ({
+    step: at,
+    open: true,
+    preview: EVERYTHING,
+    code: '',
+    refusal: null,
+    said: null,
+    begin: noop,
+    cancel: noop,
+    setCode: noop,
+    sendCode: noop,
+    confirm: noop,
+    acknowledgeAll: noop,
+    back: noop,
+    checkAgain: noop,
+    finish: noop,
+    ...over
+  })
+
+  it('holds in every step and in every line a step can say', () => {
+    const steps: DeletionStep[] = [
+      { name: 'reading' },
+      { name: 'failed' },
+      { name: 'cannot_show' },
+      { name: 'read' },
+      { name: 'sending' },
+      { name: 'code' },
+      { name: 'confirming' },
+      {
+        name: 'acknowledge',
+        organisations: [{ organisation_id: 'org-1', name: 'Acme', members: 4 }]
+      },
+      { name: 'unsettled' },
+      { name: 'result', progress: 'open' },
+      { name: 'result', progress: 'still' },
+      { name: 'result', progress: 'done' }
+    ]
+    const flows: DeletionFlow[] = steps.map((at) => flowAt(at))
+    for (const problem of PROBLEMS) {
+      for (const stage of ['before', 'after'] as const) {
+        flows.push(flowAt({ name: 'code' }, { said: { problem, stage } }))
+      }
+    }
+    for (const reason of ['wrong', 'expired', 'spent'] as const) {
+      flows.push(flowAt({ name: 'code' }, { refusal: { reason, attemptsLeft: reason === 'wrong' ? 2 : 0 } }))
+    }
+    flows.push(flowAt({ name: 'code' }, { said: { text: 'KalaReach could not use this device.' } }))
+    for (const flow of flows) {
+      const { container, unmount } = render(<DeleteAccount flow={flow} surface="ios" />)
+      const text = (container.textContent ?? '').toLowerCase()
+      for (const word of PURCHASE_WORDS) {
+        expect(text, `${flow.step.name}: ${word}`).not.toContain(word)
+      }
+      expect(container.querySelector('a[href]')).toBeNull()
+      expect(container.querySelector('form')).toBeNull()
+      unmount()
+    }
+    for (const problem of PROBLEMS) {
+      for (const stage of ['before', 'after'] as const) {
+        const text = describeProblem(problem, stage).toLowerCase()
+        for (const word of PURCHASE_WORDS) expect(text, `${problem.kind}: ${word}`).not.toContain(word)
+      }
+    }
+    for (const reason of ['wrong', 'expired', 'spent'] as const) {
+      const text = describeRefusal(reason, 0).toLowerCase()
+      for (const word of PURCHASE_WORDS) expect(text, `${reason}: ${word}`).not.toContain(word)
+    }
+  })
+})

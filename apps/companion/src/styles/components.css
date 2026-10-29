@@ -1114,14 +1114,16 @@ textarea::placeholder {
  * keyboard rule makes it instant. The panel is one column at every width, sized in rem so a larger
  * text size reflows it.
  */
-.account-panel {
+.account-panel,
+.account-panel-body {
   display: flex;
   flex-direction: column;
   gap: var(--gap-3);
 }
 
 /* The panel's cards hold text and controls directly, so they carry their own inset. */
-.account-panel > .card {
+.account-panel > .card,
+.account-panel-body > .card {
   padding: var(--gap-4);
 }
 
@@ -1178,6 +1180,54 @@ textarea::placeholder {
   flex-direction: column;
   align-items: flex-start;
   gap: var(--gap-2);
+}
+
+/*
+ * Deleting the account: lists of what goes and what stays, under headings of their own, and the
+ * field the emailed code is typed in. Sizes are in rem so a larger text size reflows them, and long
+ * words (an organisation's name, the origin) break rather than push out of the card.
+ */
+.deletion-heading {
+  margin: var(--gap-2) 0 0;
+  font-size: 0.8125rem;
+  font-weight: 700;
+  line-height: 1.45;
+  color: var(--text);
+}
+
+.deletion-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-1);
+  margin: 0;
+  padding-inline-start: 1.25rem;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.deletion-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-1);
+}
+
+.deletion-label {
+  font-size: 0.8125rem;
+  line-height: 1.45;
+  color: var(--text);
+}
+
+.deletion-code {
+  inline-size: 100%;
+  max-inline-size: 16rem;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.12em;
+}
+
+.deletion-code[aria-invalid='true'] {
+  border-color: var(--danger);
 }
 
 /*

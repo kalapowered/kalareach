@@ -396,13 +396,18 @@ const STOPS =
   'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
 
 /**
- * The controls Tab moves between inside `surface`, in document order. A group of radios is one of
+ * The controls Tab moves between inside `surface`, in document order, leaving out any that are hidden.
+ * A group of radios is one of
  * them, at the checked radio or at the first where none is checked: the others are reached by the
  * arrow keys, so treating each as a stop would put the trap's edge where Tab never lands and let Tab
  * out of the sheet.
  */
 function stopsOf(surface: HTMLElement): HTMLElement[] {
-  const all = Array.from(surface.querySelectorAll<HTMLElement>(STOPS))
+  // A control that is hidden, or inside what is, is not one Tab stops at, so it is not an edge of
+  // the trap either.
+  const all = Array.from(surface.querySelectorAll<HTMLElement>(STOPS)).filter(
+    (element) => element.closest('[hidden], [inert]') === null
+  )
   const radios = all.filter(
     (element): element is HTMLInputElement =>
       element instanceof HTMLInputElement && element.type === 'radio' && element.name !== ''
