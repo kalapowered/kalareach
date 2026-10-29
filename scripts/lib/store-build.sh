@@ -20,6 +20,7 @@
 
 KR_SECRETS_DIR="${KR_SECRETS_DIR:-$HOME/.config/kalareach-secrets}"
 KR_STORE_ROOT="${KR_STORE_ROOT:-$HOME/Library/Caches/kalareach-store}"
+kr_store_checker="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/apps/companion/scripts/store-bundle.mjs"
 
 # Build numbers count whole minutes from this instant (2026-10-01T00:00:00Z). A number rises with
 # the clock, so no counter has to be stored, and each store's rule holds: Google Play wants every
@@ -121,6 +122,28 @@ kr_store_claim() {
         kr_store_say "$1 exists already, or cannot be made" >&2
         return 2
     fi
+}
+
+# kr_store_refuse_secret_in <secret file> <path>...: fails, naming nothing of the path, when a path
+# that a message is about to print holds the secret in any form the checker searches for, or when
+# the secret cannot be read. The checker refuses such a path itself, but only once the scripts have
+# printed it in their own messages.
+kr_store_refuse_secret_in() {
+    local secret=$1 each shown
+    shift
+    for each in "$@"; do
+        shown="$(printf '%s' "$each" | node "$kr_store_checker" --redact --secret-file "$secret")" \
+            || { kr_store_say "a path could not be searched for the secret; nothing is built" >&2; return 2; }
+        [ "$shown" = "$each" ] || { kr_store_say "a path holds the secret's text or a signed token; nothing is built" >&2; return 2; }
+    done
+}
+
+# kr_store_show_tail <log> <secret file>: the last lines of a log, indented, for a person to read
+# when a step has failed. They come through the checker, which leaves out the whole of them when they
+# hold the secret in any form (split across lines too) and any line that holds a signed token or a
+# part of one; when it cannot read the secret it prints nothing.
+kr_store_show_tail() {
+    tail -n 20 "$1" | node "$kr_store_checker" --redact --secret-file "$2" | sed 's/^/    /'
 }
 
 # kr_store_remove_token_logs <output directory>: Xcode keeps request tokens made from the API key in

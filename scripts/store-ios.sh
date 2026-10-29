@@ -85,6 +85,7 @@ if [ "$archive_only" = 0 ]; then
     issuer="$(kr_store_json_field "$api_record" issuer_id)" || { kr_store_say "$api_record has no issuer_id"; exit 2; }
     key_file="$(kr_store_json_field "$api_record" key_file)" || { kr_store_say "$api_record has no key_file"; exit 2; }
     kr_store_require_file "$key_file" "the API key" || exit 2
+    kr_store_refuse_secret_in "$key_file" "$KR_STORE_ROOT" || exit 2
 fi
 
 version="$(kr_store_version "$here")" || exit 2
@@ -213,7 +214,7 @@ PLIST
         kr_store_say "the login keychain's identities or the search list changed during the export (see $out/keychain-*.txt); stopping"
         return 2
     fi
-    [ "$exported" = 0 ] || { kr_store_say "the export failed (see $out/export.log)"; tail -20 "$out/export.log" | grep -v -E 'eyJ[A-Za-z0-9_-]{8,}\.eyJ' | sed 's/^/    /'; return 2; }
+    [ "$exported" = 0 ] || { kr_store_say "the export failed (see $out/export.log)"; kr_store_show_tail "$out/export.log" "$key_file"; return 2; }
     [ "$cleaned" = 0 ] || return 2
     ipa="$(find "$out/export" -maxdepth 1 -name '*.ipa' | head -1)"
     [ -f "$ipa" ] || { kr_store_say "the export left no .ipa in $out/export"; return 2; }

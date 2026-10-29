@@ -29,12 +29,22 @@ searches for its text before it reads anything else from a bundle: in every deco
 the Android bundle, in every file of the iOS application, and, in a run that reaches its check, in
 every file of the output directory (the members of a `.aab`, `.ipa` or `.apk` one by one, and the
 `.apks` set through its packages). A signed token, the kind Xcode writes into its export logs from
-the API key, counts as a find as well. It prints how many places held one. When a bundle holds
-one it reports that and nothing else, because the other messages quote values out of the bundle,
-and an error message that quotes a secret is withheld. A run that ends early still searches its
+the API key, counts as a find as well. It searches for the secret as it is, JSON-escaped, in hex,
+in base64 and in base64url (at each of the three places a text can start among the groups of three
+bytes), and again with the white space removed from both sides, so a secret that was wrapped,
+indented or joined across lines is found; a JSON file is also read as a JSON reader reads it. A
+name counts like content: the path of the output directory, of each file under it and of each
+archive member. It prints how many places held one. When a bundle holds one it reports that and
+nothing else, because the other messages quote values out of the bundle. Everything the checker
+prints, an option or a path or an error text as much as a problem, goes through one filter that
+withholds what quotes a secret or any part of a signed token, and a record that would quote one
+fails the build instead of being written. When a failed export shows the tail of its log,
+`store-bundle.mjs --redact` drops the whole tail if it holds the secret and each line that holds a
+token, and shows nothing when it cannot read the secret. A run that ends early still searches its
 output directory and says so when it finds something. A secret shorter than eight characters is
 refused, because it would match anything. The caller's own log of a run, outside the output
-directory, is not read. The Firebase files are client configuration and not secrets: they go into
+directory, is not read, and neither are other encodings of a secret (percent encoding, XML
+entities, a compressed or encrypted copy). The Firebase files are client configuration and not secrets: they go into
 the bundle as the application's configuration, and the build directories keep a copy as they do
 of every resource.
 
@@ -131,9 +141,13 @@ and a log bundle in the temporary directory, and the script removes both.
 - the application's push environment is `production`, neither bundle lets a debugger attach, and
   the associated domains and keychain groups are the ones `identifiers.mjs` expects, the
   application's own group first;
-- every framework and dylib in the `Frameworks` directory of the application and of each extension
-  is signed by an Apple Distribution certificate of the team, and by the same certificate as the
-  bundle that holds it (code nested deeper is not read; the store refuses nested frameworks);
+- every piece of code in the application and in each extension (each Mach-O file under it, wherever
+  it sits: frameworks, dylibs inside a framework, frameworks inside a framework, helpers outside
+  `Frameworks`; an extension is read as a bundle of its own) is signed by an Apple Distribution
+  certificate of the team, and by the same certificate as the bundle that holds it. A symbolic
+  link, a universal binary of several architectures, or anything under the bundle that is neither
+  a file nor a directory is refused, because the check cannot follow a link or read a signature for
+  each architecture;
 - each bundle has an App Store profile of the team with no device list, and the application's
   profile carries the production push environment;
 - the application and the extension have the same `CFBundleVersion` and `CFBundleShortVersionString`;

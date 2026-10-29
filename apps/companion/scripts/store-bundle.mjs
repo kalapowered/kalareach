@@ -14,7 +14,10 @@
 //   iOS      the version and build number agree across the application and its notification
 //            extension (a store refuses an extension whose version differs); the push environment
 //            is production; each executable is signed, with the entitlements the application
-//            needs; and, for an exported bundle, each profile is an App Store profile of this team.
+//            needs; and, for an exported bundle, each profile is an App Store profile of this team
+//            and every piece of code under a bundle (each Mach-O file, nested or not) is signed by
+//            a distribution certificate of the team, the bundle's own. A layout the check cannot
+//            read as code (a symbolic link, a universal binary of several architectures) is refused.
 //
 // The identifiers (`identifiers.mjs`), the privacy manifest (`privacy-manifest.mjs`) and the debug
 // code (`debug-code.mjs`) are read by the checks that own them and are run from here, so one
@@ -22,7 +25,11 @@
 //
 // A secret is a file whose path is given to `--secret-file`. It is read in this process, every
 // decompressed member of the bundle (or every file of the application) is searched for it, and
-// only the number of places it was found is printed. It is never part of a command line.
+// only the number of places it was found is printed. It is never part of a command line. It is
+// searched for in the forms a file can hold it in (as it is, JSON-escaped, hex, base64 and
+// base64url, and with the white space removed, so a secret split across lines is found), and in the
+// names of files and archive members too. Whatever the command prints goes through one filter that
+// withholds a message quoting a secret or any part of a signed token.
 //
 // Usage:
 //   node scripts/store-bundle.mjs --android <app.aab> --version-code <n> --version-name <v>
@@ -30,6 +37,10 @@
 //        [--firebase <google-services.json>] [--record <store-build.json>] [--note key=value ...]
 //   node scripts/store-bundle.mjs --scan-dir <directory> --secret-file <path> [--secret-file <path> ...]
 //        (how many files under the directory hold a secret's text; bundles are read by the checks above)
+//   node scripts/store-bundle.mjs --redact --secret-file <path> [--secret-file <path> ...]
+//        (the text on the standard input, on the standard output once it is safe to show: all of it
+//        withheld if it holds a secret, each line that holds a signed token or a part of one
+//        withheld, nothing at all if a secret cannot be read)
 //   node scripts/store-bundle.mjs --ios <app.ipa | KalaReach.app> --stage archive|export
 //        --version-code <n> --version-name <v> [--skip-app-checks] [--secret-file <path> ...] [--record <file>]
 //   `--skip-app-checks` leaves out the privacy-manifest and debug-code checks, which a caller runs on its own.
@@ -38,9 +49,9 @@
 import { Buffer } from 'node:buffer'
 import { spawnSync } from 'node:child_process'
 import { X509Certificate, createHash } from 'node:crypto'
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join, relative } from 'node:path'
+import { dirname, join, relative, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 import { withArchive } from './android-classes.mjs'
@@ -220,34 +231,164 @@ export function problemsInAndroidLibraries(members, read, abis) {
 
 // -- secrets ---------------------------------------------------------------------------------
 
+/** The shape of a signed token: three base64url parts, the first two of JSON (`eyJ`). */
+const TOKEN_SHAPE = /eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/
+
+/** Any part of a signed token that can stand alone: the start of a base64url JSON object. */
+const TOKEN_PART = /eyJ[A-Za-z0-9_-]{8,}/
+
+/** The largest JSON text that is read for the strings in it. */
+const MOST_JSON = 16 * 1024 * 1024
+
+/** No secret to search for. */
+const NO_NEEDLES = { forms: [], squashed: [] }
+
 /**
- * The strings that stand for a secret file: its whole content, trimmed, and each of its lines of 32
- * characters or more, so a key block pasted in pieces is found by any whole line of it. A secret
- * shorter than 8 characters is refused: it would match anything.
+ * The bytes of a text with the white space left out, and the line breaks that a JSON string or a
+ * shell quote writes out (`\n`, `\r`, `\t`). A secret that was wrapped, indented or joined again is
+ * the same secret once these are gone from both sides.
+ */
+function squash(bytes) {
+  const kept = Buffer.allocUnsafe(bytes.length)
+  let length = 0
+  for (let index = 0; index < bytes.length; index += 1) {
+    const byte = bytes[index]
+    if (byte === 0x20 || (byte >= 0x09 && byte <= 0x0d)) continue
+    if (byte === 0x5c && (bytes[index + 1] === 0x6e || bytes[index + 1] === 0x72 || bytes[index + 1] === 0x74)) {
+      index += 1
+      continue
+    }
+    kept[length] = byte
+    length += 1
+  }
+  return kept.subarray(0, length)
+}
+
+/**
+ * The forms one piece of a secret takes in a file: as it is, escaped as JSON escapes it, in hex, and
+ * in base64 and base64url. A text inside a longer one encodes differently by where it starts among
+ * the groups of three bytes, so each of the three starts is taken, and only the characters that
+ * the neighbouring bytes cannot change.
+ */
+function formsOf(bytes) {
+  const hex = bytes.toString('hex')
+  const forms = [bytes, Buffer.from(JSON.stringify(bytes.toString('utf8')).slice(1, -1)), Buffer.from(hex), Buffer.from(hex.toUpperCase())]
+  for (let before = 0; before < 3; before += 1) {
+    const encoded = Buffer.concat([Buffer.alloc(before), bytes]).toString('base64')
+    const core = encoded.slice(Math.ceil((before * 8) / 6), Math.floor(((before + bytes.length) * 8) / 6))
+    forms.push(Buffer.from(core), Buffer.from(core.replaceAll('+', '-').replaceAll('/', '_')))
+  }
+  return forms.filter((form) => form.length >= 8)
+}
+
+/**
+ * What stands for a secret file in a search: its whole content, trimmed, and each of its lines of 32
+ * characters or more, so a key block pasted in pieces is found by any whole line of it. Each is
+ * searched in every form `formsOf` lists, and again with the white space gone (`squashed`), so a
+ * secret split across lines is found as well. A secret shorter than 8 characters is refused: it
+ * would match anything.
  */
 export function secretNeedles(content) {
   const text = content.toString('utf8').trim()
   if (text.length < 8) throw new Error('a secret file holds fewer than 8 characters, too few to search for')
-  const needles = new Set([text])
+  const pieces = new Set([text])
   for (const line of text.split(/\r?\n/)) {
     const trimmed = line.trim()
-    if (trimmed.length >= 32 && !trimmed.startsWith('-----')) needles.add(trimmed)
+    if (trimmed.length >= 32 && !trimmed.startsWith('-----')) pieces.add(trimmed)
   }
-  return [...needles].map((each) => Buffer.from(each, 'utf8'))
+  const forms = new Map()
+  for (const piece of pieces) {
+    for (const form of formsOf(Buffer.from(piece, 'utf8'))) forms.set(form.toString('latin1'), form)
+  }
+  const squashed = new Map()
+  for (const form of forms.values()) {
+    const apart = squash(form)
+    if (apart.length >= 8) squashed.set(apart.toString('latin1'), apart)
+  }
+  return { forms: [...forms.values()], squashed: [...squashed.values()] }
 }
 
-/** How many of the buffers hold any needle. */
+/** The needles of several secrets as one. */
+function mergeNeedles(list) {
+  return { forms: list.flatMap((each) => each.forms), squashed: list.flatMap((each) => each.squashed) }
+}
+
+/** Whether the bytes hold any form of the secret, whole or with the white space gone. */
+function foundIn(bytes, needles) {
+  if (needles.forms.some((form) => bytes.includes(form))) return true
+  if (needles.squashed.length === 0) return false
+  const apart = squash(bytes)
+  return needles.squashed.some((form) => apart.includes(form))
+}
+
+/** Every key and string of a JSON text as a JSON reader recovers them, whatever escapes wrote them; none for bytes that are not JSON. */
+function jsonStrings(bytes) {
+  if (bytes.length > MOST_JSON || !/^\s*[[{]/.test(bytes.subarray(0, 64).toString('latin1'))) return []
+  let value
+  try {
+    value = JSON.parse(bytes.toString('utf8'))
+  } catch {
+    return []
+  }
+  const found = []
+  const pending = [value]
+  while (pending.length > 0) {
+    const each = pending.pop()
+    if (typeof each === 'string') {
+      found.push(each)
+    } else if (Array.isArray(each)) {
+      for (const inner of each) pending.push(inner)
+    } else if (each !== null && typeof each === 'object') {
+      for (const [key, inner] of Object.entries(each)) {
+        found.push(key)
+        pending.push(inner)
+      }
+    }
+  }
+  return found
+}
+
+/** Whether bytes hold the secret's text, in any form, or JSON that says it once its escapes are read. */
+function holdsText(bytes, needles) {
+  return foundIn(bytes, needles) || jsonStrings(bytes).some((each) => foundIn(Buffer.from(each, 'utf8'), needles))
+}
+
+/** Whether bytes hold a secret's text or a token made from one, in the bytes or in the strings of JSON they spell. */
+function holdsSecret(bytes, needles) {
+  if (foundIn(bytes, needles) || TOKEN_SHAPE.test(bytes.toString('latin1'))) return true
+  return jsonStrings(bytes).some((each) => foundIn(Buffer.from(each, 'utf8'), needles) || TOKEN_SHAPE.test(each))
+}
+
+/** Whether a text that is to be shown or written holds a secret, or any part of a signed token. */
+function quotesSecret(text, needles) {
+  return holdsSecret(Buffer.from(text, 'utf8'), needles) || TOKEN_PART.test(text)
+}
+
+/** How many of the buffers hold a secret's text or a signed token. */
 export function placesWithSecret(buffers, needles) {
   let places = 0
   for (const bytes of buffers) {
-    if (needles.some((needle) => bytes.includes(needle))) places += 1
+    if (holdsSecret(bytes, needles)) places += 1
   }
   return places
 }
 
 /** The needles of every secret file named, or throws if one cannot be read. */
 function needlesOf(files) {
-  return files.flatMap((file) => secretNeedles(readFileSync(file)))
+  return mergeNeedles(files.map((file) => secretNeedles(readFileSync(file))))
+}
+
+/** The needles of the secret files that can be read: a secret that cannot be read cannot be quoted. */
+function quotableNeedles(secretFiles) {
+  return mergeNeedles(
+    secretFiles.map((file) => {
+      try {
+        return secretNeedles(readFileSync(file))
+      } catch {
+        return NO_NEEDLES
+      }
+    })
+  )
 }
 
 // -- Android: the signature and the bundle tool ----------------------------------------------
@@ -333,25 +474,22 @@ export function suppressedIfSecret(result) {
   return { problems: [`a secret file's text is in ${found} place${found === 1 ? '' : 's'} of the bundle; nothing else is reported`], facts: { secretsFound: found } }
 }
 
-/** The shape of a signed token: three base64url parts, the first two of JSON (`eyJ`). */
-const TOKEN_SHAPE = /eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/
-
-/** Whether bytes hold a secret's text or a token made from one. */
-function holdsSecret(bytes, needles) {
-  return needles.some((needle) => bytes.includes(needle)) || TOKEN_SHAPE.test(bytes.toString('latin1'))
-}
-
 /**
  * How many files under a directory hold a secret's text or a signed token, a bundle counting once
  * for each member that does (a bundle is compressed, so its bytes are searched member by member).
- * `.apks` files hold other packages whole and are left out: each package is read as an `.apk`.
+ * A name is searched like content: the directory's own path, the path of each file under it and the
+ * name of each member, since each is printed or written somewhere. `.apks` files hold other
+ * packages whole and are left out: each package is read as an `.apk`.
  */
 export function secretsUnder(directory, needles) {
-  let places = 0
+  let places = [directory, resolve(directory)].some((each) => holdsSecret(Buffer.from(each, 'utf8'), needles)) ? 1 : 0
   for (const file of filesUnder(directory)) {
-    if (/\.apks$/.test(file)) continue
-    if (/\.(aab|ipa|apk)$/.test(file)) {
-      places += withArchive(file, (members, read) => members.filter((member) => holdsSecret(read(member), needles)).length)
+    if (holdsSecret(Buffer.from(relative(directory, file), 'utf8'), needles)) {
+      places += 1
+    } else if (/\.apks$/.test(file)) {
+      continue
+    } else if (/\.(aab|ipa|apk)$/.test(file)) {
+      places += withArchive(file, (members, read) => members.filter((member) => holdsSecret(Buffer.from(member.name, 'utf8'), needles) || holdsSecret(read(member), needles)).length)
     } else if (holdsSecret(readFileSync(file), needles)) {
       places += 1
     }
@@ -359,42 +497,43 @@ export function secretsUnder(directory, needles) {
   return places
 }
 
-/** A message with nothing of it left when it quotes a secret or a signed token. */
+/** A message with nothing of it left when it quotes a secret or any part of a signed token. */
 export function withheldIfSecret(message, needles) {
-  return holdsSecret(Buffer.from(message, 'utf8'), needles) ? 'the details are withheld: they quote a secret file' : message
+  return quotesSecret(message, needles) ? 'the details are withheld: they quote a secret file' : message
+}
+
+/**
+ * Text from a log, for a person to read: all of it left out when it holds the secret in any form (a
+ * log that holds it at all is not to be trusted with what is left of it), and each line that holds a
+ * signed token or any part of one.
+ */
+export function redacted(text, needles) {
+  if (holdsText(Buffer.from(text, 'utf8'), needles)) return 'the text is withheld: it quotes a secret file\n'
+  return text
+    .split('\n')
+    .map((line) => (TOKEN_PART.test(line) ? 'a line is withheld: it quotes a signed token' : line))
+    .join('\n')
 }
 
 /**
  * The text of a build's record and its problems. A record that would quote a secret or a signed
- * token is replaced by one that holds only the identity of the bundle and says why, and that is a
- * problem of its own, so the build does not hold.
+ * token anywhere, its identity included, is replaced by one that holds only what is safe of the
+ * identity and says why, and that is a problem of its own, so the build does not hold. The record is
+ * searched as the text it is written as, which JSON escapes, and as the JSON it is, which a reader
+ * unescapes.
  */
 export function recordOf({ identity, problems, facts, notes }, needles) {
-  const safe = (value) => (typeof value === 'string' ? withheldIfSecret(value, needles) : value)
-  const named = { ...identity, file: safe(identity.file), versionName: safe(identity.versionName) }
-  const text = (holds, list, rest) => `${JSON.stringify({ ...named, holds, problems: list, ...rest }, null, 2)}\n`
-  const whole = text(problems.length === 0, problems, { ...facts, ...notes })
-  if (!holdsSecret(Buffer.from(whole, 'utf8'), needles)) return { problems, text: whole }
+  const text = (value) => `${JSON.stringify(value, null, 2)}\n`
+  const record = (holds, list, who, rest) => ({ ...who, holds, problems: list, ...rest })
+  const whole = text(record(problems.length === 0, problems, identity, { ...facts, ...notes }))
+  if (!quotesSecret(whole, needles)) return { problems, text: whole }
   const withheld = 'the details are withheld: the record quotes a secret file'
-  return { problems: [...problems, withheld], text: text(false, [withheld], {}) }
-}
-
-/**
- * The text of a failure, for a log: an error from reading a bundle or a directory can quote a name
- * or a value out of it, so it goes through the same filter as every other message. A secret file
- * that cannot be read cannot be quoted, and the message then stands as it is.
- */
-function failureText(failure, secretFiles) {
-  return withheldIfSecret(String(failure.message), quotableNeedles(secretFiles))
-}
-
-/** The needles of the secret files, or none when a file cannot be read: a secret that cannot be read cannot be quoted. */
-function quotableNeedles(secretFiles) {
-  try {
-    return needlesOf(secretFiles)
-  } catch {
-    return []
-  }
+  const safe = (value) => (typeof value === 'string' ? withheldIfSecret(value, needles) : value)
+  let replacement = text(record(false, [withheld], { ...identity, file: safe(identity.file), versionName: safe(identity.versionName) }, {}))
+  // The rest of the identity is a platform, a stage, two numbers and a digest. Were one of them the
+  // secret, nothing of the identity is kept.
+  if (quotesSecret(replacement, needles)) replacement = text({ holds: false, problems: [withheld] })
+  return { problems: [...problems, withheld], text: replacement }
 }
 
 /**
@@ -411,7 +550,7 @@ export function checkAndroid(options) {
   const certificatePem = readFileSync(options.certificate, 'utf8')
   const identifier = declared(dirname(SCRIPTS)).identifier
   const needles = needlesOf(options.secretFiles)
-  const first = withArchive(options.path, (members, read) => placesWithSecret(members.map((member) => read(member)), needles))
+  const first = withArchive(options.path, (members, read) => placesWithSecret(members.flatMap((member) => [Buffer.from(member.name, 'utf8'), read(member)]), needles))
   if (first > 0) return secretFirst(first)
   facts.secretsFound = 0
   openBundle(options.path, (manifest, members, read) => {
@@ -514,7 +653,7 @@ export function profileFromXml(xml) {
 }
 
 /**
- * What is wrong with the signature of a framework or dylib inside a bundle: it is signed with a
+ * What is wrong with the signature of a piece of code inside a bundle: it is signed with a
  * distribution certificate of the team, and the same one as the bundle that holds it, which its own
  * profile has already been held to.
  */
@@ -527,14 +666,56 @@ export function problemsInEmbeddedSignature({ described, leafSha1, hostLeafSha1,
   return problems
 }
 
-/** The frameworks and dylibs inside a bundle's `Frameworks` directory, each with its name and path. */
-export function embeddedCode(bundle) {
-  const directory = join(bundle, 'Frameworks')
-  if (!existsSync(directory)) return []
-  return readdirSync(directory)
-    .filter((entry) => entry.endsWith('.framework') || entry.endsWith('.dylib'))
-    .sort()
-    .map((entry) => ({ name: entry, path: join(directory, entry) }))
+/**
+ * What kind of code a file is, from its first bytes: `code` for a Mach-O file (one architecture, or a
+ * universal file that holds exactly one), `universal` for a universal file of several, which has a
+ * signature for each and is read for none, and `none` for anything else.
+ */
+function kindOfFile(path) {
+  const head = Buffer.alloc(8)
+  const descriptor = openSync(path, 'r')
+  try {
+    readSync(descriptor, head, 0, 8, 0)
+  } finally {
+    closeSync(descriptor)
+  }
+  const magic = head.readUInt32BE(0)
+  if (magic === 0xfeedface || magic === 0xfeedfacf || magic === 0xcefaedfe || magic === 0xcffaedfe) return 'code'
+  if (magic === 0xcafebabe || magic === 0xcafebabf) return head.readUInt32BE(4) === 1 ? 'code' : 'universal'
+  return 'none'
+}
+
+/**
+ * Every piece of code under a bundle, wherever it sits (the frameworks and dylibs of `Frameworks`,
+ * code nested in them, helpers beside the executable), as the Mach-O files that carry a signature,
+ * each with its path inside the bundle. `apart` lists bundles inside this one that are read as
+ * bundles of their own. What the check cannot read as code is not skipped but returned as `refused`:
+ * a symbolic link may lead anywhere, and a file that is neither a file nor a directory is not
+ * something a store takes.
+ */
+export function codeIn(bundle, apart = []) {
+  const code = []
+  const refused = []
+  const walk = (directory) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true }).sort((one, other) => (one.name < other.name ? -1 : 1))) {
+      const path = join(directory, entry.name)
+      if (apart.includes(path)) continue
+      const name = relative(bundle, path)
+      if (entry.isSymbolicLink()) {
+        refused.push(`${name} is a symbolic link, which this check cannot follow`)
+      } else if (entry.isDirectory()) {
+        walk(path)
+      } else if (entry.isFile()) {
+        const kind = kindOfFile(path)
+        if (kind === 'code') code.push({ name, path })
+        if (kind === 'universal') refused.push(`${name} is a universal binary of several architectures, which this check cannot read`)
+      } else {
+        refused.push(`${name} is neither a file nor a directory`)
+      }
+    }
+  }
+  walk(bundle)
+  return { code, refused }
 }
 
 /** What `codesign` describes of a signed bundle or file, and the SHA-1 of its leaf certificate ('' when it is signed ad hoc). */
@@ -647,7 +828,7 @@ export function checkIos(options) {
   }
   try {
     const needles = needlesOf(options.secretFiles)
-    const first = placesWithSecret(filesUnder(app).map((file) => readFileSync(file)), needles)
+    const first = placesWithSecret(filesUnder(app).flatMap((file) => [Buffer.from(relative(app, file), 'utf8'), readFileSync(file)]), needles)
     if (first > 0) return secretFirst(first)
     facts.secretsFound = 0
     problems.push(...problemsInBundle(app, want))
@@ -672,7 +853,13 @@ export function checkIos(options) {
       if (signed.status !== 0) problems.push(`${bundle.name}'s signature does not verify: ${signed.stderr.trim().split('\n')[0]}`)
       if (options.stage === 'export') {
         const { described, leafSha1 } = signerOf(bundle.path)
-        for (const code of embeddedCode(bundle.path)) {
+        // All the code under the bundle is held to the same rules, nested or not: the outer seal
+        // covers it, but says nothing of who signed it. The bundle's own executable is held to
+        // them below, with its profile, and an extension is read as a bundle of its own.
+        const inside = codeIn(bundle.path, bundles.filter((other) => other !== bundle).map((other) => other.path))
+        for (const each of inside.refused) problems.push(`${bundle.name} holds code this check cannot read: ${each}`)
+        for (const code of inside.code) {
+          if (code.path === join(bundle.path, info.CFBundleExecutable)) continue
           const signer = signerOf(code.path)
           for (const each of problemsInEmbeddedSignature({ ...signer, hostLeafSha1: leafSha1, team: want.team })) {
             problems.push(`${code.name} in ${bundle.name} ${each}`)
@@ -744,6 +931,8 @@ function parse(argv) {
       index += 1
     } else if (flag === '--skip-app-checks') {
       options.skipAppChecks = true
+    } else if (flag === '--redact') {
+      options.redact = true
     } else if (flag === '--abis') {
       options.abis = take(index).split(',')
       index += 1
@@ -758,6 +947,10 @@ function parse(argv) {
       throw new Error(`unknown option ${flag}`)
     }
   }
+  if (options.redact) {
+    if (options.secretFiles.length === 0) throw new Error('--redact needs a --secret-file')
+    return options
+  }
   if (options.scanDir && options.secretFiles.length === 0) throw new Error('--scan-dir needs a --secret-file')
   if (options.scanDir && !options.platform) return options
   if (!options.platform) throw new Error('give --android <bundle> or --ios <ipa or app>')
@@ -769,51 +962,87 @@ function parse(argv) {
   return options
 }
 
-if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+/** The files named by `--secret-file`, taken from the command line before it is understood, so that a command line that is wrong can be answered without quoting a secret too. */
+function secretFilesIn(argv) {
+  return argv.flatMap((flag, index) => (flag === '--secret-file' && index + 1 < argv.length ? [argv[index + 1]] : []))
+}
+
+/**
+ * Runs the command and answers its exit status: 0 when the bundle holds, 1 when it does not, 2 when
+ * it could not be read or a file could not be written. Whatever it prints, a path, an option or an
+ * error text as much as a problem, goes through one filter first, since any of them can hold the
+ * secret it was given.
+ */
+function main(argv) {
+  const needles = quotableNeedles(secretFilesIn(argv))
+  const out = (message) => console.log(withheldIfSecret(message, needles))
+  const err = (message) => console.error(withheldIfSecret(message, needles))
+  try {
+    return command(argv, needles, out, err)
+  } catch (failure) {
+    err(`the check stopped: ${failure.message}`)
+    return 2
+  }
+}
+
+function command(argv, needles, out, err) {
   let options
   try {
-    options = parse(process.argv.slice(2))
+    options = parse(argv)
   } catch (failure) {
-    console.error(failure.message)
-    process.exit(2)
+    err(failure.message)
+    return 2
+  }
+  if (options.redact) {
+    // The text of a log on the standard input, on the standard output once it is safe to show. When
+    // the secret cannot be read, nothing is shown.
+    let shown
+    try {
+      shown = redacted(readFileSync(0, 'utf8'), needlesOf(options.secretFiles))
+    } catch (failure) {
+      err(`could not filter the text: ${failure.message}`)
+      return 2
+    }
+    process.stdout.write(shown)
+    return 0
   }
   if (options.scanDir && !options.platform) {
     let places
     try {
       places = secretsUnder(options.scanDir, needlesOf(options.secretFiles))
     } catch (failure) {
-      console.error(`could not scan ${options.scanDir}: ${failureText(failure, options.secretFiles)}`)
-      process.exit(2)
+      err(`could not scan ${options.scanDir}: ${failure.message}`)
+      return 2
     }
     if (places > 0) {
-      console.error(`a secret file's text or a signed token is in ${places} place${places === 1 ? '' : 's'} under ${options.scanDir}`)
-      process.exit(1)
+      err(`a secret file's text or a signed token is in ${places} place${places === 1 ? '' : 's'} under ${options.scanDir}`)
+      return 1
     }
-    console.log(`no secret file's text and no signed token is in the files under ${options.scanDir}`)
-    process.exit(0)
+    out(`no secret file's text and no signed token is in the files under ${options.scanDir}`)
+    return 0
   }
   let result
   try {
     result = options.platform === 'android' ? checkAndroid(options) : checkIos(options)
   } catch (failure) {
-    console.error(`could not read ${options.path}: ${failureText(failure, options.secretFiles)}`)
-    process.exit(2)
+    err(`could not read ${options.path}: ${failure.message}`)
+    return 2
   }
   if (options.scanDir && !(result.facts.secretsFound > 0)) {
-    let found = 0
+    let found
     try {
       found = secretsUnder(options.scanDir, needlesOf(options.secretFiles))
     } catch (failure) {
-      console.error(`could not scan ${options.scanDir}: ${failureText(failure, options.secretFiles)}`)
-      process.exit(2)
+      err(`could not scan ${options.scanDir}: ${failure.message}`)
+      return 2
     }
     if (found > 0) result = secretFirst(found)
   }
   // A problem can quote a name or a value out of the bundle, so each goes through the same filter as
   // every other message before it reaches the terminal or the record.
-  const quotable = quotableNeedles(options.secretFiles)
-  const shown = withheldIfSecret(relative(process.cwd(), options.path), quotable)
-  let problems = [...new Set(result.problems.map((each) => withheldIfSecret(each, quotable)))]
+  const shown = withheldIfSecret(relative(process.cwd(), options.path), needles)
+  let problems = [...new Set(result.problems.map((each) => withheldIfSecret(each, needles)))]
+  let unwritten = null
   if (options.record) {
     const stats = statSync(options.path)
     const identity = {
@@ -825,13 +1054,24 @@ if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) 
       bytes: stats.size,
       sha256: stats.isFile() ? sha256(options.path) : null
     }
-    const made = recordOf({ identity, problems, facts: result.facts, notes: options.notes }, quotable)
+    const made = recordOf({ identity, problems, facts: result.facts, notes: options.notes }, needles)
     problems = made.problems
-    writeFileSync(options.record, made.text)
+    try {
+      writeFileSync(options.record, made.text)
+    } catch (failure) {
+      unwritten = failure
+    }
   }
-  if (problems.length > 0) {
-    console.error(`${shown}:\n${problems.map((each) => `  ${each}`).join('\n')}`)
-    process.exit(1)
+  if (problems.length > 0) err(`${shown}:\n${problems.map((each) => `  ${each}`).join('\n')}`)
+  if (unwritten) {
+    err(`could not write the record ${options.record}: ${unwritten.message}`)
+    return 2
   }
-  console.log(`${shown}: holds for ${options.platform} (version ${options.versionName}, build ${options.versionCode})`)
+  if (problems.length > 0) return 1
+  out(`${shown}: holds for ${options.platform} (version ${options.versionName}, build ${options.versionCode})`)
+  return 0
+}
+
+if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+  process.exitCode = main(process.argv.slice(2))
 }
