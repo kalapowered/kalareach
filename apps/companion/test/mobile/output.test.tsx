@@ -211,5 +211,48 @@ describe("the phone's output is the grant the screen opened the session under (K
     })
     expect(held()).toHaveLength(1)
   })
-})
 
+  it('shows nothing a screen that has gone read under the pairing, when the session is opened again under a share', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    const first = render(screenOn(port))
+    await person.click(screen.getByRole('tab', { name: 'Output' }))
+    await waitFor(() => {
+      expect(held()).toHaveLength(1)
+    })
+
+    // The pairing's next read at the live end carries output only the pairing is shown, and is on
+    // its way when the person goes back and opens the session again, under a share.
+    controls.records.appendOutput(SESSION_MAIN, 'seen only under the pairing\r\n')
+    const reads = controls.hold('historyPage')
+    await waitFor(
+      () => {
+        expect(reads.count).toBe(1)
+      },
+      { timeout: 5000 }
+    )
+    // The screen goes and a new one opens the same session under the share, in the same window.
+    first.rerender(<AppProvider port={port}>{null}</AppProvider>)
+    controls.standings.answerOpens(SESSION_MAIN, OPEN_UNDER_SHARE)
+    first.rerender(screenOn(port, SHARE))
+    await person.click(screen.getByRole('tab', { name: 'Output' }))
+    await waitFor(() => {
+      expect(reads.count).toBeGreaterThan(1)
+    })
+
+    // The gone screen's read answers while the share's first read is still held.
+    await act(async () => {
+      reads.answer(0)
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+    expect(held()).toEqual([])
+    expect(screen.getByTestId('output-scroll').textContent).not.toContain('seen only under the pairing')
+
+    reads.release()
+    await waitFor(() => {
+      expect(screen.getByTestId('output-scroll').textContent).toContain('finished 900 tests')
+    })
+  })
+})

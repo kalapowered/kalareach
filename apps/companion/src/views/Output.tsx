@@ -103,16 +103,18 @@ export function RetainedOutput({
    */
   readonly gate?: OpeningGate
 }): ReactNode {
-  const { port, sessions } = useApp()
+  const { port, sessions, openings } = useApp()
   const { paired } = useHeldConnection()
   const { state, update } = useSession(sessionId)
   const token = gate === undefined ? undefined : (gate.token ?? undefined)
   const waiting = gate !== undefined && (gate.token === null || !gate.running)
-  // The opening the view is under now, which a read that was made under another does not match.
-  const under = useRef(token)
-  useEffect(() => {
-    under.current = token
-  }, [token])
+  // Whether `token` is still the session's newest opening, which the window's own store says: a
+  // read made under an opening that was replaced, even by a screen that has since gone, is not
+  // shown under the one that replaced it. A view with no opening reads under none.
+  const current = useCallback(
+    () => token === undefined || openings.isCurrent(sessionId, token),
+    [openings, sessionId, token]
+  )
   const output = state.output
   const scroller = useRef<HTMLDivElement | null>(null)
   const [failure, setFailure] = useState<string | null>(null)
@@ -130,13 +132,13 @@ export function RetainedOutput({
   const change = useCallback(
     (next: (window: OutputWindow) => OutputWindow) => {
       // What an opening that has been replaced read is not shown under the one that replaced it.
-      if (under.current !== token) return
+      if (!current()) return
       update((session) => {
         const window = next(session.output)
         return window === session.output ? session : { ...session, output: window }
       })
     },
-    [update, token]
+    [update, current]
   )
 
   const page = useCallback(
@@ -212,16 +214,16 @@ export function RetainedOutput({
       reading.current = mine
       return read()
         .then(() => {
-          if (under.current === token) setFailure(null)
+          if (current()) setFailure(null)
         })
         .catch((error: unknown) => {
-          if (under.current === token) setFailure(failureMessage(error))
+          if (current()) setFailure(failureMessage(error))
         })
         .finally(() => {
           if (reading.current === mine) reading.current = null
         })
     },
-    [waiting, token]
+    [waiting, token, current]
   )
 
   /** Finds where the output ends now, and reads the page before it. */
@@ -259,6 +261,7 @@ export function RetainedOutput({
         // begins and says what it let go and why; the span reads on from there to the window.
         const from = max(0n, upTo - BigInt(pageBytes))
         const answer = await span(from, upTo)
+        if (!current()) return
         const scroll = scroller.current
         const anchor = scroll === null ? null : anchorOf(scroll)
         if (anchor !== null) keep.current = anchor
@@ -268,7 +271,7 @@ export function RetainedOutput({
             : { ...held, oldest: answer.oldest, gap: answer.gap ?? held.gap }
         )
       }),
-    [run, span, change, now, pageBytes, windowBytes]
+    [run, span, change, now, current, pageBytes, windowBytes]
   )
 
   /** Reads the page after the window's last, or from where the output ended when it holds none. */
@@ -279,6 +282,7 @@ export function RetainedOutput({
         const from = window.pages.at(-1)?.next ?? window.end
         if (from === null) return
         const answer = await page(from, BigInt(pageBytes))
+        if (!current()) return
         const scroll = scroller.current
         const anchor = scroll === null ? null : anchorOf(scroll)
         if (anchor !== null && !now().following) keep.current = anchor
@@ -295,7 +299,7 @@ export function RetainedOutput({
           )
         )
       }),
-    [run, page, change, now, pageBytes, windowBytes]
+    [run, page, change, now, current, pageBytes, windowBytes]
   )
 
   // Opening: at the live end the first time, and where the reader left it on a return.

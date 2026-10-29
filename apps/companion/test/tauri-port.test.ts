@@ -568,8 +568,9 @@ describe('the desktop port and a session screen’s opening', () => {
     await port.approvalRespond({ target, resource_id: 'resource-1', option_id: 'approve' }, OPENING)
     await port.questionRead({ session_id: SESSION, question_id: null, include_resolved: false }, OPENING)
     await port.sessionClose({ session_id: SESSION }, { sessionId: SESSION }, OPENING)
+    await port.historyPage({ session_id: SESSION, from_cursor: '0', max_bytes: '65536' }, OPENING)
     const carried = shell.invoked.map((call) => (call.args as { opening?: string }).opening)
-    expect(carried).toEqual(Array<string>(11).fill(OPENING))
+    expect(carried).toEqual(Array<string>(12).fill(OPENING))
     // A call made outside any screen names none, and native code serves it on a link of its own.
     shell.invoked.length = 0
     await port.sessionAgents(SESSION)

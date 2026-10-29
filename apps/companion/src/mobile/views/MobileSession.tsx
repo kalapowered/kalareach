@@ -2,8 +2,8 @@
  * One session on a phone: the conversation, the raw terminal, the session's retained output, and
  * the composer under the first two.
  *
- * The conversation and the terminal share the draft and the scroll position, so switching between
- * them is switching the view and not starting again. The output has no composer under it: it fills
+ * The conversation and the terminal share the draft, and each view keeps its own place, so
+ * switching between them is switching the view and not starting again. The output has no composer under it: it fills
  * the room, and the draft is there when the conversation comes back. The composer gives local
  * feedback the instant the person sends something and waits for a receipt before it says anything
  * was applied, because a request that reached the host is not a prompt the agent took.
