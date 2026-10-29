@@ -544,6 +544,96 @@ async fn every_sensitive_action_needs_a_fresh_confirmation_naming_it() {
     host.stop().await;
 }
 
+/// KR-REQ-23.47, the part about the verification context: a confirmation is a decision made now.
+/// A challenge answered after its lifetime confirms nothing, an answered confirmation spent after
+/// its lifetime issues nothing, and the owner who confirms again is the one who is served, once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_confirmation_that_has_outlived_its_lifetime_confirms_nothing() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let grant = viewer();
+    let params = invite_params(InviteGrantKind::SessionInvitation, &grant);
+    let authority = std::sync::Arc::clone(host.controller().owner_authority());
+    let beyond_the_lifetime =
+        std::time::Duration::from_millis(kr_pairing::confirm::CONFIRMATION_LIFETIME_MS + 1_000);
+
+    // A challenge that waited past its lifetime for its answer is not outstanding any more.
+    let stale = calls::request(
+        environment,
+        &mut client,
+        issue_subject(InviteGrantKind::SessionInvitation, &grant),
+    )
+    .await
+    .expect("the owner asks");
+    authority.pass(beyond_the_lifetime);
+    let (proof, presented) = calls::sign(&stale.request, &owner);
+    assert_eq!(
+        code(calls::complete(environment, &mut client, proof, presented).await),
+        ErrorCode::OwnerConfirmationRequired,
+        "the owner's answer to a challenge that ran out is refused"
+    );
+
+    // A confirmation answered in time and spent after its lifetime issues nothing.
+    calls::confirm_subject(
+        environment,
+        &mut client,
+        issue_subject(InviteGrantKind::SessionInvitation, &grant),
+        &owner,
+    )
+    .await
+    .expect("answered in time");
+    authority.pass(beyond_the_lifetime);
+    assert_eq!(
+        code(
+            calls::mutate::<_, PairInviteResult>(
+                environment,
+                &mut client,
+                Method::PairInvite,
+                &params
+            )
+            .await
+        ),
+        ErrorCode::OwnerConfirmationRequired,
+        "an answered confirmation that ran out before it was spent issues no invitation"
+    );
+
+    // The same owner, confirming again now, is served, and the confirmation is spent by it.
+    calls::confirm_subject(
+        environment,
+        &mut client,
+        issue_subject(InviteGrantKind::SessionInvitation, &grant),
+        &owner,
+    )
+    .await
+    .expect("answered again");
+    let invited: PairInviteResult =
+        calls::mutate(environment, &mut client, Method::PairInvite, &params)
+            .await
+            .expect("a fresh confirmation issues the invitation");
+    // With that invitation withdrawn, nothing else stands in the way of a second one, so what
+    // refuses it is the confirmation the first one spent.
+    calls::cancel(environment, &mut client, invited.invitation_id, false)
+        .await
+        .expect("the owner withdraws it");
+    assert_eq!(
+        code(
+            calls::mutate::<_, PairInviteResult>(
+                environment,
+                &mut client,
+                Method::PairInvite,
+                &params
+            )
+            .await
+        ),
+        ErrorCode::OwnerConfirmationRequired,
+        "and a spent confirmation issues no second one"
+    );
+    host.stop().await;
+}
+
 /// KR-REQ-10.07: a noninteractive confirmation from a session, plugin or contact-tool channel is
 /// refused, even signed by the owner device's own key; and a host with no enrolled presence
 /// signer refuses that channel too.
