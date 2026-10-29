@@ -43,9 +43,10 @@
 //! signed in when that account is the record's. When nobody is signed in, which is what a closed
 //! account leaves behind, a look reports it only to a caller that says it is following the deletion
 //! (the page that is showing its result) and only in the process whose flow began it. A look that
-//! only wants to know what is going on, as a panel does when it opens, never learns of a closed
-//! account's deletion: a sign-out of another account does not bring it back, in this process or
-//! in another.
+//! only wants to know what is going on, as a panel does when it opens, learns of a closed account's
+//! deletion only through the sign-in it ends itself: a sign-out of another account does not bring
+//! it back, in this process or in another. Such a look leaves the finished record of the flow
+//! for the page that follows it.
 //!
 //! # What is never rendered
 //!
@@ -783,8 +784,11 @@ impl ManagedAccountDeletion {
 
     /// The record of the account that is signed in is followed by this flow from now on, so that a
     /// closure learned meanwhile, which ends the very sign-in that says whose it is, is still shown
-    /// to a caller that follows it.
-    fn follow_if_signed_in(&self, mark: &str) -> std::result::Result<(), DeletionFault> {
+    /// to a caller that follows it. Says which account is signed in.
+    fn follow_if_signed_in(
+        &self,
+        mark: &str,
+    ) -> std::result::Result<Option<String>, DeletionFault> {
         let signed_in = self
             .account
             .signed_in_mark(&self.origin)
@@ -793,16 +797,18 @@ impl ManagedAccountDeletion {
         if signed_in.as_deref() == Some(mark) {
             *held(&self.flow) = AccountMark::from_hex(mark);
         }
-        Ok(())
+        Ok(signed_in)
     }
 
-    /// `progress`, if the deletion it is of is the person's: the signed-in account's, or, when no one
-    /// is signed in and the caller `following` the deletion, that of the flow in this process that
+    /// `progress`, if the deletion it is of is the person's: the signed-in account's (`own`: it was
+    /// signed in as the look began, which the look may itself have ended), or, when no one is
+    /// signed in and the caller is `following` the deletion, that of the flow in this process that
     /// began it.
     fn shown(
         &self,
         mark: &str,
         progress: DeletionProgress,
+        own: bool,
         following: bool,
     ) -> std::result::Result<DeletionProgress, DeletionFault> {
         let signed_in = self
@@ -812,7 +818,7 @@ impl ManagedAccountDeletion {
             .map(AccountMark::to_hex);
         let theirs = match signed_in {
             Some(signed_in) => signed_in == mark,
-            None => following && self.is_flow(mark),
+            None => own || (following && self.is_flow(mark)),
         };
         Ok(if theirs {
             progress
@@ -1057,7 +1063,7 @@ impl ManagedAccountDeletion {
                     fresh: false,
                 });
             }
-            let _ = self.advance(record, steps).await;
+            let _ = self.advance(record, steps, true).await;
         }
         let receipt = fresh_receipt()?;
         self.account
@@ -1136,8 +1142,8 @@ impl ManagedAccountDeletion {
     }
 
     /// The sign-in is gone before anything was sent. A deletion this device kept for the account the
-    /// person began with may have been carried out by an earlier try; another account's is none of
-    /// this one's.
+    /// person began with may have been carried out by an earlier try, or may have closed the account
+    /// since; another account's is none of this one's.
     async fn after_sign_in_gone(
         &self,
         steps: &dyn DeviceSteps,
@@ -1146,10 +1152,15 @@ impl ManagedAccountDeletion {
             .account
             .read_deletion()
             .map_err(local)?
-            .filter(|record| !record.closed && self.is_flow(&record.mark))
+            .filter(|record| self.is_flow(&record.mark))
         else {
             return Err(DeletionFault::NeedsSignIn);
         };
+        if record.closed {
+            return Ok(DeletionOutcome::Closed {
+                finished: record.done,
+            });
+        }
         match self.read_status(&record.receipt).await {
             Ok(Some(done)) => {
                 self.closed(&record.mark, &record.receipt, done, steps)
@@ -1193,7 +1204,8 @@ impl ManagedAccountDeletion {
     /// and its closure ends that account's grant and no other, but it is not shown as this one's.
     /// A caller that is `following` the deletion (the page that is showing its result) is also told
     /// of a closed account's, if it is the flow in this process that began it; one that is not
-    /// (a panel that has just opened) is told of it only while that account is signed in.
+    /// (a panel that has just opened) is told of it only if that account was signed in as the look
+    /// began. A look that tells no one leaves a finished record of the flow for the one that does.
     ///
     /// # Errors
     ///
@@ -1215,10 +1227,15 @@ impl ManagedAccountDeletion {
         let Some(record) = self.account.read_deletion().map_err(local)? else {
             return Ok(nothing);
         };
-        self.follow_if_signed_in(&record.mark)?;
+        let signed_in = self.follow_if_signed_in(&record.mark)?;
         let mark = record.mark.clone();
+        let own = signed_in.as_deref() == Some(mark.as_str());
         let advanced = if owner.is_some() {
-            self.advance(record, steps).await?
+            // The record is let go of only by a look that tells the person it is of, or when no
+            // page in this process is waiting to be told.
+            let told = own || (signed_in.is_none() && following && self.is_flow(&mark));
+            let last = told || !self.is_flow(&mark);
+            self.advance(record, steps, last).await?
         } else {
             // Someone holds the deletion: what the record shows is all there is to say.
             Advanced {
@@ -1230,7 +1247,7 @@ impl ManagedAccountDeletion {
                 closed_now: false,
             }
         };
-        let progress = self.shown(&mark, advanced.progress, following)?;
+        let progress = self.shown(&mark, advanced.progress, own, following)?;
         Ok(DeletionStatus {
             progress,
             // Only the person whose deletion it is is told of the closure.
@@ -1239,15 +1256,17 @@ impl ManagedAccountDeletion {
     }
 
     /// Brings a record as far as it can go: an account not yet known to be closed is asked about by
-    /// receipt; a closed one is settled. Called as the owner.
+    /// receipt; a closed one is settled. Called as the owner. `last` says that no look to come has
+    /// anyone to tell, so a finished record may go.
     async fn advance(
         &self,
         mut record: Record,
         steps: &dyn DeviceSteps,
+        last: bool,
     ) -> std::result::Result<Advanced, DeletionFault> {
         if record.closed {
             return Ok(Advanced {
-                progress: self.settle_closed(record, true, steps, true, true).await?,
+                progress: self.settle_closed(record, true, steps, true, last).await?,
                 closed_now: false,
             });
         }
@@ -1270,7 +1289,7 @@ impl ManagedAccountDeletion {
                 record.since_ms = now;
                 Ok(Advanced {
                     progress: self
-                        .settle_closed(record, false, steps, false, true)
+                        .settle_closed(record, false, steps, false, last)
                         .await?,
                     closed_now: true,
                 })
@@ -1363,8 +1382,9 @@ impl ManagedAccountDeletion {
         if let Some(record) = self.account.read_deletion().map_err(local)?
             && !record.closed
         {
-            self.follow_if_signed_in(&record.mark)?;
-            if self.shown(&record.mark, DeletionProgress::Unsettled, true)?
+            let signed_in = self.follow_if_signed_in(&record.mark)?;
+            let own = signed_in.as_deref() == Some(record.mark.as_str());
+            if self.shown(&record.mark, DeletionProgress::Unsettled, own, true)?
                 != DeletionProgress::None
             {
                 self.account.drop_deletion().map_err(local)?;

@@ -1622,6 +1622,74 @@ async fn the_person_can_give_up_on_a_deletion_that_may_have_run_and_not_on_a_clo
 }
 
 #[tokio::test]
+async fn a_look_that_follows_nothing_leaves_a_closed_deletion_for_the_page_that_does() {
+    let _clock = CLOCK.lock().await;
+    let rig = new_rig().await;
+    rig.wire.then([recorded("confirm_closed_deleted")]);
+    assert_eq!(
+        rig.deletion.confirm(CODE, &[], &rig.steps).await,
+        Ok(DeletionOutcome::Closed { finished: true })
+    );
+    // Another try meeting the closure it caused is told what it came to.
+    assert_eq!(
+        rig.deletion.confirm(CODE, &[], &rig.steps).await,
+        Ok(DeletionOutcome::Closed { finished: true }),
+        "a second try is not told to sign in again"
+    );
+    assert_eq!(receipts(&rig.wire).len(), 1, "and sends nothing");
+    // A panel that only opened looks first, and tells nobody.
+    let status = rig
+        .deletion
+        .status(false, &rig.steps)
+        .await
+        .expect("a look");
+    assert_eq!(status.progress, DeletionProgress::None);
+    assert!(
+        record(&rig).is_some(),
+        "the record stays for the page that is showing the result"
+    );
+    let status = rig.deletion.status(true, &rig.steps).await.expect("a look");
+    assert_eq!(status.progress, DeletionProgress::Done);
+    assert!(
+        record(&rig).is_none(),
+        "the page that follows it is told, and it goes"
+    );
+}
+
+#[tokio::test]
+async fn the_look_that_opens_the_panel_tells_the_person_whose_own_deletion_it_finds_closed() {
+    let _clock = CLOCK.lock().await;
+    for (answer, progress, kept) in [
+        ("status_open", DeletionProgress::Open, true),
+        ("status_done", DeletionProgress::Done, false),
+    ] {
+        // The person's own deletion is not known to have run, and the person is still signed in as
+        // that account when the panel opens: the look is what ends the sign-in, and it says why.
+        let rig = new_rig().await;
+        rig.wire
+            .then([Step::Lost, Step::Lost, Step::Lost, Step::Lost]);
+        assert_eq!(
+            rig.deletion.confirm(CODE, &[], &rig.steps).await,
+            Ok(DeletionOutcome::Unsettled)
+        );
+        assert!(session(&rig));
+        rig.wire.then([recorded(answer)]);
+        let status = rig
+            .deletion
+            .status(false, &rig.steps)
+            .await
+            .expect("a look");
+        assert_eq!(
+            (status.progress, status.closed_now),
+            (progress, true),
+            "{answer}"
+        );
+        assert!(!session(&rig), "the sign-in is gone");
+        assert_eq!(record(&rig).is_some(), kept, "{answer}");
+    }
+}
+
+#[tokio::test]
 async fn a_new_deletion_looks_after_an_old_closed_one_as_far_as_it_goes_and_then_makes_way() {
     let _clock = CLOCK.lock().await;
     let rig = new_rig().await;
@@ -1894,7 +1962,13 @@ async fn a_second_process_neither_begins_confirms_nor_gives_up_while_another_hol
     );
     assert_eq!(
         second.confirm(CODE, &[], &rig.steps).await,
-        Err(DeletionFault::NeedsSignIn)
+        Ok(DeletionOutcome::Closed { finished: false }),
+        "a try that meets the closure is told of it, not asked to sign in"
+    );
+    assert_eq!(
+        third.confirm(CODE, &[], &rig.steps).await,
+        Err(DeletionFault::NeedsSignIn),
+        "a process that never followed the account has no closure to tell"
     );
 }
 
