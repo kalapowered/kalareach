@@ -79,6 +79,9 @@ case "${1:-}" in
     self-test) self_test ;;
     *)
         printf '%s' "${1:-}" | grep -Eq '^[0-9a-f]{40}$' || { echo "check-commit-on-main: name the commit in full" >&2; exit 2; }
-        on_main "$1" || { echo "::error::$1 is not on main" >&2; exit 1; }
+        on_main "$1" && exit 0
+        code=$?
+        if [ "$code" -eq 2 ]; then echo "::error::main could not be fetched, so $1 is not held to it" >&2; else echo "::error::$1 is not on main" >&2; fi
+        exit 1
         ;;
 esac
