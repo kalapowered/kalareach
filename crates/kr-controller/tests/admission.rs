@@ -5,7 +5,7 @@
 
 use kr_controller::error::ControllerError;
 use kr_controller::registry::{LaunchPhase, Registry};
-use kr_protocol::ids::ActorId;
+use kr_protocol::ids::{ActorId, AuthorityRevision};
 use kr_protocol::scalars::{Digest256, TimestampMs};
 
 fn actor(name: &str) -> ActorId {
@@ -918,4 +918,127 @@ fn kr_req_24_01_the_registry_keeps_the_desktop_identity_a_worker_is_bound_to() {
         None,
         "and a session with no worker has none to read"
     );
+}
+
+/// Makes the registry file refuse one kind of write, the way a full disk or a failed statement
+/// would, by a trigger a second connection installs. The registry in the test finds it on its next
+/// statement.
+fn refuse_writes(host: &kr_ipc::testing::TempHost, name: &str, trigger: &str) {
+    let connection = rusqlite::Connection::open(host.environment().registry_database())
+        .expect("opens the registry file");
+    connection
+        .execute_batch(&format!(
+            "CREATE TRIGGER {name} {trigger} BEGIN SELECT RAISE(ABORT, 'refused'); END;"
+        ))
+        .expect("installs the fault");
+}
+
+/// Ends what [`refuse_writes`] started.
+fn allow_writes(host: &kr_ipc::testing::TempHost, name: &str) {
+    let connection = rusqlite::Connection::open(host.environment().registry_database())
+        .expect("opens the registry file");
+    connection
+        .execute_batch(&format!("DROP TRIGGER {name};"))
+        .expect("removes the fault");
+}
+
+/// KR-REQ-24.05: the display number a create is allocated and the reservation that carries the
+/// work it owes are one commit. A reservation the registry cannot write takes no number, so a
+/// create that failed leaves nothing behind for a retry to skip or for a restart to find.
+#[test]
+fn an_allocation_is_committed_with_its_reservation_or_not_at_all() {
+    let (host, mut registry) = registry();
+    refuse_writes(
+        &host,
+        "refuse_reservations",
+        "BEFORE INSERT ON reservations",
+    );
+    let token = kr_ipc::new_uuid();
+    registry
+        .reserve(
+            &actor("local:501"),
+            token,
+            digest(1),
+            &intent(),
+            TimestampMs::new(1),
+        )
+        .expect_err("the reservation cannot be written");
+    assert_eq!(registry.occupancy().expect("counts"), 0);
+    assert!(
+        registry
+            .reservation_for_token(&actor("local:501"), token)
+            .expect("reads")
+            .is_none(),
+        "no reservation stands for the token"
+    );
+
+    allow_writes(&host, "refuse_reservations");
+    let admitted = registry
+        .reserve(
+            &actor("local:501"),
+            token,
+            digest(1),
+            &intent(),
+            TimestampMs::new(2),
+        )
+        .expect("the retry reserves");
+    assert!(!admitted.deduplicated);
+    assert_eq!(
+        admitted.reservation.display_number.get(),
+        1,
+        "the refused attempt took no display number"
+    );
+}
+
+/// KR-REQ-24.05: an authority revision and the fence it owes are one commit, so the registry never
+/// holds a revision it cannot account for, and a restart finds both. The revision only rises: a
+/// floor below the standing revision still moves it up, and settling the fence ends the debt and
+/// leaves the revision where it stood.
+#[test]
+fn an_authority_revision_is_committed_with_the_fence_it_owes_or_not_at_all() {
+    let (host, mut registry) = registry();
+    refuse_writes(
+        &host,
+        "refuse_debts",
+        "BEFORE UPDATE OF fence_owed_revision ON environment",
+    );
+    registry
+        .advance_authority_revision()
+        .expect_err("the debt cannot be written");
+    registry
+        .advance_authority_revision_to(AuthorityRevision::new(5))
+        .expect_err("the debt cannot be written");
+    assert_eq!(
+        registry.authority_revision().expect("reads").get(),
+        0,
+        "no revision stands without the fence it owes"
+    );
+    assert_eq!(registry.fence_owed().expect("reads"), None);
+
+    allow_writes(&host, "refuse_debts");
+    let first = registry.advance_authority_revision().expect("advances");
+    assert_eq!(first.get(), 1);
+    assert_eq!(registry.fence_owed().expect("reads"), Some(first));
+
+    // A daemon that opens the registry again finds the revision and the debt together.
+    drop(registry);
+    let mut reopened = Registry::open(
+        host.environment().registry_database(),
+        host.environment_id(),
+    )
+    .expect("reopens the registry");
+    assert_eq!(reopened.authority_revision().expect("reads"), first);
+    assert_eq!(reopened.fence_owed().expect("reads"), Some(first));
+
+    let next = reopened
+        .advance_authority_revision_to(AuthorityRevision::new(0))
+        .expect("advances");
+    assert!(
+        next > first,
+        "a floor below the standing revision lowers nothing"
+    );
+    assert_eq!(reopened.fence_owed().expect("reads"), Some(next));
+    reopened.settle_fence(next).expect("settles");
+    assert_eq!(reopened.fence_owed().expect("reads"), None);
+    assert_eq!(reopened.authority_revision().expect("reads"), next);
 }
