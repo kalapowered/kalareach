@@ -8,7 +8,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use kr_protocol::broker::{BrokerGrant, BrokerGrants};
+use kr_protocol::broker::{ActionProvenance, BrokerGrant, BrokerGrants};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::gateway::{GatewayMode, PendingResource, PendingState};
 use kr_protocol::ids::{ActorId, AgentBindingRevision, PendingResourceId, PublisherId};
@@ -1649,6 +1649,55 @@ async fn kr_req_12_18_closing_under_a_channels_identifier_leaves_the_channel_ser
         relayed(&broker, 2, "fghij").is_some()
     })
     .await;
+    channel.close().await;
+    assert!(matches!(channel.ended().await, ChannelEnd::Ended { .. }));
+}
+
+/// KR-REQ-12.09: an approval answered on a Channels channel records the provenance it reached the
+/// application by. The answer goes out through the host's own authenticated bridge as the
+/// application's verdict, not as a reply to a typed call the application made, so the result and the
+/// receipt name an authenticated bridge response. The control is the typed route: an answer over a
+/// gateway connection is a typed result (kr-worker's gateway suite).
+#[tokio::test]
+async fn kr_req_12_09_a_channels_answer_records_the_authenticated_bridge_it_went_by() {
+    let recorded: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/channel-frames-0.77.json"))
+            .expect("the recorded frames are JSON");
+    let broker = memory_broker();
+    register(&broker, 2);
+    let package = Package::laid_out();
+    package.bind(&broker, 2);
+    let mut channel = Channel::open(
+        package.launch(&broker, 2, Some(fixture::QUALIFIED_VERSION)),
+        2,
+        launched(2),
+    );
+    channel.send(&recorded["permission_request"]).await;
+    eventually("the approval is interpreted", || {
+        relayed(&broker, 2, "abcde").is_some_and(|resource| resource.interpretation_verified)
+    })
+    .await;
+    let resource = relayed(&broker, 2, "abcde").expect("recorded");
+
+    let answered = broker
+        .agent_approval_respond(
+            &caller(),
+            &respond(2, &resource, "allow"),
+            TimestampMs::new(5),
+        )
+        .await
+        .expect("the answer goes out on the channel")
+        .0;
+    assert_eq!(answered.state, PendingState::Resolved);
+    assert_eq!(
+        answered.mutation.provenance,
+        ActionProvenance::AuthenticatedHookResponse,
+        "an answer written on a bridge's channel is a bridge response, whatever the application does with it"
+    );
+    assert!(
+        answered.mutation.provenance.is_authoritative(),
+        "and it is still a result a reader may rely on"
+    );
     channel.close().await;
     assert!(matches!(channel.ended().await, ChannelEnd::Ended { .. }));
 }
