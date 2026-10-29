@@ -449,8 +449,12 @@ instants, which is the ambiguity a fence exists to remove, so a qualified packag
 together. A reader cannot tell a byte a person typed from one the host put into the terminal for
 an application, such as the answer to a device query, and it does not try: what it has not read is
 unread input, and the Zsh, Bash and Fish readers do not report their queues drained until they have
-read it. The PowerShell reader counts the keys its editor has queued and nothing else, so bytes still
-in the terminal's queue or in .NET's input buffer are in none of its counts.
+read it. The PowerShell reader counts the keys its editor has queued, what the .NET runtime has read
+from the terminal and not yet handed to the editor, and whether the terminal's queue holds anything.
+It reads the runtime's buffer where it lies, because asking the console whether a key is available
+would take the lock the editor's reading thread holds while it waits. On a Windows console the
+runtime reads console records, which the module does not see, so there the editor's own queue is the
+only count.
 
 A launch is never written into the pseudo-terminal. There is no wake marker and no launch string,
 because the process reading the terminal may not be the shell. A rejection installs nothing.
