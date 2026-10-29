@@ -3232,6 +3232,70 @@ async fn substituting_the_origin_or_the_locator_fails_authentication() {
     ));
 }
 
+/// A permanently lost service cannot be rebuilt from a seed alone. A kit that names the service
+/// that is gone reads nothing from it, and a replacement at the same origin that holds no bundle
+/// gives the kit and its seed nothing either: the seed derives keys and holds no ciphertext. The
+/// same kit still reads the bundle at a service that is left.
+#[tokio::test]
+async fn a_seed_alone_does_not_rebuild_a_service_that_is_gone() {
+    let gone = ScriptedService::shared();
+    let left = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    for (service, origin) in [
+        (Arc::clone(&gone), ORIGIN),
+        (Arc::clone(&left), OTHER_ORIGIN),
+    ] {
+        let mut store = device(service as Arc<_>, context(origin));
+        let mut bundle = BundleStore::empty(TimestampMs::new(1));
+        store
+            .enable_writer(
+                &seed,
+                &mut bundle,
+                trusted(&writer),
+                TimestampMs::new(1_000),
+            )
+            .await
+            .expect("the bundle commits");
+    }
+    let kit = kit_of(&seed, &[ORIGIN, OTHER_ORIGIN]);
+    let restore_at = |origin: &str, service: Arc<ScriptedService>| {
+        let mut restore = FreshRestore::new(kit.clone(), RetrievalPolicy::Account);
+        restore
+            .obtained_access(ServiceAccess::new(
+                RetrievalPolicy::Account,
+                origin,
+                service as Arc<_>,
+            ))
+            .expect("access");
+        restore
+    };
+
+    // The first service is gone: what it held does not come back.
+    gone.lose_the_next_fetch();
+    assert!(matches!(
+        restore_at(ORIGIN, Arc::clone(&gone))
+            .open_bundle(ORIGIN)
+            .await,
+        Err(RecoveryError::Service(_))
+    ));
+
+    // A replacement that answers at the same origin holds no bundle, and the seed does not make one.
+    assert!(matches!(
+        restore_at(ORIGIN, ScriptedService::shared())
+            .open_bundle(ORIGIN)
+            .await,
+        Err(RecoveryError::Service(_))
+    ));
+
+    // The service that is left still serves the bundle to the same kit.
+    let material = restore_at(OTHER_ORIGIN, left)
+        .open_bundle(OTHER_ORIGIN)
+        .await
+        .expect("the kit still reads the service that is left");
+    assert_eq!(material.trusted_writers.len(), 1);
+}
+
 // ---------------------------------------------------------------------------------------------
 // KR-REQ-20.18: multiple-service kits, the migration record, and the offline export.
 // ---------------------------------------------------------------------------------------------
@@ -4374,6 +4438,9 @@ async fn completing_a_migration_whose_write_never_landed_leaves_the_move_to_be_m
     );
 }
 
+/// KR-REQ-20.19: an authenticated service or collection migration produces an explicit updated kit
+/// and a verified migration record: the kit names the new origin and locator and no longer the old
+/// ones, the record says what was verified and where, and the bundle authenticates at its new home.
 #[tokio::test]
 async fn a_migration_produces_an_updated_kit_and_a_verified_record() {
     let service = ScriptedService::shared();
