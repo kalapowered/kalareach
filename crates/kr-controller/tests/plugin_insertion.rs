@@ -1404,12 +1404,14 @@ async fn kr_req_23_30_a_repeat_of_an_offer_claims_nothing_again_and_a_changed_on
     );
 }
 
-/// KR-REQ-23.30: an offer is refused before anything is claimed when the package's declaration does
-/// not admit it, one row for each thing the declaration decides: the media type and its family, the
-/// size, the destination and the application instance the draft is for, which the worker checks
-/// against what it read; and two the control daemon decides when it claims, given the declaration's
-/// figure, the number of attachments and the way the binding was recorded to be inserted. The
-/// control is a declaration that admits it, which is carried.
+/// KR-REQ-23.30 and KR-REQ-14.03: an offer is refused before anything is claimed when the
+/// package's declaration does not admit it, one row for each thing the declaration decides: the
+/// media type and its family, the size, the destination and the application instance the draft is
+/// for, which the worker checks against what it read; and two the control daemon decides when it
+/// claims, given the declaration's figure, the number of attachments and the way the binding was
+/// recorded to be inserted, among them a path the person is to put in the terminal, which no worker
+/// offers and so no agent is ever reported to have taken. The control is a declaration that admits
+/// it, which is carried.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_23_30_an_offer_the_packages_declaration_does_not_admit_is_refused_before_a_claim() {
     use kr_plugin_sdk::effect::AttachmentContribution;
@@ -1444,6 +1446,11 @@ async fn kr_req_23_30_an_offer_the_packages_declaration_does_not_admit_is_refuse
         &acting.new_draft(),
         &handle,
         kr_protocol::transfer::InsertionMethod::VerifiedComposerInsertion,
+    );
+    let manual = acting.bind_by(
+        &acting.new_draft(),
+        &handle,
+        kr_protocol::transfer::InsertionMethod::ManualTerminalWorkflow,
     );
 
     type Alter = Box<dyn Fn(&mut AttachmentContribution)>;
@@ -1484,6 +1491,12 @@ async fn kr_req_23_30_an_offer_the_packages_declaration_does_not_admit_is_refuse
         (
             "a binding recorded to be inserted another way",
             composer.draft_id,
+            Box::new(|_| {}),
+            ErrorCode::InvalidArgument,
+        ),
+        (
+            "a binding recorded for the person to put the path in the terminal",
+            manual.draft_id,
             Box::new(|_| {}),
             ErrorCode::InvalidArgument,
         ),

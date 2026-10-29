@@ -407,9 +407,10 @@ fn a_claim_is_refused_unless_the_draft_the_binding_the_attempt_the_count_and_the
     );
 }
 
-/// KR-REQ-24.09: the outcome of an offer is recorded for its owner, at the attempt it was claimed
-/// for, with evidence for acceptance and none from the terminal; the same report again is answered
-/// as it stands and another is refused; and the claim's grant goes with the report.
+/// KR-REQ-24.09 and KR-REQ-14.03: the outcome of an offer is recorded for its owner, at the
+/// attempt it was claimed for, with evidence for acceptance and none from the terminal; the same
+/// report again is answered as it stands and another is refused; and the claim's grant goes with
+/// the report.
 #[test]
 fn an_offer_is_reported_by_its_owner_once_and_its_grant_goes_with_the_report() {
     let harness = Harness::create();
@@ -534,6 +535,113 @@ fn an_offer_is_reported_by_its_owner_once_and_its_grant_goes_with_the_report() {
         )
         .expect_err("an accepted attachment");
     assert_eq!(rebound.code(), ErrorCode::DraftConflict);
+}
+
+/// KR-REQ-14.03: a path the host gives for a manual terminal workflow is a path in terminal input,
+/// and the host never records it as an agent's acceptance of an attachment. A worker offers only
+/// a typed submission, so no outcome can be claimed or reported for the manual binding, whatever
+/// provenance a report names; the draft reads the same before and after, with the binding recorded
+/// and its read grant and upload intact. A typed submission bound beside it is claimed and
+/// accepted, so the refusal is about the insertion method.
+#[test]
+fn a_path_given_for_a_manual_terminal_workflow_is_never_recorded_as_taken_by_an_agent() {
+    let harness = Harness::create();
+    let created = draft_for(&harness, Some(session()));
+    let (with_typed, typed) = bind(
+        &harness,
+        &created,
+        "typed.png",
+        InsertionMethod::TypedSubmission,
+    );
+    let (_, manual) = bind(
+        &harness,
+        &with_typed,
+        "manual.png",
+        InsertionMethod::ManualTerminalWorkflow,
+    );
+    let before = read(&harness, created.draft_id);
+    assert_eq!(
+        state_of(&before, manual.transfer_id),
+        InsertionState::Recorded
+    );
+    let grant = before
+        .attachments
+        .iter()
+        .find(|attachment| attachment.handle.transfer_id == manual.transfer_id)
+        .expect("the manual attachment is bound")
+        .read_grant
+        .0
+        .clone()
+        .expect("the host gives the path under a read grant");
+
+    // The offer a worker would make for the manual binding if it could, at the attempt the draft's
+    // facts give the binding.
+    let offer = harness.begin_of(session(), created.draft_id, manual.transfer_id, action(71));
+    let claim = harness
+        .service
+        .insertion_begin(
+            &harness.actor,
+            session(),
+            &offer,
+            &boot_clock_at(BOOT_NOW_MS),
+        )
+        .expect_err("a worker offers only a typed submission");
+    assert_eq!(claim.code(), ErrorCode::InvalidArgument);
+
+    // Nothing was claimed, so no report settles the binding: an acceptance with upstream evidence
+    // is a conflict, and one whose only evidence is bytes written into the terminal is refused
+    // whatever the binding holds, since the host takes no such evidence from anybody.
+    for (outcome, code) in [
+        (accepted("upstream part msg_01H"), ErrorCode::DraftConflict),
+        (
+            ReportedOutcome::AcceptedByAgent {
+                provenance: ActionProvenance::TerminalInput,
+                evidence: "the path was typed".to_owned(),
+            },
+            ErrorCode::PermissionDenied,
+        ),
+    ] {
+        let refusal = harness
+            .report(session(), &offer, outcome)
+            .expect_err("an unclaimed binding takes no report");
+        assert_eq!(refusal.code(), code);
+    }
+    assert_eq!(
+        read(&harness, created.draft_id),
+        before,
+        "the refusals changed nothing"
+    );
+
+    // The control: the typed submission beside it is offered and accepted.
+    let owner = action(72);
+    harness
+        .claim(session(), created.draft_id, typed.transfer_id, owner)
+        .expect("claims the typed binding");
+    let begin = harness.begin_of(session(), created.draft_id, typed.transfer_id, owner);
+    assert_eq!(
+        harness
+            .report(session(), &begin, accepted("upstream part msg_02H"))
+            .expect("records the acceptance"),
+        InsertionState::AcceptedByAgent
+    );
+    let after = read(&harness, created.draft_id);
+    assert_eq!(
+        state_of(&after, typed.transfer_id),
+        InsertionState::AcceptedByAgent
+    );
+    assert_eq!(
+        state_of(&after, manual.transfer_id),
+        InsertionState::Recorded
+    );
+    harness
+        .service
+        .read_grant(grant.grant_id)
+        .expect("the grant the person was given still holds");
+    assert_eq!(
+        std::fs::read(&grant.host_path).expect("the file at the path the person was given"),
+        pattern(64 + "manual.png".len()),
+        "the upload the path names is still there"
+    );
 }
 
 /// KR-REQ-24.09: an offer that may have reached the agent and was not answered is unknown, not

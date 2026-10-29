@@ -313,9 +313,10 @@ fn a_contribution_declares_what_it_accepts_and_the_host_checks_it() {
     assert_eq!(over_count.code(), ErrorCode::InvalidArgument);
 }
 
-/// KR-REQ-11.49: only upstream evidence makes an insertion accepted, and a failure keeps both the
-/// draft and the completed upload. The offer that failed is offered again as a new attempt of the
-/// same binding, under a new action, and the draft holds one binding throughout.
+/// KR-REQ-11.49 and KR-REQ-14.03: only upstream evidence makes an insertion accepted, and bytes
+/// written into the terminal are not evidence. A failure keeps both the draft and the completed
+/// upload. The offer that failed is offered again as a new attempt of the same binding, under a
+/// new action, and the draft holds one binding throughout.
 #[test]
 fn a_failed_insertion_keeps_the_draft_and_the_upload_and_only_evidence_accepts() {
     let harness = Harness::create();
