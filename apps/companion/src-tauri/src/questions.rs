@@ -708,9 +708,7 @@ pub async fn read(
     let answer = host
         .within(link.session.read(Method::QuestionRead, &params))
         .await;
-    let result: QuestionReadResult = host
-        .settle(session_id, link.link(), answer)
-        .map_err(CommandError::from)?;
+    let result: QuestionReadResult = links.settle(state, session_id, link.link(), answer)?;
     // On this machine an answer goes on the session's own target. On a paired host the target is
     // the session at the epoch the question carries, in the host's environment.
     let target_for: TargetFor = match &host.route {

@@ -546,7 +546,7 @@ impl WorkerLinks {
     ) -> Result<T> {
         answer.map_err(|error| {
             let ended = if ends_the_link(&error) {
-                // Read first: it is this device that says why, and letting the link go closes it.
+                // Ask the link why before it is let go.
                 let ended = link.session.transport().ended_by_this_device();
                 self.forget(state, session_id, link);
                 ended

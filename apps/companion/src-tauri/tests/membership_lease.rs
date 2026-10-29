@@ -2276,6 +2276,35 @@ async fn an_ambient_link_to_a_member_host_is_not_used_after_a_sign_out() {
     assert!(asks_to_sign_in(&refused), "{refused}");
 }
 
+/// KR-REQ-17.53: a command that has reached the idle link when the account signs out is told to
+/// sign in, as the next command is: the link was seen open, the send is refused because the account
+/// has left, and the answer says why and not that the connection ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_command_on_an_ambient_link_when_the_account_signs_out_is_told_to_sign_in() {
+    let rig = Rig::start_with(SERVED, 1).await;
+    rig.connection(true).await;
+    let session = rig.session();
+    let params = json!({ "params": {
+        "session_id": session.to_string(),
+        "question_id": null,
+        "include_resolved": false,
+    } });
+    rig.companion()
+        .call("question_read", params.clone())
+        .expect("a link is opened beside the application's and answers");
+
+    rig.control.hold_next_request(Method::QuestionRead);
+    let reading = rig.companion().start_call("question_read", params);
+    rig.control.until_request_held().await;
+    let _ = rig.tokens.sign_out().await;
+    rig.control.release_request();
+    let refused = reading
+        .await
+        .expect("the call ran")
+        .expect_err("the link of the account that left answers nothing");
+    assert!(asks_to_sign_in(&refused), "{refused}");
+}
+
 /// KR-REQ-17.53: a raw terminal view of a member's host is a connection of its own, bound to the
 /// account like the rest. A sign-out ends the view, in the sign-in words, and the input the page
 /// sends it afterwards is refused.
