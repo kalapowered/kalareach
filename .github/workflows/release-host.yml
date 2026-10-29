@@ -262,10 +262,12 @@ jobs:
             echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           fi
 
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
       - name: The published release matrix lists this release
         run: |
           set -uo pipefail
-          rustup show active-toolchain || rustup toolchain install
           cargo build --locked --release -p kr-release-matrix-check
           for attempt in 1 2 3; do
             target/release/kr-release-matrix-check --origin https://reach.kala.to && exit 0
