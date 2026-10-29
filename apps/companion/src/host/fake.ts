@@ -2146,9 +2146,10 @@ export function fakeHost(
       checkOpening('actionRead', params.session_id ?? '', opening)
       return refuse('NOT_FOUND', 'The host holds no receipt for that action.')
     },
-    historyPage: (params) =>
+    historyPage: (params, opening) =>
       reading('historyPage', () => {
         requireConnection()
+        checkOpening('historyPage', params.session_id, opening)
         return records.history(params)
       }),
     attentionRead: (params) =>

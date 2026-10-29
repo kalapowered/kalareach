@@ -18,6 +18,7 @@ import { useCallback, useEffect, useState, useSyncExternalStore } from 'react'
 import { useApp } from './state'
 import { failureCode, failureWords } from '../host/port'
 import { emptyConversation } from '../model/conversation'
+import { emptyOutput } from '../model/output'
 import type { OpeningRecord } from '../model/openings'
 import { unreadAgent, type SessionState } from '../model/sessions'
 
@@ -30,7 +31,13 @@ function newToken(): string {
 
 /** What a session holds of what it read, without what the person made. */
 function unread(state: SessionState): SessionState {
-  return { ...state, conversation: emptyConversation(), agent: unreadAgent(), loaded: false }
+  return {
+    ...state,
+    conversation: emptyConversation(),
+    agent: unreadAgent(),
+    output: emptyOutput(),
+    loaded: false
+  }
 }
 
 /** What a screen is told about its session's opening. */

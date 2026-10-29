@@ -1773,9 +1773,10 @@ export interface HostPort {
   /**
    * One page of a session's retained output, from the cursor and within the byte bound the
    * parameters name. A live session's is read on its own worker, and an ended one's from the host's
-   * archive.
+   * archive. Over a host the application is paired with, a screen reads it under its opening, which
+   * names the session's own link and the grant the output is narrowed to.
    */
-  historyPage(params: HistoryPageParams): Promise<HistoryPageResult>
+  historyPage(params: HistoryPageParams, opening?: string): Promise<HistoryPageResult>
   /**
    * The receipt an action stands at now.
    *

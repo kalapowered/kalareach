@@ -1,10 +1,12 @@
 /**
- * One session on a phone: the conversation, the raw terminal, and the composer under both.
+ * One session on a phone: the conversation, the raw terminal, the session's retained output, and
+ * the composer under the first two.
  *
- * The two views share the draft and the scroll position, so switching between them is switching
- * the view and not starting again. The composer gives local feedback the instant the person sends
- * something and waits for a receipt before it says anything was applied, because a request that
- * reached the host is not a prompt the agent took.
+ * The conversation and the terminal share the draft and the scroll position, so switching between
+ * them is switching the view and not starting again. The output has no composer under it: it fills
+ * the room, and the draft is there when the conversation comes back. The composer gives local
+ * feedback the instant the person sends something and waits for a receipt before it says anything
+ * was applied, because a request that reached the host is not a prompt the agent took.
  *
  * The terminal view is the one with a rule in it. It opens in view mode, where a one-finger drag
  * moves the window across the session, up into its history and down its live screen: the screen
@@ -1163,9 +1165,10 @@ export function MobileSession({
             )}
           </div>
         ) : pane === 'output' ? (
-          // What the session wrote, as the host keeps it: read as the desktop reads it, and kept
-          // where the reader left it when the view changes.
-          <RetainedOutput key={sessionId} sessionId={sessionId} />
+          // What the session wrote, as the host keeps it: read as the desktop reads it, under this
+          // screen's opening so the output is the grant's, and kept where the reader left it when
+          // the view changes.
+          <RetainedOutput key={sessionId} sessionId={sessionId} gate={gate} />
         ) : liveScreen === false ? (
           <p className="m-empty" data-testid="no-live-screen">
             This share does not include the live screen.

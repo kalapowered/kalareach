@@ -22,7 +22,7 @@ import { base64UrlToBytes } from '@kalareach/protocol'
 
 import { Banner, Button } from '../components/ui'
 import { readOnCadence } from '../app/cadence'
-import { AGENT_READ_CADENCE_MS } from '../app/agent'
+import { AGENT_READ_CADENCE_MS, type OpeningGate } from '../app/agent'
 import { useHeldConnection } from '../app/rights'
 import { useApp, useSession } from '../app/state'
 import { failureMessage } from '../host/port'
@@ -86,7 +86,8 @@ export function RetainedOutput({
   sessionId,
   pageBytes = OUTPUT_PAGE_BYTES,
   windowBytes = OUTPUT_WINDOW_BYTES,
-  cadenceMs = AGENT_READ_CADENCE_MS
+  cadenceMs = AGENT_READ_CADENCE_MS,
+  gate
 }: {
   readonly sessionId: string
   /** How many bytes one read asks for. */
@@ -95,10 +96,23 @@ export function RetainedOutput({
   readonly windowBytes?: number
   /** How long after one read at the live end the next starts. */
   readonly cadenceMs?: number
+  /**
+   * The opening the output is read under, on a screen that has one. Every read carries its token,
+   * and reading goes on only while the host says the opening is open, so the output is the grant's
+   * and a read made under an opening that was replaced shows nothing.
+   */
+  readonly gate?: OpeningGate
 }): ReactNode {
   const { port, sessions } = useApp()
   const { paired } = useHeldConnection()
   const { state, update } = useSession(sessionId)
+  const token = gate === undefined ? undefined : (gate.token ?? undefined)
+  const waiting = gate !== undefined && (gate.token === null || !gate.running)
+  // The opening the view is under now, which a read that was made under another does not match.
+  const under = useRef(token)
+  useEffect(() => {
+    under.current = token
+  }, [token])
   const output = state.output
   const scroller = useRef<HTMLDivElement | null>(null)
   const [failure, setFailure] = useState<string | null>(null)
@@ -115,24 +129,29 @@ export function RetainedOutput({
 
   const change = useCallback(
     (next: (window: OutputWindow) => OutputWindow) => {
+      // What an opening that has been replaced read is not shown under the one that replaced it.
+      if (under.current !== token) return
       update((session) => {
         const window = next(session.output)
         return window === session.output ? session : { ...session, output: window }
       })
     },
-    [update]
+    [update, token]
   )
 
   const page = useCallback(
     (from: string, bytes: bigint) =>
       ask(() =>
-        port.historyPage({
-          session_id: sessionId,
-          from_cursor: from,
-          max_bytes: String(bytes < 1n ? 1n : bytes)
-        })
+        port.historyPage(
+          {
+            session_id: sessionId,
+            from_cursor: from,
+            max_bytes: String(bytes < 1n ? 1n : bytes)
+          },
+          token
+        )
       ),
-    [port, sessionId]
+    [port, sessionId, token]
   )
 
   /**
@@ -182,20 +201,24 @@ export function RetainedOutput({
   )
 
   /** Runs one read, unless one is on its way, and says what the host refused. */
-  const run = useCallback((read: () => Promise<void>): Promise<void> => {
-    if (reading.current) return Promise.resolve()
-    reading.current = true
-    return read()
-      .then(() => {
-        setFailure(null)
-      })
-      .catch((error: unknown) => {
-        setFailure(failureMessage(error))
-      })
-      .finally(() => {
-        reading.current = false
-      })
-  }, [])
+  const run = useCallback(
+    (read: () => Promise<void>): Promise<void> => {
+      // An opening that is not open reads nothing; reading starts when it is.
+      if (waiting || reading.current) return Promise.resolve()
+      reading.current = true
+      return read()
+        .then(() => {
+          setFailure(null)
+        })
+        .catch((error: unknown) => {
+          setFailure(failureMessage(error))
+        })
+        .finally(() => {
+          reading.current = false
+        })
+    },
+    [waiting]
+  )
 
   /** Finds where the output ends now, and reads the page before it. */
   const openAtEnd = useCallback(
