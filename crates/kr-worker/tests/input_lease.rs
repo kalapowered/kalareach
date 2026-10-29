@@ -2319,7 +2319,11 @@ async fn echoing_session() -> (
 ) {
     let host = kr_ipc::testing::TempHost::create();
     // Raw mode with the echo off: what comes back is what the application received.
-    let config = configuration(&host, "stty raw -echo; printf 'kr-ready.'; exec cat");
+    let mut config = configuration(&host, "stty raw -echo; printf 'kr-ready.'; exec cat");
+    // The one continuous clock of the session, in the test's hands: the response lane sets an
+    // answer's own deadline from it and the writer reads it, so a test that moves it moves both.
+    let clock = kr_ipc::clock::ManualSharedClock::new();
+    config.time.continuous = Arc::new(clock.clone());
     let session_id = config.session_id;
     let mut session = Session::open(config).expect("opens");
     session.launch().expect("launches");
@@ -2330,7 +2334,6 @@ async fn echoing_session() -> (
         .lease
         .epoch
         .get();
-    let clock = kr_ipc::clock::ManualSharedClock::new();
     let runtime = Arc::new(
         SessionRuntime::start(session, std::sync::Arc::new(clock.clone())).expect("starts"),
     );
