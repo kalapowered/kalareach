@@ -637,14 +637,7 @@ pub enum TerminalInput {
     /// What the terminal sent, byte for byte.
     Bytes(Vec<u8>),
     /// A run of key records, in the order the console reported them, for the session to spell as
-    /// its terminal asked for.
-    #[cfg_attr(
-        not(windows),
-        expect(
-            dead_code,
-            reason = "only a Windows console reports keys as records; the attachment handles them everywhere"
-        )
-    )]
+    /// its terminal asked for. Only a Windows console reports keys this way.
     Keys(Vec<kr_term::win32::KeyRecord>),
 }
 
