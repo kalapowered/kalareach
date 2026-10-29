@@ -226,6 +226,14 @@ jobs:
         timeout-minutes: 5
         run: rustup target add wasm32-wasip2
 
+      # The iOS unit tests of the phones group build the library that opens a sealed notification
+      # preview for the simulator, in a build phase of the test scheme that runs cargo for this
+      # target. The runner's toolchain has its own architecture only, and without this target
+      # that phase fails and no test of the scheme runs.
+      - name: Install the iOS simulator target
+        timeout-minutes: 5
+        run: rustup target add aarch64-apple-ios-sim
+
       # The worker's pseudo-terminal suite drives each shell section 3 names; the runner has Bash
       # and Zsh.
       - name: Install Fish
