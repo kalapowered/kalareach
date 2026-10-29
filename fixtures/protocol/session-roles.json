@@ -1,0 +1,44 @@
+{
+  "description": "The four session roles in order of increasing authority, each with the actions the host writes into a grant made for it. The host reads it as SessionRole::default_actions, and the companion's page reads it as the table it names a share's role by.",
+  "roles": [
+    {
+      "role": "viewer",
+      "default_actions": ["session.view"]
+    },
+    {
+      "role": "reviewer",
+      "default_actions": ["session.view", "files.read"]
+    },
+    {
+      "role": "controller",
+      "default_actions": [
+        "session.view",
+        "files.read",
+        "terminal.input",
+        "terminal.geometry",
+        "agent.prompt",
+        "agent.cancel",
+        "agent.approval.respond",
+        "question.respond"
+      ]
+    },
+    {
+      "role": "owner",
+      "default_actions": [
+        "session.view",
+        "files.read",
+        "terminal.input",
+        "terminal.geometry",
+        "terminal.geometry.transfer",
+        "terminal.palette",
+        "agent.prompt",
+        "agent.cancel",
+        "agent.approval.respond",
+        "question.respond",
+        "session.rename",
+        "session.close",
+        "session.share"
+      ]
+    }
+  ]
+}
