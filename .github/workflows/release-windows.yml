@@ -10,8 +10,8 @@ name: release-windows
 # manifest with keys and a channel root that this run made, packs it and holds the archive to what a
 # host stages. No environment and no secret is read, and the job is given no token to ask for one.
 # What it signs is not a release, because no host trusts a root it made: the archive it keeps says so
-# in its name. A Windows host keeps no store of releases, so the install into a store that the macOS
-# and Linux jobs make has no counterpart here.
+# in its name. The macOS and Linux jobs also install the tree they make into a store; this workflow
+# does not install the Windows tree into one.
 #
 # The `release` job is the release. It runs for a release tag and for the default branch, once the
 # repository variable `WINDOWS_HOST_RELEASE` is `true`, and a run on any other ref, or without the
