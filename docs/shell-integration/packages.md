@@ -147,10 +147,12 @@ callback therefore classifies typeahead wrongly. So:
   event hook, and no read reaches that branch.
 - **A cancellation returns a negative key.** `KR_RL_CANCEL` is negative and distinct from `EOF` and
   `READERR`, so `_rl_dispatch_subseq`, `_rl_insert_next`, `rl_digit_loop` and `rl_vi_domove` each
-  end their own operation through the path they already have for a negative key, which runs
-  `_rl_abort_internal`: the executing macro is popped, pending input is cleared, the argument is
-  reset, and `rl_line_buffer` is left exactly as it was. A cancellation that finds nothing in
-  progress returns no key at all, so the reader stays in the read it is in.
+  end their own operation through the path they already have for a negative key. In
+  `_rl_dispatch_subseq` and `rl_digit_loop` that path runs `_rl_abort_internal`: the executing macro
+  is popped, pending input is cleared and the argument is reset. `_rl_insert_next` returns to its
+  caller, and `rl_vi_domove` returns an error that its caller answers with the bell. In all four
+  `rl_line_buffer` is left exactly as it was. A cancellation that finds nothing in progress returns
+  no key at all, so the reader stays in the read it is in.
 - **`readline_internal_char` takes the end-of-file decision** immediately before Readline's own
   `c == EOF && rl_end` and empty-line branches, after the next character has been selected. It
   answers native or consume, replaces no binding, and a consume continues the same `readline` call.

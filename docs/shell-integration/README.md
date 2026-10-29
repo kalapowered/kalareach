@@ -852,10 +852,11 @@ method, and that is exactly what it cannot do:
   operation and then reads the queue, unless the editor's own key queue still holds keys, which go
   first. The read-line entry reports the reader and reads the mailbox once, before the editor's read
   starts, and the editor clears its buffer when its read starts. A launch the module reads there is
-  refused, with `revoked` when its revocation has arrived and with `editor_left` when it has not,
-  because a line installed before the read would never run. A launch quotes the fence of the read it
-  was made for, and the worker publishes this read's fence only after the reader has acknowledged
-  one, so what the module reads there is a launch for the read before. A key the person bound to a script of their own is theirs and carries no boundary, and an ordinary
+  refused: with `revoked` when its revocation has arrived, with `fence_invalid` or
+  `not_primary_reader` when its fence or the reader no longer fits it, and otherwise with
+  `editor_left`, because a line installed before the read would never run. A launch quotes the
+  fence of the read it was made for, and the worker publishes this read's fence only after the
+  reader has acknowledged one, so what the module reads there is a launch for the read before. A key the person bound to a script of their own is theirs and carries no boundary, and an ordinary
   character goes straight to the editor's own insertion, so a request that arrives at a parked
   reader is answered after its next bound key that leaves the editor's queue empty rather than
   immediately; in the Vi command table that is a bound key of the insert table or the next read-line
