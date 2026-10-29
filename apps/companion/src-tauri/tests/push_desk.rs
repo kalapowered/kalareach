@@ -1087,7 +1087,7 @@ async fn the_keys_filed_for_the_receivers_are_the_preview_key_the_host_was_told_
             "the {purpose:?} seed is not what is filed"
         );
         for (whose, public) in [
-            ("its own", identity.keys.raw(purpose)),
+            ("its own", identity.keys.public_keys().raw(purpose)),
             ("the host's", paired.host_keys.raw(purpose)),
         ] {
             assert!(
