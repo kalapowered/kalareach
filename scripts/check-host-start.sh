@@ -31,33 +31,68 @@ if [ "$(uname -s)" = Linux ]; then
     export HOME="$work/home" XDG_CONFIG_HOME="$work/home/.config"
 fi
 daemon=""
+failed=0
 cleanup() {
+    local status=$?
     "$kr" close 1 > /dev/null 2>&1 || true
-    # The daemon is the process `kr new` reported starting; nothing else is ended.
+    # The daemon is the process `kr new` reported starting; nothing else is ended. A process that
+    # is still alive after ten seconds fails the check, and the directories it uses stay where they
+    # are, since removing them under a running daemon proves nothing.
     if [ -n "$daemon" ]; then
         kill "$daemon" 2> /dev/null || true
         for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$daemon" 2> /dev/null || break; sleep 1; done
+        if kill -0 "$daemon" 2> /dev/null; then
+            echo "check-host-start: the control daemon (process $daemon) is still running ten seconds after it was asked to stop; $work stays" >&2
+            exit 1
+        fi
     fi
     "$kr" shell remove > /dev/null 2>&1 || true
     chmod -R u+w "${work:?}" 2> /dev/null || true
     rm -rf "${work:?}"
+    # A step that ended the script under `set -e` keeps its own status.
+    if [ "$failed" -ne 0 ]; then exit 1; fi
+    exit "$status"
 }
 trap cleanup EXIT
 
 "$kr" host startup --set standalone
 "$kr" shell install
-created="$("$kr" new --invisible --headless 2>&1)"
+if ! created="$("$kr" new --invisible --headless 2>&1)"; then
+    printf '%s\n' "$created"
+    daemon="$(printf '%s\n' "$created" | sed -n 's/.*started the control daemon.*(process \([0-9][0-9]*\)).*/\1/p' | head -1)"
+    echo "check-host-start: kr new failed" >&2
+    failed=1
+    exit 1
+fi
 printf '%s\n' "$created"
 daemon="$(printf '%s\n' "$created" | sed -n 's/.*started the control daemon.*(process \([0-9][0-9]*\)).*/\1/p' | head -1)"
-listed="$("$kr" list)"
+if [ -z "$daemon" ]; then
+    echo "check-host-start: kr new did not say which process it started as the control daemon, so its stop cannot be shown" >&2
+    failed=1
+    exit 1
+fi
+if ! listed="$("$kr" list)"; then
+    echo "check-host-start: kr list failed" >&2
+    failed=1
+    exit 1
+fi
 printf '%s\n' "$listed"
 case "$listed" in
-    *"no sessions"* | "") echo "check-host-start: the host lists no session after it created one" >&2; exit 1 ;;
+    *"no sessions"* | "") echo "check-host-start: the host lists no session after it created one" >&2; failed=1; exit 1 ;;
 esac
 "$kr" close 1
 # A close is asked for and takes a moment: the daemon is stopped once no session is left.
+closed=no
 for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    case "$("$kr" list)" in *"no sessions"*) break ;; esac
+    if listed="$("$kr" list)" && case "$listed" in *"no sessions"*) true ;; *) false ;; esac; then
+        closed=yes
+        break
+    fi
     sleep 1
 done
+if [ "$closed" != yes ]; then
+    echo "check-host-start: the session was still listed twenty seconds after it was closed" >&2
+    failed=1
+    exit 1
+fi
 echo "check-host-start: the control daemon, a worker and a shell of $("$kr" --version) started, and the session closed"
