@@ -627,6 +627,43 @@ pub async fn subscribe(
     outcome.map(|_| ()).map_err(CliError::Refused)
 }
 
+/// One read of the terminal's input.
+///
+/// A terminal emulator hands this command bytes. A Windows console hands it the keys as the console
+/// reported them, and turning those into bytes loses what bytes cannot carry, so the two are not
+/// the same kind of input and are not made to look alike on the way in.
+#[derive(Clone, PartialEq, Eq)]
+pub enum TerminalInput {
+    /// What the terminal sent, byte for byte.
+    Bytes(Vec<u8>),
+    /// A run of key records, in the order the console reported them, for the session to spell as
+    /// its terminal asked for.
+    #[cfg_attr(
+        not(windows),
+        expect(
+            dead_code,
+            reason = "only a Windows console reports keys as records; the attachment handles them everywhere"
+        )
+    )]
+    Keys(Vec<kr_term::win32::KeyRecord>),
+}
+
+impl std::fmt::Debug for TerminalInput {
+    /// Which kind it is and how much it holds, never what: a read is what a person typed.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bytes(bytes) => formatter
+                .debug_struct("Bytes")
+                .field("len", &bytes.len())
+                .finish(),
+            Self::Keys(keys) => formatter
+                .debug_struct("Keys")
+                .field("count", &keys.len())
+                .finish(),
+        }
+    }
+}
+
 /// Reads the terminal in a blocking thread and hands batches to the caller.
 ///
 /// The thread ends when the terminal's input does, when a batch has nowhere to go, or when the
@@ -635,7 +672,10 @@ pub async fn subscribe(
 #[cfg(unix)]
 pub fn spawn_input_reader(
     terminal: std::fs::File,
-) -> (tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>, InputStop) {
+) -> (
+    tokio::sync::mpsc::UnboundedReceiver<TerminalInput>,
+    InputStop,
+) {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -693,7 +733,10 @@ pub fn spawn_input_reader(
             match terminal.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(read) => {
-                    if sender.send(buffer[..read].to_vec()).is_err() {
+                    if sender
+                        .send(TerminalInput::Bytes(buffer[..read].to_vec()))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -712,49 +755,58 @@ pub fn spawn_input_reader(
     )
 }
 
-/// Reads the terminal in a blocking thread and hands batches to the caller.
+/// Reads the console in a blocking thread and hands the keys to the caller as the records the
+/// console reported them in.
 ///
-/// The thread ends when the terminal's input does, when a batch has nowhere to go, or when the
-/// returned [`InputStop`] is used to cancel its read.
+/// Section 8 puts a Windows console on a different footing from a terminal emulator: what it
+/// reports is a record with a virtual key, a scan code, one UTF-16 code unit, whether the key went
+/// down or came up, the modifier state and a repeat count, and the session spells it as its
+/// terminal asked for. A record that is not a key is not read as input.
+///
+/// The thread ends when the console's input does, when a batch has nowhere to go, or when the
+/// returned [`InputStop`] is used. It waits for the console and for the stop together, so the stop
+/// does not depend on a read being cancelled.
 #[cfg(not(unix))]
 pub fn spawn_input_reader(
-    terminal: std::fs::File,
-) -> (tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>, InputStop) {
+    console: std::fs::File,
+) -> (
+    tokio::sync::mpsc::UnboundedReceiver<TerminalInput>,
+    InputStop,
+) {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::windows::records::{ReadEvent, RecordReader, StopEvent};
 
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-    let stopping = Arc::new(AtomicBool::new(false));
-    let stopping_here = Arc::clone(&stopping);
+    let stop = StopEvent::new().map(Arc::new);
+    let waker = stop.clone();
     let thread = std::thread::spawn(move || {
-        let mut terminal = terminal;
-        let mut buffer = vec![0_u8; 8 * 1024];
+        let mut reader = RecordReader::over(console);
         loop {
-            // Looked at before every read: a stop that came between two reads cancelled nothing,
-            // and this is what ends the thread then.
-            if stopping_here.load(Ordering::SeqCst) {
-                break;
+            match reader.wait(waker.as_deref()) {
+                Ok(true) => {}
+                Ok(false) | Err(_) => break,
             }
-            match terminal.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(read) => {
-                    if sender.send(buffer[..read].to_vec()).is_err() {
-                        break;
-                    }
+            let Ok(events) = reader.read_events() else {
+                break;
+            };
+            for event in events {
+                if let ReadEvent::Keys(keys) = event
+                    && sender.send(TerminalInput::Keys(keys)).is_err()
+                {
+                    return;
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => break,
             }
         }
     });
-    (receiver, InputStop { stopping, thread })
+    (receiver, InputStop { stop, thread })
 }
 
 /// The thread that reads `terminal` until its input ends or `sender` has no receiver.
 #[cfg(unix)]
 fn spawn_blocking_reader(
     terminal: std::fs::File,
-    sender: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    sender: tokio::sync::mpsc::UnboundedSender<TerminalInput>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut terminal = terminal;
@@ -763,7 +815,10 @@ fn spawn_blocking_reader(
             match terminal.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(read) => {
-                    if sender.send(buffer[..read].to_vec()).is_err() {
+                    if sender
+                        .send(TerminalInput::Bytes(buffer[..read].to_vec()))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -815,23 +870,25 @@ impl InputStop {
 /// What ends the thread [`spawn_input_reader`] started.
 #[cfg(not(unix))]
 pub struct InputStop {
-    /// Set to ask the thread to stop, which it looks at before every read.
-    stopping: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The event the thread also waits on, or nothing when the system would not make one and the
+    /// thread cannot be woken.
+    stop: Option<std::sync::Arc<crate::windows::records::StopEvent>>,
     /// The reading thread.
     thread: std::thread::JoinHandle<()>,
 }
 
 #[cfg(not(unix))]
 impl InputStop {
-    /// Asks the thread to stop and cancels the read it may be in, again and again until it has
-    /// ended or a second has gone: a cancel that came between two reads cancelled nothing, and the
-    /// thread looks at the request before its next one.
+    /// Wakes the thread, which has ended a moment later: it was waiting for the console and for
+    /// this together, and is not part way through a read it cannot leave. A thread that cannot be
+    /// woken is left to end with the next key.
     pub fn stop(self) {
-        self.stopping
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let Some(stop) = &self.stop else {
+            return;
+        };
+        stop.signal();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         while !self.thread.is_finished() && std::time::Instant::now() < deadline {
-            crate::platform::cancel_blocked_read(&self.thread);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }

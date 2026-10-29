@@ -28,9 +28,13 @@ use kr_client::shown::Shown;
 use std::os::windows::io::AsRawHandle as _;
 
 use kr_term::win32::{KeyRecord, PairHold};
+use windows_sys::Win32::Foundation::{HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
 use windows_sys::Win32::System::Console::{
-    ENABLE_MOUSE_INPUT, ENABLE_WINDOW_INPUT, GetNumberOfConsoleInputEvents, INPUT_RECORD,
-    KEY_EVENT, MOUSE_EVENT, ReadConsoleInputW, WINDOW_BUFFER_SIZE_EVENT,
+    ENABLE_WINDOW_INPUT, GetNumberOfConsoleInputEvents, INPUT_RECORD, KEY_EVENT, MOUSE_EVENT,
+    ReadConsoleInputW, WINDOW_BUFFER_SIZE_EVENT,
+};
+use windows_sys::Win32::System::Threading::{
+    CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects,
 };
 
 use crate::error::{CliError, Result};
@@ -40,6 +44,40 @@ use crate::error::{CliError, Result};
 /// A held key, a paste and an IME commit all arrive as runs of records, so a read that asked for
 /// one at a time would make a system call per keystroke of a paste.
 const BATCH: usize = 256;
+
+/// An event the thread that reads the console waits on beside the console, so that it can be woken
+/// to end.
+///
+/// A read of the console cannot be woken by anything else the thread waits on: it is the console
+/// that is waited for, and this is what is waited for with it.
+pub struct StopEvent(std::os::windows::io::OwnedHandle);
+
+impl StopEvent {
+    /// Makes an event that is not set, or nothing when the system will not make one.
+    #[must_use]
+    pub fn new() -> Option<Self> {
+        use std::os::windows::io::{FromRawHandle as _, RawHandle};
+
+        // SAFETY: no attributes and no name are passed, and the handle that comes back is checked
+        // before it is used.
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if event.is_null() {
+            return None;
+        }
+        // SAFETY: the handle is a new event this call made and nothing else owns.
+        Some(Self(unsafe {
+            std::os::windows::io::OwnedHandle::from_raw_handle(event as RawHandle)
+        }))
+    }
+
+    /// Sets the event, which ends the wait of a thread that is waiting on it.
+    pub fn signal(&self) {
+        use std::os::windows::io::AsRawHandle as _;
+
+        // SAFETY: the handle is this event's own and open for the call.
+        let _ = unsafe { SetEvent(self.0.as_raw_handle() as HANDLE) };
+    }
+}
 
 /// The console input this attachment reads.
 pub struct RecordReader {
@@ -58,6 +96,40 @@ impl RecordReader {
         Self {
             handle,
             pairs: PairHold::new(),
+        }
+    }
+
+    /// Waits until the console has input, or until `stop` is set, and says whether it is input.
+    ///
+    /// With no event to wait for it does not wait at all and says there is input, so the read that
+    /// follows is the wait.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the system will not wait.
+    pub fn wait(&self, stop: Option<&StopEvent>) -> Result<bool> {
+        use std::os::windows::io::AsRawHandle as _;
+
+        let Some(stop) = stop else {
+            return Ok(true);
+        };
+        let handles: [HANDLE; 2] = [
+            self.handle.as_raw_handle() as HANDLE,
+            stop.0.as_raw_handle() as HANDLE,
+        ];
+        // SAFETY: both handles are open for the call, the first this reader's own and the second
+        // the event's, and the array holds exactly the two the count names.
+        let woken = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) };
+        if woken == WAIT_OBJECT_0 {
+            Ok(true)
+        } else if woken == WAIT_OBJECT_0 + 1 {
+            Ok(false)
+        } else {
+            debug_assert!(woken == WAIT_FAILED || woken > WAIT_OBJECT_0 + 1);
+            Err(CliError::Terminal(shown!(
+                "wait for the console's input: {}",
+                Shown::io(&std::io::Error::last_os_error())
+            )))
         }
     }
 
@@ -258,22 +330,25 @@ pub enum ConsoleEvent {
 /// The console input mode a record reader needs.
 ///
 /// `ENABLE_VIRTUAL_TERMINAL_INPUT` is deliberately absent: it is the console translating records
-/// into VT sequences, which is the translation this path exists to avoid. `ENABLE_WINDOW_INPUT`
-/// is present so that a resize arrives as a record rather than being dropped; it is counted as
-/// "other" and handled as the separate operation it is.
+/// into VT sequences, which is the translation this path exists to avoid. Line input, echo and
+/// the console's own handling of Ctrl-C are absent as well: every key, the interrupt among them,
+/// is a record to hand on to the session. Mouse and window-size records are not asked for, since
+/// nothing here dispatches them: the console keeps the mouse for selecting text, as it does for any
+/// command that does not ask for it.
 #[must_use]
 pub const fn record_input_mode(saved: u32) -> u32 {
     use windows_sys::Win32::System::Console::{
-        ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT,
+        ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_MOUSE_INPUT, ENABLE_PROCESSED_INPUT,
+        ENABLE_VIRTUAL_TERMINAL_INPUT,
     };
 
-    (saved
+    saved
         & !(ENABLE_LINE_INPUT
             | ENABLE_ECHO_INPUT
             | ENABLE_PROCESSED_INPUT
-            | ENABLE_VIRTUAL_TERMINAL_INPUT))
-        | ENABLE_WINDOW_INPUT
-        | ENABLE_MOUSE_INPUT
+            | ENABLE_VIRTUAL_TERMINAL_INPUT
+            | ENABLE_MOUSE_INPUT
+            | ENABLE_WINDOW_INPUT)
 }
 
 #[cfg(test)]
@@ -300,11 +375,6 @@ mod tests {
             mode & ENABLE_PROCESSED_INPUT,
             0,
             "the interrupt key is input to forward rather than an event for this process"
-        );
-        assert_ne!(
-            mode & ENABLE_WINDOW_INPUT,
-            0,
-            "a resize arrives as a record"
         );
     }
 }
