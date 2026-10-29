@@ -75,7 +75,7 @@ export JAVA_HOME="$java_home"
 kr_store_require_file "$keystore" "the upload keystore" || exit 2
 kr_store_require_file "$password_file" "the upload keystore's password file" || exit 2
 [ -f "$certificate" ] || { kr_store_say "no upload certificate at $certificate"; exit 2; }
-kr_store_refuse_secret_in "$password_file" "$KR_STORE_ROOT" ${device_dir:+"$device_dir"} || exit 2
+kr_store_refuse_secret_in "$password_file" "$KR_STORE_ROOT" ${device_dir:+"$device_dir"} ${number_given:+"$number_given"} || exit 2
 
 # ---- The emulator leg --------------------------------------------------------------------------
 

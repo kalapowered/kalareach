@@ -85,7 +85,7 @@ if [ "$archive_only" = 0 ]; then
     issuer="$(kr_store_json_field "$api_record" issuer_id)" || { kr_store_say "$api_record has no issuer_id"; exit 2; }
     key_file="$(kr_store_json_field "$api_record" key_file)" || { kr_store_say "$api_record has no key_file"; exit 2; }
     kr_store_require_file "$key_file" "the API key" || exit 2
-    kr_store_refuse_secret_in "$key_file" "$KR_STORE_ROOT" || exit 2
+    kr_store_refuse_secret_in "$key_file" "$KR_STORE_ROOT" ${number_given:+"$number_given"} || exit 2
 fi
 
 version="$(kr_store_version "$here")" || exit 2

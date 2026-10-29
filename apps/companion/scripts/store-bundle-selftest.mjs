@@ -394,7 +394,21 @@ held('a secret written into a JSON file is found whatever the escaping, and othe
     placesIn('hex-mixed', { 'a.txt': '6A6b6C6d6E6f7071' }, jumble),
     placesIn('hex-spaced', { 'a.txt': '6A 6b 6C 6d\n6E 6f 70 71' }, jumble)
   ])
-  held('a secret of fewer than eight characters apart from white space is refused', 'throws', (() => { try { secretNeedles(Buffer.from('a b c d e\n')); return 'returns' } catch { return 'throws' } })())
+  held(
+    'a secret joined across lines by a line continuation is found, and a log that holds one is not shown',
+    [1, false],
+    [
+      placesIn('continued', { 'a.properties': 'storePassword=correct-horse-\\\n    battery-staple' }, scalar),
+      redacted('storePassword=correct-horse-\\\n    battery-staple\n', scalar).includes('battery-staple')
+    ]
+  )
+  held('a secret of fewer than eight bytes apart from white space is refused', 'throws', (() => { try { secretNeedles(Buffer.from('a b c d e\n')); return 'returns' } catch { return 'throws' } })())
+}
+
+{
+  // The lines left of a log, with the words put in place of the others, are not the secret either.
+  const joined = secretNeedles(Buffer.from('a line is withheld: it quotes a signed tokenhello\n'))
+  held('the lines left of a redacted log do not make up the secret', 0, placesWithSecret([Buffer.from(redacted('eyJabcdefgh\nhello\n', joined))], joined))
 }
 
 {
@@ -452,6 +466,16 @@ held('a secret in the name of a file, of an archive member or of the directory i
   held('a directory scan that finds the secret in a file says how many places and prints nothing of it', [1, false, true], [found.status, leaks(found), /in 1 place under/.test(found.stderr)])
   const unknown = cli([`--bogus-${HORSE}`, '--secret-file', horseFile])
   held('an option that is the secret is refused without printing it', [2, false], [unknown.status, leaks(unknown)])
+  // A secret the command has read and cannot search for (it is too short) could be quoted by anything:
+  // it prints no detail at all.
+  const shortFile = join(work, 'short-secret'); writeFileSync(shortFile, 'a b c d e\n')
+  const shortOption = cli(['--bogus-a b c d e', '--secret-file', shortFile])
+  const shortScan = cli(['--scan-dir', join(work, 'missing-a b c d e'), '--secret-file', shortFile])
+  held(
+    'a secret too short to search for is read, and no option or path is printed that could quote it',
+    [2, false, 2, false],
+    [shortOption.status, `${shortOption.stdout}${shortOption.stderr}`.includes('a b c d e'), shortScan.status, `${shortScan.stdout}${shortScan.stderr}`.includes('a b c d e')]
+  )
   const escaped = cli(['--bogus={"password":"\\u0063orrect-horse-battery-staple"}', '--secret-file', horseFile])
   held('an option that holds the secret JSON-escaped is refused without printing it', [2, false], [escaped.status, `${escaped.stdout}${escaped.stderr}`.includes('orrect-horse-battery-staple')])
   const field = cli(['--ios', import.meta.filename, '--stage', 'export', '--version-code', '1', '--version-name', '0.1.0', '--note', 'holds=true', '--secret-file', horseFile])
