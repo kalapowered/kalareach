@@ -444,12 +444,35 @@ fn kr_req_11_13_a_program_two_packages_recognise_equally_well_is_adopted_bound_t
         "and it is found once"
     );
 
-    // One of the packages is no longer admitted: the one left is selected for the instance.
+    // One of the packages is no longer admitted: the one left is selected for the instance, and
+    // the views are told what the instance is now, with no word of a tie that no longer stands.
     setup.admit_only(2, &[1]);
     assert_eq!(
         setup.bound_to(instance),
         Some(setup.packages[1].package_digest)
     );
+    let told = setup.adoptions.sweep();
+    assert_eq!(
+        told.len(),
+        1,
+        "the instance is announced as bound: {told:?}"
+    );
+    assert_eq!(told[0].application_instance_id, instance);
+    assert_eq!(
+        told[0]
+            .plugin_id
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("kalareach/claude-one"),
+        "it names the package it is bound to"
+    );
+    assert_eq!(
+        told[0].refusal.as_ref().map(String::as_str),
+        Some(ADOPTED_REFUSAL),
+        "and says what any adopted program's bridges say"
+    );
+    assert!(setup.adoptions.sweep().is_empty(), "and once");
     started.end();
 }
 
