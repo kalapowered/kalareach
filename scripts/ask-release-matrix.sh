@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Asks the signed release matrix whether it lists this release, with the program a job built earlier.
 #
-#   scripts/ask-release-matrix.sh <directory that holds kr-release-matrix-check and its .sha256> [<its SHA-256>]
+#   scripts/ask-release-matrix.sh <directory that holds kr-release-matrix-check and its .sha256> <its SHA-256>
 #   scripts/ask-release-matrix.sh self-test
 #
 # The program is held to the sum beside it, and to the SHA-256 the job that built it stated as an
-# output when one is given (the sum beside it is in the same artefact, so it shows damage and not a
+# output, which is required (the sum beside it is in the same artefact, so it shows damage and not a
 # replacement), and run against the managed service, in the way the other
 # publication jobs run the one they build: a refusal (exit 1) is final, and a service that did not
 # answer (exit 2) is asked again twice, a minute apart. KR_MATRIX_RETRY_SECONDS shortens the minute
@@ -35,7 +35,8 @@ ask() { # <directory> [<SHA-256 of the program>]
 }
 
 self_test() {
-    local work status=0
+    local work status=0 me
+    me="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
     work="$(mktemp -d "${TMPDIR:-/tmp}/kr-ask-matrix.XXXXXX")"
     trap 'rm -rf "${work:?}"' RETURN
     export KR_MATRIX_RETRY_SECONDS=0
@@ -56,7 +57,12 @@ PROGRAM
     }
     check() { # <name> <expected exit> <expected runs> [<SHA-256 the program is expected to have>]
         local got runs
-        ask "$work/program" "${4:-}" > /dev/null 2>&1; got=$?
+        # By the command line, as the workflow runs it; without a digest, the first argument alone.
+        if [ -n "${4:-}" ]; then
+            bash "$me" "$work/program" "$4" > /dev/null 2>&1; got=$?
+        else
+            ask "$work/program" > /dev/null 2>&1; got=$?
+        fi
         runs="$(cat "$work/runs")"
         if [ "$got" = "$2" ] && [ "$runs" = "$3" ]; then
             echo "self-test ok: $1"
@@ -81,11 +87,13 @@ PROGRAM
     stand_in 0
     check "a program whose sum is right and whose SHA-256 is not the one stated is refused and not run" 1 0 "$(printf x | sha256sum | cut -d' ' -f1)"
     check "a program whose SHA-256 is the one stated is run" 0 1 "$(sha256sum "$work/program/kr-release-matrix-check" | cut -d' ' -f1)"
+    stand_in 0
+    bash "$me" "$work/program" > /dev/null 2>&1 && { echo "self-test FAILED: the program was run with no digest stated"; status=1; } || echo "self-test ok: no digest stated is a refusal from the command line"
     [ "$status" -eq 0 ] && echo "ask-release-matrix: the self-test passed"
     return "$status"
 }
 
 case "${1:-}" in
     self-test) self_test ;;
-    *) ask "${1:?name the directory that holds the program}" "${2:-}" ;;
+    *) ask "${1:?name the directory that holds the program}" "${2:?name the SHA-256 the job that built the program stated}" ;;
 esac
