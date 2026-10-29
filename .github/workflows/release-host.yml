@@ -9,18 +9,20 @@ name: release-host
 #
 #   gh workflow run release-host.yml --ref main -f commit=<sha> -f build_run=<run id> -f staged_sums_sha256=<hex>
 #
-# `source` holds the inputs to what they name before any approval: the commit is on `main`, the run
-# is a successful `release-tree.yml` run on that commit, each tree is the artefact whose digest
-# GitHub states, and the staged files are the ones whose sums hash to the third input. It prints
-# every digest in the run's summary, so the person who approves can compare them with what the
-# signing script printed.
+# `source` holds the inputs to what they name before any approval: the commit is on `main` (by the
+# copy of the check that `main` holds, so that no script of the commit runs before it has passed), the
+# run is a successful `release-tree.yml` run on that commit, each tree is the artefact whose digest
+# GitHub states, the staged files are the ones whose sums hash to the third input, and each staged
+# macOS tree is the run's tree with its programs signed and nothing else changed. It prints every
+# digest in the run's summary, so the person who approves can compare them with what the signing
+# script printed.
 #
 # `matrix` asks whether the signed release matrix the managed service publishes lists a tier for the
 # package version the commit carries, as every other job that publishes a release does. It holds no
 # key and no write access, and `channel` waits for it, so a release the matrix does not serve is
 # refused before anyone is asked to approve a use of the release keys. `publish` asks again, with the
-# program `matrix` built, as its own first step and before it writes anything, because the approval
-# in between can come days after the first answer, and a re-run of `publish` has to ask afresh.
+# program `matrix` built, before it writes anything, because the approval in between can come days
+# after the first answer, and a re-run of `publish` has to ask afresh.
 #
 # `channel` is the only job that holds a key. It is behind the `update-signing` environment, which
 # puts a person in front of every use of the update channel's two release keys, it has no write
@@ -87,7 +89,6 @@ jobs:
       release: ${{ steps.run.outputs.release }}
       commit: ${{ steps.run.outputs.commit }}
     env:
-      GH_TOKEN: ${{ github.token }}
       COMMIT: ${{ inputs.commit }}
       BUILD_RUN: ${{ inputs.build_run }}
       STAGED_SUMS: ${{ inputs.staged_sums_sha256 }}
@@ -105,12 +106,19 @@ jobs:
           printf '%s' "$BUILD_RUN" | grep -Eq '^[0-9]+$' || { echo "::error::the build run is a number"; exit 1; }
           printf '%s' "$STAGED_SUMS" | grep -Eq '^[0-9a-f]{64}$' || { echo "::error::the staged sums digest is 64 hexadecimal digits"; exit 1; }
           [ "$(git rev-parse HEAD)" = "$COMMIT" ] || { echo "::error::the checkout is not $COMMIT"; exit 1; }
-          bash scripts/check-commit-on-main.sh self-test
-          bash scripts/check-commit-on-main.sh "$COMMIT"
+          # The commit is held to main by main's own copy of the check, taken from the branch just
+          # fetched: no script of the commit being checked runs before this has passed, and none of
+          # them is given the token.
+          git fetch --quiet origin '+refs/heads/main:refs/remotes/origin/main' || { echo "::error::main could not be fetched"; exit 1; }
+          git show refs/remotes/origin/main:scripts/check-commit-on-main.sh > "$RUNNER_TEMP/check-commit-on-main.sh" || { echo "::error::main holds no scripts/check-commit-on-main.sh"; exit 1; }
+          bash "$RUNNER_TEMP/check-commit-on-main.sh" self-test
+          bash "$RUNNER_TEMP/check-commit-on-main.sh" "$COMMIT"
           [ -s "$CHANNEL_ROOT" ] || { echo "::error::$CHANNEL_ROOT is not in this commit: the update channel's root is committed before a release is sealed"; exit 1; }
 
       - name: Hold the build run
         id: run
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           facts="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN" --jq '"\(.path) \(.conclusion) \(.head_sha) \(.head_branch)"')"
           if [ "$facts" != ".github/workflows/release-tree.yml success $COMMIT main" ]; then
@@ -129,6 +137,7 @@ jobs:
 
       - name: Hold the staged files
         env:
+          GH_TOKEN: ${{ github.token }}
           RELEASE: ${{ steps.run.outputs.release }}
         run: |
           # Only a 404 is "nothing there"; any other answer from GitHub stops the run.
@@ -171,6 +180,7 @@ jobs:
       # that names this commit, this release and this target.
       - name: Take the trees, and hold each to its digest and its manifest
         env:
+          GH_TOKEN: ${{ github.token }}
           RELEASE: ${{ steps.run.outputs.release }}
         run: |
           python3 -I scripts/check-staged-tree.py self-test
@@ -192,8 +202,9 @@ jobs:
                 # the same members at the same modes, the same release.json, every file that is not
                 # Mach-O as the run's manifest describes it, and every Mach-O file the run's outside
                 # its code signature. Sealing writes the manifest again over whatever is here.
-                cp "$RUNNER_TEMP/staged-files/signed-$top.tar" "$out/$top.tar"
-                python3 -I scripts/check-staged-tree.py compare "$RUNNER_TEMP/$target-unzipped/$top.tar" "$out/$top.tar" || { echo "::error::the staged tree of $target is not the tree the run built with its programs signed"; exit 1; }
+                # The tar the next job unpacks is the one the check writes from what it read, in the
+                # standard form, and not the staged one.
+                python3 -I scripts/check-staged-tree.py compare "$RUNNER_TEMP/$target-unzipped/$top.tar" "$RUNNER_TEMP/staged-files/signed-$top.tar" "$out/$top.tar" || { echo "::error::the staged tree of $target is not the tree the run built with its programs signed"; exit 1; }
                 ;;
               *)
                 cp "$RUNNER_TEMP/$target-unzipped/$top.tar" "$out/$top.tar"
@@ -247,6 +258,8 @@ jobs:
     name: the published release matrix lists this release
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    outputs:
+      program_sha256: ${{ steps.program.outputs.sha256 }}
     steps:
       - name: Hold the commit to a full hash
         env:
@@ -283,10 +296,13 @@ jobs:
           exit 2
 
       - name: Keep the program for the check made again before the release is written
+        id: program
         run: |
           mkdir -p "$RUNNER_TEMP/matrix-check"
           cp target/release/kr-release-matrix-check "$RUNNER_TEMP/matrix-check/"
           (cd "$RUNNER_TEMP/matrix-check" && sha256sum kr-release-matrix-check | tee kr-release-matrix-check.sha256)
+          # The sum beside the program is in the artefact with it; this one is the job's own output.
+          echo "sha256=$(cut -d' ' -f1 "$RUNNER_TEMP/matrix-check/kr-release-matrix-check.sha256")" >> "$GITHUB_OUTPUT"
 
       # The trees last three days, and the program is used after the last of the approval, the sealing
       # and the checks, so it outlasts them by two more.
@@ -595,9 +611,11 @@ jobs:
       # is the one `matrix` built, held to its sum by the script, which also asks again when the
       # service does not answer; nothing is built where a release is written, and the step has no token.
       - name: The published release matrix still lists this release
+        env:
+          PROGRAM_SHA256: ${{ needs.matrix.outputs.program_sha256 }}
         run: |
           bash scripts/ask-release-matrix.sh self-test
-          bash scripts/ask-release-matrix.sh "$RUNNER_TEMP/matrix-check"
+          bash scripts/ask-release-matrix.sh "$RUNNER_TEMP/matrix-check" "$PROGRAM_SHA256"
 
       - name: Publish the release
         env:
