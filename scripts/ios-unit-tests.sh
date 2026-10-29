@@ -13,9 +13,11 @@
 #                      `-only-testing:KalaReachNativeTests/<Class>/<method>`. The simulator is this
 #                      script's choice, so a `-destination` among them is refused.
 #
-# The exit status is xcodebuild's. It needs Xcode with an iOS Simulator runtime, and a network to
-# fetch the Swift packages the project pins. Those are fetched at the versions the project's
-# `Package.resolved` records and never resolved again, so the run leaves the file as it found it.
+# The exit status is xcodebuild's. It needs Xcode with an iOS Simulator runtime, Rust with the
+# `aarch64-apple-ios-sim` target (a build phase of the scheme compiles the notification preview
+# library for it), and a network to fetch the Swift packages the project pins. Those are fetched at
+# the versions the project's `Package.resolved` records and never resolved again, so the run leaves
+# the file as it found it.
 #
 # The tests are built with the newest Xcode that is installed under a versioned name
 # (`/Applications/Xcode_<version>.app`, as a hosted runner has them) or is the one selected, by its
@@ -42,7 +44,7 @@ while [ $# -gt 0 ]; do
             break
             ;;
         -h|--help)
-            sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
             exit 2
             ;;
         *)

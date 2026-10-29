@@ -231,6 +231,7 @@ jobs:
       # target. The runner's toolchain has its own architecture only, and without this target
       # that phase fails and no test of the scheme runs.
       - name: Install the iOS simulator target
+        if: ${{ inputs.groups == '' || contains(inputs.groups, 'phones') }}
         timeout-minutes: 5
         run: rustup target add aarch64-apple-ios-sim
 
