@@ -322,14 +322,19 @@ is forwarded like every other byte, so a key that reaches the command that way s
 the person presses it again.
 
 A Windows console reports keys, not bytes, so there the command reads the console with
-`ReadConsoleInputW` and asks it for none of its own translation into terminal sequences. Each read
-goes to the session as one `console_keys` write: for every key, the virtual key, the scan code, the
-UTF-16 code unit, whether the key went down or came up, the modifier state and the repeat count, as
-the console reported them. The command spells nothing and invents no scan code. The worker spells
-the records for the session's terminal, in the win32 input mode format when that terminal asked for
-it and as legacy terminal input otherwise (see the host reference). The scroll-back keys above work
-the same way, from the records of Shift and Page Up or Page Down. The command does not ask the
-console for mouse records, so the console keeps the mouse for selecting text.
+`ReadConsoleInputW` and asks it for none of its own translation into terminal sequences. The key
+records of a read go to the session as a `console_keys` write: for every key, the virtual key, the
+scan code, the UTF-16 code unit, whether the key went down or came up, the modifier state and the
+repeat count, as the console reported them. A record that is not a key ends the run, and the first
+half of a character outside the basic plane waits for its second half. The command spells nothing
+and invents no scan code. The worker spells the records for the session's terminal, in the win32
+input mode format when that terminal asked for it and as legacy terminal input otherwise (see the
+host reference); while the application has negotiated an encoding that records cannot express, the
+worker refuses the write, and the attachment ends and says why. The scroll-back keys above are taken
+from the records of Shift and Page Up or Page Down, key by key: the key going down and the same key
+coming up are the window's, and every other record, a release among them, is the session's. The
+command does not ask the console for mouse or window-size records, so the console keeps the mouse
+for selecting text.
 
 Bracketed paste is the one piece of context the command keeps, and it keeps it by watching the
 bytes as they go past rather than by holding any of them: a start delimiter opens a paste and an
