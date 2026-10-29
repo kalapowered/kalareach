@@ -43,7 +43,7 @@ kr_store_number() {
     local platform=$1 given=${2:-} number receipt last=0
     if [ -n "$given" ]; then
         case "$given" in
-            '' | *[!0-9]* | 0*) kr_store_say "the build number must be a whole number without a leading zero, not '$given'" >&2; return 2 ;;
+            '' | *[!0-9]* | 0*) kr_store_say "the build number must be a whole number without a leading zero" >&2; return 2 ;;
         esac
         number=$given
     else
@@ -139,11 +139,12 @@ kr_store_refuse_secret_in() {
 }
 
 # kr_store_show_tail <log> <secret file>: the last lines of a log, indented, for a person to read
-# when a step has failed. They come through the checker, which leaves out the whole of them when they
-# hold the secret in any form (split across lines too) and any line that holds a signed token or a
-# part of one; when it cannot read the secret it prints nothing.
+# when a step has failed. The whole log goes through the checker first, so that a secret split across
+# the first line of the tail is found: it leaves out all of the log when it holds the secret in any
+# form (split across lines too) and each line that holds a signed token or a part of one; when it
+# cannot read the secret it prints nothing.
 kr_store_show_tail() {
-    tail -n 20 "$1" | node "$kr_store_checker" --redact --secret-file "$2" | sed 's/^/    /'
+    node "$kr_store_checker" --redact --secret-file "$2" <"$1" | tail -n 20 | sed 's/^/    /'
 }
 
 # kr_store_remove_token_logs <output directory>: Xcode keeps request tokens made from the API key in

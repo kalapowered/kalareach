@@ -44,6 +44,7 @@ import {
   problemsInVersions,
   profileFromXml,
   recordOf,
+  redacted,
   secretNeedles,
   signerOf
 } from './store-bundle.mjs'
@@ -350,12 +351,90 @@ held('a secret written into a JSON file is found whatever the escaping, and othe
   )
 }
 
+{
+  // JSON escapes are read wherever they sit: in a log line, in a file of lines, behind white space, in a
+  // string on its own, in a file of any size, whatever the writer escapes (a slash, a letter, a symbol,
+  // a pair of surrogates).
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+  const slashLines = [0, 1, 2].map((line) => Array.from({ length: 64 }, (_, index) => alphabet[(index * 5 + line * 13) % 64]).join(''))
+  const slashKey = pem(slashLines.join('\n'))
+  const slashNeedles = secretNeedles(slashKey)
+  const apple = JSON.stringify(slashKey.toString()).replaceAll('/', '\\/')
+  const scalar = secretNeedles(Buffer.from('correct-horse-battery-staple\n'))
+  const umlaut = secretNeedles(Buffer.from('päss=word&more-9f3k\n'))
+  const smile = secretNeedles(Buffer.from('smile😀-secret-9f\n'))
+  held(
+    'a secret in a JSON string is found whatever escapes it and wherever the string sits',
+    [1, 1, 1, 1, 1, 1, 1, 1, 1],
+    [
+      placesIn('esc-slash-line', { 'run.log': `request body={"key":${apple}}` }, slashNeedles),
+      placesIn('esc-ndjson', { 'run.ndjson': `{"a":1}\n{"key":${apple}}\n` }, slashNeedles),
+      placesIn('esc-python', { 'run.log': 'user=p\\u00e4ss=word&more-9f3k' }, umlaut),
+      placesIn('esc-gson', { 'run.log': 'user=päss\\u003dword\\u0026more-9f3k' }, umlaut),
+      placesIn('esc-letter', { 'a.json': '{"password":"\\u0063orrect-horse-battery-staple"}' }, scalar),
+      placesIn('esc-spaces', { 'a.json': `${' '.repeat(100)}{"password":"\\u0063orrect-horse-battery-staple"}` }, scalar),
+      placesIn('esc-string', { 'a.json': '"\\u0063orrect-horse-battery-staple"' }, scalar),
+      placesIn('esc-large', { 'a.json': `{"filler":"${'x'.repeat(17 * 1024 * 1024)}","password":"\\u0063orrect-horse-battery-staple"}` }, scalar),
+      placesIn('esc-pair', { 'run.log': 'x smile\\ud83d\\ude00-secret-9f y' }, smile)
+    ]
+  )
+  held(
+    'a secret that is escaped and then encoded, or that follows a data backslash, is found',
+    [1, 1, 1],
+    [
+      placesIn('esc-base64', { 'a.txt': Buffer.from(JSON.stringify({ p: QUOTED })).toString('base64') }, quoted),
+      placesIn('esc-data-backslash', { 'a.txt': '\\top-secret-\npassword' }, secretNeedles(Buffer.from('top-secret-password\n'))),
+      placesIn('esc-split-after-escape', { 'a.json': '{"path":"C:\\\\newpass-\\nword-7731"}' }, secretNeedles(Buffer.from('newpass-word-7731\n')))
+    ]
+  )
+  const jumble = secretNeedles(Buffer.from('jklmnopq\n'))
+  held('hex of either case, or of both, is found, also when it is spaced', [1, 1, 1, 1], [
+    placesIn('hex-lower', { 'a.txt': '6a6b6c6d6e6f7071' }, jumble),
+    placesIn('hex-upper', { 'a.txt': '6A6B6C6D6E6F7071' }, jumble),
+    placesIn('hex-mixed', { 'a.txt': '6A6b6C6d6E6f7071' }, jumble),
+    placesIn('hex-spaced', { 'a.txt': '6A 6b 6C 6d\n6E 6f 70 71' }, jumble)
+  ])
+  held('a secret of fewer than eight characters apart from white space is refused', 'throws', (() => { try { secretNeedles(Buffer.from('a b c d e\n')); return 'returns' } catch { return 'throws' } })())
+}
+
+{
+  // The words this check prints in place of a quotation are never the secret.
+  const words = secretNeedles(Buffer.from('secret file\n'))
+  const identity = { file: 'KalaReach.ipa', platform: 'ios', stage: 'export', versionName: '0.1.0', versionCode: 1, bytes: 1, sha256: 'ab' }
+  const made = recordOf({ identity, problems: [], facts: {}, notes: { leak: 'secret file' } }, words)
+  held(
+    'when the secret is what the placeholders say, none of them is printed or written',
+    [false, false, false, 1],
+    [made.text.includes('secret file'), withheldIfSecret('x secret file y', words).includes('secret file'), redacted('a secret file here\n', words).includes('secret file'), made.problems.length]
+  )
+}
+
+{
+  const identity = { file: 'KalaReach.ipa', platform: 'ios', stage: 'export', versionName: '0.1.0', versionCode: 1, bytes: 1, sha256: 'ab' }
+  const refuses = (parts) => { try { recordOf({ identity, problems: [], facts: {}, notes: {}, ...parts }, horse); return 'returns' } catch { return 'throws' } }
+  held(
+    'a note or a fact named like a field of the record is refused, as is a note named like a fact',
+    ['throws', 'throws', 'throws', 'throws', 'returns'],
+    [refuses({ notes: { file: 'safe.ipa' } }), refuses({ notes: { holds: 'true' } }), refuses({ facts: { problems: [] } }), refuses({ facts: { a: 1 }, notes: { a: 2 } }), refuses({ notes: { commit: 'abc' } })]
+  )
+}
+
 held('a secret in the name of a file, of an archive member or of the directory itself is found', [1, 1, 1], (() => {
   const archives = join(work, 'archives'); mkdirSync(archives)
   writeFileSync(join(archives, 'named.aab'), zip([{ name: `before-${HORSE}-after.txt`, bytes: Buffer.from('x') }]))
   const empty = join(work, `empty-${HORSE}`); mkdirSync(empty)
   return [placesIn('named-file', { [`before-${HORSE}-after.txt`]: 'x' }, horse), secretsUnder(archives, horse), secretsUnder(empty, horse)]
 })())
+
+{
+  const scanned = join(work, 'links'); mkdirSync(scanned)
+  writeFileSync(join(scanned, 'real.txt'), 'x')
+  symlinkSync('real.txt', join(scanned, 'link.txt'))
+  const attempt = () => { try { return secretsUnder(scanned, horse) } catch (failure) { return failure.message } }
+  held('a directory scan refuses a link, which it cannot read', 'link.txt is a link or a special file, which this scan cannot read', attempt())
+  const folders = join(work, 'folders'); mkdirSync(join(folders, `inner-${HORSE}`), { recursive: true })
+  held('a directory scan searches the name of a directory that holds no file', 1, secretsUnder(folders, horse))
+}
 
 {
   // The command, run as the build scripts run it: nothing it prints holds the secret, whatever the
@@ -373,6 +452,13 @@ held('a secret in the name of a file, of an archive member or of the directory i
   held('a directory scan that finds the secret in a file says how many places and prints nothing of it', [1, false, true], [found.status, leaks(found), /in 1 place under/.test(found.stderr)])
   const unknown = cli([`--bogus-${HORSE}`, '--secret-file', horseFile])
   held('an option that is the secret is refused without printing it', [2, false], [unknown.status, leaks(unknown)])
+  const escaped = cli(['--bogus={"password":"\\u0063orrect-horse-battery-staple"}', '--secret-file', horseFile])
+  held('an option that holds the secret JSON-escaped is refused without printing it', [2, false], [escaped.status, `${escaped.stdout}${escaped.stderr}`.includes('orrect-horse-battery-staple')])
+  const field = cli(['--ios', import.meta.filename, '--stage', 'export', '--version-code', '1', '--version-name', '0.1.0', '--note', 'holds=true', '--secret-file', horseFile])
+  held('a note named like a field of the record is refused', [2, true], [field.status, field.stderr.includes('--note cannot be named like a field of the record: holds')])
+  const linked = join(work, 'linked-dir'); mkdirSync(linked); symlinkSync(import.meta.filename, join(linked, `link-${HORSE}`))
+  const refused = cli(['--scan-dir', linked, '--secret-file', horseFile])
+  held('a directory scan that meets a link is refused without printing the link\'s name', [2, false], [refused.status, leaks(refused)])
   const absent = cli(['--ios', join(work, `absent-${HORSE}.ipa`), '--stage', 'export', '--version-code', '1', '--version-name', '0.1.0', '--secret-file', horseFile])
   held('a bundle path that holds the secret and does not exist is refused without printing it', [2, false], [absent.status, leaks(absent)])
   const unreadable = join(work, `unreadable-${HORSE}.aab`); writeFileSync(unreadable, 'not an archive')
@@ -390,6 +476,8 @@ held('a secret in the name of a file, of an archive member or of the directory i
     [0, true, true, false],
     [plain.status, plain.stdout.includes(ordinary[0]), plain.stdout.includes('done'), plain.stdout.includes('eyJ')]
   )
+  const escapedToken = redact([...ordinary, `{"auth":"${TOKEN.replaceAll('eyJ', '\\u0065yJ')}"}`])
+  held('a token whose start is JSON-escaped is not printed either', [0, true, false], [escapedToken.status, escapedToken.stdout.includes(ordinary[0]), escapedToken.stdout.includes('a'.repeat(12))])
   const holds = (answer) => squashed(answer.stdout).includes(squashed(bodyLines[0]))
   const keyLines = keyText.toString().trim().split('\n')
   const variants = [
@@ -571,6 +659,7 @@ heldProblems('a framework signed with another distribution certificate is refuse
     [found.code.map((each) => each.name), found.refused]
   )
   held('a bundle part that is read on its own is left out of the bundle that holds it', ['A.framework/Frameworks/B.framework/B', 'one-slice'], codeIn(tree, [join(tree, 'A.framework', 'A')]).code.map((each) => each.name))
+  held('a link is refused even when it is named as a part to be read on its own', true, codeIn(tree, [join(tree, 'link')]).refused.some((each) => each.startsWith('link is a symbolic link')))
 }
 
 held('an application that says it needs no export documentation passes, and one that is silent or says it does not', [0, 1, 1], [
@@ -839,13 +928,20 @@ held('a log bundle outside the temporary directory is kept, and the cleanup fail
     `"Authorization" = "Bearer ${TOKEN}";`,
     'Code=1 "provisioning failed"'
   ]
-  writeFileSync(log, [...keyText.toString().trim().split('\n'), ...Array.from({ length: 25 }, (_, index) => `line ${index}`), ...trail].join('\n'))
+  writeFileSync(log, [...Array.from({ length: 25 }, (_, index) => `line ${index}`), ...trail].join('\n'))
   const shown = shell(`kr_store_show_tail "${log}" "${key}"`)
   held(
     'the tail of a log is shown indented, without a token or a part of one',
     [0, true, true, false, false],
     [shown.status, shown.stdout.includes('    Export failed: no signing certificate was found'), shown.stdout.includes('    Code=1 "provisioning failed"'), shown.stdout.includes('eyJ'), shown.stdout.includes(bodyLines[0])]
   )
+  // A log that holds the key anywhere, above the lines that would be shown too, is shown not at all.
+  writeFileSync(log, [...keyText.toString().trim().split('\n'), ...Array.from({ length: 25 }, (_, index) => `line ${index}`), ...trail].join('\n'))
+  const kept = shell(`kr_store_show_tail "${log}" "${key}"`).stdout
+  held('a log that holds the key above its tail is not shown at all', [false, false], [kept.includes('Export failed'), kept.includes(bodyLines[0])])
+  const horseKey = join(work, 'show-horse'); writeFileSync(horseKey, 'correct-horse-battery-staple\n')
+  writeFileSync(log, ['first', 'a correct-horse-', 'battery-staple', ...Array.from({ length: 19 }, (_, index) => `line ${index}`)].join('\n'))
+  held('a secret split across the first line of the tail is not shown', false, shell(`kr_store_show_tail "${log}" "${horseKey}"`).stdout.includes('battery-staple'))
   writeFileSync(log, [...Array.from({ length: 5 }, (_, index) => `line ${index}`), ...bodyLines.join('').match(/.{1,20}/g)].join('\n'))
   held('a tail that holds the key rewrapped is not shown', false, shell(`kr_store_show_tail "${log}" "${key}"`).stdout.replace(/\s+/g, '').includes(bodyLines[0]))
   held('a tail is not shown when the secret cannot be read', '', shell(`kr_store_show_tail "${log}" "${join(work, 'no-such-key')}"`).stdout)
