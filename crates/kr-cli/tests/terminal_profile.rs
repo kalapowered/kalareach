@@ -617,7 +617,9 @@ fn a_profile_that_cannot_be_looked_at_is_neither_changed_nor_forgotten() {
 }
 
 /// KR-REQ-01.21: a profile whose folder was replaced by a file is not there, so a removal forgets it
-/// and leaves the file, where a profile that cannot be looked at keeps its record.
+/// and leaves the file, where a profile that cannot be looked at keeps its record, and `status`
+/// (what a dry run reports) says the same: the profile is missing and whether it is the default is
+/// known.
 #[test]
 fn a_profile_whose_folder_became_a_file_is_gone() {
     for application in applications() {
@@ -632,6 +634,27 @@ fn a_profile_whose_folder_became_a_file_is_gone() {
             .to_path_buf();
         std::fs::remove_dir_all(&folder).expect("the folder goes");
         std::fs::write(&folder, b"not a folder").expect("a file in its place");
+        let status = profile::status(
+            application.terminal,
+            &person.places(),
+            person
+                .record()
+                .profiles()
+                .expect("reads")
+                .into_iter()
+                .next(),
+        );
+        assert_eq!(
+            status.standing,
+            Some(profile::Standing::Missing),
+            "{:?}",
+            application.terminal
+        );
+        assert!(
+            status.default_known,
+            "{:?}: no profile is no unknown default",
+            application.terminal
+        );
         assert_eq!(
             person.remove(application.terminal).expect("answers"),
             Removed::AlreadyGone,

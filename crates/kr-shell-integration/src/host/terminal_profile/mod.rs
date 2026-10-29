@@ -1016,7 +1016,15 @@ fn is_default(
                 match std::fs::read_to_string(&file) {
                     Ok(text) => iterm2::guid_in(&text)
                         .map_or(Ok(false), |guid| iterm2::is_default(home, &guid)),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                    // No file, or a file where a folder on the way should be: no profile to be the default.
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                        ) =>
+                    {
+                        Ok(false)
+                    }
                     Err(error) => Err(ProfileError::io(&file, error)),
                 }
             }
