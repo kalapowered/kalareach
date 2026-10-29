@@ -634,8 +634,10 @@ A test result is what this host observed, and nothing a caller reports.
   A platform that keeps no such record has none, and a result there is indeterminate. The record
   shows that nothing in the copy was written while the suite ran. It does not show what the suite
   read, which can be anything on the machine. Nor does it show a write through a shared mapping that
-  the platform has not yet recorded when the result is recorded, a write by a process that outlives
-  the session, or a system clock set back by an account allowed to set it.
+  the platform has not yet recorded when the result is recorded (Linux records it at the write and
+  macOS when the mapping is released, so a mapping released before the session ends is shown), a
+  write by a process that outlives the session, or a system clock set back by an account allowed to
+  set it.
 * **Declared outputs.** A suite may declare paths it intends to write, other than its source, such
   as a build directory. These paths are not compared. Each one that is there is recorded in one
   reference, in path order, found through handles that follow no link and stay on the copy's mount.

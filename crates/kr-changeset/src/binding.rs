@@ -46,9 +46,10 @@
 //! It shows that nothing in the copy was written while the command ran, outside the declared
 //! outputs. It does not show what the command read: the copy holds the version, and a command can
 //! read anything else on the machine. It does not show a write through a shared mapping that the
-//! platform has not yet recorded when the result is recorded, a write by a process that outlives
-//! the session after the record is taken, a root account that sets the system clock back, or a
-//! filesystem that does not keep what it reports.
+//! platform has not yet recorded when the result is recorded (Linux records it at the write and
+//! macOS when the mapping is released, so a mapping released before the session ends is shown), a
+//! write by a process that outlives the session after the record is taken, a root account that
+//! sets the system clock back, or a filesystem that does not keep what it reports.
 
 use kr_protocol::ids::MaterialisationId;
 

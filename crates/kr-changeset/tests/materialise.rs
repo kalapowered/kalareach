@@ -1048,6 +1048,77 @@ fn a_run_that_changed_a_tested_path_and_restored_it_attests_nothing() {
     }
 }
 
+/// The program for the mapping case: python maps the file it is given. Given a second argument it
+/// maps it shared and writable, changes the first byte and puts it back, so that the bytes are as
+/// they were, and ends without asking for the mapping to be flushed; otherwise it maps it read-only
+/// and reads the byte. (A writable mapping that is never written moves the change time on macOS
+/// when it is unmapped, so the control maps read-only.)
+const MAPPED_WRITE: &str = r#"import mmap, sys
+if len(sys.argv) > 2:
+    with open(sys.argv[1], "r+b") as handle:
+        view = mmap.mmap(handle.fileno(), 0)
+        first = view[0]
+        view[0] = first ^ 1
+        view[0] = first
+        view.close()
+else:
+    with open(sys.argv[1], "rb") as handle:
+        view = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)
+        view[0]
+        view.close()
+"#;
+
+/// The python3 interpreter the mapping case runs.
+fn python3() -> std::path::PathBuf {
+    [
+        "/usr/bin/python3",
+        "/usr/local/bin/python3",
+        "/opt/homebrew/bin/python3",
+    ]
+    .into_iter()
+    .map(std::path::PathBuf::from)
+    .find(|candidate| candidate.exists())
+    .expect("a python3 for the mapping case")
+}
+
+/// Runs the mapping program on `file`, which it writes through a shared mapping, and puts back,
+/// when `write` is set, and only reads through a read-only one otherwise.
+fn map_shared(file: &Path, write: bool) {
+    let mut command = std::process::Command::new(python3());
+    command.args(["-c", MAPPED_WRITE]).arg(file);
+    if write {
+        command.arg("write");
+    }
+    assert!(
+        command.status().expect("python3 runs").success(),
+        "the mapping program ends well"
+    );
+}
+
+/// KR-REQ-14.34: a run that wrote through a shared mapping and put the byte back leaves a copy that
+/// reads as the version, and its result attests nothing, because the platform moved the file's
+/// change time when it recorded the write. On macOS the change time is the only thing that moves
+/// (the write does not touch the instant the file was last modified); Linux moves both. A run that
+/// mapped the same file and only read it is attested. A mapping a process still holds when the
+/// result is recorded is not shown, which the automation document says.
+#[test]
+fn a_run_that_wrote_through_a_shared_mapping_and_put_the_byte_back_attests_nothing() {
+    let fixture = Fixture::create();
+
+    // The control: the same file mapped and read, writing nothing.
+    let read = a_run_in(&fixture, "mapped-only", &[], |directory| {
+        map_shared(&directory.join("README.md"), false);
+    });
+    assert_eq!(read.tested_source, TestedSource::UnmodifiedVersion);
+    assert!(read.tested_version.0.is_some());
+
+    let written = a_run_in(&fixture, "mapped-and-written", &[], |directory| {
+        map_shared(&directory.join("README.md"), true);
+    });
+    assert_eq!(written.tested_source, TestedSource::Indeterminate);
+    assert!(written.tested_version.0.is_none(), "it attests no version");
+}
+
 /// KR-REQ-14.34 and KR-REQ-25.20: a declared output is the one place a run may write. The
 /// directory an output is in cannot tell the output from a name written beside it, so it is
 /// watched by name: a file made beside the output and removed again is a write, at the root and
