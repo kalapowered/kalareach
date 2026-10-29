@@ -26,7 +26,7 @@ use kr_protocol::agent::{
 };
 use kr_protocol::authority::EffectClass;
 use kr_protocol::broker::{ActionName, ActionProvenance, ActionToken, BrokerGrant};
-use kr_protocol::gateway::{PendingState, RichOperation};
+use kr_protocol::gateway::{PendingResource, PendingState, RichOperation};
 use kr_protocol::ids::{
     ActorId, AgentBindingRevision, ApplicationInstanceId, BrokerBindingId, CapabilityId, GrantId,
     SessionId, StreamCursor,
@@ -1803,6 +1803,32 @@ impl Broker {
         }
         if let Some(token) = permit.token.as_ref() {
             self.state().tokens.retire(&token.token_id);
+        }
+    }
+
+    /// Checks that a caller's history reaches the pending resource it would answer, where
+    /// `reached` says whether it does for the resource as it stands now.
+    ///
+    /// A resource the caller's history does not reach is refused with the text of a resource this
+    /// broker does not hold, so an answer does not say that a request exists outside the caller's
+    /// scope. Nothing is claimed and no marker is written.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnknownSubject`] for a resource this broker does not hold and for
+    /// one `reached` refuses, and what the ledger's read fails with.
+    pub fn check_reached(
+        &self,
+        resource_id: kr_protocol::ids::PendingResourceId,
+        reached: impl FnOnce(&PendingResource) -> bool,
+    ) -> Result<()> {
+        let resource = self.state().resource(resource_id)?;
+        if reached(&resource) {
+            Ok(())
+        } else {
+            Err(BrokerError::unknown(format!(
+                "no pending resource {resource_id}"
+            )))
         }
     }
 

@@ -6838,6 +6838,23 @@ impl WorkerService {
         }
     }
 
+    /// Refuses an answer to a pending request that this caller's history does not reach.
+    ///
+    /// Only the local owner reaches everything. A caller acting under a grant reaches what the
+    /// history scope that came with its frame reaches, and a caller that arrives with none reaches
+    /// nothing. The refusal is the text of a request this host does not hold. Checked before the
+    /// dispatch marker, so a refusal leaves nothing behind.
+    fn check_decision_reached(
+        &self,
+        caller: &Caller,
+        resource_id: kr_protocol::ids::PendingResourceId,
+    ) -> Result<()> {
+        let reach = caller.disclosure(true);
+        Ok(self
+            .broker
+            .check_reached(resource_id, |resource| reach.reaches_resource(resource))?)
+    }
+
     /// Checks a mutation's target, authority and preconditions without acting on it.
     fn validate(
         &self,
@@ -7053,14 +7070,24 @@ impl WorkerService {
                 let params: kr_protocol::agent::AgentCancelParams = parse(&mutation.params)?;
                 Self::check_session(session, params.target.subject.session_id)
             }
+            // An answer decides something the answerer has to be able to read, so what is decided
+            // here is reach, as it is for a question: an approval this caller's history does not
+            // reach, and that its grant does not name while it can still be decided, is refused as
+            // one this host does not hold, before anything is claimed.
             Method::AgentApprovalRespond => {
                 let params: kr_protocol::agent::AgentApprovalRespondParams =
                     parse(&mutation.params)?;
-                Self::check_session(session, params.target.subject.session_id)
+                Self::check_session(session, params.target.subject.session_id)?;
+                self.check_decision_reached(caller, params.resource_id)
             }
             Method::PluginActionInvoke => {
                 let params: kr_protocol::agent::PluginActionInvokeParams = parse(&mutation.params)?;
-                Self::check_session(session, params.target.subject.session_id)
+                Self::check_session(session, params.target.subject.session_id)?;
+                // An action that names a pending request answers it, whatever else it is.
+                match params.resource_id.as_ref() {
+                    Some(resource_id) => self.check_decision_reached(caller, *resource_id),
+                    None => Ok(()),
+                }
             }
             // An action belongs to the actor that submitted it, or to the host owner over anybody
             // else's, and the receipt itself is the subject: nothing else about the request decides

@@ -3689,13 +3689,16 @@ async fn forward_as_device(
     };
     let lease =
         common::a_lease_after_the_announcement(daemon, mutation.target.environment_id, 1, 1).await;
+    // The daemon sends the history scope of the grant it decided the mutation under, and an
+    // answer to a pending request is held to it: this grant reaches back to the start of time.
     daemon
-        .forward(
+        .forward_within(
             mutation,
             &envelope,
             &grant_rights.iter().copied().collect(),
             kr_protocol::scalars::U64::new(kr_ipc::clock::boot_elapsed_ms() + 30_000),
             Some(lease),
+            common::a_scope_with_the_live_screen(),
         )
         .await
         .expect("the forward reaches the worker")

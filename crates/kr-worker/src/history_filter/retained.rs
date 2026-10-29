@@ -17,6 +17,7 @@
 //! every write method is listed and a test fails on one that is not.
 
 use kr_protocol::envelope::ParamsValue;
+use kr_protocol::gateway::PendingResource;
 use kr_protocol::method::Method;
 use kr_protocol::question::{Question, QuestionResolveResult, QuestionState};
 use kr_protocol::receipt::{ActionCancelResult, Receipt};
@@ -62,6 +63,30 @@ impl Disclosure {
                     question.question_id,
                     question.created_at_ms.get(),
                     question.state,
+                )
+                .is_ok(),
+        }
+    }
+}
+
+impl Disclosure {
+    /// Returns whether this reader's history reaches a pending resource as it stands now, which is
+    /// what decides whether it may answer the resource.
+    ///
+    /// The moment the broker recorded the request decides it, and an approval a grant names is
+    /// reached only while it can still be decided ([`HistoryFilter::admit_resource`]). A reader
+    /// that carries no scope reaches nothing: the absence of a scope never widens what is reached.
+    #[must_use]
+    pub fn reaches_resource(&self, resource: &PendingResource) -> bool {
+        match self {
+            Self::Whole => true,
+            Self::StateOnly => false,
+            Self::Scoped { reach, .. } => reach
+                .admit_resource(
+                    resource.kind,
+                    resource.resource_id,
+                    resource.recorded_at.get(),
+                    resource.state,
                 )
                 .is_ok(),
         }
