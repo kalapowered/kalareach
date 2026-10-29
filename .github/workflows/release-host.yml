@@ -14,8 +14,9 @@ name: release-host
 # run is a successful `release-tree.yml` run on that commit, each tree is the artefact whose digest
 # GitHub states, the staged files are the ones whose sums hash to the third input, and each staged
 # macOS tree is the run's tree with its programs signed and nothing else changed. It prints every
-# digest in the run's summary, so the person who approves can compare them with what the signing
-# script printed.
+# digest in the run's summary: the person who approves compares the staged sums and the digest of
+# the sums with what the signing script printed. The trees to be sealed are the tars the checks
+# wrote, so for the two macOS trees their digests are not the signing script's.
 #
 # `matrix` asks whether the signed release matrix the managed service publishes lists a tier for the
 # package version the commit carries, as every other job that publishes a release does. It holds no
@@ -107,8 +108,8 @@ jobs:
           printf '%s' "$STAGED_SUMS" | grep -Eq '^[0-9a-f]{64}$' || { echo "::error::the staged sums digest is 64 hexadecimal digits"; exit 1; }
           [ "$(git rev-parse HEAD)" = "$COMMIT" ] || { echo "::error::the checkout is not $COMMIT"; exit 1; }
           # The commit is held to main by main's own copy of the check, taken from the branch just
-          # fetched: no script of the commit being checked runs before this has passed, and none of
-          # them is given the token.
+          # fetched: no script of the commit being checked runs before this has passed, none of them
+          # runs in a step that has the token, and the one that reads a tar is run without it.
           git fetch --quiet origin '+refs/heads/main:refs/remotes/origin/main' || { echo "::error::main could not be fetched"; exit 1; }
           git show refs/remotes/origin/main:scripts/check-commit-on-main.sh > "$RUNNER_TEMP/check-commit-on-main.sh" || { echo "::error::main holds no scripts/check-commit-on-main.sh"; exit 1; }
           bash "$RUNNER_TEMP/check-commit-on-main.sh" self-test
@@ -183,7 +184,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE: ${{ steps.run.outputs.release }}
         run: |
-          python3 -I scripts/check-staged-tree.py self-test
+          env -u GH_TOKEN python3 -I scripts/check-staged-tree.py self-test
           for target in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
             top="kalareach-$target-$RELEASE"
             out="$RUNNER_TEMP/to-seal/$target"
@@ -204,7 +205,7 @@ jobs:
                 # its code signature. Sealing writes the manifest again over whatever is here.
                 # The tar the next job unpacks is the one the check writes from what it read, in the
                 # standard form, and not the staged one.
-                python3 -I scripts/check-staged-tree.py compare "$RUNNER_TEMP/$target-unzipped/$top.tar" "$RUNNER_TEMP/staged-files/signed-$top.tar" "$out/$top.tar" || { echo "::error::the staged tree of $target is not the tree the run built with its programs signed"; exit 1; }
+                env -u GH_TOKEN python3 -I scripts/check-staged-tree.py compare "$RUNNER_TEMP/$target-unzipped/$top.tar" "$RUNNER_TEMP/staged-files/signed-$top.tar" "$out/$top.tar" || { echo "::error::the staged tree of $target is not the tree the run built with its programs signed"; exit 1; }
                 ;;
               *)
                 cp "$RUNNER_TEMP/$target-unzipped/$top.tar" "$out/$top.tar"

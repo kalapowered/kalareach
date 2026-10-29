@@ -122,8 +122,9 @@ commit, each tree is the artefact whose digest GitHub states, and the staged fil
 macOS tree is held to the run's tree by `scripts/check-staged-tree.py`: the same directories and files at the same
 modes, the run's `release.json`, every file that is not Mach-O as that manifest describes it, and every Mach-O
 file equal to the run's outside its code signature. The job passes on the tar that check writes from what it
-read, and not the staged one. It prints every digest in the run's summary. The person who approves the `update-signing` deployment compares them with what the signing
-script printed. The files the sealing job takes are kept for three days, so the approval has to come within three
+read, and not the staged one. It prints every digest in the run's summary. The person who approves the `update-signing` deployment compares
+the staged sums, and the digest of the sums, with what the signing script printed; the digests of the two macOS trees
+to be sealed are those of the tars the check wrote, which the signing script never saw. The files the sealing job takes are kept for three days, so the approval has to come within three
 days of the dispatch. The approval is the one approval of a release: the jobs after it run without another,
 and `publish` runs only after every archive has been verified against the root committed in
 `release/tester-channel/root.json`, installed into a store, and started on its own platform: the control daemon, a worker and a shell create a session and close it.

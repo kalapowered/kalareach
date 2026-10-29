@@ -18,8 +18,8 @@ name: release-windows
 # variable, shows it skipped, so a run that proves the trees never reaches the environment.
 # It takes the trees the `build` job made, signs the files that carry a signature, holds each of them
 # to what a release requires, and then writes each manifest again, since signing changed the files,
-# and signs it with the channel's release keys. Those keys do not exist yet, so the job stops there
-# with a named refusal until they do.
+# and signs it with the production channel's release keys. No workflow can use those keys, so the job
+# stops there with a named refusal.
 #
 # The signing key is an Azure Artifact Signing key. It stays inside the service, in hardware, and
 # what comes back over the wire is a signature: no copy of it exists in this repository, on a
