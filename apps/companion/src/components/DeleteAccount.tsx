@@ -437,11 +437,12 @@ export function useDeletion(port: HostPort, view: AccountView | null): DeletionF
   // The result asks how the removal goes until it is done, for about two minutes, and then says it
   // is still finishing; the next time the panel opens it asks again.
   const progress = step.name === 'result' ? step.progress : null
-  // A result that is shown as done is told to the backend, which keeps the record of the deletion
-  // until a page has shown it.
+  // A result that is shown as done is said to the backend, which keeps the record of the deletion
+  // until a page has shown it: no look lets go of it, because the answer of a look can be one that
+  // nobody sees (a Try again pressed while it was out).
   useEffect(() => {
     if (progress !== 'done') return
-    inOrder(() => port.accountDeletionStatus(true)).catch(() => undefined)
+    inOrder(() => port.accountDeletionResultShown()).catch(() => undefined)
   }, [inOrder, port, progress])
   useEffect(() => {
     if (progress !== 'open') return

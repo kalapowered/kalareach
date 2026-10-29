@@ -2173,6 +2173,14 @@ export interface HostPort {
   accountDeletionHide(): Promise<DeletionStatusAnswer>
 
   /**
+   * Says that the page has shown the result of the deletion: the device lets go of its record once
+   * what it has to settle is settled. No look at how the removal goes does that, since the answer of
+   * a look can be one nobody sees. Answers `none`, and a problem when another window is working on
+   * the deletion.
+   */
+  accountDeletionResultShown(): Promise<DeletionStatusAnswer>
+
+  /**
    * Tells `listener` where the device stands each time that changes by itself. Resolves, with the
    * function that stops it, once the listener is registered: nothing published before then
    * reaches it.

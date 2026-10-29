@@ -549,12 +549,16 @@ describe('how the removal goes', () => {
    * Mounts the panel with the clock under the test's hand and walks it, through the screen, to the
    * result of a confirmation that closed the account, with the removal finished or not.
    */
-  async function atTheResult(finished: boolean) {
+  async function atTheResult(
+    finished: boolean,
+    arrange?: (deletion: ReturnType<typeof fakeHost>['controls']['account']['deletion']) => void
+  ) {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
     const { port, controls } = fakeHost()
     controls.account.set(SIGNED_IN)
     controls.account.deletion.answerConfirm({ state: 'closed', finished })
     controls.account.deletion.answerStatus({ state: 'open' })
+    arrange?.(controls.account.deletion)
     render(
       <AppProvider port={port}>
         <MobileApp surface="ios" storage={null} />
@@ -606,9 +610,38 @@ describe('how the removal goes', () => {
     expect(controls.account.deletion.statusReads).toBe(after)
   })
 
-  it('tells the backend the result was shown when it shows the removal as done', async () => {
+  it('says to the backend that the result was shown when it shows the removal as done', async () => {
     const { controls } = await atTheResult(true)
-    expect(controls.account.deletion.statusFollowing.filter(Boolean)).toHaveLength(1)
+    expect(controls.account.deletion.resultsShown).toBe(1)
+  })
+
+  it('says nothing of a result it did not show: a look that found it done while Try again was pressed', async () => {
+    const { controls, panel } = await atTheResult(false, (deletion) => {
+      // The answer is lost, and the second try meets the closure.
+      deletion.answerConfirm({ state: 'unsettled' }, { state: 'closed', finished: true })
+      deletion.answerStatus({ state: 'none' })
+    })
+    const { deletion } = controls.account
+    // The automatic look will find the removal done.
+    deletion.answerStatus({ state: 'done' })
+    expect(within(panel).getByTestId('delete-account')).toHaveAttribute('data-step', 'unsettled')
+    deletion.holdStatus()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000)
+    })
+    // The look is out. Try again is pressed beside it, and the look's answer is no longer wanted.
+    await act(async () => {
+      within(panel).getByTestId('delete-account-again').click()
+      await vi.advanceTimersByTimeAsync(10)
+    })
+    await act(async () => {
+      deletion.releaseStatus()
+      await vi.advanceTimersByTimeAsync(10)
+    })
+    expect(within(panel).getByTestId('delete-account')).toHaveAttribute('data-step', 'result')
+    expect(within(panel).getByText(/is deleted/)).toBeVisible()
+    expect(deletion.confirms).toHaveLength(2)
+    expect(deletion.resultsShown, 'said once, for the result that was shown').toBe(1)
   })
 
   it('shows a removal that had finished inside the confirmation, and asks no more', async () => {
