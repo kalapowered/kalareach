@@ -43,6 +43,10 @@ fi
 # The signer is the pinned one. A program named in the environment is taken only for an ad hoc
 # signature of a proving run: the Developer ID signature reads the private key, and only the pinned
 # program is given it.
+if [ -n "${KR_RCODESIGN:-}" ]; then
+    # By absolute path, so that the file that is verified is the file that runs.
+    case "$KR_RCODESIGN" in /*) ;; *) KR_RCODESIGN="$PWD/$KR_RCODESIGN" ;; esac
+fi
 if [ -n "${KR_RCODESIGN:-}" ] && [ "$identity" = developer-id ]; then
     bash "$here/install-rcodesign.sh" --verify "$KR_RCODESIGN" || {
         echo "sign-macos-tree: KR_RCODESIGN is not the pinned rcodesign, and the Developer ID key is read only by the pinned one" >&2

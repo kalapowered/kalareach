@@ -61,13 +61,38 @@ self_test() {
         echo "self-test FAILED: the signer stopped, and not for the pin: $(head -1 "$work/out")"
         status=1
     fi
+    # A pinned copy in the directory the signer runs in, and another program of the same name on PATH
+    # that says the pinned version and leaves a mark when it runs. The signer is handed the bare name.
+    # What is hashed has to be what runs, so the mark must not appear. Only where the pinned
+    # executable is at hand.
+    local pinned="${KR_TOOLS_DIR:-$HOME/.cache/kalareach-tools}/rcodesign-$version/rcodesign"
+    if is_pinned "$pinned"; then
+        mkdir -p "$work/bin" "$work/here"
+        cp "$pinned" "$work/here/rcodesign"
+        printf '#!/bin/sh\n: > "%s/ran"\necho "apple-codesign %s"\n' "$work" "$version" > "$work/bin/rcodesign"
+        chmod 755 "$work/bin/rcodesign"
+        (cd "$work/here" && PATH="$work/bin:$PATH" KR_RCODESIGN=rcodesign KR_SIGN_KEY="$work/key" KR_SIGN_CERT="$work/cert" KR_SIGN_CHAIN="$work/chain" \
+            bash "$(dirname "${BASH_SOURCE[0]}")/sign-macos-tree.sh" "$work/tree" developer-id > /dev/null 2>&1) || true
+        if [ -e "$work/ran" ]; then
+            echo "self-test FAILED: a program found on PATH ran in place of the file that was hashed"
+            status=1
+        else
+            echo "self-test ok: the file that is hashed is the file that runs, for a name with no directory"
+        fi
+    else
+        echo "self-test note: the pinned executable is not installed here, so the case of a bare name was not run"
+    fi
     [ "$status" -eq 0 ] && echo "install-rcodesign: the self-test passed"
     return "$status"
 }
 
 case "${1:-}" in
     --verify)
-        if is_pinned "${2:?name the executable}"; then exit 0; fi
+        # One file is named, by its absolute path, and the same file is hashed and run: a bare name
+        # would be hashed where this runs and run from PATH.
+        candidate="${2:?name the executable}"
+        case "$candidate" in /*) ;; *) candidate="$PWD/$candidate" ;; esac
+        if is_pinned "$candidate"; then exit 0; fi
         echo "install-rcodesign: ${2} is not the pinned rcodesign $version (SHA-256 $executable_sha256)" >&2
         exit 1
         ;;
