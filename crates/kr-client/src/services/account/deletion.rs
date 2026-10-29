@@ -25,7 +25,7 @@
 //! A record that exists says that a request of its deletion may have run and is not known to have:
 //! a request the service answered, or refused before it ran, is not kept. A later confirmation for
 //! the same account reuses the receipt. The record is removed when the closure is known and what
-//! this device has to settle is settled, when the person gives up on it ([`forget`]), and after
+//! this device has to settle is settled, when the person gives up on it ([`ManagedAccountDeletion::forget`]), and after
 //! [`KEPT_FOR_MS`]. It is never read as proof that a deletion did not go through: the service
 //! saying `unknown` to a receipt means no more than that.
 //!
