@@ -951,13 +951,21 @@ impl Assembled {
     /// own directory on the internal disk, which goes when the process does. Each test is given a
     /// copy of its own: the archive is hundreds of megabytes of programs, and a test that packed its
     /// own would repeat what another has already done.
+    ///
+    /// The packed archive is read back whole once, and each copy is held to the digest of the archive
+    /// it was copied from. A packed archive or a copy that is bad then fails here, named, and not in
+    /// whichever case unpacks it, as a failure of the unpacking.
     fn archive(&self, archive: &Path) {
         self.archive_signed(archive, &keys().targets);
     }
 
     /// Gives `archive` the release as an archive whose manifest `signer` signed.
     fn archive_signed(&self, archive: &Path, signer: &Ed25519KeyPair) {
-        static PACKED: OnceLock<Mutex<HashMap<String, Arc<OnceLock<PathBuf>>>>> = OnceLock::new();
+        /// A release packed: where its archive is and the SHA-256 of the archive, or why it is not
+        /// fit to give to a case. The reason is kept, so that every case that wants the release
+        /// fails at once with it, and none packs it again.
+        type Packed = Result<(PathBuf, [u8; 32]), String>;
+        static PACKED: OnceLock<Mutex<HashMap<String, Arc<OnceLock<Packed>>>>> = OnceLock::new();
         // Two releases that are signed alike are packed alike: the signature covers every file's
         // digest, and the channel root is one of the files.
         let identity = format!("{}\n{}", signed_members(&self.members(), signer), self.root);
@@ -985,10 +993,62 @@ impl Assembled {
             });
             pack(&tree, &top, &packed);
             std::fs::remove_dir_all(&tree).expect("the tree goes");
-            packed
+            if let Err(error) = read_whole(&packed) {
+                return Err(format!(
+                    "the archive packed at {} does not read back as the archive that was written: \
+                     {error}",
+                    packed.display()
+                ));
+            }
+            let digest = file_digest(&packed);
+            Ok((packed, digest))
         });
+        let (packed, digest) = packed.as_ref().unwrap_or_else(|why| panic!("{why}"));
         std::fs::copy(packed, archive).expect("a copy of the archive");
+        assert!(
+            file_digest(archive) == *digest,
+            "the copy at {} is not the archive packed at {}",
+            archive.display(),
+            packed.display()
+        );
     }
+}
+
+/// The SHA-256 of the file at `path`, read whole.
+fn file_digest(path: &Path) -> [u8; 32] {
+    use sha2::Digest as _;
+    use std::io::Read as _;
+
+    let mut file = std::fs::File::open(path).expect("a file to take the digest of");
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => return hasher.finalize().into(),
+            Ok(read) => hasher.update(&buffer[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => panic!("{} is not read: {error}", path.display()),
+        }
+    }
+}
+
+/// Reads the packed archive to its end through the decompression a release's archive is read with,
+/// which checks every block and the checksum the archive ends with.
+#[cfg(unix)]
+fn read_whole(packed: &Path) -> std::io::Result<()> {
+    let file = std::fs::File::open(packed)?;
+    let mut decoder = flate2::read::GzDecoder::new(std::io::BufReader::new(file));
+    std::io::copy(&mut decoder, &mut std::io::sink()).map(|_| ())
+}
+
+/// Reads every entry of the packed archive to its end, which checks each entry's checksum.
+#[cfg(windows)]
+fn read_whole(packed: &Path) -> std::io::Result<()> {
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(packed)?)?;
+    for index in 0..archive.len() {
+        std::io::copy(&mut archive.by_index(index)?, &mut std::io::sink())?;
+    }
+    Ok(())
 }
 
 /// Packs `tree` as a `.zip` whose entries are the tree's files under `top`, as a Windows release's
