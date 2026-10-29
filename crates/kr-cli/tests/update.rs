@@ -5020,13 +5020,13 @@ async fn a_rollback_needs_an_older_release_in_the_store() {
     let _ = two;
 }
 
-/// KR-REQ-26.10: going back does not bring back a key the channel retired. Release two carries the
-/// next version of the channel's root, which names a new targets key in place of the first. An
-/// update that waits trusts nothing it has not switched to, so it can be run again once what held
-/// it has gone; once the host has switched to release two, a rollback to release one, whose own
-/// root is the first, still trusts the second: an archive signed with the retired key is refused
-/// and one signed with the new key is taken. The archive release two came in, which only the retired
-/// key signed, is refused too.
+/// KR-REQ-26.10, KR-REQ-26.37: going back does not bring back a key the channel retired. Release two
+/// carries the next version of the channel's root, which names a new targets key in place of the
+/// first. An update that waits trusts nothing it has not switched to, so it can be run again once
+/// what held it has gone; once the host has switched to release two, a rollback to release one,
+/// whose own root is the first, still trusts the second: an archive signed with the retired key is
+/// refused and one signed with the new key is taken. The archive release two came in, which only the
+/// retired key signed, is refused too.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_does_not_bring_back_a_key_the_channel_retired() {
