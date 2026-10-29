@@ -358,3 +358,82 @@ async fn a_pipe_in_place_of_the_named_file_is_answered_and_not_waited_for() {
         other => panic!("{other:?}"),
     }
 }
+
+/// What the person owns around one nominated file: every name in its directory with the bytes and
+/// the modification time of each, and the directory's own modification time, which moves when a
+/// name is added, removed or renamed.
+fn owned_state(
+    directory: &std::path::Path,
+) -> (
+    std::time::SystemTime,
+    Vec<(String, Vec<u8>, std::time::SystemTime)>,
+) {
+    let modified = |path: &std::path::Path| {
+        std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .expect("a modification time")
+    };
+    let mut names: Vec<_> = std::fs::read_dir(directory)
+        .expect("lists the directory")
+        .map(|entry| {
+            let path = entry.expect("an entry").path();
+            (
+                path.file_name()
+                    .expect("a name")
+                    .to_string_lossy()
+                    .into_owned(),
+                std::fs::read(&path).expect("reads the file"),
+                modified(&path),
+            )
+        })
+        .collect();
+    names.sort();
+    (modified(directory), names)
+}
+
+/// KR-REQ-03.30: the worker performing the checks changes no user data and sends no input. The
+/// file the person nominated and everything beside it are as they were once the checks have run,
+/// and the check that would send a keystroke is not performed, since no isolated context of its own
+/// was supplied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn performing_the_checks_changes_nothing_the_person_owns_and_sends_no_input() {
+    let host = host().await;
+    let directory = tempfile::tempdir().expect("a directory of this test's own");
+    let file = directory.path().join("authorised.txt");
+    std::fs::write(&file, b"the person nominated this").expect("the nominated file");
+    std::fs::write(directory.path().join("beside.txt"), b"not nominated").expect("another file");
+    let before = owned_state(directory.path());
+    let mut link = daemon(&host, ControllerConnectionRole::Checks).await;
+
+    for id in 1..=2 {
+        match ask(&mut link, request(&host, id, file.to_str())).await {
+            Answer::Findings(found) => {
+                assert!(
+                    found
+                        .records
+                        .iter()
+                        .any(|record| record.capability.as_str()
+                            == capabilities::AUTHORISED_FILE_READ),
+                    "the read was performed"
+                );
+                // The check that sends input is performed only in a context of its own that the
+                // caller supplies. The request has no way to supply one, so no finding says
+                // that a keystroke was sent or that input injection was found to work.
+                assert!(
+                    found.records.iter().all(|record| {
+                        record.capability.as_str() != capabilities::INPUT_INJECTION
+                            || record.state != CapabilityState::QualifiedAvailable
+                    }),
+                    "{:?}",
+                    found.records
+                );
+            }
+            other => panic!("the checks were not performed: {other:?}"),
+        }
+        assert_eq!(
+            owned_state(directory.path()),
+            before,
+            "the person's files are as they were after request {id}"
+        );
+    }
+}
