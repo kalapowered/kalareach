@@ -222,6 +222,8 @@ fn at(ms_after: u64) {
 struct Flaky {
     inner: MemoryStore,
     fail_session_delete: Mutex<bool>,
+    /// Whether a write of the deletion record is refused, as a failing disk does.
+    fail_record_write: Mutex<bool>,
 }
 
 impl std::fmt::Debug for Flaky {
@@ -236,6 +238,15 @@ impl SecretStore for Flaky {
     }
 
     fn set(&self, name: &SecretName, value: &[u8]) -> CryptoResult<()> {
+        if name.as_str() == "account/deletion" && *self.fail_record_write.lock().expect("flaky") {
+            // The first write, which is the receipt's, is let through; the one that says the
+            // account is closed is refused.
+            if self.inner.get(name)?.is_some() {
+                return Err(CryptoError::SecretStore {
+                    message: "the disk refused".to_owned(),
+                });
+            }
+        }
         self.inner.set(name, value)
     }
 
@@ -843,6 +854,7 @@ async fn an_ending_that_failed_is_finished_after_a_restart_and_only_for_its_own_
     let flaky = Arc::new(Flaky {
         inner: MemoryStore::new(),
         fail_session_delete: Mutex::new(true),
+        fail_record_write: Mutex::new(false),
     });
     let rig = rig_over(Arc::clone(&flaky) as Arc<dyn SecretStore>).await;
     rig.wire.then([recorded("confirm_closed_closing")]);
@@ -1001,4 +1013,30 @@ async fn nothing_the_client_renders_carries_the_code_a_token_the_receipt_or_the_
     ] {
         assert!(!rendered.contains(secret), "{secret} in {rendered}");
     }
+}
+
+#[tokio::test]
+async fn a_closure_whose_record_could_not_be_written_still_ends_the_sign_in() {
+    let _clock = CLOCK.lock().await;
+    let flaky = Arc::new(Flaky {
+        inner: MemoryStore::new(),
+        fail_session_delete: Mutex::new(false),
+        fail_record_write: Mutex::new(true),
+    });
+    let rig = rig_over(Arc::clone(&flaky) as Arc<dyn SecretStore>).await;
+    rig.wire.then([recorded("confirm_closed_closing")]);
+    assert_eq!(
+        rig.deletion.confirm(CODE, &[]).await,
+        Ok(DeletionOutcome::Closed { finished: false })
+    );
+    assert!(
+        !session(&rig),
+        "the account is closed, so the sign-in goes with it"
+    );
+    let kept = record(&rig).expect("the receipt's record is there");
+    assert_eq!(
+        kept["closed_ms"],
+        serde_json::Value::Null,
+        "the closure could not be written"
+    );
 }

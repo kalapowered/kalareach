@@ -235,7 +235,7 @@ impl Account {
                     DeletionProgress::Open => StatusAnswer::Open,
                     DeletionProgress::Done => StatusAnswer::Done,
                 };
-                if status.progress != DeletionProgress::None {
+                if status.device_pending {
                     self.after_deletion().await;
                 }
                 (answer, status.device_pending)

@@ -31,7 +31,7 @@
 //! The code, the token, the receipt and the address are never in a rendering of anything here.
 
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -507,27 +507,34 @@ impl SignedInAccount {
         self.drop_deletion()
     }
 
-    /// Ends the stored grant if the record says its account is closed and the grant is still that
-    /// account's, without telling the service. Once, and again if it was interrupted.
-    async fn end_closed_grant(&self, origin: &str) -> Result<()> {
+    /// Ends the stored grant if its account is closed and the grant is still that account's,
+    /// without telling the service. The closure is the record's, or `known` when the caller has just
+    /// learned it and the record could not be written. Once, and again if it was interrupted.
+    async fn end_closed_grant(&self, origin: &str, known: Option<&str>) -> Result<()> {
         let _held = self.hold().await?;
-        let Some(mut record) = self.read_deletion()? else {
-            return Ok(());
+        let mut record = self.read_deletion()?;
+        let mark = match (&record, known) {
+            (Some(kept), _) if kept.closed_ms.is_some() && kept.grant_ended => return Ok(()),
+            (Some(kept), _) if kept.closed_ms.is_some() => kept.mark.clone(),
+            (_, Some(known)) => known.to_owned(),
+            _ => return Ok(()),
         };
-        if record.closed_ms.is_none() || record.grant_ended {
-            return Ok(());
-        }
         let ours = self
             .read_grant()?
-            .is_some_and(|grant| mark_hex(grant.mark_at(origin)) == record.mark);
+            .is_some_and(|grant| mark_hex(grant.mark_at(origin)) == mark);
         if ours {
             self.delete_grant()?;
         }
         if ours || self.read_grant()?.is_none() {
             self.ended.store(false, Ordering::SeqCst);
         }
-        record.grant_ended = true;
-        self.write_deletion(&record)?;
+        if let Some(record) = record.as_mut()
+            && record.mark == mark
+            && record.closed_ms.is_some()
+        {
+            record.grant_ended = true;
+            self.write_deletion(record)?;
+        }
         self.publish();
         Ok(())
     }
@@ -587,8 +594,8 @@ pub struct ManagedAccountDeletion {
     account: Arc<SignedInAccount>,
     /// The account the deletion in front of the person began for.
     flow: Mutex<Option<AccountMark>>,
-    /// Whether a confirmation is in flight in this process, which nothing may drop the record under.
-    in_flight: AtomicBool,
+    /// How many confirmations are in flight in this process, which nothing may drop the record under.
+    in_flight: AtomicUsize,
     look_every: Duration,
 }
 
@@ -601,12 +608,19 @@ impl fmt::Debug for ManagedAccountDeletion {
     }
 }
 
-/// Holds the in-flight flag for as long as it lives.
-struct Flight<'a>(&'a AtomicBool);
+/// Counts one confirmation in flight for as long as it lives.
+struct Flight<'a>(&'a AtomicUsize);
+
+impl<'a> Flight<'a> {
+    fn begin(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(count)
+    }
+}
 
 impl Drop for Flight<'_> {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -623,7 +637,7 @@ impl ManagedAccountDeletion {
             http,
             account,
             flow: Mutex::new(None),
-            in_flight: AtomicBool::new(false),
+            in_flight: AtomicUsize::new(0),
             look_every: LOOK_EVERY,
         }
     }
@@ -812,8 +826,7 @@ impl ManagedAccountDeletion {
         {
             return Err(DeletionFault::Refused);
         }
-        self.in_flight.store(true, Ordering::SeqCst);
-        let _flight = Flight(&self.in_flight);
+        let _flight = Flight::begin(&self.in_flight);
 
         let mark = match self.authorise(false).await {
             Ok((_, mark)) => mark,
@@ -833,7 +846,7 @@ impl ManagedAccountDeletion {
                 Sent::Data(data) => {
                     return match read_confirmed(&data) {
                         Some(Confirmed::Closed { finished }) => {
-                            self.closed(finished).await;
+                            self.closed(finished, &mark_hex(mark)).await;
                             Ok(DeletionOutcome::Closed { finished })
                         }
                         Some(Confirmed::Outcome(outcome)) => Ok(outcome),
@@ -887,7 +900,7 @@ impl ManagedAccountDeletion {
     /// Neither step can change what the person is told, because the account is closed whatever
     /// this device manages to write. A step that fails is retried by [`Self::settle`], at the next
     /// start or the next look.
-    async fn closed(&self, finished: bool) {
+    async fn closed(&self, finished: bool, mark: &str) {
         let now = self.account.deletion_clock();
         let _ = self
             .account
@@ -896,7 +909,10 @@ impl ManagedAccountDeletion {
                 record.done_seen |= finished;
             })
             .await;
-        let _ = self.account.end_closed_grant(&self.origin).await;
+        let _ = self
+            .account
+            .end_closed_grant(&self.origin, Some(mark))
+            .await;
     }
 
     /// Looks for a lost answer by receipt. An account found closed is settled as if the answer had
@@ -936,7 +952,7 @@ impl ManagedAccountDeletion {
             Sent::Data(data) => match data.get("state").and_then(serde_json::Value::as_str) {
                 Some(state @ ("open" | "done")) => {
                     let done = state == "done";
-                    self.closed(done).await;
+                    self.closed(done, &record.mark).await;
                     Ok(Some(done))
                 }
                 Some("unknown") => Ok(None),
@@ -968,7 +984,7 @@ impl ManagedAccountDeletion {
         let Some(record) = self.account.read_deletion().map_err(local)? else {
             return Ok(none);
         };
-        if self.in_flight.load(Ordering::SeqCst) {
+        if self.in_flight.load(Ordering::SeqCst) > 0 {
             return Ok(none);
         }
         let now = self.account.deletion_clock();
@@ -1014,7 +1030,7 @@ impl ManagedAccountDeletion {
     /// Returns the fault that stopped it.
     pub async fn settle(&self) -> std::result::Result<bool, DeletionFault> {
         self.account
-            .end_closed_grant(&self.origin)
+            .end_closed_grant(&self.origin, None)
             .await
             .map_err(local)?;
         Ok(self
