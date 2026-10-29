@@ -354,7 +354,8 @@ libsqlite3-sys = { opt-level = "s" }
 # digest, the compressor and its checksum are the larger part of what they spend on a release. So
 # these three packages are optimised in debug and test builds too; the rest of them are not. The
 # compressor and checksum entries are for flate2's Rust backend, which is the one `kr` and the tests
-# use.
+# use. The zlib-rs in the lock file belongs to the flate2 that the build script of
+# `libsodium-sys-stable` links through its own `zip`; `kr` and the tests do not link it.
 [profile.dev.package.sha2]
 opt-level = 3
 
