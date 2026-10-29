@@ -2222,6 +2222,9 @@ fn integrating(directory: &std::path::Path, version: &str, flags: &[&str]) -> st
 /// bridge's is: the flags and variables are in the release, so a release that changes only a flag
 /// widens no grant and still installs only with the owner's confirmation of that release, and the
 /// installation stays where it was without it.
+///
+/// KR-REQ-20.25, the adapter update: a new release of an installed adapter that changes what it
+/// launches does not replace the installed one without the owner's confirmation of that release.
 #[tokio::test]
 async fn kr_req_11_11_a_release_that_changes_its_command_integration_asks_the_owner_again() {
     let home = tempfile::tempdir().expect("a temporary directory");

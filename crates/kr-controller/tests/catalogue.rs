@@ -2764,6 +2764,9 @@ async fn installed_requests(host: &Host) -> usize {
 /// KR-REQ-02.09, the part about enlarging what an installation may do: the installation that
 /// widens is refused with `OwnerConfirmationRequired` until the owner has confirmed exactly it, and
 /// a confirmation for another package or another grant does not stand in.
+///
+/// KR-REQ-20.25, the adapter update: an update that would increase what the adapter's installation
+/// may do is not applied silently; it waits for the owner's confirmation of that exact update.
 #[tokio::test]
 async fn kr_req_10_05_and_11_11_an_installation_that_widens_is_the_owners_confirmed_decision() {
     let host = host();
