@@ -1686,36 +1686,74 @@ fn a_removal_stops_for_a_key_of_its_own_set_after_the_reset_check(
     assert!(person.recorded_uuid().is_none());
 }
 
-/// One case of each kind for a key of an application, so that a fault in one shows by name.
-macro_rules! own_key_cases {
-    ($($install:ident, $removal:ident: $application:expr, $key:expr;)*) => {$(
-        /// KR-REQ-01.21: the last look of an install finds a key of kr's own that the person set
-        /// after the install read it back.
-        #[test]
-        fn $install() {
-            an_install_stops_for_a_key_of_its_own_set_after_the_read_back(&$application, $key);
-        }
-
-        /// KR-REQ-01.21: the last look of a removal finds a key of kr's own that another writer set
-        /// after the removal checked its reset.
-        #[test]
-        fn $removal() {
-            a_removal_stops_for_a_key_of_its_own_set_after_the_reset_check(&$application, $key);
-        }
-    )*};
+/// KR-REQ-01.21: the last look of an install finds the name of a GNOME Terminal profile set after the install read it back.
+#[test]
+fn a_name_set_after_the_read_back_stops_a_gnome_terminal_install() {
+    an_install_stops_for_a_key_of_its_own_set_after_the_read_back(&GNOME, OwnKey::Name);
 }
 
-own_key_cases! {
-    a_name_set_after_the_read_back_stops_a_gnome_terminal_install,
-    a_name_set_after_the_reset_check_stops_a_gnome_terminal_removal: GNOME, OwnKey::Name;
-    a_flag_set_after_the_read_back_stops_a_gnome_terminal_install,
-    a_flag_set_after_the_reset_check_stops_a_gnome_terminal_removal: GNOME, OwnKey::Flag;
-    a_command_set_after_the_read_back_stops_a_gnome_terminal_install,
-    a_command_set_after_the_reset_check_stops_a_gnome_terminal_removal: GNOME, OwnKey::Command;
-    a_name_set_after_the_read_back_stops_a_ptyxis_install,
-    a_name_set_after_the_reset_check_stops_a_ptyxis_removal: PTYXIS, OwnKey::Name;
-    a_flag_set_after_the_read_back_stops_a_ptyxis_install,
-    a_flag_set_after_the_reset_check_stops_a_ptyxis_removal: PTYXIS, OwnKey::Flag;
-    a_command_set_after_the_read_back_stops_a_ptyxis_install,
-    a_command_set_after_the_reset_check_stops_a_ptyxis_removal: PTYXIS, OwnKey::Command;
+/// KR-REQ-01.21: the last look of a removal finds the name of a GNOME Terminal profile set after the removal checked its reset.
+#[test]
+fn a_name_set_after_the_reset_check_stops_a_gnome_terminal_removal() {
+    a_removal_stops_for_a_key_of_its_own_set_after_the_reset_check(&GNOME, OwnKey::Name);
+}
+
+/// KR-REQ-01.21: the last look of an install finds the name of a Ptyxis profile set after the install read it back.
+#[test]
+fn a_name_set_after_the_read_back_stops_a_ptyxis_install() {
+    an_install_stops_for_a_key_of_its_own_set_after_the_read_back(&PTYXIS, OwnKey::Name);
+}
+
+/// KR-REQ-01.21: the last look of a removal finds the name of a Ptyxis profile set after the removal checked its reset.
+#[test]
+fn a_name_set_after_the_reset_check_stops_a_ptyxis_removal() {
+    a_removal_stops_for_a_key_of_its_own_set_after_the_reset_check(&PTYXIS, OwnKey::Name);
+}
+
+/// KR-REQ-01.21: the last look of an install finds the flag of a GNOME Terminal profile set after the install read it back.
+#[test]
+fn a_flag_set_after_the_read_back_stops_a_gnome_terminal_install() {
+    an_install_stops_for_a_key_of_its_own_set_after_the_read_back(&GNOME, OwnKey::Flag);
+}
+
+/// KR-REQ-01.21: the last look of a removal finds the flag of a GNOME Terminal profile set after the removal checked its reset.
+#[test]
+fn a_flag_set_after_the_reset_check_stops_a_gnome_terminal_removal() {
+    a_removal_stops_for_a_key_of_its_own_set_after_the_reset_check(&GNOME, OwnKey::Flag);
+}
+
+/// KR-REQ-01.21: the last look of an install finds the flag of a Ptyxis profile set after the install read it back.
+#[test]
+fn a_flag_set_after_the_read_back_stops_a_ptyxis_install() {
+    an_install_stops_for_a_key_of_its_own_set_after_the_read_back(&PTYXIS, OwnKey::Flag);
+}
+
+/// KR-REQ-01.21: the last look of a removal finds the flag of a Ptyxis profile set after the removal checked its reset.
+#[test]
+fn a_flag_set_after_the_reset_check_stops_a_ptyxis_removal() {
+    a_removal_stops_for_a_key_of_its_own_set_after_the_reset_check(&PTYXIS, OwnKey::Flag);
+}
+
+/// KR-REQ-01.21: the last look of an install finds the command of a GNOME Terminal profile set after the install read it back.
+#[test]
+fn a_command_set_after_the_read_back_stops_a_gnome_terminal_install() {
+    an_install_stops_for_a_key_of_its_own_set_after_the_read_back(&GNOME, OwnKey::Command);
+}
+
+/// KR-REQ-01.21: the last look of a removal finds the command of a GNOME Terminal profile set after the removal checked its reset.
+#[test]
+fn a_command_set_after_the_reset_check_stops_a_gnome_terminal_removal() {
+    a_removal_stops_for_a_key_of_its_own_set_after_the_reset_check(&GNOME, OwnKey::Command);
+}
+
+/// KR-REQ-01.21: the last look of an install finds the command of a Ptyxis profile set after the install read it back.
+#[test]
+fn a_command_set_after_the_read_back_stops_a_ptyxis_install() {
+    an_install_stops_for_a_key_of_its_own_set_after_the_read_back(&PTYXIS, OwnKey::Command);
+}
+
+/// KR-REQ-01.21: the last look of a removal finds the command of a Ptyxis profile set after the removal checked its reset.
+#[test]
+fn a_command_set_after_the_reset_check_stops_a_ptyxis_removal() {
+    a_removal_stops_for_a_key_of_its_own_set_after_the_reset_check(&PTYXIS, OwnKey::Command);
 }
