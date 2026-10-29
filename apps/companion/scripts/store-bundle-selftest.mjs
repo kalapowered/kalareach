@@ -205,7 +205,11 @@ heldProblems('a bundle configuration that does not is refused', problemsInBundle
 
 // -- secrets -------------------------------------------------------------------------------------
 
-const secret = Buffer.from('-----BEGIN PRIVATE KEY-----\nMIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQgabcdefghijklmnop\n-----END PRIVATE KEY-----\n')
+// A key block made of nothing real, its header and footer put together at run time so that no file
+// of the repository holds text shaped like a private key.
+const fence = (word) => `${'-'.repeat(5)}${word} PRIVATE KEY${'-'.repeat(5)}`
+const pem = (body) => Buffer.from(`${fence('BEGIN')}\n${body}\n${fence('END')}\n`)
+const secret = pem(Buffer.from('synthetic body for the self-test, not a key at all').toString('base64'))
 const needles = secretNeedles(secret)
 held('a secret key block is found by any long line of it', 1, placesWithSecret([Buffer.from(`xx${secret.toString().split('\n')[1]}yy`)], needles))
 held('text that is not the secret is not found', 0, placesWithSecret([Buffer.from('MIGTAgEAMBMGB')], needles))
