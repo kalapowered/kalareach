@@ -468,6 +468,40 @@ mod tests {
         assert!(matches!(error, RuntimeError::ComponentTooLarge { .. }));
     }
 
+    /// The nice value the kernel holds for the calling thread, from its own record of the thread.
+    #[cfg(target_os = "linux")]
+    fn nice_of_this_thread() -> i64 {
+        let stat = std::fs::read_to_string("/proc/thread-self/stat").expect("the thread's record");
+        // The command name sits in parentheses and may hold spaces; what follows its closing one is
+        // plain fields, the state first. The nice value is the nineteenth field of the record.
+        let after_the_name = stat.rsplit_once(')').expect("the name is closed").1;
+        after_the_name
+            .split_whitespace()
+            .nth(16)
+            .expect("the nice field")
+            .parse()
+            .expect("a number")
+    }
+
+    // KR-REQ-11.41: a thread that asks for background priority has the lowest priority an ordinary
+    // thread can have, in the kernel's own record of it, and not only a report that it asked.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_thread_that_lowers_its_priority_has_the_lowest_ordinary_priority_in_the_kernel() {
+        let (outcome, after) = std::thread::spawn(|| {
+            let outcome = lower_priority();
+            (outcome, nice_of_this_thread())
+        })
+        .join()
+        .expect("the thread finished");
+        assert_eq!(
+            outcome,
+            BackgroundPriority::Lowered,
+            "an ordinary thread may always lower its own priority"
+        );
+        assert_eq!(after, 19, "the kernel holds this thread at nice {after}");
+    }
+
     // KR-REQ-11.41: a compile runs on a pool thread that has asked for background priority.
     #[test]
     fn a_pool_thread_asks_for_background_priority() {
