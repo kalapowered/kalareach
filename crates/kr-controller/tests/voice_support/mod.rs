@@ -108,6 +108,8 @@ struct State {
     phone_closes: usize,
     /// The gate the held phone close waits at.
     phone_close_gate: Arc<Gate>,
+    /// Whether the service is down: every connection is ended as it is accepted.
+    down: bool,
 }
 
 /// What the service does to a close it has been told to fail.
@@ -202,10 +204,15 @@ impl StandIn {
             hold_first_phone_close: false,
             phone_closes: 0,
             phone_close_gate: Arc::default(),
+            down: false,
         }));
         let (serving_route, serving_state) = (Arc::clone(&route), Arc::clone(&state));
         let task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
+                if serving_state.lock().expect("the stand-in's state").down {
+                    drop(stream);
+                    continue;
+                }
                 let (route, state) = (Arc::clone(&serving_route), Arc::clone(&serving_state));
                 tokio::spawn(async move { serve(stream, &route, &state).await });
             }
@@ -275,6 +282,14 @@ impl StandIn {
     pub fn release_creations(&self) {
         let gate = Arc::clone(&self.state.lock().expect("the stand-in's state").creation);
         gate.release();
+    }
+
+    /// Takes the service down, as when its process is killed: every control socket that is open is
+    /// dropped with no closing frame, and every connection made afterwards is ended as it is
+    /// accepted, so no request and no upgrade is ever answered.
+    pub fn go_down(&self) {
+        self.state.lock().expect("the stand-in's state").down = true;
+        self.route.drop_sockets();
     }
 
     /// Has a call closed over HTTP end the call's control with a closure, as the service does when

@@ -20,6 +20,8 @@
 //! | A sign of life that native code refuses as ended ends the call | `a_sign_of_life_native_code_refuses_as_ended_ends_the_call` |
 //! | A delegation is answered to the model that nothing was done, once | `a_delegation_is_answered_to_the_model_that_nothing_was_done_once` |
 //! | A mute silences the microphone here and is told to the service | `muting_the_microphone_silences_it_here_and_tells_the_service` |
+//! | A voice call is not a shell session: hanging up leaves the session a worker runs live | `hanging_up_a_call_leaves_the_terminal_session_it_was_made_over_running` |
+//! | A voice service that is down at the start, in the call or at the hang-up leaves mute, silence, the media's stop and the grant's revocation with this device and the host | `a_service_that_is_down_at_the_start_leaves_no_media_and_a_notice`, `a_service_that_goes_down_in_the_call_leaves_mute_and_silence_with_native_code`, `a_service_that_is_down_at_the_hang_up_still_stops_the_media_and_revokes_the_grant` |
 //! | A host that names another voice service gets no token | `a_host_that_names_another_voice_service_gets_no_token` |
 //! | The native session ending revokes the call's grant in the host's store before the service finalises the call | `ending_the_native_session_revokes_the_voice_grant_before_the_service_finalises_the_call` |
 //! | A stop that never returns does not hold the host's revocation | `a_stop_native_code_never_returns_does_not_hold_the_revocation` |
@@ -215,6 +217,8 @@ struct Scene {
     tokens: Arc<SignedInAccount>,
     service: Arc<PhoneService>,
     session: String,
+    /// The workers of the sessions the host really runs, when the scene was made over some.
+    workers: Vec<net_support::worker::Worker>,
 }
 
 impl Scene {
@@ -222,10 +226,32 @@ impl Scene {
         self.host.as_ref().expect("the host is running")
     }
 
-    /// Stops the daemon, once.
+    /// What the host says of a session the workers run, read at its local socket.
+    async fn state_of(
+        &self,
+        session_id: kr_protocol::ids::SessionId,
+    ) -> kr_protocol::session::SessionState {
+        let mut client = self.host().client().await;
+        let read: kr_protocol::session::SessionReadResult = client
+            .request(
+                kr_protocol::method::Method::SessionRead,
+                &kr_protocol::session::SessionReadParams { session_id },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the session reads")
+            .to_typed()
+            .expect("decodes");
+        read.session.state
+    }
+
+    /// Stops the daemon, once, and the workers it ran over.
     async fn stop_host(&mut self) {
         if let Some(host) = self.host.take() {
             host.stop().await;
+        }
+        for worker in self.workers.drain(..) {
+            worker.stop().await;
         }
     }
 
@@ -307,9 +333,31 @@ async fn scene_over(
     account_origin: Option<&str>,
     deadlines: HttpDeadlines,
 ) -> Scene {
+    scene_built(timings, signed_in, account_origin, deadlines, 0).await
+}
+
+/// As [`scene_over`], with the host running `sessions` real sessions, each served by a worker, the
+/// first of which the call is made over. With none, the call names a session the host does not run.
+async fn scene_built(
+    timings: Timings,
+    signed_in: Option<IssuedGrant>,
+    account_origin: Option<&str>,
+    deadlines: HttpDeadlines,
+    sessions: u64,
+) -> Scene {
     let stand_in = StandIn::start().await;
-    let owner = DeviceKeys::generate().expect("owner keys");
-    let host = Host::start_with_document(&owner, &document_naming(stand_in.origin())).await;
+    let (host, owner, workers) = if sessions == 0 {
+        let owner = DeviceKeys::generate().expect("owner keys");
+        let host = Host::start_with_document(&owner, &document_naming(stand_in.origin())).await;
+        (host, owner, Vec::new())
+    } else {
+        let adopted = net_support::worker::Adopted::start_with_document(
+            sessions,
+            &document_naming(stand_in.origin()),
+        )
+        .await;
+        (adopted.host, adopted.owner, adopted.workers)
+    };
     host.controller()
         .host_account()
         .keep_for_test(stand_in.host_grant())
@@ -376,7 +424,10 @@ async fn scene_over(
         &[ActionRight::SessionView, ActionRight::AgentPrompt],
     )
     .await;
-    let session = kr_protocol::ids::SessionId::new(kr_ipc::new_uuid()).to_string();
+    let session = workers.first().map_or_else(
+        || kr_protocol::ids::SessionId::new(kr_ipc::new_uuid()).to_string(),
+        |worker| worker.session_id.to_string(),
+    );
     let scene = Scene {
         host: Some(host),
         stand_in,
@@ -385,6 +436,7 @@ async fn scene_over(
         tokens,
         service,
         session,
+        workers,
     };
     tokio::time::timeout(WATCHDOG, async {
         loop {
@@ -976,6 +1028,207 @@ async fn muting_the_microphone_silences_it_here_and_tells_the_service() {
         "only the microphone's mute is advice to the provider: {tellings:?}"
     );
     let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// KR-REQ-15.02: a voice call is not a shell session. The call is made over a session a worker
+/// really runs, which the host reads for the call; hanging up ends the call, revokes its grant and
+/// leaves the session live, with the same state it had while the call ran.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hanging_up_a_call_leaves_the_terminal_session_it_was_made_over_running() {
+    let mut scene = scene_built(
+        quick(),
+        Some(phone_grant(PHONE_TOKEN, 3600)),
+        None,
+        HttpDeadlines::default(),
+        1,
+    )
+    .await;
+    let session_id = scene.workers[0].session_id;
+    let started = scene.start().await;
+    assert_eq!(
+        started["value"]["outcome"]["started"]["session"]["session_ids"],
+        json!([session_id.to_string()]),
+        "the call is made over the session the worker runs: {started}"
+    );
+    scene
+        .state_where("a running call", |state| state["running"] == true)
+        .await;
+    assert_eq!(
+        scene.state_of(session_id).await,
+        kr_protocol::session::SessionState::Live
+    );
+
+    let closed = scene
+        .call("voice_stop", json!({ "voiceSessionId": null }))
+        .expect("the hang-up is answered");
+    assert_eq!(closed["closed_locally"], true, "{closed}");
+    scene
+        .state_where("the end", |state| state["running"] == false)
+        .await;
+
+    assert_eq!(
+        scene.state_of(session_id).await,
+        kr_protocol::session::SessionState::Live,
+        "the session the call was made over is still live after the hang-up"
+    );
+    scene.stop_host().await;
+}
+
+/// KR-REQ-15.17: the voice service is down when the call is asked for. The host cannot make the
+/// call at it and does not say what became of the request, so the phone stops the microphone it
+/// opened, tells the person in words, and keeps the notice that a grant may stand at the host until
+/// the call would have closed. There is no call to mute, and nothing of the person's own is held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_service_that_is_down_at_the_start_leaves_no_media_and_a_notice() {
+    let timings = Timings {
+        host_within: Duration::from_millis(300),
+        ..asking_again()
+    };
+    let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
+    let prepared = scene.prepared().await;
+    scene.stand_in.go_down();
+
+    let started = scene.call("voice_start", scene.start_request(&prepared));
+
+    let started = started.expect("the host answers the page");
+    assert!(
+        started["value"].is_null(),
+        "no call was reported: {started}"
+    );
+    let state = scene.state();
+    assert_eq!(state["running"], false, "{state}");
+    assert_eq!(state["ended"]["cause"], "start_unknown", "{state}");
+    assert_eq!(state["ended"]["closed_locally"], true, "{state}");
+    assert!(
+        !state["ended"]["words"].as_str().unwrap_or("").is_empty(),
+        "the person is told why: {state}"
+    );
+    assert_eq!(state["owed"][0]["kind"], "start_unknown", "{state}");
+    assert!(scene.platform.count("stop") >= 1, "the media is stopped");
+    assert!(
+        !scene.platform.holds_a_call(),
+        "native code holds no media after a call that was never made"
+    );
+    assert!(
+        scene
+            .call(
+                "voice_set_muted",
+                json!({ "what": "microphone", "muted": true })
+            )
+            .is_err(),
+        "there is no call to mute"
+    );
+    scene.stop_host().await;
+}
+
+/// KR-REQ-15.17: the voice service goes down in the middle of a call. Nothing the service does
+/// ends the call for the person, and the microphone's mute and the voice's silence are native
+/// code's own: both take effect with no service to tell, and the screen reads the control as
+/// unreachable rather than the call as over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_service_that_goes_down_in_the_call_leaves_mute_and_silence_with_native_code() {
+    let mut scene = scene().await;
+    scene.start().await;
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+
+    scene.stand_in.go_down();
+    let lost = scene
+        .state_where("a control that cannot be reached", |state| {
+            state["control"] == "unreachable"
+        })
+        .await;
+    assert_eq!(
+        lost["running"], true,
+        "the loss does not end the call: {lost}"
+    );
+    assert_eq!(lost["ended"], serde_json::Value::Null, "{lost}");
+
+    let muted = scene
+        .call(
+            "voice_set_muted",
+            json!({ "what": "microphone", "muted": true }),
+        )
+        .expect("the microphone is muted with no service to tell");
+    assert_eq!(muted["capture"], "muted_by_person", "{muted}");
+    assert!(
+        scene
+            .platform
+            .commands()
+            .contains(&"mute:Microphone:true".to_owned()),
+        "native code was told to mute: {:?}",
+        scene.platform.commands()
+    );
+    let silenced = scene
+        .call(
+            "voice_set_muted",
+            json!({ "what": "playback", "muted": true }),
+        )
+        .expect("the voice is silenced with no service to tell");
+    assert_eq!(silenced["playing"], false, "{silenced}");
+
+    let after = scene.state();
+    assert_eq!(after["running"], true, "{after}");
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// KR-REQ-15.17: the voice service is down when the person hangs up. The hang-up is answered with
+/// the media stopped and the host's grant revoked in its own store, neither waiting on the service,
+/// and the host's answer says it could not tell the service. What the service later confirms is
+/// reported by the case that has a service refuse the close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_service_that_is_down_at_the_hang_up_still_stops_the_media_and_revokes_the_grant() {
+    let mut scene = scene().await;
+    let started = scene.start().await;
+    let grant_id: kr_protocol::ids::GrantId = serde_json::from_value(
+        started["value"]["outcome"]["started"]["session"]["grant_id"].clone(),
+    )
+    .expect("the grant the call runs under");
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+
+    scene.stand_in.go_down();
+    scene
+        .state_where("a control that cannot be reached", |state| {
+            state["control"] == "unreachable"
+        })
+        .await;
+    let closed = scene
+        .call("voice_stop", json!({ "voiceSessionId": null }))
+        .expect("the hang-up is answered");
+    assert_eq!(closed["closed_locally"], true, "{closed}");
+
+    assert!(
+        scene.platform.commands().contains(&"stop".to_owned()),
+        "native code stopped the media: {:?}",
+        scene.platform.commands()
+    );
+    let revoked = scene
+        .host()
+        .controller()
+        .sharing()
+        .grants()
+        .record(grant_id)
+        .expect("the store answers")
+        .expect("the record is there")
+        .revoked_at_ms
+        .is_some();
+    assert!(revoked, "the grant is revoked in the host's store");
+    let state = scene.state();
+    assert_eq!(state["running"], false, "{state}");
+    assert_eq!(state["ended"]["host"]["kind"], "revoked", "{state}");
+    assert_eq!(
+        state["ended"]["host"]["broker_notified"], false,
+        "the host could not tell the service: {state}"
+    );
     scene.stop_host().await;
 }
 
