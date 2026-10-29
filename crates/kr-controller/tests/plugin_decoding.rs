@@ -602,7 +602,9 @@ async fn kr_req_11_38_an_approval_waiting_for_a_person_holds_no_call_of_the_comp
                 [number.to_string()],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .unwrap_or_else(|error| panic!("request {number} has no record in the journal: {error}"));
+            .unwrap_or_else(|error| {
+                panic!("request {number} has no record in the journal: {error}")
+            });
         assert_eq!(resource, approval.resource_id.get().as_bytes().as_slice());
         assert_eq!(state, PendingState::Pending.as_str());
         assert_eq!(durability, Durability::Durable.as_str());

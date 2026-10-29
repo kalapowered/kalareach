@@ -528,7 +528,10 @@ mod tests {
             "the pool thread's request was declined, which a sandbox that refuses a thread the \
              change of its own priority does"
         );
-        assert_eq!(held_at, 19, "the kernel holds the pool thread at nice {held_at}");
+        assert_eq!(
+            held_at, 19,
+            "the kernel holds the pool thread at nice {held_at}"
+        );
     }
 
     // KR-REQ-11.41: a pool thread reports the priority its request for background priority came to.
