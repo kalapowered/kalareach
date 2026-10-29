@@ -17,7 +17,7 @@
 //! | KR-REQ-11.38 | a lane that is full loses observations it holds, counts them, takes a fresh snapshot of the component, and never loses the request the upstream is waiting on; an observation that never returns is stopped by its bound and named; an observation that asks for more memory or produces more output than a call may is refused and the binding's record names the bound; three faults in a minute disable the binding while the native terminal goes on; a snapshot that never returns is stopped by its bound and named |
 //! | KR-REQ-11.39 | the terminal drains and its questions are answered while the worker's observation pump is held, and while the plugin runtime has stopped reading what is handed to it; the worker lets go of that runtime and takes the component up again when it reads |
 //! | KR-REQ-11.40 | an observation the component never returns from is stopped by fuel when its deadline cannot fire, and named so |
-//! | KR-REQ-11.41 | a component that was compiled when it was registered is observed without a fault, the compile outside the observation's deadline |
+//! | KR-REQ-11.41 | a component that was compiled when it was registered is observed without a fault, the compile outside the observation's deadline; a compile that is queued and not done leaves the terminal draining and its questions answered |
 //! | KR-REQ-24.06 | a plugin runtime killed with a receipt, a question and an approval live leaves all three as they were and answerable, and its component is registered again in the replacement and restored to the state the worker held |
 //! | KR-REQ-11.01 | a component reads the execution its binding is bound to as the broker holds it: the revision, the selected conversation and the running turn when it is registered, and each change of them in its next call, also on a runtime that replaces a lost one |
 //! | KR-REQ-24.27 | the plugin runtime is told whether privacy mode stands, each time it changes and before the first component is registered on a runtime that replaces another, and no document of the worker's connection reaches the worker once the runtime has said it holds privacy mode; turning privacy mode on drops the state held for a component and none is taken or held while it is on, observation for live use goes on, a component offered anything made in it has no state taken until it starts again, and then state is taken again; the runtime's words in a fault, and in the reason a component is disabled for, are never kept once privacy mode has stood on the connection that carries them, however many notices wait and however late the link reads them |
@@ -590,6 +590,71 @@ async fn kr_req_11_41_a_component_compiled_at_registration_is_observed_inside_it
         world.reason(1)
     );
     assert!(world.broker().rich_disabled(binding(1)).is_none());
+}
+
+/// KR-REQ-11.41: a compile that is queued and not done never stops the terminal draining or its
+/// questions being answered, and does not fault the binding.
+///
+/// The plugin host queues the compile of the binding's component behind a hold on its compile pool,
+/// so the component cannot be compiled whatever the machine does, and the host says when the compile
+/// is queued. While it is held the binding is not ready (the control: the registration is waiting
+/// for the compile and nothing else), and the shell goes on: it prints a line and asks the terminal
+/// a question each time round and stops until it is answered, so a higher line number and another
+/// answer are the terminal draining and being answered. When the compile is let go the binding
+/// becomes ready, its component was compiled and not loaded, and nothing faulted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_11_41_a_compile_that_is_queued_and_not_done_leaves_the_terminal_draining_and_answered()
+ {
+    let Some(world) = Observing::start(Options {
+        shell: ASKING_SHELL.to_owned(),
+        holding_compiles: true,
+        ..Options::with(vec![Spec::semantic_only(1).shipping("slow-compile")])
+    })
+    .await
+    else {
+        return;
+    };
+    until("the plugin host to have queued the compile", || async {
+        world.a_compile_is_held().then_some(())
+    })
+    .await;
+    let lane = world.broker().observation();
+    assert!(
+        !lane.is_ready(binding(1)),
+        "the binding was ready with its compile held"
+    );
+
+    // Where the terminal had got to with the compile held.
+    let (high_water, answers) = until("the shell to be asking", || async {
+        let text = world.output();
+        highest_line(&text).map(|line| (line, answered(&text)))
+    })
+    .await;
+    until(
+        "the shell to go on and be answered while the compile is held",
+        || async {
+            let text = world.output();
+            (highest_line(&text) > Some(high_water) && answered(&text) > answers).then_some(())
+        },
+    )
+    .await;
+    assert!(
+        !lane.is_ready(binding(1)),
+        "the compile was done although it was held"
+    );
+
+    world.let_the_compiles_go();
+    world.until_ready(1).await;
+    let reason = world.reason(1);
+    assert!(
+        reason.contains("compiled in"),
+        "the registration compiled the component: {reason}"
+    );
+    assert!(world.broker().rich_disabled(binding(1)).is_none());
+    assert!(
+        !reason.contains("fault"),
+        "a compile that waited faulted the binding: {reason}"
+    );
 }
 
 /// KR-REQ-24.06: a plugin runtime that is killed while the worker holds a receipt, a question and an

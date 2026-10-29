@@ -74,6 +74,17 @@ const REGISTRATION_GATE: &str = "hold-registrations";
 #[cfg(feature = "testing")]
 const REGISTRATION_GATE_REACHED: &str = "hold-registrations.reached";
 
+/// The file, in the state directory beside the compiled-code cache, that holds every compile this
+/// host queues for as long as it exists. A host built without the `testing` feature reads no such
+/// file.
+#[cfg(feature = "testing")]
+const COMPILE_GATE: &str = "hold-compiles";
+
+/// The file a host makes beside [`COMPILE_GATE`] when a registration has queued a compile behind
+/// the closed gate.
+#[cfg(feature = "testing")]
+const COMPILE_GATE_REACHED: &str = "hold-compiles.reached";
+
 /// How many bindings one worker connection may hold.
 ///
 /// A binding is an instance, a thread and a queue, and a connection that could register without
@@ -789,6 +800,21 @@ impl PluginHost {
         }
     }
 
+    /// Takes the compile pool's hold, before a compile is queued, for as long as the compile gate
+    /// file exists in the state directory this host files its cache in.
+    ///
+    /// It serves the case that shows a compile which is queued and not done leaves the terminal
+    /// alone: the pool is held, so the component cannot be compiled however fast the machine is, and
+    /// the gate file is the case's own, in the case's own state directory.
+    #[cfg(feature = "testing")]
+    fn hold_compiles_at_the_gate(&self) -> Option<HeldCompiles> {
+        let gate = self.config.cache_root.parent()?.join(COMPILE_GATE);
+        gate.exists().then(|| HeldCompiles {
+            hold: self.runtime.hold_compiles(),
+            gate,
+        })
+    }
+
     /// Registers one binding inside one deadline.
     ///
     /// The deadline is absolute across every stage: reading the payload, compiling it, and creating
@@ -862,13 +888,14 @@ impl PluginHost {
         // background thread under its own budget, and only once an instance exists does any
         // call budget start.
         let remaining = remaining_of(started, REGISTER_DEADLINE).map_err(refusal)?;
-        let compiled = self
-            .runtime
-            .compile(wasm)
-            .map_err(refusal)?
-            .wait(remaining)
-            .await
-            .map_err(refusal)?;
+        #[cfg(feature = "testing")]
+        let held = self.hold_compiles_at_the_gate();
+        let compilation = self.runtime.compile(wasm).map_err(refusal)?;
+        #[cfg(feature = "testing")]
+        if let Some(held) = held {
+            held.queued();
+        }
+        let compiled = compilation.wait(remaining).await.map_err(refusal)?;
         let binding = BindingId::new(binding_id);
         let request = BindingRequest {
             binding_id: binding,
@@ -945,6 +972,29 @@ impl PluginHost {
                     false,
                 )
             })
+    }
+}
+
+/// The compile pool's hold, and the gate file that keeps it.
+#[cfg(feature = "testing")]
+struct HeldCompiles {
+    hold: crate::runtime::compile::CompileHold,
+    gate: std::path::PathBuf,
+}
+
+#[cfg(feature = "testing")]
+impl HeldCompiles {
+    /// Says a compile is queued behind the hold, by the file beside the gate, and lets the hold go
+    /// once the gate file is removed.
+    fn queued(self) {
+        let Self { hold, gate } = self;
+        let _ = std::fs::write(gate.with_file_name(COMPILE_GATE_REACHED), b"");
+        tokio::spawn(async move {
+            while gate.exists() {
+                tokio::time::sleep(core::time::Duration::from_millis(20)).await;
+            }
+            drop(hold);
+        });
     }
 }
 

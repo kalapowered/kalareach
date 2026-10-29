@@ -37,6 +37,12 @@ use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 use super::acting::{installed, rich};
 use super::{Epoch, Hosted, PATIENCE, component, hosted_running, until};
 
+/// The plugin host's compile gate and the file it makes beside it when a compile is queued behind
+/// the closed gate (`COMPILE_GATE` and `COMPILE_GATE_REACHED` in `kr-plugin-runtime`'s
+/// `service::host`, which a host built with the `testing` feature reads).
+const COMPILE_GATE: &str = "hold-compiles";
+const COMPILE_GATE_REACHED: &str = "hold-compiles.reached";
+
 /// The instance every binding here observes.
 pub fn instance() -> ApplicationInstanceId {
     ApplicationInstanceId::new(Uuid::from_bytes([2; 16]))
@@ -190,6 +196,9 @@ pub struct Options {
     pub shell: String,
     /// The bindings to make.
     pub bindings: Vec<Spec>,
+    /// Whether the plugin host queues every compile behind a hold until
+    /// [`Observing::let_the_compiles_go`] is called.
+    pub holding_compiles: bool,
 }
 
 impl Options {
@@ -199,6 +208,7 @@ impl Options {
             epoch: Epoch::Held,
             shell: "exec cat".to_owned(),
             bindings,
+            holding_compiles: false,
         }
     }
 }
@@ -365,6 +375,13 @@ impl Observing {
         }
         let mut installed_components = Vec::new();
         let hosted = hosted_running(options.epoch, None, &options.shell).await;
+        if options.holding_compiles {
+            // The plugin host reads the gate when a registration reaches its compile, so the gate
+            // is closed before the worker's link asks for the host.
+            let directory = hosted.environment().state_dir().to_path_buf();
+            std::fs::create_dir_all(&directory).expect("the environment's state directory");
+            std::fs::write(directory.join(COMPILE_GATE), b"closed").expect("the gate is closed");
+        }
         for name in &components {
             let wasm = component(name)?;
             installed_components.push((*name, install_named(&hosted, name, &wasm)));
@@ -619,6 +636,25 @@ impl Observing {
             cursor = page.next_cursor.get();
         }
         String::from_utf8_lossy(&seen).into_owned()
+    }
+
+    /// Whether the plugin host has queued a compile behind its closed gate.
+    pub fn a_compile_is_held(&self) -> bool {
+        self.hosted
+            .environment()
+            .state_dir()
+            .join(COMPILE_GATE_REACHED)
+            .exists()
+    }
+
+    /// Opens the gate: the compiles the plugin host queued go on.
+    pub fn let_the_compiles_go(&self) {
+        let gate = self.hosted.environment().state_dir().join(COMPILE_GATE);
+        match std::fs::remove_file(&gate) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("the gate is not opened: {error}"),
+        }
     }
 
     /// Waits until a binding is registered and ready to be offered observations.

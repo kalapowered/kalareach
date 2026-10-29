@@ -21,7 +21,9 @@ path = "src/bin/kr-plugin-host.rs"
 # which a workspace test run does by itself. It also builds a host that holds every registration it
 # is sent, before it reads or compiles anything, while a file named `hold-registrations` is in its
 # environment's state directory, which the Windows case of a host that ends with a registration
-# unanswered relies on.
+# unanswered relies on. While a file named `hold-compiles` is there, it queues each compile behind
+# a hold on its compile pool, which the case of a terminal that goes on beside a compile that is
+# not done relies on.
 testing = ["kr-plugin-runtime/testing"]
 
 [dependencies]
