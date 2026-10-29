@@ -280,6 +280,8 @@ struct State {
     token_endpoint_down: Option<u16>,
     /// The reply the release matrix route publishes, as the text a test gave it.
     release_matrix: Option<Vec<u8>>,
+    /// The reply the service description route publishes, as the text a test gave it.
+    service_description: Option<Vec<u8>>,
 }
 
 /// What the service did with one request.
@@ -900,6 +902,18 @@ impl ServiceWeb {
         self.state.lock().expect("the state").release_matrix = None;
     }
 
+    /// Publishes `reply` at the service description route, exactly as given: a test that signs it
+    /// with [`signed_service_description`](crate::signed_service_description) serves a description
+    /// a client accepts under that key, and one that alters the text serves what a client refuses.
+    pub fn publish_service_description(&self, reply: &[u8]) {
+        self.state.lock().expect("the state").service_description = Some(reply.to_vec());
+    }
+
+    /// Stops publishing: the route answers `404 NOT_FOUND`, as a service with no description does.
+    pub fn withdraw_service_description(&self) {
+        self.state.lock().expect("the state").service_description = None;
+    }
+
     /// How many requests went to `path`, reaching the service or not.
     #[must_use]
     pub fn requests_to(&self, path: &str) -> usize {
@@ -1199,6 +1213,10 @@ impl ServiceWeb {
             let state = self.state.lock().expect("the state");
             return crate::matrix::answer(state.release_matrix.as_deref());
         }
+        if path == crate::description::PATH {
+            let state = self.state.lock().expect("the state");
+            return crate::description::answer(state.service_description.as_deref());
+        }
         if path == "/api/relay/payer-authorisation/sign-in" {
             let mut state = self.state.lock().expect("the state");
             let State { relay, tokens, .. } = &mut *state;
@@ -1430,8 +1448,8 @@ impl ServiceHttp for ServiceWeb {
         url: &'a str,
         _headers: &'a [(&'a str, &'a str)],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
-        // The only read the service has is the release matrix, which is public: no body, no
-        // credential and no account.
+        // The only reads the service has are the release matrix and the service description,
+        // which are public: no body, no credential and no account.
         let handled = self.handle(
             self.path_of(url),
             &serde_json::json!({ "body": null }),

@@ -97,6 +97,7 @@
 //! | A new lease is installed on the relay instance the service selects when it is issued (the stand-in sets it with `name_relay_url`, and has one instance at a time), and every answer about the lease names that instance: a refill keeps the instance it was issued on | source only | `relay/lease.ts` `issueNew`, `refillExisting`; `relay/instances.ts` `selectInstance`, `readSelectable` | `a_pairs_traffic_crosses_the_relay_its_lease_is_installed_on`, `a_host_keeps_its_leases_on_the_relay_new_leases_land_on` |
 //! | Withdrawing an authorisation revokes the leases issued under it | source only | `relay/index.ts` `withdraw`; `relay/lease.ts` `fenceAuthorisation` | `a_withdrawn_authorisation_ends_the_leases_and_the_owner_is_told_to_sign_in` |
 //! | A pairing admission request is proven by the same credential as a lease request, over the canonical body (`{ host_endpoint_key, candidate_endpoint_key, relay_url }`, domain `kr-relay-admission-request/1`); a relay URL the service does not carry is `state: not_managed` and spends nothing; the service's free budget being spent is `state: unavailable` with the paths that still work and no relay is asked; a pair that holds a live lease at that relay is `state: not_needed`; otherwise it is `state: admitted` with 600 seconds and 512 KiB | source only | `relay/admission.ts` `issueAdmission`, `relay/instances.ts` `findInstanceByUrl`; `relay/index.ts` `admission` | `a_device_pairs_through_the_managed_relay_while_the_host_holds_a_lease` |
+//! | The service description is published at `GET /.well-known/kalareach-service.json` with no body or credential, as `{ description, signature }` with no envelope; the signature is Ed25519 over `CBOR({"kalareach-service-description-v1": { schema_version, network: { relay_urls, pkarr_publisher_url, pkarr_resolver_url, dns_origin }, authority: { origin }, mailbox: { origin }, relay: { origin } }})` with a service it does not name signed as null and a relay map it does not name as an empty list; a deployment with no signing key publishes the description without a signature; the relay map is the registry's selectable relays in canonical form, sorted; a service is named only where it is configured | source only, and a vector made by the Worker's own encoder and `node:crypto` (a local Worker cannot be run here) | `workers/api/src/service-description.ts` | `crates/kr-client/tests/service_description.rs` |
 //! | The per-network rate in front of anonymous admission, the relay's own refusals of an admission (a pair that holds a lease, an allowance that ran out, a replay, a start-up refusal) and the counting of a failure toward the operations alert | not modelled: the stand-in limits no route and always finds the relay willing | `billing/client.ts` `admitAnonymous`, `relay/admission.ts` | `Moment::Refuse`, `carry_relay` |
 //! | The relay installing the lease, the relay's own counting and the settlement's evidence | not modelled: the stand-in answers that the lease is installed and counts the bytes a test says the relay counted | `relay/install.ts`, `relay/settlement.ts` | none |
 //! | Uploads the service has lost answer `NOT_FOUND` | source only | `storage/upload.ts:607` | `Moment::UploadsLost`; the daemon's `an_upload_the_service_lost_or_closed_is_made_again` |
@@ -118,6 +119,7 @@
 //! | A removal of an object is a compared write that carries no object: it takes the next place in the object's order, leaves a tombstone the next write carries on from, frees the object's place in the collection, keeps nothing when its comparison loses, and is answered from a receipt like a write | recorded | `sync/collection.ts:1568-1747` | same |
 //! | An object's replay past the receipts' retention, a restore of the deployment and the membership index being behind the collection | not modelled: a local run sweeps no receipt and puts no collection back, and the index is read from the collections when it is asked | `sync/collection.ts:2477-2520`, `sync/memberships.ts` | none |
 
+mod description;
 mod feed;
 mod http;
 mod mailbox;
@@ -128,6 +130,7 @@ mod settings;
 mod sync;
 mod web;
 
+pub use description::signed as signed_service_description;
 pub use http::{Served, serve};
 pub use matrix::signed as signed_release_matrix;
 pub use organisation::{

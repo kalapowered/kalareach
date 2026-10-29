@@ -1,0 +1,59 @@
+{
+  "web_commit": "3648f5306b7ee04adf3a4eabfe5eece59d46b8c0",
+  "public_key": "ESZTt8qko94XmogxftjUh7zscthwWZ17-LP2PcbLx20",
+  "signing_input_hex": "a178206b616c6172656163682d736572766963652d6465736372697074696f6e2d7631a56572656c6179a1666f726967696e7568747470733a2f2f72656163682e6b616c612e746f676d61696c626f78a1666f726967696e7568747470733a2f2f72656163682e6b616c612e746f676e6574776f726ba46a646e735f6f726967696ef66a72656c61795f75726c7382781d68747470733a2f2f72656c61792d312e72656163682e6b616c612e746f781d68747470733a2f2f72656c61792d322e72656163682e6b616c612e746f72706b6172725f7265736f6c7665725f75726c781f68747470733a2f2f6e73312e72656163682e6b616c612e746f2f706b61727273706b6172725f7075626c69736865725f75726c781f68747470733a2f2f6e73312e72656163682e6b616c612e746f2f706b61727269617574686f72697479a1666f726967696e7568747470733a2f2f72656163682e6b616c612e746f6e736368656d615f76657273696f6e01",
+  "published": {
+    "description": {
+      "schema_version": 1,
+      "network": {
+        "relay_urls": [
+          "https://relay-1.reach.kala.to",
+          "https://relay-2.reach.kala.to"
+        ],
+        "pkarr_publisher_url": "https://ns1.reach.kala.to/pkarr",
+        "pkarr_resolver_url": "https://ns1.reach.kala.to/pkarr"
+      },
+      "authority": {
+        "origin": "https://reach.kala.to"
+      },
+      "mailbox": {
+        "origin": "https://reach.kala.to"
+      },
+      "relay": {
+        "origin": "https://reach.kala.to"
+      }
+    },
+    "signature": "1YTOGngtv5h3QWkWvmkTbRN3kaZT95PJRzH-cMM4wqE_TZGJViiO9RIV78PUVs3OTEhddE3_EnEewNiy32xGBg"
+  },
+  "matrix": {
+    "schemaVersion": 1,
+    "revision": "2",
+    "issuedAt": "2026-10-27",
+    "installedClientWindowDays": 90,
+    "alternatives": [
+      "direct",
+      "self-hosted-relay",
+      "self-hosted-discovery"
+    ],
+    "tiers": [
+      {
+        "id": "2026-10-compatible",
+        "compatible": true,
+        "client": {
+          "minimum": "0.77.0",
+          "maximum": "0.79.99"
+        },
+        "relay": {
+          "minimum": "1.2.0",
+          "maximum": "1.2.99"
+        },
+        "discovery": {
+          "minimum": "1.2.0",
+          "maximum": "1.2.99"
+        }
+      }
+    ]
+  },
+  "matrix_signing_input_hex": "a1736b722d72656c656173652d6d61747269782f31a665746965727381a562696472323032362d31302d636f6d70617469626c656572656c6179a2676d6178696d756d66312e322e3939676d696e696d756d65312e322e3066636c69656e74a2676d6178696d756d67302e37392e3939676d696e696d756d66302e37372e3069646973636f76657279a2676d6178696d756d66312e322e3939676d696e696d756d65312e322e306a636f6d70617469626c65f5687265766973696f6e6132696973737565645f61746a323032362d31302d32376c616c7465726e61746976657383666469726563747173656c662d686f737465642d72656c61797573656c662d686f737465642d646973636f766572796e736368656d615f76657273696f6e01781c696e7374616c6c65645f636c69656e745f77696e646f775f64617973185a",
+  "matrix_signature": "8wRKJZgtV5QJr3jcb74yZHZeqjyGWizLAaLTXtyi2qy23v8_LWK9-8SLw6FCXPWRmRbPVA-rQFkuowqOZQhYCg"
+}

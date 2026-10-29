@@ -111,26 +111,27 @@ async fn connection(mut socket: TcpStream, web: Arc<ServiceWeb>) {
     let carries_content = received
         .header("content-type")
         .is_some_and(|kind| kind.starts_with("application/octet-stream"));
-    let parsed = if received.path == crate::matrix::PATH {
-        // A read: public, no body and no credential, so it is not a signed request.
-        Ok(serde_json::json!({ "body": serde_json::Value::Null }))
-    } else if crate::organisation::is_organisation_route(&received.path) {
-        // Proven by the account's bearer token alone: the body is the request, and a read has none.
-        if received.body.is_empty() {
+    let parsed =
+        if received.path == crate::matrix::PATH || received.path == crate::description::PATH {
+            // A read: public, no body and no credential, so it is not a signed request.
             Ok(serde_json::json!({ "body": serde_json::Value::Null }))
+        } else if crate::organisation::is_organisation_route(&received.path) {
+            // Proven by the account's bearer token alone: the body is the request, and a read has none.
+            if received.body.is_empty() {
+                Ok(serde_json::json!({ "body": serde_json::Value::Null }))
+            } else {
+                serde_json::from_slice::<serde_json::Value>(&received.body)
+                    .map(|body| serde_json::json!({ "body": body }))
+                    .map_err(|_| ())
+            }
+        } else if carries_content {
+            received
+                .header("kr-service-request")
+                .map(document_of)
+                .ok_or(())
         } else {
-            serde_json::from_slice::<serde_json::Value>(&received.body)
-                .map(|body| serde_json::json!({ "body": body }))
-                .map_err(|_| ())
-        }
-    } else if carries_content {
-        received
-            .header("kr-service-request")
-            .map(document_of)
-            .ok_or(())
-    } else {
-        serde_json::from_slice(&received.body).map_err(|_| ())
-    };
+            serde_json::from_slice(&received.body).map_err(|_| ())
+        };
     let handled = match &parsed {
         Ok(document) => web.handle(
             &received.path,

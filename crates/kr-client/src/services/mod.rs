@@ -123,6 +123,7 @@ pub mod account;
 pub mod admission;
 pub mod authority;
 pub mod backup;
+pub mod description;
 pub mod http;
 pub mod json;
 pub mod mailbox;
@@ -226,6 +227,7 @@ pub fn managed_response_limits() -> ResponseLimits {
             backup::BACKUP_ANSWER_LIMIT_BYTES,
         )
         .for_path(matrix::PATH, matrix::MAX_ANSWER_BYTES)
+        .for_path(description::PATH, description::MAX_ANSWER_BYTES)
 }
 
 /// How this module's rule about what is never rendered is checked.

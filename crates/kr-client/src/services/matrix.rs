@@ -107,6 +107,24 @@ impl Pins {
     pub const fn of(keys: Vec<AuthorisationKey>) -> Self {
         Self(keys)
     }
+
+    /// The one key a person gives for a service they run, as unpadded base64url of its 32 bytes.
+    /// Text that is not such a key gives nothing.
+    #[must_use]
+    pub fn from_key_text(text: &str) -> Option<Self> {
+        decode_key(text).map(|key| Self(vec![key]))
+    }
+
+    /// Whether the signature verifies over the transcript under one of the keys.
+    pub(crate) fn vouches_for(
+        &self,
+        transcript: &SigningTranscript,
+        signature: &Signature64,
+    ) -> bool {
+        self.0
+            .iter()
+            .any(|key| verify(key, transcript, signature).is_ok())
+    }
 }
 
 /// A key, from unpadded base64url of its 32 bytes.
