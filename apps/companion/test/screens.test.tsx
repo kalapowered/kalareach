@@ -216,6 +216,21 @@ describe('the semantic view', () => {
     expect(screen.getByTestId('composer-queue')).toBeInTheDocument()
   })
 
+  // KR-REQ-15.22: cancelling a coding task is the composer's typed interrupt, which names the turn
+  // the agent's binding is on. The host refuses a turn that is not the one running, so the turn
+  // ending is the proof that the request carried the current one.
+  it('cancels the turn the binding is on with the typed interrupt', async () => {
+    const { controls } = start({ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' })
+    const interrupt = await screen.findByTestId('composer-interrupt')
+    expect(controls.records.agentOf(SESSION_MAIN).binding.turn_id).not.toBeNull()
+
+    await userEvent.click(interrupt)
+
+    await waitFor(() => {
+      expect(controls.records.agentOf(SESSION_MAIN).binding.turn_id).toBeNull()
+    })
+  })
+
   it('offers neither a queue nor steering where the upstream offers neither', async () => {
     start({ view: 'session', sessionId: '8a7b6c50-22bb-4c3d-8e4f-000000000102', pane: 'semantic' })
     const send = await screen.findByTestId('composer-send')

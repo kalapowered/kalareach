@@ -293,9 +293,10 @@ async fn every_agent_read_goes_to_the_sessions_worker_on_one_link() {
     assert_eq!(page.links(), 1);
 }
 
-/// KR-REQ-13.12: each composer action is its own mutation on the session's worker, and its envelope
-/// names what the parameters name and nothing the page chose: the worker's environment, its session
-/// at its epoch, the instance and the binding revision the action was prepared against.
+/// KR-REQ-13.12 and KR-REQ-15.22: each composer action is its own mutation on the session's worker,
+/// and its envelope names what the parameters name and nothing the page chose: the worker's
+/// environment, its session at its epoch, the instance and the binding revision the action was
+/// prepared against. A cancellation is the typed `agent.turn.cancel` and carries the turn it names.
 #[tokio::test(flavor = "multi_thread")]
 async fn each_agent_mutation_names_the_workers_session_the_instance_and_the_revision() {
     let mut worker = ScriptedWorker::start(Challenge::Answered);
@@ -357,7 +358,8 @@ async fn each_agent_mutation_names_the_workers_session_the_instance_and_the_revi
                 let _: AgentSteerParams = call.params();
             }
             Method::AgentTurnCancel => {
-                let _: AgentCancelParams = call.params();
+                let cancel: AgentCancelParams = call.params();
+                assert_eq!(cancel.turn_id, turn(), "the cancellation names its turn");
             }
             _ => {
                 let _: AgentApprovalRespondParams = call.params();
