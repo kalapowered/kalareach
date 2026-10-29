@@ -2773,8 +2773,9 @@ fn trusted() -> kr_cli::update::release::ChannelRoot {
         .expect("the root is there")
 }
 
-/// KR-REQ-26.09: a manifest is taken only when a threshold of the keys the trusted root names for
-/// its targets role signed it, over exactly what it says.
+/// KR-REQ-26.09, KR-REQ-26.37: a manifest is taken only when a threshold of the keys the trusted
+/// root names for its targets role signed it, over exactly what it says: a signature by a key the
+/// root names for no targets role, by a stranger, or over a changed document is rejected.
 #[cfg(unix)]
 #[test]
 fn a_manifest_is_taken_only_as_the_root_s_targets_keys_signed_it() {
@@ -2808,8 +2809,8 @@ fn a_manifest_is_taken_only_as_the_root_s_targets_keys_signed_it() {
     assert!(ReleaseManifest::read_document(repeated.as_bytes()).is_err());
 }
 
-/// A release carries the host's root or the one that follows it, signed by the host's root keys and
-/// its own; any other root is refused.
+/// KR-REQ-26.37: a root rotates only to its successor. A release carries the host's root or the one
+/// that follows it, signed by the host's root keys and its own; any other root is refused.
 #[cfg(unix)]
 #[test]
 fn a_channel_root_is_followed_only_by_its_successor() {
