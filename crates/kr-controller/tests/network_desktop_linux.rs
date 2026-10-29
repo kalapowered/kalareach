@@ -27,13 +27,22 @@ fn typed<T: kr_protocol::wire::WireMessage>(value: &ParamsValue) -> T {
     value.to_typed().expect("a result of the declared shape")
 }
 
-/// What one display-server record tells whoever reads it.
+/// What one display-server record tells whoever reads it, with each name as the number of bytes it
+/// has: the owner is told the name, and a device is told its class and its length.
 #[derive(Debug, PartialEq, Eq)]
 struct Told {
     server: DisplayServer,
-    schema: Option<String>,
-    compositor_named: bool,
-    application: Option<String>,
+    schema_bytes: Option<usize>,
+    compositor_bytes: Option<usize>,
+    application_bytes: Option<usize>,
+}
+
+/// The length of a name as the reader of the answer is told it.
+fn bytes_of(name: &str) -> usize {
+    name.strip_prefix("[name withheld, ")
+        .and_then(|rest| rest.strip_suffix(" bytes]"))
+        .and_then(|length| length.parse().ok())
+        .unwrap_or(name.len())
 }
 
 fn told(answer: &EnvironmentCapabilitiesResult) -> Told {
@@ -43,9 +52,18 @@ fn told(answer: &EnvironmentCapabilitiesResult) -> Told {
         .expect("the display server has a record of its own");
     Told {
         server: answer.desktop.desktop.display_server,
-        schema: record.identity.schema.as_ref().cloned(),
-        compositor_named: answer.desktop.desktop.compositor.is_present(),
-        application: record.subject.application.as_ref().cloned(),
+        schema_bytes: record.identity.schema.as_ref().map(|name| bytes_of(name)),
+        compositor_bytes: answer
+            .desktop
+            .desktop
+            .compositor
+            .as_ref()
+            .map(|name| bytes_of(name)),
+        application_bytes: record
+            .subject
+            .application
+            .as_ref()
+            .map(|name| bytes_of(name)),
     }
 }
 
@@ -148,11 +166,15 @@ async fn a_device_is_told_x11_wayland_and_the_compositor_apart() {
     let [x11, sway, gnome] = &answers[..] else {
         panic!("three sessions were read");
     };
-    assert_eq!(x11.schema.as_deref(), Some("x11"));
-    assert_eq!(sway.schema.as_deref(), Some("wayland"));
-    assert!(!x11.compositor_named && sway.compositor_named && gnome.compositor_named);
+    assert_eq!(x11.schema_bytes, Some("x11".len()));
+    assert_eq!(sway.schema_bytes, Some("wayland".len()));
+    assert!(
+        x11.compositor_bytes.is_none()
+            && sway.compositor_bytes.is_some()
+            && gnome.compositor_bytes.is_some()
+    );
     assert_ne!(
-        sway.application, gnome.application,
+        sway, gnome,
         "two compositors under one display server are two answers"
     );
 }
