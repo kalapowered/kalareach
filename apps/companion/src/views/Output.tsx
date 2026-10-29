@@ -121,8 +121,8 @@ export function RetainedOutput({
   const now = useCallback(() => sessions.get(sessionId).output, [sessions, sessionId])
   // Where the reader was before pages came or went, restored once they have been laid out.
   const keep = useRef<{ readonly from: string; readonly offset: number } | null>(null)
-  // One read at a time.
-  const reading = useRef(false)
+  // One read at a time under an opening: the opening that made it, while one is on its way.
+  const reading = useRef<{ readonly under: string | undefined } | null>(null)
   // Where the reader is now, kept as they scroll and recorded as they leave.
   const position = useRef<OutputWindow['anchor']>(null)
   const [initial] = useState(() => output)
@@ -203,21 +203,25 @@ export function RetainedOutput({
   /** Runs one read, unless one is on its way, and says what the host refused. */
   const run = useCallback(
     (read: () => Promise<void>): Promise<void> => {
-      // An opening that is not open reads nothing; reading starts when it is.
-      if (waiting || reading.current) return Promise.resolve()
-      reading.current = true
+      // An opening that is not open reads nothing; reading starts when it is. A read still on its
+      // way under an opening that has been replaced does not hold up the one that replaced it.
+      if (waiting || (reading.current !== null && reading.current.under === token)) {
+        return Promise.resolve()
+      }
+      const mine = { under: token }
+      reading.current = mine
       return read()
         .then(() => {
-          setFailure(null)
+          if (under.current === token) setFailure(null)
         })
         .catch((error: unknown) => {
-          setFailure(failureMessage(error))
+          if (under.current === token) setFailure(failureMessage(error))
         })
         .finally(() => {
-          reading.current = false
+          if (reading.current === mine) reading.current = null
         })
     },
-    [waiting]
+    [waiting, token]
   )
 
   /** Finds where the output ends now, and reads the page before it. */

@@ -179,5 +179,37 @@ describe("the phone's output is the grant the screen opened the session under (K
       expect(screen.getByTestId('output-scroll').textContent).toContain('finished 900 tests')
     })
   })
+
+  it('reads under the new opening while a read made under the old one is still on its way', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    const view = render(screenOn(port))
+    await person.click(screen.getByRole('tab', { name: 'Output' }))
+    await waitFor(() => {
+      expect(held()).toHaveLength(1)
+    })
+
+    // The next read at the live end, made under the pairing, is on its way when the grant changes.
+    const reads = controls.hold('historyPage')
+    await waitFor(
+      () => {
+        expect(reads.count).toBe(1)
+      },
+      { timeout: 5000 }
+    )
+    controls.standings.answerOpens(SESSION_MAIN, OPEN_UNDER_SHARE)
+    view.rerender(screenOn(port, SHARE))
+
+    // The share's own first read is made without waiting for the old one to end, and what the old
+    // one answers is not shown.
+    await waitFor(() => {
+      expect(reads.count).toBeGreaterThan(1)
+    })
+    reads.release()
+    await waitFor(() => {
+      expect(screen.getByTestId('output-scroll').textContent).toContain('finished 900 tests')
+    })
+    expect(held()).toHaveLength(1)
+  })
 })
 
