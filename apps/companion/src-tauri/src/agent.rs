@@ -28,7 +28,7 @@ use kr_client::{ClientError, Session};
 use kr_ipc::paths::EnvironmentPaths;
 use kr_protocol::agent::AgentMutationTarget;
 use kr_protocol::envelope::ActionTarget;
-use kr_protocol::error::ErrorCode;
+use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::gateway::PendingResource;
 use kr_protocol::ids::{
     AgentBindingRevision, ApplicationInstanceId, CapabilityId, EnvironmentId, GrantId,
@@ -545,10 +545,15 @@ impl WorkerLinks {
         answer: std::result::Result<T, ClientError>,
     ) -> Result<T> {
         answer.map_err(|error| {
-            if ends_the_link(&error) {
+            let ended = if ends_the_link(&error) {
+                // Read first: it is this device that says why, and letting the link go closes it.
+                let ended = link.session.transport().ended_by_this_device();
                 self.forget(state, session_id, link);
-            }
-            CommandError::from(error)
+                ended
+            } else {
+                None
+            };
+            answered(error, ended)
         })
     }
 
@@ -594,6 +599,13 @@ pub(crate) fn ends_the_link(error: &ClientError) -> bool {
     )
 }
 
+/// What a call that failed answers. A call that found the connection ended answers why, in the
+/// account's words, when this device ended it for the account's sake, and not that the connection
+/// was lost.
+fn answered(error: ClientError, ended_by_this_device: Option<ProtocolError>) -> CommandError {
+    ended_by_this_device.map_or_else(|| CommandError::from(error), CommandError::from)
+}
+
 /// Whether a failure means the host let go of the snapshot a page was continuing.
 fn lets_the_snapshot_go(error: &ClientError) -> bool {
     matches!(error, ClientError::ResyncRequired)
@@ -629,6 +641,17 @@ mod tests {
                 "{code:?}"
             );
         }
+    }
+
+    /// A call that finds the connection ended because this device ended it for the account answers
+    /// why; one that finds it lost answers that it was lost.
+    #[test]
+    fn a_connection_this_device_ended_answers_why() {
+        let why = ProtocolError::new(ErrorCode::HostNotConfigured, "sign in to use this host");
+        let ended = answered(ClientError::ConnectionEnded, Some(why.clone()));
+        assert_eq!((ended.code, ended.message), (why.code, why.message));
+        let lost = answered(ClientError::ConnectionEnded, None);
+        assert_eq!(lost.code, ErrorCode::ResourceUnavailable);
     }
 
     /// A snapshot the host let go is started again; any other refusal is the answer.
