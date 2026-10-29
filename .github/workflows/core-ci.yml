@@ -2307,14 +2307,23 @@ jobs:
     runs-on: macos-15
     strategy:
       fail-fast: false
-      # Two runners, one definition. They set up the same way and then divide the work, so that the
-      # tests and the demonstrations do not wait for one another: `tests` runs the lint and the
-      # workspace's tests, and `demonstrations` the end-to-end demonstrations and the performance
-      # measurements. A step that names neither part is both's.
+      # Three runners, one definition. They set up the same way and then divide the work, so that
+      # the tests and the demonstrations do not wait for one another. `tests` runs the lint, the
+      # controller's tests and the cases that need a filesystem or a clock of their own;
+      # `tests-second` runs the tests of every other package; `demonstrations` runs the end-to-end
+      # demonstrations and the performance measurements. A step that names no part is every
+      # part's. The two that run tests build the whole workspace's tests and then run the packages
+      # their `packages` names. The controller's tests are 43 of the 105 minutes that the
+      # workspace's tests take to run, so they are one runner's alone; the other takes the
+      # workspace less kr-sync-integration and the controller, and so tests a package added later.
       matrix:
         include:
           - name: macos
             part: tests
+            packages: -p kr-controller
+          - name: macos-second
+            part: tests-second
+            packages: --workspace --exclude kr-sync-integration --exclude kr-controller
           - name: macos-demonstrations
             part: demonstrations
     # Every step has a limit of its own, and the limits add up to less than this one, so a step that
@@ -2557,26 +2566,32 @@ jobs:
         timeout-minutes: 2
         run: bash scripts/disk-report.sh step "the documentation"
 
-      # The workspace's tests, less what this runner cannot run, each left out by name here:
+      # The workspace's tests, built whole by each of the two runners that run them. The suites
+      # start programs that lie beside them and that other packages build, so a build of only the
+      # packages a runner tests would leave some out. The step after this one runs the runner's
+      # own packages. Cargo settles the features of a run from the packages it names: the second
+      # runner's packages settle them as the whole workspace does and build nothing again, and the
+      # controller's alone build the crates under its tests once more with the features its own
+      # tests ask for.
+      - name: Build the workspace's tests
+        if: ${{ !cancelled() && startsWith(matrix.part, 'tests') }}
+        timeout-minutes: 70
+        run: cargo test --locked --workspace --exclude kr-sync-integration --no-run
+
+      # The tests of the packages this runner's `packages` names, less what this runner cannot run,
+      # each left out by name here:
       #
       # - kr-sync-integration, every test of which is a leg against a live deployment and does
       #   nothing without one. The rust job runs each leg against the deployment it names.
       # - The container cases, which need podman, and this runner has none. The rust job's runner
       #   has it, and its test step runs them.
       # - The cases that need another filesystem, and the cases whose verdicts are timings, which
-      #   the two steps after this one run.
-      #
-      # The step builds the workspace's tests and then runs them, and it grows with the tests. On a
-      # hosted runner it has taken 108 to 141 minutes when it passed, and on a runner 15 to 30 per
-      # cent slower in every suite it ran into a limit of 145 minutes with 38 suites not started.
-      # Its limit is 197 minutes, the most that this job's limit leaves once the other steps of
-      # this part have theirs: the limits of the part add up to 354 of the job's 355 minutes.
-      # That is under twice the longest it has taken.
+      #   the two steps after this one run on the first runner.
       - name: Test
-        if: ${{ !cancelled() && matrix.part == 'tests' }}
-        timeout-minutes: 197
+        if: ${{ !cancelled() && startsWith(matrix.part, 'tests') }}
+        timeout-minutes: 125
         run: >-
-          cargo test --locked --workspace --exclude kr-sync-integration --no-fail-fast --
+          cargo test --locked ${{ matrix.packages }} --no-fail-fast --
           --skip the_helper_inside_a_container_refuses_a_handshake_that_declares_a_network_actor
           --skip a_running_container_is_observed_as_running_and_a_stopped_one_as_stopped
           --skip a_reused_container_name_is_not_the_identity_that_was_enrolled
@@ -2607,7 +2622,7 @@ jobs:
       # the step needs: the cases that stage a release refuse to start with less than their own
       # margin to spare.
       - name: What the disk holds after the workspace's tests
-        if: ${{ !cancelled() && matrix.part == 'tests' }}
+        if: ${{ !cancelled() && startsWith(matrix.part, 'tests') }}
         continue-on-error: true
         timeout-minutes: 2
         run: bash scripts/disk-report.sh step "the workspace's tests"
@@ -2824,7 +2839,7 @@ jobs:
       # What the disk had left once every step above was done, and for the tests the lowest free
       # space of every stretch of the job.
       - name: What the disk has left
-        if: ${{ !cancelled() && matrix.part == 'tests' }}
+        if: ${{ !cancelled() && startsWith(matrix.part, 'tests') }}
         continue-on-error: true
         timeout-minutes: 2
         run: bash scripts/disk-report.sh end "what the disk has left"
