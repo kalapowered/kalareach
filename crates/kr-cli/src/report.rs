@@ -297,11 +297,15 @@ pub fn session_line(summary: &SessionSummary) -> Line {
         SessionState::Closing => "closing",
         SessionState::Closed => "closed",
     };
-    // The application is the name of a program, which the person who asked for the list is shown;
-    // a session with none in its foreground has a dash in its column.
+    // The application is the name of a program, which the person who asked for the list is shown,
+    // with anything a terminal would act on or hide written out; a session with none in its
+    // foreground has a dash in its column.
     let application = Asked::text(
         Request::Sessions,
-        summary.application.as_deref().unwrap_or("-"),
+        &summary
+            .application
+            .as_deref()
+            .map_or_else(|| "-".to_owned(), crate::share::visibly),
     );
     stdout_line!(
         "{}  {} {} {}x{} {} attachment{}  {}  {}",
@@ -1238,6 +1242,26 @@ mod tests {
         assert_eq!(
             session_line(&summary).text(),
             "   3  live     native_compat   120x40   1 attachment  -               /bin/zsh"
+        );
+    }
+
+    /// KR-REQ-13.10: the application a session's line names is written out where a terminal would
+    /// act on it or hide it, so a program's name cannot turn the shell path after it round; the
+    /// document a script reads keeps the name as the worker reported it.
+    #[test]
+    fn the_application_in_a_line_is_written_out_where_a_terminal_would_hide_it() {
+        let mut summary = summary_for_tests();
+        summary.application = Some("claude\u{202e}gnp".to_owned());
+        let line = session_line(&summary);
+        assert!(
+            line.text().contains("claude\\u{202e}gnp"),
+            "the line writes the override out: {}",
+            line.text()
+        );
+        assert!(!line.text().contains('\u{202e}'), "{}", line.text());
+        assert_eq!(
+            session(&summary).json()["application"],
+            json!("claude\u{202e}gnp")
         );
     }
 
