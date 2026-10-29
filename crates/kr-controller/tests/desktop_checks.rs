@@ -357,6 +357,88 @@ async fn a_later_run_replaces_the_findings_and_moves_the_revision_only_when_they
     adopted.stop().await;
 }
 
+/// KR-REQ-03.29: a permission withdrawn between two runs is found by the second one, as
+/// `permission_required`, and not before: the daemon cannot read a permission, so what the first run
+/// found stands until the checks are performed again, and the repeat moves the capability revision.
+///
+/// The permission is the one the filesystem keeps for the nominated file, which the worker meets the
+/// way it meets a privacy grant: it performs the read and the operating system answers.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_permission_withdrawn_is_found_by_the_next_run_and_not_before() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    assert_ne!(
+        kr_ipc::paths::current_uid(),
+        0,
+        "run as an ordinary user: the superuser reads through a withdrawn permission"
+    );
+    let adopted = Adopted::start_with_document(1, &headless()).await;
+    let host = &adopted.host;
+    let directory = tempfile::tempdir().expect("a directory of this test's own");
+    let file = directory.path().join("authorised.txt");
+    std::fs::write(&file, b"the person nominated this").expect("the test's file");
+
+    ask(host, ActionId::new(kr_ipc::new_uuid()), Some(&file))
+        .await
+        .expect("asked");
+    let ready = until(host, CapabilityChecksState::Current).await;
+    let before = ready
+        .desktop
+        .record(capabilities::AUTHORISED_FILE_READ)
+        .expect("the read check has a record")
+        .clone();
+    assert_eq!(before.state, CapabilityState::QualifiedAvailable);
+    let finished = ready
+        .checks
+        .finished_at_ms
+        .0
+        .expect("a finished run says when");
+
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000))
+        .expect("the permission is withdrawn");
+    // Nothing the daemon can read moved, so nothing ends what the first run found.
+    let standing = shown(host).await;
+    assert_eq!(standing.checks.state, CapabilityChecksState::Current);
+    assert_eq!(
+        standing
+            .desktop
+            .record(capabilities::AUTHORISED_FILE_READ)
+            .expect("the read check still has its record")
+            .state,
+        CapabilityState::QualifiedAvailable,
+        "the finding stands until the checks are performed again"
+    );
+
+    ask(host, ActionId::new(kr_ipc::new_uuid()), Some(&file))
+        .await
+        .expect("asked again");
+    let repeated = until_a_run_after(host, finished).await;
+    let after = repeated
+        .desktop
+        .record(capabilities::AUTHORISED_FILE_READ)
+        .expect("the read check has a record");
+    assert_eq!(
+        after.state,
+        CapabilityState::PermissionRequired,
+        "{:?}",
+        after.disabled_reason
+    );
+    assert_eq!(
+        after.evidence_source,
+        CapabilityEvidenceSource::DisclosedProbe
+    );
+    assert!(
+        after.revision.get() > before.revision.get(),
+        "a finding that changed is a change of evidence"
+    );
+
+    // The directory is removed after the permission is given back, which a tempdir needs.
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
+        .expect("the permission is given back");
+    adopted.stop().await;
+}
+
 /// KR-REQ-03.29: the answer given to a request for the checks is kept for 30 days and outlives the
 /// daemon: a repeat on a later connection after a restart, when the window it was sent in is gone,
 /// is given the answer it was given and no run of its own, and another request under the same
