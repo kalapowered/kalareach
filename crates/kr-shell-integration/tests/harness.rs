@@ -196,8 +196,10 @@ fn a_scenario_that_ends_in_a_late_installation_says_so_in_its_purpose() {
             continue;
         }
         assert!(
-            scenario.purpose.contains("late installation"),
-            "{} replays a reader's late installation and its purpose does not say so: {}",
+            scenario.purpose.contains("late installation")
+                && !scenario.purpose.contains("the caller gets EDITOR_BUSY"),
+            "{} replays a reader's late installation and its purpose does not say so, or says its \
+             caller gets EDITOR_BUSY: {}",
             scenario.id,
             scenario.purpose
         );
