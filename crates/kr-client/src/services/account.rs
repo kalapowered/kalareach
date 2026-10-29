@@ -70,6 +70,8 @@ use sha2::Digest as _;
 use subtle::ConstantTimeEq as _;
 use url::Url;
 
+pub mod deletion;
+
 use super::json::Unreadable;
 use super::{ServiceFuture, ServiceHttpAnswer};
 use crate::error::{ClientError, Result};

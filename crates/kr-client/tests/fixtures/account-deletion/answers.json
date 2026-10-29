@@ -1,0 +1,502 @@
+{
+  "preview": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "data": {
+        "address": "r***@ts.org",
+        "warnings": [],
+        "deleted": [
+          "sign_ins",
+          "passkeys_and_address",
+          "backup_records",
+          "recovery_bundle",
+          "relay_and_voice_ended",
+          "payment_record",
+          "organisation_memberships",
+          "device_registrations"
+        ],
+        "kept": [
+          "billing_records",
+          "relay_records",
+          "call_records",
+          "reasoning_records",
+          "backup_index_rows",
+          "organisation_records",
+          "device_records",
+          "recovery_copies",
+          "other_services"
+        ],
+        "choices": {
+          "subscription": "end_at_once",
+          "refund": "none",
+          "credit": "forfeited",
+          "keptRecordsYears": 7
+        },
+        "codeDigits": 8,
+        "codeLifetimeSeconds": 300,
+        "backupFileDays": 7
+      }
+    }
+  },
+  "preview_with_warnings": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "data": {
+        "address": "r***@ts.org",
+        "warnings": [
+          {
+            "kind": "organisation_owner",
+            "organisation_id": "org-1",
+            "name": "Acme",
+            "members": 4
+          },
+          {
+            "kind": "subscription"
+          },
+          {
+            "kind": "credit"
+          },
+          {
+            "kind": "money_owed"
+          }
+        ],
+        "deleted": [
+          "sign_ins",
+          "passkeys_and_address",
+          "backup_records",
+          "recovery_bundle",
+          "relay_and_voice_ended",
+          "payment_record",
+          "organisation_memberships",
+          "device_registrations"
+        ],
+        "kept": [
+          "billing_records",
+          "relay_records",
+          "call_records",
+          "reasoning_records",
+          "backup_index_rows",
+          "organisation_records",
+          "device_records",
+          "recovery_copies",
+          "other_services"
+        ],
+        "choices": {
+          "subscription": "end_at_once",
+          "refund": "none",
+          "credit": "forfeited",
+          "keptRecordsYears": 7
+        },
+        "codeDigits": 8,
+        "codeLifetimeSeconds": 300,
+        "backupFileDays": 7
+      }
+    }
+  },
+  "preview_unknown_deleted_key": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "data": {
+        "address": "r***@ts.org",
+        "warnings": [],
+        "deleted": [
+          "sign_ins",
+          "passkeys_and_address",
+          "backup_records",
+          "recovery_bundle",
+          "relay_and_voice_ended",
+          "payment_record",
+          "organisation_memberships",
+          "device_registrations",
+          "some_new_kind"
+        ],
+        "kept": [
+          "billing_records",
+          "relay_records",
+          "call_records",
+          "reasoning_records",
+          "backup_index_rows",
+          "organisation_records",
+          "device_records",
+          "recovery_copies",
+          "other_services"
+        ],
+        "choices": {
+          "subscription": "end_at_once",
+          "refund": "none",
+          "credit": "forfeited",
+          "keptRecordsYears": 7
+        },
+        "codeDigits": 8,
+        "codeLifetimeSeconds": 300,
+        "backupFileDays": 7
+      }
+    }
+  },
+  "preview_unknown_kept_key": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "data": {
+        "address": "r***@ts.org",
+        "warnings": [],
+        "deleted": [
+          "sign_ins",
+          "passkeys_and_address",
+          "backup_records",
+          "recovery_bundle",
+          "relay_and_voice_ended",
+          "payment_record",
+          "organisation_memberships",
+          "device_registrations"
+        ],
+        "kept": [
+          "billing_records",
+          "relay_records",
+          "call_records",
+          "reasoning_records",
+          "backup_index_rows",
+          "organisation_records",
+          "device_records",
+          "recovery_copies",
+          "other_services",
+          "some_new_kind"
+        ],
+        "choices": {
+          "subscription": "end_at_once",
+          "refund": "none",
+          "credit": "forfeited",
+          "keptRecordsYears": 7
+        },
+        "codeDigits": 8,
+        "codeLifetimeSeconds": 300,
+        "backupFileDays": 7
+      }
+    }
+  },
+  "preview_unknown_warning": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "data": {
+        "address": "r***@ts.org",
+        "warnings": [
+          {
+            "kind": "some_new_warning"
+          }
+        ],
+        "deleted": [
+          "sign_ins",
+          "passkeys_and_address",
+          "backup_records",
+          "recovery_bundle",
+          "relay_and_voice_ended",
+          "payment_record",
+          "organisation_memberships",
+          "device_registrations"
+        ],
+        "kept": [
+          "billing_records",
+          "relay_records",
+          "call_records",
+          "reasoning_records",
+          "backup_index_rows",
+          "organisation_records",
+          "device_records",
+          "recovery_copies",
+          "other_services"
+        ],
+        "choices": {
+          "subscription": "end_at_once",
+          "refund": "none",
+          "credit": "forfeited",
+          "keptRecordsYears": 7
+        },
+        "codeDigits": 8,
+        "codeLifetimeSeconds": 300,
+        "backupFileDays": 7
+      }
+    }
+  },
+  "preview_unknown_choice": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "data": {
+        "address": "r***@ts.org",
+        "warnings": [],
+        "deleted": [
+          "sign_ins",
+          "passkeys_and_address",
+          "backup_records",
+          "recovery_bundle",
+          "relay_and_voice_ended",
+          "payment_record",
+          "organisation_memberships",
+          "device_registrations"
+        ],
+        "kept": [
+          "billing_records",
+          "relay_records",
+          "call_records",
+          "reasoning_records",
+          "backup_index_rows",
+          "organisation_records",
+          "device_records",
+          "recovery_copies",
+          "other_services"
+        ],
+        "choices": {
+          "subscription": "end_at_once",
+          "refund": "prorated",
+          "credit": "forfeited",
+          "keptRecordsYears": 7
+        },
+        "codeDigits": 8,
+        "codeLifetimeSeconds": 300,
+        "backupFileDays": 7
+      }
+    }
+  },
+  "code_sent": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "data": {
+        "sent": true
+      }
+    }
+  },
+  "code_rate_limited": {
+    "status": 429,
+    "body": {
+      "ok": false,
+      "error": {
+        "code": "RATE_LIMITED",
+        "message": "Too many attempts. Try again shortly.",
+        "retryAfterSeconds": 900
+      }
+    },
+    "headers": {
+      "Retry-After": "900"
+    }
+  },
+  "code_mail_failed": {
+    "status": 503,
+    "body": {
+      "ok": false,
+      "error": {
+        "code": "SERVICE_UNAVAILABLE",
+        "message": "The code could not be sent just now. Try again shortly.",
+        "retryAfterSeconds": 30
+      }
+    },
+    "headers": {
+      "Retry-After": "30"
+    }
+  },
+  "confirm_closed_deleted": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "data": {
+        "result": "closed",
+        "state": "deleted"
+      }
+    }
+  },
+  "confirm_closed_closing": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "data": {
+        "result": "closed",
+        "state": "closing"
+      }
+    }
+  },
+  "confirm_wrong": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "data": {
+        "result": "code_refused",
+        "reason": "wrong",
+        "attempts_left": 4
+      }
+    }
+  },
+  "confirm_expired": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "data": {
+        "result": "code_refused",
+        "reason": "expired",
+        "attempts_left": 0
+      }
+    }
+  },
+  "confirm_spent": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "data": {
+        "result": "code_refused",
+        "reason": "spent",
+        "attempts_left": 0
+      }
+    }
+  },
+  "confirm_acknowledge": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "data": {
+        "result": "acknowledge",
+        "organisations": [
+          {
+            "organisation_id": "org-1",
+            "name": "Acme",
+            "members": 4
+          }
+        ]
+      }
+    }
+  },
+  "confirm_unknown_result": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "data": {
+        "result": "some_new_result"
+      }
+    }
+  },
+  "confirm_rate_limited": {
+    "status": 429,
+    "body": {
+      "ok": false,
+      "error": {
+        "code": "RATE_LIMITED",
+        "message": "Too many attempts. Try again shortly.",
+        "retryAfterSeconds": 300
+      }
+    },
+    "headers": {
+      "Retry-After": "300"
+    }
+  },
+  "confirm_receipt_taken": {
+    "status": 400,
+    "body": {
+      "ok": false,
+      "error": {
+        "code": "INVALID_REQUEST",
+        "message": "That receipt was used already. Make a new one."
+      }
+    }
+  },
+  "confirm_malformed": {
+    "status": 400,
+    "body": {
+      "ok": false,
+      "error": {
+        "code": "INVALID_REQUEST",
+        "message": "Send the code from the email and a receipt of 32 hexadecimal characters."
+      }
+    }
+  },
+  "confirm_unavailable": {
+    "status": 503,
+    "body": {
+      "ok": false,
+      "error": {
+        "code": "SERVICE_UNAVAILABLE",
+        "message": "That could not be confirmed just now. If it was carried out, the status of your request says so; if not, try again shortly.",
+        "retryAfterSeconds": 30
+      }
+    },
+    "headers": {
+      "Retry-After": "30"
+    }
+  },
+  "internal": {
+    "status": 500,
+    "body": {
+      "ok": false,
+      "error": {
+        "code": "INTERNAL",
+        "message": "Something went wrong."
+      }
+    }
+  },
+  "unauthenticated": {
+    "status": 401,
+    "body": {
+      "ok": false,
+      "error": {
+        "code": "UNAUTHENTICATED",
+        "message": "Sign in to continue."
+      }
+    }
+  },
+  "forbidden": {
+    "status": 403,
+    "body": {
+      "ok": false,
+      "error": {
+        "code": "FORBIDDEN",
+        "message": "That is not allowed."
+      }
+    }
+  },
+  "status_unknown": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "data": {
+        "state": "unknown"
+      }
+    }
+  },
+  "status_open": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "data": {
+        "state": "open"
+      }
+    }
+  },
+  "status_done": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "data": {
+        "state": "done"
+      }
+    }
+  },
+  "status_rate_limited": {
+    "status": 429,
+    "body": {
+      "ok": false,
+      "error": {
+        "code": "RATE_LIMITED",
+        "message": "Too many attempts. Try again shortly.",
+        "retryAfterSeconds": 60
+      }
+    },
+    "headers": {
+      "Retry-After": "60"
+    }
+  },
+  "gateway_page": {
+    "status": 502,
+    "body_text": "<html><body>Bad gateway</body></html>"
+  }
+}
