@@ -30,7 +30,7 @@ use kr_protocol::hostinfo::export::ContentClass;
 use kr_protocol::service::GatewayOrigin;
 
 use crate::cli::NetworkArguments;
-use crate::doctor::configuration as document_file;
+use crate::doctor::configuration::{WRITTEN, apply_over, document_path, load, refusal, validate};
 use crate::error::{CliError, Result};
 use crate::output::{self, Asked, Document, Request};
 use crate::resolve::{self, KnownEnvironment};
@@ -59,7 +59,7 @@ enum Action {
 /// service cannot be had.
 pub async fn run(paths: &HostPaths, arguments: &NetworkArguments, json: bool) -> Result<()> {
     let environment = resolve::select(paths, None)?;
-    let loaded = document_file::load(&environment.paths);
+    let loaded = load(&environment.paths);
     let action = if arguments.clear {
         clear(&environment.paths, &loaded)?
     } else if arguments.join {
@@ -85,7 +85,7 @@ fn show_needs_a_usable_document(loaded: &Loaded) -> Result<()> {
 
 /// Takes the eight settings out.
 fn clear(paths: &EnvironmentPaths, loaded: &Loaded) -> Result<Action> {
-    configuration::editable(loaded).map_err(|refused| document_file::refusal(&refused))?;
+    configuration::editable(loaded).map_err(|refused| refusal(&refused))?;
     let held = loaded
         .document
         .as_ref()
@@ -94,10 +94,10 @@ fn clear(paths: &EnvironmentPaths, loaded: &Loaded) -> Result<Action> {
         return Ok(Action::Cleared { revision: None });
     }
     let change = Change::Network(None);
-    document_file::validate(paths, &change)?;
+    validate(paths, &change)?;
     let writers = crate::barrier::hold_for_configuration(paths)?;
-    let permit = crate::barrier::permit(&writers, &document_file::WRITTEN)?;
-    let revision = document_file::apply_over(paths, &change, &permit, Some(loaded))?;
+    let permit = crate::barrier::permit(&writers, &WRITTEN)?;
+    let revision = apply_over(paths, &change, &permit, Some(loaded))?;
     Ok(Action::Cleared {
         revision: Some(revision),
     })
@@ -111,7 +111,7 @@ async fn join(
     json: bool,
 ) -> Result<Action> {
     // Before any request: a document that cannot be edited ends the command here.
-    configuration::editable(&loaded).map_err(|refused| document_file::refusal(&refused))?;
+    configuration::editable(&loaded).map_err(|refused| refusal(&refused))?;
 
     let origin = GatewayOrigin::new(
         arguments
@@ -158,10 +158,10 @@ async fn join(
     }
 
     let change = Change::Network(Some(described.selection().clone()));
-    document_file::validate(paths, &change)?;
+    validate(paths, &change)?;
     let writers = crate::barrier::hold_for_configuration(paths)?;
-    let permit = crate::barrier::permit(&writers, &document_file::WRITTEN)?;
-    let revision = document_file::apply_over(paths, &change, &permit, Some(&loaded))?;
+    let permit = crate::barrier::permit(&writers, &WRITTEN)?;
+    let revision = apply_over(paths, &change, &permit, Some(&loaded))?;
     Ok(Action::Joined {
         revision: Some(revision),
         description: Box::new(described),
@@ -274,7 +274,7 @@ fn show_differences(
 
 /// Tells what happened and what the document now selects.
 fn present(environment: &KnownEnvironment, action: &Action, json: bool) {
-    let now = document_file::load(&environment.paths);
+    let now = load(&environment.paths);
     let empty = ConfigurationDocument::empty();
     let document = now.document.as_ref().unwrap_or(&empty);
     let revision = match action {
@@ -285,10 +285,7 @@ fn present(environment: &KnownEnvironment, action: &Action, json: bool) {
         let mut shown = Document::new()
             .with("ok", true)
             .with("environment_id", output::said(&environment.environment_id))
-            .with(
-                "document",
-                Shown::root(&document_file::document_path(&environment.paths)),
-            )
+            .with("document", Shown::root(&document_path(&environment.paths)))
             .with("changed", revision.is_some())
             .with("revision", now.revision())
             .with("network", selection_document(document));

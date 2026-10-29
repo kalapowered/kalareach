@@ -437,8 +437,12 @@ async fn a_join_writes_what_the_service_described_and_a_second_changes_nothing()
     assert_eq!(written["mailbox"]["origin"], origin, "{written}");
     assert_eq!(written["relay"]["origin"], origin, "{written}");
     assert!(
-        written.get("startup").is_none() && written.get("preferences").is_none(),
-        "nothing else is written: {written}"
+        written["startup"]["controller"].is_null()
+            && written["preferences"]["sleep_inhibition"].is_null()
+            && written["network"]["bind_address"].is_null()
+            && written["network"]["proxy_url"].is_null()
+            && written["shell"]["mode"].is_null(),
+        "nothing else is chosen: {written}"
     );
     assert_eq!(shown["network"]["network.enabled"], true, "{shown}");
 
