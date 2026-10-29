@@ -29,6 +29,7 @@ use kr_protocol::envelope::Outcome;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::gateway::{PendingResource, PendingState};
 use kr_protocol::local::ControllerConnectionRole;
+use kr_protocol::session::Durability;
 use kr_worker::broker::decoding::NotDecoded;
 use plugin_world::observing::{
     Observing, Options, Spec, binding, digest, instance, package, request, request_noting,
@@ -549,16 +550,17 @@ async fn kr_req_11_21_an_approval_the_table_read_is_answered_with_the_tables_byt
     );
 }
 
-/// KR-REQ-11.38: a long wait for a person is a resource in the worker's ledger and not a component's
-/// call that stays open.
+/// KR-REQ-11.38: a long wait for a person is a durable resource in the worker's ledger and not a
+/// component's call that stays open.
 ///
 /// Three requests the upstream waits on are each read into an approval by the component, and the
-/// person answers none of them. While the three wait, the component takes another call and has
-/// decoded each of them once: a decode that stayed open for the person would hold the binding's
-/// thread, and neither the later requests nor that call would be served. The person then answers
-/// the middle one, the first and the last, in that order, and the component, which is asked to
-/// encode each answer when it is given, has its answer written to the upstream once and for its own
-/// request.
+/// person answers none of them. Each approval is a pending resource that the broker records as
+/// durable. While the three wait, the component takes another call and has decoded each of them
+/// once and encoded none: a decode that stayed open for the person would hold the binding's thread,
+/// and neither the later requests nor that call would be served. The person then answers the middle
+/// one, the first and the last, in that order, and the component, which is asked to encode each
+/// answer when it is given, has its answer written to the upstream once and for its own request.
+/// (That an approval outlives the plugin runtime is `kr_req_24_06_...` in the observation suite.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_11_38_an_approval_waiting_for_a_person_holds_no_call_of_the_component() {
     let Some(world) =
@@ -574,6 +576,11 @@ async fn kr_req_11_38_an_approval_waiting_for_a_person_holds_no_call_of_the_comp
     for number in [21, 22, 23] {
         let approval = approved(&world, &number.to_string()).await;
         assert_eq!(approval.state, PendingState::Pending);
+        assert_eq!(
+            approval.durability,
+            Durability::Durable,
+            "the wait for request {number} is recorded in memory only"
+        );
         approvals.push(approval);
     }
 
@@ -598,15 +605,25 @@ async fn kr_req_11_38_an_approval_waiting_for_a_person_holds_no_call_of_the_comp
         assert!(matches!(outcome, Outcome::Ok(_)), "{outcome:?}");
         let number = 21 + u64::try_from(index).expect("a small index");
         until_answered(&world, number).await;
-        assert_eq!(answers_to(&world, number).len(), 1);
     }
     for number in [21, 22, 23] {
+        let answers = answers_to(&world, number);
         assert_eq!(
-            answers_to(&world, number).len(),
+            answers.len(),
             1,
             "request {number} was not answered exactly once"
         );
+        assert!(
+            answers[0].contains(r#""via":"component""#),
+            "request {number} was answered with the table's bytes and not the component's: {}",
+            answers[0]
+        );
     }
+    let account = world.raw_account(1).await.expect("the component answers");
+    assert!(
+        account.starts_with("decode=3;encode=3;"),
+        "the component decoded and encoded each request once: {account}"
+    );
 }
 
 /// Asks `world` to answer request `id` with its component's bytes, runs `disturb` while the
