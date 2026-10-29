@@ -24,17 +24,22 @@ fn file(directory: &Path, name: &str, text: &str) -> PathBuf {
     path
 }
 
-/// The cursor Neovim reports in its ruler: the line and the screen column, from 1.
-fn ruler(screen: &Screen) -> Option<(u64, u64)> {
+/// The cursor Neovim reports in its ruler: the line, the byte column and the screen column, from 1.
+fn ruler_position(screen: &Screen) -> Option<(u64, u64, u64)> {
     (0..screen.rows.len()).rev().find_map(|row| {
         screen.line(row).split_whitespace().find_map(|word| {
-            let (line, column) = word.split_once(',')?;
+            let (line, columns) = word.split_once(',')?;
             let line = line.parse::<u64>().ok()?;
             // `16-11` is the byte column and then the screen column; one number is both.
-            let column = column.rsplit('-').next()?.parse::<u64>().ok()?;
-            Some((line, column))
+            let (byte, column) = columns.split_once('-').unwrap_or((columns, columns));
+            Some((line, byte.parse::<u64>().ok()?, column.parse::<u64>().ok()?))
         })
     })
+}
+
+/// The cursor Neovim reports in its ruler: the line and the screen column, from 1.
+fn ruler(screen: &Screen) -> Option<(u64, u64)> {
+    ruler_position(screen).map(|(line, _, column)| (line, column))
 }
 
 /// Shows that the program asked its terminal questions and that none of them reached the typing
@@ -164,15 +169,16 @@ async fn paste_and_land(session: &mut Session, path: &Path, samples: &[&str]) ->
     for index in 0..samples.len() {
         let line = index as u64 + 1;
         // The cursor on the marker's `|`: the line, then the start of it, then the marker. Neovim
-        // can draw after one key and before the next, so a ruler on the line may still be the
-        // line's start; the marker follows the sample and is never in the first column.
+        // can draw after any of those keys, so the wait is for the ruler to name the marker's own
+        // byte, the one after the sample, and not for the line alone.
+        let marker = samples[index].len() as u64 + 1;
         session.type_bytes(format!("{line}G0f|").as_bytes());
         let screen = session
             .wait_for("the cursor on the marker", |screen| {
-                ruler(screen).is_some_and(|(at, column)| at == line && column > 1)
+                ruler_position(screen).is_some_and(|(at, byte, _)| at == line && byte == marker)
             })
             .await;
-        let (_, column) = ruler(&screen).expect("a ruler");
+        let (_, _, column) = ruler_position(&screen).expect("a ruler");
         landings.push(Landing {
             neovim_column: column - 1,
             grid_column: crate::harness::ascii_suffix_column(&screen, index, "|end"),
