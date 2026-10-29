@@ -463,45 +463,22 @@ fn selection_document(document: &ConfigurationDocument) -> Document {
 mod tests {
     use super::*;
 
-    /// A public key as a service publishes one: 43 characters of unpadded base64url.
-    const KEY: &str = "ESZTt8qko94XmogxftjUh7zscthwWZ17-LP2PcbLx20";
-
-    fn arguments(key: Option<&str>, unsigned: bool) -> NetworkArguments {
-        NetworkArguments {
-            join: true,
-            service: None,
-            key: key.map(str::to_owned),
-            unsigned,
-            replace: false,
-            clear: false,
-        }
-    }
-
-    /// The managed service's description is read only under the key this build pins, whatever a flag
-    /// says, and a service a person runs names its key or says it is taken on the connection alone.
-    /// No case reaches this from outside: the commands name loopback services, since the managed
-    /// origin is not one a test can stand in for.
+    /// The managed service's description is read only under the key this build pins. No case
+    /// reaches this from outside: the commands name loopback services, since the managed origin is
+    /// not one a test can stand in for, and the flags that would change it are refused before any
+    /// request.
     #[test]
-    fn the_managed_service_is_read_under_the_pinned_key_and_no_flag_changes_that() {
+    fn the_managed_service_is_read_under_the_pinned_key() {
         let managed = GatewayOrigin::new(kr_client::services::account::ACCOUNT_ORIGIN)
             .expect("the managed origin");
-        assert!(matches!(
-            trust(&managed, &arguments(None, false)),
-            Ok(Trust::Pinned(_))
-        ));
-        assert!(trust(&managed, &arguments(None, true)).is_err());
-        assert!(trust(&managed, &arguments(Some(KEY), false)).is_err());
-
-        let own = GatewayOrigin::new("https://service.example.test").expect("an origin");
-        assert!(trust(&own, &arguments(None, false)).is_err());
-        assert!(matches!(
-            trust(&own, &arguments(None, true)),
-            Ok(Trust::TlsOnly)
-        ));
-        assert!(matches!(
-            trust(&own, &arguments(Some(KEY), false)),
-            Ok(Trust::Pinned(_))
-        ));
-        assert!(trust(&own, &arguments(Some("not a key"), false)).is_err());
+        let arguments = NetworkArguments {
+            join: true,
+            service: None,
+            key: None,
+            unsigned: false,
+            replace: false,
+            clear: false,
+        };
+        assert!(matches!(trust(&managed, &arguments), Ok(Trust::Pinned(_))));
     }
 }

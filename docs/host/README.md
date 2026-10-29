@@ -213,8 +213,7 @@ they are, because those are the machine's own, and it does not replace a value t
 without `--replace`. No relay or discovery address is compiled into the release, which pins only the
 managed service's origin and the key it signs its description with: a relay added to the service
 reaches a host when its person joins again with `--replace`, and the daemon never rewrites the
-document. The
-fields below remain the whole contract for a document written by hand.
+document. The fields below remain the whole contract for a document written by hand.
 
 ```json
 "network": {

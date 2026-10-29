@@ -1769,10 +1769,14 @@ by another key; `--key` and `--unsigned` are refused for it. A service you run i
 `--service`, an `https` address with no path (an `http` address is read only on this machine), and
 the command wants one of two things from you. `--key` gives the public key the service signs its
 description with, as 43 characters of unpadded base64url, and the description is read only when it
-verifies under it. `--unsigned` takes the description on the connection alone, so it is as
-trustworthy as that connection and the service that answered, and the output says so. With neither,
-the command refuses. The key that the service publishes beside its release matrix proves nothing
-and is not read.
+verifies under it. The signature covers the origin the description is served at, which the command
+takes from the `--service` you give: name the service by the origin it is configured with
+(`PUBLIC_SITE_ORIGIN` for the KalaReach Worker), because a signed reply read at another address of
+the same service does not verify there, and a static copy of one is read with `--unsigned`.
+`--unsigned` takes the description on the connection alone, so it is as trustworthy as that
+connection and the service that answered, and the output says so. With neither, the command
+refuses. The key that the service publishes beside its release matrix proves nothing and is not
+read.
 
 The request is made through the proxy `network.proxy_url` names, and directly when it names none; it
 never goes round one. A document that this build must not rewrite, or cannot read, ends the command

@@ -623,6 +623,18 @@ async fn a_description_is_read_under_the_key_named_and_a_flag_does_not_replace_t
         Some(2),
         "a key is for a service that is named"
     );
+    // The managed origin is refused a flag before any request. The host here names a proxy that is
+    // a listener of the test's own, so that were the refusal ever lost the request would reach
+    // that listener and never the real service.
+    let proxy = Counting::start();
+    let managed = Tree::create();
+    managed.write_document(&json!({
+        "version": 3,
+        "level": 1,
+        "revision": 1,
+        "network": { "proxy_url": proxy.http() },
+    }));
+    let before = managed.document_bytes();
     for managed_flag in ["--unsigned", "--key"] {
         let key = service.public_key();
         let mut arguments = vec![
@@ -636,10 +648,11 @@ async fn a_description_is_read_under_the_key_named_and_a_flag_does_not_replace_t
         if managed_flag == "--key" {
             arguments.push(&key);
         }
-        let output = tree.kr(&arguments);
+        let output = managed.kr(&arguments);
         assert_eq!(output.status.code(), Some(2), "{}", said(&output));
-        assert!(tree.document_bytes().is_none());
+        assert_eq!(managed.document_bytes(), before, "nothing was written");
     }
+    assert_eq!(proxy.accepted(), 0, "no request was made");
 
     // A description a service published without a signature is read only on the connection alone,
     // and the output says so.

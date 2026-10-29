@@ -18,9 +18,9 @@
 //! signature is never a description's, and a description's is never a matrix's. The signed bytes
 //! also hold the origin the description is served at, which this module takes from the origin it
 //! asked and no redirect changes, so a description signed for one service never verifies as
-//! another's even when one key signed both. [`Trust::Pinned`] requires that signature. A service a person runs names its own public key, and a description
-//! signed by it is read the same way. [`Trust::TlsOnly`] takes the description on the connection
-//! alone, for a person who has said so.
+//! another's even when one key signed both. [`Trust::Pinned`] requires that signature. A service a
+//! person runs names its own public key, and a description signed by it is read the same way.
+//! [`Trust::TlsOnly`] takes the description on the connection alone, for a person who has said so.
 //!
 //! The key the service publishes beside a signature proves nothing, since whoever forged the
 //! description would publish a key of their own, so this module never reads one.
@@ -205,7 +205,8 @@ impl Refusal {
                  not; the service should correct it"
             }
             Self::Signature => {
-                "the service's description is not signed by the key this host expects of it"
+                "the service's description is not signed, for the address this host asked, by the \
+                 key this host expects of it"
             }
             Self::Insecure => {
                 "the service's description names a plain http address, which a host joins only \

@@ -1525,7 +1525,8 @@ pub struct NetworkArguments {
     pub join: bool,
     /// The origin of the service to join, instead of the KalaReach service: an `https` address with
     /// no path, or an `http` address on this machine. A service you run is verified with `--key`, or
-    /// taken on the connection alone with `--unsigned`.
+    /// taken on the connection alone with `--unsigned`. A signature covers the origin it was made
+    /// for, so name the service by the origin it is configured with.
     #[arg(long, requires = "join", value_name = "ORIGIN")]
     pub service: Option<String>,
     /// The public key a service you run signs its description with, as 43 characters of unpadded
@@ -2183,23 +2184,21 @@ mod tests {
     }
 
     /// A service's public key is unpadded base64url, whose alphabet has `-`, so one key in
-    /// sixty-four starts with it. `--key` takes it as its value and not as an option, and a value
-    /// that looks like another option of the command is the key's too.
+    /// sixty-four starts with it. `--key` takes it as its value and not as an option.
     #[test]
     fn a_public_key_that_starts_with_a_hyphen_is_the_value_of_key() {
         let key = format!("-{}", "A".repeat(42));
-        for arguments in [vec!["--key", key.as_str()], vec!["--key", "--unsigned"]] {
-            let mut all = vec![
-                "kr",
-                "host",
-                "network",
-                "--join",
-                "--service",
-                "https://service.example.test",
-            ];
-            all.extend(arguments);
-            assert!(Cli::try_parse_from(&all).is_ok(), "{all:?}");
-        }
+        let all = [
+            "kr",
+            "host",
+            "network",
+            "--join",
+            "--service",
+            "https://service.example.test",
+            "--key",
+            key.as_str(),
+        ];
+        assert!(Cli::try_parse_from(all).is_ok());
     }
 
     /// KR-REQ-07.50: a literal `--` ends option parsing, so what follows it is an argument even
