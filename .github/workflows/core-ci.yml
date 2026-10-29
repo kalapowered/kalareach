@@ -2562,11 +2562,15 @@ jobs:
       # - The cases that need another filesystem, and the cases whose verdicts are timings, which
       #   the two steps after this one run.
       #
-      # The step builds the workspace's tests and then runs them. At its longest it needed about 71
-      # minutes, 19 to build and 52 to run, and it grows with the tests.
+      # The step builds the workspace's tests and then runs them, and it grows with the tests. On a
+      # hosted runner it has taken 108 to 141 minutes when it passed, and on a runner 15 to 30 per
+      # cent slower in every suite it ran into a limit of 145 minutes with 38 suites not started.
+      # Its limit is 197 minutes, the most that this job's limit leaves once the other steps of
+      # this part have theirs: the limits of the part add up to 354 of the job's 355 minutes.
+      # That is under twice the longest it has taken.
       - name: Test
         if: ${{ !cancelled() && matrix.part == 'tests' }}
-        timeout-minutes: 145
+        timeout-minutes: 197
         run: >-
           cargo test --locked --workspace --exclude kr-sync-integration --no-fail-fast --
           --skip the_helper_inside_a_container_refuses_a_handshake_that_declares_a_network_actor
