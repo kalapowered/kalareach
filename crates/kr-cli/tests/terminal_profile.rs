@@ -7,6 +7,13 @@
 //! each terminal application whose profile is a file, and run on every platform, so the formats are
 //! checked wherever the suite runs. The command cases run the real `kr` and only for the terminal
 //! application of their platform.
+//!
+//! `defaults` reads the user's own preferences whatever `HOME` says, so the command cases name the
+//! preference files of the person's home in `KR_TERMINAL_PREFERENCES_DIR` (its `domains`
+//! directory, with a file for each of Terminal's and iTerm2's domains where a case needs one).
+//! Only a build with the `testing` feature of kr-shell-integration reads that variable. The `kr`
+//! these cases start has the feature, through kr-cli's development dependency on that crate, and no
+//! shipped build does; one case runs a release build of `kr` to show that it ignores the variable.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -933,7 +940,27 @@ mod command {
         arguments: &[&str],
         otherwise: &[(&str, &std::ffi::OsStr)],
     ) -> (std::process::Output, String) {
-        let mut command = std::process::Command::new(support::kr());
+        // `defaults` ignores HOME: the preferences are this person's own files, never the
+        // runner's.
+        run_program(
+            &support::kr(),
+            person,
+            arguments,
+            Some(person.home.join("domains").as_os_str()),
+            otherwise,
+        )
+    }
+
+    /// `program` run for a person as [`run`] does, with the preferences variable set to
+    /// `preferences` where there is one, and the rest of the environment set otherwise.
+    fn run_program(
+        program: &Path,
+        person: &Person,
+        arguments: &[&str],
+        preferences: Option<&std::ffi::OsStr>,
+        otherwise: &[(&str, &std::ffi::OsStr)],
+    ) -> (std::process::Output, String) {
+        let mut command = std::process::Command::new(program);
         command
             .args(["host", "terminal-profile"])
             .args(arguments)
@@ -947,14 +974,14 @@ mod command {
             .env("SHELL", "/bin/sh")
             .env("KR_RUNTIME_DIR", person.tree.paths().runtime_root())
             .env("KR_STATE_DIR", person.tree.paths().state_root())
-            // `defaults` ignores HOME: the preferences are this person's own files, never the
-            // runner's.
-            .env(
-                kr_shell_integration::host::terminal_profile::PREFERENCES_DIRECTORY_VARIABLE,
-                person.home.join("domains"),
-            )
             .current_dir(&person.home)
             .stdin(std::process::Stdio::null());
+        if let Some(preferences) = preferences {
+            command.env(
+                kr_shell_integration::host::terminal_profile::PREFERENCES_DIRECTORY_VARIABLE,
+                preferences,
+            );
+        }
         for (name, value) in otherwise {
             command.env(name, value);
         }
@@ -1073,6 +1100,59 @@ mod command {
             assert_eq!(output.status.code(), Some(2), "{said}");
             assert!(!elsewhere.exists(), "nothing was written outside the home");
         }
+    }
+
+    /// KR-REQ-01.21, KR-REQ-26.04: a release build of `kr` does not read the preferences variable.
+    /// The `kr` of this suite is a test build, which reads it (kr-cli's development dependency
+    /// enables the `testing` feature of the library for it); a value that build refuses is no value
+    /// to a release build, which answers as it does without the variable. The release build is made
+    /// by the list that runs this (`cargo build --release -p kr-cli --bin kr`) and named in
+    /// `KR_RELEASE_PROGRAM`; where that is not set the case is skipped, and it fails where
+    /// `KR_REQUIRE_RELEASE_PROGRAM` is set. Linux only, since a release build that did read the
+    /// variable is shown by any platform, and on macOS one that did not would read the runner's own
+    /// preferences.
+    #[test]
+    fn a_release_build_does_not_read_the_preferences_variable() {
+        let Some(release) = std::env::var_os("KR_RELEASE_PROGRAM").map(PathBuf::from) else {
+            assert!(
+                std::env::var_os("KR_REQUIRE_RELEASE_PROGRAM").is_none(),
+                "KR_REQUIRE_RELEASE_PROGRAM is set, and KR_RELEASE_PROGRAM names no release build of kr"
+            );
+            eprintln!("skipped: KR_RELEASE_PROGRAM names no release build of kr");
+            return;
+        };
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        assert!(release.is_file(), "{} is built", release.display());
+        let Some(application) = application() else {
+            return;
+        };
+        let person = Person::with(&application);
+        (application.seed)(&person);
+        let before = person.everything();
+
+        let (output, said) = run_program(&release, &person, &["status", "--json"], None, &[]);
+        assert!(output.status.success(), "{said}");
+        let without = document(&output);
+
+        let outside = person.tree.root().join("outside");
+        for bad in [
+            std::ffi::OsString::new(),
+            "relative/domains".into(),
+            outside.into_os_string(),
+        ] {
+            // The test build refuses the value: it is the variable that is being read.
+            let (refused, said) =
+                run_program(&support::kr(), &person, &["status"], Some(&bad), &[]);
+            assert_eq!(refused.status.code(), Some(2), "{bad:?}: {said}");
+            // The release build does not look.
+            let (output, said) =
+                run_program(&release, &person, &["status", "--json"], Some(&bad), &[]);
+            assert!(output.status.success(), "{bad:?}: {said}");
+            assert_eq!(document(&output), without, "{bad:?}");
+        }
+        assert_eq!(person.everything(), before, "and nothing was written");
     }
 
     /// KR-REQ-01.21, KR-REQ-26.04: the command installs the profile and writes nothing else of its

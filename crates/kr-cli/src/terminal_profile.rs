@@ -18,7 +18,7 @@ use kr_shell_integration::host::terminal_profile::record::{
     PROFILE_WRITTEN, ProfileRecord, RecordError, Wrote,
 };
 use kr_shell_integration::host::terminal_profile::{
-    HomeError, Place, ProfileError, ProfileHome, ProfileTerminal, Removed, Standing,
+    Place, ProfileError, ProfileHome, ProfileTerminal, Removed, Standing,
 };
 
 use crate::cli::{
@@ -81,21 +81,7 @@ pub fn run(
 
 /// The places this person's terminal applications keep their profiles in.
 fn this_user() -> Result<ProfileHome> {
-    ProfileHome::of_this_user().map_err(|error| {
-        CliError::Usage(Shown::said(match error {
-            HomeError::NoHome => {
-                "there is no home directory to find a terminal application's profiles in"
-            }
-            HomeError::PreferencesDirectory => {
-                "KR_TERMINAL_PREFERENCES_DIR must be an absolute directory inside the home this \
-                 run uses; it is empty, relative or outside it, and nothing was read or written"
-            }
-            HomeError::OwnHome => {
-                "KR_TERMINAL_PREFERENCES_DIR is for a run whose home is not the account's own; \
-                 nothing was read or written"
-            }
-        }))
-    })
+    ProfileHome::of_this_user().map_err(|error| CliError::Usage(Shown::said(error.said())))
 }
 
 /// The argument vector a profile runs: this installation's own `kr`, through the store's
@@ -872,9 +858,8 @@ fn failure(error: &ProfileError, home: &ProfileHome) -> CliError {
             Shown::root(word)
         )),
         ProfileError::Outside(terminal) => CliError::Usage(shown!(
-            "the record names {}'s profile outside the home this run is confined to \
-             (KR_TERMINAL_PREFERENCES_DIR is set), so it was left alone and nothing was written; \
-             run this without the variable to work on it",
+            "the record names {}'s profile outside the home this run is confined to, so it was \
+             left alone and nothing was written",
             Shown::said(terminal.name())
         )),
         ProfileError::RecordedElsewhere { terminal, recorded } => CliError::Usage(shown!(

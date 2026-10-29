@@ -750,18 +750,7 @@ of the person's shell is installed, and how `kr new` starts the control daemon.
   or over SSH. Terminal's preferences must also hold a profile to copy.
 
 These are usage failures (exit 2). A failure of `gsettings`, `defaults` or `plutil`, of the record or
-of a file exits 1. `--dry-run` skips the check for a running Terminal. `defaults` reads the user's
-own preferences whatever `HOME` says; `KR_TERMINAL_PREFERENCES_DIR`, an absolute directory inside
-the home the run uses, makes `kr` take Terminal's and iTerm2's preferences from the files
-`com.apple.Terminal.plist` and `com.googlecode.iterm2.plist` under it (`defaults` adds the extension
-to the path), so a run that must not reach the person's own names a directory of its own. A run
-that sets it is confined to its home, which must not be the account's own: an empty, relative or
-outside value, or the account's own home, is refused (exit 2) with nothing read or written, never
-read as unset. In a confined run a record that names a profile file or a preferences path outside
-the home, which a run that was not confined made, is left alone (exit 2, `status` says
-`unreadable`), and an install that would write a profile file outside the home (Konsole's follows
-`XDG_DATA_HOME`) is refused, whatever the preferences the run reads say. The settings of GNOME
-Terminal and Ptyxis are the session's settings database's, which the variable does not move.
+of a file exits 1. `--dry-run` skips the check for a running Terminal.
 
 An install that fails after it began writing takes back what it wrote. For GNOME Terminal and
 Ptyxis the keys go back to what they held when the write began, which for an install again is the
