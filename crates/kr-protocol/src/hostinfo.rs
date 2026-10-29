@@ -4208,6 +4208,14 @@ pub mod configuration {
         /// the secret references and the start choice are the host's own, and so are the
         /// variables and command integrations of every set of preferences.
         DeviceConfiguration(Box<DeviceConfiguration>),
+        /// Join the service a description names, or leave it.
+        ///
+        /// With a selection, the eight settings [`ServiceSelection::KEYS`] names become what the
+        /// service described and `network.enabled` becomes true. With `None`, those eight settings
+        /// are taken out. The machine's own choices in `network` (`bind_address`,
+        /// `relay_trust_anchors`, `relay_only`, `local_discovery`, `mainline_dht` and `proxy_url`)
+        /// and every other section are left as they are.
+        Network(Option<ServiceSelection>),
     }
 
     impl Change {
@@ -4225,6 +4233,7 @@ pub mod configuration {
                 Self::Descriptions { .. } => "descriptions",
                 Self::DeviceConfiguration(_) => "device_configuration",
                 Self::ShellMode(_) => SHELL_MODE.key,
+                Self::Network(_) => "network",
             }
         }
 
@@ -4243,8 +4252,169 @@ pub mod configuration {
                 | Self::CommandIntegration { .. }
                 | Self::DeviceConfiguration(_)
                 | Self::ShellMode(_) => ValueEffect::NewSessionsOnly,
-                Self::ControllerStartup(_) => Selection::EFFECT,
+                Self::ControllerStartup(_) | Self::Network(_) => Selection::EFFECT,
             }
+        }
+    }
+
+    /// The settings a service describes of itself for a host that joins it.
+    ///
+    /// A join owns exactly eight settings of four sections, [`Self::KEYS`], and nothing else: the
+    /// machine's own choices in `network` and every other section are the person's. A value is
+    /// absent when the service does not describe that service.
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub struct ServiceSelection {
+        /// The relay map.
+        pub relay_urls: Vec<String>,
+        /// The Pkarr server this host publishes its signed record to.
+        pub pkarr_publisher_url: Option<String>,
+        /// The Pkarr server this host resolves peers from.
+        pub pkarr_resolver_url: Option<String>,
+        /// The DNS origin this host resolves peers from.
+        pub dns_origin: Option<String>,
+        /// The authority feed this host reads its remote revocations from.
+        pub authority_origin: Option<String>,
+        /// The mailbox service this host places the encrypted objects of its notifications in.
+        pub mailbox_origin: Option<String>,
+        /// The relay lease service this host asks for a lease for each paired device.
+        pub relay_origin: Option<String>,
+    }
+
+    impl ServiceSelection {
+        /// The eight settings a join owns, in the order `kr doctor` prints them.
+        pub const KEYS: [&'static str; 8] = [
+            NETWORK_ENABLED.key,
+            NETWORK_RELAY_URLS.key,
+            NETWORK_PKARR_PUBLISHER_URL.key,
+            NETWORK_PKARR_RESOLVER_URL.key,
+            NETWORK_DNS_ORIGIN.key,
+            AUTHORITY_ORIGIN.key,
+            MAILBOX_ORIGIN.key,
+            RELAY_ORIGIN.key,
+        ];
+
+        /// Whether the description names no relay and no discovery server. A host that joined such
+        /// a description would have the network on and nothing to reach it by.
+        #[must_use]
+        pub fn selects_nothing(&self) -> bool {
+            self.relay_urls.is_empty()
+                && self.pkarr_publisher_url.is_none()
+                && self.pkarr_resolver_url.is_none()
+                && self.dns_origin.is_none()
+        }
+
+        /// Whether the document holds any of the eight settings a join owns.
+        #[must_use]
+        pub fn held_by(document: &ConfigurationDocument) -> bool {
+            document.network.enabled.is_present()
+                || document.network.relay_urls.is_present()
+                || document.network.pkarr_publisher_url.is_present()
+                || document.network.pkarr_resolver_url.is_present()
+                || document.network.dns_origin.is_present()
+                || document.authority.origin.is_present()
+                || document.mailbox.origin.is_present()
+                || document.relay.origin.is_present()
+        }
+
+        /// How the document stands against this description, setting by setting.
+        ///
+        /// A setting the document does not hold and the description does not name is the same in
+        /// both. A relay map is the same when it names the same relays in any order. A document
+        /// that holds a setting the description leaves out differs from it.
+        #[must_use]
+        pub fn compare(&self, document: &ConfigurationDocument) -> Comparison {
+            let mut result = Comparison::default();
+            let relays = |urls: &[String]| -> Option<Vec<String>> {
+                let mut urls = urls.to_vec();
+                urls.sort();
+                urls.dedup();
+                (!urls.is_empty()).then_some(urls)
+            };
+            judge(
+                NETWORK_ENABLED.key,
+                document.network.enabled.0,
+                Some(true),
+                &mut result,
+            );
+            judge(
+                NETWORK_RELAY_URLS.key,
+                relays(document.network.relay_urls()),
+                relays(&self.relay_urls),
+                &mut result,
+            );
+            let held = |value: Option<&str>| value.map(str::to_owned);
+            judge(
+                NETWORK_PKARR_PUBLISHER_URL.key,
+                held(document.network.pkarr_publisher_url()),
+                self.pkarr_publisher_url.clone(),
+                &mut result,
+            );
+            judge(
+                NETWORK_PKARR_RESOLVER_URL.key,
+                held(document.network.pkarr_resolver_url()),
+                self.pkarr_resolver_url.clone(),
+                &mut result,
+            );
+            judge(
+                NETWORK_DNS_ORIGIN.key,
+                held(document.network.dns_origin()),
+                self.dns_origin.clone(),
+                &mut result,
+            );
+            judge(
+                AUTHORITY_ORIGIN.key,
+                held(document.authority.origin()),
+                self.authority_origin.clone(),
+                &mut result,
+            );
+            judge(
+                MAILBOX_ORIGIN.key,
+                held(document.mailbox.origin()),
+                self.mailbox_origin.clone(),
+                &mut result,
+            );
+            judge(
+                RELAY_ORIGIN.key,
+                held(document.relay.origin()),
+                self.relay_origin.clone(),
+                &mut result,
+            );
+            result
+        }
+    }
+
+    /// How a document stands against what a service describes: each of the settings a join owns
+    /// is in exactly one of the three lists.
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub struct Comparison {
+        /// Settings the document does not hold and the description names: a join writes them.
+        pub to_write: Vec<&'static str>,
+        /// Settings that are the same in both, or that neither holds.
+        pub equal: Vec<&'static str>,
+        /// Settings the document holds with another value, or that the description leaves out.
+        pub different: Vec<&'static str>,
+    }
+
+    impl Comparison {
+        /// Whether a join would change nothing.
+        #[must_use]
+        pub fn is_current(&self) -> bool {
+            self.to_write.is_empty() && self.different.is_empty()
+        }
+    }
+
+    /// Puts one setting in the list of [`Comparison`] it belongs to.
+    fn judge<T: PartialEq>(
+        key: &'static str,
+        held: Option<T>,
+        described: Option<T>,
+        result: &mut Comparison,
+    ) {
+        match (held, described) {
+            (None, None) => result.equal.push(key),
+            (None, Some(_)) => result.to_write.push(key),
+            (Some(held), Some(described)) if held == described => result.equal.push(key),
+            (Some(_), _) => result.different.push(key),
         }
     }
 
@@ -4365,6 +4535,35 @@ pub mod configuration {
         edit_in(loaded, change, &THIS_RELEASE)
     }
 
+    /// Whether this build may edit a loaded document at all: one that is absent, or that it read
+    /// at or below its own level. A command that has something to do before an edit, such as
+    /// asking a service, asks this first, so that it does nothing for an edit that will be refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EditRefused::NotOurs`] for a document above this build's level and for one this
+    /// build could not read.
+    pub fn editable(loaded: &Loaded) -> Result<(), EditRefused> {
+        editable_in(loaded, &THIS_RELEASE)
+    }
+
+    fn editable_in(loaded: &Loaded, release: &Release) -> Result<(), EditRefused> {
+        if let Some(newer) = &loaded.newer {
+            return Err(EditRefused::NotOurs(
+                Sentence::new()
+                    .stated("this document is at level ")
+                    .number(newer.declared)
+                    .stated(" and this build edits documents up to level ")
+                    .number(release.level)
+                    .stated("; nothing was written"),
+            ));
+        }
+        match (&loaded.document, loaded.status.state) {
+            (Some(_), _) | (None, DocumentState::Absent) => Ok(()),
+            (None, _) => Err(EditRefused::NotOurs(loaded.status.detail.clone())),
+        }
+    }
+
     /// Applies one change to a loaded document as a release applies it.
     ///
     /// A document above the release's level is refused whether or not any member was left out of
@@ -4378,16 +4577,7 @@ pub mod configuration {
         change: &Change,
         release: &Release,
     ) -> Result<Edited, EditRefused> {
-        if let Some(newer) = &loaded.newer {
-            return Err(EditRefused::NotOurs(
-                Sentence::new()
-                    .stated("this document is at level ")
-                    .number(newer.declared)
-                    .stated(" and this build edits documents up to level ")
-                    .number(release.level)
-                    .stated("; nothing was written"),
-            ));
-        }
+        editable_in(loaded, release)?;
         let based_on = match (&loaded.document, loaded.status.state) {
             (Some(document), _) => document.revision,
             (None, DocumentState::Absent) => 0,
@@ -4437,6 +4627,28 @@ pub mod configuration {
             }
             Change::ShellMode(mode) => {
                 document.shell.mode = Nullable(*mode);
+            }
+            Change::Network(selection) => {
+                let selected = selection.as_ref();
+                let some_or_null = |value: Option<&String>| Nullable(value.cloned());
+                document.network.enabled = Nullable(selected.map(|_| true));
+                document.network.relay_urls = Nullable(
+                    selected
+                        .filter(|selection| !selection.relay_urls.is_empty())
+                        .map(|selection| selection.relay_urls.clone()),
+                );
+                document.network.pkarr_publisher_url =
+                    some_or_null(selected.and_then(|s| s.pkarr_publisher_url.as_ref()));
+                document.network.pkarr_resolver_url =
+                    some_or_null(selected.and_then(|s| s.pkarr_resolver_url.as_ref()));
+                document.network.dns_origin =
+                    some_or_null(selected.and_then(|s| s.dns_origin.as_ref()));
+                document.authority.origin =
+                    some_or_null(selected.and_then(|s| s.authority_origin.as_ref()));
+                document.mailbox.origin =
+                    some_or_null(selected.and_then(|s| s.mailbox_origin.as_ref()));
+                document.relay.origin =
+                    some_or_null(selected.and_then(|s| s.relay_origin.as_ref()));
             }
             Change::Descriptions {
                 enabled,
@@ -10404,6 +10616,103 @@ mod tests {
             refused,
             Err(configuration::EditRefused::Invalid(_))
         ));
+    }
+
+    /// KR-REQ-26.16: a join is one validated edit of eight settings and no others, and the document
+    /// is compared with a description setting by setting, so that a join which would change nothing
+    /// is told from one that writes and from one that would replace a value the document holds.
+    #[test]
+    fn a_join_edits_eight_settings_and_the_document_is_compared_with_it_setting_by_setting() {
+        use configuration::ServiceSelection;
+
+        let described = ServiceSelection {
+            relay_urls: vec![
+                "https://relay-b.example.test".to_owned(),
+                "https://relay-a.example.test".to_owned(),
+            ],
+            pkarr_publisher_url: Some("https://ns1.example.test/pkarr".to_owned()),
+            pkarr_resolver_url: Some("https://ns1.example.test/pkarr".to_owned()),
+            dns_origin: None,
+            authority_origin: Some("https://service.example.test".to_owned()),
+            mailbox_origin: Some("https://service.example.test".to_owned()),
+            relay_origin: Some("https://service.example.test".to_owned()),
+        };
+
+        // A document that holds nothing is written the seven settings the service names; the
+        // eighth, the DNS origin, is held by neither.
+        let compared = described.compare(&ConfigurationDocument::empty());
+        assert!(compared.different.is_empty());
+        assert_eq!(compared.equal, ["network.dns_origin"]);
+        assert_eq!(compared.to_write.len(), 7);
+        assert!(!compared.is_current());
+
+        // The edit writes them at the level the sections give, keeps the machine's own choices, and
+        // leaves a document the comparison finds current.
+        let mut own = ConfigurationDocument::empty();
+        own.network.bind_address = Nullable::some("127.0.0.1:0".to_owned());
+        own.network.relay_only = Nullable::some(true);
+        own.network.relay_urls = Nullable::some(vec!["https://relay-a.example.test".to_owned()]);
+        let change = Change::Network(Some(described.clone()));
+        assert_eq!(change.key(), "network");
+        let written = configuration::edit(
+            &configuration::load(Some(configuration::contents(&own).as_bytes())),
+            &change,
+        )
+        .expect("an edit");
+        assert_eq!(
+            written.document.level, 4,
+            "the relay section is one of level 4"
+        );
+        assert_eq!(written.document.network.bind_address(), Some("127.0.0.1:0"));
+        assert!(written.document.network.relay_only());
+        assert!(written.document.network.joins());
+        assert!(described.compare(&written.document).is_current());
+
+        // The relay map is a set: the same relays in another order are the same.
+        let mut reordered = written.document.clone();
+        reordered.network.relay_urls = Nullable::some(vec![
+            "https://relay-a.example.test".to_owned(),
+            "https://relay-b.example.test".to_owned(),
+        ]);
+        assert!(described.compare(&reordered).is_current());
+
+        // A value the person chose, and a setting the service leaves out that the document holds,
+        // are differences a join does not write over.
+        let mut chosen = written.document.clone();
+        chosen.network.enabled = Nullable::some(false);
+        chosen.network.pkarr_publisher_url =
+            Some("https://elsewhere.example.test/pkarr".to_owned()).into();
+        let compared = described.compare(&chosen);
+        assert_eq!(
+            compared.different,
+            ["network.enabled", "network.pkarr_publisher_url"]
+        );
+        let mut without_mailbox = described.clone();
+        without_mailbox.mailbox_origin = None;
+        assert_eq!(
+            without_mailbox.compare(&written.document).different,
+            ["mailbox.origin"]
+        );
+
+        // Leaving takes out the eight and no other, and the level falls with the sections.
+        let left = configuration::edit(
+            &configuration::load(Some(written.contents.as_bytes())),
+            &Change::Network(None),
+        );
+        assert!(
+            left.is_err(),
+            "relay_only is the person's, and with no relay it leaves a document that is invalid"
+        );
+        let mut relaxed = written.document.clone();
+        relaxed.network.relay_only = Nullable::null();
+        let left = configuration::edit(
+            &configuration::load(Some(configuration::contents(&relaxed).as_bytes())),
+            &Change::Network(None),
+        )
+        .expect("an edit");
+        assert!(!ServiceSelection::held_by(&left.document));
+        assert_eq!(left.document.network.bind_address(), Some("127.0.0.1:0"));
+        assert_eq!(left.document.level, 1, "nothing of a later level is held");
     }
 
     /// KR-REQ-26.13: the `shell` section holds the owner's default shell mode, a section of level
