@@ -1187,6 +1187,10 @@ impl ManagedAccountDeletion {
             progress: DeletionProgress::None,
             closed_now: false,
         };
+        // Most looks find nothing, and take nothing for it.
+        if self.account.read_deletion().map_err(local)?.is_none() {
+            return Ok(nothing);
+        }
         let owner = self.try_own().await?;
         let Some(record) = self.account.read_deletion().map_err(local)? else {
             return Ok(nothing);
