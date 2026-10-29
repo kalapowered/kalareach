@@ -162,14 +162,16 @@ once for each Windows target and with no environment and no secret, checks out t
 assembles the tree, and proves it: it signs the manifest with keys of its own, packs it, and holds
 the archive to what a host stages. What it signs is no release, and the archive it keeps says so in
 its name. The `release` job takes the two trees. It waits, because it declares the `release-signing`
-environment and that environment has a required reviewer, so a person approves every signature this
-project ever makes. It runs for a release tag and for the default branch only, and a run on any other
+environment and that environment has a required reviewer, so a person approves every Windows
+signature. It runs for a release tag and for the default branch only, and a run on any other
 ref shows it skipped. Approve it and the run signs the files of each tree that carry a signature,
-verifies each of them, puts them back, and then stops, naming the reason: the update channel's release
-keys do not exist yet, so `release.json` cannot be signed again after the signatures changed the files.
-Publishing a release waits for the key ceremony, which is the project owner's to hold, on every
-platform. When the keys exist, that step is replaced by the one that signs, and the run goes on to pack
-both archives, hold them to what a host stages, and publish a release carrying them and their sums.
+verifies each of them, puts them back, and then stops, naming the reason: the production update
+channel's release keys are not available to a workflow, so `release.json` cannot be signed again
+after the signatures changed the files. Publishing a Windows release waits for the key ceremony of
+the production channel, which is the project owner's to hold; the macOS and Linux releases are signed
+under the tester channel and do not wait for it. When the production keys can be used, that step is
+replaced by the one that signs, and the run goes on to pack both archives, hold them to what a host
+stages, and publish a release carrying them and their sums.
 
 To sign a commit without releasing it, start the workflow by hand and give it a ref. The gate job
 settles that commit and records it in the Step Summary. The reviewer in the `release-signing`
