@@ -8,6 +8,7 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-15.11 | `the_grammar_reads_the_requests_it_holds_and_nothing_else`, `a_mark_in_or_beside_a_number_leaves_no_number` |
+//! | KR-REQ-15.21 | `no_spoken_form_submits_a_prompt_or_answers_an_approval` |
 
 use kr_protocol::scalars::U64;
 use kr_protocol::voice::{FragmentText, TranscriptFragment, VoiceAction};
@@ -351,5 +352,72 @@ fn a_mark_in_or_beside_a_number_leaves_no_number() {
                 "{mark:?} then {first} names no session"
             );
         }
+    }
+}
+
+/// KR-REQ-15.21: submitting a prompt needs a clear spoken confirmation that names the destination
+/// session, and an approval decision needs the verified request's details and an explicit answer.
+/// The host reads speech deterministically and for the four requests above only, so no spoken form
+/// submits a prompt or answers an approval: a prompt is never spoken into a session, and the
+/// spoken destination a confirmation would name is never reached. Whatever a person says that
+/// sounds like either, the host reads no request from it, and a request the grammar does read
+/// carries no destination confirmation and no approval answer.
+#[test]
+fn no_spoken_form_submits_a_prompt_or_answers_an_approval() {
+    let sounds_like_one: &[&[&str]] = &[
+        // A prompt, and the destination it is sent to.
+        &["submit the prompt to session 3"],
+        &["send the prompt fix the failing test to session three"],
+        &["send it to session 3"],
+        &["tell session three to run the tests"],
+        &["ask session 2 to fix the build"],
+        &["session 3, run the tests"],
+        &["submit", "to session 3"],
+        // A confirmation of one, clear or not, naming the destination or not.
+        &["yes, send it to session 3"],
+        &["yes submit it to session three"],
+        &["Yes, send it to session 3, I confirm."],
+        &["confirm, session 3"],
+        &["I confirm"],
+        &["yes"],
+        &["send it"],
+        &["submit"],
+        &["do it"],
+        // An answer to an approval, explicit or not.
+        &["approve the request"],
+        &["approve"],
+        &["yes, allow it"],
+        &["allow once"],
+        &["deny the request"],
+        &["no, do not allow it"],
+        // A request the grammar holds, with a prompt or a confirmation said beside it: the whole
+        // utterance has to be the request.
+        &["status of session 3 and send it to session 3"],
+        &["go to session 3, yes send it"],
+        &["close session 3 and submit the prompt"],
+    ];
+    for texts in sounds_like_one {
+        assert_eq!(read(texts), Err(Misread::NotARequest), "{texts:?}");
+    }
+
+    // The requests that are read give the host an action to check and nothing it could take as
+    // the person's confirmation of a destination or an answer to an approval: `read` asserts that
+    // of each answer.
+    for texts in [
+        &["status"][..],
+        &["brief me on session 2"],
+        &["open session 6"],
+        &["close session 3"],
+    ] {
+        let (action, _) = read(texts).expect("a request the grammar holds");
+        assert!(
+            !matches!(
+                action,
+                VoiceAction::SubmitPrompt
+                    | VoiceAction::ComposePrompt
+                    | VoiceAction::AnswerApproval
+            ),
+            "{texts:?} read as {action:?}"
+        );
     }
 }

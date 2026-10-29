@@ -15,7 +15,7 @@
 //! | KR-REQ-15.17 | `a_result_that_was_admitted_and_not_performed_is_reported_as_admitted` |
 //! | KR-REQ-15.19 | `the_terms_a_person_reads_before_a_call_are_the_services_own`, `a_host_without_the_services_terms_says_why`, `a_preparation_is_refused_where_a_start_would_be` |
 //! | KR-REQ-15.20 | `context_selection_uses_the_requesting_devices_scope_and_nothing_wider` |
-//! | KR-REQ-15.21 | `the_default_voice_grant_permits_four_things_and_names_them`, `submitting_a_prompt_needs_the_spoken_destination` |
+//! | KR-REQ-15.21 | `the_default_voice_grant_permits_four_things_and_names_them`, `submitting_a_prompt_needs_the_spoken_destination`, `speech_reaches_no_prompt_submission_under_a_grant_that_permits_one` |
 //! | KR-REQ-15.22 | `cancelling_a_turn_needs_the_typed_request_and_the_current_turn` |
 //! | KR-REQ-23.51 | `every_voice_method_needs_the_voice_grant`, `a_delegation_answered_before_is_answered_again_under_the_authority_that_stands_now` |
 
@@ -3733,6 +3733,58 @@ async fn submitting_a_prompt_needs_the_spoken_destination() {
         result.outcome,
         VoiceDelegationOutcome::Performed { .. }
     ));
+}
+
+/// KR-REQ-15.21: the host reads speech with its own grammar, which holds no request that submits a
+/// prompt or answers an approval, so even a call whose voice grant the person broadened to permit
+/// both reaches neither by speech: whatever is said, in whatever words, the host proposes nothing,
+/// and the spoken destination a prompt would need is never reached.
+#[tokio::test]
+async fn speech_reaches_no_prompt_submission_under_a_grant_that_permits_one() {
+    let fixture = fixture().in_the_product_grammar();
+    let call = started(
+        &fixture,
+        Some(&[
+            VoiceAction::SubmitPrompt,
+            VoiceAction::AnswerApproval,
+            VoiceAction::Status,
+        ]),
+    )
+    .await;
+
+    for (index, words) in [
+        "send the prompt fix the failing test to session one",
+        "send it to session one",
+        "yes, send it to session one",
+        "I confirm, submit it to session one",
+        "approve the request",
+        "yes, allow it",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let result = fixture
+            .coordinator
+            .delegate(
+                device(PHONE),
+                action(u8::try_from(index).expect("a small index") + 1),
+                &saying(call, &format!("s{index}"), words),
+                11_000,
+                &unbounded(),
+            )
+            .await
+            .expect("an answer");
+        assert_eq!(
+            refusal(&result.outcome).0,
+            VoiceRefusal::NotUnderstood,
+            "{words}"
+        );
+        assert_eq!(result.action.0, None, "{words}");
+    }
+    assert!(
+        fixture.submitter.proposals().is_empty(),
+        "nothing spoken reached the host"
+    );
 }
 
 /// KR-REQ-15.21: an approval decision needs the verified request's details and an explicit answer,
