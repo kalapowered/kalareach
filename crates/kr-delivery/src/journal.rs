@@ -2345,13 +2345,18 @@ impl DeliveryJournal {
             && !transition.reported_by_destination
             && matches!(
                 transition.state,
-                DeliveryState::Abandoned | DeliveryState::Expired | DeliveryState::Revoked
+                DeliveryState::Abandoned
+                    | DeliveryState::Expired
+                    | DeliveryState::Revoked
+                    | DeliveryState::Cancelled
             )
         {
-            // This host stopping, its own deadline passing, and an authorisation it no longer
-            // holds are all facts about this host. None of them settles what became of something
-            // the gateway or the service already has: a destination reconfigured after a dispatch,
-            // or a credential this host lost, says nothing about the notification that went.
+            // This host stopping, its own deadline passing, an authorisation it no longer holds
+            // and privacy mode taking back a read of the gateway's decision are all facts about
+            // this host. None of them settles what became of something the gateway or the service
+            // already has: a destination reconfigured after a dispatch, a credential this host
+            // lost, or a status read that was never presented says nothing about the notification
+            // that went.
             Transition {
                 state: unresolved_for(kind),
                 next: crate::push::NextAction::None,
