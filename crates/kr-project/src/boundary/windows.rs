@@ -131,6 +131,18 @@ pub const MECHANISM: &str = "none yet: a per-invocation application container ca
 /// and then this.
 const ENFORCED: bool = false;
 
+/// Why no Git is run here, which is what an invocation is refused with and what a request that
+/// needs Git is told before Git is looked for.
+pub const NO_GIT: Option<&str> = if ENFORCED {
+    None
+} else {
+    Some(
+        "an application container on this platform cannot keep a repository from being executed \
+         from, and cannot bound which ports a remote operation reaches, so this host refuses \
+         rather than claiming a boundary it does not have",
+    )
+};
+
 /// The rights a container is given on a directory an operation owns.
 ///
 /// Read, write, and the right to take a name away, which is what an ordinary Git operation needs:
@@ -276,15 +288,9 @@ impl Drop for OwnedSid {
 /// made, the job cannot be built or the process cannot be started. Nothing here starts Git outside
 /// its container.
 pub fn start(invocation: &Invocation<'_>, confinement: &Confinement) -> Result<Spawned> {
-    if !ENFORCED {
+    if let Some(why) = NO_GIT {
         return Err(ProjectError::GitFailed {
-            detail: format!(
-                "{} is not run: an application container on this platform cannot keep a repository \
-                 from being executed from, and cannot bound which ports a remote operation reaches, \
-                 so this host refuses rather than claiming a boundary it does not have",
-                invocation.described
-            )
-            .into(),
+            detail: format!("{} is not run: {why}", invocation.described).into(),
         });
     }
     let container = build(confinement)?;

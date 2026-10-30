@@ -108,11 +108,12 @@ mod linux {
     /// readable as every invocation's are, and the child's temporary directory made for it.
     fn run_enclosed(fixture: &Fixture, working: &Path, enclosed: Enclosed<'_>) -> Outcome {
         let profile = fixture.service().profile();
+        let git = profile.git().expect("Git is installed");
         let environment_id = fixture.environment_id();
         let temporary = tempfile::TempDir::new().expect("a temporary directory for the child");
         let confinement = Confinement {
             program: enclosed.program.to_owned(),
-            exec_path: profile.git().exec_path().to_owned(),
+            exec_path: git.exec_path().to_owned(),
             helpers: enclosed.helpers,
             working: OpenedDirectory::open(environment_id, working, None)
                 .expect("the working directory opens"),
@@ -120,7 +121,7 @@ mod linux {
             temporary: OpenedDirectory::open(environment_id, temporary.path(), None)
                 .expect("the temporary directory opens"),
             readable: [
-                profile.git().program(),
+                git.program(),
                 profile.empty_config(),
                 profile.hooks_directory(),
                 profile.home_directory(),
@@ -133,8 +134,9 @@ mod linux {
             reads: enclosed.reads,
         };
         let nothing: [&OsStr; 0] = [];
-        let environment =
-            profile.environment(&GitRequest::read(working, &nothing), temporary.path());
+        let environment = profile
+            .environment(&GitRequest::read(working, &nothing), temporary.path())
+            .expect("Git is installed");
         let mut child = kr_project::boundary::start(
             &Invocation {
                 program: enclosed.program,
@@ -199,7 +201,13 @@ mod linux {
         reads: Reads,
     ) -> Outcome {
         let named = format!("--file={}", file.display());
-        let program = fixture.service().profile().git().executable().to_owned();
+        let program = fixture
+            .service()
+            .profile()
+            .git()
+            .expect("Git is installed")
+            .executable()
+            .to_owned();
         run_enclosed(
             fixture,
             working,

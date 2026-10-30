@@ -120,6 +120,9 @@ use crate::error::{ProjectError, Result};
 pub const MECHANISM: &str = "Landlock rules attached to the directory handles this host opened, \
                              with a system-call filter for the sockets Landlock does not cover";
 
+/// This platform has a boundary an invocation runs inside.
+pub const NO_GIT: Option<&str> = None;
+
 /// The interface version the filesystem confinement is built against.
 ///
 /// Truncation arrived here. Below it a process could shorten a file this boundary never made

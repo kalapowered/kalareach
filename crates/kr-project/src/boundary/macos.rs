@@ -47,6 +47,9 @@ use crate::error::{ProjectError, Result};
 pub const MECHANISM: &str = "a per-invocation macOS sandbox profile, applied by the system's own launcher before it \
      executes Git";
 
+/// This platform has a boundary an invocation runs inside.
+pub const NO_GIT: Option<&str> = None;
+
 /// The launcher that applies a profile and then executes what it was given.
 const LAUNCHER: &str = "/usr/bin/sandbox-exec";
 

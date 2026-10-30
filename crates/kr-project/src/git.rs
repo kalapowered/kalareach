@@ -603,18 +603,27 @@ pub struct GitProgram {
 impl GitProgram {
     /// Resolves installed Git, its own `--exec-path` and its version.
     ///
-    /// The process's own `PATH` is consulted exactly here, once, at startup. Every invocation
-    /// afterwards runs with the `PATH` the profile builds.
+    /// The process's own `PATH` is consulted exactly here. Every invocation afterwards runs with
+    /// the `PATH` the profile builds.
     ///
     /// # Errors
     ///
     /// Returns [`ProjectError::GitUnavailable`] when Git is not installed, cannot be resolved to
-    /// an absolute path, or is older than [`MINIMUM_GIT_VERSION`].
+    /// an absolute path, cannot answer, or is older than [`MINIMUM_GIT_VERSION`]. The message ends
+    /// with the step that installs Git on this platform.
     pub fn discover() -> Result<Self> {
-        let program = search_path(GIT_FILE_NAME).ok_or_else(|| ProjectError::GitUnavailable {
-            detail: "installed Git was not found on this host".to_owned().into(),
-        })?;
-        Self::at(&program)
+        Self::discover_on(std::env::var_os("PATH").as_deref())
+    }
+
+    /// Resolves the Git that `search` leads to, as [`Self::discover`] resolves the one on this
+    /// process's `PATH`.
+    fn discover_on(search: Option<&OsStr>) -> Result<Self> {
+        search_in(search, GIT_FILE_NAME)
+            .ok_or_else(|| ProjectError::GitUnavailable {
+                detail: "installed Git was not found on this host".to_owned().into(),
+            })
+            .and_then(|program| Self::at(&program))
+            .map_err(with_install_step)
     }
 
     /// Resolves one named Git binary, its helper directory and its version.
@@ -724,10 +733,44 @@ impl GitProgram {
     }
 }
 
+/// Where installed Git comes from, and the program once it has been found.
+///
+/// Git is looked for the first time an invocation needs it, on the search path the process had
+/// when the profile was prepared, and a program that was found is kept for the life of the
+/// profile. A search that found nothing usable is not kept: a host that installs Git while the
+/// daemon runs serves the next request that needs it without a restart.
+#[derive(Debug)]
+struct Installation {
+    search: Option<OsString>,
+    found: OnceLock<GitProgram>,
+    /// Held while Git is looked for, so that requests which arrive together start Git's probes once
+    /// between them when Git is found: the one that finds it keeps it, and the others read what it
+    /// kept. A search that finds nothing keeps nothing, and each request waiting behind it then
+    /// searches in its turn.
+    looking: Mutex<()>,
+}
+
+impl Installation {
+    fn program(&self) -> Result<&GitProgram> {
+        if let Some(found) = self.found.get() {
+            return Ok(found);
+        }
+        let _one_look_at_a_time = self
+            .looking
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(found) = self.found.get() {
+            return Ok(found);
+        }
+        let resolved = GitProgram::discover_on(self.search.as_deref())?;
+        Ok(self.found.get_or_init(|| resolved))
+    }
+}
+
 /// The restricted profile: the program, and the empty directories the overrides point at.
 #[derive(Clone, Debug)]
 pub struct RestrictedProfile {
-    git: GitProgram,
+    git: Arc<Installation>,
     environment_id: EnvironmentId,
     empty_config: PathBuf,
     hooks: PathBuf,
@@ -1264,12 +1307,51 @@ impl RestrictedProfile {
     /// templates are copied from another, and the child's home is the third so that no
     /// `~/.gitconfig`, `~/.gitignore` or `~/.ssh/config` is ever read.
     ///
+    /// Git is not looked for here. The first invocation that needs it looks for it on this
+    /// process's `PATH` as it is now, so a host without a working Git prepares a profile and
+    /// refuses each invocation instead.
+    ///
     /// # Errors
     ///
     /// Returns [`ProjectError::StagingUnavailable`] when a directory or the empty file cannot be
-    /// created, or [`ProjectError::GitUnavailable`] when Git cannot be resolved.
+    /// created.
     pub fn prepare(root: &Path, environment_id: EnvironmentId) -> Result<Self> {
-        Self::prepare_with(root, environment_id, GitProgram::discover()?)
+        Self::prepare_searching(root, environment_id, std::env::var_os("PATH"))
+    }
+
+    /// Prepares the profile like [`Self::prepare`], with Git looked for on `search` instead of on
+    /// this process's `PATH`.
+    ///
+    /// Compiled with the fixtures, so that a test can prepare a profile for a host with no Git, or
+    /// with a Git that cannot answer, without changing the environment of the process it runs in.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StagingUnavailable`] when a directory or the empty file cannot be
+    /// created.
+    #[cfg(feature = "git-fixtures")]
+    pub fn prepare_on(
+        root: &Path,
+        environment_id: EnvironmentId,
+        search: Option<OsString>,
+    ) -> Result<Self> {
+        Self::prepare_searching(root, environment_id, search)
+    }
+
+    fn prepare_searching(
+        root: &Path,
+        environment_id: EnvironmentId,
+        search: Option<OsString>,
+    ) -> Result<Self> {
+        Self::prepare_around(
+            root,
+            environment_id,
+            Installation {
+                search,
+                found: OnceLock::new(),
+                looking: Mutex::new(()),
+            },
+        )
     }
 
     /// Prepares the profile around one already-resolved Git program.
@@ -1282,6 +1364,22 @@ impl RestrictedProfile {
         root: &Path,
         environment_id: EnvironmentId,
         git: GitProgram,
+    ) -> Result<Self> {
+        Self::prepare_around(
+            root,
+            environment_id,
+            Installation {
+                search: None,
+                found: OnceLock::from(git),
+                looking: Mutex::new(()),
+            },
+        )
+    }
+
+    fn prepare_around(
+        root: &Path,
+        environment_id: EnvironmentId,
+        git: Installation,
     ) -> Result<Self> {
         // Every directory in the profile is derived from this one, and one of them is where each
         // Git child starts. A relative root would name a different directory depending on where
@@ -1371,7 +1469,7 @@ impl RestrictedProfile {
             &profile.join(TEMPORARY_MANIFEST_FILE),
         )?;
         Ok(Self {
-            git,
+            git: Arc::new(git),
             environment_id,
             empty_config,
             hooks,
@@ -1393,12 +1491,16 @@ impl RestrictedProfile {
     ///
     /// Compiled with the fixtures, so a test can state what an invocation's execution list is
     /// without starting one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::GitUnavailable`] when there is no usable Git.
     #[cfg(feature = "git-fixtures")]
-    #[must_use]
-    pub fn execution_list(&self, request: &GitRequest<'_>) -> Vec<PathBuf> {
-        let mut programs = vec![self.git.executable().to_owned()];
-        programs.extend(helpers(request, self.git.exec_path()));
-        programs
+    pub fn execution_list(&self, request: &GitRequest<'_>) -> Result<Vec<PathBuf>> {
+        let git = self.git()?;
+        let mut programs = vec![git.executable().to_owned()];
+        programs.extend(helpers(request, git.exec_path()));
+        Ok(programs)
     }
 
     /// Runs something between the reading of a repository's configuration and the start of a Git
@@ -1423,10 +1525,21 @@ impl RestrictedProfile {
         self.read_deadline = Some(deadline);
     }
 
-    /// Returns the resolved Git program.
-    #[must_use]
-    pub const fn git(&self) -> &GitProgram {
-        &self.git
+    /// Returns the Git program this profile runs, looking for it if no invocation has needed it
+    /// yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::GitUnavailable`] when there is no usable Git, with the step that
+    /// installs it, and the platform's own [`ProjectError::GitFailed`] before any search where the
+    /// platform runs no Git at all. The search is made again at the next call.
+    pub fn git(&self) -> Result<&GitProgram> {
+        if let Some(why) = crate::boundary::NO_GIT {
+            return Err(ProjectError::GitFailed {
+                detail: format!("Git is not run on this platform: {why}").into(),
+            });
+        }
+        self.git.program()
     }
 
     /// Returns the support set an invocation for a caller bounded by a grant runs with on this
@@ -1438,15 +1551,17 @@ impl RestrictedProfile {
     ///
     /// # Errors
     ///
-    /// Returns [`ProjectError::GitFailed`] naming what could not be named, and on a platform that
-    /// does not confine what Git reads.
+    /// Returns [`ProjectError::GitUnavailable`] when there is no usable Git, and
+    /// [`ProjectError::GitFailed`] naming what could not be named, and on a platform that does not
+    /// confine what Git reads.
     pub fn support_set(&self) -> Result<Arc<SupportSet>> {
+        let git = self.git()?;
         self.support
             .get_or_init(|| {
-                let shells = crate::boundary::connection_shell(self.git.exec_path());
-                let mut programs: Vec<&Path> = vec![self.git.executable()];
+                let shells = crate::boundary::connection_shell(git.exec_path());
+                let mut programs: Vec<&Path> = vec![git.executable()];
                 programs.extend(shells.iter().map(PathBuf::as_path));
-                crate::boundary::support_set(&programs, self.git.exec_path())
+                crate::boundary::support_set(&programs, git.exec_path())
                     .map(Arc::new)
                     .map_err(|refusal| refusal.to_string())
             })
@@ -1481,9 +1596,10 @@ impl RestrictedProfile {
     ///
     /// # Errors
     ///
-    /// Returns [`ProjectError::GitFailed`] when the invocation cannot start, cannot be waited on,
-    /// or runs past its deadline. A non-zero exit is an output rather than an error, because a
-    /// caller often needs the exit code.
+    /// Returns [`ProjectError::GitUnavailable`] when there is no usable Git, before anything of
+    /// the invocation exists, and [`ProjectError::GitFailed`] when the invocation cannot start,
+    /// cannot be waited on, or runs past its deadline. A non-zero exit is an output rather than an
+    /// error, because a caller often needs the exit code.
     pub fn run(&self, request: &GitRequest<'_>) -> Result<GitOutput> {
         self.run_noting_the_start(request, &mut false)
     }
@@ -1523,6 +1639,10 @@ impl RestrictedProfile {
                 .into(),
             ));
         }
+        // Git is looked for before anything of the invocation exists, so a host without a usable
+        // Git refuses here and leaves no directory behind. What is found is kept, and the steps
+        // below ask for it again without searching.
+        let git = self.git()?;
         // Opened once, here, and handed to the child. Everything the boundary is built from is
         // resolved in this moment rather than one after another.
         let working =
@@ -1539,7 +1659,7 @@ impl RestrictedProfile {
         )?;
         let confinement = self.confinement(request, working, &temporary)?;
         let arguments = self.argument_vector(request);
-        let environment = self.environment(request, temporary.path());
+        let environment = self.environment(request, temporary.path())?;
         let described = request.describe();
         #[cfg(feature = "git-fixtures")]
         if let Some(interposition) = self.interposition.as_ref() {
@@ -1547,7 +1667,7 @@ impl RestrictedProfile {
         }
         let mut child = crate::boundary::start(
             &crate::boundary::Invocation {
-                program: self.git.executable(),
+                program: git.executable(),
                 arguments: &arguments,
                 environment: &environment,
                 described: &described,
@@ -1694,17 +1814,18 @@ impl RestrictedProfile {
             Some(admission) if admission.is_bounded() => Reads::Bounded(self.support_set()?),
             _ => Reads::Everywhere,
         };
+        let git = self.git()?;
         Ok(Confinement {
-            program: self.git.executable().to_owned(),
-            exec_path: self.git.exec_path().to_owned(),
-            helpers: helpers(request, self.git.exec_path()),
+            program: git.executable().to_owned(),
+            exec_path: git.exec_path().to_owned(),
+            helpers: helpers(request, git.exec_path()),
             working,
             reserved,
             temporary,
             // Where a platform's mechanism confines reading as well as writing, these are what Git
             // reads that lie outside the directories the operation owns.
             readable: [
-                self.git.program().to_owned(),
+                git.program().to_owned(),
                 self.empty_config.clone(),
                 self.hooks.clone(),
                 self.template.clone(),
@@ -1722,7 +1843,8 @@ impl RestrictedProfile {
     ///
     /// # Errors
     ///
-    /// Returns [`ProjectError::GitFailed`] when the invocation fails or its output was truncated.
+    /// Returns [`ProjectError::GitUnavailable`] when there is no usable Git, and
+    /// [`ProjectError::GitFailed`] when the invocation fails or its output was truncated.
     pub fn run_checked(&self, request: &GitRequest<'_>) -> Result<String> {
         let output = self.run(request)?;
         output.require_success()?;
@@ -1768,8 +1890,11 @@ impl RestrictedProfile {
     /// The order matters in one place: `credential.helper` is blanked first, which empties the
     /// list, and the approved broker's helper is appended after it. Everything else is independent.
     /// Each pair reaches Git as `GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>`, in this order.
-    #[must_use]
-    pub fn overrides(&self, request: &GitRequest<'_>) -> Vec<(String, OsString)> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::GitUnavailable`] when there is no usable Git.
+    pub fn overrides(&self, request: &GitRequest<'_>) -> Result<Vec<(String, OsString)>> {
         let mut settings: Vec<(String, OsString)> = vec![
             // Hooks are looked for in a directory this host owns and keeps empty, so a planted
             // `.git/hooks/post-checkout` is never found.
@@ -1882,7 +2007,7 @@ impl RestrictedProfile {
         if let Some(name) = request.remote_name.filter(|name| plain_name(name)) {
             settings.push((
                 format!("remote.{name}.uploadpack"),
-                upload_pack(&self.git).into_os_string(),
+                upload_pack(self.git()?).into_os_string(),
             ));
         }
         // Every driver the repository defines, blanked by name. The names come from the audit,
@@ -1896,33 +2021,36 @@ impl RestrictedProfile {
                 settings.push((format!("{section}.{driver}.{key}"), OsString::from(*blank)));
             }
         }
-        settings
+        Ok(settings)
     }
 
     /// Builds the complete environment one invocation runs with.
     ///
     /// The temporary directory is this invocation's own, so a Git that needs one writes inside the
     /// boundary rather than reaching for a directory shared with everything else on this machine.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::GitUnavailable`] when there is no usable Git.
     pub fn environment(
         &self,
         request: &GitRequest<'_>,
         temporary: &Path,
-    ) -> Vec<(OsString, OsString)> {
+    ) -> Result<Vec<(OsString, OsString)>> {
+        let git = self.git()?;
         let mut path = OsString::from(
-            self.git
-                .program
+            git.program
                 .parent()
                 .unwrap_or_else(|| Path::new(""))
                 .as_os_str(),
         );
         path.push(PATH_SEPARATOR);
-        path.push(self.git.exec_path.as_os_str());
+        path.push(git.exec_path.as_os_str());
         let mut environment: Vec<(OsString, OsString)> = vec![
             (OsString::from("PATH"), path),
             (
                 OsString::from("GIT_EXEC_PATH"),
-                self.git.exec_path.as_os_str().to_owned(),
+                git.exec_path.as_os_str().to_owned(),
             ),
             (OsString::from("GIT_CONFIG_NOSYSTEM"), OsString::from("1")),
             (
@@ -1983,7 +2111,7 @@ impl RestrictedProfile {
         // The overrides, as the environment form of `git -c`. Setting the count here also
         // neutralises an inherited one: the child's environment is built from nothing, so the only
         // key and value pairs Git reads are these.
-        let overrides = self.overrides(request);
+        let overrides = self.overrides(request)?;
         environment.push((
             OsString::from("GIT_CONFIG_COUNT"),
             OsString::from(overrides.len().to_string()),
@@ -2007,7 +2135,7 @@ impl RestrictedProfile {
             ));
         }
         environment.extend(inherited_platform_environment(&self.home));
-        environment
+        Ok(environment)
     }
 }
 
@@ -3002,12 +3130,34 @@ fn read_bounded<R: std::io::Read + Send + 'static>(pipe: R) -> Reader {
     Reader { handle, read }
 }
 
-/// Finds one program on the process's own `PATH`.
-fn search_path(file_name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
+/// Finds one program on a search path.
+fn search_in(search: Option<&OsStr>, file_name: &str) -> Option<PathBuf> {
+    std::env::split_paths(search?)
         .map(|directory| directory.join(file_name))
         .find(|candidate| candidate.is_file())
+}
+
+/// The step that installs Git on this platform, which a refusal for lack of it ends with.
+///
+/// Windows has none: this host runs no Git there whether or not it is installed, so naming an
+/// install would send a person to a step that changes nothing. The text uses only characters a
+/// message repeats, so it reaches the caller as written.
+const INSTALL_STEP: Option<&str> = if cfg!(target_os = "macos") {
+    Some("Install the Command Line Tools with xcode-select --install, then try again.")
+} else if cfg!(windows) {
+    None
+} else {
+    Some("Install Git with the system package manager, then try again.")
+};
+
+/// Ends a refusal for lack of a usable Git with the step that installs it.
+fn with_install_step(error: ProjectError) -> ProjectError {
+    match (error, INSTALL_STEP) {
+        (ProjectError::GitUnavailable { detail }, Some(step)) => ProjectError::GitUnavailable {
+            detail: format!("{detail}. {step}").into(),
+        },
+        (other, _) => other,
+    }
 }
 
 /// Returns the program Git starts the other end of a connection as.
@@ -3592,7 +3742,7 @@ mod tests {
         let arguments: [&OsStr; 1] = [OsStr::new("status")];
         let request = GitRequest::read(Path::new("/tree"), &arguments)
             .with_drivers(vec![("filter".to_owned(), "marker".to_owned())]);
-        let overrides = profile.overrides(&request);
+        let overrides = profile.overrides(&request).expect("Git is installed");
         let named = |key: &str| {
             overrides
                 .iter()
@@ -3630,8 +3780,9 @@ mod tests {
         assert!(argv.contains(&OsString::from("--no-optional-locks")));
         assert!(argv.contains(&OsString::from("--no-pager")));
         // The environment is built rather than inherited, so what Git reads is exactly this.
-        let environment =
-            profile.environment(&request, Path::new("/state/git-profile/temporary/one"));
+        let environment = profile
+            .environment(&request, Path::new("/state/git-profile/temporary/one"))
+            .expect("Git is installed");
         let value = |name: &str| {
             environment
                 .iter()
@@ -3726,7 +3877,7 @@ mod tests {
                 port: None,
                 remote_name: Some("origin"),
             });
-        let overrides = profile.overrides(&request);
+        let overrides = profile.overrides(&request).expect("Git is installed");
         let helpers: Vec<&OsString> = overrides
             .iter()
             .filter(|(key, _)| key == "credential.helper")
@@ -3752,8 +3903,9 @@ mod tests {
                 .iter()
                 .any(|(key, value)| key == "core.sshCommand" && value.is_empty())
         );
-        let environment =
-            profile.environment(&request, Path::new("/state/git-profile/temporary/one"));
+        let environment = profile
+            .environment(&request, Path::new("/state/git-profile/temporary/one"))
+            .expect("Git is installed");
         assert!(
             environment
                 .iter()
@@ -3882,7 +4034,7 @@ mod tests {
         let arguments: [&OsStr; 1] = [OsStr::new("status")];
         let request =
             GitRequest::read(Path::new("/tree"), &arguments).with_drivers(audit.drivers.clone());
-        let overrides = profile.overrides(&request);
+        let overrides = profile.overrides(&request).expect("Git is installed");
         assert!(
             overrides
                 .iter()
@@ -3891,8 +4043,9 @@ mod tests {
         );
         // A key holding an equals sign is expressible only in the environment form, which is why
         // the overrides travel there: the key and the value are separate variables.
-        let environment =
-            profile.environment(&request, Path::new("/state/git-profile/temporary/one"));
+        let environment = profile
+            .environment(&request, Path::new("/state/git-profile/temporary/one"))
+            .expect("Git is installed");
         let keys: Vec<String> = environment
             .iter()
             .filter(|(name, _)| name.to_string_lossy().starts_with("GIT_CONFIG_KEY_"))
@@ -4374,12 +4527,16 @@ mod tests {
     /// A profile whose directories are named but never created, for the tests that read its lists.
     fn test_profile() -> RestrictedProfile {
         RestrictedProfile {
-            git: GitProgram {
-                program: PathBuf::from("/usr/bin/git"),
-                executable: PathBuf::from("/usr/libexec/git-core/git"),
-                exec_path: PathBuf::from("/usr/libexec/git-core"),
-                version: "git version 2.50.1".to_owned(),
-            },
+            git: Arc::new(Installation {
+                search: None,
+                looking: Mutex::new(()),
+                found: OnceLock::from(GitProgram {
+                    program: PathBuf::from("/usr/bin/git"),
+                    executable: PathBuf::from("/usr/libexec/git-core/git"),
+                    exec_path: PathBuf::from("/usr/libexec/git-core"),
+                    version: "git version 2.50.1".to_owned(),
+                }),
+            }),
             environment_id: EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16])),
             empty_config: PathBuf::from("/state/git-profile/empty-config"),
             hooks: PathBuf::from("/state/git-profile/hooks"),
@@ -4425,7 +4582,7 @@ mod tests {
                 port: None,
                 remote_name: Some("origin"),
             });
-        let overrides = profile.overrides(&request);
+        let overrides = profile.overrides(&request).expect("Git is installed");
         let fixed: Vec<&OsString> = overrides
             .iter()
             .filter(|(key, _)| key == "remote.origin.uploadpack")
@@ -4434,11 +4591,11 @@ mod tests {
         assert_eq!(fixed.len(), 1, "the program is named exactly once");
         assert_eq!(
             fixed[0],
-            &upload_pack(profile.git()).into_os_string(),
+            &upload_pack(profile.git().expect("Git is installed")).into_os_string(),
             "and it is Git's own, under Git's own helper directory"
         );
         assert!(
-            Path::new(fixed[0]).starts_with(profile.git().exec_path()),
+            Path::new(fixed[0]).starts_with(profile.git().expect("Git is installed").exec_path()),
             "which is where the boundary's execution list already reaches"
         );
 
@@ -4456,6 +4613,7 @@ mod tests {
         assert!(
             !profile
                 .overrides(&awkward)
+                .expect("Git is installed")
                 .iter()
                 .any(|(key, _)| key.ends_with(".uploadpack"))
         );
@@ -4465,6 +4623,7 @@ mod tests {
         assert!(
             !profile
                 .overrides(&read)
+                .expect("Git is installed")
                 .iter()
                 .any(|(key, _)| key.ends_with(".uploadpack"))
         );
