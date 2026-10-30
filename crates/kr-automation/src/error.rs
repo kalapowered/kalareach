@@ -40,6 +40,20 @@ pub enum AutomationError {
     #[error("permission denied: {0}")]
     PermissionDenied(String),
 
+    /// The workspace a node runs in could not be opened as the host recorded it, so nothing was
+    /// dispatched.
+    ///
+    /// This is a refusal of the place and not of the grant, and not an outcome: the node pauses
+    /// as it does for [`Self::PermissionDenied`], and the caller is answered with the code the
+    /// project service gives the failure, such as `SOURCE_CHANGED` for a tree that was replaced.
+    #[error("{detail}")]
+    WorkspaceUnavailable {
+        /// The code the project service gave the failure.
+        code: ErrorCode,
+        /// What it said.
+        detail: String,
+    },
+
     /// This host could not read the grant a definition names, so it cannot say what it admits.
     ///
     /// This is not a refusal. A refusal says the grant does not authorise the work; this says the
@@ -301,6 +315,9 @@ impl From<&AutomationError> for ProtocolError {
             ),
             AutomationError::PermissionDenied(message) => {
                 Self::new(ErrorCode::PermissionDenied, message.clone())
+            }
+            AutomationError::WorkspaceUnavailable { code, detail } => {
+                Self::new(*code, detail.clone())
             }
             AutomationError::AuthorityUnavailable(message) => Self::new(
                 ErrorCode::StorageUnavailable,

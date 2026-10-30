@@ -1089,21 +1089,21 @@ async fn command_directory(
             // Opened as a capture opens it: the tree at the recorded path must be the one the
             // project service recorded, by device and inode. A directory that was moved, removed
             // or replaced since is refused, and a command never runs in a place nobody chose.
-            blocking(move || -> std::result::Result<PathBuf, String> {
-                let resolved = changesets
-                    .resolve(workspace_id)
-                    .map_err(|error| error.to_string())?;
-                let opened = changesets
-                    .open_repository(&resolved, None)
-                    .map_err(|error| error.to_string())?;
+            blocking(move || -> kr_changeset::Result<PathBuf> {
+                let resolved = changesets.resolve(workspace_id)?;
+                let opened = changesets.open_repository(&resolved, None)?;
                 Ok(opened.top_level().to_path_buf())
             })
             .await
             .map_err(|error| {
-                kr_automation::AutomationError::PermissionDenied(format!(
-                    "the workspace this command runs in is not the one that was recorded: {}",
-                    kr_project::git::redact(&error)
-                ))
+                // The code is the project service's own for the failure, such as `SOURCE_CHANGED`
+                // for a tree that was replaced. The failure is of the place, not of a grant.
+                kr_automation::AutomationError::WorkspaceUnavailable {
+                    code: error.code(),
+                    detail: format!(
+                        "the workspace this command runs in could not be opened: {error}"
+                    ),
+                }
             })?
         }
         (None, Some(scratch)) => scratch.to_path_buf(),

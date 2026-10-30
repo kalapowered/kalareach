@@ -6013,8 +6013,9 @@ async fn a_directory_put_in_place_of_a_commands_own_is_left_alone() {
 
 /// KR-REQ-25.14: a command declared for a workspace runs in the tree the project service recorded
 /// for it and nowhere else. A tree that was moved aside, with another directory put at its path,
-/// is refused where the command would start, the node pauses, and nothing runs in the other
-/// directory. The control is the same node before the directory is replaced.
+/// is refused where the command would start, as the project service refuses a workspace whose
+/// tree changed (`SOURCE_CHANGED`) and not as a refusal of the grant, the node pauses, and nothing
+/// runs in the other directory. The control is the same node before the directory is replaced.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_command_runs_only_in_the_workspace_that_was_recorded() {
     let host = working_host().await;
@@ -6051,7 +6052,7 @@ async fn a_command_runs_only_in_the_workspace_that_was_recorded() {
     std::fs::rename(&tree, host.work().join("moved-away")).expect("the tree is moved aside");
     std::fs::create_dir(&tree).expect("another directory is put at its path");
     let refused = failure(start(&mut control, &host, &document, "evt-replaced").await);
-    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert_eq!(refused.code, ErrorCode::SourceChanged, "{refused:?}");
     assert!(
         !tree.join("ran-here").exists(),
         "nothing ran in a directory that is not the recorded tree"

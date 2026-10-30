@@ -93,9 +93,11 @@ pub enum Cancellation {
 ///
 /// A runner that asks the grant again before its effect, as the host's own does, answers
 /// [`crate::AutomationError::PermissionDenied`] or [`crate::AutomationError::AuthorityUnavailable`]
-/// only when it refused the effect before starting it. The engine treats that exactly as it treats
-/// a refusal it decided itself: the node and its run pause, and nothing is claimed about an effect
-/// that never began.
+/// only when it refused the effect before starting it. A runner that cannot open the workspace a
+/// node runs in answers [`crate::AutomationError::WorkspaceUnavailable`], under the code the
+/// project service gives the failure, likewise before it starts anything. The engine treats each
+/// exactly as it treats a refusal it decided itself: the node and its run pause, and nothing is
+/// claimed about an effect that never began.
 pub trait ActionRunner: Send + Sync {
     /// Executes one action node.
     fn execute(
@@ -547,11 +549,13 @@ impl WorkflowEngine {
                         }
                     };
 
-                    // A runner that asked the grant once more and was refused never began the
-                    // effect, so this is a refusal and not an outcome: the node pauses as it would
-                    // have if the engine's own check had refused it a moment earlier.
+                    // A runner that asked the grant once more and was refused, or could not open
+                    // the workspace the node runs in, never began the effect, so this is a refusal
+                    // and not an outcome: the node pauses as it would have if the engine's own
+                    // check had refused it a moment earlier.
                     if let Err(
                         refusal @ (crate::error::AutomationError::PermissionDenied(_)
+                        | crate::error::AutomationError::WorkspaceUnavailable { .. }
                         | crate::error::AutomationError::AuthorityUnavailable(_)),
                     ) = outcome_res
                     {
