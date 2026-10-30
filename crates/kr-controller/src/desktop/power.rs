@@ -552,7 +552,12 @@ mod platform {
     /// the answer; a host with no mains supply at all is a host running on battery. A host with no
     /// power supplies published is a desktop machine or a virtual one, and neither answers this.
     pub(super) fn power_source() -> PowerSource {
-        let Ok(entries) = std::fs::read_dir("/sys/class/power_supply") else {
+        power_source_in(std::path::Path::new("/sys/class/power_supply"))
+    }
+
+    /// Reads whether the host is running on mains power from the power-supply class under `root`.
+    fn power_source_in(root: &std::path::Path) -> PowerSource {
+        let Ok(entries) = std::fs::read_dir(root) else {
             return PowerSource::Unknown;
         };
         let mut mains = None;
@@ -580,7 +585,84 @@ mod platform {
 
     #[cfg(test)]
     mod tests {
-        use super::names;
+        use super::{names, power_source_in};
+        use kr_protocol::desktop::PowerSource;
+
+        /// The power-supply class a host shows, one directory for each supply with the files the
+        /// kernel gives it.
+        fn class(supplies: &[(&str, &[(&str, &str)])]) -> tempfile::TempDir {
+            let root = tempfile::tempdir().expect("a power-supply class");
+            for (name, files) in supplies {
+                let directory = root.path().join(name);
+                std::fs::create_dir_all(&directory).expect("a supply directory");
+                for (file, content) in *files {
+                    std::fs::write(directory.join(file), content).expect("a supply file");
+                }
+            }
+            root
+        }
+
+        /// The host's power source is read from the power-supply class the way the description
+        /// host reads it, so that `host.info` and the descriptions' policy say the same of one
+        /// machine: a charger of any USB kind that is online is mains, a peripheral's battery is
+        /// not the host's power, and a supply the host will not describe leaves the source
+        /// unknown, which a `mains_only` setting does not take for mains.
+        #[test]
+        fn the_power_source_is_the_one_the_descriptions_read_from_the_same_class() {
+            let battery: &[(&str, &str)] = &[("type", "Battery\n")];
+            let mouse: &[(&str, &str)] = &[("type", "Battery\n"), ("scope", "Device\n")];
+            let adapter: &[(&str, &str)] = &[("type", "Mains\n"), ("online", "0\n")];
+            let usb_pd: &[(&str, &str)] = &[("type", "USB_PD\n"), ("online", "1\n")];
+            let programmable: &[(&str, &str)] = &[("type", "USB\n"), ("online", "2\n")];
+            let unknown: &[(&str, &str)] = &[("type", "Unknown\n"), ("online", "1\n")];
+            let cases: [(&str, &[(&str, &[(&str, &str)])], PowerSource); 8] = [
+                (
+                    "a desktop with a wireless mouse",
+                    &[("hid-mouse", mouse)],
+                    PowerSource::Mains,
+                ),
+                (
+                    "a laptop on a USB-C charger",
+                    &[("BAT0", battery), ("ucsi", usb_pd)],
+                    PowerSource::Mains,
+                ),
+                (
+                    "a laptop on a programmable supply",
+                    &[("BAT0", battery), ("ucsi", programmable)],
+                    PowerSource::Mains,
+                ),
+                (
+                    "a laptop unplugged, with a mouse",
+                    &[("BAT0", battery), ("AC", adapter), ("hid-mouse", mouse)],
+                    PowerSource::Battery,
+                ),
+                ("a host with no power supply", &[], PowerSource::Mains),
+                (
+                    "a battery and no adapter",
+                    &[("BAT0", battery)],
+                    PowerSource::Unknown,
+                ),
+                (
+                    "a supply of the type unknown",
+                    &[("charger", unknown)],
+                    PowerSource::Unknown,
+                ),
+                (
+                    "a supply that says nothing of itself",
+                    &[("odd", &[])],
+                    PowerSource::Unknown,
+                ),
+            ];
+            for (name, supplies, expected) in cases {
+                let root = class(supplies);
+                assert_eq!(power_source_in(root.path()), expected, "{name}");
+            }
+            assert_eq!(
+                power_source_in(&class(&[]).path().join("no-such-class")),
+                PowerSource::Unknown,
+                "a host with no power-supply class"
+            );
+        }
 
         #[test]
         fn only_this_process_s_own_inhibitor_acknowledges_it() {
