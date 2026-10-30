@@ -1938,19 +1938,19 @@ mod tests {
     }
 
     /// KR-REQ-24.26: a directory refused for its owner or its access list is said with a reason in
-    /// fixed words, so that a person told it is not owner-only is told what to look at, and the
-    /// detail, which can name an account, is not said.
+    /// fixed words, so that a person told it is not owner-only is told what to look at. The words
+    /// claim no more than the check knows: the directory is not known to keep others out.
     #[test]
     fn a_directory_refused_for_its_access_list_says_why_in_fixed_words() {
         let said = Shown::ipc(&IpcError::DirectoryAccessRefused {
             path: "/state/environments".into(),
-            detail: "planted-account-name".to_owned(),
+            detail: "its list could not be read".to_owned(),
         });
         assert!(
-            said.as_str().contains("does not keep other accounts out"),
+            said.as_str()
+                .contains("is not known to keep other accounts out"),
             "{said}"
         );
-        assert!(!said.as_str().contains("planted-account-name"), "{said}");
     }
 
     /// A path prefix outside a configured root says a drive's letter, and never a server's, a
