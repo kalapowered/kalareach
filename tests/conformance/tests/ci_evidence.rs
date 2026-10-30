@@ -4,13 +4,16 @@
 //! `KR_TEST_ARTIFACTS_DIR` and collected into the CI artifact store. A workflow is how that is
 //! delivered, so these hold the things a deleted or disabled step or a moved file would lose without
 //! any job going red: the check that refuses a run with no screenshot kept, run on real
-//! directories; a job for each class of test on a runner that has its tool, whose step is not
+//! directories; a job for each class of test on the runner the workflow gives it, whose step is not
 //! disabled and runs under the condition the workflow gives it, with the matrix leg that condition
-//! names still in the matrix; the evidence check and the strict uploads, neither disabled, none of
-//! them cut short or kept for less than the repository's default; and the table of those jobs in
-//! the conformance document. It reads the workflow as text, line by line, which holds its layout
-//! (jobs at two spaces, steps at six): a reformatting fails it loudly, and a step that swallows
-//! its failure in the command (`|| true`) is not looked for.
+//! names still in the matrix; the landing workflow's triggers; the evidence check and the strict
+//! uploads, neither disabled, each made by the upload action of the directory the tests write to,
+//! after the step that writes last, none of them cut short or kept for less than the repository's
+//! default; and the table of those jobs in the conformance document. It reads the workflow as text,
+//! line by line, which holds its layout (jobs at two spaces, steps at six, a trigger or a key on a
+//! line of its own, no comment after a compared value): a reformatting fails it loudly. What it
+//! does not read is what a step's command does: a step that swallows its failure (`|| true`),
+//! runs no test (`--no-run`), leaves early or changes the shell it runs in is not looked for.
 
 #![cfg(unix)]
 
@@ -550,33 +553,25 @@ fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
     }
 
     // The landing workflow runs on every push to main and on every pull request, with no filter
-    // that leaves a change out, and by hand.
+    // that leaves a change out, and by hand: the first four lines of its `on:` block are these
+    // exactly, and what follows them is the manual run's inputs.
     let triggers = trigger_lines(&workflow);
-    let keys_at = |indent: usize| -> Vec<String> {
-        triggers
-            .iter()
-            .filter_map(|line| key_value(line))
-            .filter(|(at, ..)| *at == indent)
-            .map(|(_, key, _)| key)
-            .collect()
-    };
     assert_eq!(
-        keys_at(2),
-        ["push", "pull_request", "workflow_dispatch"],
-        "the landing workflow does not run on a push, a pull request and by hand, and only those"
+        triggers.get(..4),
+        Some(
+            &[
+                "  push:",
+                "    branches: [\"main\"]",
+                "  pull_request:",
+                "  workflow_dispatch:",
+            ][..]
+        ),
+        "the landing workflow does not run on a push to main, a pull request without a filter and \
+         by hand, as its first triggers"
     );
-    assert_eq!(
-        keys_at(4),
-        ["branches", "inputs"],
-        "a push or a pull request is filtered by something other than the branch of a push"
-    );
-    assert_eq!(
-        triggers
-            .iter()
-            .find_map(|line| key_value(line).filter(|(_, key, _)| key == "branches"))
-            .map(|(_, _, value)| compact(value)),
-        Some(compact("[\"main\"]")),
-        "a push to a branch other than main does not run the landing workflow"
+    assert!(
+        triggers[4..].iter().all(|line| line.starts_with("    ")),
+        "the landing workflow has a trigger besides push, pull_request and workflow_dispatch"
     );
 
     // KR-REQ-27.03: what each of the jobs that drive a device or a browser keeps, and what refuses
@@ -607,17 +602,24 @@ fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
             "the evidence check does not run on every runner of the matrix"
         );
     }
-    for (job_name, artefact, path) in [
-        ("companion", "companion-evidence-", "/tmp/kr-test-artifacts"),
+    for (job_name, artefact, path, writer) in [
+        (
+            "companion",
+            "companion-evidence-",
+            "/tmp/kr-test-artifacts",
+            "scripts/desktop-controls-macos.sh",
+        ),
         (
             "android-app",
             "test-evidence-android",
             "${{ env.KR_TEST_ARTIFACTS_DIR }}",
+            "scripts/android-app-launch.sh",
         ),
         (
             "ios",
             "test-evidence-ios",
             "${{ env.KR_TEST_ARTIFACTS_DIR }}",
+            "scripts/ios-app-launch.sh",
         ),
     ] {
         let text = job(&workflow, job_name);
@@ -626,8 +628,9 @@ fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
             "the {job_name} job is disabled or lets its failure pass"
         );
         for upload in steps_holding(&text, &format!("name: {artefact}")) {
-            assert!(
-                upload.contains("if-no-files-found: error"),
+            assert_eq!(
+                value_at(&upload, 10, "if-no-files-found").as_deref(),
+                Some("error"),
                 "the {job_name} job's upload of {artefact} does not fail when it kept nothing"
             );
             assert!(
@@ -644,6 +647,16 @@ fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
                 !upload.contains("retention-days"),
                 "the {job_name} job's upload of {artefact} sets a retention of its own, which \
                  can keep the evidence for less than the repository's default"
+            );
+            // After the step that writes last, or the upload leaves that step's files behind.
+            let placed = steps_of(&text)
+                .iter()
+                .position(|step| step.contains(&format!("name: {artefact}")))
+                .expect("the upload is a step of the job");
+            assert!(
+                position_of_tool(&text, writer).is_some_and(|written| written < placed),
+                "the {job_name} job's upload of {artefact} comes before the step that runs \
+                 {writer}, which writes after it"
             );
             // The action that uploads, and the directory it uploads: the one the tests write to.
             assert!(
@@ -743,8 +756,9 @@ fn the_wsl2_acceptance_has_a_workflow_that_runs_its_script_on_windows() {
             None,
             "the step that keeps the set runs under a condition"
         );
-        assert!(
-            kept.contains("if-no-files-found: error"),
+        assert_eq!(
+            value_at(&kept, 10, "if-no-files-found").as_deref(),
+            Some("error"),
             "the step that keeps the set does not fail when it kept nothing"
         );
     }
