@@ -2220,21 +2220,29 @@ fn bytes_of(credential: &PushDeliveryCredential) -> [u8; 32] {
         .expect("thirty-two bytes")
 }
 
-/// The credential the secret store holds for one authorisation, read the way a daemon that starts
-/// next would read it.
-fn stored_credential(
+/// What the secret store holds for one authorisation, read the way a daemon that starts next would
+/// read it.
+fn stored_item(
     environment: &Environment,
     sender: PushSenderRecordId,
-) -> Option<PushDeliveryCredential> {
+) -> kr_controller::push::secrets::StoredCredential {
     let store = open_store_in(&environment.host.tree().environment().secrets_dir())
         .expect("the daemon's secret store");
-    match kr_controller::push::secrets::DestinationSecrets::new(
+    kr_controller::push::secrets::DestinationSecrets::new(
         Arc::from(store.store),
         environment.environment_id(),
     )
     .push_credential(sender)
     .expect("a read")
-    {
+}
+
+/// The credential the secret store holds for one authorisation, when it holds one this build can
+/// use.
+fn stored_credential(
+    environment: &Environment,
+    sender: PushSenderRecordId,
+) -> Option<PushDeliveryCredential> {
+    match stored_item(environment, sender) {
         kr_controller::push::secrets::StoredCredential::Held(credential) => Some(credential),
         _ => None,
     }
@@ -3355,6 +3363,78 @@ async fn a_device_revoked_while_the_daemon_was_down_is_ended_at_the_next_start()
             .is_some_and(|held| held.state == PushSenderState::Revoked)
     })
     .await;
+}
+
+/// KR-REQ-16.10: a destination in service whose rule has ended is sent nothing, and its credential
+/// is not kept for it: the daemon that starts next removes it from memory and from the secret
+/// store instead of renewing a bearer for a device that content cannot reach. The control is the
+/// same destination while its rule stands, whose credential that start loads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_destination_whose_rule_ended_gives_up_its_credential_at_the_next_start() {
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0xd2));
+    let credential =
+        environment
+            .gateway
+            .issue(sender, phone.installation(), environment.host_signing_key());
+    phone
+        .register(&environment, &credential)
+        .await
+        .expect("the credential is registered");
+
+    let environment = environment.restart().await;
+    assert!(
+        environment
+            .controller()
+            .delivery_runtime()
+            .credentials()
+            .held(sender)
+            .is_some(),
+        "the control: a start loads the credential of a destination whose rule stands"
+    );
+    assert!(stored_credential(&environment, sender).is_some());
+
+    // The rule ends and the destination stays in service. The daemon's own writers end a rule and
+    // take the destination out of service together, so this record is written by hand: the start
+    // must not depend on both having been done.
+    let mut record = environment
+        .destination(phone.device_id())
+        .expect("the destination");
+    record.rule = None;
+    environment
+        .controller()
+        .delivery()
+        .configure(&record)
+        .expect("the destination is written without its rule");
+    assert!(
+        stored_credential(&environment, sender).is_some(),
+        "writing the record took nothing from the secret store"
+    );
+
+    let environment = environment.restart().await;
+    assert!(
+        environment
+            .destination(phone.device_id())
+            .is_some_and(|record| record.enabled && record.rule.is_none()),
+        "the destination is still in service, with no rule"
+    );
+    assert!(
+        environment
+            .controller()
+            .delivery_runtime()
+            .credentials()
+            .held(sender)
+            .is_none(),
+        "the start loaded no credential for it"
+    );
+    assert!(
+        matches!(
+            stored_item(&environment, sender),
+            kr_controller::push::secrets::StoredCredential::Absent
+        ),
+        "and removed the one the secret store kept"
+    );
 }
 
 /// A destination in service with no credential kept for it, which is what a stop between writing a
