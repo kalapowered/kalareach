@@ -35,9 +35,9 @@ fn check(evidence: &Path, strays: &Path) -> Option<i32> {
         .code()
 }
 
-/// KR-REQ-21.02: a run whose browser tests kept their screenshots in the evidence directory
-/// passes, and a run that kept none, or left one in the temporary directory where the runner would
-/// lose it, fails.
+/// KR-REQ-21.02 and KR-REQ-27.03: a run whose browser tests kept their screenshots in the evidence
+/// directory passes, and a run that kept none, or left one in the temporary directory where the
+/// runner would lose it, fails.
 #[test]
 fn a_run_that_kept_no_screenshot_in_the_evidence_directory_fails() {
     let evidence = TempDir::new().expect("a directory");
@@ -209,7 +209,7 @@ struct ClassOfTest {
     conditions: &'static [&'static str],
 }
 
-const CLASSES: [ClassOfTest; 7] = [
+const CLASSES: [ClassOfTest; 8] = [
     ClassOfTest {
         class: "browser behaviour, on both kinds of runner",
         job: "companion",
@@ -246,6 +246,13 @@ const CLASSES: [ClassOfTest; 7] = [
         conditions: &[],
     },
     ClassOfTest {
+        class: "the Tauri desktop application in a real window, on Windows",
+        job: "windows",
+        runner: &["runs-on: windows-2025"],
+        tool: "cargo test --locked -p companion-tauri --test host_events",
+        conditions: &[],
+    },
+    ClassOfTest {
         class: "a Linux machine",
         job: "rust",
         runner: &["runs-on: ubuntu-24.04"],
@@ -261,11 +268,13 @@ const CLASSES: [ClassOfTest; 7] = [
     },
 ];
 
-/// KR-REQ-21.01: each class of test section 21 names has a job in the landing workflow that runs
-/// its tool on a runner that has it, by a step that is not disabled: Playwright for browser
-/// behaviour, the operating system's own tooling for native controls and for the iOS Simulator on
-/// macOS, an Android emulator for the Android phone, and a hosted Windows, Linux and macOS machine
-/// each for its platform's tests. The conformance document's table names the same jobs.
+/// KR-REQ-21.01 and KR-REQ-27.02, the part a workflow can hold: each class of test section 21
+/// names has a job in the landing workflow that runs its tool on a runner that has it, by a step
+/// that is not disabled: Playwright for browser behaviour, the operating system's own tooling for
+/// native controls and for the iOS Simulator on macOS, an Android emulator for the Android phone,
+/// the Tauri desktop application in a real window on Windows, and a hosted Windows, Linux and macOS
+/// machine each for its platform's tests. The conformance document's table names the same jobs.
+/// Physical devices are the person's own and no workflow starts them.
 #[test]
 fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
     let workflow = fs::read_to_string(repository().join(".github/workflows/core-ci.yml"))
@@ -303,8 +312,8 @@ fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
         }
     }
 
-    // What each of the jobs that drive a device or a browser keeps, and what refuses a run that
-    // kept nothing.
+    // KR-REQ-27.03: what each of the jobs that drive a device or a browser keeps, and what refuses
+    // a run that kept nothing.
     let companion = job(&workflow, "companion");
     assert!(
         !is_disabled(&header(&companion)),
@@ -347,4 +356,28 @@ fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
         held,
         "the conformance document's table of classes names the jobs the workflow's test holds"
     );
+}
+
+/// KR-REQ-27.02, the WSL2 run: the release's WSL2 acceptance has a workflow of its own that runs
+/// the acceptance script on a hosted Windows machine by a step that is not disabled, because the
+/// landing workflow does not carry it.
+#[test]
+fn the_wsl2_acceptance_has_a_workflow_that_runs_its_script_on_windows() {
+    let workflow = fs::read_to_string(repository().join(".github/workflows/wsl-acceptance.yml"))
+        .expect("the WSL2 acceptance workflow");
+    let text = job(&workflow, "acceptance");
+    assert!(
+        !is_disabled(&header(&text)),
+        "the acceptance job is disabled or lets its failure pass"
+    );
+    assert!(
+        text.contains("runs-on: windows-2025"),
+        "the acceptance job has no hosted Windows runner"
+    );
+    for held in steps_running(&text, "scripts/e2e-wsl.sh") {
+        assert!(
+            !is_disabled(&held),
+            "the step that runs the WSL2 acceptance is disabled"
+        );
+    }
 }
