@@ -51,7 +51,7 @@ mod support;
 #[path = "../../../../crates/kr-controller/tests/voice_support/mod.rs"]
 mod voice_support;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -2073,7 +2073,8 @@ async fn forgetting_the_host_ends_the_call_and_owes_the_revocation() {
 /// service is told over its own route, with the account's token, because nothing else can: no
 /// control was opened for the call and the host cannot tell it. KR-REQ-17.14: the close goes
 /// through the client of the voice service the application was given, and the application reports
-/// the managed inference service as one it holds a client of.
+/// the managed inference service as one it holds a client of when the factory it was given makes
+/// one, and as one it holds none of when that factory cannot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_call_the_host_cannot_be_told_about_is_closed_at_the_service_over_its_own_route() {
     let timings = Timings {
@@ -2082,6 +2083,10 @@ async fn a_call_the_host_cannot_be_told_about_is_closed_at_the_service_over_its_
     };
     let closed = Arc::new(Mutex::new(Vec::<String>::new()));
     let recording = Arc::clone(&closed);
+    let asked = Arc::new(AtomicUsize::new(0));
+    let counting = Arc::clone(&asked);
+    let failing = Arc::new(AtomicBool::new(false));
+    let failing_now = Arc::clone(&failing);
     let mut scene = scene_replacing(
         timings,
         Some(phone_grant(PHONE_TOKEN, 3600)),
@@ -2090,6 +2095,10 @@ async fn a_call_the_host_cannot_be_told_about_is_closed_at_the_service_over_its_
         0,
         move |service| {
             service.with_brokers(Arc::new(move |origin, http, tokens| {
+                counting.fetch_add(1, Ordering::SeqCst);
+                if failing_now.load(Ordering::SeqCst) {
+                    return Err("the broker's client cannot be made".to_owned());
+                }
                 Ok(Arc::new(ForkBroker {
                     managed: managed_brokers()(origin, http, tokens)?,
                     closed: Arc::clone(&recording),
@@ -2138,16 +2147,32 @@ async fn a_call_the_host_cannot_be_told_about_is_closed_at_the_service_over_its_
         ["call-1".to_owned()],
         "the close went through the client the application was given"
     );
+    let asked_before = asked.load(Ordering::SeqCst);
     let services = scene
         .call("account_services", json!({}))
         .expect("the services the application holds a client of");
-    let inference = services
+    assert_eq!(inference_line(&services)["configured"], true, "{services}");
+    assert!(
+        asked.load(Ordering::SeqCst) > asked_before,
+        "the line was made from the client the factory it was given makes"
+    );
+
+    // A factory that cannot make the client leaves the application holding none.
+    failing.store(true, Ordering::SeqCst);
+    let services = scene
+        .call("account_services", json!({}))
+        .expect("the services the application holds a client of");
+    assert_eq!(inference_line(&services)["configured"], false, "{services}");
+}
+
+/// The line the account sheet shows for managed inference, among the `lines` the command gave.
+fn inference_line(lines: &serde_json::Value) -> &serde_json::Value {
+    lines
         .as_array()
         .expect("a list of lines")
         .iter()
         .find(|line| line["service"] == "managed inference")
-        .expect("the managed inference line");
-    assert_eq!(inference["configured"], true, "{services}");
+        .expect("the managed inference line")
 }
 
 /// The person chooses another host to browse while a call runs. The call belongs to the host that
