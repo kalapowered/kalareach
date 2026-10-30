@@ -5,12 +5,16 @@
 //! logon. A station that exists already keeps the security it was made with, so the starter reads
 //! the station back and refuses to start a worker on one that admits more than the starter's own
 //! station does, and starts it on one that admits less: the interactive station gains entries
-//! while a logon lasts ("Run as different user" adds one for the account it starts a program as),
-//! and a station made before that has not the new entry.
+//! while a logon lasts (a "Run as different user" may add one for the account it starts a program
+//! as), and a station made before that has not the new entry.
 //!
 //! These cases change the security of objects that every headless start of this logon meets, so
 //! they run one at a time, and each puts back what it changed. They need a signed-in interactive
-//! session, which is where the logon's stations are the ones the starter meets.
+//! session, and the daemon's task must run in the same logon as this test, which holds when the
+//! account is not an administrator with an elevated token over a filtered one: a window station made
+//! without a name belongs to its maker's logon. Each case first shows that the starter does meet a
+//! station this test makes, and fails if it does not, rather than passing without having shown
+//! anything. No other headless worker of this logon may be running.
 
 #![cfg(windows)]
 
@@ -29,6 +33,21 @@ const NATIVE: &[&str] = &["--shell-mode", "native_compat"];
 
 /// Held by each case for as long as it changes the security of anything.
 static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Holds a window station of the logon that admits everyone, where the starter's own does not, and
+/// requires the start that meets it to be refused, which shows that the starter and this test are
+/// in one logon.
+async fn the_starter_meets_the_stations_this_test_makes(host: &WorkerHost) {
+    let wider = HeldStation::make(|own| format!("{own}(A;;0x1;;;WD)"))
+        .unwrap_or_else(|error| panic!("a station wider than the starter's own: {error}"));
+    let refused = host.kr_new(NATIVE).await;
+    assert!(
+        !refused.succeeded(),
+        "the starter was not stopped by a station of this test's logon that admits everyone, so \
+         it is in another logon and these cases show nothing: {}",
+        wider.access_list
+    );
+}
 
 /// KR-REQ-03.24: a window station that exists already and admits everyone, where the starter's
 /// own does not, is refused, with the step that refused it named, and no worker is started on it.
@@ -67,6 +86,7 @@ async fn a_logon_station_that_admits_more_than_the_starters_own_refuses_the_star
 async fn a_logon_station_that_admits_less_than_the_starters_own_starts_the_worker() {
     let _alone = ONE_AT_A_TIME.lock().await;
     let host = WorkerHost::start().await;
+    the_starter_meets_the_stations_this_test_makes(&host).await;
 
     let narrower = HeldStation::make(without_administrators)
         .unwrap_or_else(|error| panic!("a station narrower than the starter's own: {error}"));
@@ -80,12 +100,13 @@ async fn a_logon_station_that_admits_less_than_the_starters_own_starts_the_worke
 }
 
 /// KR-REQ-03.24: an entry added to the interactive station and desktop while a headless session is
-/// open, as "Run as different user" adds one, does not refuse the next headless start: the
+/// open, as a "Run as different user" may add one, does not refuse the next headless start: the
 /// station the first session holds has not the entry, and admits less.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_entry_added_to_the_interactive_station_does_not_refuse_a_later_headless_start() {
     let _alone = ONE_AT_A_TIME.lock().await;
     let host = WorkerHost::start().await;
+    the_starter_meets_the_stations_this_test_makes(&host).await;
 
     let first = host.kr_new(NATIVE).await;
     assert!(first.succeeded(), "the first session: {}", first.said());
@@ -105,6 +126,9 @@ async fn an_entry_added_to_the_interactive_station_does_not_refuse_a_later_headl
         "a headless start was refused after an entry was added to the interactive station: {}",
         second.said()
     );
+    added
+        .put_back()
+        .unwrap_or_else(|error| panic!("the interactive station was not left as it was: {error}"));
 }
 
 /// The station's access list without the entry for the administrators that applies to the station

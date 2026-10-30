@@ -2,7 +2,9 @@
 //! cases that need a station or the interactive desktop to be other than the system made it.
 //!
 //! Everything here acts as the account the test runs as, on the logon it runs in, and puts back
-//! what it changed when its value is dropped.
+//! what it changed when its value is dropped. A window station made without a name belongs to the
+//! logon of the process that makes it, so what a case makes here meets the starter only where this
+//! test and the daemon's task share one logon; the cases check that before they rely on it.
 
 #![cfg(windows)]
 #![expect(
@@ -99,12 +101,12 @@ impl Drop for HeldStation {
 }
 
 /// An entry added to the interactive window station's access list and to the interactive
-/// desktop's, as "Run as different user" adds one for the account it starts a program as, and
-/// taken away again when this is dropped.
+/// desktop's, as a "Run as different user" may add one for the account it starts a program as, and
+/// taken away again when [`Self::put_back`] says so or, failing that, when this is dropped.
 pub struct EntryOnInteractive {
     // Dropped in this order: the lists are put back through the handles, so the handles go last.
     station: Restore,
-    _desktop: Restore,
+    desktop: Restore,
     _interactive: Interactive,
 }
 
@@ -120,9 +122,22 @@ impl EntryOnInteractive {
         let desktop = Restore::add_to(interactive.desktop)?;
         Ok(Self {
             station,
-            _desktop: desktop,
+            desktop,
             _interactive: interactive,
         })
+    }
+
+    /// Puts both lists back as they were and checks that they read back so.
+    ///
+    /// Dropping this does the same without a word when it fails, which is for a case that has
+    /// already failed; a case that means to leave the machine as it found it calls this.
+    ///
+    /// # Errors
+    ///
+    /// Returns what went wrong, or which list did not read back as it was.
+    pub fn put_back(&self) -> Result<(), String> {
+        self.station.put_back()?;
+        self.desktop.put_back()
     }
 
     /// The interactive station's access list as it is now.
@@ -139,6 +154,8 @@ impl EntryOnInteractive {
 struct Restore {
     object: HANDLE,
     original: *mut ACL,
+    /// The list's text before it was changed.
+    original_text: String,
     /// Keeps the descriptor that `original` points into.
     _descriptor: Local,
 }
@@ -152,8 +169,22 @@ impl Restore {
         Ok(Self {
             object,
             original,
+            original_text: text,
             _descriptor: descriptor,
         })
+    }
+
+    fn put_back(&self) -> Result<(), String> {
+        set_dacl(self.object, self.original)?;
+        let now = access_list_text(self.object)?;
+        if now == self.original_text {
+            Ok(())
+        } else {
+            Err(format!(
+                "the access list reads {now} after it was put back, and was {}",
+                self.original_text
+            ))
+        }
     }
 }
 
