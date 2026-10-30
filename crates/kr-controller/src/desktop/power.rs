@@ -551,8 +551,9 @@ mod platform {
     ///
     /// Through the reader the description host uses, so that `host.info` and the descriptions say
     /// the same of one machine: the kernel's power-supply class, read by supply type. A host the
-    /// reader cannot qualify (it lists a supply it will not describe, or has a battery and no
-    /// charger online) is unknown, which a `mains_only` setting does not take for mains.
+    /// reader cannot qualify (it lists a supply it will not describe, or has a battery and lists
+    /// no charger at all) is unknown, which a `mains_only` setting does not take for mains. A host
+    /// with a battery whose every charger is offline is on its battery.
     pub(super) fn power_source() -> PowerSource {
         power_source_in(std::path::Path::new("/sys/class/power_supply"))
     }

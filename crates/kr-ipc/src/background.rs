@@ -335,7 +335,9 @@ mod platform {
     pub(super) const IO_NORMAL: u32 = 2;
 
     /// Lowers the I/O priority of the calling process, and reads it back from the process and from
-    /// the calling thread, which reads the process's value once it is set.
+    /// the calling thread. On the Windows build this was tried on (Windows Server 2025, build
+    /// 26100) a thread reads the process's value for itself once it is set; the read-back does not
+    /// rely on that, and counts the class as applied only when both read very low.
     pub(super) fn lower_io_class() -> std::result::Result<IoClass, Refusal> {
         set_io_priority(IO_VERY_LOW).map_err(|()| "this host refused the very low I/O priority")?;
         io_class().ok_or("this host did not report the I/O priority it was given")
@@ -646,10 +648,10 @@ mod tests {
     }
 
     /// The class is read from the thread that asks, and the thread that loads the model exists
-    /// before the process's class is lowered. A thread that was already running when the process's
-    /// class was lowered reads the lowered value for itself, so the model thread's own I/O priority
-    /// is the process's and the read-back taken on that thread says so. The class is put back for
-    /// the thread as well as the process.
+    /// before the process's class is lowered. On the Windows build this was tried on (Windows
+    /// Server 2025, build 26100), a thread that was already running when the process's class was
+    /// lowered reads the lowered value for itself, so the read-back taken on that thread says the
+    /// process's. The class is put back for the thread as well as the process.
     #[cfg(windows)]
     #[test]
     fn the_io_class_a_windows_thread_reads_is_its_own_and_follows_the_process() {

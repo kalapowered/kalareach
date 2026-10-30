@@ -140,15 +140,17 @@ the state is `resource_paused`, the reason is named, and the deterministic title
 
 - **Battery** pauses inference by default. A host that cannot read its own power source is treated
   as being on battery, because it has not been told otherwise. On Linux the kernel names each
-  supply's type, and the host reads each type one way. A charger is mains when it is online: that
-  is `Mains`, every `USB` kind, `BrickID` (Apple's) and `Wireless`. A `Battery` and a `UPS` are
-  stores of charge, and a `UPS` that says it is online has not said the host is on mains. A host
-  with no store of charge is on mains, and one with a store of charge and no charger online is on
-  its battery. A supply it will not describe, with no charger online, leaves the source unknown
-  rather than mains, because that supply may be the battery: its type is missing, unreadable or
-  empty, is the kernel's `Unknown` (a driver that was not told what its supply is), or is one this
-  build has no name for. A battery that belongs to a peripheral (the kernel's scope `Device`, such
-  as a wireless mouse or a phone on a cable) is not the host's power and is left out.
+  supply's type, and the host reads each type one way. A charger is mains when it is online: that is
+  `Mains`, every `USB` kind, `BrickID` (Apple's) and `Wireless`. A `Battery` and a `UPS` are stores
+  of charge, and a `UPS` that says it is online has not said the host is on mains. A host with no
+  store of charge is on mains. One with a store of charge is on its battery when it lists a charger
+  and none is online, and its source is unknown when it lists no charger at all, because a battery
+  or a `UPS` alone does not say what the host runs from. A supply it will not describe, with no
+  charger online, leaves the source unknown rather than mains, because that supply may be the
+  battery: its type is missing, unreadable or empty, is the kernel's `Unknown` (a driver that was
+  not told what its supply is), or is one this build has no name for. A battery that belongs to a
+  peripheral (the kernel's scope `Device`, such as a wireless mouse or a phone on a cable) is not
+  the host's power and is left out.
 - **Thermal or memory pressure** pauses it even on mains. Heat is read from what each platform
   reports: the system's thermal pressure level on macOS, on Intel and on Apple silicon alike
   (nominal reads as cool, moderate as elevated, and heavy or beyond as critical; a level that is
@@ -174,9 +176,10 @@ each later one a period after the last, until the work answers. A process that p
 while it works is therefore ended by the first reading taken after it did, and it can stay over the
 ceiling for at most one period plus the time the daemon takes to run the turn that reads it, when
 the platform gives the reading. A reading it does not give leaves the process alone until the next
-one, and a platform that never gives one leaves only the process's own check, so there is no bound
-in time. Nothing reads the process between jobs or while it checks a file. The bound is in time: the daemon does not
-bound how much memory a process adds in that period. What keeps the growth small is the process's
+one, and a platform that never gives one leaves only the process's own check, so on that platform
+there is no bound. Nothing reads the process between jobs or while it checks a file. Where the
+platform gives readings, the bound is in time and not in memory: the daemon does not bound how much
+memory a process adds in that period. What keeps the growth small is the process's
 own check between tokens, which looks at its resident set every eight tokens, and the admission of
 a profile only when its itemised cost fits under the ceiling.
 
@@ -187,25 +190,29 @@ on every platform.
 
 On macOS and Linux no operating-system limit backs either figure: the daemon's reading and the
 process's own check are the whole mechanism. On Windows the daemon also creates the process held,
-puts it in a job object whose per-process limit on committed memory is the ceiling in force when
-the process starts, and lets it run only then, so the process never runs outside the limit and
-memory it commits as it starts is refused. The daemon counts the limit applied only when the system
-reads it back and reports the process in the job; a system that accepted the assignment and cannot
-answer the question of membership leaves the limit in force and recording. A daemon that ends in
-the moment between creating the process and letting it run leaves behind a process that never ran.
+puts it in a job object whose per-process limit on committed memory is the ceiling in force when the
+process starts, and lets it run once that has been tried. A process the system took into the job
+runs only behind the limit, so memory it commits as it starts is refused when it passes the limit.
+The daemon counts the limit applied when the system reads it back as asked and does not say the
+process is outside the job; a system that accepted the assignment and cannot answer the question of
+membership leaves the limit in force and recording. When the limit is not applied, the process is
+let run all the same. The job also ends the process when the daemon lets go of it, so a start that
+fails or panics, and a daemon that ends, between creating the process and letting it run leave no
+process that never ran. One case remains: a daemon killed from outside in the few calls between the
+process's creation and its entry into the job, or before it lets run a process the job did not take.
 A commit past the limit is refused by the system. A runtime that cannot allocate ends, and one that
 catches the failed allocation answers that its load or job failed and goes on. The daemon asks the
-job when the process closes its end, when its frames stop short, and when it answers that a load
-or a job failed. If the job recorded a refused commit, the process ended for memory: it is ended,
+job when the process closes its end, when its frames stop short, and when it answers that a load or
+a job failed. If the job recorded a refused commit, the process ended for memory: it is ended,
 inference pauses with `memory_pressure` as it does for a reading past the ceiling, and the job is
-not retried. The answer of the load or the job in hand, when it does not fail, clears what the
-job recorded, so a refusal the runtime got over does not count against a later end. An answer for
-other work, a late or a repeated one, neither clears nor uses it. Windows does not promise to
-deliver the job's message, so a refusal that was not recorded reads as an ordinary end or an
-ordinary failure. The limit is on committed memory and not on the resident set, so it does not
-count the weights a model maps for reading, and the daemon's reading stays the measure of the
-resident set. A host that will not apply the limit says so on its standard error
-and keeps the daemon's reading as the only ender.
+not retried. The answer of the load or the job in hand, when it does not fail, clears what the job
+recorded, so a refusal the runtime got over does not count against a later end. An answer for other
+work, a late or a repeated one, neither clears nor uses it. Windows does not promise to deliver the
+job's message, so a refusal that was not recorded reads as an ordinary end or an ordinary failure.
+The limit is on committed memory and not on the resident set, so it does not count the weights a
+model maps for reading, and the daemon's reading stays the measure of the resident set. A host that
+will not apply the limit says so on its standard error and keeps the daemon's reading as the only
+ender.
 
 CPU-only is two settings rather than one. Zero GPU layers keeps every layer's weights on the
 processor; turning the library's *operation* offload off keeps the arithmetic there too, because the
@@ -493,7 +500,7 @@ A page of facts is applied under privacy mode's admission at the generation it w
 
 The host reads the memory, power and thermal conditions of the machine every ten seconds, on a thread of its own, because reading the state of the platform can start a program. A reading more than a minute old says nothing: every signal is then unqualified, and the policy pauses rather than trusting the last answer.
 
-Power and heat come from the facility each platform documents. On macOS, power comes from `pmset -g ps` and heat from the system's thermal pressure level, which Intel and Apple silicon Macs both post: nominal reads as cool, moderate as elevated, and heavy or beyond as critical. A level that is never posted reads as nominal, because the system gives the same state for a name nobody posts as for a cool machine, so a Mac that never posts one reads as cool and not as unread. On Linux, power comes from the kernel's power-supply class and heat from each thermal zone against the lowest trip point it declares, among its first eight, which is the one the platform acts on before a critical point. A zone with no trip point above zero, or whose temperature cannot be read, is left out. On Windows, power comes from the system's power-status call, which puts a machine with no battery on mains, and heat from the passive limit of each thermal zone's performance counters, the share of the processors' top speed the platform allows because of heat. The worst zone that was read decides there. A zone that was listed and gave no usable reading keeps the host from reading as nominal, so heat is unqualified unless another zone shows it, and a machine that lists no zone says nothing about heat. A platform with no reader says nothing about either: the policy treats that as battery for power and does not pause for heat.
+Power and heat come from the facility each platform documents. On macOS, power comes from `pmset -g ps` and heat from the system's thermal pressure level, which Intel and Apple silicon Macs both post: nominal reads as cool, moderate as elevated, and heavy or beyond as critical. A level that is never posted reads as nominal, because the system gives the same state for a name nobody posts as for a cool machine, so a Mac that never posts one reads as cool and not as unread. On Linux, power comes from the kernel's power-supply class and heat from each thermal zone against the lowest trip point it declares above zero, among its first eight. The reader does not read a trip point's type, so a zone that declares only a critical point is read against that point, and in a zone whose lowest trip point is a fan's step, the step reads as the zone's limit. A zone with no trip point above zero, or whose temperature cannot be read, is left out. On Windows, power comes from the system's power-status call, which puts a machine with no battery on mains, and heat from the passive limit of each thermal zone's performance counters, the share of the processors' top speed the platform allows because of heat. The worst zone that was read decides there. A zone that was listed and gave no usable reading keeps the host from reading as nominal, so heat is unqualified unless another zone shows it, and a machine that lists no zone says nothing about heat. A platform with no reader says nothing about either: the policy treats that as battery for power and does not pause for heat.
 
 The description process is a child of the control daemon. It is located next to the executable of the worker. It is started when work is first due.
 

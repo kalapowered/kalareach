@@ -515,8 +515,10 @@ pub mod platform {
     /// `online` of 1, or 2 for a programmable supply) is mains. A store of charge is the host's own
     /// energy: `Battery`, and `UPS`, which does not say by being online that the host is on mains.
     /// A host with no store of charge at all is on mains, because there is nothing for it
-    /// to be running from; a host with one and no charger online is on the battery. A supply with
-    /// the scope `Device` is a peripheral's, a mouse or a phone on a cable, and is not the host's
+    /// to be running from. A host with one is on the battery when it lists a charger and every
+    /// charger it lists is offline; when it lists no charger at all (a `Battery` or a `UPS` alone)
+    /// it has not been told what it runs from, and the signal is unqualified. A supply with the
+    /// scope `Device` is a peripheral's, a mouse or a phone on a cable, and is not the host's
     /// power.
     ///
     /// A supply whose type or state the host would not tell is not one that can be left out: it
@@ -621,7 +623,9 @@ pub mod platform {
         // first eight. Comparing a temperature with a fixed number would be meaningless across
         // machines; comparing it with the trip point the platform itself declared is the
         // platform's own judgement. The lowest is the one that matters: on an ACPI zone the first
-        // is often the critical point, well above one the platform acts on earlier.
+        // is often the critical point, well above one the platform acts on earlier. The type of a
+        // trip point is not read, so a zone that declares only a critical point is read against
+        // it, and a zone whose lowest trip point is a fan's step reads that step as its limit.
         let Ok(entries) = std::fs::read_dir("/sys/class/thermal") else {
             return Signal::Unqualified {
                 why: "this host has no thermal class",

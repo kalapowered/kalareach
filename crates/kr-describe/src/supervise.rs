@@ -764,8 +764,10 @@ impl Driver {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        // A process the system is to hold to a memory limit is created held and let run only when
-        // it is behind the limit, so that it never runs outside it.
+        // A process the system is to hold to a memory limit is created held and let run once the
+        // limit has been tried, so that a process the system took into the limit never runs
+        // outside it. A limit the system would not apply leaves the process to run with the
+        // daemon's reading as its only ender.
         #[cfg(windows)]
         let hold = self.launch.system_memory_limit;
         #[cfg(windows)]

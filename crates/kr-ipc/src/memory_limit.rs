@@ -23,7 +23,8 @@
 //!
 //! A process runs from the moment it is created, and a limit does not reach back to memory it has
 //! committed already. So a process that is to be held to a limit is created held ([`start_held`]),
-//! put behind the limit, and only then let run ([`resume`]): it never runs outside the limit.
+//! put behind the limit, and only then let run ([`resume`]): it does not run before it is behind
+//! the limit.
 //!
 //! The job ends the processes in it when its last handle closes. A process that was created held
 //! never runs, so it never reads the end of its input or the end of its owner, and nothing in it
