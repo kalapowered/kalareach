@@ -146,34 +146,54 @@ stops, so a limit that a part has is written in that part's own document.
   otherwise.
 - **Encrypted push.** The host composes each notification, and a preview travels sealed to the
   receiving device's own preview key, so a service that carries it cannot read it:
-  [delivery](delivery/README.md). Neither phone build opens a preview, so a phone shows the generic
-  alert: [mobile](client/mobile.md).
+  [delivery](delivery/README.md). On phones the receivers open a sealed preview in one Rust
+  function. A generic alert is shown if the preview cannot be opened, if the host is unknown, or for
+  anything a session itself said, which the seal never holds: [mobile](client/mobile.md).
 - **Attention.** One inbox for every session and workflow of an environment, with escalation rules,
-  quiet hours and review state, and a view of what changed since an actor's last visit:
-  [host](host/README.md#attention-review-and-what-changed-since-a-visit).
-- **Sharing and control.** Grants scoped to environments and sessions, a narrower grant that a
-  holder can delegate, revocation that completes through a per-worker barrier, and an input lease
-  that a controller takes explicitly: [grants](host/README.md#grants-sharing-and-revocation),
-  [pairing](pairing/README.md) and [who may type](host/README.md#who-may-type).
+  quiet hours and review state, and a view of what changed since an actor's last visit. This view of
+  changes is the host's own record of changes, but the client can also ask the host's local model
+  for a summary of changes since the last visit. The summary is kept separate from the changes:
+  [host](host/README.md#attention-review-and-what-changed-since-a-visit) and
+  [descriptions](describe/README.md).
+- **Sharing and control.** Grants scoped to environments and sessions, and a narrower grant that a
+  holder can delegate. `kr share invite` offers one session to a paired device for a bounded period
+  of time. The owner is shown the role and rights that will be offered before the invitation exists.
+  The receiving device accepts the invitation in the companion application. `kr share transfer`
+  hands control of a session to another device. A revocation completes through a barrier per worker.
+  An input lease, which a controller takes explicitly, decides who may type:
+  [grants](host/README.md#grants-sharing-and-revocation), [pairing](pairing/README.md),
+  [who may type](host/README.md#who-may-type) and [cli](cli/README.md).
 - **Automation.** Versioned workflows that react to verified events, under causal budgets and a
   declared grant: [automation](automation/README.md).
-- **Sync, recovery and backup.** Encrypted settings sync and the recovery kit in the shared client
-  library, and the producer that encrypts and signs a history backup with the host's store of its
-  generations. The host does not upload a backup to a service: [client](client/README.md), [the
-  backup service](host/README.md#the-backup-service) and [crypto](crypto/README.md).
-- **The plugin catalogue.** A signed catalogue of adapter packages, searched offline, whose entries
-  carry each release's compatible SDK range and the executable builds it was qualified against:
-  [catalogue](plugins/catalogue.md).
-- **Teams.** Signed membership leases and an organisation's policy-signing chain, which a host
-  verifies without reaching the service ([account authority
-  objects](protocol/README.md#account-authority-objects)). The roles, single sign-on and SCIM that
-  issue them run in the website's account system.
+- **Sync, recovery and backup.** Encrypted settings sync and the recovery kit are inside the shared
+  client library. Once the owner has run `kr backup setup` on a host, the host encrypts one backup
+  of its closed sessions and its configuration, at most once a day, and uploads it to the storage
+  service. The owner can run `kr backup restore` to open a backup with the recovery kit and write it
+  out as files in a folder, without bringing back keys, grants or devices. Setup needs a chosen
+  storage service and a signed-in account, and it makes nothing on native Windows:
+  [client](client/README.md), [cli](cli/README.md),
+  [the backup service](host/README.md#the-backup-service) and [crypto](crypto/README.md).
+- **The plugin catalogue.** A signed catalogue of adapter packages that can be searched offline.
+  Each release in the catalogue states which range of SDKs it is compatible with and which
+  executable builds it was qualified against. If a host is enrolled in an organisation and the
+  applied policy states that only a list of adapters can be used on that host, then only those
+  adapters can be used: [catalogue](plugins/catalogue.md) and
+  [organisation policy](host/README.md#organisation-policy).
+- **Teams.** Signed leases of membership and the signed chain for the organisation's policy, which a
+  host verifies without contacting the service
+  ([account authority objects](protocol/README.md#account-authority-objects)). The owner can enrol a
+  host in an organisation with `kr organisation`. When a host is enrolled in an organisation, the
+  organisation's signed policy is applied to the host and the host can be made exclusively
+  organisation-managed ([host](host/README.md#organisation-policy)). The roles, single sign-on and
+  SCIM that issue the leases and the chain run in the website's account system.
 - **External notification destinations.** Webhook, Slack, Discord, Telegram and email destinations,
   each with its own recipient and content policy, and a stored credential for the four that need
   one: [delivery](delivery/README.md#external-destinations).
-- **Environments and diagnostics.** WSL, container, SSH and paired environments the owner enrols
-  with `kr bridge`, and `kr doctor`, which reports diagnostics and writes a support bundle that
-  carries content only when the person passes `--include-content` and approves its preview:
+- **Environments and diagnostics.** WSL, container, SSH and paired environments can be enrolled by
+  the owner with `kr bridge`, which can name the attached terminal as an environment's clipboard
+  destination. `kr doctor` reports diagnostics and writes a support bundle that carries content only
+  when the person passes `--include-content` and approves its preview. `kr export` writes a closed
+  session's retained output to a file as a JSON document or an asciicast recording:
   [host](host/README.md#wsl-and-containers) and [cli](cli/README.md).
 
 ## What is open source, and what is a service
