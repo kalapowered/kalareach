@@ -923,7 +923,7 @@ describe('the sheet', () => {
 
     const carries = await screen.findByTestId('invitation-carries')
     await waitFor(() => {
-      expect(carries.textContent).toContain('See what the session shows and does from when they accept')
+      expect(carries.textContent).toContain('See what the session shows and does from when you invite, or from the earlier activity you choose')
     })
     expect(carries.querySelector('[data-notice]')).toBeNull()
     expect(within(carries).getByTestId('no-current-screen')).toHaveTextContent(

@@ -48,7 +48,8 @@ export function roleWords(role: string | null): string {
 
 /** What each action lets a recipient do, in words. */
 export const ACTION_WORDS: Partial<Readonly<Record<ActionRight, string>>> = {
-  'session.view': 'See what the session shows and does from when they accept',
+  'session.view':
+    'See what the session shows and does from when you invite, or from the earlier activity you choose',
   'files.read':
     'Read files. A paired device cannot do this yet, and a host update can turn it on while the share lasts',
   'question.respond': 'Answer the agent’s questions',

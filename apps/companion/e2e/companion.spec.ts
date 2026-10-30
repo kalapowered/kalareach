@@ -952,7 +952,7 @@ test.describe('settings over a live session', () => {
     await page.getByTestId('open-settings').click()
     await page.getByRole('button', { name: 'Sharing' }).click()
     const carries = page.getByTestId('invitation-carries')
-    await expect(carries).toContainText('See what the session shows and does from when they accept')
+    await expect(carries).toContainText('See what the session shows and does from when you invite, or from the earlier activity you choose')
     await page.getByRole('switch', { name: 'Let a viewer answer questions' }).click()
     await expect(carries.locator('[data-notice="agent_permissions"]')).toBeVisible()
     await page.getByRole('radio', { name: /Sam's iPhone/ }).check()
