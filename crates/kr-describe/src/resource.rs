@@ -423,6 +423,18 @@ pub mod platform {
         }
     }
 
+    /// What a macOS thermal pressure level says of the heat: nominal is nominal, moderate means the
+    /// platform has started holding something back, and heavy, trapping, sleeping and any level
+    /// beyond them mean it is holding back a great deal.
+    #[must_use]
+    pub const fn thermal_of_pressure_level(level: u64) -> ThermalState {
+        match level {
+            0 => ThermalState::Nominal,
+            1 => ThermalState::Elevated,
+            _ => ThermalState::Critical,
+        }
+    }
+
     /// What a set of thermal zones says of the heat: the worst of the zones that were read, and
     /// nothing when the machine lists none.
     ///
@@ -578,25 +590,15 @@ pub mod platform {
 
     #[cfg(target_os = "macos")]
     fn thermal() -> Signal<ThermalState> {
-        // `pmset -g therm` reports the limits this platform is applying. A scheduler limit below
-        // 100 is the host saying it is holding something back, which is exactly the signal section
-        // 22 asks for.
-        let Some(text) = run("/usr/bin/pmset", &["-g", "therm"]) else {
-            return Signal::Unqualified {
-                why: "this host did not report a thermal state",
-            };
-        };
-        let Some(limit) = text
-            .lines()
-            .find_map(|line| line.trim().strip_prefix("CPU_Speed_Limit"))
-            .and_then(|rest| rest.trim().strip_prefix('='))
-            .and_then(|value| value.trim().parse::<u32>().ok())
-        else {
-            return Signal::Unqualified {
-                why: "this host did not report a processor speed limit",
-            };
-        };
-        Signal::Qualified(thermal_of_speed_limit(limit))
+        // The system's thermal pressure level, which Intel and Apple silicon Macs both post. The
+        // limits `pmset -g therm` prints are an Intel Mac's alone: on Apple silicon it records none,
+        // so a reader of them never sees heat there.
+        kr_ipc::conditions::thermal_pressure_level().map_or(
+            Signal::Unqualified {
+                why: "this host did not report a thermal pressure level",
+            },
+            |level| Signal::Qualified(thermal_of_pressure_level(level)),
+        )
     }
 
     #[cfg(target_os = "linux")]

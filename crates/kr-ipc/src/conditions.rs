@@ -1,11 +1,13 @@
 //! What the host's own facilities say about where its power comes from and how hot it is, on the
 //! platform whose facility is a system call.
 //!
-//! macOS and Linux answer through programs and files that need no system call of this crate's, and
-//! their readers stay with the code that uses them. Windows answers through two facilities: the
-//! power-status call, which says whether the machine is on the mains or on a battery, and the
-//! performance counters of its thermal zones, whose passive limit says how far the platform is
-//! holding the processors back to keep the machine cool.
+//! Linux answers through files that need no system call of this crate's, and its reader stays with
+//! the code that uses it. macOS answers its power through a program, which stays there too, and its
+//! heat through the system's notification state: the thermal pressure level, which says how far the
+//! platform is holding the machine back to keep it cool, on Intel and on Apple silicon alike.
+//! Windows answers through two facilities: the power-status call, which says whether the machine is
+//! on the mains or on a battery, and the performance counters of its thermal zones, whose passive
+//! limit says how far the platform is holding the processors back to keep the machine cool.
 //!
 //! A reading says what the facility said and nothing about what to do with it. A facility that does
 //! not answer is an absent reading, never a guess: [`supply`] returns nothing when the system would
@@ -131,6 +133,74 @@ pub fn thermal_zones() -> Vec<ThermalZone> {
 #[must_use]
 pub const fn thermal_zones() -> Vec<ThermalZone> {
     Vec::new()
+}
+
+/// Reads the thermal pressure level macOS reports: 0 is nominal, 1 moderate, 2 heavy, 3 trapping and
+/// 4 sleeping, the levels the system's `OSThermalNotification.h` names for macOS.
+///
+/// Nothing when the system would not say, and nothing on a platform whose facility this crate does
+/// not call.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn thermal_pressure_level() -> Option<u64> {
+    macos::thermal_pressure_level()
+}
+
+/// Reads the thermal pressure level macOS reports: nothing on a platform that has no such level.
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub const fn thermal_pressure_level() -> Option<u64> {
+    None
+}
+
+/// The one place in this crate that asks the system's notification state for the thermal pressure
+/// level.
+///
+/// The workspace forbids unsafe code; this crate denies it and relaxes the rule for this module,
+/// because the notification state has no safe interface.
+#[cfg(target_os = "macos")]
+mod macos {
+    #![expect(
+        unsafe_code,
+        reason = "the system's notification state has no safe interface"
+    )]
+
+    use std::ffi::{CStr, c_char, c_int};
+
+    /// The status the notification calls return when they did what was asked.
+    const NOTIFY_STATUS_OK: u32 = 0;
+
+    /// The notification the system posts the thermal pressure level under, which the SDK names
+    /// `kOSThermalNotificationPressureLevelName`.
+    const PRESSURE_LEVEL: &CStr = c"com.apple.system.thermalpressurelevel";
+
+    unsafe extern "C" {
+        /// `notify_register_check`, which registers a name to be read with `notify_get_state` and
+        /// posts nothing.
+        fn notify_register_check(name: *const c_char, out_token: *mut c_int) -> u32;
+        /// `notify_get_state`, which reads the 64-bit state last posted under a registered name.
+        fn notify_get_state(token: c_int, state: *mut u64) -> u32;
+        /// `notify_cancel`, which releases a registration.
+        fn notify_cancel(token: c_int) -> u32;
+    }
+
+    pub(super) fn thermal_pressure_level() -> Option<u64> {
+        let mut token: c_int = 0;
+        // SAFETY: the call reads a NUL-terminated name that outlives it and writes one 32-bit value
+        // through a pointer to a live local of that size.
+        let registered = unsafe { notify_register_check(PRESSURE_LEVEL.as_ptr(), &raw mut token) };
+        if registered != NOTIFY_STATUS_OK {
+            return None;
+        }
+        let mut state = 0_u64;
+        // SAFETY: the call takes the token registered above and writes one 64-bit value through a
+        // pointer to a live local of that size.
+        let read = unsafe { notify_get_state(token, &raw mut state) };
+        // SAFETY: the call takes the token registered above, once, and reads no memory of this
+        // process. A registration that cannot be released is left to the process's end.
+        let _ = unsafe { notify_cancel(token) };
+        (read == NOTIFY_STATUS_OK).then_some(state)
+    }
 }
 
 /// The two places in this crate that call the performance counters and the power status.
@@ -305,6 +375,16 @@ mod windows {
 #[cfg(test)]
 mod tests {
     use super::{PowerStatus, Supply, ThermalZone};
+
+    /// A Mac answers with one of the levels the SDK names for macOS, 0 to 4. A reading outside them
+    /// would mean the call was made wrongly, and the host would then be paused for heat it does not
+    /// have.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_thermal_pressure_level_a_mac_reports_is_one_the_system_names() {
+        let level = super::thermal_pressure_level().expect("the system answers");
+        assert!(level <= 4, "the level {level}");
+    }
 
     /// Windows' power-status call, answered with the bytes machines returned: a desktop with no
     /// battery that is plugged in (recorded on the Windows test machine, whose class has no

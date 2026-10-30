@@ -633,6 +633,39 @@ fn the_thermal_zones_a_platform_lists_say_how_hot_the_host_is() {
     );
 }
 
+/// KR-REQ-22.13: what a Mac's thermal pressure level says of the heat. The levels are the ones the
+/// system's `OSThermalNotification.h` names for macOS; a level beyond them is not taken for cool.
+#[test]
+fn the_pressure_levels_a_mac_reports_say_how_hot_the_host_is() {
+    use kr_describe::resource::platform::thermal_of_pressure_level;
+
+    assert_eq!(thermal_of_pressure_level(0), ThermalState::Nominal);
+    assert_eq!(thermal_of_pressure_level(1), ThermalState::Elevated);
+    for level in [2, 3, 4, 5, u64::MAX] {
+        assert_eq!(
+            thermal_of_pressure_level(level),
+            ThermalState::Critical,
+            "level {level}"
+        );
+    }
+}
+
+/// KR-REQ-22.13: a Mac of either processor family reads how hot it is. `pmset -g therm` records no
+/// processor speed limit on Apple silicon, so a reading taken from it left heat unread there and
+/// never paused inference for it.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_mac_reads_how_hot_it_is() {
+    use kr_describe::resource::platform::read_conditions;
+
+    let conditions = read_conditions();
+    assert!(
+        matches!(conditions.thermal, Signal::Qualified(_)),
+        "{:?}",
+        conditions.thermal
+    );
+}
+
 /// KR-REQ-22.13: a Windows host reads its power source and, when it lists a thermal zone and reads
 /// each one, how hot it is; a power source the system would not name, and a host that lists no
 /// zone, stay unqualified.
