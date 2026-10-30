@@ -3283,6 +3283,40 @@ async fn a_fetch_begins_only_when_asked_and_leaves_checked_files_and_no_process_
     environment.stop().await;
 }
 
+/// KR-REQ-24.26: the directories a fetch makes for the model's files are owner-only under the mask
+/// a login starts with, which is the one a daemon that no service definition started has: the
+/// models directory, the profile's and the revision's.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fetch_makes_the_directories_of_the_models_files_owner_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let _login = kr_ipc::testing::LoginUmask::hold();
+    let fixture = Fixture::start().await;
+    fixture.reply("/tiny.gguf", Reply::Body(WEIGHTS.to_vec()));
+    let environment = Environment::start(Setup {
+        catalogue: Some(catalogue_at(1, fixture.url("/tiny.gguf"), WEIGHTS)),
+        held: false,
+        ..Setup::new()
+    })
+    .await;
+    environment.download(DescriptionDownloadAction::Start).await;
+    environment
+        .setup_until("the fetch verified", |shown| {
+            shown.download == DescriptionDownload::Verified
+        })
+        .await;
+
+    let revision = environment.files();
+    let profile = revision.parent().expect("the profile's directory");
+    let models = profile.parent().expect("the models directory");
+    for made in [models, profile, revision.as_path()] {
+        let mode = std::fs::metadata(made).expect("made").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "{}", made.display());
+    }
+    environment.stop().await;
+}
+
 /// KR-REQ-22.01: cancelling a fetch while its body is arriving stops it and deletes what it had
 /// written, and no file of the profile is left. A fetch asked for afterwards starts from nothing
 /// and completes. The server holds half the body until the client leaves, so only the cancellation

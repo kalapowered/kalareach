@@ -80,8 +80,8 @@ cap-std = "=4.0.3"
 ciborium = "=0.2.2"
 clap = { version = "=4.6.7", features = ["derive"] }
 # Reads a file's access-control list on macOS, where the mode bits do not describe it. Used to
-# refuse replacing a document whose protection this host cannot carry across, rather than to grant
-# anything.
+# refuse replacing a document whose protection this host cannot carry across, and to refuse a
+# directory that an access entry lets another account into, rather than to grant anything.
 exacl = { version = "=0.13.0", default-features = false }
 # The byte buffers the update client's transport streams carry, which the host's own transport of
 # the bundled generation fills as the network transport does.

@@ -15,6 +15,7 @@
 #![cfg(unix)]
 
 use std::io::Read;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -156,20 +157,23 @@ async fn hosted(script: &str) -> Hosted {
 /// session leader makes the operating system revoke the terminal from every process that holds it,
 /// and a test that killed one would be testing a condition the command is never in.
 fn shell_running(hosted: &Hosted, command_line: &str) -> CommandBuilder {
+    shell_over(
+        hosted.temp.paths().runtime_root(),
+        hosted.temp.paths().state_root(),
+        command_line,
+    )
+}
+
+/// As [`shell_running`], over roots that need not exist.
+fn shell_over(runtime_root: &Path, state_root: &Path, command_line: &str) -> CommandBuilder {
     let mut builder = CommandBuilder::new("/bin/sh");
     builder.arg("-c");
     builder.arg(command_line);
     builder.env_clear();
     builder.env("PATH", "/usr/bin:/bin");
     builder.env("TERM", "xterm-256color");
-    builder.env(
-        "KR_RUNTIME_DIR",
-        hosted.temp.paths().runtime_root().display().to_string(),
-    );
-    builder.env(
-        "KR_STATE_DIR",
-        hosted.temp.paths().state_root().display().to_string(),
-    );
+    builder.env("KR_RUNTIME_DIR", runtime_root.display().to_string());
+    builder.env("KR_STATE_DIR", state_root.display().to_string());
     builder.cwd("/");
     builder
 }
@@ -672,4 +676,68 @@ async fn a_create_whose_terminal_exchange_fails_asks_for_no_session() {
     );
     let _ = shell.kill();
     let _ = shell.wait();
+}
+
+/// The permission bits a directory carries.
+fn mode_of(directory: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::metadata(directory)
+        .unwrap_or_else(|error| panic!("{}: {error}", directory.display()))
+        .permissions()
+        .mode()
+        & 0o777
+}
+
+/// KR-REQ-24.26: the first command of a fresh install that asks the terminal what it can do, run
+/// under the mask a login starts with, leaves the runtime root and the record of the question
+/// owner-only. The probe is the first thing to make the runtime root, and a root left open would
+/// refuse the start that follows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_probe_on_a_fresh_install_leaves_the_runtime_root_owner_only() {
+    let base = kr_ipc::testing::PrivateTempDir::create();
+    let above = base.path().join("fresh");
+    let runtime = above.join("runtime");
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("opens a terminal");
+    let mut shell = pty
+        .slave
+        .spawn_command(shell_over(
+            &runtime,
+            &base.path().join("state"),
+            &format!(
+                "umask 022; {} new --attach --palette probe; printf 'create-finished-%s\\n' \"$?\"",
+                kr().display()
+            ),
+        ))
+        .expect("starts the shell");
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+    assert!(
+        output.wait_for(b"create-finished-", Duration::from_secs(40)),
+        "the command finished: {}",
+        output.text().escape_debug()
+    );
+    let _ = shell.kill();
+    let _ = shell.wait();
+
+    let probes = runtime.join("probes");
+    assert_eq!(
+        std::fs::read_dir(&probes)
+            .unwrap_or_else(|error| panic!(
+                "the probe's record is in {}: {error}",
+                probes.display()
+            ))
+            .count(),
+        1,
+        "the question that went unanswered is recorded"
+    );
+    for made in [&above, &runtime, &probes] {
+        assert_eq!(mode_of(made), 0o700, "{}", made.display());
+    }
 }

@@ -4194,6 +4194,28 @@ fn rust_sources(directory: &std::path::Path) -> Vec<(std::path::PathBuf, String)
     sources
 }
 
+/// KR-REQ-24.26: the directory a backup's ciphertext is staged in is owner-only under the mask a
+/// login starts with, which is the one a daemon that no service definition started has.
+#[cfg(unix)]
+#[test]
+fn the_staging_directory_of_a_backup_store_is_owner_only_under_a_login_mask() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let _login = kr_ipc::testing::LoginUmask::hold();
+    let root = tempfile::tempdir().expect("a disposable directory on the internal disk");
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).expect("the state directory");
+    drop(BackupStore::open(&state).expect("a backup store"));
+
+    let staging = state.join("backup");
+    let mode = std::fs::metadata(&staging)
+        .expect("the staging directory")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o700, "{}", staging.display());
+}
+
 /// A store whose schema is not the one this build writes is refused, whatever its version says.
 ///
 /// The rules a store enforces are part of its schema. A database written when one of them was

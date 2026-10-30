@@ -225,6 +225,43 @@ impl Drop for PrivateTempDir {
     }
 }
 
+/// Holds the process's file-creation mask at 022, the one a login starts with, until it is dropped.
+///
+/// A directory made without a mode of its own comes out 0755 under it, which is what a daemon that
+/// no service definition started makes. A case that must show a directory is owner-only because the
+/// host asked for that mode, and not because the mask of whoever runs the suite happens to take the
+/// rest away, holds this first. The mask belongs to the whole process, so a second holder waits for
+/// the first to drop its own; a case that does not hold one runs under whichever mask is set.
+#[cfg(unix)]
+pub struct LoginUmask {
+    previous: rustix::fs::Mode,
+    _turn: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(unix)]
+impl LoginUmask {
+    /// Sets the mask to 022, after any other holder has dropped its own.
+    #[must_use]
+    pub fn hold() -> Self {
+        static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let turn = TURN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = rustix::process::umask(rustix::fs::Mode::from_bits_truncate(0o022));
+        Self {
+            previous,
+            _turn: turn,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for LoginUmask {
+    fn drop(&mut self) {
+        rustix::process::umask(self.previous);
+    }
+}
+
 /// Returns the program that copies a file on this system.
 ///
 /// The usual two places first, then the search path, and a clear refusal when there is none. A
