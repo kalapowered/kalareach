@@ -4874,7 +4874,7 @@ pub async fn account_services<R: tauri::Runtime>(
 ) -> Result<Vec<crate::services::ServiceLine>> {
     let account = account.get().await?;
     Ok(crate::services::lines(
-        &crate::services::held_by(&app, &account).into_clients(),
+        &crate::services::held_by(&app, account).into_clients(),
     ))
 }
 
