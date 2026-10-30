@@ -275,3 +275,113 @@ fn a_git_that_answers_without_end_is_stopped_at_the_bound_and_refused() {
         "{refusal:?}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn requests_that_arrive_together_start_one_look_between_them() {
+    use std::sync::Barrier;
+
+    const REQUESTS: usize = 8;
+
+    // Git behind a wrapper that counts how often it is asked, and is slow enough that requests
+    // which arrive together meet a look that is still under way. Looked for once, it is asked its
+    // two questions once; looked for by each request it would be asked them eight times over.
+    let installed = match kr_project::git::GitProgram::discover() {
+        Ok(installed) => installed,
+        Err(error) => {
+            println!("not exercised: this host has no Git to wrap: {error}");
+            return;
+        }
+    };
+    let directory = tempfile::tempdir().expect("a directory for this test");
+    let search = directory.path().join("search");
+    std::fs::create_dir(&search).expect("a search path of this test's own");
+    let asked = directory.path().join("asked");
+    stand_in(
+        &search,
+        &format!(
+            "echo asked >> '{}'\nsleep 0.3\nexec '{}' \"$@\"",
+            asked.display(),
+            installed.program().display()
+        ),
+    );
+    let profile = profile_searching(directory.path(), &search);
+    let together = Barrier::new(REQUESTS);
+
+    let programs: Vec<usize> = std::thread::scope(|scope| {
+        let looks: Vec<_> = (0..REQUESTS)
+            .map(|_| {
+                scope.spawn(|| {
+                    together.wait();
+                    let found = profile.git().expect("Git is found");
+                    std::ptr::from_ref(found) as usize
+                })
+            })
+            .collect();
+        looks
+            .into_iter()
+            .map(|look| look.join().expect("the look ends"))
+            .collect()
+    });
+
+    assert!(
+        programs.windows(2).all(|pair| pair[0] == pair[1]),
+        "every request is given the one program that was found"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&asked)
+            .expect("the wrapper was asked")
+            .lines()
+            .count(),
+        2,
+        "Git was asked for its helper directory and its version once, for all of them"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn requests_that_arrive_together_share_the_refusal_of_one_look() {
+    use std::sync::Barrier;
+
+    const REQUESTS: usize = 4;
+
+    // A Git that hangs. Each request that looked for itself would wait out the bound in its turn,
+    // and the stand-in would be started once for each of them.
+    let directory = tempfile::tempdir().expect("a directory for this test");
+    let search = directory.path().join("search");
+    std::fs::create_dir(&search).expect("a search path of this test's own");
+    let started = directory.path().join("started");
+    stand_in(
+        &search,
+        &format!("echo started >> '{}'\nexec sleep 120", started.display()),
+    );
+    let profile = profile_waiting(directory.path(), &search, Duration::from_secs(2));
+    let together = Barrier::new(REQUESTS);
+
+    std::thread::scope(|scope| {
+        let looks: Vec<_> = (0..REQUESTS)
+            .map(|_| {
+                scope.spawn(|| {
+                    together.wait();
+                    profile.git().map(|_| ()).expect_err("no Git answers")
+                })
+            })
+            .collect();
+        for look in looks {
+            let refusal = look.join().expect("the look ends");
+            assert!(
+                matches!(refusal, ProjectError::GitUnavailable { .. }),
+                "{refusal:?}"
+            );
+        }
+    });
+
+    let starts = std::fs::read_to_string(&started)
+        .expect("the stand-in was started")
+        .lines()
+        .count();
+    assert!(
+        starts < REQUESTS,
+        "the stand-in was started {starts} times for {REQUESTS} requests that arrived together"
+    );
+}
