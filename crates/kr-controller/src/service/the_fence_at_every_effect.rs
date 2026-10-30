@@ -1519,6 +1519,191 @@ async fn a_fence_that_lands_once_an_environment_change_holds_the_record_stops_it
     assert!(!recorded(1));
 }
 
+/// A platform that raises a fence on this host while it answers, and starts what it is told to: it
+/// says the environment is stopped until it has been started.
+struct FenceRaisingPlatform {
+    controller: std::sync::Weak<Controller>,
+    /// Whether the fence is raised while the platform answers, or left to the test.
+    raises: bool,
+    /// Whether the environment answers as running without being started.
+    running: bool,
+    started: std::sync::atomic::AtomicBool,
+}
+
+impl FenceRaisingPlatform {
+    fn new(controller: &Arc<Controller>, raises: bool, running: bool) -> Arc<Self> {
+        Arc::new(Self {
+            controller: Arc::downgrade(controller),
+            raises,
+            running,
+            started: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    fn raise(&self) {
+        if self.raises
+            && let Some(controller) = self.controller.upgrade()
+        {
+            controller.hold_fence(true);
+        }
+    }
+
+    fn was_started(&self) -> bool {
+        self.started.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl crate::bridge::store::Observer for FenceRaisingPlatform {
+    fn observe(
+        &self,
+        _: &kr_protocol::identity::EnvironmentEnrolment,
+    ) -> crate::error::Result<kr_protocol::identity::EnvironmentPresence> {
+        use kr_protocol::identity::EnvironmentPresence;
+        if self.running || self.was_started() {
+            Ok(EnvironmentPresence::Running)
+        } else {
+            self.raise();
+            Ok(EnvironmentPresence::EnvironmentStopped)
+        }
+    }
+
+    fn start(&self, _: &kr_protocol::identity::EnvironmentEnrolment) -> crate::error::Result<()> {
+        self.started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.raise();
+        Ok(())
+    }
+}
+
+/// KR-REQ-09.09: a fence that lands while a refresh waits on the platform stops the record of what
+/// the platform said, and a refresh that started the environment is then an outcome this host does
+/// not know and not a refusal it keeps: the start is not undone by the record not being made. A
+/// fence that lands after the record, before a bridge is opened, leaves the refresh as it ran and
+/// says no bridge was opened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_that_lands_while_a_refresh_waits_on_the_platform_stops_the_record() {
+    use kr_protocol::identity::{
+        EnvironmentEnrolParams, EnvironmentPresence, EnvironmentRefreshParams,
+        EnvironmentRefreshResult,
+    };
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let carried = crate::authority::AdmittedMutation {
+        connection_id,
+        admitted_revision: controller
+            .admitted_revision(connection_id)
+            .expect("the connection is registered"),
+        deadline: None,
+    };
+    let change = |method: Method, params: ParamsValue| {
+        let controller = Arc::clone(&controller);
+        let mutation = mutation_of(&temp, method, params);
+        let actor =
+            super::routes::local_actor(actor_id.clone(), connection_id, controller.generation);
+        async move {
+            controller
+                .environment_record(&actor, false, &mutation, method, carried)
+                .await
+        }
+    };
+    let refresh = |byte: u8, start: bool| {
+        change(
+            Method::EnvironmentRefresh,
+            ParamsValue::from_typed(&EnvironmentRefreshParams {
+                environment_id: enrolment_of(byte).environment_id,
+                start,
+            })
+            .expect("encodes"),
+        )
+    };
+    let status_of = |byte: u8| {
+        let state_dir = controller.paths.state_dir().to_path_buf();
+        let environment_id = enrolment_of(byte).environment_id;
+        crate::bridge::store::Store::with_locked(&state_dir, |store| {
+            Ok(store
+                .list(None, kr_ipc::now_ms().get())
+                .into_iter()
+                .find(|row| row.enrolment.environment_id == environment_id)
+                .map(|row| row.status))
+        })
+        .expect("the record opens")
+        .expect("the environment is enrolled")
+    };
+    for byte in [1, 2, 3] {
+        change(
+            Method::EnvironmentEnrol,
+            ParamsValue::from_typed(&EnvironmentEnrolParams {
+                enrolment: enrolment_of(byte),
+            })
+            .expect("encodes"),
+        )
+        .await
+        .expect("enrolled");
+    }
+
+    // A refresh that only looks: the fence lands while the platform answers, and nothing is
+    // recorded of what it said.
+    let platform = FenceRaisingPlatform::new(&controller, true, false);
+    controller.ask_instead(platform.clone());
+    let refused = refresh(1, false).await.expect_err("the record is refused");
+    controller.hold_fence(false);
+    refused_for_a_fence(&refused.to_protocol_error());
+    assert_eq!(
+        status_of(1),
+        EnvironmentPresence::Stale,
+        "the answer was not recorded"
+    );
+    assert!(!platform.was_started());
+
+    // A refresh that started the environment: the same fence, and the start is not undone by the
+    // record not being made, so the answer is an unknown outcome, which no claim keeps as a
+    // refusal.
+    let platform = FenceRaisingPlatform::new(&controller, true, false);
+    controller.ask_instead(platform.clone());
+    let unknown = refresh(2, true)
+        .await
+        .expect_err("the record is refused after a start");
+    controller.hold_fence(false);
+    assert!(platform.was_started());
+    assert_eq!(unknown.code(), ErrorCode::OutcomeUnknown, "{unknown}");
+    assert!(
+        !matches!(
+            unknown.code().retry_category(),
+            kr_protocol::error::RetryCategory::NoRetry
+                | kr_protocol::error::RetryCategory::ConfigurationChange
+        ),
+        "no claim keeps it as a refusal"
+    );
+    assert_eq!(status_of(2), EnvironmentPresence::Stale);
+
+    // A fence that lands after the record is made: the refresh has run and is answered, and no
+    // bridge is opened for it.
+    controller.ask_instead(FenceRaisingPlatform::new(&controller, false, true));
+    let (arrived, release) = controller.after_the_environment_is_recorded.arm();
+    let waiting = tokio::spawn(refresh(3, false));
+    arrival(arrived).await;
+    controller.hold_fence(true);
+    release.send(()).expect("the refresh goes on");
+    let answered = waiting
+        .await
+        .expect("the refresh finishes")
+        .expect("a refresh that has run is answered");
+    controller.hold_fence(false);
+    let result: EnvironmentRefreshResult = answered.to_typed().expect("a result");
+    assert_eq!(result.row.status, EnvironmentPresence::Running);
+    assert!(result.verification.0.is_none());
+    assert!(
+        result.connection.contains("no bridge was opened") && result.connection.contains("fence"),
+        "{}",
+        result.connection
+    );
+    assert_eq!(
+        status_of(3),
+        EnvironmentPresence::Running,
+        "it was recorded"
+    );
+}
+
 /// KR-REQ-09.09, 09.12 and 26.16: a machine group step another attempt recorded is not given back
 /// to a late attempt, one that finds the claim after waiting for the step lock, while this host owes
 /// a fence it could not raise. The control: with nothing owed, the same late attempt is answered

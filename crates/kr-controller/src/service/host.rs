@@ -201,6 +201,32 @@ impl Controller {
         })
     }
 
+    /// The platform a refresh asks about an environment.
+    fn environment_observer(&self) -> Arc<dyn crate::bridge::store::Observer + Send + Sync> {
+        #[cfg(feature = "testing")]
+        if let Some(replaced) = self
+            .environment_observer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            return replaced;
+        }
+        Arc::new(crate::bridge::platform::PlatformObserver)
+    }
+
+    /// Has a refresh ask `observer` in place of the platform, for this host's own tests.
+    #[cfg(test)]
+    pub(crate) fn ask_instead(
+        &self,
+        observer: Arc<dyn crate::bridge::store::Observer + Send + Sync>,
+    ) {
+        *self
+            .environment_observer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observer);
+    }
+
     /// Answers `environment.inventory` from this host's cache.
     ///
     /// Section 3: a listing reports what was last observed and starts nothing. Nothing here takes
@@ -404,23 +430,45 @@ impl Controller {
 
                 let observing = state_dir.clone();
                 let asking = Arc::clone(&controller);
+                let platform = self.environment_observer();
                 // The platform command is a blocking one, and it is run on a blocking thread so a
-                // distribution that takes seconds to start does not hold this runtime.
+                // distribution that takes seconds to start does not hold this runtime. It is asked
+                // under the admission before it runs, and what it saw is recorded under the
+                // admission asked again: a fence landing during the command stops the record, and
+                // a refusal after a start is an outcome this host does not know, since the start
+                // is not undone by the record not being made.
                 let refreshed = tokio::task::spawn_blocking(move || {
                     crate::bridge::store::Store::with_locked(&observing, |store| {
                         #[cfg(feature = "testing")]
                         asking.after_the_environment_record_is_taken.wait();
                         asking.check_registration(&carried)?;
-                        store.refresh(
+                        let observed = store.observe(
                             params.environment_id,
                             params.start,
-                            &crate::bridge::platform::PlatformObserver,
-                            now_ms,
-                        )
+                            platform.as_ref(),
+                        )?;
+                        let started = observed.started();
+                        asking
+                            .under_registration(&carried, || store.record(observed, now_ms))
+                            .and_then(|recorded| recorded)
+                            .map_err(|refusal| {
+                                if started {
+                                    ControllerError::Uncertain {
+                                        detail: format!(
+                                            "the environment was started and this host did not \
+                                             record what it saw: {refusal}"
+                                        ),
+                                    }
+                                } else {
+                                    refusal
+                                }
+                            })
                     })
                 })
                 .await
                 .map_err(|error| ControllerError::supervision(error.to_string()))??;
+                #[cfg(feature = "testing")]
+                self.after_the_environment_is_recorded.wait();
                 let crate::bridge::store::Refreshed {
                     mut row,
                     started,
@@ -439,9 +487,16 @@ impl Controller {
                          with --start to start it"
                             .to_owned(),
                     )
+                } else if let Err(refusal) = controller.check_registration(&carried) {
+                    // The platform has been asked and the record is made. Opening a bridge reaches
+                    // into another environment, so it waits on the admission; what it refuses is
+                    // not a refusal of the refresh, which has run.
+                    (
+                        Nullable::null(),
+                        format!("no bridge was opened, because {refusal}"),
+                    )
                 } else {
                     // Opening a bridge reaches into another environment, after waits of its own.
-                    controller.check_registration(&carried)?;
                     let opened_for = row.enrolment.clone();
                     match crate::bridge::verify::through_bridge(
                         actor,

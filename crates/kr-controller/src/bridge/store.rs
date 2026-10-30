@@ -124,6 +124,25 @@ pub trait Observer {
     fn start(&self, enrolment: &EnvironmentEnrolment) -> Result<()>;
 }
 
+/// What the platform said about one environment, before the record has taken it in.
+#[derive(Clone, Debug)]
+pub struct Observed {
+    enrolment: EnvironmentEnrolment,
+    instance: EnrolmentInstance,
+    status: EnvironmentPresence,
+    /// Whether the platform was told to start the environment.
+    started: bool,
+}
+
+impl Observed {
+    /// Whether the platform was told to start the environment, which the record not taking in
+    /// what was seen does not undo.
+    #[must_use]
+    pub const fn started(&self) -> bool {
+        self.started
+    }
+}
+
 /// What one refresh saw, and which approved record it saw it for.
 #[derive(Clone, Debug)]
 pub struct Refreshed {
@@ -349,19 +368,23 @@ impl Store {
             .copied()
     }
 
-    /// Observes one environment now, starting it first when `start` is set.
+    /// Asks the platform about one environment now, starting it first when `start` is set, and
+    /// changes nothing in the record.
+    ///
+    /// The platform command can take seconds, and what the caller was admitted under can lapse
+    /// meanwhile. So what it saw is not recorded here: [`Self::record`] takes it in, under the
+    /// admission asked again.
     ///
     /// # Errors
     ///
     /// Returns a not-found failure when nothing is enrolled under that identity, and whatever the
     /// observer reported otherwise.
-    pub fn refresh(
-        &mut self,
+    pub fn observe(
+        &self,
         environment_id: EnvironmentId,
         start: bool,
         observer: &dyn Observer,
-        now_ms: u64,
-    ) -> Result<Refreshed> {
+    ) -> Result<Observed> {
         let enrolment = self
             .enrolment(environment_id)
             .ok_or_else(|| {
@@ -381,8 +404,28 @@ impl Store {
             started = true;
         }
         let status = observer.observe(&enrolment)?;
+        Ok(Observed {
+            enrolment,
+            instance,
+            status,
+            started,
+        })
+    }
+
+    /// Takes in what [`Self::observe`] saw, and answers with the row as observed at `now_ms`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a failure when the record cannot be written.
+    pub fn record(&mut self, observed: Observed, now_ms: u64) -> Result<Refreshed> {
+        let Observed {
+            enrolment,
+            instance,
+            status,
+            started,
+        } = observed;
         self.record.observations.insert(
-            environment_id.to_string(),
+            enrolment.environment_id.to_string(),
             Observation {
                 status,
                 at_ms: now_ms,
@@ -811,9 +854,7 @@ mod tests {
         let record = enrolment(1, "ubuntu");
         store.enrol(record.clone(), 100).expect("enrolled");
         let observer = Recorder::answering(EnvironmentPresence::Running);
-        store
-            .refresh(record.environment_id, false, &observer, 200)
-            .expect("refreshed");
+        refresh(&mut store, record.environment_id, false, &observer, 200).expect("refreshed");
         let fresh = store.list(None, 200);
         assert_eq!(fresh[0].status, EnvironmentPresence::Running);
         assert!(!fresh[0].is_evidence_of_a_live_process());
@@ -829,9 +870,8 @@ mod tests {
         let record = enrolment(1, "ubuntu");
         store.enrol(record.clone(), 100).expect("enrolled");
         let observer = Recorder::answering(EnvironmentPresence::EnvironmentStopped);
-        let refreshed = store
-            .refresh(record.environment_id, false, &observer, 200)
-            .expect("refreshed");
+        let refreshed =
+            refresh(&mut store, record.environment_id, false, &observer, 200).expect("refreshed");
         let (row, started) = (refreshed.row, refreshed.started);
         assert!(!started);
         assert!(observer.started.borrow().is_empty());
@@ -847,9 +887,8 @@ mod tests {
         store.enrol(record.clone(), 100).expect("enrolled");
         store.enrol(enrolment(2, "debian"), 100).expect("enrolled");
         let observer = Recorder::answering(EnvironmentPresence::EnvironmentStopped);
-        let refreshed = store
-            .refresh(record.environment_id, true, &observer, 200)
-            .expect("refreshed");
+        let refreshed =
+            refresh(&mut store, record.environment_id, true, &observer, 200).expect("refreshed");
         let (row, started) = (refreshed.row, refreshed.started);
         assert!(started);
         assert_eq!(*observer.started.borrow(), vec!["ubuntu-distribution"]);
@@ -863,12 +902,23 @@ mod tests {
         let record = enrolment(1, "ubuntu");
         store.enrol(record.clone(), 100).expect("enrolled");
         let observer = Recorder::answering(EnvironmentPresence::Running);
-        let started = store
-            .refresh(record.environment_id, true, &observer, 200)
+        let started = refresh(&mut store, record.environment_id, true, &observer, 200)
             .expect("refreshed")
             .started;
         assert!(!started);
         assert!(observer.started.borrow().is_empty());
+    }
+
+    /// One refresh: the platform asked, then what it said taken in.
+    fn refresh(
+        store: &mut Store,
+        environment_id: EnvironmentId,
+        start: bool,
+        observer: &dyn Observer,
+        now_ms: u64,
+    ) -> Result<Refreshed> {
+        let observed = store.observe(environment_id, start, observer)?;
+        store.record(observed, now_ms)
     }
 
     /// Which record an identity names now, which is what a bridge is opened for.

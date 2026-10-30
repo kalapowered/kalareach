@@ -579,6 +579,17 @@ pub struct Controller {
     /// every shipped build.
     #[cfg(feature = "testing")]
     after_the_environment_record_is_taken: crate::attention::Pause,
+    /// Where this host's own tests stop an environment refresh once the platform has answered and
+    /// the record has taken the answer in, before the admission is asked again to open a bridge,
+    /// so that a fence can land in between. The pause holds the thread. Compiled away in every
+    /// shipped build.
+    #[cfg(feature = "testing")]
+    after_the_environment_is_recorded: crate::attention::Pause,
+    /// The platform this host's own tests have a refresh ask in place of the real one. Compiled
+    /// away in every shipped build.
+    #[cfg(feature = "testing")]
+    environment_observer:
+        std::sync::Mutex<Option<Arc<dyn crate::bridge::store::Observer + Send + Sync>>>,
     /// Where this host's own tests stop a retry that has found its retained answer, before the
     /// admission it arrived under is asked again, so that a withdrawal can land in between.
     /// Compiled away in every shipped build.

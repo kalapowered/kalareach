@@ -1171,6 +1171,10 @@ impl Controller {
             #[cfg(feature = "testing")]
             after_the_environment_record_is_taken: crate::attention::Pause::default(),
             #[cfg(feature = "testing")]
+            after_the_environment_is_recorded: crate::attention::Pause::default(),
+            #[cfg(feature = "testing")]
+            environment_observer: std::sync::Mutex::new(None),
+            #[cfg(feature = "testing")]
             local_pace: std::sync::Mutex::new(super::local::LocalPace::default()),
             #[cfg(feature = "testing")]
             local_writes_blocked: std::sync::atomic::AtomicUsize::new(0),
