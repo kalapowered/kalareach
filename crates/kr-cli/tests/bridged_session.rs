@@ -3338,15 +3338,36 @@ impl Container {
         ]);
         String::from_utf8_lossy(&inspected.stdout).trim().to_owned()
     }
+
+    /// Removes the container by the identifier the runtime issued, never by a name somebody else
+    /// might hold now. Says why when it could not, and never panics.
+    fn remove(&self) -> Result<(), String> {
+        let removed = self.runtime.run(
+            &["rm", "--force", "--time", "0", "--", &self.id],
+            self.runtime.quick,
+        )?;
+        if removed.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "the runtime said: {}",
+                String::from_utf8_lossy(&removed.stderr).trim()
+            ))
+        }
+    }
 }
 
 impl Drop for Container {
     fn drop(&mut self) {
-        // By the identifier this test recorded, never by a name somebody else might hold now.
-        let _ = self
-            .runtime
-            .call(&["rm", "--force", "--time", "0", "--", &self.id]);
-        let _ = &self.name;
+        // A cleanup that panics while a failed assertion unwinds aborts the whole test binary and
+        // cleans up nothing after it in any case still running. So a removal that fails or stalls
+        // is recorded here and not raised.
+        if let Err(why) = self.remove() {
+            eprintln!(
+                "the container {} ({}) was not removed and may still be running: {why}",
+                self.name, self.id
+            );
+        }
     }
 }
 
@@ -3390,6 +3411,15 @@ exit 0
     }
 }
 
+/// The calls a stand-in runtime was given, one line of arguments each.
+fn recorded_calls(directory: &Path) -> Vec<String> {
+    std::fs::read_to_string(directory.join("calls"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
 /// A container the harness holds by the identifier a stand-in runtime issued.
 fn held_in(runtime: Runtime) -> Container {
     Container {
@@ -3406,6 +3436,33 @@ fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
         .cloned()
         .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
         .unwrap_or_default()
+}
+
+/// A removal that stalls is an error the harness reports, and one that stalls while a failed
+/// assertion unwinds is recorded and aborts nothing: a destructor that panics then ends the whole
+/// test binary and leaves the cleanup of every other case in flight undone.
+#[test]
+fn a_removal_that_stalls_while_an_assertion_fails_is_recorded_and_aborts_nothing() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let container = held_in(stalling_runtime(directory.path(), &["rm"]));
+    let why = container
+        .remove()
+        .expect_err("a removal that never ends is an error and not a panic");
+    assert!(why.contains("\"rm\""), "the call is named: {why}");
+
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _held = container;
+        panic!("an assertion of the case fails");
+    }));
+    assert_eq!(
+        panic_message(failed.expect_err("the assertion's own panic is what unwinds")),
+        "an assertion of the case fails"
+    );
+    let removals = recorded_calls(directory.path())
+        .iter()
+        .filter(|call| call.starts_with("rm "))
+        .count();
+    assert_eq!(removals, 2, "the unwinding case tried to remove it too");
 }
 
 /// A call to the container runtime that never ends fails the case that made it, with the call
