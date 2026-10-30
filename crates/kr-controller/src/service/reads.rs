@@ -203,6 +203,35 @@ impl Controller {
         }
     }
 
+    /// Serves `session.processes`: the processes the session's worker had recorded, each read
+    /// against the operating system. The record is read from the worker's journal while the worker
+    /// runs, read-only; see [`crate::processes`] for why that is safe.
+    ///
+    /// # Errors
+    ///
+    /// Returns `UNKNOWN_SESSION` for a session this daemon does not know, `SESSION_CLOSED` for one
+    /// that has closed, and the refusals of [`crate::processes::session_processes`].
+    pub(super) async fn session_processes(
+        self: &Arc<Self>,
+        params: &ParamsValue,
+    ) -> Result<ParamsValue> {
+        let params: kr_protocol::session_processes::SessionProcessesParams = parse(params)?;
+        let session_id = params.session_id;
+        let summary = self.session_summary(session_id).await?;
+        if summary.state == SessionState::Closed {
+            return Err(ControllerError::SessionClosed {
+                session: session_id.to_string(),
+            });
+        }
+        let paths = self.paths.clone();
+        let view = tokio::task::spawn_blocking(move || {
+            crate::processes::session_processes(&paths, session_id)
+        })
+        .await
+        .map_err(|error| ControllerError::InvalidArgument(error.to_string()))??;
+        encode(&view)
+    }
+
     /// Serves one page of a closed session's retained output.
     ///
     /// KR-ACC-029: a history request never creates a worker. A session whose worker is alive is
