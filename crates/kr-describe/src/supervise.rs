@@ -956,7 +956,8 @@ impl Driver {
                         // this wire.
                         return self.kill(ProcessEnd::BrokenWire, now, reports);
                     }
-                    if running.work.is_some_and(|due| due.id == id) {
+                    let in_hand = running.work.is_some_and(|due| due.id == id);
+                    if in_hand {
                         running.work = None;
                         running.next_sample_ms = u64::MAX;
                     }
@@ -967,11 +968,11 @@ impl Driver {
                     // on. When the system refused it the memory, that is the ceiling, and the
                     // process ends for it: the work is failed and not tried again, and inference
                     // pauses, as it does when the daemon's own reading finds the process over.
-                    // Asked of every answer to a load or a job, so that a refusal the runtime got
-                    // over is forgotten
-                    // and is not taken for the cause of a later end.
-                    let refused = self.the_system_refused_memory();
-                    if refused && the_work_failed(&answer) {
+                    // Asked of every answer to the load or the job in hand, so that a refusal the
+                    // runtime got over is forgotten and is not taken for the cause of a later end.
+                    // An answer for other work, which a late or a repeated answer is, belongs to
+                    // no refusal that the work in hand is owed.
+                    if in_hand && self.the_system_refused_memory() && the_work_failed(&answer) {
                         return self.kill(ProcessEnd::MemoryCeiling, now, reports);
                     }
                 }
