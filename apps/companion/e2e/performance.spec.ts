@@ -4,18 +4,20 @@
  *
  * The component test next to the interface counts what a keystroke touches and how its cost grows
  * with the history, in a document that has no renderer. What it cannot show is when a key reaches
- * the screen. Here the keys are typed through the browser's own input pipeline, and each is timed
- * from the event's own time stamp to the start of the second animation frame after it: the frame
- * that follows the one that presented the key's effect. A page that is busy with the stream
- * presents that frame late, so the figure includes input delay, the handler's work and the wait
- * for a paint.
+ * the screen. Here the keys are typed through the browser's input pipeline, and each is timed from
+ * the event's own time stamp to the start of the second animation frame after it: the frame that
+ * follows the one that presented the key's effect. A page that is busy with the stream presents
+ * that frame late, so the figure includes input delay, the handler's work and the wait for a
+ * paint.
  *
- * The figure is read against the page's own frame period, measured on the idle page in the same
- * run, and not against a number of milliseconds: a machine that paints one frame in a third of a
- * second has a frame period of that length, and the question is how many such periods a key waits.
- * It is also read against the same keys typed with a short history and no stream, so the machine
- * cancels out of the second reading too. Each reading is printed with its engine, whether it met
- * its bound or not, and attached to the run.
+ * The figure is a recording. Section 27 gives this target no number, and a bound on elapsed time
+ * would judge the machine the run happens on as much as the interface, so the case asserts only
+ * conditions: every key reached the composer in order and was timed, and the stream was being
+ * drawn while the keys were typed. The readings are the median of the keys in frame periods of the
+ * page's own idle frames and against the same keys with a short history and nothing streaming; each
+ * is printed with the engine and with a verdict against the reference bounds below, and attached to
+ * the run. The verdict is for a reference run to read: a display's frame period does not change
+ * with the processor, so the same bounds are tighter on a slower machine.
  */
 
 import { expect, test, type Page } from '@playwright/test'
@@ -31,15 +33,12 @@ const KEYS = 'responsive input'.repeat(3)
 const PAUSE_MS = 40
 
 /**
- * The most animation frames a key may wait, in the middle of the readings, with the stream
- * running over the full history. A key that waits is behind work the page has not yet done; the
- * stream adds a fixed amount of work to each frame, so this is the number of frames a keystroke
- * is allowed to be late by, not a time.
+ * The reference bounds the verdict line reads the readings against: the most frame periods the
+ * middle key may wait with the stream running over the full history, and how much later it may be
+ * than with a short history and nothing streaming. They are not asserted.
  */
-const MAXIMUM_PERIODS = 4
-
-/** How much later the middle key may be than with a short history and nothing streaming. */
-const MAXIMUM_GROWTH = 3
+const REFERENCE_PERIODS = 4
+const REFERENCE_GROWTH = 3
 
 declare global {
   interface Window {
@@ -132,7 +131,7 @@ async function typeKeys(page: Page): Promise<number[]> {
 }
 
 test.describe('KR-PERF-008: input stays responsive while output streams over a large history', () => {
-  test('a key is painted within a few frames while 20 nodes a frame stream over 4000', async ({ page }) => {
+  test('a key is painted and timed while 20 nodes a frame stream over 4000', async ({ page }) => {
     const engine = test.info().project.name
     await openSession(page)
     await startTiming(page)
@@ -222,7 +221,7 @@ test.describe('KR-PERF-008: input stays responsive while output streams over a l
       body: JSON.stringify(figures, null, 2),
       contentType: 'application/json'
     })
-    const verdict = periods <= MAXIMUM_PERIODS && growth <= MAXIMUM_GROWTH ? 'met' : 'missed'
+    const verdict = periods <= REFERENCE_PERIODS && growth <= REFERENCE_GROWTH ? 'met' : 'missed'
     console.log(
       `KR-PERF-008 key to painted frame (${engine}): median ${middle.streamed.toFixed(1)} ms = ${periods.toFixed(1)} frame periods of ${period.toFixed(1)} ms ` +
         `with ${PER_FRAME} nodes a frame streaming over ${HISTORY}, p95 ${percentile(streamed, 0.95).toFixed(1)} ms, ` +
@@ -231,12 +230,11 @@ test.describe('KR-PERF-008: input stays responsive while output streams over a l
 
     // Every key reached the composer, in order, and the stream was being drawn while they were
     // typed: a run where the keys finished before any of the stream reached the screen would
-    // report the same figures and mean something else.
+    // report the same figures and mean something else. The readings above are recorded, and
+    // judged on a reference run.
     expect(typed).toBe(KEYS)
     expect(await page.evaluate(() => window.krKeys?.names.join('') ?? '')).toBe(KEYS)
     expect(streamed).toHaveLength(KEYS.length)
     expect(drawnAfter).toBeGreaterThan(drawnBefore)
-    expect(periods).toBeLessThanOrEqual(MAXIMUM_PERIODS)
-    expect(growth).toBeLessThanOrEqual(MAXIMUM_GROWTH)
   })
 })
