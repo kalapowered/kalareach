@@ -24,10 +24,15 @@ use kr_protocol::desktop::{
 use kr_protocol::envelope::ParamsValue;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::hostinfo::HostInfoResult;
-use kr_protocol::ids::EnvironmentId;
+use kr_protocol::ids::{EnvironmentId, InputLeaseEpoch};
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::session::ApplicationState;
+use kr_shell_integration::contract::fence::LeaseView;
+use kr_shell_integration::contract::requests::LaunchTransactionId;
+use kr_transport::clock::SystemContinuousClock;
+use kr_worker::fence::FenceDriver;
+use kr_worker::fence::driver::LaunchAnswer;
 use net_support::Host;
 use net_support::worker::{Adopted, Upstream};
 
@@ -511,6 +516,63 @@ fn the_platform_lists(process: &str) -> Option<bool> {
     }))
 }
 
+/// What the host holds under the pending request `waiting` counts, as the platform confirms it.
+///
+/// The count is the daemon's, so it holds on every platform. Whether the machine is then kept
+/// awake is the platform's: where it confirms the assertion, its own listing names the process the
+/// host says it holds it for, and where it does not, the host says which facility did not. The
+/// process is returned for the first case, so a caller can see the platform let it go.
+async fn what_is_held_for(host: &Host, waiting: &HostInfoResult) -> Option<String> {
+    let power = &waiting.power;
+    assert_eq!(
+        power.active,
+        power.holder.is_present(),
+        "an assertion is held exactly when the host names its holder"
+    );
+    if power.active {
+        assert_eq!(
+            power.reason.as_ref().copied(),
+            Some(kr_protocol::desktop::InhibitionReason::PendingRequests),
+            "the reason is the request that is waiting"
+        );
+        // The process the assertion is held for is the owner's to read: a device is told it was
+        // withheld, as a name.
+        let owner = owner_reads(host).await;
+        let holder = owner.power.holder.0.expect("the owner reads the holder");
+        let process = holder_process(&holder).to_owned();
+        if let Some(listed) = the_platform_lists(&process) {
+            assert!(listed, "the platform's own listing names process {process}");
+        }
+        Some(process)
+    } else {
+        // What the platform said about its facility leaves this host as its class and length, so
+        // a device is told that the host says why and not the words.
+        assert!(
+            power.withheld_reason.is_present(),
+            "a host that cannot hold the assertion says why it does not: {power:?}"
+        );
+        None
+    }
+}
+
+/// Waits until the platform's own listing no longer names `held_for`, where it confirmed the
+/// assertion.
+///
+/// The host lets it go by its own review of its demand: nothing here asks the host anything while
+/// this waits, so a read does not do the releasing.
+async fn until_the_platform_lets_go(held_for: Option<&str>) {
+    if let Some(process) = held_for {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        while the_platform_lists(process) == Some(true) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the platform's listing still names process {process} after the demand ended"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+}
+
 /// KR-REQ-03.27: what the agent in a session waits for is the host's own sleep demand, read by a
 /// device over the network.
 ///
@@ -541,36 +603,7 @@ async fn kr_req_03_27_what_an_agent_waits_for_is_a_pending_request_a_device_read
     // A question the agent put to the person.
     let question = worker.ask("publish");
     let waiting = demand_reaches(&session, 1).await;
-    let power = &waiting.power;
-    assert_eq!(
-        power.active,
-        power.holder.is_present(),
-        "an assertion is held exactly when the host names its holder"
-    );
-    let held_for = if power.active {
-        assert_eq!(
-            power.reason.as_ref().copied(),
-            Some(kr_protocol::desktop::InhibitionReason::PendingRequests),
-            "the reason is the request that is waiting"
-        );
-        // The process the assertion is held for is the owner's to read: a device is told it was
-        // withheld, as a name.
-        let owner = owner_reads(&adopted.host).await;
-        let holder = owner.power.holder.0.expect("the owner reads the holder");
-        let process = holder_process(&holder).to_owned();
-        if let Some(listed) = the_platform_lists(&process) {
-            assert!(listed, "the platform's own listing names process {process}");
-        }
-        Some(process)
-    } else {
-        // What the platform said about its facility leaves this host as its class and length, so
-        // a device is told that the host says why and not the words.
-        assert!(
-            power.withheld_reason.is_present(),
-            "a host that cannot hold the assertion says why it does not: {power:?}"
-        );
-        None
-    };
+    let held_for = what_is_held_for(&adopted.host, &waiting).await;
 
     worker
         .service
@@ -587,19 +620,7 @@ async fn kr_req_03_27_what_an_agent_waits_for_is_a_pending_request_a_device_read
             },
         )
         .expect("the person withdraws the question");
-    // Where the platform confirmed the assertion, the host lets it go by its own review of its
-    // demand: nothing here asks the host anything while this waits, so a read does not do the
-    // releasing.
-    if let Some(process) = held_for.as_deref() {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-        while the_platform_lists(process) == Some(true) {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the platform's listing still names process {process} after the demand ended"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-    }
+    until_the_platform_lets_go(held_for.as_deref()).await;
     let released = demand_reaches(&session, 0).await;
     assert!(!released.power.active, "the assertion ends with the demand");
 
@@ -608,6 +629,67 @@ async fn kr_req_03_27_what_an_agent_waits_for_is_a_pending_request_a_device_read
     let instance = worker.register_agent(std::sync::Arc::clone(&upstream));
     let _approval = worker.offer_approval(instance, upstream, None);
     demand_reaches(&session, 1).await;
+
+    session.close();
+    adopted.stop().await;
+}
+
+/// A launch confirmation `worker` is waiting on its reader for, held the way the worker's own
+/// `shell.launch` handler holds one.
+///
+/// The session is managed, so it counts launches and says so; a `native_compat` session cannot have
+/// one and says nothing. What the reader would answer is not what this shows, so the caller stays
+/// waiting until the returned transaction is forgotten.
+fn a_launch_waiting_for_its_reader(
+    worker: &net_support::worker::Worker,
+) -> (
+    LaunchTransactionId,
+    tokio::sync::oneshot::Receiver<LaunchAnswer>,
+) {
+    let mut session = worker.runtime().session();
+    session.install_fence(FenceDriver::new(
+        worker.session_id,
+        LeaseView::unheld(InputLeaseEpoch::new(0)),
+        std::sync::Arc::new(SystemContinuousClock::new()),
+    ));
+    let transaction = LaunchTransactionId::new(kr_ipc::new_uuid());
+    let receiver = session.register_launch(transaction);
+    (transaction, receiver)
+}
+
+/// KR-REQ-03.27: a launch confirmation the reader has not answered is a pending request, and the
+/// count travels from the worker to the host's sleep demand.
+///
+/// The worker serves the count in its answer to `session.read`, which is how the daemon learns it,
+/// so this fails if the worker says nothing there. While the caller waits the host is held awake,
+/// where the platform confirms the assertion, and it is let go once the caller is not waiting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_03_27_a_launch_waiting_for_its_reader_is_a_pending_request_a_device_reads() {
+    let mut document = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
+    document.preferences.sleep_inhibition =
+        kr_protocol::scalars::Nullable::some(SleepInhibitionSetting::BatteryToo);
+    let adopted = Adopted::start_with_document(1, &document).await;
+    let (_device, session) =
+        net_support::paired_device(&adopted.host, &adopted.owner, VIEWER).await;
+    let worker = &adopted.workers[0];
+
+    let idle = demand_reaches(&session, 0).await;
+    assert!(
+        !idle.power.active,
+        "nothing is outstanding, so nothing is held"
+    );
+
+    let (transaction, _caller) = a_launch_waiting_for_its_reader(worker);
+    let waiting = demand_reaches(&session, 1).await;
+    let held_for = what_is_held_for(&adopted.host, &waiting).await;
+
+    worker.runtime().session().forget_launch(transaction);
+    until_the_platform_lets_go(held_for.as_deref()).await;
+    let released = demand_reaches(&session, 0).await;
+    assert!(
+        !released.power.active,
+        "the assertion ends once the caller is not waiting"
+    );
 
     session.close();
     adopted.stop().await;
