@@ -717,7 +717,7 @@ struct Switching {
 /// What ended a wait of the reader.
 #[cfg(any(not(unix), test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Woken {
+pub enum Woken {
     /// The stop was made.
     Stop,
     /// The console has input.
