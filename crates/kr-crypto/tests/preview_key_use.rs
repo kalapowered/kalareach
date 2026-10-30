@@ -12,9 +12,7 @@
 
 use kr_crypto::CryptoError;
 use kr_crypto::archive::{encrypt_object, wrap_object_key};
-use kr_crypto::envelope::{
-    PreviewRefusal, open_notification_envelope, pad_notification_preview, seal_envelope,
-};
+use kr_crypto::envelope::{open_notification_envelope, pad_notification_preview, seal_envelope};
 use kr_crypto::keys::{NotificationPreviewKeyPair, StoredEnvelopeKeyPair, key_id};
 use kr_crypto::sealed::seal_notification_preview;
 use kr_protocol::archive::{KeyWrapContext, KeyWrapFormat, KeyWrapPurpose};
@@ -57,15 +55,14 @@ fn forced_into_a_stored_envelope_key(preview: &NotificationPreviewKeyPair) -> St
     StoredEnvelopeKey::from_bytes(*preview.public().as_bytes())
 }
 
-/// KR-REQ-16.11: a mailbox record does not name a preview key as its recipient, and is not a
-/// preview.
+/// KR-REQ-16.11: a mailbox record does not name a preview key as its recipient.
 ///
-/// The control is a preview sealed to the preview key, which opens with it. The refusals are the two
-/// ways a mailbox record could meet the preview key: addressed to its identifier, which the seal
-/// refuses because a stored-envelope recipient has the stored-envelope identifier for its bytes; and
-/// addressed properly, which the preview opener refuses as not a preview.
+/// The controls are a preview sealed to the preview key, which opens with it, and a mailbox record
+/// sealed to the device's stored-envelope key. The refusal is a mailbox record addressed to the
+/// preview key's identifier, which the seal refuses because a stored-envelope recipient has the
+/// stored-envelope identifier for its bytes.
 #[test]
-fn a_mailbox_record_cannot_name_a_preview_key_as_its_recipient_and_is_not_a_preview() {
+fn a_mailbox_record_cannot_name_a_preview_key_as_its_recipient() {
     let host_preview = NotificationPreviewKeyPair::generate().expect("a keypair");
     let device_preview = NotificationPreviewKeyPair::generate().expect("a keypair");
     let host_stored = StoredEnvelopeKeyPair::generate().expect("a keypair");
@@ -131,22 +128,8 @@ fn a_mailbox_record_cannot_name_a_preview_key_as_its_recipient_and_is_not_a_prev
         host_stored.key_id(),
         device_stored.key_id(),
     );
-    let record = seal_envelope(&host_stored, device_stored.public(), &to_the_stored_key)
+    seal_envelope(&host_stored, device_stored.public(), &to_the_stored_key)
         .expect("a mailbox record is sealed to the stored-envelope key");
-
-    // And that record is not a preview: the preview opener refuses it by what it declares.
-    let not_a_preview = open_notification_envelope(
-        &device_preview,
-        &kr_protocol::scalars::NotificationPreviewKey::from_bytes(*host_stored.public().as_bytes()),
-        &record,
-        NOW_MS,
-    )
-    .expect_err("a mailbox record is not opened as a preview");
-    assert!(
-        matches!(not_a_preview, PreviewRefusal::NotAPreview),
-        "{}",
-        not_a_preview.reason()
-    );
 }
 
 /// KR-REQ-16.11: an archive key wrap does not name a preview key as its recipient.

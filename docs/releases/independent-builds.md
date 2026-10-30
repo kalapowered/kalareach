@@ -20,17 +20,20 @@ configured for.
   reach iOS devices, so the key is the project's and never the app's.
 - **A gateway origin.** The build input `KR_PUSH_GATEWAY_ORIGIN` names the push gateway the app
   registers with, an `https://host[:port]` origin with no path. An Android build takes it from the
-  environment, beside `KR_GOOGLE_SERVICES_JSON`. An iOS build takes it from `Local.xcconfig`, beside
-  `KR_GOOGLE_SERVICE_INFO`, because `tauri ios build` does not hand its environment to the Xcode
-  build; `//` starts a comment in that file, so the line reads
-  `KR_PUSH_GATEWAY_ORIGIN = https:/$()/push.builder.example`. A build given no value uses the
-  official gateway, `https://reach.kala.to`, and sends the same requests as the official build. A
-  value that is not such an origin stops the build. A release build has no other way to change the
-  origin, and the input moves only the push gateway: the account the app signs in to and its other
-  services stay where they are. Each request is bound to the exact origin it was addressed to, so a
-  signature made for one deployment cannot be replayed against another, and a gateway refuses a
-  request authorised for somebody else's origin. The gateway compares the origin as exact text, so
-  the origin the gateway is configured with and the build input are the same text.
+  environment, beside `KR_GOOGLE_SERVICES_JSON`. An iOS build takes it from
+  `apps/companion/src-tauri/gen/apple/Local.xcconfig`, beside `KR_GOOGLE_SERVICE_INFO`, because
+  `tauri ios build` does not hand its environment to the Xcode build; `//` starts a comment in that
+  file, so the line reads `KR_PUSH_GATEWAY_ORIGIN = https:/$()/push.builder.example`. A build given
+  no value uses the official gateway, `https://reach.kala.to`, and sends the same requests as the
+  official build. A value that is not such an origin stops the build, and a build given one prints
+  `this build registers with the push gateway at <origin>` among its cargo warnings, which is the
+  sign that the input reached the build. A debug build also reads an origin from a device test's
+  file in its data directory; a release build has no other way to change the origin. The input
+  moves only the push gateway: the account the app signs in to and its other services stay where
+  they are. Each request is bound to the exact origin it was addressed to, so a signature made for
+  one deployment cannot be replayed against another, and a gateway refuses a request authorised for
+  somebody else's origin. The gateway compares the origin as exact text, so its setting
+  `PUSH_GATEWAY_ORIGIN` is the same text as the build input.
 
 The official gateway sends through the official Firebase project, so it reaches the apps registered
 in that project and no others. A host that is self-hosted forwards encrypted envelopes through the

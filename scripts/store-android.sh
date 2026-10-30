@@ -275,6 +275,9 @@ kr_store_say "version $version, build number $number, into $out"
 # pages, so the build names the one the project pins.
 export NDK_HOME="$ndk" ANDROID_NDK_HOME="$ndk" ANDROID_NDK_ROOT="$ndk" ANDROID_HOME="$sdk"
 export KR_GOOGLE_SERVICES_JSON="$firebase"
+# A store bundle is the official build, which registers with the official gateway: a gateway named in
+# this shell is for an independently signed build.
+unset KR_PUSH_GATEWAY_ORIGIN
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$(kr_store_cargo_target "$here")}"
 
 unsigned="$companion/src-tauri/gen/android/app/build/outputs/bundle/universalRelease/app-universal-release.aab"

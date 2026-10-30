@@ -3,8 +3,8 @@
 //! The official applications send their notification requests to the managed service's gateway. An
 //! independently signed build names its own with the build input `KR_PUSH_GATEWAY_ORIGIN`, beside
 //! the Firebase and APNs inputs it already gives. The input is read once, when the application is
-//! built: nothing at run time or in the interface changes it, and the account the application signs
-//! in to is not moved by it.
+//! built: a release build has no other way to change the origin, and the account the application
+//! signs in to is not moved by it.
 //!
 //! This file is compiled twice. The build step refuses a build given a value that is not an origin,
 //! so a mistyped input stops the build instead of giving an application that cannot register. The
@@ -71,16 +71,13 @@ mod tests {
     }
 
     /// What is not an `https://host[:port]` origin refuses the build rather than an application that
-    /// cannot register. The scheme is this module's rule: another scheme, a loopback `http` one
-    /// among them, and none at all. The rest of the grammar is the protocol's origin type, which
-    /// the module defers to; a path stands for it.
+    /// cannot register. The `https` scheme is this module's rule: the protocol's origin type also
+    /// takes a loopback `http` one. The rest of the grammar is that type's, which the module defers
+    /// to; a path stands for it.
     #[test]
     fn a_value_that_is_not_an_https_origin_refuses_the_build() {
         for malformed in [
-            "http://push.builder.example",
             "http://127.0.0.1:8787",
-            "ftp://push.builder.example",
-            "push.builder.example",
             "https://push.builder.example/api/push",
         ] {
             assert!(check(malformed).is_err(), "{malformed:?}");

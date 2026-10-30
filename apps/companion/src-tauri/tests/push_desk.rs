@@ -442,7 +442,8 @@ fn vectors() -> Value {
 }
 
 /// The notification service, as a script: it takes a proposal and says it sent the challenge, and
-/// issues the credential the vectors record. It keeps the tokens it was proposed.
+/// issues the credential the vectors record, for the origin it was asked at. It keeps the tokens it
+/// was proposed and the addresses it was posted to.
 struct Gateway {
     proposed: Mutex<Vec<String>>,
     /// Every address a request was posted to.
