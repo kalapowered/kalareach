@@ -1656,7 +1656,8 @@ what lets an agent with no terminal window drive a browser on the screen in fron
 The identity is the whole of it, and nothing is ever rebound to a new login: a session whose
 desktop ended is closed and you create another. How well a reused login-session number is told
 apart from the login before it depends on the platform, because the generation is the start value
-of the process that owns the login and each platform owns its login differently.
+of the process that owns the login on macOS and Linux and the time the system records for the
+session's user to have logged on on Windows, and each platform owns its login differently.
 `docs/host/platforms.md` says what each one establishes, including where the answer is weaker.
 `docs/host/platforms.md` has the per-platform detail, including what each platform does at logout
 and what it will not tell this host.

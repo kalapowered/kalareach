@@ -8,17 +8,23 @@
 //! | --- | --- | --- |
 //! | macOS | the Aqua security session behind the user's `gui` launchd domain | `loginwindow`, which the domain names as its creator |
 //! | Linux | the login manager's session for this user's graphical login | the session's leader |
-//! | Windows | the interactive logon session | that session's `winlogon` |
+//! | Windows | the interactive logon session | none: Terminal Services' record of the session |
 //!
 //! Anchoring on a process buys two things. The generation is the kernel's own start value for that
 //! process, so two logins that happen to share a session number are told apart wherever the
-//! platform starts that process afresh for each login, which macOS and Linux both do; the Windows
-//! reader below says where that does not hold. And the
+//! platform starts that process afresh for each login, which macOS and Linux both do. And the
 //! recheck is one kernel query about a recorded identity —
 //! [`kr_ipc::identity::process_state`] — rather than another conversation with the platform's
 //! session facilities. That matters because a live session asks the question on every wake of its
 //! supervision, and a reading that cost a subprocess each time would spend more of a processor on
 //! watching nothing happen than the whole host is allowed while idle.
+//!
+//! Windows has no such process for an account to read. The logon process of a session belongs to
+//! the system, and an account without administrative rights, or an administrator whose token is
+//! not elevated, cannot open it to read its start time. The Windows reader asks Terminal Services
+//! instead, which answers the account about its own sessions: the generation is the time the
+//! session's user logged on, and a login is rechecked by asking again, on the slower cadence that
+//! a platform conversation gets.
 //!
 //! # Three answers, not two
 //!
@@ -45,7 +51,8 @@ pub struct Login {
     pub generation: Option<u64>,
     /// What the generation was read from.
     pub generation_source: DesktopGenerationSource,
-    /// The process that owns the login session, where the platform names one.
+    /// The process that owns the login session, where the platform names one an account can read.
+    /// Windows names none.
     pub anchor: Option<ProcessStartIdentity>,
     /// Whether the session has graphical access.
     pub graphic_access: bool,
@@ -195,7 +202,7 @@ pub fn named_presence(session: &str, generation: Option<u64>, uid: u32) -> Prese
 }
 
 /// What running a platform command produced.
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 enum Printed {
     /// It ran and succeeded.
     Output(String),
@@ -205,10 +212,7 @@ enum Printed {
     /// could not reach its own service, or that refused for a reason of its own, has not
     /// established that a login session is gone, and treating it as though it had would close a
     /// live session.
-    ///
-    /// The Windows reader carries the text without reading it: the task listing prints no phrase
-    /// that means "that session is not there", so every failure of it leaves the question open.
-    Failed(#[cfg_attr(windows, allow(dead_code))] String),
+    Failed(String),
     /// It could not be run at all, so the platform was never asked.
     NotRun,
 }
@@ -218,7 +222,7 @@ enum Printed {
 /// The difference between a command that failed and one that never ran is part of the distinction
 /// [`Reading`] exists for; the other part is what a failure said. Nothing here interpolates text
 /// into a command line: the argument vector is a vector.
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn run(program: &str, arguments: &[&str]) -> Printed {
     // The child writes to files of this reading's own rather than to pipes. A pipe has to be read
     // while the child runs, or the child blocks on a full one; reading it needs either a thread or
@@ -236,11 +240,6 @@ fn run(program: &str, arguments: &[&str]) -> Printed {
         return Printed::NotRun;
     };
     let started = {
-        // Started under the lock every start of this worker's takes on Windows, while a launch's
-        // stream ends may be inheritable: a process that held one would hold a backend's output
-        // open for as long as it ran.
-        #[cfg(windows)]
-        let _inheriting = crate::windows::launch::inheriting();
         #[cfg(feature = "testing")]
         let program = probe_program(program);
         std::process::Command::new(program)
@@ -296,8 +295,8 @@ fn run(program: &str, arguments: &[&str]) -> Printed {
     let _ = std::fs::remove_dir_all(&directory);
     let Some((printed, failed)) = captured else {
         // A capture this host could not read is not empty output. Empty output is an answer here:
-        // Linux reads it as no graphical session, and Windows as no matching logon. This probe has
-        // no answer, which is what `NotRun` says.
+        // Linux reads it as no graphical session. This probe has no answer, which is what
+        // `NotRun` says.
         return Printed::NotRun;
     };
     if status.success() {
@@ -313,7 +312,7 @@ fn run(program: &str, arguments: &[&str]) -> Printed {
 ///
 /// A directory of its own so the two names cannot collide with another reading's, and so removing
 /// it takes both files with it however the reading ended.
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn capture_files() -> Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
     let directory = std::env::temp_dir().join(format!("kr-desktop-{}", kr_ipc::new_uuid()));
     // `create_dir` and not `create_dir_all`: a directory that is already there is one this host
@@ -336,7 +335,7 @@ fn capture_files() -> Option<(std::path::PathBuf, std::path::PathBuf, std::path:
 ///
 /// `create_new` and not `create`: a file already at that name is one this host did not make, and a
 /// name that resolves through somebody else's symbolic link is somebody else's file to truncate.
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn new_file(path: &std::path::Path) -> Option<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -350,11 +349,11 @@ fn new_file(path: &std::path::Path) -> Option<std::fs::File> {
 }
 
 /// The most one capture this host reads from a platform command it ran.
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const CAPTURE_LIMIT: u64 = 1024 * 1024;
 
 /// Reads one capture, up to [`CAPTURE_LIMIT`], or nothing where it could not be read.
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn read_capture(path: &std::path::Path) -> Option<Vec<u8>> {
     use std::io::Read as _;
 
@@ -371,7 +370,7 @@ fn read_capture(path: &std::path::Path) -> Option<Vec<u8>> {
 ///
 /// Generous for a question that normally answers in milliseconds, and short enough that a facility
 /// which has stopped answering is noticed within one watch cadence.
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// What this host's own tests asked the deadline to be, in milliseconds, or [`u64::MAX`] when none
@@ -415,7 +414,7 @@ pub fn set_probe_program(program: Option<&std::path::Path>) {
 }
 
 /// The program a platform command runs: the one it is given, unless a test named another.
-#[cfg(feature = "testing")]
+#[cfg(all(feature = "testing", any(target_os = "macos", target_os = "linux")))]
 fn probe_program(asked: &str) -> String {
     PROBE_PROGRAM
         .lock()
@@ -425,7 +424,7 @@ fn probe_program(asked: &str) -> String {
 }
 
 /// The deadline a platform command is held to now: [`PROBE_DEADLINE`], unless a test moved it.
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn probe_deadline() -> std::time::Duration {
     #[cfg(feature = "testing")]
     {
@@ -441,8 +440,7 @@ fn probe_deadline() -> std::time::Duration {
 ///
 /// Only these answers are absence. Everything else a facility can fail with — a service it could
 /// not reach, a permission it did not have, a version that does not know the question — leaves the
-/// question open. The Windows reader asks nothing that answers this way, so it is the two
-/// platforms whose session facilities name what is missing that use this.
+/// question open. Only the two platforms whose session facilities name what is missing use this.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn says_absent(said: &str, absent: &[&str]) -> bool {
     absent.iter().any(|phrase| said.contains(phrase))
@@ -453,7 +451,7 @@ fn says_absent(said: &str, absent: &[&str]) -> bool {
 /// A start value of zero is not a start value: it is what a platform reader returns when it could
 /// not open the process. Treating it as a generation would give every unreadable process the same
 /// one.
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn anchor(pid: u32) -> Option<ProcessStartIdentity> {
     kr_ipc::identity::process_start_identity(pid)
         .ok()
@@ -776,123 +774,40 @@ mod implementation {
 
 #[cfg(windows)]
 mod implementation {
-    use super::{Login, Presence, Printed, Reading, anchor, run};
-    use kr_protocol::desktop::{
-        DesktopAvailability, DesktopGenerationSource, DesktopSessionKind, DisplayServer,
-    };
-
-    /// The process every interactive logon session owns.
-    const LOGON_PROCESS: &str = "winlogon.exe";
+    use super::{Presence, Reading, logon, presence_of, reading_of};
 
     /// Reads the interactive logon session this process runs in.
     ///
     /// The session number is what matters and the account name is not enough: the same account
     /// signs in to different sessions over a remote desktop connection and through user
-    /// switching, and a worker belongs to exactly one of them. The session's own logon process
-    /// anchors the generation, which tells a session number reused by a later session apart from
-    /// this one. It is a weaker generation than the other two platforms give: this host reads the
-    /// logon process that owns the session, and does not establish that one is started for each
-    /// authenticated sign-in, so a sign-out and a sign-in that kept both the session number and
-    /// its logon process would read as the same desktop.
+    /// switching, and a worker belongs to exactly one of them. Terminal Services' record of the
+    /// session supplies the generation, which is the time its user logged on: a session number
+    /// that a later sign-in reuses has a later logon time, and a session that is reconnected
+    /// keeps the one it had. The record is the account's to read for its own sessions, whatever
+    /// the account's rights.
     pub(super) fn read_login(_uid: u32) -> Reading {
-        let session = match own_session() {
-            Ok(Some(session)) => session,
-            Ok(None) => return Reading::None,
-            Err(()) => return Reading::Unavailable,
+        let Some(session) = logon::own_session() else {
+            return Reading::Unavailable;
         };
         // Session 0 is the service session. It has no desktop, and a worker started there is not
         // a desktop execution host whatever else is true of it.
         if session == 0 {
             return Reading::None;
         }
-        let anchored = match logon_process(session) {
-            Ok(Some(pid)) => anchor(pid),
-            // No logon process owns that session, so it is not an interactive login.
-            Ok(None) => return Reading::None,
-            Err(()) => return Reading::Unavailable,
-        };
-        if anchored.is_none() {
-            return Reading::Unavailable;
-        }
-        let remote = std::env::var("SESSIONNAME")
-            .is_ok_and(|name| !name.eq_ignore_ascii_case("console") && !name.is_empty());
-        Reading::Desktop(Login {
-            kind: DesktopSessionKind::WindowsInteractive,
-            platform_session: Some(session.to_string()),
-            generation: anchored.as_ref().map(|identity| identity.start_value.get()),
-            generation_source: DesktopGenerationSource::WindowsSessionLogon,
-            anchor: anchored,
-            graphic_access: true,
-            remote,
-            // Whether the session is attended, locked or disconnected is not something this host
-            // reads, and an unlocked desktop is not something it may assume.
-            availability: DesktopAvailability::Unknown,
-            display_server: DisplayServer::WindowsDesktop,
-            compositor: None,
-        })
+        reading_of(session, logon::record(session))
     }
 
     /// Asks whether a recorded interactive logon session is still there.
     ///
     /// The same account signs in to several sessions at once over a remote desktop connection and
     /// through user switching, so the session number is asked about directly rather than through
-    /// the session this process happens to be in. A session number with no logon process is a
+    /// the session this process happens to be in. A session number nobody is logged on in is a
     /// sign-out.
     pub(super) fn named_presence(session: &str, generation: Option<u64>, _uid: u32) -> Presence {
         let Ok(number) = session.parse::<u32>() else {
             return Presence::Unknown;
         };
-        match logon_process(number) {
-            Ok(Some(pid)) => match (anchor(pid), generation) {
-                (Some(live), Some(recorded)) if live.start_value.get() != recorded => {
-                    Presence::Ended
-                }
-                (Some(_), _) => Presence::Present,
-                (None, _) => Presence::Unknown,
-            },
-            // No logon process owns that session number, so that login has ended.
-            Ok(None) => Presence::Ended,
-            Err(()) => Presence::Unknown,
-        }
-    }
-
-    /// Returns the session number this process runs in.
-    fn own_session() -> Result<Option<u32>, ()> {
-        match run(
-            "tasklist",
-            &[
-                "/FI",
-                &format!("PID eq {}", std::process::id()),
-                "/FO",
-                "CSV",
-                "/NH",
-            ],
-        ) {
-            Printed::Output(printed) => Ok(super::task_rows(&printed)
-                .into_iter()
-                .find_map(|row| row.session)),
-            Printed::Failed(_) | Printed::NotRun => Err(()),
-        }
-    }
-
-    /// Returns the identifier of the logon process that owns one session.
-    fn logon_process(session: u32) -> Result<Option<u32>, ()> {
-        match run(
-            "tasklist",
-            &[
-                "/FI",
-                &format!("IMAGENAME eq {LOGON_PROCESS}"),
-                "/FO",
-                "CSV",
-                "/NH",
-            ],
-        ) {
-            Printed::Output(printed) => Ok(super::task_rows(&printed)
-                .into_iter()
-                .find(|row| row.session == Some(session))
-                .and_then(|row| row.pid)),
-            Printed::Failed(_) | Printed::NotRun => Err(()),
-        }
+        presence_of(generation, logon::record(number))
     }
 }
 
@@ -914,6 +829,76 @@ mod implementation {
         Presence::Unknown
     }
 }
+
+/// What Terminal Services said about one session.
+#[cfg(any(windows, test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Asked {
+    /// It described the session.
+    Record(SessionRecord),
+    /// It has no such session.
+    NoSuchSession,
+    /// It did not answer, or answered in a way this host cannot read.
+    Unanswered,
+}
+
+/// The parts of Terminal Services' record of a session that name a login.
+#[cfg(any(windows, test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionRecord {
+    /// When the session's user logged on, in the system's 100 ns ticks since 1601, or zero when
+    /// nobody is logged on in the session.
+    logon_time: u64,
+    /// Whether the session is a remote desktop one.
+    remote: bool,
+}
+
+/// Describes the login of the session a process runs in, from what Terminal Services said about it.
+///
+/// A session nobody is logged on in has no graphical login. A record that could not be had says
+/// nothing either way.
+#[cfg(any(windows, test))]
+fn reading_of(session: u32, asked: Asked) -> Reading {
+    match asked {
+        // The process runs in this session, so a service that does not know it is a service that
+        // cannot answer, not a session that is not there.
+        Asked::Unanswered | Asked::NoSuchSession => Reading::Unavailable,
+        Asked::Record(record) if record.logon_time == 0 => Reading::None,
+        Asked::Record(record) => Reading::Desktop(Login {
+            kind: DesktopSessionKind::WindowsInteractive,
+            platform_session: Some(session.to_string()),
+            generation: Some(record.logon_time),
+            generation_source: DesktopGenerationSource::WindowsSessionLogon,
+            anchor: None,
+            graphic_access: true,
+            remote: record.remote,
+            // Whether the session is attended, locked or disconnected is not something this host
+            // reads, and an unlocked desktop is not something it may assume.
+            availability: DesktopAvailability::Unknown,
+            display_server: DisplayServer::WindowsDesktop,
+            compositor: None,
+        }),
+    }
+}
+
+/// Says whether the login a record names is still the one in its session number.
+#[cfg(any(windows, test))]
+fn presence_of(generation: Option<u64>, asked: Asked) -> Presence {
+    match asked {
+        Asked::Unanswered => Presence::Unknown,
+        // Nobody is logged on in that session number now, so that login has ended.
+        Asked::NoSuchSession => Presence::Ended,
+        Asked::Record(record) if record.logon_time == 0 => Presence::Ended,
+        // A later sign-in to the same session number logged on later.
+        Asked::Record(record) => match generation {
+            Some(recorded) if recorded != record.logon_time => Presence::Ended,
+            _ => Presence::Present,
+        },
+    }
+}
+
+#[cfg(windows)]
+mod logon;
 
 /// Returns the single-depth fields of a printed domain description.
 ///
@@ -977,41 +962,11 @@ fn availability(state: &str, locked: bool, active: bool) -> DesktopAvailability 
     }
 }
 
-/// One row of a printed task listing.
-#[cfg(windows)]
-struct TaskRow {
-    /// The process identifier.
-    pid: Option<u32>,
-    /// The session the process runs in.
-    session: Option<u32>,
-}
-
-/// Returns the rows of a comma-separated task listing.
-///
-/// The columns are the image name, the process identifier, the session name, the session number
-/// and the memory use. Quoted fields are unwrapped; a row that does not have the columns this
-/// module needs contributes nothing.
-#[cfg(windows)]
-fn task_rows(printed: &str) -> Vec<TaskRow> {
-    printed
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            let columns: Vec<&str> = line
-                .split("\",\"")
-                .map(|column| column.trim_matches('"').trim())
-                .collect();
-            TaskRow {
-                pid: columns.get(1).and_then(|value| value.parse().ok()),
-                session: columns.get(3).and_then(|value| value.parse().ok()),
-            }
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{Login, Presence, presence};
+    use super::{
+        Asked, Login, Presence, Reading, SessionRecord, presence, presence_of, reading_of,
+    };
     #[cfg(target_os = "macos")]
     use super::{creator_pid, domain_header};
 
@@ -1132,16 +1087,102 @@ mod tests {
         assert!(fields.contains(&("Leader".to_owned(), "1234".to_owned())));
     }
 
+    /// KR-REQ-03.18: a Windows session is a login when Terminal Services records a user logged on
+    /// in it, whatever rights the asking account has, and the logon time is its generation.
+    #[test]
+    fn a_session_with_a_user_logged_on_is_a_login_generated_by_the_logon_time() {
+        let asked = Asked::Record(SessionRecord {
+            logon_time: 133_900_000_000_000_000,
+            remote: false,
+        });
+        let Reading::Desktop(login) = reading_of(2, asked.clone()) else {
+            panic!("a session with a user logged on is a login");
+        };
+        assert!(login.is_desktop(), "{login:?}");
+        assert_eq!(login.platform_session.as_deref(), Some("2"));
+        assert_eq!(login.generation, Some(133_900_000_000_000_000));
+        assert!(
+            login.anchor.is_none(),
+            "no process an account can open owns a session"
+        );
+
+        // A later sign-in to the same session number is another login.
+        let Reading::Desktop(later) = reading_of(
+            2,
+            Asked::Record(SessionRecord {
+                logon_time: 133_900_000_000_000_001,
+                remote: false,
+            }),
+        ) else {
+            panic!("a later sign-in is a login");
+        };
+        assert_ne!(login.generation, later.generation);
+
+        assert_eq!(
+            presence_of(login.generation, asked.clone()),
+            Presence::Present
+        );
+        assert_eq!(presence_of(Some(1), asked), Presence::Ended);
+    }
+
+    /// KR-REQ-03.18: a session nobody is logged on in, or one that is not there, is not a login,
+    /// and a service that does not answer establishes neither.
+    #[test]
+    fn a_session_without_a_user_or_without_an_answer_is_not_taken_for_a_login() {
+        let nobody = Asked::Record(SessionRecord {
+            logon_time: 0,
+            remote: false,
+        });
+        assert_eq!(reading_of(1, nobody.clone()), Reading::None);
+        assert_eq!(presence_of(Some(5), nobody), Presence::Ended);
+
+        assert_eq!(reading_of(1, Asked::NoSuchSession), Reading::Unavailable);
+        assert_eq!(presence_of(Some(5), Asked::NoSuchSession), Presence::Ended);
+
+        assert_eq!(reading_of(1, Asked::Unanswered), Reading::Unavailable);
+        assert_eq!(presence_of(Some(5), Asked::Unanswered), Presence::Unknown);
+    }
+
+    /// KR-REQ-03.18: a process in a user session reads that session's login whatever rights its
+    /// account has, with the session's logon time as the generation, and asking about the session
+    /// by number says the same login is still there and a login with another logon time is not.
     #[cfg(windows)]
     #[test]
-    fn a_task_listing_yields_the_session_a_process_runs_in() {
-        let rows = super::task_rows(
-            "\"winlogon.exe\",\"968\",\"Console\",\"1\",\"12,345 K\"\n\
-             \"winlogon.exe\",\"4242\",\"RDP-Tcp#3\",\"3\",\"11,000 K\"\n",
+    fn a_process_in_a_user_session_reads_that_sessions_login_without_opening_any_process() {
+        let session = super::logon::own_session().expect("the process's own session");
+        let reading = super::read_login(0);
+        if session == 0 {
+            assert_eq!(reading, Reading::None, "the service session has no desktop");
+            return;
+        }
+        let Reading::Desktop(login) = reading else {
+            panic!("a process in user session {session} reads {reading:?}, not its login");
+        };
+        assert_eq!(login.platform_session, Some(session.to_string()));
+        assert!(login.is_desktop(), "{login:?}");
+        assert!(login.anchor.is_none(), "{login:?}");
+        let again = super::read_login(0);
+        assert_eq!(
+            again,
+            Reading::Desktop(login.clone()),
+            "the login does not move"
         );
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].pid, Some(968));
-        assert_eq!(rows[0].session, Some(1));
-        assert_eq!(rows[1].session, Some(3));
+        assert_eq!(
+            super::named_presence(&session.to_string(), login.generation, 0),
+            Presence::Present
+        );
+        assert_eq!(
+            super::named_presence(
+                &session.to_string(),
+                login.generation.map(|logon| logon + 1),
+                0
+            ),
+            Presence::Ended
+        );
+        assert_eq!(
+            super::named_presence("123456789", login.generation, 0),
+            Presence::Ended,
+            "a session number nobody holds is a login that has ended"
+        );
     }
 }

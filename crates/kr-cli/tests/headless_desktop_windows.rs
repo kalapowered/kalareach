@@ -5,11 +5,10 @@
 //! desktop of its own, so neither it nor a program it starts inherits the interactive desktop of
 //! the person signed in. The probe runs in a headless session's shell, which is a console program
 //! in a pseudo-console, so that the shell answering at all shows that such a program still runs on
-//! a desktop of its own. As a control, the same probe runs in a process the task's starter creates
-//! with no desktop of its own, which is what it does for a desktop-bound worker, and finds the
-//! interactive desktop. That is not a desktop-bound session: an account without administrative
-//! rights cannot have one bound here, because the login reader cannot read the start time of its
-//! logon process. Which profile gets a desktop of its own is the supervisor's `placement` case.
+//! a desktop of its own. As a control, the same probe runs in a `desktop_bound` session of the
+//! same account and finds the interactive desktop and a window it makes there. The account needs
+//! no administrative rights for either: the host reads its login from the session the daemon runs
+//! in.
 //!
 //! This is not a boundary against a process of the same account, which can still open the
 //! interactive desktop by name; nothing here claims that it is.
@@ -166,81 +165,25 @@ fn window_here(title: &str) -> bool {
     .contains("kr-seen True")
 }
 
-/// Starts PowerShell through the environment's task, as a service, which the starter creates on
-/// its own desktop as it does a desktop-bound worker, makes it run the probe and make a window
-/// titled `title`, and returns what the probe found.
-async fn on_the_starters_desktop(host: &WorkerHost, title: &str) -> Found {
-    use kr_controller::supervision::{LaunchOutcome, ServiceLaunch, WorkerSupervisor as _};
-
-    let directory = host.tree.root();
-    let script = directory.join("probe.ps1");
-    let result = directory.join("probe.txt");
-    std::fs::write(
-        &script,
-        format!(
-            "{}\r\n$line = 'kr-probe ' + [KrProbe]::Run() + ' kr-end.'\r\n\
-             Set-Content -LiteralPath '{}' -Value $line\r\n[KrProbe]::Show('{title}', 30000)\r\n",
-            load(),
-            result.display()
-        ),
-    )
-    .expect("the probe's script");
-    let outcome = host.task_supervisor().start_service(&ServiceLaunch {
-        label: format!("kr-probe-{}", kr_ipc::new_uuid()),
-        program: kr_worker::default_shell::platform_default().into(),
-        arguments: vec![
-            "-NoProfile".to_owned(),
-            "-NonInteractive".to_owned(),
-            "-ExecutionPolicy".to_owned(),
-            "Bypass".to_owned(),
-            "-File".to_owned(),
-            script.display().to_string(),
-        ],
-        jobs_directory: host.tree.environment().jobs_dir(),
-        working_directory: directory.to_path_buf(),
-    });
-    let LaunchOutcome::Started(identity) = outcome else {
-        panic!("the probe was not started: {outcome:?}");
-    };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    let found = loop {
-        if let Some(text) = std::fs::read_to_string(&result)
-            .ok()
-            .filter(|text| text.contains(" kr-end."))
-        {
-            break Found::of(&text);
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the probe wrote nothing in 60 seconds"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    };
-    // The window is looked for while the probe holds it up, and the probe is ended afterwards.
-    let seen = (0..40).any(|_| {
+/// Whether a window titled `title` shows on the interactive desktop within a few seconds.
+fn window_appears(title: &str) -> bool {
+    (0..40).any(|_| {
         std::thread::sleep(std::time::Duration::from_millis(250));
         window_here(title)
-    });
-    kr_ipc::starter::end_process(&identity).expect("the probe is ended");
-    assert!(
-        seen,
-        "a window a process started on the starter's own desktop made is not on the interactive desktop, so the look for the headless session's window could not have found one"
-    );
-    found
+    })
 }
 
 /// KR-REQ-03.24: a headless session's shell is on a desktop of its own, not on the interactive
-/// one, draws nothing on it, and still runs; a process the starter creates with no desktop of its
-/// own is on the interactive desktop and its window is there.
+/// one, draws nothing on it, and still runs; a desktop-bound session of the same account is on the
+/// interactive desktop and its window is there.
 ///
 /// The control is this test's own probe: if it is not on the interactive desktop, the machine this
 /// runs on has no signed-in session and nothing here would show anything. The window of the
-/// starter's own process is the control for the headless session's: the same call, on the
+/// desktop-bound session is the control for the headless session's: the same call, on the
 /// interactive desktop, is seen from here. Nothing here says a headless process cannot open the
 /// interactive desktop by name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_headless_session_is_not_on_the_interactive_desktop_and_a_process_on_the_starters_own_is()
-{
+async fn a_headless_session_is_not_on_the_interactive_desktop_and_a_desktop_bound_one_is() {
     let control = probe_here();
     assert!(
         control.on_the_interactive_desktop(),
@@ -274,19 +217,46 @@ async fn a_headless_session_is_not_on_the_interactive_desktop_and_a_process_on_t
         "a window a headless session's shell made is on the interactive desktop"
     );
 
-    // What a desktop-bound worker is started on is what the task's starter gives a process it is
-    // told nothing about: its own desktop. A desktop-bound session cannot be bound here, because
-    // the login reader needs the start time of the session's logon process, which an account
-    // without administrative rights cannot read, so the same placement is asked for directly.
     let bound_title = title("bound");
-    let bound = on_the_starters_desktop(&host, &bound_title).await;
+    let bound_session = host
+        .kr_new_as(Some("--desktop"), &["--shell-mode", "native_compat"])
+        .await;
+    assert!(
+        bound_session.succeeded(),
+        "a desktop-bound session is created for an account whose login the host can read: {}",
+        bound_session.said()
+    );
+    assert_eq!(bound_session.document["worker_profile"], "desktop_bound");
+    let (bound, _holding_bound) = probe_in_session(&host, &bound_session, &bound_title).await;
     assert!(
         bound.on_the_interactive_desktop(),
-        "a process started on the starter's own desktop is not on the interactive desktop: {bound:?}"
+        "a desktop-bound session's shell is not on the interactive desktop: {bound:?}"
     );
     assert_eq!(
         (bound.winsta0.as_str(), bound.default.as_str()),
         ("opened", "opened"),
-        "a process started on the starter's own desktop reaches the interactive desktop: {bound:?}"
+        "a desktop-bound session's shell reaches the interactive desktop: {bound:?}"
+    );
+    assert!(
+        window_appears(&bound_title),
+        "a window a desktop-bound session's shell made is not on the interactive desktop"
+    );
+}
+
+/// KR-REQ-03.19: a host whose account has a login session creates a `desktop_bound` session when
+/// the request names no profile, and the account's rights do not decide that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_that_names_no_profile_is_desktop_bound_where_the_account_has_a_login() {
+    let host = WorkerHost::start().await;
+    let created = host.kr_new_as(None, &[]).await;
+    assert!(
+        created.succeeded(),
+        "the session was not created: {}",
+        created.said()
+    );
+    assert_eq!(
+        created.document["worker_profile"], "desktop_bound",
+        "the host's default is the desktop its account is signed in to: {}",
+        created.document
     );
 }

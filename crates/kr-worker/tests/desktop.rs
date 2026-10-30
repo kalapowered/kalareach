@@ -418,6 +418,11 @@ fn the_desktop_identity_binds_the_user_the_platform_session_the_boot_and_the_gen
                     .is_ok_and(|status| status.success()),
                 "this host has a graphical login domain and no complete desktop identity was read"
             );
+            #[cfg(windows)]
+            assert!(
+                kr_ipc::starter::current_session().is_ok_and(|session| session == 0),
+                "this process runs in a user session and no complete desktop identity was read"
+            );
             let context = desktop::context(WorkerProfile::DesktopBound, boot);
             assert!(!context.is_desktop());
             assert_eq!(context.kind, DesktopSessionKind::None);
@@ -429,19 +434,28 @@ fn the_desktop_identity_binds_the_user_the_platform_session_the_boot_and_the_gen
     // A reading that describes a login session describes all four parts of the identity, or it is
     // not a desktop at all.
     assert!(live.is_desktop(), "{live:?}");
-    assert!(
-        live.anchor.is_some(),
-        "the reading names the process that owns the login session: {live:?}"
-    );
     assert_ne!(
         live.generation_source,
         kr_protocol::desktop::DesktopGenerationSource::Unavailable,
         "and says what the generation was read from"
     );
-    assert_eq!(
-        live.generation,
-        live.anchor.as_ref().map(|anchor| anchor.start_value.get()),
-        "the generation is that process's own start value"
+    // Windows names no process an account can open, so its generation is the session's logon time.
+    #[cfg(not(windows))]
+    {
+        assert!(
+            live.anchor.is_some(),
+            "the reading names the process that owns the login session: {live:?}"
+        );
+        assert_eq!(
+            live.generation,
+            live.anchor.as_ref().map(|anchor| anchor.start_value.get()),
+            "the generation is that process's own start value"
+        );
+    }
+    #[cfg(windows)]
+    assert!(
+        live.anchor.is_none() && live.generation.is_some_and(|logon| logon > 0),
+        "the generation is the session's logon time and no process owns it: {live:?}"
     );
 
     let context = desktop::from_login(&live, WorkerProfile::DesktopBound, boot.clone());

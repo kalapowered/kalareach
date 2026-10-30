@@ -13,21 +13,27 @@ desktop. The generation is there for a reason: Linux and Windows both reuse a lo
 number, so the number alone would say a session created in one login belongs to the next one to get
 that number.
 
-Every platform has one process that owns its login session, and its kernel start value is the
-generation. On macOS and Linux that process is created with the login and dies with it, so two
-logins are told apart even when the platform hands out the same session number. On Windows the
-logon process owns the interactive session, and this host does not establish that a new one is
-started for each authenticated sign-in: where a session number and its logon process both outlive a
-sign-out, this host would read the next sign-in as the same desktop. Telling those apart needs a
-per-user agent inside the session itself, which this host does not install, so the Windows answer is
-weaker than the other two and the tables below say where that shows.
+On macOS and Linux one process owns the login session, and its kernel start value is the
+generation. That process is created with the login and dies with it, so two logins are told apart
+even when the platform hands out the same session number. On Windows the logon process of a session
+belongs to the system, and an account without administrative rights, or an administrator whose
+token is not elevated, cannot open it. The generation is the time the system records for the
+session's user to have logged on, which the account reads for its own session whatever its rights.
+A later sign-in to the same session number logs on later, and a session that is disconnected and
+reconnected keeps the time it had. This host does not establish that the system gives a fresh
+logon time to every authenticated sign-in to a session, so where it did not, the next sign-in
+would read as the same desktop. Telling those apart needs a per-user agent inside the session
+itself, which this host does not install, so the Windows answer is weaker than the other two and
+the tables below say where that shows. A Windows session bound under an earlier release recorded
+the logon process's start value as its generation, which the logon time does not equal: it reads
+as another login.
 
 | | macOS | Linux | Windows |
 | --- | --- | --- | --- |
 | The login session | the Aqua security session behind the user's graphical launchd domain | the login manager's session for the user's graphical login | the interactive logon session |
-| Read through | `launchctl print gui/<uid>`, whose handle is the security session and whose creator is the process below | `loginctl show-session`, for the session the login manager reports as the user's display | the task listing, for the session the worker's own process runs in |
-| The owning process | `loginwindow` | the session leader | that session's `winlogon` |
-| Also reported | whether the domain is the graphical one, and whether the screen is locked while this user is the one at the console, which is the session the window server's lock state is about | the session type (X11 or Wayland), its desktop environment, its state and its locked hint | whether the session is a remote desktop one |
+| Read through | `launchctl print gui/<uid>`, whose handle is the security session and whose creator is the process below | `loginctl show-session`, for the session the login manager reports as the user's display | the system's record of the session the worker's own process runs in, which the account reads whatever its rights |
+| The owning process | `loginwindow` | the session leader | none: the generation is the session's logon time |
+| Also reported | whether the domain is the graphical one, and whether the screen is locked while this user is the one at the console, which is the session the window server's lock state is about | the session type (X11 or Wayland), its desktop environment, its state and its locked hint | whether the session is a remote desktop one, from the name of its window station |
 | Not read | | | whether the session is attended, locked or disconnected, so its availability reads as unknown rather than as a screen that is there for the taking |
 
 A reading that names a login session but not its generation is not a desktop. The platform session
@@ -37,10 +43,11 @@ not having found out, which is a third answer and not the same as there being no
 desktop-bound session closes when the platform says its login has gone, and not when the platform
 declines to answer.
 
-A session records that identity when it is created, and `kr status` prints it. A worker asks one
-question afterwards, on every wake of its supervision: is the process that owns my login session
-still running, with the same start value? That is one kernel query, which is what lets it be asked
-that often.
+A session records that identity when it is created, and `kr status` prints it. On macOS and Linux a
+worker asks one question afterwards, on every wake of its supervision: is the process that owns my
+login session still running, with the same start value? That is one kernel query, which is what
+lets it be asked that often. On Windows no process answers, so the worker asks the system for the
+session's record again, at most every 30 seconds, and a login that ended is noticed that much later.
 
 A worker that is already gone cannot be asked, so the host reads the desktop the worker reported
 from the registry's row of the worker, without opening the session's journal, and asks the platform

@@ -552,11 +552,20 @@ impl WorkerHost {
     /// Runs `kr new --invisible --headless` in this host's directory with `arguments` after it,
     /// through this host's daemon, and returns what it printed.
     ///
-    /// The session has no desktop of its own: the account these tests run as may have none, and a
-    /// session that is not a window is what they read.
+    /// The session has no desktop of its own: it is a session that is not a window, which is what
+    /// most of these tests read, whatever login the account running them has.
     pub async fn kr_new(&self, arguments: &[&str]) -> Created {
+        self.kr_new_as(Some("--headless"), arguments).await
+    }
+
+    /// Runs `kr new --invisible` with `profile` after it (`--headless`, `--desktop`, or nothing,
+    /// which leaves the choice to the host) and `arguments` after that, and returns what it
+    /// printed.
+    pub async fn kr_new_as(&self, profile: Option<&str>, arguments: &[&str]) -> Created {
         let cwd = self.tree.root().display().to_string();
-        let mut words = vec!["--json", "new", "--invisible", "--headless", "--cwd", &cwd];
+        let mut words = vec!["--json", "new", "--invisible"];
+        words.extend(profile);
+        words.extend(["--cwd", &cwd]);
         words.extend_from_slice(arguments);
         let output = self.kr(&words, &[]).await;
         let document = serde_json::from_slice(&output.stdout).unwrap_or(serde_json::Value::Null);
