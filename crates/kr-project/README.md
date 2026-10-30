@@ -6,9 +6,13 @@ staged publication and the credential rule. This file describes one thing: the b
 invocation runs inside, and exactly which mechanism holds which guarantee on each platform.
 
 The Git that runs outside all of this is the one that says which Git this host has. Resolving the
-program starts it two to four times at startup (for its version and its own helper directory, and
-again for the copy under that directory), each with an environment of nothing and no repository
-named, and none of them under a boundary.
+program starts it two to four times, the first time anything needs it and not before (for its
+version and its own helper directory, and again for the copy under that directory), each with an
+environment of nothing and no repository named, and none of them under a boundary. On Linux the
+first need is the proof the daemon makes when it starts; elsewhere it is a request, or work the
+daemon resumes when it starts. A host whose Git is missing, or cannot answer, still opens the
+service. Each request that runs Git is refused until a resolution finds one, and a resolution that
+failed is made again at the next request.
 
 ## Why there is one
 
