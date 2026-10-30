@@ -267,7 +267,7 @@ fn run_check(files: &[(PathBuf, String)], docs_dir: &Path) -> ExitCode {
     let broken = method_index::broken_links(docs_dir);
     if !broken.is_empty() {
         eprintln!(
-            "{} method index links do not land on their section:",
+            "{} method index links do not land on a section that names their method:",
             broken.len()
         );
         for description in &broken {

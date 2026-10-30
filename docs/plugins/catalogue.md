@@ -216,7 +216,7 @@ for it either: the later generation is a sync's to verify and accept.
 The index is written whole and flushed, and only then does the pointer move to name it. A reader
 sees one generation or the previous one, never a mixture.
 
-A package is staged in a directory of its own, every payload is verified as a set, and the directory
+A package that `plugin.install` installs is staged in a directory of its own, every payload is verified as a set, and the directory
 is renamed into place once all of them verify. A package is therefore never half installed.
 
 A package already here is used only after every file its manifest declares is checked where it

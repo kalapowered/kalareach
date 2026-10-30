@@ -32,7 +32,7 @@ not pass through the managed service.
 
 ## What the coordinator may read
 
-The coordinator may read two things. The first is content the host has already passed through its
+The coordinator may read two things; `voice.context` serves the selection to the device. The first is content the host has already passed through its
 shared host-side history filter at the voice-context surface, under a viewer scope built from the
 **requesting device's** grant. The second is the bounded fragments of what the person said, which
 the paired device hands over with each delegation; the coordinator reads them once, with the grammar
@@ -139,7 +139,7 @@ become authority by arriving over a channel the host trusts for something else.
 
 ## What a delegation carries, and who reads it
 
-A delegation carries the call it belongs to, the provider's identifier, where in the call it
+A delegation (`voice.delegate`) carries the call it belongs to, the provider's identifier, where in the call it
 happened, and the fragments of what the person said. The paired device is the only thing that sees
 the provider's data channel, so it hands the host the transcript it vouches for. The device names no
 action, no session and no destination: **the host reads the words itself**, with a grammar of its
@@ -163,7 +163,7 @@ to the action, so a signature given for one utterance does not confirm another.
 
 ## The voice grant
 
-A voice grant is an ordinary grant in the host's one authority store. There is no second store.
+A voice grant (`voice.grant`) is an ordinary grant in the host's one authority store. There is no second store.
 
 Two kinds exist per device. The **standing** grant says which voice actions the person chose to
 permit and survives calls. The **session-bound** grant is delegated from it when a call starts,
@@ -301,7 +301,7 @@ Before a call, `voice.prepare` reads the managed service's published terms and h
 device unchanged: the model, the disclosure, the rate with its version, the longest call the service
 authorises and whether an operator has it open. Reading them creates nothing on either side.
 
-A start for a managed call names the version of the rate the person was shown, and the host passes
+A start for a managed call (`voice.start`) names the version of the rate the person was shown, and the host passes
 it on as the service's `expectedRateVersion`. The service compares it with the rate it would charge
 now. When the two differ it refuses before anything is held, and the host answers `rate_changed`
 with the rate as it is now; no voice session and no grant are written for that start.
