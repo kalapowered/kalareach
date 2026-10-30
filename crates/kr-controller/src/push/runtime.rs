@@ -388,7 +388,11 @@ impl DeliveryRuntime {
                     self.runtime.clone(),
                     self.cadence.unknown,
                 ),
-                forgetter: GatewayForget::new(Arc::clone(&transports), self.runtime.clone()),
+                forgetter: GatewayForget::new(
+                    Arc::clone(&transports),
+                    self.runtime.clone(),
+                    Arc::clone(&self.credentials),
+                ),
                 external: ExternalSenders::new(
                     Arc::clone(&transports),
                     self.runtime.clone(),

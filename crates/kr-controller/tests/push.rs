@@ -4071,6 +4071,9 @@ enum ForgetScript {
     DoesNotAnswer,
     /// Refuses the request under `code`, with words of its own that repeat nothing the host sent.
     Refuses(&'static str),
+    /// Removes what it holds the first time it is asked and holds nothing after, as a gateway
+    /// does for a record it has removed.
+    RemovesOnce,
 }
 
 impl DeliveringGateway {
@@ -4220,8 +4223,16 @@ impl kr_client::services::ServiceHttp for DeliveringGateway {
                         Some(ForgetScript::AnswersAboutAnother(another)) => another,
                         _ => named,
                     };
+                    let asked_so_far = self
+                        .asked
+                        .lock()
+                        .expect("the gateway is not poisoned")
+                        .iter()
+                        .filter(|asked| asked.url.ends_with("/api/push/deliver/forget"))
+                        .count();
                     let held = match other {
                         Some(ForgetScript::Holds(held)) => held,
+                        Some(ForgetScript::RemovesOnce) if asked_so_far > 1 => "none",
                         _ => "settled",
                     };
                     (
@@ -8095,7 +8106,12 @@ async fn a_deletion_the_gateway_did_not_carry_out_is_not_reported_as_one() {
         ),
     ] {
         let gateway = Arc::new(DeliveringGateway::forgetting(script));
-        let (host, copy, _) = a_host_whose_alert_left(&gateway).await;
+        let (host, copy, sender) = a_host_whose_alert_left(&gateway).await;
+        // The bearer is one the gateway has shown to be its authorisation's, so an answer that it
+        // holds nothing would be read as a deletion: only what the gateway does not answer is
+        // left to fail.
+        let credentials = host.controller().delivery_runtime().credentials();
+        credentials.show(&credentials.held(sender).expect("a credential is held"));
 
         let error = delete_retained(&host, &copy.reference)
             .await
@@ -8119,11 +8135,14 @@ async fn a_deletion_the_gateway_did_not_carry_out_is_not_reported_as_one() {
     }
 }
 
-/// KR-REQ-24.29: whatever the gateway says it held, queued, settled or nothing, once it has
-/// answered for the one notification the deletion is done: it holds nothing for it now.
+/// KR-REQ-24.29: a gateway that removed a record it held, queued or settled, has nothing left to
+/// delete for the notification. Its answer that it holds nothing is the same whether it removed
+/// the record, never had one, or was asked under a credential that is not the one the notification
+/// was sent under, so this host takes it as a deletion only under a credential the gateway has
+/// shown it sees records with.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_gateway_that_answers_for_the_notification_has_nothing_left_to_delete() {
-    for held in ["queued", "settled", "none"] {
+async fn a_gateway_that_removed_the_record_has_nothing_left_to_delete() {
+    for held in ["queued", "settled"] {
         let gateway = Arc::new(DeliveringGateway::forgetting(ForgetScript::Holds(held)));
         let (host, copy, _) = a_host_whose_alert_left(&gateway).await;
 
@@ -8135,6 +8154,66 @@ async fn a_gateway_that_answers_for_the_notification_has_nothing_left_to_delete(
         assert_eq!(gateway.forgets().len(), 1, "{held}");
         host.stop().await;
     }
+}
+
+/// KR-REQ-24.29: the gateway's answer that it holds nothing for a notification is a deletion once
+/// it has removed a record under the credential the host asks with, and not before. A repeat is
+/// then the same answer. A registration that keeps what the destination holds and carries another
+/// bearer puts a credential in the place of that one, and the same answer from it says nothing:
+/// it is the answer a bearer of another installation gets for a record it cannot see.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_that_nothing_is_held_is_a_deletion_only_under_a_bearer_the_gateway_has_shown() {
+    // A host that has not yet seen the gateway account for a record has nothing to read `none` by.
+    let gateway = Arc::new(DeliveringGateway::forgetting(ForgetScript::Holds("none")));
+    let (host, copy, _) = a_host_whose_alert_left(&gateway).await;
+    let error = delete_retained(&host, &copy.reference)
+        .await
+        .expect_err("nothing shows the bearer is the notification's authorisation's");
+    assert_eq!(
+        error.code,
+        kr_protocol::error::ErrorCode::StorageUnavailable
+    );
+    assert_eq!(gateway.forgets().len(), 1, "the gateway was asked");
+    assert_eq!(privacy_report(&host).await.exported, vec![copy]);
+    host.stop().await;
+
+    let gateway = Arc::new(DeliveringGateway::forgetting(ForgetScript::RemovesOnce));
+    let (host, copy, sender) = a_host_whose_alert_left(&gateway).await;
+    assert!(
+        delete_retained(&host, &copy.reference)
+            .await
+            .expect("the gateway removed the record")
+            .deleted
+    );
+    assert!(
+        delete_retained(&host, &copy.reference)
+            .await
+            .expect("it holds nothing now, under the bearer that removed the record")
+            .deleted,
+        "the control: the same bearer, asked again"
+    );
+
+    // A registration with the destination's values and another bearer.
+    let credentials = host.controller().delivery_runtime().credentials();
+    let held = credentials.held(sender).expect("a credential is held");
+    credentials
+        .keep(PushDeliveryCredential {
+            secret: SecretBytes32::from_bytes([0x77; 32]),
+            revision: kr_protocol::ids::PushSenderRevision::new(held.revision.get() + 1),
+            ..held
+        })
+        .expect("the registration is kept");
+    let listed = privacy_report(&host).await.exported;
+    assert_eq!(listed, vec![copy.clone()], "the destination is as it was");
+    let error = delete_retained(&host, &copy.reference)
+        .await
+        .expect_err("a bearer nothing has shown says nothing by holding nothing");
+    assert_eq!(
+        error.code,
+        kr_protocol::error::ErrorCode::StorageUnavailable
+    );
+    assert_eq!(gateway.forgets().len(), 3);
+    host.stop().await;
 }
 
 /// KR-REQ-24.29: the request for each notification is made under the credential of the device the
