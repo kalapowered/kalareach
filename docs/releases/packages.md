@@ -137,13 +137,15 @@ not answer, answered 408, 429 or a 5xx other than 501, or answered with more tha
 job asks again twice, a minute apart, only after a 2. A release served only by a later tier passes
 with a warning, because the network half of that rollout is the operator's to have deployed first.
 
-A revision covering each new level is live before any release of it. The package version moves at
-a cut, and a host built at a version no tier lists is refused new leases on the managed relay
-service, so the matrix revision that lists the next level is published, with a client range that
-reaches past it, before the release or the build that carries it. A revision number that was
-published too high cannot be lowered: the next revision has to exceed it, within 18 digits. A
-Worker rollback is not a way to correct a matrix, because hosts keep the newer revision and ignore
-the older.
+A revision covering each new level is live before any release of it. The package version moves at a
+cut, and a host built at a version no tier lists is refused new leases on the managed relay service,
+so the matrix revision that lists the next level is published, with a client range that reaches past
+it, before the release or the build that carries it. A revision number that was published too high
+cannot be lowered: the next revision has to exceed it, within 18 digits. A Worker rollback is not a
+way to correct a matrix, because hosts keep the newer revision and ignore the older. The cut also
+sets `PRODUCTION_FIRST_REVISION` in `crates/kr-client/src/services/matrix.rs` to the first revision
+that lists the release, since a host with no copy refuses any revision below it and would take a
+rolled-back older one that lists no build of the release.
 
 ## A level is one surface
 

@@ -82,11 +82,12 @@ pub const PRODUCTION_PINS: [&str; 1] = ["rXLAn41VOtyCoQ-_rp42_jyBj6eVuv7J9leeBbw
 
 /// The first revision of the managed service's matrix that a build reads.
 ///
-/// Revision 1 listed clients up to 0.4.99 and so no build of this product. A host that holds no
-/// copy takes the first verified reply it reads, so a service rolled back to revision 1 would
-/// close the lease gate on every such host until a newer revision was published. A revision below
-/// this one is refused whether or not a copy is held, and the revision published at a release is
-/// never lower than it.
+/// A host that holds no copy takes the first verified reply it reads, so a service rolled back to a
+/// revision that lists no build of this product would close the lease gate on every such host until
+/// a newer revision was published. A revision below this one is refused whether or not a copy is
+/// held. It is the first revision that lists the release carrying it: revision 1 listed clients up
+/// to 0.4.99, so this is 2 for the releases revision 2 lists, and a release that revision 2 does
+/// not list raises it to the first revision that does.
 pub const PRODUCTION_FIRST_REVISION: u64 = 2;
 
 /* -------------------------------------------------------------------------- */
@@ -121,12 +122,12 @@ impl Pins {
     pub const fn of(keys: Vec<AuthorisationKey>) -> Self {
         Self {
             keys,
-            first_revision: 1,
+            first_revision: 0,
         }
     }
 
     /// The one key a person gives for a service they run, as unpadded base64url of its 32 bytes.
-    /// Text that is not such a key gives nothing. The service's matrix may start at revision 1.
+    /// Text that is not such a key gives nothing. Any revision is read.
     #[must_use]
     pub fn from_key_text(text: &str) -> Option<Self> {
         decode_key(text).map(|key| Self::of(vec![key]))
