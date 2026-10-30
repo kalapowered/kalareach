@@ -318,42 +318,47 @@ mod tests {
         std::process::exit(code);
     }
 
-    /// The variable that makes the child half below ask twice, and the size of each request.
-    const ASK_TWICE: &str = "KR_MEMORY_LIMIT_ASK_TWICE_BYTES";
+    /// The variable that makes the child half below ask again and again, and the size of each
+    /// request.
+    const ASK_AGAIN: &str = "KR_MEMORY_LIMIT_ASK_AGAIN_BYTES";
 
-    /// What the child says between its two requests, when the system refused the first.
-    const REFUSED_FIRST: &str = "the-first-request-was-refused";
-
-    /// The child half of the case that asks twice. Run on its own it asks for nothing and passes.
-    /// Started by the case with the variable set, it asks the system to commit that much, says
-    /// whether the system refused, waits for a line on its input, asks again, and exits with
-    /// whether the system refused the second request.
+    /// The child half of the case that asks four times. Run on its own it asks for nothing and
+    /// passes. Started by the case with the variable set, it asks the system to commit that much
+    /// and says whether the system refused (`request-<n>-refused`), and waits for a line on its
+    /// input before each next request. Between the requests it does nothing before the second,
+    /// keeps a block it commits for the third, and gives that block back before the fourth.
     #[test]
-    fn the_child_that_asks_the_system_for_memory_twice() {
+    fn the_child_that_asks_the_system_for_memory_again_and_again() {
         use std::io::{BufRead as _, Write as _};
 
-        fn refused(ask: usize) -> bool {
+        fn ask_and_say(request: u32, ask: usize) {
             let mut held: Vec<u8> = Vec::new();
-            held.try_reserve_exact(ask).is_err()
+            let said = if held.try_reserve_exact(ask).is_err() {
+                "refused"
+            } else {
+                "granted"
+            };
+            println!("request-{request}-{said}");
+            std::io::stdout().flush().expect("the answer is written");
+            let mut line = String::new();
+            std::io::stdin()
+                .lock()
+                .read_line(&mut line)
+                .expect("the go-ahead is read");
         }
 
-        let Ok(ask) = std::env::var(ASK_TWICE) else {
+        let Ok(ask) = std::env::var(ASK_AGAIN) else {
             return;
         };
         let ask: usize = ask.parse().expect("a number of bytes");
-        if !refused(ask) {
-            std::process::exit(0);
-        }
-        println!("{REFUSED_FIRST}");
-        std::io::stdout()
-            .flush()
-            .expect("the first answer is written");
-        let mut line = String::new();
-        std::io::stdin()
-            .lock()
-            .read_line(&mut line)
-            .expect("the go-ahead is read");
-        std::process::exit(if refused(ask) { REFUSED } else { 0 });
+        ask_and_say(1, ask);
+        ask_and_say(2, ask);
+        let kept = vec![1_u8; 4 << 20];
+        std::hint::black_box(&kept);
+        ask_and_say(3, ask);
+        drop(kept);
+        ask_and_say(4, ask);
+        std::process::exit(0);
     }
 
     /// A child a case started, ended when the case lets go of it, so that a case that fails before
@@ -376,7 +381,11 @@ mod tests {
     impl Drop for Started {
         fn drop(&mut self) {
             let _ = self.0.kill();
-            let _ = self.0.wait();
+            // Bounded, so that a child the system will not end cannot hold a case for good.
+            let give_up = Instant::now() + WAIT;
+            while matches!(self.0.try_wait(), Ok(None)) && Instant::now() < give_up {
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 
@@ -518,23 +527,67 @@ mod tests {
         assert!(limit.take_refusal());
     }
 
-    /// A process that is refused a second commit, after it was refused one and the limit said so,
-    /// is recorded as refused again. This is another refused allocation by the same process under
-    /// the same limit, and not another reading of the first: a limit that said so only once for a
-    /// process would leave every refusal after the first reading as an ordinary end.
+    /// The limit reports a refusal each time the system posts one, and keeps no memory of an earlier
+    /// report: a message posted after one that was taken is taken as well. The messages are posted
+    /// to the limit's own port as the system posts them, so this holds on every build of the
+    /// system, whatever it decides to post.
     #[test]
-    fn a_second_commit_the_system_refuses_a_process_is_recorded_as_the_first_was() {
+    fn a_refusal_posted_after_one_that_was_taken_is_taken_as_well() {
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::System::IO::PostQueuedCompletionStatus;
+        use windows_sys::Win32::System::SystemServices::JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT;
+
+        // Never let run, and ended with the case.
+        let child = held_child_asking(512 * MIB);
+        let limit = MemoryLimit::around(child.as_handle(), 256 * MIB)
+            .expect("the limit is applied to the child");
+        let post = || {
+            let port: HANDLE = limit.port.as_raw_handle().cast();
+            // SAFETY: the call takes a port that `limit` holds open, and posts one message to it.
+            let posted = unsafe {
+                PostQueuedCompletionStatus(
+                    port,
+                    JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT,
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            assert_ne!(posted, 0, "the message is posted");
+        };
+        assert!(
+            !limit.take_refusal(),
+            "nothing is recorded before one is posted"
+        );
+        post();
+        assert!(limit.take_refusal(), "a refusal that is posted is taken");
+        assert!(!limit.take_refusal(), "and taken once");
+        post();
+        assert!(
+            limit.take_refusal(),
+            "a refusal posted after that is taken as well"
+        );
+    }
+
+    /// A process that is refused a commit again, after it gave memory back, is recorded as refused
+    /// again. This is another refused allocation by the same process under the same limit, and not
+    /// another reading of the first: a limit that said so only once for a process would leave every
+    /// refusal after the first reading as an ordinary end. The process asks four times, and the
+    /// limit is asked after each: the first is recorded and said once. The second, with nothing
+    /// done between, and the third, after a commit that succeeded, are asked and not required
+    /// either way. The fourth, after the process gave that commit back, is required.
+    #[test]
+    fn a_refusal_after_the_process_gave_memory_back_is_recorded_again() {
         use std::io::Write as _;
 
         let mut command = Command::new(std::env::current_exe().expect("this test binary"));
         command
             .args([
                 "--exact",
-                "memory_limit::tests::the_child_that_asks_the_system_for_memory_twice",
+                "memory_limit::tests::the_child_that_asks_the_system_for_memory_again_and_again",
                 "--nocapture",
                 "--test-threads=1",
             ])
-            .env(ASK_TWICE, (512 * MIB).to_string())
+            .env(ASK_AGAIN, (512 * MIB).to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -546,21 +599,23 @@ mod tests {
 
         let mut input = child.stdin.take().expect("a pipe");
         let hear = lines_of(child.stdout.take().expect("a pipe"));
-        text_after(&hear, REFUSED_FIRST);
-        assert!(limit.take_refusal(), "the first refusal is recorded");
-        assert!(!limit.take_refusal(), "and said once");
-
-        writeln!(input, "go").expect("the child is told to ask again");
+        let mut recorded = Vec::new();
+        for request in 1..=4 {
+            text_after(&hear, &format!("request-{request}-refused"));
+            recorded.push(limit.take_refusal());
+            if request == 1 {
+                assert!(recorded[0], "the first refusal is recorded");
+                assert!(!limit.take_refusal(), "and said once");
+            }
+            writeln!(input, "go").expect("the child is told to go on");
+        }
         drop(input);
-        let status = exit_of(&mut child, "the child that was told to ask again");
-        assert_eq!(
-            status.code(),
-            Some(REFUSED),
-            "the system refused the second request too"
-        );
+        let status = exit_of(&mut child, "the child that asked four times");
+        assert_eq!(status.code(), Some(0), "the child ends when it is done");
         assert!(
-            limit.take_refusal(),
-            "and the limit recorded that refusal as it did the first"
+            recorded[3],
+            "the refusal after the process gave memory back is recorded; recorded after each \
+             request: {recorded:?}"
         );
     }
 
@@ -640,7 +695,8 @@ mod tests {
 
         writeln!(input, "go").expect("the daemon is told to end");
         drop(input);
-        exit_of(&mut daemon, "the daemon");
+        let status = exit_of(&mut daemon, "the daemon");
+        assert_eq!(status.code(), Some(0), "the daemon ended as it was told");
 
         let raw: windows_sys::Win32::Foundation::HANDLE = process.as_raw_handle().cast();
         // SAFETY: the call takes a handle that this function holds open.
