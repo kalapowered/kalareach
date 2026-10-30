@@ -44,6 +44,7 @@
 
 pub mod clock_trust;
 pub mod config;
+mod device_errors;
 pub mod devices;
 pub mod dispatch;
 mod earlier_attention_clock;
@@ -486,7 +487,9 @@ impl HostHandler for NetworkHost {
     }
 
     fn pairing_surface(&self) -> Option<Arc<dyn PairingSurface>> {
-        Some(Arc::clone(&self.pairing) as Arc<dyn PairingSurface>)
+        Some(Arc::new(device_errors::ForACandidate(
+            Arc::clone(&self.pairing) as Arc<dyn PairingSurface>,
+        )))
     }
 
     fn serve(self: Arc<Self>, session: AuthorisedSession) -> BoxFuture<'static, ()> {
@@ -1440,10 +1443,13 @@ fn transport_of(connection: &iroh::endpoint::Connection) -> Transport {
     }
 }
 
+/// The frame that turns a connection away, saying why as a device is told it.
 fn refusal(error: &kr_protocol::error::ProtocolError) -> kr_protocol::envelope::ControlFrame {
     kr_protocol::envelope::ControlFrame::Response(kr_protocol::envelope::Response {
         request_id: kr_protocol::ids::RequestId::new(0),
-        outcome: kr_protocol::envelope::Outcome::Error(error.clone()),
+        outcome: kr_protocol::envelope::Outcome::Error(
+            device_errors::error_for_a_device(error).into_owned(),
+        ),
     })
 }
 
@@ -4523,5 +4529,34 @@ pub(crate) mod tests {
             "and it renews the lease: {held:?} then {renewed:?}"
         );
         network.shutdown().await;
+    }
+
+    /// A connection the daemon turns away is told why, and what names the host is not part of why.
+    #[test]
+    fn a_refusal_of_a_connection_does_not_name_the_host() {
+        use kr_protocol::envelope::{ControlFrame, Outcome};
+        use kr_protocol::error::{ErrorCode, ProtocolError};
+
+        let told = |error: &ProtocolError| match super::refusal(error) {
+            ControlFrame::Response(response) => match response.outcome {
+                Outcome::Error(error) => error,
+                Outcome::Ok(_) => panic!("a refusal"),
+            },
+            other => panic!("a response: {other:?}"),
+        };
+        let whole = ProtocolError::new(ErrorCode::PermissionDenied, "this device was revoked");
+        assert_eq!(told(&whole), whole);
+
+        let naming = ProtocolError::new(
+            ErrorCode::StorageUnavailable,
+            "the registry is unavailable: open /Users/marguerite/.local/state/kr/registry.sqlite3",
+        );
+        let shown = told(&naming);
+        assert_eq!(shown.code, ErrorCode::StorageUnavailable);
+        assert!(!shown.message.contains("marguerite"), "{shown:?}");
+        assert!(
+            shown.message.starts_with("the registry is unavailable;"),
+            "{shown:?}"
+        );
     }
 }

@@ -149,6 +149,12 @@ impl RemoteConnection {
                 ));
             }
         }
+        // A device is not the local owner, so the failure the receipt records is shown to it as the
+        // worker's receipts are: the code, and a sentence of this host's in place of the message.
+        let read = kr_protocol::receipt::ActionReadResult {
+            receipt: read.receipt.with_error_withheld(),
+            ..read
+        };
         Some(match ParamsValue::from_typed(&read) {
             Ok(value) => ControlFrame::Response(Response {
                 request_id: request.request_id,
