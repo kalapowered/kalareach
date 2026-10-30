@@ -291,9 +291,12 @@ the device's word. A device that lies about it can decide that race for its own 
 costs it a retired bearer and one renewal to replace it, which is two of the host's sixty requests
 an hour, and the next renewal asked for with nothing changed meanwhile replaces it.
 
-A rejected token takes the destination out of service, and the next start removes its stored
-credential. After the host's first renewal the phone's copy of the bearer is dead too, so the phone
-issues again before it registers.
+A rejected token takes the destination out of service. The destination keeps its rule and its
+credential, across a start too, so the host can still ask the gateway what became of what it sent
+and to delete what it holds, and the credential is renewed as any is. An unpairing or a removal
+leaves the destination no rule, and the next start removes its stored credential. After the host's
+first renewal the phone's copy of the bearer is dead too, so the phone issues again before it
+registers.
 
 A renewal the gateway refuses or does not answer is asked for again after five minutes, then ten,
 doubling to an hour. A credential's expiry is the device's word, and one that says it is due while
@@ -754,11 +757,12 @@ removal. It is false for a message in another service and for what is on a devic
 It is true for a notification the push gateway took or may have taken and that this host will not
 present again, while the destination is the one the notification was admitted for: the host can ask
 the gateway to delete the record it still holds for it. The journal keeps only a digest of that
-destination, so a registration with the same values, a change of previews and a rejected token leave
-the flag as it was, while a new grant, stored-envelope key, installation or authorisation clears it,
-and a row recorded with no digest never has it. Deleting reaches nothing a provider queued or a
-device holds, and the host records nothing of it, so the notification stays listed.
-`docs/host/README.md` describes the deletion call.
+destination, so a registration with the same values, a change of previews and a rejected token (the
+destination then keeps its credential, across a start too) leave the flag as it was, while a new
+grant, stored-envelope key, installation or authorisation clears it, and a row recorded with no
+digest never has it. Deleting reaches nothing a provider queued or a device holds, and the host
+records nothing of it, so the notification stays listed. `docs/host/README.md` describes the
+deletion call.
 
 ## Session text
 
