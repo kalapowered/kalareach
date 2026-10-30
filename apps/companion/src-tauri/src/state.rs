@@ -45,6 +45,7 @@ pub struct AppState {
     revocations: OnceLock<Arc<crate::revocation::Revocations>>,
     intake: OnceLock<Arc<dyn IntakePlatform>>,
     sync_service: OnceLock<Arc<SyncService>>,
+    sync_clients: OnceLock<Arc<dyn crate::services::SyncServices>>,
     recovery: OnceLock<Arc<Recovery>>,
     push: OnceLock<Arc<crate::push::PushDesk>>,
     inbox: Arc<crate::inbox::InboxDesk>,
@@ -90,6 +91,7 @@ impl AppState {
             revocations: OnceLock::new(),
             intake: OnceLock::new(),
             sync_service: OnceLock::new(),
+            sync_clients: OnceLock::new(),
             recovery: OnceLock::new(),
             push: OnceLock::new(),
             inbox: Arc::new(crate::inbox::InboxDesk::default()),
@@ -558,6 +560,26 @@ impl AppState {
     /// Records the sync service this computer is set to use.
     pub fn sync_service_opened(&self, service: Arc<SyncService>) {
         let _ = self.sync_service.set(service);
+    }
+
+    /// Replaces the clients of the sync service this computer reaches. It takes effect for the
+    /// desks opened afterwards, and the first call is the one that stands.
+    pub fn sync_clients_replaced(&self, clients: Arc<dyn crate::services::SyncServices>) {
+        let _ = self.sync_clients.set(clients);
+    }
+
+    /// The clients of the sync service this computer reaches: the ones installed with
+    /// [`Self::sync_clients_replaced`], or the managed ones signing with `identity`'s key.
+    #[must_use]
+    pub fn sync_clients(
+        &self,
+        identity: &crate::device::DeviceIdentity,
+    ) -> Arc<dyn crate::services::SyncServices> {
+        Arc::clone(self.sync_clients.get_or_init(|| {
+            Arc::new(crate::services::ManagedSyncServices::new(
+                identity.keys.authorisation.clone(),
+            ))
+        }))
     }
 
     /// Records this computer's reader of its own mailbox, once it has been opened.

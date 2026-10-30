@@ -45,8 +45,7 @@ use kr_client::services::account::{
     AccountMark, AccountToken, AccountTokenSource, BACKUP_WRITE_SCOPE, SignedInAccount,
 };
 use kr_client::services::{
-    HttpDeadlines, HttpService, ManagedSyncService, ServiceFuture, ServiceSigner,
-    managed_response_limits,
+    HttpDeadlines, HttpService, ServiceFuture, ServiceSigner, managed_response_limits,
 };
 use kr_crypto::kdf::RecoverySeed;
 use kr_crypto::keys::AuthorisationKeyPair;
@@ -67,6 +66,7 @@ use zeroize::Zeroizing;
 
 use crate::account::Account;
 use crate::error::{CommandError, Result};
+use crate::services::SyncServices;
 use crate::sync_service::{SyncService, SyncServiceView, host_of};
 
 /// The scope in the device's secure store that the recovery seed is kept under.
@@ -361,6 +361,7 @@ pub struct Recovery {
     secrets: Arc<dyn SecretStore>,
     signer: Arc<dyn ServiceSigner>,
     service: Arc<SyncService>,
+    clients: Arc<dyn SyncServices>,
     /// This process's turn, taken for the length of each step beside the lock on [`LOCK`]. A store
     /// writes one bundle from this device at a time, and it is opened for a step and closed at its
     /// end, so two steps at once would be two writers.
@@ -385,6 +386,7 @@ impl Recovery {
         secrets: Arc<dyn SecretStore>,
         key: AuthorisationKeyPair,
         service: Arc<SyncService>,
+        clients: Arc<dyn SyncServices>,
     ) -> Result<Self> {
         let directory = data.join(DIRECTORY);
         // The directory is on disk before anything is written in it: a record is made before the
@@ -402,6 +404,7 @@ impl Recovery {
             secrets,
             signer: Arc::new(DeviceSigner(key)),
             service,
+            clients,
             steps: tokio::sync::Mutex::new(()),
         })
     }
@@ -975,20 +978,10 @@ impl Recovery {
         record: &Record,
         tokens: Arc<dyn AccountTokenSource>,
     ) -> Result<BundleStore> {
-        let origin = record.origin()?;
-        let http = HttpService::with(
-            origin.clone(),
-            HttpDeadlines::default(),
-            managed_response_limits(),
-        )
-        .map_err(|error| {
-            CommandError::local_failure(format!(
-                "this computer cannot reach the sync service: {error}"
-            ))
-        })?;
-        let service = ManagedSyncService::new(origin, Arc::new(http), Arc::clone(&self.signer))
-            .presenting(tokens, BACKUP_WRITE_SCOPE);
-        BundleStore::open(Arc::new(service), record.context(), &self.directory).map_err(said)
+        let service = self
+            .clients
+            .presenting(&record.origin()?, tokens, BACKUP_WRITE_SCOPE)?;
+        BundleStore::open(service, record.context(), &self.directory).map_err(said)
     }
 }
 
