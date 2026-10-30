@@ -61,7 +61,8 @@ fn draft_for(harness: &Harness, session: Option<SessionId>) -> DraftRecord {
         .draft
 }
 
-/// Binds a new typed attachment named `name` to `draft`, and returns the draft and the handle.
+/// Binds a new attachment named `name` to `draft`, to be inserted by `method`, and returns the draft
+/// and the handle.
 fn bind(
     harness: &Harness,
     draft: &DraftRecord,
