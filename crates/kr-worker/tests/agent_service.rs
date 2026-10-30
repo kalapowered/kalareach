@@ -3687,6 +3687,59 @@ async fn forward_as_device(
     .await
 }
 
+/// The envelope the control daemon vouches for the paired device the approval cases forward for.
+fn a_test_phone() -> kr_protocol::actor::ActorEnvelope {
+    kr_protocol::actor::ActorEnvelope {
+        actor_id: kr_protocol::ids::ActorId::new("device:a-test-phone").expect("an actor"),
+        ingress: kr_protocol::actor::ActorIngress::PairedDevice,
+        device_id: Nullable::some(kr_protocol::ids::DeviceId::new(Uuid::from_bytes([9; 16]))),
+        grant_id: Nullable::some(kr_protocol::ids::GrantId::new(Uuid::from_bytes([8; 16]))),
+        grant_revision: Nullable::some(kr_protocol::ids::AuthorityRevision::new(1)),
+        controller_generation: ControllerGeneration::new(1),
+        connection_id: kr_protocol::ids::ConnectionId::new(Uuid::from_bytes([7; 16])),
+    }
+}
+
+/// The receipt of an action that device submitted, read as the daemon forwards the device's own
+/// `action.read`: a worker keeps a receipt under the actor that submitted the action.
+async fn receipt_of_the_device(
+    daemon: &mut BoundLink,
+    action_id: ActionId,
+) -> kr_protocol::receipt::Receipt {
+    let frame = ControlFrame::ForwardedRead(Box::new(kr_protocol::local::ForwardedRequest {
+        request: Request {
+            request_id: RequestId::new(901),
+            method: Method::ActionRead.into(),
+            method_version: MethodVersion::V1,
+            params: ParamsValue::from_typed(&kr_protocol::receipt::ActionReadParams {
+                action_id,
+                session_id: None,
+            })
+            .expect("encodes"),
+        },
+        authority_deadline_boot_ms: Nullable::some(kr_protocol::scalars::U64::new(
+            kr_ipc::clock::boot_elapsed_ms() + 30_000,
+        )),
+        actor: a_test_phone(),
+        history: None,
+    }));
+    daemon.send(&frame).await.expect("writes the read");
+    let outcome = loop {
+        match daemon.recv().await.expect("the worker answers") {
+            ControlFrame::Response(response) => break response.outcome,
+            ControlFrame::Notification(_) | ControlFrame::Event(_) => {}
+            other => panic!("the worker answered {other:?}"),
+        }
+    };
+    let Outcome::Ok(value) = outcome else {
+        panic!("the receipt is readable: {outcome:?}");
+    };
+    value
+        .to_typed::<kr_protocol::receipt::ActionReadResult>()
+        .expect("the result decodes")
+        .receipt
+}
+
 /// As [`forward_as_device`], under the history scope of the grant the daemon decided the mutation
 /// under, or under none when the daemon sent none.
 async fn forward_as_device_within(
@@ -3695,15 +3748,7 @@ async fn forward_as_device_within(
     grant_rights: &[kr_protocol::rights::ActionRight],
     history: Option<kr_protocol::grant::HistoryScope>,
 ) -> std::result::Result<ParamsValue, kr_protocol::error::ProtocolError> {
-    let envelope = kr_protocol::actor::ActorEnvelope {
-        actor_id: kr_protocol::ids::ActorId::new("device:a-test-phone").expect("an actor"),
-        ingress: kr_protocol::actor::ActorIngress::PairedDevice,
-        device_id: Nullable::some(kr_protocol::ids::DeviceId::new(Uuid::from_bytes([9; 16]))),
-        grant_id: Nullable::some(kr_protocol::ids::GrantId::new(Uuid::from_bytes([8; 16]))),
-        grant_revision: Nullable::some(kr_protocol::ids::AuthorityRevision::new(1)),
-        controller_generation: ControllerGeneration::new(1),
-        connection_id: kr_protocol::ids::ConnectionId::new(Uuid::from_bytes([7; 16])),
-    };
+    let envelope = a_test_phone();
     let lease =
         common::a_lease_after_the_announcement(daemon, mutation.target.environment_id, 1, 1).await;
     let rights = grant_rights.iter().copied().collect();
@@ -4388,10 +4433,9 @@ async fn kr_req_10_51_an_answering_action_is_held_to_the_callers_history() {
     );
     // Each refusal is recorded as a rejection, not left as an action nobody can account for: the
     // worker accepts the action before it weighs the caller's history and rejects it after.
-    let mut owner = cli(&host).await;
     for action_id in refused {
         assert_eq!(
-            receipt(&mut owner, action_id).await.state,
+            receipt_of_the_device(&mut daemon, action_id).await.state,
             ReceiptState::Rejected,
             "the refused answer has a receipt that says it was refused"
         );
