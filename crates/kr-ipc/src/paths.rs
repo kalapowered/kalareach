@@ -712,9 +712,7 @@ pub fn create_dir_all_owner_only(path: &Path) -> std::io::Result<()> {
 /// Returns an error when the directory cannot be created, or when it exists with the wrong owner
 /// or permissions.
 pub fn create_private_directory(path: &Path) -> Result<()> {
-    let named = without_final_separator(path);
-    let path = named.as_path();
-    match std::fs::symlink_metadata(path) {
+    match std::fs::symlink_metadata(without_final_separator(path)) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return Err(IpcError::io(
                 "open",
@@ -745,13 +743,14 @@ pub fn create_private_directory(path: &Path) -> Result<()> {
     check_owner_only(path, &metadata)
 }
 
-/// `path` without a final separator.
+/// `path` without a final separator, to look the name up by.
 ///
 /// The operating system resolves a symbolic link whose name ends in a separator, so the name `link/`
 /// is looked up as the directory the link points to, and the link goes unseen. A root given that
-/// way has to be looked at as the name it is.
-fn without_final_separator(path: &Path) -> PathBuf {
-    path.components().collect()
+/// way has to be looked at as the name it is. Only the lookup drops the separator: the path in an
+/// error stays as it was given, so that a caller that shows the configured root finds it.
+fn without_final_separator(path: &Path) -> &Path {
+    path.components().as_path()
 }
 
 /// Creates one owner-only directory that was not there, and says whether it did.
@@ -4225,6 +4224,14 @@ mod tests {
         );
         assert_eq!(error.mending_command(), None, "{error}");
         assert!(!error.to_string().contains("chmod"), "{error}");
+
+        // A directory that is not a link, given the same way, is refused under the name it was
+        // given, which is the one a caller that shows the configured root finds.
+        let real = PathBuf::from(format!("{}/", behind.display()));
+        match create_private_tree(&real, &real).expect_err("a directory open to others") {
+            IpcError::DirectoryNotOwnerOnly { path, .. } => assert_eq!(path, real),
+            other => panic!("refused as a mode: {other}"),
+        }
         let mode = std::fs::metadata(&behind)
             .expect("kept")
             .permissions()
