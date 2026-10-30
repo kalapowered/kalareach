@@ -2108,16 +2108,18 @@ async fn kr_req_11_35_a_journal_fault_after_the_rich_marker_leaves_the_rich_answ
 }
 
 /// KR-REQ-11.33, KR-REQ-11.35 and KR-REQ-27.05, an upstream that disconnects after dispatch: a
-/// committed marker followed by a transmission that fails is not a refusal. The answer's fate is
-/// unknown, the connection a failed write ends serves the terminal nothing more, the request stays
-/// uncertain, and nobody sends it again.
+/// committed marker followed by a transmission that fails part way is not a refusal. The server has
+/// the first bytes of the answer and then goes. The answer's fate is unknown, the connection a
+/// failed write ends serves the terminal nothing more, the request stays uncertain, and nobody
+/// sends it again: a second answer from either writer is refused.
 ///
 /// Not claimed: Windows, where no gateway runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_11_35_a_committed_marker_followed_by_a_failed_transmission_leaves_the_request_uncertain()
  {
     let store = common::SharedStore::open();
-    let mut world = World::with_store(&store);
+    // The pipe to the server holds eight bytes, so the answer's frame goes out in parts.
+    let mut world = World::opened(8, Some(&store));
     world.terminal_selects("thread-1").await;
     world.server_says(ASK).await;
     let id = world.broker.pending_resources()[0].resource_id;
@@ -2129,32 +2131,44 @@ async fn kr_req_11_35_a_committed_marker_followed_by_a_failed_transmission_leave
         .broker
         .mark_approval(&admitted, NOW)
         .expect("the marker is committed");
+    let (dispatch, request) = marked.transmission();
+    let pending = dispatch.submit(&request).expect("the frame is queued");
+    let in_flight = marked.submitted(pending);
 
-    // The server's end of the pipe is gone: the bytes cannot be written.
+    // The server reads the first bytes of the answer, which is what it has of it, and goes.
+    let mut first = [0_u8; 8];
+    world
+        .upstream
+        .read_exact(&mut first)
+        .await
+        .expect("the first bytes of the answer reached the server");
     drop(std::mem::replace(
         &mut world.upstream,
         tokio::io::duplex(1).0,
     ));
-    let (dispatch, request) = marked.transmission();
-    let failed = match dispatch.submit(&request) {
-        Ok(pending) => marked.submitted(pending).settled(NOW).await.err(),
-        Err(error) => Some(marked.refused(error)),
-    };
-    let failed = failed.expect("the answer could not be written");
+    let failed = in_flight
+        .settled(NOW)
+        .await
+        .expect_err("the answer did not finish");
     assert!(
         !failed.proven_unsent(),
-        "after the marker nobody can establish what happened: {failed:?}"
+        "after the marker and some bytes nobody can establish what happened: {failed:?}"
     );
     state_of(&world, id, PendingState::Uncertain).await;
 
     // A write that failed ended the connection, so the terminal's answer comes to a connection
     // that no longer serves, and nothing is written for it. The request stays uncertain: no
-    // writer answers it again.
+    // writer answers it again, the rich one included.
     world
         .owner
         .from_client(TERMINAL_ANSWERS, NOW)
         .await
         .expect_err("the connection ended with the failed write");
+    let again = world
+        .broker
+        .admit_approval(&World::owner_caller(), &world.rich_answer("accept"), NOW)
+        .expect_err("an answer that may have gone is not asked for again");
+    assert_eq!(again.code(), ErrorCode::QuestionResolved);
     assert_eq!(
         world.broker.pending(id).expect("held").state,
         PendingState::Uncertain
