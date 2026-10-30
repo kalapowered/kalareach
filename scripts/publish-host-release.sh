@@ -166,12 +166,13 @@ print(", ".join(signed["roles"]["targets"]["keyids"]))
     # shellcheck disable=SC2016
     {
         echo
-        echo "Download an archive and the sum file under the names the sum file lists. A link above writes the + of"
-        echo "the release as %2B, and curl keeps that spelling in a file name unless it is given the name, so name"
-        echo "each file:"
+        echo "Download an archive under the name the sum file lists for it, and the sum file as SHA256SUMS. A link above"
+        echo "writes the + of the release as %2B, and curl keeps that spelling in a file name unless it is given the"
+        echo "name, so name each file. A browser may decompress an archive and keep none to check, so use curl, which"
+        echo "has to follow the redirect each link answers with:"
         echo
-        echo "    curl -L -o kalareach-<target>-$release.tar.gz <the link of that archive above>"
-        echo "    curl -L -o SHA256SUMS <the link of SHA256SUMS above>"
+        echo "    curl -fL -o kalareach-<target>-$release.tar.gz <the link of that archive above>"
+        echo "    curl -fL -o SHA256SUMS <the link of SHA256SUMS above>"
         echo
         echo "Check the archive with the one sum file for all four:"
         echo
@@ -580,6 +581,8 @@ for line in text.splitlines():
         print(line.strip())
 PYTHON
     [ "$(grep -c '' "$STUB_STATE/notes-commands.sh")" -eq 3 ] || { echo "the notes give other than two downloads and a check:"; cat "$STUB_STATE/notes-commands.sh"; return 1; }
+    # A link of the real host answers with a redirect, which the stand-in's files do not: the downloads follow it.
+    [ "$(grep -c -E '^curl -[A-Za-z]*L[A-Za-z]* ' "$STUB_STATE/notes-commands.sh")" -eq 2 ] || { echo "a download in the notes does not follow redirects:"; cat "$STUB_STATE/notes-commands.sh"; return 1; }
     ( cd "$dl/named" && bash "$STUB_STATE/notes-commands.sh" ) > "$STUB_STATE/named.txt" 2>&1 || { echo "the notes' commands failed:"; cat "$STUB_STATE/named.txt"; return 1; }
     grep -q -F "kalareach-$target-$release.tar.gz: OK" "$STUB_STATE/named.txt" || { echo "the check did not print OK for the archive:"; cat "$STUB_STATE/named.txt"; return 1; }
     # The notes' own check line, run where only the sums are and no archive has the name they list, is not a pass.
