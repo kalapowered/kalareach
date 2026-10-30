@@ -158,6 +158,27 @@ fn battery_pauses_by_default_and_runs_when_an_owner_enables_it() {
     ));
 }
 
+/// The files of one supply directory as the kernel shows them: a file with a content, and a file
+/// with `None`, which is a directory, so that reading it fails the way a supply that went away
+/// mid-read does.
+type Files<'a> = &'a [(&'a str, Option<&'a str>)];
+
+/// What a power-supply class laid out as the kernel lays it out says of the host's power.
+fn power_of_tree(supplies: &[(&str, Files)]) -> Signal<PowerSource> {
+    let root = tempfile::tempdir().expect("a power-supply class");
+    for (name, files) in supplies {
+        let directory = root.path().join(name);
+        std::fs::create_dir_all(&directory).expect("a supply directory");
+        for (file, content) in *files {
+            match content {
+                Some(text) => std::fs::write(directory.join(file), text).expect("a supply file"),
+                None => std::fs::create_dir(directory.join(file)).expect("an unreadable file"),
+            }
+        }
+    }
+    kr_describe::resource::platform::power_of_supplies(root.path())
+}
+
 /// KR-REQ-22.13: what a power-supply class says of the host's power, read from trees laid out as
 /// the kernel lays them out. A supply the host would not describe may be the battery, so with no
 /// mains online it is not taken for a host on mains, which would admit inference on a battery.
@@ -165,46 +186,26 @@ fn battery_pauses_by_default_and_runs_when_an_owner_enables_it() {
 fn a_power_supply_the_host_would_not_describe_is_not_taken_for_mains() {
     use kr_describe::resource::platform::power_of_supplies;
 
-    /// One supply directory with the files the kernel shows, and a directory where a file is
-    /// `None`: reading a directory as a file fails the way a supply that went away mid-read does.
-    fn supply(root: &std::path::Path, name: &str, files: &[(&str, Option<&str>)]) {
-        let directory = root.join(name);
-        std::fs::create_dir_all(&directory).expect("a supply directory");
-        for (file, content) in files {
-            match content {
-                Some(text) => std::fs::write(directory.join(file), text).expect("a supply file"),
-                None => std::fs::create_dir(directory.join(file)).expect("an unreadable file"),
-            }
-        }
-    }
-    type Files<'a> = &'a [(&'a str, Option<&'a str>)];
-    let tree = |supplies: &[(&str, Files)]| {
-        let root = tempfile::tempdir().expect("a power-supply class");
-        for (name, files) in supplies {
-            supply(root.path(), name, files);
-        }
-        power_of_supplies(root.path())
-    };
     let battery: Files = &[("type", Some("Battery\n"))];
     let mains_online: Files = &[("type", Some("Mains\n")), ("online", Some("1\n"))];
     let mains_offline: Files = &[("type", Some("Mains\n")), ("online", Some("0\n"))];
 
     // The cases the reader always answered.
     assert_eq!(
-        tree(&[("BAT0", battery), ("AC", mains_online)]),
+        power_of_tree(&[("BAT0", battery), ("AC", mains_online)]),
         Signal::Qualified(PowerSource::Mains)
     );
     assert_eq!(
-        tree(&[("BAT0", battery), ("AC", mains_offline)]),
+        power_of_tree(&[("BAT0", battery), ("AC", mains_offline)]),
         Signal::Qualified(PowerSource::Battery)
     );
-    assert_eq!(tree(&[]), Signal::Qualified(PowerSource::Mains));
+    assert_eq!(power_of_tree(&[]), Signal::Qualified(PowerSource::Mains));
     assert_eq!(
-        tree(&[("AC", mains_online)]),
+        power_of_tree(&[("AC", mains_online)]),
         Signal::Qualified(PowerSource::Mains)
     );
     assert!(matches!(
-        tree(&[("BAT0", battery)]),
+        power_of_tree(&[("BAT0", battery)]),
         Signal::Unqualified { .. }
     ));
     let absent = tempfile::tempdir().expect("a directory");
@@ -218,12 +219,15 @@ fn a_power_supply_the_host_would_not_describe_is_not_taken_for_mains() {
     let undescribed_supplies: [Files; 3] = [&[], &[("type", None)], &[("type", Some("\n"))]];
     for undescribed in undescribed_supplies {
         assert!(
-            matches!(tree(&[("BAT0", undescribed)]), Signal::Unqualified { .. }),
+            matches!(
+                power_of_tree(&[("BAT0", undescribed)]),
+                Signal::Unqualified { .. }
+            ),
             "an undescribed supply alone: {undescribed:?}"
         );
         assert!(
             matches!(
-                tree(&[("BAT0", undescribed), ("AC", mains_offline)]),
+                power_of_tree(&[("BAT0", undescribed), ("AC", mains_offline)]),
                 Signal::Unqualified { .. }
             ),
             "an undescribed supply beside a mains supply that is offline: {undescribed:?}"
@@ -231,7 +235,7 @@ fn a_power_supply_the_host_would_not_describe_is_not_taken_for_mains() {
     }
     // A mains supply that would not say whether it is online is no more known to be plugged in.
     assert!(matches!(
-        tree(&[("AC", &[("type", Some("Mains\n")), ("online", None)])]),
+        power_of_tree(&[("AC", &[("type", Some("Mains\n")), ("online", None)])]),
         Signal::Unqualified { .. }
     ));
 
@@ -239,11 +243,11 @@ fn a_power_supply_the_host_would_not_describe_is_not_taken_for_mains() {
     // mains, and a laptop on its battery is on its battery with the mouse beside it.
     let mouse: Files = &[("type", Some("Battery\n")), ("scope", Some("Device\n"))];
     assert_eq!(
-        tree(&[("hid-mouse", mouse)]),
+        power_of_tree(&[("hid-mouse", mouse)]),
         Signal::Qualified(PowerSource::Mains)
     );
     assert_eq!(
-        tree(&[
+        power_of_tree(&[
             ("BAT0", battery),
             ("hid-mouse", mouse),
             ("AC", mains_offline)
@@ -255,18 +259,103 @@ fn a_power_supply_the_host_would_not_describe_is_not_taken_for_mains() {
     let usb_pd: Files = &[("type", Some("USB_PD\n")), ("online", Some("1\n"))];
     let programmable: Files = &[("type", Some("USB\n")), ("online", Some("2\n"))];
     assert_eq!(
-        tree(&[("BAT0", battery), ("ucsi", usb_pd)]),
+        power_of_tree(&[("BAT0", battery), ("ucsi", usb_pd)]),
         Signal::Qualified(PowerSource::Mains)
     );
     assert_eq!(
-        tree(&[("BAT0", battery), ("ucsi", programmable)]),
+        power_of_tree(&[("BAT0", battery), ("ucsi", programmable)]),
         Signal::Qualified(PowerSource::Mains)
     );
 
     // The control: an adapter that says it is online settles it, whatever else the host would not
     // describe, so a laptop on its charger is not paused for a supply it cannot read.
     assert_eq!(
-        tree(&[("BAT0", &[("type", None)]), ("AC", mains_online)]),
+        power_of_tree(&[("BAT0", &[("type", None)]), ("AC", mains_online)]),
+        Signal::Qualified(PowerSource::Mains)
+    );
+}
+
+/// A supply of the type `kind` that says it is online.
+fn online(kind: &str) -> [(&str, Option<&str>); 2] {
+    [("type", Some(kind)), ("online", Some("1\n"))]
+}
+
+/// A supply of the type `kind` that says it is offline.
+fn offline(kind: &str) -> [(&str, Option<&str>); 2] {
+    [("type", Some(kind)), ("online", Some("0\n"))]
+}
+
+/// KR-REQ-22.13: each type the kernel names for a supply is either a charger, which is mains when
+/// it is online, a store of charge, which is not, or a supply that says nothing of itself, which
+/// keeps the host from being taken for one on mains. The types are the kernel's own:
+/// `Unknown`, `Battery`, `UPS`, `Mains`, the `USB` kinds, `BrickID` and `Wireless`.
+#[test]
+fn each_type_of_supply_the_kernel_names_says_what_it_can_of_the_host_s_power() {
+    let battery: Files = &[("type", Some("Battery\n"))];
+    let mains_online = online("Mains\n");
+
+    // A supply of the type `Unknown`, which a driver reports when it was not told what it is, may
+    // be the battery. Alone, or beside an adapter that is offline, it is not a host on mains, and
+    // saying it is online settles nothing, because it has not said what it is online as.
+    for unknown in [online("Unknown\n"), offline("Unknown\n")] {
+        assert!(
+            matches!(
+                power_of_tree(&[("charger", &unknown)]),
+                Signal::Unqualified { .. }
+            ),
+            "an unknown supply alone: {unknown:?}"
+        );
+        assert!(
+            matches!(
+                power_of_tree(&[("BAT0", battery), ("charger", &unknown)]),
+                Signal::Unqualified { .. }
+            ),
+            "a battery and an unknown supply: {unknown:?}"
+        );
+    }
+    // An adapter that says it is online settles it whatever the unknown supply is.
+    assert_eq!(
+        power_of_tree(&[("charger", &online("Unknown\n")), ("AC", &mains_online)]),
+        Signal::Qualified(PowerSource::Mains)
+    );
+    // A type this reader has no name for, which a later kernel may add, is treated as unknown.
+    assert!(matches!(
+        power_of_tree(&[("new", &online("Fusion\n"))]),
+        Signal::Unqualified { .. }
+    ));
+
+    // Apple's charger and a wireless charging pad are chargers, as the USB kinds are.
+    for charger in ["BrickID\n", "Wireless\n"] {
+        assert_eq!(
+            power_of_tree(&[("BAT0", battery), ("charger", &online(charger))]),
+            Signal::Qualified(PowerSource::Mains),
+            "a battery with a {charger:?} charger online"
+        );
+        assert_eq!(
+            power_of_tree(&[("BAT0", battery), ("charger", &offline(charger))]),
+            Signal::Qualified(PowerSource::Battery),
+            "a battery with a {charger:?} charger offline"
+        );
+    }
+
+    // A supply of the type `UPS` is a store of charge, as a battery is: that it says it is online
+    // does not say the host is on mains, and a host that has one and no mains supply online has not
+    // been told it is on mains.
+    let ups_online = online("UPS\n");
+    assert!(matches!(
+        power_of_tree(&[("ups", &ups_online)]),
+        Signal::Unqualified { .. }
+    ));
+    assert!(matches!(
+        power_of_tree(&[("BAT0", battery), ("ups", &ups_online)]),
+        Signal::Unqualified { .. }
+    ));
+    assert_eq!(
+        power_of_tree(&[("ups", &ups_online), ("AC", &offline("Mains\n"))]),
+        Signal::Qualified(PowerSource::Battery)
+    );
+    assert_eq!(
+        power_of_tree(&[("ups", &ups_online), ("AC", &mains_online)]),
         Signal::Qualified(PowerSource::Mains)
     );
 }
