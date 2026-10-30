@@ -486,9 +486,6 @@ pub fn process_state(identity: &ProcessStartIdentity) -> ProcessState {
     current_process(identity).into()
 }
 
-/// The longest executable name [`read_process`] returns, in bytes.
-pub const MAX_PROCESS_NAME_BYTES: usize = 255;
-
 /// What one reading of a running process gave besides the fact that it runs.
 ///
 /// Each member is a fact of the platform's own process interface and is `None` where the platform
@@ -500,7 +497,8 @@ pub struct ProcessFacts {
     /// identifier names whichever process holds the number by the time anyone looks, so a parent
     /// is kept only as the process a second reading of the child still names.
     pub parent: Option<ProcessStartIdentity>,
-    /// The base name of the executable, as lossy UTF-8 cut at [`MAX_PROCESS_NAME_BYTES`] on a
+    /// The base name of the executable, as lossy UTF-8 cut at
+    /// [`kr_protocol::session_processes::MAX_PROCESS_NAME_BYTES`] bytes on a
     /// character boundary. Never the arguments, the environment, the working directory or a path.
     pub name: Option<String>,
 }
@@ -598,9 +596,11 @@ fn parent_both_readings_name(
     }
 }
 
-/// Cuts `name` at [`MAX_PROCESS_NAME_BYTES`] on a character boundary.
+/// Cuts `name` at the longest name a process view keeps, on a character boundary.
 fn cut_name(name: &str) -> String {
-    let mut end = name.len().min(MAX_PROCESS_NAME_BYTES);
+    let mut end = name
+        .len()
+        .min(kr_protocol::session_processes::MAX_PROCESS_NAME_BYTES);
     while !name.is_char_boundary(end) {
         end -= 1;
     }
@@ -776,8 +776,9 @@ mod platform {
 
     /// Reads one of a process's own `/proc` files, `/proc/<pid>/<file>`.
     ///
-    /// Every question this module asks about one process reads through here, so a test can see
-    /// which processes a question read about.
+    /// Every question this module asks about a process's state, start or lineage reads through
+    /// here, so a test can see which processes a question read about. The executable's name is
+    /// read by [`executable_name`] and is not counted: a state question always comes first.
     fn read_process_file(pid: u32, file: &str) -> std::io::Result<String> {
         read_process_file_opened(pid, file, |_| None)
     }
@@ -2053,7 +2054,8 @@ mod platform {
     }
 
     /// The base name of the executable a process runs, from `proc_pidpath`, or `None` when the
-    /// process will not say: another account's process reads as refused.
+    /// process will not say or its path is not UTF-8 (the library refuses one). A process of another
+    /// account is not reached: the question before this one, about its start, is refused first.
     pub(super) fn executable_name(pid: u32) -> Option<String> {
         let raw = i32::try_from(pid).ok()?;
         let path = libproc::libproc::proc_pid::pidpath(raw).ok()?;
@@ -2622,8 +2624,8 @@ mod platform {
         ))
     }
 
-    /// Windows gives the state of a recorded process and no name: the image name needs the
-    /// process's own handle, which this reading does not keep.
+    /// This host reads the state of a recorded process on Windows and no name: the image name
+    /// needs the process's own handle, which this reading does not keep.
     pub(super) fn executable_name(_pid: u32) -> Option<String> {
         None
     }

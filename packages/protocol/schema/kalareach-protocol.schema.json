@@ -22861,7 +22861,7 @@
         },
         {
           "const": "session.processes",
-          "description": "Read the processes one session's worker had recorded, each checked against the operating system now: the process and its start, its role in the session, whether it is running, ended or unknown, and for a running one its parent as an identity and the base name of its executable. The list is labelled recorded: it is what the worker last wrote, not a live enumeration, and a process that started and ended between two of the worker's observations is not in it. The answer is the local owner's and holds no argument, environment, directory or path.",
+          "description": "Read the processes one session's worker had recorded, each checked against the operating system now: the process and its start, its role in the session, whether it is running, ended or unknown, and for a running one its parent as an identity and the base name of its executable. The list is labelled recorded: it is what the worker last wrote, not a live enumeration, and a process that started and ended between two of the worker's observations is not in it. The answer is the local owner's and holds no argument, environment, working directory or executable path.",
           "type": "string"
         },
         {
@@ -29302,7 +29302,7 @@
         },
         {
           "const": "unrecorded",
-          "description": "The record names no boot, so its start values cannot be tied to one.",
+          "description": "The record names no boot, so its start values cannot be tied to one, or the worker has\nwritten no record at all.",
           "type": "string"
         },
         {
@@ -37645,7 +37645,7 @@
               "type": "null"
             }
           ],
-          "description": "The base name of its executable, for a running row whose executable the platform gives, as\nlossy UTF-8 of at most [`MAX_PROCESS_NAME_BYTES`] bytes. Null for every other row."
+          "description": "The base name of its executable, for a running row whose executable the platform gives, as\nlossy UTF-8 of at most [`MAX_PROCESS_NAME_BYTES`] bytes. Null for every other row. A name\nthat was cut cannot be told from one of exactly that length."
         },
         "parent": {
           "anyOf": [

@@ -114,7 +114,9 @@ fn a_process_that_refuses_its_executable_is_still_running() {
     let child = child_of(&program, "wait_for_the_pipe_to_close");
     let identity = process_start_identity(child.id()).expect("the child's identity");
     if std::fs::read_link(format!("/proc/{}/exe", child.id())).is_ok() {
-        // The superuser reads every link, so no process refuses this reader.
+        // The superuser reads every link, so no process refuses this reader: the case cannot be
+        // made here, and it says so rather than passing as if it had.
+        eprintln!("not run: this account reads every process's executable link");
         end(child);
         return;
     }
