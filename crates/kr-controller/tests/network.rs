@@ -7125,3 +7125,211 @@ async fn kr_req_25_10_a_recipient_is_sent_no_title_and_no_link_target_its_issuer
     close_session(&mut local, &host, session_id).await;
     daemon.stop().await;
 }
+
+/// A console-shaped program: it announces itself, reads a line, prints a result and loops until
+/// its input ends, which is the shape of a REPL or a database console. Each result is followed by
+/// a line shaped like `ps` output, naming a process that does not exist, so a view that read terminal
+/// text would list it. On Linux it also starts a process in a session of its own, which the worker
+/// can see only while this program, that process's parent, is alive.
+const CONSOLE: &str = "#!/bin/sh\n\
+    case \"$(uname -s)\" in Linux) setsid sleep 90 & ;; esac\n\
+    printf 'console-%s\\n' ready\n\
+    while IFS= read -r line; do\n\
+      printf 'result:%s\\n' \"$line\"\n\
+      printf '%6s ? S 0:00 fakeproc\\n' 31337\n\
+    done\n\
+    printf 'console-%s\\n' gone\n";
+
+/// Reads `session.processes` as the owner at this machine does.
+async fn processes_of(
+    client: &mut LocalClient,
+    session_id: SessionId,
+) -> Result<kr_protocol::session_processes::SessionProcessesResult, kr_protocol::error::ProtocolError>
+{
+    client
+        .request(
+            Method::SessionProcesses,
+            &kr_protocol::session_processes::SessionProcessesParams { session_id },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .map(|answer| answer.to_typed().expect("decodes"))
+}
+
+/// KR-REQ-25.06: the process view of a real session, and the third clause with it. A console-shaped
+/// program started in the session's shell uses the terminal like any program: what is typed reaches
+/// it and its result is in the session's retained output, and nothing structured is involved. The
+/// view lists the shell as the root and the console as a running process whose parent is that root,
+/// each read from the operating system with the start the kernel recorded. The fake `ps` lines the
+/// console prints are never listed. When the console ends its row is not running. The method
+/// refuses a session that has closed and one that was never there.
+///
+/// The worker records what it has seen at its next observation, which is about a second after
+/// traffic and about thirty seconds when the session is idle, so every wait is for the expected
+/// rows themselves, with a deadline above that.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sessions_processes_are_read_from_the_system_and_a_console_uses_the_terminal() {
+    use kr_protocol::session_processes::{
+        ProcessBoot, ProcessListing, ProcessRole, ProcessStanding, SessionProcessesResult,
+    };
+
+    const WAIT: Duration = Duration::from_secs(90);
+
+    async fn until_listed(
+        client: &mut LocalClient,
+        session_id: SessionId,
+        wanted: impl Fn(&SessionProcessesResult) -> bool,
+    ) -> SessionProcessesResult {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            let view = processes_of(client, session_id)
+                .await
+                .expect("the owner reads the view");
+            if wanted(&view) {
+                return view;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the view never listed what was expected: {view:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    let host = Host::create();
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let daemon = host.start(loopback(), &owner).await;
+    let mut local = host.client().await;
+    let created = create(&mut local, &host).await;
+    let session_id = created.session.session_id;
+    let worker_endpoint = kr_ipc::paths::Endpoint::from_path(
+        created
+            .endpoint
+            .as_ref()
+            .cloned()
+            .expect("a live session names its worker"),
+    )
+    .expect("a worker endpoint");
+
+    // The console runs in the session's shell, and what is typed at it is printed by it.
+    let console = host.tree().root().join("console.sh");
+    std::fs::write(&console, CONSOLE).expect("the console is written");
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        &console,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .expect("the console can run");
+    the_owner_types_until(
+        &worker_endpoint,
+        host.environment_id,
+        session_id,
+        &format!("{}\n", kr_worker::testing::shell_quoted(&console)),
+        "console-ready",
+    )
+    .await;
+    the_owner_types_until(
+        &worker_endpoint,
+        host.environment_id,
+        session_id,
+        "select 1\n",
+        "result:select 1",
+    )
+    .await;
+
+    // The view lists the shell and, below it, the console, each as the system reads it.
+    let view = until_listed(&mut local, session_id, |view| {
+        let root = view
+            .processes
+            .iter()
+            .find(|row| row.role == ProcessRole::Root);
+        root.is_some_and(|root| {
+            view.processes.iter().any(|row| {
+                row.role == ProcessRole::Descendant
+                    && row.state == ProcessStanding::Running
+                    && row.parent.0.as_ref() == Some(&root.process)
+            })
+        })
+    })
+    .await;
+    assert_eq!(view.listing, ProcessListing::Recorded);
+    assert_eq!(view.boot, ProcessBoot::Same);
+    let root = view
+        .processes
+        .iter()
+        .find(|row| row.role == ProcessRole::Root)
+        .expect("a root");
+    assert_eq!(root.state, ProcessStanding::Running, "the shell runs");
+    let console_row = view
+        .processes
+        .iter()
+        .find(|row| {
+            row.role == ProcessRole::Descendant && row.parent.0.as_ref() == Some(&root.process)
+        })
+        .expect("the console");
+    assert_eq!(console_row.state, ProcessStanding::Running);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    assert!(
+        console_row
+            .name
+            .0
+            .as_deref()
+            .is_some_and(|name| !name.contains('/')),
+        "the system gives the executable's base name: {console_row:?}"
+    );
+    // Nothing the console printed is a process of the view.
+    assert!(
+        view.processes
+            .iter()
+            .all(|row| row.process.pid.get() != 31337 && row.name.0.as_deref() != Some("fakeproc")),
+        "text on the terminal is not a process: {view:?}"
+    );
+
+    // On Linux the console's own child in a session of its own is recorded while the console, its
+    // parent, is alive.
+    #[cfg(target_os = "linux")]
+    {
+        let console_identity = console_row.process.clone();
+        until_listed(&mut local, session_id, |view| {
+            view.processes.iter().any(|row| {
+                row.state == ProcessStanding::Running
+                    && row.parent.0.as_ref() == Some(&console_identity)
+            })
+        })
+        .await;
+    }
+
+    // When the console's input ends it ends, and its row is no longer running.
+    let console_identity = console_row.process.clone();
+    the_owner_types_until(
+        &worker_endpoint,
+        host.environment_id,
+        session_id,
+        "\u{4}",
+        "console-gone",
+    )
+    .await;
+    until_listed(&mut local, session_id, |view| {
+        view.processes
+            .iter()
+            .find(|row| row.process == console_identity)
+            .is_none_or(|row| row.state != ProcessStanding::Running)
+    })
+    .await;
+
+    // A session that was never there, and one that has closed.
+    let unknown = processes_of(
+        &mut local,
+        SessionId::new(kr_protocol::scalars::Uuid::from_bytes([7; 16])),
+    )
+    .await
+    .expect_err("no such session");
+    assert_eq!(unknown.code, ErrorCode::UnknownSession, "{unknown:?}");
+    close_session(&mut local, &host, session_id).await;
+    let closed = processes_of(&mut local, session_id)
+        .await
+        .expect_err("the session has closed");
+    assert_eq!(closed.code, ErrorCode::SessionClosed, "{closed:?}");
+    daemon.stop().await;
+}

@@ -73,6 +73,7 @@ use crate::error::{ControllerError, Result};
 use crate::privacy::Published;
 
 mod fence;
+pub(crate) use fence::is_an_earlier_boot;
 mod import;
 
 pub use fence::{Ended, Fenced};

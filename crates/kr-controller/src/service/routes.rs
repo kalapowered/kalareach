@@ -305,9 +305,13 @@ impl Controller {
                 .and_then(|answer| host_read(answer, owner)),
             Method::SessionList => self.session_list(&request.params).await,
             Method::SessionRead => self.session_read(&request.params).await,
+            // The one read of a live worker's journal this daemon makes: its record of the
+            // processes it owns, read-only, in one short read (`crate::processes`).
+            Method::SessionProcesses => self.session_processes(&request.params).await,
             // A closed or crashed session's history and receipts are the archive's, and it serves
             // them with no worker. A live session's are its worker's, and this daemon says which
-            // endpoint to ask rather than reading another process's journal behind its back.
+            // endpoint to ask rather than reading the rest of another process's journal behind its
+            // back.
             Method::HistoryPage => self.archive_history_page(&request.params).await,
             Method::HistoryTimes => self.archive_history_times(&request.params).await,
             Method::ActionRead => {

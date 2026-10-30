@@ -641,7 +641,7 @@ fn read_record(
 /// so it is not an earlier one. Only the kind and the length are compared: a build that changed how
 /// one kind of value is made without changing its length would have this take a record of its own
 /// boot for an earlier boot's.
-fn is_an_earlier_boot(
+pub(crate) fn is_an_earlier_boot(
     recorded: &kr_protocol::identity::BootIdentity,
     now: &kr_protocol::identity::BootIdentity,
 ) -> bool {
