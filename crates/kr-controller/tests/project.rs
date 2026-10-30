@@ -1156,16 +1156,30 @@ fn install_step() -> &'static str {
     }
 }
 
-/// Puts a `git` that is the script `body` on `search`.
+/// Puts a `git` that is the script `body` on `search`, replacing the one that is there.
+///
+/// The text is written where nothing starts it and a separate process copies it into place, so no
+/// descriptor of this process is ever open on the program for writing: these cases run on threads
+/// of one process beside others that start children, and Linux refuses to start a program that a
+/// child still holds open for writing.
 #[cfg(unix)]
 fn stand_in(search: &Path, body: &str) {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let program = search.join("git");
+    let text = search.join("git.text");
+    std::fs::write(&text, format!("#!/bin/sh\n{body}\n")).expect("the stand-in's text");
     let _ = std::fs::remove_file(&program);
-    std::fs::write(&program, format!("#!/bin/sh\n{body}\n")).expect("the stand-in for Git");
-    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
-        .expect("the stand-in can run");
+    kr_ipc::testing::place_program(&text, &program);
+    std::fs::remove_file(&text).expect("the text goes once the stand-in is in place");
+}
+
+/// Whether a process with this identifier still exists, zombies included.
+#[cfg(unix)]
+fn exists(pid: &str) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", pid])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// Puts the Git of the machine running this test on `search`, as installing it would.
@@ -1399,11 +1413,12 @@ async fn a_daemon_starts_where_there_is_no_git() {
 }
 
 /// A Git that never answers holds nothing else: the daemon starts and answers, a request that
-/// needs Git is refused when Git has had the time it is given, and the daemon ends when it is
-/// interrupted instead of waiting for Git.
+/// needs Git is refused when Git has had the time it is given, a later request is refused the same
+/// way, and the daemon ends when it is interrupted instead of waiting for Git, with nothing the
+/// stand-in started left running.
 ///
-/// The stand-in waits for much longer than a daemon gives Git, and writes a mark if it is ever
-/// allowed to finish.
+/// The stand-in waits for much longer than a daemon gives Git, starts a process of its own to wait
+/// with, and writes a mark if it is ever allowed to finish.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_daemon_whose_git_never_answers_answers_refuses_and_ends_when_interrupted() {
@@ -1413,11 +1428,14 @@ async fn a_daemon_whose_git_never_answers_answers_refuses_and_ends_when_interrup
     let search = host.root().join("search");
     std::fs::create_dir(&search).expect("a search path of this test's own");
     let (started, finished) = (host.root().join("started"), host.root().join("finished"));
+    let (own, child) = (host.root().join("own"), host.root().join("child"));
     stand_in(
         &search,
         &format!(
-            "echo started >> '{}'\nsleep 300\n: > '{}'",
+            "echo started >> '{}'\necho $$ > '{}'\nsleep 300 &\necho $! > '{}'\nwait\n: > '{}'",
             started.display(),
+            own.display(),
+            child.display(),
             finished.display()
         ),
     );
@@ -1439,13 +1457,13 @@ async fn a_daemon_whose_git_never_answers_answers_refuses_and_ends_when_interrup
     );
 
     // A request that needs Git, while the stand-in is under way, and another connection's answer
-    // to a request that does not.
-    let before = lines_in(&started);
-    let mut asking = connect(&endpoint).await;
-    let first = tokio::spawn({
-        let params = init_params(environment_id, work.path(), "first");
+    // to a request that does not: the answer comes while the first is still waiting.
+    let init = |name: &'static str| {
+        let endpoint = endpoint.clone();
+        let params = init_params(environment_id, work.path(), name);
         async move {
-            asking
+            connect(&endpoint)
+                .await
                 .mutate(
                     Method::ProjectInit,
                     ActionId::new(kr_ipc::new_uuid()),
@@ -1454,7 +1472,9 @@ async fn a_daemon_whose_git_never_answers_answers_refuses_and_ends_when_interrup
                 )
                 .await
         }
-    });
+    };
+    let before = lines_in(&started);
+    let first = tokio::spawn(init("first"));
     wait_until("the stand-in is asked for the request", || {
         lines_in(&started) > before
     })
@@ -1465,6 +1485,10 @@ async fn a_daemon_whose_git_never_answers_answers_refuses_and_ends_when_interrup
             .projects
             .is_empty(),
         "the daemon answers while Git is being waited for"
+    );
+    assert!(
+        !first.is_finished(),
+        "and the request that needs Git was still waiting when it did"
     );
     let refusal = failure(
         tokio::time::timeout(guard, first)
@@ -1481,33 +1505,42 @@ async fn a_daemon_whose_git_never_answers_answers_refuses_and_ends_when_interrup
     );
     assert_eq!(names_in(work.path()), Vec::<String>::new());
 
-    // A later request is refused the same way, and the daemon is interrupted while it waits.
+    // A later request is refused the same way.
+    let later = failure(
+        tokio::time::timeout(guard, tokio::spawn(init("later")))
+            .await
+            .expect("the later request is refused rather than waited on for ever")
+            .expect("the request task ends")
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(later.code, ErrorCode::HostNotConfigured, "{later:?}");
+
+    // And the daemon is interrupted while one more look is under way: it ends by itself, and what
+    // the stand-in started goes with it.
     let before = lines_in(&started);
-    let mut asking = connect(&endpoint).await;
-    let later = tokio::spawn({
-        let params = init_params(environment_id, work.path(), "later");
-        async move {
-            asking
-                .mutate(
-                    Method::ProjectInit,
-                    ActionId::new(kr_ipc::new_uuid()),
-                    ActionTarget::environment(environment_id),
-                    &params,
-                )
-                .await
-        }
-    });
-    wait_until("the stand-in is asked for the later request", || {
+    let last = tokio::spawn(init("last"));
+    wait_until("the stand-in is asked once more", || {
         lines_in(&started) > before
     })
     .await;
     daemon
         .interrupt()
         .unwrap_or_else(|error| panic!("the daemon ends when it is interrupted: {error}"));
-    later.abort();
+    last.abort();
+    for named in [&own, &child] {
+        let pid = std::fs::read_to_string(named)
+            .expect("the stand-in recorded its processes")
+            .trim()
+            .to_owned();
+        wait_until(
+            &format!("process {pid} of the stand-in still runs after the daemon ended"),
+            || !exists(&pid),
+        )
+        .await;
+    }
     assert!(
         !finished.exists(),
-        "the stand-in was ended by the daemon and never finished by itself"
+        "the stand-in was ended and never finished by itself"
     );
 }
 
