@@ -4053,6 +4053,9 @@ struct DeliveringGateway {
     forget: Option<ForgetScript>,
 }
 
+/// Words a gateway's refusal carries that no person is shown.
+const GATEWAY_WORDS: &str = "words-only-the-gateway-says";
+
 /// How a gateway answers a request to delete what it holds, other than by doing it.
 #[derive(Debug, Clone, Copy)]
 enum ForgetScript {
@@ -4064,6 +4067,10 @@ enum ForgetScript {
     Holds(&'static str),
     /// Refuses the request for now, as it does a host that asked too often.
     RateLimited,
+    /// Never answers: the exchange ends before the gateway says anything.
+    DoesNotAnswer,
+    /// Refuses the request under `code`, with words of its own that repeat nothing the host sent.
+    Refuses(&'static str),
 }
 
 impl DeliveringGateway {
@@ -4196,6 +4203,16 @@ impl kr_client::services::ServiceHttp for DeliveringGateway {
                             "message": "This host has asked to delete too often.",
                             "retryAfterSeconds": 60,
                         },
+                    }),
+                ),
+                Some(ForgetScript::DoesNotAnswer) => {
+                    return Box::pin(async { Err(kr_client::ClientError::ConnectionEnded) });
+                }
+                Some(ForgetScript::Refuses(code)) => (
+                    500,
+                    serde_json::json!({
+                        "ok": false,
+                        "error": { "code": code, "message": GATEWAY_WORDS },
                     }),
                 ),
                 other => {
@@ -7927,12 +7944,25 @@ async fn a_host_whose_alert_left(
     kr_protocol::privacy::PrivacyExported,
     PushSenderRecordId,
 ) {
+    a_host_whose_alert_left_over(Arc::new(OneTransport(
+        Arc::clone(gateway) as Arc<dyn kr_client::services::ServiceHttp>
+    )))
+    .await
+}
+
+/// [`a_host_whose_alert_left`], with the alert and every later exchange going through
+/// `transports`.
+async fn a_host_whose_alert_left_over(
+    transports: Arc<dyn kr_controller::push::transport::DeliveryTransports>,
+) -> (
+    net_support::Host,
+    kr_protocol::privacy::PrivacyExported,
+    PushSenderRecordId,
+) {
     let host = net_support::Host::start_unowned().await;
     let controller = host.controller();
     let (_, sender, _) = pair_phone(controller, 10, SessionSelector::Any);
-    assert!(controller.attach_delivery_transport(Arc::new(OneTransport(
-        Arc::clone(gateway) as Arc<dyn kr_client::services::ServiceHttp>
-    ))));
+    assert!(controller.attach_delivery_transport(transports));
     set_privacy(&host, true).await;
     controller
         .attention()
@@ -8031,8 +8061,11 @@ async fn a_person_can_have_the_gateway_delete_what_it_holds_for_a_notification_t
 }
 
 /// KR-REQ-24.29: a deletion the gateway did not carry out is not reported as one. A gateway that
-/// refuses the credential, and one whose answer is about another notification, leave the copy
-/// listed as it was and the person is told the gateway did not delete.
+/// refuses the credential, one whose answer is about another notification, one that does not
+/// answer, one that refuses the request under a code it publishes or under one it does not, and one
+/// that takes no more deletions for now each leave the copy listed as it was, and the person is
+/// told the gateway did not delete. Of a refusal the person is shown a published code and never
+/// the gateway's own words.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_deletion_the_gateway_did_not_carry_out_is_not_reported_as_one() {
     for (script, code) in [
@@ -8042,6 +8075,18 @@ async fn a_deletion_the_gateway_did_not_carry_out_is_not_reported_as_one() {
         ),
         (
             ForgetScript::AnswersAboutAnother(NotificationId::new(uuid(200))),
+            kr_protocol::error::ErrorCode::StorageUnavailable,
+        ),
+        (
+            ForgetScript::DoesNotAnswer,
+            kr_protocol::error::ErrorCode::StorageUnavailable,
+        ),
+        (
+            ForgetScript::Refuses("INTERNAL"),
+            kr_protocol::error::ErrorCode::StorageUnavailable,
+        ),
+        (
+            ForgetScript::Refuses("A_CODE_THE_GATEWAY_NEVER_PUBLISHED"),
             kr_protocol::error::ErrorCode::StorageUnavailable,
         ),
         (
@@ -8057,6 +8102,12 @@ async fn a_deletion_the_gateway_did_not_carry_out_is_not_reported_as_one() {
             .expect_err("the gateway did not delete");
 
         assert_eq!(error.code, code, "{script:?}: {error:?}");
+        assert!(
+            !error.message.contains(GATEWAY_WORDS)
+                && !error.message.contains("A_CODE_THE_GATEWAY_NEVER_PUBLISHED"),
+            "{script:?}: only a published code is repeated: {}",
+            error.message
+        );
         assert_eq!(gateway.forgets().len(), 1, "{script:?}");
         let report = privacy_report(&host).await;
         assert_eq!(
@@ -8266,6 +8317,177 @@ async fn a_notification_sent_under_a_registration_since_replaced_is_not_deleted_
     let error = delete_retained(&host, &copy.reference)
         .await
         .expect_err("the host cannot say it deleted what it asked nothing about");
+    assert_eq!(error.code, kr_protocol::error::ErrorCode::PermissionDenied);
+    assert!(gateway.forgets().is_empty(), "nothing left the host");
+    host.stop().await;
+}
+
+/// KR-REQ-24.29: the host asks the gateway to delete only a notification it will not present
+/// again. A send on the wire whose detail is in a mailbox is listed and is not offered, because an
+/// answer that the gateway holds nothing would stop no send still to come, and the host would
+/// report a deletion that stopped nothing. The call that names it is refused and asks the gateway
+/// nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_listed_notification_the_host_may_still_send_is_not_deleted_at_the_gateway() {
+    let host = net_support::Host::start_unowned().await;
+    let controller = host.controller();
+    pair_phone(controller, 10, SessionSelector::Any);
+    let gateway = Arc::new(DeliveringGateway::holding());
+    assert!(controller.attach_delivery_transport(Arc::new(OneTransport(
+        Arc::clone(&gateway) as Arc<dyn kr_client::services::ServiceHttp>
+    ))));
+    let on_the_wire = || {
+        controller
+            .delivery()
+            .with(|producer| {
+                Ok(producer
+                    .journal()
+                    .deliveries()
+                    .expect("a read")
+                    .iter()
+                    .any(|record| record.state == DeliveryState::InFlight))
+            })
+            .unwrap_or(false)
+    };
+    set_privacy(&host, true).await;
+    controller
+        .attention()
+        .observe(&[pending_approval_in(
+            SessionId::new(uuid(90)),
+            1,
+            "req-write-hosts",
+        )])
+        .expect("the store records the approval");
+    until_holds("the alert being on the wire", on_the_wire).await;
+    // The alert's detail went into the device's mailbox, which is what lists a copy that has not
+    // been answered.
+    let path = host
+        .tree()
+        .environment()
+        .state_dir()
+        .join("delivery.sqlite3");
+    rusqlite::Connection::open(&path)
+        .expect("a second connection")
+        .execute(
+            "UPDATE delivery_notifications SET detail_left = 1 WHERE state = 'in_flight'",
+            [],
+        )
+        .expect("the detail is recorded as left");
+
+    let listed = privacy_report(&host).await.exported;
+    let answer = match listed.first() {
+        Some(copy) => Some(delete_retained(&host, &copy.reference).await),
+        None => None,
+    };
+    let asked = gateway.forgets();
+    // The held send is let go before anything is asserted, so a failure here ends the case and
+    // does not leave a send that nothing will answer.
+    gateway.release();
+    until_holds("the held send being answered", || !on_the_wire()).await;
+    host.stop().await;
+
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert!(!listed[0].deletable, "its send is still to be answered");
+    let error = answer
+        .expect("the copy was listed")
+        .expect_err("a send that may still be made is not deleted");
+    assert_eq!(error.code, kr_protocol::error::ErrorCode::PermissionDenied);
+    assert!(asked.is_empty(), "nothing left the host");
+}
+
+/// Transports that wait, once armed, at the moment a deletion asks where to send, until
+/// released.
+#[derive(Debug)]
+struct HeldWhereToSend {
+    gateway: Arc<dyn kr_client::services::ServiceHttp>,
+    hold: Mutex<Hold>,
+    changed: std::sync::Condvar,
+}
+
+#[derive(Debug, Default)]
+struct Hold {
+    armed: bool,
+    waiting: bool,
+    released: bool,
+}
+
+impl HeldWhereToSend {
+    fn over(gateway: Arc<dyn kr_client::services::ServiceHttp>) -> Self {
+        Self {
+            gateway,
+            hold: Mutex::new(Hold::default()),
+            changed: std::sync::Condvar::new(),
+        }
+    }
+
+    /// The next request for a transport waits.
+    fn arm(&self) {
+        self.hold.lock().expect("not poisoned").armed = true;
+    }
+
+    /// Whether a request for a transport is waiting.
+    fn waiting(&self) -> bool {
+        self.hold.lock().expect("not poisoned").waiting
+    }
+
+    fn release(&self) {
+        self.hold.lock().expect("not poisoned").released = true;
+        self.changed.notify_all();
+    }
+}
+
+impl kr_controller::push::transport::DeliveryTransports for HeldWhereToSend {
+    fn to(
+        &self,
+        _origin: &kr_protocol::service::GatewayOrigin,
+    ) -> Result<Arc<dyn kr_client::services::ServiceHttp>, String> {
+        let mut hold = self.hold.lock().expect("not poisoned");
+        if hold.armed {
+            hold.armed = false;
+            hold.waiting = true;
+            while !hold.released {
+                hold = self.changed.wait(hold).expect("not poisoned");
+            }
+            hold.waiting = false;
+        }
+        Ok(Arc::clone(&self.gateway))
+    }
+
+    fn outbound(&self) -> kr_controller::config::Outbound {
+        kr_controller::config::Outbound::Direct
+    }
+}
+
+/// KR-REQ-24.29: the authority a deletion was admitted under is asked again immediately before
+/// the request is put, after the credential is found and the transport is resolved. A person whose
+/// registration is withdrawn while the host works out where to send has the call refused, and
+/// nothing leaves the host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_registration_withdrawn_while_a_deletion_finds_its_transport_sends_nothing() {
+    let gateway = Arc::new(DeliveringGateway::default());
+    let transports = Arc::new(HeldWhereToSend::over(
+        Arc::clone(&gateway) as Arc<dyn kr_client::services::ServiceHttp>
+    ));
+    let (host, copy, _) = a_host_whose_alert_left_over(
+        Arc::clone(&transports) as Arc<dyn kr_controller::push::transport::DeliveryTransports>
+    )
+    .await;
+    assert!(copy.deletable);
+    transports.arm();
+
+    let (answer, ()) = tokio::join!(delete_retained(&host, &copy.reference), async {
+        until_holds("the deletion waiting for its transport", || {
+            transports.waiting()
+        })
+        .await;
+        host.controller()
+            .revoke_authority()
+            .await
+            .expect("the revocation is recorded");
+        transports.release();
+    });
+
+    let error = answer.expect_err("the registration the call was admitted under is gone");
     assert_eq!(error.code, kr_protocol::error::ErrorCode::PermissionDenied);
     assert!(gateway.forgets().is_empty(), "nothing left the host");
     host.stop().await;
