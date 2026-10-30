@@ -5670,7 +5670,7 @@ pub(crate) mod tests {
 
         // An action is performed the way the store performs it: with the log's own cursor.
         let reading = world.module.reading();
-        let performed = |request_id: u64, cursor: u64| -> MutationRequest {
+        let performed = |actor: &ActorId, request_id: u64, cursor: u64| -> MutationRequest {
             let mutation = MutationRequest {
                 request_id: RequestId::new(request_id),
                 method: Method::VisitAcknowledge.into(),
@@ -5690,7 +5690,7 @@ pub(crate) mod tests {
                 })
                 .expect("encodes"),
             };
-            let key = action_key(&reader, &mutation, Method::VisitAcknowledge).expect("a key");
+            let key = action_key(actor, &mutation, Method::VisitAcknowledge).expect("a key");
             early
                 .view(|viewer| {
                     world.module.store().expect("the store").perform(
@@ -5709,13 +5709,13 @@ pub(crate) mod tests {
                 .expect("the store performs the action");
             mutation
         };
-        let answered = |mutation: &MutationRequest, caller: &Caller| -> u64 {
+        let answered = |actor: &ActorId, mutation: &MutationRequest, caller: &Caller| -> u64 {
             let ControlFrame::Response(Response {
                 outcome: Outcome::Ok(value),
                 ..
             }) = world
                 .module
-                .retained(caller, &reader, mutation, Method::VisitAcknowledge)
+                .retained(caller, actor, mutation, Method::VisitAcknowledge)
                 .expect("the store holds the action")
             else {
                 panic!("the repeat is answered");
@@ -5727,15 +5727,15 @@ pub(crate) mod tests {
                 .get()
         };
 
-        let at_the_end = performed(9, 3);
+        let at_the_end = performed(&reader, 9, 3);
         assert_eq!(
-            answered(&at_the_end, &Caller::Owner),
+            answered(&reader, &at_the_end, &Caller::Owner),
             3,
             "the owner is answered the log's own"
         );
-        assert_eq!(answered(&at_the_end, &early), shown_early.get());
+        assert_eq!(answered(&reader, &at_the_end, &early), shown_early.get());
         assert_eq!(
-            answered(&at_the_end, &late),
+            answered(&reader, &at_the_end, &late),
             shown_late.get(),
             "numbered by the later bound"
         );
@@ -5743,11 +5743,12 @@ pub(crate) mod tests {
         // An action recorded at a place before the history of the caller that repeats it is
         // answered as the place its history starts at, which is where that caller's first view
         // starts, and not as a number that says how many changes the place lies after.
-        let at_the_start = performed(10, 0);
+        let starter = ActorId::new("test:starter").expect("an actor");
         let newcomer = ActorId::new("test:newcomer").expect("an actor");
+        let at_the_start = performed(&starter, 10, 0);
         for caller in [&early, &late] {
             assert_eq!(
-                answered(&at_the_start, caller),
+                answered(&starter, &at_the_start, caller),
                 world.changed_for(&newcomer, caller).await.from_cursor.get(),
             );
         }
