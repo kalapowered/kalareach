@@ -3644,7 +3644,8 @@ enum Asked {
     /// program, and the caller goes on without it.
     Declined(ProjectError),
     /// The program did not answer in the time it is given, answered with more than a version and a
-    /// directory, or left its output open. It is not a program this host can run work through.
+    /// directory, or left its output open; or this host could not wait on it or read its output
+    /// without blocking. It is not a program this host can run work through.
     Overran(ProjectError),
 }
 
@@ -3667,7 +3668,8 @@ impl Asked {
 /// would have exited with. A child that cannot be waited on is refused and nothing is signalled by
 /// its number, which may be another process's by now. A process that left the group and kept the
 /// pipe is out of reach: the answer is refused after a short wait for the end of its output, and
-/// the pipe is closed, so it costs this host no more than the descriptor for as long as it runs.
+/// this host closes its end of the pipe, so the process runs on with its own end and this host
+/// holds nothing of it.
 fn ask(
     program: &Path,
     arguments: &[&str],
