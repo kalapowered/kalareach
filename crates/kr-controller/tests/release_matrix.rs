@@ -147,6 +147,16 @@ impl Rig {
     /// As [`Self::start`], not waiting for the first read, with the configuration document sending
     /// the daemon's requests through `proxy` when one is given.
     async fn start_without_waiting(published: Option<&Value>, proxy: Option<String>) -> Self {
+        Self::start_reading_from(1, published, proxy).await
+    }
+
+    /// As [`Self::start_without_waiting`], for a host that reads no revision below
+    /// `first_revision`.
+    async fn start_reading_from(
+        first_revision: u64,
+        published: Option<&Value>,
+        proxy: Option<String>,
+    ) -> Self {
         let served = serve().await;
         served.web().bound_relay_sign_ins(8 * 1024 * 1024);
         let matrix_key = AuthorisationKeyPair::generate().expect("a key pair");
@@ -174,7 +184,7 @@ impl Rig {
             wall.clocks(),
             Some(ReleaseMatrixStage {
                 timer: Arc::clone(&matrix_timer),
-                pins: Pins::of(vec![*matrix_key.public()]),
+                pins: Pins::of(vec![*matrix_key.public()]).from_revision(first_revision),
                 proxy_url: proxy,
             }),
         )
@@ -489,6 +499,37 @@ async fn a_skewed_host_is_refused_new_leases_keeps_its_working_route_and_gets_ne
     rig.pass().await;
     rig.until("the new device holds a lease", || rig.holds(&other))
         .await;
+}
+
+/// KR-REQ-17.46: a service rolled back to the publication that listed no build of this product
+/// gates nothing on a host that holds no copy: the check says the reply was not accepted, the lease
+/// requests go on, nothing is kept, and the first revision the host reads is read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_first_publication_below_the_first_revision_a_host_reads_gates_nothing() {
+    let rig = Rig::start_reading_from(2, Some(&skewing("1")), None).await;
+    rig.until_a_matrix_pass(1).await;
+    let owner = rig.owner_device();
+    rig.until("the owner's device holds a lease", || rig.holds(&owner))
+        .await;
+    assert_eq!(
+        rig.check("release-matrix").await.status,
+        DoctorStatus::Warning,
+        "a reply that is not accepted is said, and the host asks again by itself"
+    );
+    assert!(!kept_file(rig.host.tree()).exists(), "nothing was kept");
+    let (_device, record) = rig.pairs().await;
+    rig.pass().await;
+    rig.until("the new device holds a lease", || rig.holds(&record))
+        .await;
+
+    // The first revision the host reads decides, as any other does.
+    rig.publish(&skewing("2"));
+    rig.the_matrix_is_read_again().await;
+    assert!(kept_file(rig.host.tree()).exists(), "revision 2 is kept");
+    let (_other_device, other) = rig.pairs().await;
+    rig.pass().await;
+    assert!(!rig.holds(&other), "a skew at the first revision gates");
+    assert_eq!(rig.requests_for(&other), 0);
 }
 
 /* -------------------------------------------------------------------------- */

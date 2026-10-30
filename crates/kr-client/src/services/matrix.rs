@@ -80,39 +80,69 @@ const MAX_REVISION_DIGITS: usize = 18;
 /// rotation is a release with the new key here.
 pub const PRODUCTION_PINS: [&str; 1] = ["rXLAn41VOtyCoQ-_rp42_jyBj6eVuv7J9leeBbwMjBI"];
 
+/// The first revision of the managed service's matrix that a build reads.
+///
+/// Revision 1 listed clients up to 0.4.99 and so no build of this product. A host that holds no
+/// copy takes the first verified reply it reads, so a service rolled back to revision 1 would
+/// close the lease gate on every such host until a newer revision was published. A revision below
+/// this one is refused whether or not a copy is held, and the revision published at a release is
+/// never lower than it.
+pub const PRODUCTION_FIRST_REVISION: u64 = 2;
+
 /* -------------------------------------------------------------------------- */
 /* The pinned keys                                                             */
 /* -------------------------------------------------------------------------- */
 
-/// The keys a matrix may be signed by.
+/// The keys a matrix may be signed by, and the first revision a matrix of that service may have.
 #[derive(Clone)]
-pub struct Pins(Vec<AuthorisationKey>);
+pub struct Pins {
+    keys: Vec<AuthorisationKey>,
+    first_revision: u64,
+}
 
 crate::debug_as_name!(Pins);
 
 impl Pins {
-    /// The keys this build pins, [`PRODUCTION_PINS`].
+    /// The keys this build pins, [`PRODUCTION_PINS`], and the first revision it reads,
+    /// [`PRODUCTION_FIRST_REVISION`].
     #[must_use]
     pub fn production() -> Self {
-        Self(
-            PRODUCTION_PINS
+        Self {
+            keys: PRODUCTION_PINS
                 .iter()
                 .filter_map(|text| decode_key(text))
                 .collect(),
-        )
+            first_revision: PRODUCTION_FIRST_REVISION,
+        }
     }
 
-    /// Keys a test signs with.
+    /// Keys a test signs with. Any revision is read.
     #[must_use]
     pub const fn of(keys: Vec<AuthorisationKey>) -> Self {
-        Self(keys)
+        Self {
+            keys,
+            first_revision: 1,
+        }
     }
 
     /// The one key a person gives for a service they run, as unpadded base64url of its 32 bytes.
-    /// Text that is not such a key gives nothing.
+    /// Text that is not such a key gives nothing. The service's matrix may start at revision 1.
     #[must_use]
     pub fn from_key_text(text: &str) -> Option<Self> {
-        decode_key(text).map(|key| Self(vec![key]))
+        decode_key(text).map(|key| Self::of(vec![key]))
+    }
+
+    /// These pins, refusing a matrix of a revision below `first_revision`.
+    #[must_use]
+    pub const fn from_revision(mut self, first_revision: u64) -> Self {
+        self.first_revision = first_revision;
+        self
+    }
+
+    /// The first revision a matrix signed under these keys may have.
+    #[must_use]
+    pub const fn first_revision(&self) -> u64 {
+        self.first_revision
     }
 
     /// Whether the signature verifies over the transcript under one of the keys.
@@ -121,7 +151,7 @@ impl Pins {
         transcript: &SigningTranscript,
         signature: &Signature64,
     ) -> bool {
-        self.0
+        self.keys
             .iter()
             .any(|key| verify(key, transcript, signature).is_ok())
     }
@@ -293,6 +323,10 @@ pub enum Refusal {
     Older,
     /// The revision is the one held, signed over other bytes.
     Conflicts,
+    /// The revision is below the first one this build reads for the service
+    /// ([`Pins::first_revision`]), whether or not a copy is held. A service rolled back to such a
+    /// revision must not decide anything.
+    BelowFirst,
 }
 
 /* -------------------------------------------------------------------------- */
@@ -450,12 +484,11 @@ impl Document {
             .and_then(|bytes| <[u8; 64]>::try_from(bytes).ok())
             .map(Signature64::from_bytes)
             .ok_or(Refusal::Signature)?;
-        if !pins
-            .0
-            .iter()
-            .any(|key| verify(key, &transcript, &signature).is_ok())
-        {
+        if !pins.vouches_for(&transcript, &signature) {
             return Err(Refusal::Signature);
+        }
+        if revision < pins.first_revision {
+            return Err(Refusal::BelowFirst);
         }
 
         let mut alternatives = Vec::new();

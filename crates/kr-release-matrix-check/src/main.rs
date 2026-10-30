@@ -103,6 +103,7 @@ fn reason(refusal: Unsupported) -> String {
                 Refusal::Revision => "its revision is not a counter",
                 Refusal::Signature => "its signature does not verify under the key this build pins",
                 Refusal::Older | Refusal::Conflicts => "it conflicts with the copy held",
+                Refusal::BelowFirst => "its revision is below the first this build reads",
             }
         ),
         Unsupported::Unread(why) => format!(
