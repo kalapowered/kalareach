@@ -5,8 +5,10 @@
 //! own, and a window station that already exists keeps the security it was made with. Before it
 //! starts a child on either, it asks whether the object admits more than the starter's own does.
 //! More is refused. Less is not: a station made from an earlier reading of the interactive one has
-//! not the entries that a later "Run as different user" added to it, and the worker, which runs as
-//! the starter does, is admitted to it all the same.
+//! not the entries that were added to that one later (a "Run as different user", for one), and the
+//! worker, which runs as the starter does, is admitted to it all the same. What counts as less is
+//! narrow: the starter's own entries with allowing entries left out and denying entries put in,
+//! still in the starter's order. Any other list is refused, whether or not it admits more.
 //!
 //! The text is what the system writes for a descriptor, `D:` and its entries for an access list or
 //! `S:` and its label entry for the integrity label. Nothing here calls the system, so it is read
@@ -90,17 +92,17 @@ pub(super) fn access_list(text: &str) -> Result<AccessList, String> {
             return Err(format!("the entry ({inner}) has too few fields"));
         }
         let kind = fields[0];
-        let flags = fields[1];
+        // An entry that only children inherit decides nothing about this object.
+        if inherit_only(fields[1]) {
+            continue;
+        }
         let decision = match kind {
-            "A" | "OA" | "XA" | "ZA" => Decision::Allow,
+            // An entry for the owner's rights narrows what the owner has of its own accord, so
+            // taking it away widens that: it can only be matched, never left out.
+            "A" | "OA" | "XA" | "ZA" if !matches!(fields[5], "OW" | "S-1-3-4") => Decision::Allow,
             "D" | "OD" | "XD" => Decision::Deny,
             _ => Decision::Other,
         };
-        // An entry that only children inherit decides nothing about this object. The flags are
-        // two letters each, so a pair is looked for and not a run of letters that two flags make.
-        if flags.as_bytes().chunks(2).any(|flag| flag == b"IO") {
-            continue;
-        }
         fields.remove(1);
         list.push(Entry {
             decision,
@@ -125,7 +127,7 @@ pub(super) fn label(text: &str) -> Result<Label, String> {
     let mut found = None;
     for inner in parenthesised(entries)? {
         let fields = split_top_level(inner);
-        if fields.first() != Some(&"ML") {
+        if fields.first() != Some(&"ML") || fields.get(1).is_some_and(|flags| inherit_only(flags)) {
             continue;
         }
         let (Some(policy), Some(level)) = (fields.get(2), fields.get(5)) else {
@@ -147,7 +149,7 @@ pub(super) fn label(text: &str) -> Result<Label, String> {
 ///
 /// Fewer allowing entries admit less, and further denying entries admit less. A missing denying
 /// entry, a further allowing one, a null list where there were entries, and entries in another
-/// order, which the system evaluates differently, each admit more or cannot be shown to admit no
+/// order, which the system may evaluate differently, each admit more or cannot be shown to admit no
 /// more, and are refused.
 pub(super) fn access_list_admits_more(own: &AccessList, found: &AccessList) -> Option<String> {
     match (own, found) {
@@ -180,44 +182,58 @@ pub(super) fn label_admits_more(own: Label, found: Label) -> Option<String> {
     None
 }
 
+/// Says why `found` is not `own` with allowing entries left out and denying entries put in.
+///
+/// The two lists line up when each entry of `found` is either one of `own`'s, in the same order, or
+/// a further denying entry, and each entry of `own` is either matched or an allowing entry that
+/// `found` leaves out. Which entries are the further ones is not told by looking at them one at a
+/// time, so every way of lining the lists up is tried.
 fn entries_admit_more(own: &[Entry], found: &[Entry]) -> Option<String> {
-    let mut matched = vec![false; own.len()];
-    let mut cursor = 0;
-    for entry in found {
-        let at = own[cursor..]
-            .iter()
-            .position(|candidate| candidate == entry)
-            .map(|offset| cursor + offset);
-        match at {
-            Some(at) => {
-                matched[at] = true;
-                cursor = at + 1;
+    // `lined[i][j]`: `own[..i]` and `found[..j]` line up.
+    let mut lined = vec![vec![false; found.len() + 1]; own.len() + 1];
+    lined[0][0] = true;
+    for i in 0..=own.len() {
+        for j in 0..=found.len() {
+            if i == 0 && j == 0 {
+                continue;
             }
-            // A further denying entry only takes access away.
-            None if entry.decision == Decision::Deny => {}
-            None if own.contains(entry) => {
-                return Some(format!(
-                    "its entry ({}) is in another order than the starter's own",
-                    entry.meaning
-                ));
-            }
-            None => {
-                return Some(format!(
-                    "it has an entry ({}) that the starter's own has not",
-                    entry.meaning
-                ));
-            }
+            let left_out = i > 0 && own[i - 1].decision == Decision::Allow && lined[i - 1][j];
+            let put_in = j > 0 && found[j - 1].decision == Decision::Deny && lined[i][j - 1];
+            let matched = i > 0 && j > 0 && own[i - 1] == found[j - 1] && lined[i - 1][j - 1];
+            lined[i][j] = left_out || put_in || matched;
         }
     }
-    own.iter()
-        .zip(&matched)
-        .find(|(entry, matched)| !**matched && entry.decision != Decision::Allow)
-        .map(|(entry, _)| {
-            format!(
-                "it lacks the entry ({}) that the starter's own has",
-                entry.meaning
-            )
-        })
+    if lined[own.len()][found.len()] {
+        return None;
+    }
+    if let Some(entry) = found
+        .iter()
+        .find(|entry| entry.decision != Decision::Deny && !own.contains(entry))
+    {
+        return Some(format!(
+            "it has an entry ({}) that the starter's own has not",
+            entry.meaning
+        ));
+    }
+    if let Some(entry) = own
+        .iter()
+        .find(|entry| entry.decision != Decision::Allow && !found.contains(entry))
+    {
+        return Some(format!(
+            "it lacks the entry ({}) that the starter's own has",
+            entry.meaning
+        ));
+    }
+    Some(
+        "its entries are not in the starter's order, which cannot be shown to admit no more"
+            .to_owned(),
+    )
+}
+
+/// Whether the flags of an entry say that only children inherit it. The flags are two letters each,
+/// so a pair is looked for and not a run of letters that two flags make.
+fn inherit_only(flags: &str) -> bool {
+    flags.as_bytes().chunks(2).any(|flag| flag == b"IO")
 }
 
 /// The text inside each top-level pair of parentheses of `text`, which holds nothing else.
@@ -380,6 +396,16 @@ mod tests {
         // admit no more.
         assert!(more("D:(D;;0x1;;;BG)(A;;0x1;;;SY)", "D:(A;;0x1;;;SY)").is_some());
         assert!(more(own, "D:(A;;0x1;;;S-1-5-5-0-1)(A;;0x1;;;SY)").is_some());
+        // An entry for the owner's rights narrows what the owner has of its own accord, so
+        // leaving it out admits more.
+        assert!(more("D:(A;;0x20000;;;OW)(A;;0x1;;;WD)", "D:(A;;0x1;;;WD)").is_some());
+        assert_eq!(
+            more(
+                "D:(A;;0x20000;;;OW)(A;;0x1;;;WD)",
+                "D:(A;;0x20000;;;OW)(A;;0x1;;;WD)"
+            ),
+            None
+        );
     }
 
     /// KR-REQ-03.24: an object that admits less than the starter's own is not refused: a station
@@ -393,6 +419,15 @@ mod tests {
         // Nobody at all, and a further denying entry, admit less.
         assert_eq!(more(own, "D:"), None);
         assert_eq!(more(own, "D:(D;;0x1;;;BG)(A;;0x1;;;SY)"), None);
+        // A further denying entry may come before entries that match the starter's own, whichever
+        // of the denying entries the starter's own has is the one it matches.
+        assert_eq!(
+            more(
+                "D:(A;;0x1;;;WD)(D;;0x1;;;WD)",
+                "D:(D;;0x1;;;WD)(A;;0x1;;;WD)(D;;0x1;;;WD)"
+            ),
+            None
+        );
         // Where the starter's own admits everyone, nothing admits more.
         assert_eq!(more("D:NO_ACCESS_CONTROL", "D:(A;;0x1;;;SY)"), None);
         assert_eq!(more("D:NO_ACCESS_CONTROL", "D:"), None);
@@ -420,6 +455,10 @@ mod tests {
         // A label no lower than the medium one, against none, is not more.
         assert_eq!(label_admits_more(read(""), read("S:(ML;;NW;;;HI)")), None);
         assert!(label_admits_more(read(""), read("S:(ML;;NW;;;LW)")).is_some());
+
+        // A label that only children inherit is not the object's own.
+        assert_eq!(read("S:(ML;OIIO;NW;;;HI)"), own);
+        assert!(label_admits_more(read("S:(ML;;NW;;;HI)"), read("S:(ML;OIIO;NW;;;HI)")).is_some());
 
         assert!(label("S:(ML;;NW;;;XX)").is_err());
         assert!(label("S:(ML;;QQ;;;ME)").is_err());
