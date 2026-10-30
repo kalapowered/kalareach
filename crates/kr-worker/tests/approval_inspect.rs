@@ -1740,6 +1740,17 @@ async fn answer_as_device(
     history: Option<HistoryScope>,
 ) -> Result<ParamsValue, ProtocolError> {
     let mutation = answer_mutation(host, request_id, resource_id);
+    forward_answer(daemon, host, &mutation, history).await
+}
+
+/// As [`answer_as_device`], for an answer the caller composed, so that it can ask after the action
+/// by its identifier.
+async fn forward_answer(
+    daemon: &mut BoundLink,
+    host: &Host,
+    mutation: &MutationRequest,
+    history: Option<HistoryScope>,
+) -> Result<ParamsValue, ProtocolError> {
     let lease = common::a_lease_after_the_announcement(daemon, host.environment_id, 1, 1).await;
     let rights = [ActionRight::SessionView, ActionRight::AgentApprovalRespond]
         .into_iter()
@@ -1748,19 +1759,12 @@ async fn answer_as_device(
     let sent = match history {
         Some(history) => {
             daemon
-                .forward_within(
-                    &mutation,
-                    &device(),
-                    &rights,
-                    deadline,
-                    Some(lease),
-                    history,
-                )
+                .forward_within(mutation, &device(), &rights, deadline, Some(lease), history)
                 .await
         }
         None => {
             daemon
-                .forward(&mutation, &device(), &rights, deadline, Some(lease))
+                .forward(mutation, &device(), &rights, deadline, Some(lease))
                 .await
         }
     };
@@ -1787,7 +1791,10 @@ async fn kr_req_10_51_a_device_answers_an_approval_only_where_its_history_or_its
             .load(std::sync::atomic::Ordering::SeqCst)
     };
 
-    let unknown = answer_as_device(&mut daemon, &host, 300, absent, Some(reach(past, &[])))
+    let mut refused = Vec::new();
+    let asked = answer_mutation(&host, 300, absent);
+    refused.push(asked.action_id);
+    let unknown = forward_answer(&mut daemon, &host, &asked, Some(reach(past, &[])))
         .await
         .expect_err("the host holds no such approval");
     for (request_id, history) in [
@@ -1796,7 +1803,9 @@ async fn kr_req_10_51_a_device_answers_an_approval_only_where_its_history_or_its
         (303, None),
         (304, Some(reach(past, &[named]))),
     ] {
-        let withheld = answer_as_device(&mut daemon, &host, request_id, early, history)
+        let asked = answer_mutation(&host, request_id, early);
+        refused.push(asked.action_id);
+        let withheld = forward_answer(&mut daemon, &host, &asked, history)
             .await
             .expect_err("an approval the device's history does not reach is not answered");
         assert_eq!(withheld.code, unknown.code, "({request_id}) {withheld:?}");
@@ -1827,6 +1836,31 @@ async fn kr_req_10_51_a_device_answers_an_approval_only_where_its_history_or_its
         PendingState::Pending,
         "the refused answers left the approval as it was"
     );
+    // Each refusal is recorded as a rejection, which the device that asked can read: the worker
+    // accepts the action before it weighs the device's history and rejects it after.
+    for (index, action_id) in (400..).zip(refused) {
+        let read = exchange(
+            &mut daemon,
+            scoped(
+                Method::ActionRead,
+                &kr_protocol::receipt::ActionReadParams {
+                    action_id,
+                    session_id: None,
+                },
+                index,
+                device(),
+                reach(Some(RECORDED_AT.get()), &[]),
+            ),
+        )
+        .await;
+        assert_eq!(
+            answered::<kr_protocol::receipt::ActionReadResult>(read)
+                .receipt
+                .state,
+            kr_protocol::receipt::ReceiptState::Rejected,
+            "the refused answer has a receipt that says it was refused"
+        );
+    }
 
     answer_as_device(&mut daemon, &host, 306, named, Some(reach(past, &[named])))
         .await
