@@ -513,8 +513,7 @@ fn unread_input_is_not_drained(kind: ShellKind, unread: &[u8], completion: &[u8]
     signal_the_shell(&session, "STOP");
     // A reader that answers only when it steps meets its mailbox at the step a person gives it by
     // typing, so the answers wait behind that step and not ahead of it.
-    session.type_the_step();
-    session.type_bytes(unread);
+    session.type_behind_the_step(unread);
     let id = session.ask_after_the_step(WorkerRequest::Fence(RootEditorFenceParams {
         session_id: session.session_id,
         fence_id: fence_id(31),
@@ -524,7 +523,9 @@ fn unread_input_is_not_drained(kind: ShellKind, unread: &[u8], completion: &[u8]
         cause: FenceCause::EditorEntry,
     }));
     signal_the_shell(&session, "CONT");
-    let BridgeAnswer::Fence(RootEditorFenceResult::Acknowledged(asked)) = session.answer(id) else {
+    let BridgeAnswer::Fence(RootEditorFenceResult::Acknowledged(asked)) =
+        session.answer_after_the_step(id)
+    else {
         panic!("the reader did not acknowledge the fence it was asked for")
     };
     assert!(
