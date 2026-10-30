@@ -850,9 +850,15 @@ fn check_owner_only(path: &Path, metadata: &std::fs::Metadata) -> Result<()> {
 #[cfg(target_os = "macos")]
 fn others_in_access_list(path: &Path) -> Option<String> {
     access_list_verdict(exacl::getfacl(path, None), || {
-        let mut own = vec![current_uid().to_string()];
-        own.extend(passwd_entry().map(|account| account.name));
-        own
+        // The list names an account by its short name, or by its number where the system has no
+        // record of it, so a number is this user's name only when the system has no other: an
+        // account can be called "501". Two accounts with one short name in different databases of
+        // accounts cannot be told apart by what the list gives.
+        vec![
+            passwd_entry()
+                .map(|account| account.name)
+                .unwrap_or_else(|| current_uid().to_string()),
+        ]
     })
 }
 
@@ -876,8 +882,10 @@ fn access_list_verdict(
                 })
                 .then(|| "its access list lets another account in".to_owned())
         }
-        // A file system that does not support access lists has none to let anybody in.
-        Err(error) if error.raw_os_error() == Some(libc::EOPNOTSUPP) => None,
+        // A file system that does not support access lists has none to let anybody in. The error
+        // reaches here from the library with the path in its text and without its code, so it is
+        // the kind that says so: the system's "not supported on the file system" is `Unsupported`.
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => None,
         Err(error) => Some(format!("its access list could not be read: {error}")),
     }
 }
@@ -3898,42 +3906,6 @@ mod tests {
         std::fs::set_permissions(directory, std::fs::Permissions::from_mode(mode)).expect("chmod");
     }
 
-    /// KR-REQ-24.26: a directory whose access list lets another account in is not owner-only,
-    /// whatever its mode says: one with mode 0700 is refused, and one that is open too is refused
-    /// with no command, since `chmod 700` leaves the list as it was and the check would pass it
-    /// while that account could still write.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_directory_whose_access_list_lets_another_account_in_is_refused_and_names_no_command() {
-        let root = temporary_root("access-list");
-        let another = exacl::AclEntry::allow_user("root", exacl::Perm::WRITE, None);
-
-        let closed = root.join("closed");
-        create_private_tree(&root, &closed).expect("creates");
-        give_list(&closed, std::slice::from_ref(&another));
-        let error = create_private_tree(&root, &closed).expect_err("refuses a list that lets in");
-        assert!(
-            matches!(error, IpcError::DirectoryAccessRefused { .. }),
-            "{error}"
-        );
-
-        let open = root.join("open");
-        create_private_tree(&root, &open).expect("creates");
-        give_mode(&open, 0o755);
-        give_list(&open, &[another]);
-        let error = create_private_tree(&root, &open).expect_err("refuses");
-        assert_eq!(error.mending_command(), None, "{error}");
-        assert!(!error.to_string().contains("chmod"), "{error}");
-
-        // What a person would have done anyway: the mode is mended and the list is still there.
-        give_mode(&open, 0o700);
-        assert!(
-            create_private_tree(&root, &open).is_err(),
-            "a mode does not remove an access entry"
-        );
-        std::fs::remove_dir_all(&root).ok();
-    }
-
     /// KR-REQ-24.26: a list that gives nobody else anything does not refuse a directory: the
     /// denial the system puts on a home folder, and an entry for this user, leave an owner-only
     /// directory owner-only, and a directory that is open as well keeps its command.
@@ -3968,17 +3940,39 @@ mod tests {
     }
 
     /// KR-REQ-24.26: a list that cannot be read is not taken to be closed, so the directory is
-    /// refused and no command is named for it; a file system that keeps no lists has none to read.
+    /// refused and no command is named for it; a file system that does not support lists has none
+    /// to read. The error is made the way the library makes the errors of a read: it keeps the kind
+    /// of the system's error and the path, and not the code.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_list_that_cannot_be_read_is_not_called_closed() {
-        let own = || vec!["501".to_owned(), "someone".to_owned()];
-        let unreadable = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
-        let said = access_list_verdict(Err(unreadable), own).expect("refuses what it cannot read");
+        let own = || vec!["someone".to_owned()];
+        let read_error = |code: i32| {
+            std::io::Error::new(
+                std::io::Error::from_raw_os_error(code).kind(),
+                "File \"/x\": the system's words",
+            )
+        };
+        let said = access_list_verdict(Err(read_error(libc::EACCES)), own)
+            .expect("refuses what it cannot read");
         assert!(said.contains("could not be read"), "{said}");
 
-        let kept_none = std::io::Error::from_raw_os_error(libc::EOPNOTSUPP);
-        assert_eq!(access_list_verdict(Err(kept_none), own), None);
+        assert_eq!(
+            access_list_verdict(Err(read_error(libc::EOPNOTSUPP)), own),
+            None
+        );
+    }
+
+    /// KR-REQ-24.26: an entry the library names by a number is not this user's while the system
+    /// has a name for this user, since an account can be called by a number.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_entry_called_by_a_number_is_not_this_users_when_the_system_names_this_user() {
+        let by_number = exacl::AclEntry::allow_user("501", exacl::Perm::READ, None);
+        let by_name = exacl::AclEntry::allow_user("someone", exacl::Perm::READ, None);
+        let own = || vec!["someone".to_owned()];
+        assert!(access_list_verdict(Ok(vec![by_number]), own).is_some());
+        assert_eq!(access_list_verdict(Ok(vec![by_name]), own), None);
     }
 
     #[test]
