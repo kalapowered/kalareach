@@ -335,6 +335,10 @@ const VK_NEXT: u16 = 0x22;
 const VK_SHIFT: u16 = 0x10;
 const VK_CONTROL: u16 = 0x11;
 const VK_MENU: u16 = 0x12;
+/// The keys that toggle a lock. Pressing one types nothing: it changes a state the next key carries.
+const VK_CAPITAL: u16 = 0x14;
+const VK_NUMLOCK: u16 = 0x90;
+const VK_SCROLL: u16 = 0x91;
 
 /// Takes this terminal's own scroll-back out of the records a console reported, and returns the
 /// rest with how far the window is to move.
@@ -403,10 +407,15 @@ fn take_scroll_keys(
 }
 
 /// Whether a run of key records holds a key the person pressed: one going down that is not a
-/// modifier. A release, and a modifier on its own, are not typing.
+/// modifier or a lock. A release, a modifier on its own and a lock key are not typing.
 fn presses(keys: &[kr_term::win32::KeyRecord]) -> bool {
-    keys.iter()
-        .any(|key| key.key_down && !matches!(key.virtual_key, VK_SHIFT | VK_CONTROL | VK_MENU))
+    keys.iter().any(|key| {
+        key.key_down
+            && !matches!(
+                key.virtual_key,
+                VK_SHIFT | VK_CONTROL | VK_MENU | VK_CAPITAL | VK_NUMLOCK | VK_SCROLL
+            )
+    })
 }
 
 /// The bytes a terminal sends when a bracketed paste begins.
@@ -2751,10 +2760,11 @@ mod tests {
         assert!(held.is_empty());
     }
 
-    /// A release, and a modifier on its own, are not something the person typed: they neither take
-    /// a terminal back to the live screen nor count as input a closing session refused.
+    /// A release, a modifier on its own and a lock key are not something the person typed: they
+    /// neither take a terminal back to the live screen nor count as input a closing session
+    /// refused.
     #[test]
-    fn only_a_key_going_down_that_is_not_a_modifier_is_a_press() {
+    fn only_a_key_going_down_that_is_not_a_modifier_or_a_lock_is_a_press() {
         use kr_term::win32::KeyRecord;
 
         let key = |virtual_key: u16, key_down: bool| KeyRecord {
@@ -2773,6 +2783,14 @@ mod tests {
         );
         assert!(presses(&[key(0x10, true), key(0x0d, true)]));
         assert!(!presses(&[]));
+        for (lock, name) in [
+            (0x14, "Caps Lock"),
+            (0x90, "Num Lock"),
+            (0x91, "Scroll Lock"),
+        ] {
+            assert!(!presses(&[key(lock, true)]), "{name} types nothing");
+            assert!(presses(&[key(lock, true), key(u16::from(b'A'), true)]));
+        }
     }
 
     /// Holding the key repeats it, and a read of several is that many pages.
