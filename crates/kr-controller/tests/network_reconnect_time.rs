@@ -1,0 +1,283 @@
+//! What a paired device waits for when it comes back to a real daemon.
+//!
+//! KR-PERF-006 gives a reconnect two seconds from the moment the transport is available to a
+//! usable 120x40 screen, leaving out pairing, an outage of discovery and the operating system's
+//! suspension. The client library's own case times its half against a host that answers at once,
+//! and the transport's times a frame carried. This case times the whole of what lies between: one
+//! real daemon on the loopback network, a real worker it adopts, and a paired device that has been
+//! attached and subscribed before and has gone. The clock starts where the row starts it, with the
+//! transport returned and nothing yet asked of the host; it stops when the restoration has
+//! installed the screen the host projects and the client has painted it. The attach that comes
+//! before the subscription, the host's answer to each, and the projection it builds and publishes
+//! are all inside the figure.
+
+#![cfg(unix)]
+
+mod net_support;
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use kr_client::cursors::Restoration;
+use kr_client::projection::paint::{Keyboard, Window};
+use kr_client::projection::{Applied, Projection};
+use kr_client::session::Session;
+use kr_crypto::keys::DeviceKeys;
+use kr_protocol::attachment::{
+    AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult,
+};
+use kr_protocol::envelope::{ActionTarget, ParamsValue};
+use kr_protocol::ids::{EnvironmentId, SessionId, StreamId};
+use kr_protocol::method::Method;
+use kr_protocol::recovery::EventStream;
+use kr_protocol::rights::ActionRight;
+use kr_protocol::scalars::{DurationMs, Nullable};
+use kr_protocol::session::Dimensions;
+
+use net_support::worker::Worker;
+use net_support::{Device, Host, pair_with, paired_dial, proposal};
+
+/// How long a case waits for something the host does without being asked again: a liveness bound,
+/// and not the figure under test.
+const LIVENESS: Duration = Duration::from_secs(120);
+
+/// The screen section 27 names.
+const COLUMNS: u64 = 120;
+const ROWS: u64 = 40;
+
+/// The last line the application writes, which is on the screen the device is restored to.
+const LAST_LINE: &str = "kr-row-45";
+
+/// The application: it writes more lines than a screen holds, says it is ready, and keeps the
+/// session open.
+fn application(kept: &std::path::Path) -> String {
+    format!(
+        "i=1; while [ $i -le 45 ]; do echo kr-row-$i; i=$((i+1)); done; touch '{}'; exec cat",
+        kept.join("ready").display()
+    )
+}
+
+fn output_stream() -> StreamId {
+    StreamId::new("session.output").expect("a stream identifier")
+}
+
+/// Attaches as a terminal of the session's size that draws a rendering of its grid, without
+/// claiming the geometry, subscribes from the client's cursors, and returns the time until the
+/// host's screen is installed and painted, with the painted text.
+///
+/// Everything a reconnecting client does after the transport returns is in here, in the order it
+/// does it: the attach, the subscription named by the cursors, the projection's snapshot and rows,
+/// and the paint.
+async fn restored(
+    session: &Session,
+    environment_id: EnvironmentId,
+    session_id: SessionId,
+    started: Instant,
+) -> (Duration, String) {
+    // The events are read from before the subscription, so nothing it queues is missed.
+    let mut events = session.events();
+    let attached: SessionAttachResult = session
+        .mutate(
+            Method::SessionAttach,
+            ActionTarget {
+                environment_id,
+                session_id: Nullable::some(session_id),
+                session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+                application_instance_id: Nullable::null(),
+                agent_binding_revision: Nullable::null(),
+            },
+            None,
+            &ParamsValue::empty(),
+            &SessionAttachParams {
+                session_id,
+                mode: AttachMode::Terminal,
+                claim_geometry: false,
+                dimensions: Nullable::some(Dimensions::new(COLUMNS, ROWS)),
+                terminal_profile_id: Nullable::null(),
+                requested: [AttachmentCapability::ObserveTerminal]
+                    .into_iter()
+                    .collect(),
+            },
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect("the attach is settled")
+        .to_typed()
+        .expect("an attachment");
+
+    let mut restoration = Restoration::start(output_stream(), &session.cursors().await);
+    let params = restoration
+        .subscribe_params(
+            session_id,
+            attached.attachment.attachment_id,
+            &[EventStream::Output],
+        )
+        .expect("the stream is waiting to subscribe");
+    session
+        .subscribe_events(&params)
+        .await
+        .expect("the subscription succeeds");
+    restoration.subscribed().expect("the order is kept");
+
+    let mut projection = Projection::new();
+    let deadline = tokio::time::Instant::now() + LIVENESS;
+    loop {
+        let notification = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("the host projected a screen")
+            .expect("the channel is open");
+        let Some(event) =
+            kr_client::projection::decode(notification.event_type.as_str(), &notification.payload)
+        else {
+            continue;
+        };
+        if matches!(projection.apply(event), Applied::Installed) {
+            break;
+        }
+    }
+    restoration.installed().expect("the snapshot is installed");
+
+    let screen = projection.screen().expect("a screen");
+    assert_eq!(
+        (
+            screen.dimensions.columns.get(),
+            screen.dimensions.rows.get()
+        ),
+        (COLUMNS, ROWS),
+        "the screen the host restored is the size section 27 names"
+    );
+    let painted =
+        kr_client::projection::paint::install(screen, Window::of(screen), Keyboard::EVERYTHING);
+    let elapsed = started.elapsed();
+    (
+        elapsed,
+        String::from_utf8(painted.bytes).expect("the paint is text and escapes"),
+    )
+}
+
+/// KR-PERF-006: a paired device that comes back to a real daemon has a painted 120x40 screen of
+/// the session within two seconds of the transport's return.
+///
+/// The device is attached and subscribed once and goes, and the host has recorded that its
+/// connection ended. It then dials again and the clock starts when the transport is returned. The
+/// two seconds are the row's figure, so they are asserted, and the reading is printed with the
+/// conditions it was taken under.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_paired_device_that_comes_back_has_a_painted_screen_inside_the_reconnect_budget() {
+    let kept = tempfile::tempdir().expect("a directory for what the application keeps");
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let stopped = host.shut_down().await;
+    let worker = Worker::start_running_sized(
+        stopped.tree(),
+        1,
+        &application(kept.path()),
+        Dimensions::new(COLUMNS, ROWS),
+    )
+    .await;
+    let settings = stopped.settings().clone();
+    let host = stopped.start(settings).await;
+    until("the daemon to serve the worker's session", || async {
+        let mut client = host.client().await;
+        client
+            .request(
+                Method::SessionRead,
+                &kr_protocol::session::SessionReadParams {
+                    session_id: worker.session_id,
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .is_ok()
+            .then_some(())
+    })
+    .await;
+    until("the application to write its screen", || async {
+        kept.path().join("ready").exists().then_some(())
+    })
+    .await;
+
+    let device = Device::create().await;
+    let record = pair_with(
+        &host,
+        &device,
+        &owner,
+        proposal(&[ActionRight::SessionView]),
+    )
+    .await;
+    let dial = paired_dial(&host, &device, &record);
+
+    // The first connection: attached, subscribed and restored, then gone.
+    let first_transport = dial.dial().await;
+    let first_started = Instant::now();
+    let session = Session::start(Arc::new(first_transport)).expect("a session");
+    let (first, painted) = restored(
+        &session,
+        host.environment_id,
+        worker.session_id,
+        first_started,
+    )
+    .await;
+    assert!(
+        painted.contains(LAST_LINE),
+        "the screen carries the session's text"
+    );
+    session.close();
+    until("the host to record that the connection ended", || async {
+        (host.connections_of(&record) == 0).then_some(())
+    })
+    .await;
+
+    // The return: the clock starts with the transport, and nothing has been asked of the host.
+    let transport = dial.dial().await;
+    let started = Instant::now();
+    let session = Session::start(Arc::new(transport)).expect("a session");
+    let (elapsed, painted) =
+        restored(&session, host.environment_id, worker.session_id, started).await;
+    assert!(
+        painted.contains(LAST_LINE),
+        "every row of the session's screen is in what a terminal would be sent"
+    );
+    eprintln!(
+        "KR-PERF-006 reconnect to a real daemon: {elapsed:?} from the transport's return to a \
+         painted {COLUMNS}x{ROWS} screen (the first connection took {first:?}); {} logical \
+         processors, {}",
+        std::thread::available_parallelism().map_or(0, std::num::NonZero::get),
+        if cfg!(debug_assertions) {
+            "a debug build"
+        } else {
+            "a release build"
+        },
+    );
+    assert!(
+        elapsed < kr_client::retry::RECONNECT_BUDGET,
+        "a reconnect to a real daemon took {elapsed:?}, over the {:?} budget",
+        kr_client::retry::RECONNECT_BUDGET
+    );
+
+    session.close();
+    worker
+        .runtime()
+        .close(kr_protocol::session::ClosureReason::CloseRequested)
+        .1
+        .release();
+    host.stop().await;
+}
+
+/// Asks `check` until it answers, or the liveness bound runs out.
+async fn until<T, Fut>(what: &str, mut check: impl FnMut() -> Fut) -> T
+where
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let deadline = tokio::time::Instant::now() + LIVENESS;
+    loop {
+        if let Some(found) = check().await {
+            return found;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "waited {LIVENESS:?} for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
