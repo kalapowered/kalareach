@@ -3415,6 +3415,269 @@ mod tests {
         assert_eq!(other.awaiting_delivery().expect("a count"), 0);
     }
 
+    /// The figures section 25 states, written out so that a case reads them as the section does:
+    /// the idle reminder comes after five minutes, and a repeat inside sixty seconds is the same
+    /// condition.
+    const FIVE_MINUTES_MS: u64 = 5 * 60 * 1_000;
+    const SIXTY_SECONDS_MS: u64 = 60 * 1_000;
+
+    /// Every origin read to its end, which is what a pass that feeds its events in order has done.
+    fn read_through(_: &kr_attention::Origin) -> Option<u64> {
+        Some(u64::MAX)
+    }
+
+    /// A question in session one that the host verified is pending, seen at `continuous_ms` after
+    /// the store opened, with the clock it was stamped on vouched for.
+    fn raise_question(
+        attention: &mut Attention,
+        sequence: u64,
+        continuous_ms: u64,
+        verified: bool,
+    ) {
+        let wall_ms = NOON + continuous_ms;
+        attention
+            .apply(
+                &SourceEvent::new(
+                    EventCursor::in_session(session(1), AttentionSource::Questions, sequence),
+                    TimestampMs::new(wall_ms),
+                    EventKind::QuestionPending {
+                        question_id: kr_protocol::ids::QuestionId::new(Uuid::from_bytes([9; 16])),
+                        session_id: session(1),
+                        verified,
+                        pending_since_ms: TimestampMs::new(wall_ms),
+                        pending_since_anchor: Some(kr_attention::time::Anchor::new(
+                            kr_attention::time::BootMark::from_bytes([7; 16]),
+                            continuous_ms,
+                        )),
+                        summary: "which branch?".to_owned(),
+                    },
+                ),
+                reading(continuous_ms, wall_ms),
+            )
+            .expect("the store records the question");
+    }
+
+    /// The same approval request seen again `continuous_ms` after the store opened.
+    fn raise_approval_again(attention: &mut Attention, sequence: u64, continuous_ms: u64) {
+        let wall_ms = NOON + continuous_ms;
+        attention
+            .apply(
+                &SourceEvent::new(
+                    EventCursor::in_session(session(1), AttentionSource::Receipts, sequence),
+                    TimestampMs::new(wall_ms),
+                    EventKind::ApprovalRequested {
+                        request_id: kr_protocol::ids::ApprovalRequestId::new("req-1")
+                            .expect("an identifier"),
+                        session_id: session(1),
+                        summary: "write /etc/hosts".to_owned(),
+                    },
+                ),
+                reading(continuous_ms, wall_ms),
+            )
+            .expect("the store records the approval");
+    }
+
+    /// Advances the store's timers to `continuous_ms` after it opened.
+    fn advance_to(attention: &mut Attention, continuous_ms: u64) {
+        attention
+            .tick(reading(continuous_ms, NOON + continuous_ms), &read_through)
+            .expect("the store records the timers");
+    }
+
+    /// Takes what `attention` announces for one phone, and produces from it. Returns how many
+    /// announcements were taken and how many notifications the journal admitted for them.
+    fn deliver(
+        producer: &mut Producer,
+        attention: &mut Attention,
+        phone: &DestinationRecord,
+    ) -> (usize, usize) {
+        let taken = take(producer, attention, &Everything(BTreeSet::new()), NORMAL).taken;
+        let produced = producer
+            .finish_pending(
+                std::slice::from_ref(phone),
+                &Everything(BTreeSet::new()),
+                1_000,
+            )
+            .expect("production");
+        (taken, produced.admitted)
+    }
+
+    /// The rules of the events the journal has taken and not yet produced from.
+    fn pending_rules(producer: &Producer) -> Vec<String> {
+        producer
+            .journal()
+            .pending_events(0, 10)
+            .expect("a read")
+            .iter()
+            .map(|event| {
+                kr_cbor::from_canonical_slice::<Production>(
+                    &event.notice,
+                    &kr_cbor::Limits::DEFAULT,
+                )
+                .expect("the production inputs")
+                .notice
+                .rule
+            })
+            .collect()
+    }
+
+    /// KR-REQ-25.03, the idle reminder at the delivery consumer: a question the host verified is
+    /// pending is announced when it is asked, and announced again once five minutes of it being
+    /// pending have passed, and not a moment before. The journal then holds one notification for the
+    /// question and one for the reminder, which is the one the person is told of. The control is a
+    /// question nothing verified, which is neither announced nor reminded of.
+    #[test]
+    fn a_verified_question_nobody_answered_is_reminded_after_five_minutes_and_not_before() {
+        let mut producer = producer();
+        let phone = push_destination("phone", true);
+        producer
+            .journal_mut()
+            .configure_destination(&phone)
+            .expect("a destination");
+        let mut attention = store();
+        raise_question(&mut attention, 1, 0, true);
+        assert_eq!(deliver(&mut producer, &mut attention, &phone), (1, 1));
+
+        advance_to(&mut attention, FIVE_MINUTES_MS - 1);
+        assert_eq!(
+            deliver(&mut producer, &mut attention, &phone),
+            (0, 0),
+            "five minutes have not passed"
+        );
+        advance_to(&mut attention, FIVE_MINUTES_MS);
+        let taken = take(
+            &mut producer,
+            &mut attention,
+            &Everything(BTreeSet::new()),
+            NORMAL,
+        );
+        assert_eq!(taken.taken, 1, "five minutes have passed");
+        assert_eq!(
+            pending_rules(&producer),
+            vec![AttentionRule::InputIdleReminder.as_str().to_owned()],
+            "what is taken is the reminder"
+        );
+        let produced = producer
+            .finish_pending(
+                std::slice::from_ref(&phone),
+                &Everything(BTreeSet::new()),
+                1_000,
+            )
+            .expect("production");
+        assert_eq!(produced.admitted, 1);
+        assert_eq!(producer.journal().deliveries().expect("a read").len(), 2);
+
+        let mut other = self::producer();
+        other
+            .journal_mut()
+            .configure_destination(&phone)
+            .expect("a destination");
+        let mut unverified = store();
+        raise_question(&mut unverified, 1, 0, false);
+        advance_to(&mut unverified, FIVE_MINUTES_MS * 2);
+        assert_eq!(
+            deliver(&mut other, &mut unverified, &phone),
+            (0, 0),
+            "a question nothing verified is neither announced nor reminded of"
+        );
+    }
+
+    /// KR-REQ-25.03, the 60-second window at the delivery consumer: the same condition seen again
+    /// inside the window is counted on its inbox item and produces no second notification, and seen
+    /// again once the window has run it is announced and produced again.
+    #[test]
+    fn a_condition_seen_again_inside_sixty_seconds_is_counted_and_not_delivered_again() {
+        let mut producer = producer();
+        let phone = push_destination("phone", true);
+        producer
+            .journal_mut()
+            .configure_destination(&phone)
+            .expect("a destination");
+        let mut attention = store();
+        raise_approval(&mut attention, 1, NOON, "req-1");
+        assert_eq!(deliver(&mut producer, &mut attention, &phone), (1, 1));
+
+        let window = SIXTY_SECONDS_MS;
+        raise_approval_again(&mut attention, 2, window - 1);
+        assert_eq!(
+            deliver(&mut producer, &mut attention, &phone),
+            (0, 0),
+            "a repeat inside the window is not delivered"
+        );
+        let item = attention
+            .inbox(
+                &kr_protocol::ids::ActorId::new("local:501").expect("an actor"),
+                &kr_attention::Viewer::Owner,
+                true,
+            )
+            .expect("the inbox")
+            .remove(0);
+        assert_eq!(
+            item.occurrences,
+            kr_protocol::scalars::U64::new(2),
+            "but it is counted"
+        );
+        assert_eq!(producer.journal().deliveries().expect("a read").len(), 1);
+
+        raise_approval_again(&mut attention, 3, window);
+        assert_eq!(
+            deliver(&mut producer, &mut attention, &phone),
+            (1, 1),
+            "the window has run"
+        );
+        assert_eq!(producer.journal().deliveries().expect("a read").len(), 2);
+    }
+
+    /// KR-REQ-25.03, quiet hours at the delivery consumer: an approval first seen inside them is
+    /// urgent and in the inbox throughout, is offered to the consumer by nothing while they last,
+    /// and is taken and produced once they end.
+    #[test]
+    fn an_approval_seen_in_quiet_hours_stays_in_the_inbox_and_is_delivered_when_they_end() {
+        use kr_protocol::attention::{AttentionLevel, QuietHours};
+
+        let mut producer = producer();
+        let phone = push_destination("phone", true);
+        producer
+            .journal_mut()
+            .configure_destination(&phone)
+            .expect("a destination");
+        let mut attention = store();
+        attention
+            .set_quiet_hours(Some(QuietHours {
+                start_minute: kr_protocol::scalars::U64::new(11 * 60),
+                end_minute: kr_protocol::scalars::U64::new(13 * 60),
+                zone: Nullable::null(),
+            }))
+            .expect("the store records the window");
+        raise_approval(&mut attention, 1, NOON, "req-1");
+
+        assert_eq!(
+            deliver(&mut producer, &mut attention, &phone),
+            (0, 0),
+            "nothing is offered while the hours last"
+        );
+        let inbox = || {
+            attention
+                .inbox(
+                    &kr_protocol::ids::ActorId::new("local:501").expect("an actor"),
+                    &kr_attention::Viewer::Owner,
+                    true,
+                )
+                .expect("the inbox")
+        };
+        let held = inbox();
+        assert_eq!(held.len(), 1, "the approval is in the inbox");
+        assert_eq!(held[0].level, AttentionLevel::Urgent);
+
+        let hour = 60 * 60 * 1_000;
+        advance_to(&mut attention, hour);
+        assert_eq!(
+            deliver(&mut producer, &mut attention, &phone),
+            (1, 1),
+            "the hours have ended"
+        );
+    }
+
     /// The take is made only while the journal stands where the published privacy state says.
     #[test]
     fn nothing_is_taken_while_the_journal_and_the_published_state_disagree() {
