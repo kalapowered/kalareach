@@ -25,10 +25,12 @@ use std::os::windows::ffi::OsStrExt as _;
 use windows_sys::Win32::Foundation::{
     DUPLICATE_SAME_ACCESS, DuplicateHandle, GENERIC_ALL, HANDLE, LocalFree,
 };
-use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_WINDOW_OBJECT};
+use windows_sys::Win32::Security::Authorization::{
+    GetSecurityInfo, SE_WINDOW_OBJECT, SetSecurityInfo,
+};
 use windows_sys::Win32::Security::{
-    DACL_SECURITY_INFORMATION, LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-    SECURITY_ATTRIBUTES,
+    ACL, DACL_SECURITY_INFORMATION, InitializeSecurityDescriptor, LABEL_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SetSecurityDescriptorDacl,
 };
 use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
 use windows_sys::Win32::System::StationsAndDesktops::{
@@ -72,18 +74,21 @@ impl OwnDesktop {
         }
         // The security the child would have met on the starter's own station and desktop, read
         // before anything changes: opening the desktop by name is done on the current station.
-        let own_station = name_of(current_station())?;
-        let station_security = {
-            let opened = Station::open(&own_station, READ_CONTROL)?;
-            security_of(opened.0)?
+        let own_station = name_of(current_station()).map_err(step("read the station's name"))?;
+        let station_source = {
+            let opened = Station::open(&own_station, READ_CONTROL)
+                .map_err(step("open the starter's station to read its security"))?;
+            security_of(opened.0).map_err(step("read the starter's station's security"))?
         };
-        let own_desktop = name_of(current_desktop())?;
-        let desktop_security = {
-            let opened = Desktop::open(&own_desktop, READ_CONTROL)?;
-            security_of(opened.0)?
+        let own_desktop = name_of(current_desktop()).map_err(step("read the desktop's name"))?;
+        let desktop_source = {
+            let opened = Desktop::open(&own_desktop, READ_CONTROL)
+                .map_err(step("open the starter's desktop to read its security"))?;
+            security_of(opened.0).map_err(step("read the starter's desktop's security"))?
         };
 
-        let station_attributes = attributes(&station_security);
+        let mut station_security = station_source.access_only();
+        let station_attributes = attributes(&mut station_security);
         // SAFETY: a null name asks the system to name the station from the logon session, the
         // attributes point at a descriptor that lives until the call returns, and the call returns
         // a handle or null.
@@ -96,15 +101,19 @@ impl OwnDesktop {
             )
         };
         if station.is_null() {
-            return Err(io::Error::last_os_error());
+            return Err(step("create the window station")(io::Error::last_os_error()));
         }
         let station = Station(station);
-        let station_name = name_of(station.0)?;
+        station_source.label_onto(station.0).map_err(step(
+            "give the window station the starter's integrity level",
+        ))?;
+        let station_name = name_of(station.0).map_err(step("read the new station's name"))?;
 
         let desktop = {
-            let _switched = Switched::to(&station)?;
+            let _switched = Switched::to(&station).map_err(step("use the new window station"))?;
             let label_wide = wide(label);
-            let desktop_attributes = attributes(&desktop_security);
+            let mut desktop_security = desktop_source.access_only();
+            let desktop_attributes = attributes(&mut desktop_security);
             // SAFETY: the label is terminated, the device and mode are absent, the attributes
             // point at a descriptor that lives until the call returns, and the call returns a
             // handle or null.
@@ -119,9 +128,13 @@ impl OwnDesktop {
                 )
             };
             if created.is_null() {
-                return Err(io::Error::last_os_error());
+                return Err(step("create the desktop")(io::Error::last_os_error()));
             }
-            Desktop(created)
+            let created = Desktop(created);
+            desktop_source
+                .label_onto(created.0)
+                .map_err(step("give the desktop the starter's integrity level"))?;
+            created
         };
 
         let mut name = station_name;
@@ -167,7 +180,9 @@ impl OwnDesktop {
                 )
             };
             if duplicated == 0 {
-                return Err(io::Error::last_os_error());
+                return Err(step("lend the station and desktop to the child")(
+                    io::Error::last_os_error(),
+                ));
             }
         }
         Ok(())
@@ -294,23 +309,75 @@ fn name_of(object: HANDLE) -> io::Result<Vec<u16>> {
     Ok(buffer)
 }
 
-/// A security descriptor read from an object, freed on drop.
-struct Descriptor(PSECURITY_DESCRIPTOR);
+/// The security of an object the starter reads: the descriptor that holds it, and the access list
+/// and integrity label inside it.
+struct Source {
+    descriptor: PSECURITY_DESCRIPTOR,
+    access: *mut ACL,
+    label: *mut ACL,
+}
 
-impl Drop for Descriptor {
+impl Drop for Source {
     fn drop(&mut self) {
         // SAFETY: the descriptor was allocated by `GetSecurityInfo`, which asks for it to be freed
-        // with this call, and nothing else holds it.
-        unsafe { LocalFree(self.0) };
+        // with this call, and nothing else holds it. The two lists point inside it.
+        unsafe { LocalFree(self.descriptor) };
+    }
+}
+
+impl Source {
+    /// A descriptor that holds the access list alone. A descriptor that carries the label cannot
+    /// be given to a new object without a privilege the starter does not hold, so the label is
+    /// applied afterwards by [`Self::label_onto`], which asks for none up to the caller's own
+    /// level.
+    fn access_only(&self) -> SECURITY_DESCRIPTOR {
+        // SAFETY: all-zero is the initial state `InitializeSecurityDescriptor` is given.
+        let mut descriptor: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
+        let pointer = (&raw mut descriptor).cast();
+        // SAFETY: the pointer is to a live descriptor of the full size, and the access list it is
+        // given lives in this value, which outlives the descriptor's use.
+        unsafe {
+            InitializeSecurityDescriptor(pointer, 1);
+            SetSecurityDescriptorDacl(pointer, 1, self.access, 0);
+        }
+        descriptor
+    }
+
+    /// Gives `target` this object's integrity label, if it has one.
+    fn label_onto(&self, target: HANDLE) -> io::Result<()> {
+        if self.label.is_null() {
+            return Ok(());
+        }
+        // SAFETY: the target is open with the right to change its label, the label list lives in
+        // this value, and every other part is absent, which the call permits.
+        let status = unsafe {
+            SetSecurityInfo(
+                target,
+                SE_WINDOW_OBJECT,
+                LABEL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                self.label,
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(
+                i32::try_from(status).unwrap_or(i32::MAX),
+            ));
+        }
+        Ok(())
     }
 }
 
 /// The access list and the integrity label of an object: what decides who may use it and from
 /// which level.
-fn security_of(object: HANDLE) -> io::Result<Descriptor> {
+fn security_of(object: HANDLE) -> io::Result<Source> {
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-    // SAFETY: the object is open with the right to read its security, every other out parameter is
-    // absent, which the call permits, and `descriptor` is a live out parameter.
+    let mut access: *mut ACL = std::ptr::null_mut();
+    let mut label: *mut ACL = std::ptr::null_mut();
+    // SAFETY: the object is open with the right to read its security, the owner and group are
+    // absent, which the call permits, and the three out parameters are live.
     let status = unsafe {
         GetSecurityInfo(
             object,
@@ -318,8 +385,8 @@ fn security_of(object: HANDLE) -> io::Result<Descriptor> {
             DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
+            &raw mut access,
+            &raw mut label,
             &raw mut descriptor,
         )
     };
@@ -328,15 +395,27 @@ fn security_of(object: HANDLE) -> io::Result<Descriptor> {
             i32::try_from(status).unwrap_or(i32::MAX),
         ));
     }
-    Ok(Descriptor(descriptor))
+    Ok(Source {
+        descriptor,
+        access,
+        label,
+    })
 }
 
 /// Attributes that give a new object `descriptor`, not inheritable.
-fn attributes(descriptor: &Descriptor) -> SECURITY_ATTRIBUTES {
+fn attributes(descriptor: &mut SECURITY_DESCRIPTOR) -> SECURITY_ATTRIBUTES {
     SECURITY_ATTRIBUTES {
         nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(0),
-        lpSecurityDescriptor: descriptor.0,
+        lpSecurityDescriptor: (&raw mut *descriptor).cast(),
         bInheritHandle: 0,
+    }
+}
+
+/// Names the call that failed, so that a refusal says which one it was.
+fn step(what: &'static str) -> impl Fn(io::Error) -> io::Error {
+    move |error| {
+        let kind = error.kind();
+        io::Error::new(kind, format!("{what}: {error}"))
     }
 }
 
