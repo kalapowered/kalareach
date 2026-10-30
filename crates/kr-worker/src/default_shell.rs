@@ -12,10 +12,19 @@ use std::path::{Path, PathBuf};
 /// Returns the shell a session starts: the request's, else the configured one, else the platform's.
 #[must_use]
 pub fn resolve(requested: Option<&str>) -> String {
+    choose(requested, configured(), platform_default)
+}
+
+/// The request's shell, else the configured one, else the platform's.
+fn choose(
+    requested: Option<&str>,
+    configured: Option<String>,
+    platform: impl FnOnce() -> String,
+) -> String {
     requested
         .map(str::to_owned)
-        .or_else(configured)
-        .unwrap_or_else(platform_default)
+        .or(configured)
+        .unwrap_or_else(platform)
 }
 
 /// The shell this host is configured to launch when a request names none.
@@ -84,9 +93,18 @@ impl WindowsPlaces {
     /// Reads the places from this process's environment.
     #[must_use]
     pub fn from_environment() -> Self {
-        let directory = |name: &str| std::env::var_os(name).map(PathBuf::from);
+        Self::from_variables(std::env::var_os)
+    }
+
+    /// Reads the places from environment variables given by `get`.
+    ///
+    /// The system directory is the first of `SystemRoot` and `windir` that is an absolute path,
+    /// so a variable that is set to a relative name does not hide the other.
+    #[must_use]
+    pub fn from_variables(get: impl Fn(&str) -> Option<std::ffi::OsString>) -> Self {
+        let directory = |name: &str| get(name).map(PathBuf::from);
         Self {
-            search_path: std::env::var_os("PATH")
+            search_path: get("PATH")
                 .map(|path| std::env::split_paths(&path).collect())
                 .unwrap_or_default(),
             program_files: ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"]
@@ -94,8 +112,11 @@ impl WindowsPlaces {
                 .filter_map(directory)
                 .collect(),
             local_app_data: directory("LOCALAPPDATA"),
-            system_root: directory("SystemRoot").or_else(|| directory("windir")),
-            command_interpreter: std::env::var("ComSpec").ok(),
+            system_root: ["SystemRoot", "windir"]
+                .into_iter()
+                .filter_map(directory)
+                .find(|root| root.is_absolute()),
+            command_interpreter: get("ComSpec").and_then(|value| value.into_string().ok()),
         }
     }
 }
@@ -343,7 +364,26 @@ mod tests {
             .join("..")
             .join("Evil")
             .join("pwsh.exe");
-        for refused in [six, elsewhere, another_stores_alias, beside_the_seven] {
+        // A directory whose name merely starts with a 7 is not PowerShell 7's, wherever it is: the
+        // standard places are the program-files directory's `PowerShell` and the Store's own
+        // alias directory, exactly, and nothing under or beside them.
+        let seven_zip = absolute("Programs").join("7-Zip").join("pwsh.exe");
+        let seven_tools = absolute("7-tools").join("pwsh.exe");
+        let below_the_aliases = absolute("Users")
+            .join("someone")
+            .join("Microsoft")
+            .join("WindowsApps")
+            .join("sub")
+            .join("pwsh.exe");
+        for refused in [
+            six,
+            elsewhere,
+            another_stores_alias,
+            beside_the_seven,
+            seven_zip,
+            seven_tools,
+            below_the_aliases,
+        ] {
             assert_eq!(
                 windows_default(
                     &on_the_path(places(), &refused),
@@ -407,6 +447,102 @@ mod tests {
             r"C:\Windows\System32\cmd.exe",
             "a system that names no directory of its own still gets the standard one"
         );
+    }
+
+    /// KR-REQ-03.03: a command interpreter that is a relative name is not taken even when a file by
+    /// that name is there, and the interpreter the system names never comes before PowerShell.
+    #[test]
+    fn the_interpreter_the_system_names_is_taken_only_as_the_last_resort_and_only_by_a_full_path() {
+        let relative = |interpreter: &str| WindowsPlaces {
+            command_interpreter: Some(interpreter.to_owned()),
+            ..places()
+        };
+        for value in [r".\planted.exe", "cmd.exe", "planted.exe"] {
+            assert_eq!(
+                windows_default(&relative(value), present(&[PathBuf::from(value)])),
+                system_command_interpreter(),
+                "{value} is a file that is there, and it is not a full path"
+            );
+        }
+        let interpreter = PathBuf::from(places().command_interpreter.expect("one is named"));
+        for powershell in [installed(), five()] {
+            assert_eq!(
+                windows_default(
+                    &places(),
+                    present(&[interpreter.clone(), powershell.clone()])
+                ),
+                powershell.to_str().unwrap(),
+                "the interpreter the system names comes after PowerShell"
+            );
+        }
+        let relative_root = WindowsPlaces {
+            system_root: Some(PathBuf::from("System")),
+            command_interpreter: None,
+            ..places()
+        };
+        let relative_five = PathBuf::from("System")
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        assert_eq!(
+            windows_default(&relative_root, present(&[relative_five])),
+            r"C:\Windows\System32\cmd.exe",
+            "a relative system directory is neither searched nor used for the interpreter"
+        );
+    }
+
+    /// KR-REQ-03.03: the system directory is the first of `SystemRoot` and `windir` that is an
+    /// absolute path.
+    #[test]
+    fn the_system_directory_is_read_from_the_first_absolute_variable() {
+        let variables = |pairs: Vec<(&'static str, PathBuf)>| {
+            WindowsPlaces::from_variables(move |name| {
+                pairs
+                    .iter()
+                    .find(|(candidate, _)| *candidate == name)
+                    .map(|(_, value)| value.clone().into_os_string())
+            })
+        };
+        let root = absolute("Real");
+        assert_eq!(
+            variables(vec![("windir", root.clone())]).system_root,
+            Some(root.clone()),
+            "windir stands in for a SystemRoot that is not set"
+        );
+        assert_eq!(
+            variables(vec![
+                ("SystemRoot", PathBuf::from("relative")),
+                ("windir", root.clone())
+            ])
+            .system_root,
+            Some(root.clone()),
+            "a relative SystemRoot does not stop windir being read"
+        );
+        assert_eq!(
+            variables(vec![("SystemRoot", PathBuf::from("relative"))]).system_root,
+            None
+        );
+        assert_eq!(
+            variables(vec![("SystemRoot", absolute("Other")), ("windir", root)]).system_root,
+            Some(absolute("Other")),
+            "SystemRoot comes first"
+        );
+    }
+
+    /// The shell a session starts is the request's, else the configured one, else the platform's.
+    #[test]
+    fn a_request_names_the_shell_before_the_configured_one_and_that_before_the_platforms() {
+        let platform = || "/platform/shell".to_owned();
+        assert_eq!(
+            choose(Some("/requested"), Some("/configured".to_owned()), platform),
+            "/requested"
+        );
+        assert_eq!(
+            choose(None, Some("/configured".to_owned()), platform),
+            "/configured"
+        );
+        assert_eq!(choose(None, None, platform), "/platform/shell");
     }
 
     /// KR-REQ-03.03: an empty or relative search-path entry is not the directory the worker runs
