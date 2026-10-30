@@ -478,18 +478,19 @@ release that does not know it leaves it alone.
 
 If the verified matrix lists no tier for the build this daemon is, the host asks the lease service
 for no new lease and no pairing admission, and the owner is told: the `release-matrix` check warns
-and names the paths that still work, and the `relay-leases` check warns that new leases are
-refused, naming the paths the host can use: a host with `network.relay_only` is offered a relay of
-its own and never a direct connection. A lease the host holds is still refilled, so a route that works stays up. The refusal holds
-the keeper's next requests for five minutes, refills included, and a refill falls due with ten
-minutes of a fifteen-minute lease left, so no lease runs out for it. Sessions, workers, grants, direct connections and the `kr host update` command are not
-touched. A copy another package version read is not acted on as a skew: after an update the held
+and names the paths that still work, and the `relay-leases` check warns that new leases are refused,
+naming the paths the host can use: a host with `network.relay_only` is offered a relay of its own
+and never a direct connection. A lease the host holds is still refilled, so a route that works stays
+up. The refusal holds the keeper's next requests for five minutes, refills included, and a refill
+falls due with ten minutes of a fifteen-minute lease left, so no lease runs out for it. Sessions,
+workers, grants, direct connections and the `kr host update` command are not touched.
+A copy another package version read is not acted on as a skew: after an update the held
 copy usually predates the build, and until a read for the new build succeeds the check says it has
 not been read for this build.
 
 What the host does not do is stop on a matrix it cannot trust. A reply that does not verify, one
-below the first revision the build reads (the service published revision 1 before it listed any
-build of this product, and a host with no copy would take it from a service rolled back to it), one
+below the first revision the build reads (a service rolled back to a matrix that lists no build
+of this product would otherwise close the gate of a host with no copy), one
 older than the copy held, one with the held revision and other content, and a service that does not
 answer leave the held copy deciding, or, with none held, leave the host asking nothing of the matrix.
 The check says which of these happened and that the host asks again by itself.

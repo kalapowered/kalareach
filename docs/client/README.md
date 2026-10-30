@@ -1521,15 +1521,15 @@ about a build.
 
 `HeldMatrix` keeps the newest accepted copy. A higher revision replaces it, the same revision with
 the same signed bytes refreshes the read time and the build that read it, and a lower revision, or
-the same revision over other bytes, is refused with the copy untouched. The pins also carry the first
-revision a build reads, `PRODUCTION_FIRST_REVISION` (2) for the managed service: revision 1 listed
-clients up to 0.4.99 and so no build of this product, and a host with no copy would take it from a
-service rolled back to it and close its lease gate. A reply below the first revision is refused as
-`Refusal::BelowFirst`, whether or not a copy is held, and a kept copy below it is no copy. A service a
-person runs for themselves may start at revision 1. `Document::serve` chooses
-the first tier, in the signed order, whose client range holds the build's package version. A build
-in no tier gets a `RouteError`: `UNSUPPORTED_CAPABILITY`, the revision, and the signed alternatives
-this client knows, each in its own words, with `direct` left out for a host that only uses relays.
+the same revision over other bytes, is refused with the copy untouched. The pins also carry the
+first revision a build reads, `PRODUCTION_FIRST_REVISION` for the managed service. A host with no
+copy takes the first verified reply it reads, so a service rolled back to a revision that lists no
+build of this product would close its lease gate. A reply below the first revision is refused as
+`Refusal::BelowFirst`, whether or not a copy is held, and a kept copy below it is no copy.
+`Document::serve` chooses the first tier, in the signed order, whose client range holds the build's
+package version. A build in no tier gets a `RouteError`: `UNSUPPORTED_CAPABILITY`, the revision, and
+the signed alternatives this client knows, each in its own words, with `direct` left out for a host
+that only uses relays.
 
 `ReleaseGate` is what the managed relay lease service and the pairing admission ask before they
 send a request that takes a new lease (`gated_by`). It is closed only for a skew that a verified

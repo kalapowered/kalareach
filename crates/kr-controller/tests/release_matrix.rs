@@ -415,8 +415,15 @@ impl Rig {
     }
 
     /// What the host says of its authority and of one session's worker, in the answers of
-    /// `host.info`, `grant.list`, `device.list` and `session.read`. Nothing in it moves with time.
-    async fn standing_of(&self, session_id: SessionId) -> Value {
+    /// `host.info`, `grant.list`, `device.list` and `session.read`: the controller generation, the
+    /// grants, the row of the device `device`, the worker's epoch, state and root process, and, when
+    /// `with_revision` is set, the authority revision. Nothing in it moves with time.
+    async fn standing_of(
+        &self,
+        session_id: SessionId,
+        device: kr_protocol::ids::DeviceId,
+        with_revision: bool,
+    ) -> Value {
         let mut local = self.host.client().await;
         let info: HostInfoResult = net_support::pairing::read(&mut local, Method::HostInfo, &())
             .await
@@ -440,6 +447,10 @@ impl Rig {
         )
         .await
         .expect("device.list");
+        let row = devices
+            .devices
+            .iter()
+            .find(|summary| summary.device_id == device);
         let worker = match self.session_of(session_id).await {
             Ok(read) => json!({
                 "epoch": read.session.session_epoch,
@@ -454,7 +465,8 @@ impl Rig {
             "started_at_ms": info.started_at_ms,
             "live_sessions": info.live_sessions,
             "grants": grants,
-            "devices": devices,
+            "device": row,
+            "authority_revision": with_revision.then_some(devices.authority_revision),
             "worker": worker,
         })
     }
@@ -609,20 +621,23 @@ async fn a_skewed_host_is_refused_new_leases_keeps_its_working_route_and_gets_ne
 }
 
 /// KR-REQ-17.46: a skew never resets host authority and never ends a worker. A host runs a real
-/// session worker and has a device paired; the matrix drops its build and the gate closes; what
-/// `host.info`, `grant.list`, `device.list` and `session.read` say of the controller generation, the
-/// grants (a share of the session to the paired device), the authority revision and the worker's epoch, state and root process is what they said
-/// before, and the device's connection is served. The matrix that lists the build gives the same
-/// answers again. The comparison is shown to see a change: a grant withdrawn makes it differ, and so
-/// does a worker that ends.
+/// session worker and has a device paired and a session shared with it. The matrix drops the
+/// host's build and the gate closes. A device paired under the closed gate meets the refusal: no
+/// lease request for it leaves the host. What `host.info`, `grant.list`, `device.list` and
+/// `session.read` say of the controller generation, the grants, the first device's row and the
+/// worker's epoch, state and root process is what they said before the skew; the first device is
+/// served on the connection it had; and the answers, with the authority revision, are the same
+/// again when a revision that lists the build reopens the gate. The comparison is shown to see a
+/// change: a grant withdrawn makes it differ, and so does a worker that ends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_skew_leaves_the_hosts_authority_and_its_session_worker_as_they_were() {
     let rig = Rig::start(Some(&supporting("2"))).await;
     let (rig, worker) = rig.with_a_session_worker().await;
+    let session_id = worker.session_id;
     let (device, record) = rig.pairs().await;
     let share = net_support::worker::share(
         &rig.host,
-        worker.session_id,
+        session_id,
         &device,
         &record,
         kr_protocol::sharing::RoleSelection::plain(kr_protocol::sharing::SessionRole::Viewer),
@@ -639,9 +654,9 @@ async fn a_skew_leaves_the_hosts_authority_and_its_session_worker_as_they_were()
         gate.closed().is_none(),
         "a build the matrix lists is served"
     );
-    let before = rig.standing_of(worker.session_id).await;
+    let before = rig.standing_of(session_id, record.device_id, false).await;
     let running = rig
-        .session_of(worker.session_id)
+        .session_of(session_id)
         .await
         .expect("the session is served")
         .session;
@@ -660,32 +675,48 @@ async fn a_skew_leaves_the_hosts_authority_and_its_session_worker_as_they_were()
         DoctorStatus::Warning
     );
 
+    // A device paired now meets the closed gate: the keeper's pass sends nothing for it.
+    let (_other_device, other) = rig.pairs().await;
+    rig.pass().await;
+    assert!(!rig.holds(&other));
+    assert_eq!(
+        rig.requests_for(&other),
+        0,
+        "no lease request left the host"
+    );
+
     // Nothing the host says of its authority or of the worker has moved, and the device that was
     // paired before is served on the connection it had.
-    assert_eq!(rig.standing_of(worker.session_id).await, before);
+    assert_eq!(
+        rig.standing_of(session_id, record.device_id, false).await,
+        before
+    );
     let doctor: HostDoctorResult = session
         .read(Method::HostDoctor, &())
         .await
         .expect("the device is still served");
     assert!(!doctor.checks.is_empty());
+    let closed = rig.standing_of(session_id, record.device_id, true).await;
 
     // A revision that lists the build opens the gate, and the answers are the same again.
     rig.publish(&supporting("4"));
     rig.the_matrix_is_read_again().await;
     assert!(gate.closed().is_none());
-    assert_eq!(rig.standing_of(worker.session_id).await, before);
+    assert_eq!(
+        rig.standing_of(session_id, record.device_id, true).await,
+        closed
+    );
 
     // The comparison sees what it claims to: a grant withdrawn changes the answers.
     net_support::worker::revoke(&rig.host, share.grant_id).await;
-    let after_revoking = rig.standing_of(worker.session_id).await;
-    assert_ne!(after_revoking["grants"], before["grants"]);
+    let after_revoking = rig.standing_of(session_id, record.device_id, true).await;
+    assert_ne!(after_revoking["grants"], closed["grants"]);
 
     // And a worker that ends: the daemon no longer reports the worker it reported.
-    let session_id = worker.session_id;
     worker.stop().await;
     assert_ne!(
-        rig.standing_of(session_id).await["worker"],
-        before["worker"]
+        rig.standing_of(session_id, record.device_id, true).await["worker"],
+        closed["worker"]
     );
 }
 
@@ -726,6 +757,7 @@ async fn a_first_publication_below_the_first_revision_a_host_reads_gates_nothing
 async fn a_skewed_host_is_offered_only_the_paths_it_can_use() {
     for relay_only in [false, true] {
         let rig = Rig::start_configured(1, relay_only, Some(&skewing("2")), None).await;
+        rig.until_a_matrix_pass(1).await;
         let (_device, record) = rig.pairs().await;
         rig.pass().await;
         assert_eq!(rig.requests_for(&record), 0, "the gate is closed");
