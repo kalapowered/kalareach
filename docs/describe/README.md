@@ -141,7 +141,9 @@ the state is `resource_paused`, the reason is named, and the deterministic title
 - **Battery** pauses inference by default. A host that cannot read its own power source is treated
   as being on battery, because it has not been told otherwise. On Linux that includes a host with a
   power supply it will not describe and no mains supply online: the supply may be the battery, so
-  the source is unknown rather than mains.
+  the source is unknown rather than mains. A battery that belongs to a peripheral (the kernel's
+  scope `Device`, such as a wireless mouse or a phone on a cable) is not the host's power and is
+  left out.
 - **Thermal or memory pressure** pauses it even on mains. Heat is read from what each platform
   reports: the system's thermal pressure level on macOS, on Intel and on Apple silicon alike
   (nominal reads as cool, moderate as elevated, and heavy or beyond as critical), the passive limit
@@ -163,9 +165,10 @@ happen. A job that held its process past the ceiling without ever finishing is e
 reading alone, publishes nothing, is not queued again, and pauses inference the same way.
 
 The first reading of a load or a job is due one reading period (one second) after it starts, and
-each later one a period after the last. A process that passes the ceiling is therefore ended by the
-first reading taken after it did, and it can stay over the ceiling for at most one period plus the
-time the daemon takes to run the turn that reads it. That bound is in time: the daemon does not
+each later one a period after the last, until the work answers. A process that passes the ceiling
+while it works is therefore ended by the first reading taken after it did, and it can stay over the
+ceiling for at most one period plus the time the daemon takes to run the turn that reads it. Nothing
+reads the process between jobs or while it checks a file. The bound is in time: the daemon does not
 bound how much memory a process adds in that period. What keeps the growth small is the process's
 own check between tokens, which looks at its resident set every eight tokens, and the admission of
 a profile only when its itemised cost fits under the ceiling.
@@ -179,10 +182,13 @@ On macOS and Linux no operating-system limit backs either figure: the daemon's r
 process's own check are the whole mechanism. On Windows the daemon also puts the process in a job
 object whose per-process limit on committed memory is the ceiling in force when the process starts,
 and counts the limit applied only when the system reads it back and reports the process in the job.
-A commit past the limit is refused by the system, and a runtime that cannot allocate ends. When the
-process closes its end, the daemon asks the job whether it refused a commit, and if it did the
-process ended for memory: inference pauses with `memory_pressure` as it does for a reading past the
-ceiling, and the job is not retried. The limit is on committed memory and not on the resident set,
+A commit past the limit is refused by the system. A runtime that cannot allocate ends, and one that
+catches the failed allocation answers that its load or job failed and goes on. The daemon asks the
+job when the process closes its end, when its frames stop short, and when it answers that a load
+or a job failed. If the job recorded a refused commit, the process ended for memory: it is ended,
+inference pauses with `memory_pressure` as it does for a reading past the ceiling, and the job is
+not retried. Windows does not promise to deliver the job's message, so a refusal that was not
+recorded reads as an ordinary end or an ordinary failure. The limit is on committed memory and not on the resident set,
 so it does not count the weights a model maps for reading, and the daemon's reading stays the
 measure of the resident set. A host that will not apply the limit says so on its standard error
 and keeps the daemon's reading as the only ender.

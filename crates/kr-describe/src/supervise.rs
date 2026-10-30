@@ -796,20 +796,21 @@ impl Driver {
         .ok()
     }
 
-    /// How a process that closed its end ended: one that the system refused memory past its limit
-    /// ended for memory, and the rest ended as they said.
-    fn how_it_ended(&self, why: ProcessEnd) -> ProcessEnd {
+    /// Whether the operating system refused the process memory since it was last asked, and
+    /// forgets it. A refusal belongs to the next thing the process does: the end it comes to, or
+    /// the answer it gives, and not to a later end that has another cause.
+    fn the_system_refused_memory(&self) -> bool {
         #[cfg(windows)]
-        if why == ProcessEnd::Exited
-            && self
-                .process
+        {
+            self.process
                 .as_ref()
                 .and_then(|running| running.system_limit.as_ref())
-                .is_some_and(kr_ipc::memory_limit::MemoryLimit::reached)
-        {
-            return ProcessEnd::MemoryCeiling;
+                .is_some_and(kr_ipc::memory_limit::MemoryLimit::take_refusal)
         }
-        why
+        #[cfg(not(windows))]
+        {
+            false
+        }
     }
 
     /// Hands one frame to the writer, or says why the process is not taking it.
@@ -865,7 +866,6 @@ impl Driver {
             Event::Wake => {}
             Event::Closed { tag, why } => {
                 if Some(tag) == current {
-                    let why = self.how_it_ended(why);
                     self.kill(why, now, reports)?;
                 }
             }
@@ -962,6 +962,16 @@ impl Driver {
                     if running.cancel.is_some_and(|cancel| cancel.id == id) {
                         running.cancel = None;
                     }
+                    // A runtime that catches a failed allocation answers that it failed and goes
+                    // on. When the system refused it the memory, that is the ceiling, and the
+                    // process ends for it: the work is failed and not tried again, and inference
+                    // pauses, as it does when the daemon's own reading finds the process over.
+                    // Asked of every answer, so that a refusal the runtime got over is forgotten
+                    // and is not taken for the cause of a later end.
+                    let refused = self.the_system_refused_memory();
+                    if refused && the_work_failed(&answer) {
+                        return self.kill(ProcessEnd::MemoryCeiling, now, reports);
+                    }
                 }
                 // An answer from a process that has been ended is still given to the service,
                 // which drops it: its work ended with the process.
@@ -1013,6 +1023,15 @@ impl Driver {
     fn kill(&mut self, why: ProcessEnd, now: Reading, reports: &mut Vec<Report>) -> Result<()> {
         let Some(running) = self.process.as_ref() else {
             return Ok(());
+        };
+        // A process that closed its end, or whose frames stopped in the middle, while the system
+        // had refused it memory, ended for memory. The ends the daemon decides itself are its own.
+        let why = if matches!(why, ProcessEnd::Exited | ProcessEnd::BrokenWire)
+            && self.the_system_refused_memory()
+        {
+            ProcessEnd::MemoryCeiling
+        } else {
+            why
         };
         let checking = running.check.map(|due| due.id);
         self.kill_only();
@@ -1110,6 +1129,21 @@ fn answered(answer: Answer) -> Answered {
             }
         }
     }
+}
+
+/// Whether an answer says that a load or a job failed in the runtime, which is the ending a
+/// refused allocation comes to in a runtime that catches it.
+const fn the_work_failed(answer: &Answer) -> bool {
+    matches!(
+        answer,
+        Answer::LoadEnded {
+            why: crate::wire::LoadEnd::Failed,
+            ..
+        } | Answer::Ended {
+            why: crate::wire::JobEnd::Failed,
+            ..
+        }
+    )
 }
 
 /// Returns a process's resident set, when the platform will say.

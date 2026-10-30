@@ -3,10 +3,15 @@
 //!
 //! Windows has no call that ends a process for the memory it holds. A job object can refuse the
 //! commit that would pass a limit, and say that it did: the process's allocation fails, the process
-//! deals with that as it does (a runtime that cannot allocate ends), and the job posts a message to
-//! the completion port it was given. [`MemoryLimit`] is that job, with that port, around one
-//! process. It is the system's own backstop behind a reading of the process's resident set that
-//! somebody else takes at intervals.
+//! deals with that as it does (a runtime that cannot allocate ends, and one that catches the
+//! failure answers that it failed and goes on), and the job posts a message to the completion port
+//! it was given. [`MemoryLimit`] is that job, with that port, around one process. It is the
+//! system's own backstop behind a reading of the process's resident set that somebody else takes at
+//! intervals.
+//!
+//! The message is the only record of a refusal, and Windows does not promise to deliver it for a
+//! limit of this kind. A refusal that was not recorded reads as an ordinary end of the process, so
+//! an absent message is not proof that no commit was refused.
 //!
 //! The limit is on committed memory: the private memory the process asked the system to back,
 //! touched or not. A file mapped for reading is not committed, so the limit does not count the
@@ -26,8 +31,7 @@
     reason = "creating a job object with a completion port and moving a process into it have no safe form"
 )]
 
-use std::os::windows::io::{FromRawHandle as _, OwnedHandle, RawHandle};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::os::windows::io::{AsRawHandle as _, BorrowedHandle, FromRawHandle as _, OwnedHandle};
 
 use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::IO::{CreateIoCompletionPort, GetQueuedCompletionStatus};
@@ -58,9 +62,6 @@ pub struct MemoryLimit {
     /// Where the job posts that a process in it passed the limit.
     port: OwnedHandle,
     limit_bytes: u64,
-    /// Whether a message that the limit was passed has been taken from the port. A message is taken
-    /// once, so what it said is kept.
-    reached: AtomicBool,
 }
 
 impl MemoryLimit {
@@ -69,13 +70,16 @@ impl MemoryLimit {
     /// allowed to differ from the one asked for by the rounding the system applies to it.
     ///
     /// The handle must be open on the process with the right to set its quota and to terminate it,
-    /// as the one a parent holds of the child it started is.
+    /// as the one a parent holds of the child it started is, and it stays open for the call.
     ///
     /// # Errors
     ///
     /// Returns why the limit was not applied: the system refused one of the calls, or reported a
     /// limit or a membership other than the one asked for.
-    pub fn around(process: RawHandle, limit_bytes: u64) -> std::result::Result<Self, Refusal> {
+    pub fn around(
+        process: BorrowedHandle<'_>,
+        limit_bytes: u64,
+    ) -> std::result::Result<Self, Refusal> {
         let wanted = usize::try_from(limit_bytes)
             .map_err(|_| "the memory limit is more than this platform addresses")?;
         // SAFETY: the call takes no pointer to memory of this process other than two null
@@ -95,8 +99,8 @@ impl MemoryLimit {
         // SAFETY: the handle was just returned by the call above and nothing else owns it.
         let port = unsafe { OwnedHandle::from_raw_handle(port.cast()) };
 
-        let raw_job: HANDLE = std::os::windows::io::AsRawHandle::as_raw_handle(&job).cast();
-        let raw_port: HANDLE = std::os::windows::io::AsRawHandle::as_raw_handle(&port).cast();
+        let raw_job: HANDLE = job.as_raw_handle().cast();
+        let raw_port: HANDLE = port.as_raw_handle().cast();
         let association = JOBOBJECT_ASSOCIATE_COMPLETION_PORT {
             CompletionKey: std::ptr::null_mut(),
             CompletionPort: raw_port,
@@ -114,8 +118,7 @@ impl MemoryLimit {
             return Err("this host would not tie the job to its completion port");
         }
 
-        // SAFETY: the structure is plain data, for which all zeroes is a valid value.
-        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
         limits.ProcessMemoryLimit = wanted;
         // SAFETY: the call reads one structure of the size given, from a live local.
@@ -131,8 +134,7 @@ impl MemoryLimit {
             return Err("this host refused the process memory limit");
         }
 
-        // SAFETY: the structure is plain data, for which all zeroes is a valid value.
-        let mut held: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        let mut held = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         // SAFETY: the call writes one structure of the size given, through a pointer to a live
         // local, and nothing else of this process.
         let read = unsafe {
@@ -151,7 +153,7 @@ impl MemoryLimit {
             return Err("this host did not report the memory limit it was given");
         }
 
-        let process: HANDLE = process.cast();
+        let process: HANDLE = process.as_raw_handle().cast();
         // SAFETY: the call takes two handles, which the caller and this function hold open.
         if unsafe { AssignProcessToJobObject(raw_job, process) } == 0 {
             return Err("this host would not put the process in the job");
@@ -166,7 +168,6 @@ impl MemoryLimit {
             _job: job,
             port,
             limit_bytes,
-            reached: AtomicBool::new(false),
         })
     }
 
@@ -176,13 +177,16 @@ impl MemoryLimit {
         self.limit_bytes
     }
 
-    /// Whether the system refused the process a commit because it would have passed the limit.
+    /// Whether the job has recorded that the system refused the process a commit because it would
+    /// have passed the limit since this was last asked, and forgets it.
     ///
-    /// It reads what the job has posted, without waiting, so a process that has ended has said
-    /// everything it will. Once true it stays true.
+    /// It reads what the job has posted, without waiting. The system posts the message inside the
+    /// refused call, before that call returns, so a process that has ended has posted everything it
+    /// will. The message is not promised, though: false means none was seen.
     #[must_use]
-    pub fn reached(&self) -> bool {
-        let raw_port: HANDLE = std::os::windows::io::AsRawHandle::as_raw_handle(&self.port).cast();
+    pub fn take_refusal(&self) -> bool {
+        let raw_port: HANDLE = self.port.as_raw_handle().cast();
+        let mut refused = false;
         loop {
             let mut message = 0_u32;
             let mut key = 0_usize;
@@ -199,13 +203,12 @@ impl MemoryLimit {
                 )
             };
             if taken == 0 {
-                break;
+                return refused;
             }
             if message == JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT {
-                self.reached.store(true, Ordering::Release);
+                refused = true;
             }
         }
-        self.reached.load(Ordering::Acquire)
     }
 }
 
@@ -217,7 +220,7 @@ fn size_of<T>(value: &T) -> u32 {
 #[cfg(test)]
 mod tests {
     use std::io::{BufRead as _, Write as _};
-    use std::os::windows::io::AsRawHandle as _;
+    use std::os::windows::io::AsHandle as _;
     use std::process::{Command, Stdio};
 
     use super::MemoryLimit;
@@ -273,15 +276,15 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("the child starts");
-        let limit = MemoryLimit::around(child.as_raw_handle(), limit_bytes)
+        let limit = MemoryLimit::around(child.as_handle(), limit_bytes)
             .expect("the limit is applied to the child");
         assert_eq!(limit.limit_bytes(), limit_bytes);
-        assert!(!limit.reached(), "nothing has been asked yet");
+        assert!(!limit.take_refusal(), "nothing has been asked yet");
         let mut input = child.stdin.take().expect("the child's input");
         input.write_all(b"go\n").expect("the child is waiting");
         drop(input);
         let ended = child.wait().expect("the child ends");
-        (ended.code(), limit.reached())
+        (ended.code(), limit.take_refusal())
     }
 
     /// A process behind the limit that commits more than it allows is refused by the system, and
