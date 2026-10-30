@@ -3481,14 +3481,98 @@ mod tests {
     /// A key going down at the console, as the case types it.
     #[cfg(unix)]
     fn key_down(code: u8) -> crate::attach::TerminalInput {
+        key_going(code, true)
+    }
+
+    /// A key coming up at the console, as the case types it.
+    #[cfg(unix)]
+    fn key_up(code: u8) -> crate::attach::TerminalInput {
+        key_going(code, false)
+    }
+
+    #[cfg(unix)]
+    fn key_going(code: u8, key_down: bool) -> crate::attach::TerminalInput {
         crate::attach::TerminalInput::Keys(vec![kr_term::win32::KeyRecord {
             virtual_key: u16::from(code),
             scan_code: 0,
             unicode: u16::from(code.to_ascii_lowercase()),
-            key_down: true,
+            key_down,
             control_keys: 0,
             repeat: 1,
         }])
+    }
+
+    /// The virtual key and direction of each record of a write of console keys.
+    #[cfg(unix)]
+    fn records_of(content: &kr_protocol::input::InputContent) -> Vec<(u16, bool)> {
+        match content {
+            kr_protocol::input::InputContent::ConsoleKeys { keys } => keys
+                .iter()
+                .map(|key| (key.virtual_key, key.key_down))
+                .collect(),
+            other => panic!("not a write of console keys: {other:?}"),
+        }
+    }
+
+    /// A key that came up at the console after going down before this command read it, the Return
+    /// that started the command among them, is not sent: it never went down in the session. The
+    /// release of a key this attachment did see go down is.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_loop_sends_no_release_for_a_key_whose_press_it_did_not_see() {
+        const RETURN: u8 = 0x0d;
+        let ran = wire::run_switched(true, true, |mut case| async move {
+            case.types_without_waiting(key_up(RETURN));
+            let pressed = case.types(key_down(b'A')).await;
+            assert_eq!(
+                (pressed.sequence, records_of(&pressed.content)),
+                (0, vec![(u16::from(b'A'), true)]),
+                "the first write is the press: the release of the Return was dropped"
+            );
+            case.takes(&pressed);
+            let released = case.types(key_up(b'A')).await;
+            assert_eq!(
+                (released.sequence, records_of(&released.content)),
+                (1, vec![(u16::from(b'A'), false)]),
+                "a key seen going down is sent coming up"
+            );
+            case.takes(&released);
+            case.hangs_up();
+        })
+        .await;
+        assert!(
+            matches!(ran.outcome, AttachOutcome::Detached),
+            "{:?}",
+            ran.outcome
+        );
+    }
+
+    /// A session that refuses a release first, and refuses a key pressed after it, is a session
+    /// that lost typing: the refusal of the release began the closing, and the press was refused
+    /// while the attachment was already closing.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_press_refused_after_a_release_by_a_closing_session_is_said_to_be_undelivered() {
+        let outcome = wire::run(true, |mut case| async move {
+            let pressed = case.types(key_down(b'A')).await;
+            let released = case.types(key_up(b'A')).await;
+            let behind = case.types(key_down(b'B')).await;
+            case.takes(&pressed);
+            case.refuses(&released, ErrorCode::SessionClosed);
+            case.refuses(&behind, ErrorCode::SessionClosed);
+            case.closes();
+        })
+        .await;
+        assert!(
+            matches!(
+                outcome,
+                AttachOutcome::Closed {
+                    undelivered: true,
+                    ..
+                }
+            ),
+            "the press refused behind the release was typing lost: {outcome:?}"
+        );
     }
 
     /// A closure this build cannot read ends the attachment as a failure: the session ended, and
