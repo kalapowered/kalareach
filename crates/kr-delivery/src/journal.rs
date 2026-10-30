@@ -2820,9 +2820,21 @@ impl DeliveryJournal {
     ///
     /// Section 24: already-sent notifications and already-delivered external messages are not
     /// retroactively erased. They are shown as retained artifacts, with a separately authorised
-    /// deletion action; `deletable` says whether this host holds a way to ask
-    /// (which `gateway_can_be_asked_about` decides), not that asking will succeed and not that no other
-    /// copy exists.
+    /// deletion action; `deletable` says whether this host holds a way to ask (which
+    /// `the_gateway_may_hold` and the destination decide), not that asking will succeed and not
+    /// that no other copy exists.
+    ///
+    /// A notification to a paired device is listed when the gateway took it or may have, whatever
+    /// its state (a notification the gateway is retrying that this host only reads the decision
+    /// of, or one a gateway answer settled after the content was dispatched, has no mailbox
+    /// detail to be listed by), and otherwise only when its detail may be in the device's mailbox.
+    /// An external message is listed when its destination took it, called it a duplicate or left
+    /// it unknown.
+    ///
+    /// A listed notification is deletable only while its destination is still a push destination
+    /// with a rule: unpairing removes the credential the request is made under, and a removed
+    /// destination is kept as history with no rule. An external message is in somebody else's
+    /// service, which this host has no route to ask.
     ///
     /// Each one carries the notification and destination it is a copy of. That is what a deletion
     /// action addresses: the action is authorised separately from the pass that produced the copy,
@@ -2844,6 +2856,7 @@ impl DeliveryJournal {
                LEFT JOIN delivery_outbox o ON o.notification_id = n.notification_id
               WHERE n.state IN ('accepted', 'duplicate', 'duplicate_uncertain', 'outcome_unknown')
                  OR n.detail_left <> 0
+                 OR (n.destination_kind = 'push' AND n.dispatched <> 0)
               GROUP BY n.notification_id
               ORDER BY n.admitted_at_ms",
         )?;
@@ -2868,11 +2881,18 @@ impl DeliveryJournal {
                 DeliveryState::from_stored(&state).ok_or(DeliveryError::JournalUnreadable(
                     "a stored delivery state is not one this build writes",
                 ))?;
-            let state = state.as_str();
             let kind =
                 DestinationKind::from_stored(&kind).ok_or(DeliveryError::JournalUnreadable(
                     "a stored destination kind is not one this build writes",
                 ))?;
+            // The query reads every push notification this host dispatched. One the gateway
+            // cannot hold is listed only for the detail it left in a mailbox.
+            let gateway_may_hold = matches!(kind, DestinationKind::Push)
+                && the_gateway_may_hold(state, dispatched != 0, next.as_deref());
+            if matches!(kind, DestinationKind::Push) && !gateway_may_hold && detail_left == 0 {
+                continue;
+            }
+            let state = state.as_str();
             exported.push(ExportedDelivery {
                 notification_id: identifier.parse().map_err(|_| {
                     DeliveryError::JournalUnreadable(
@@ -2893,15 +2913,14 @@ impl DeliveryJournal {
                     )
                 },
                 left_at_ms: TimestampMs::new(as_u64(left_at)),
-                deletable: matches!(kind, DestinationKind::Push)
-                    && the_gateway_can_be_asked_about(
-                        state,
-                        dispatched != 0,
-                        next.as_deref(),
-                        destinations
-                            .iter()
-                            .find(|record| record.id.as_str() == destination),
-                    ),
+                deletable: gateway_may_hold
+                    && destinations
+                        .iter()
+                        .find(|record| record.id.as_str() == destination)
+                        .is_some_and(|record| {
+                            matches!(record.destination, Destination::Push(_))
+                                && record.rule.is_some()
+                        }),
             });
         }
         Ok(exported)
@@ -4584,8 +4603,8 @@ const SCHEMA: &str = "
         ON delivery_events (produced, taken_seq);
 ";
 
-/// Whether this host can ask the push gateway to delete what it holds for a notification in
-/// `state` whose destination is `destination`, and whether asking would stop it.
+/// Whether the push gateway holds a record of a notification in `state`, or may, and this host is
+/// not going to present it again.
 ///
 /// The gateway holds a record of a notification it was given, and a host can ask it to delete what
 /// it still holds. So the notification must have reached the gateway or may have, and this host
@@ -4597,20 +4616,8 @@ const SCHEMA: &str = "
 /// wire, or retrying with another send to come is not. Neither is one that settled without the
 /// gateway having it, which has nothing there to delete, nor the detail a notification left in a
 /// mailbox, which the device removes when it acknowledges it.
-///
-/// The destination must still be a push destination with a rule: unpairing removes the credential
-/// the request is made under, and a removed destination is kept as history with no rule. An
-/// external message is in somebody else's service, which this host has no route to ask.
-fn the_gateway_can_be_asked_about(
-    state: &str,
-    dispatched: bool,
-    next_action: Option<&str>,
-    destination: Option<&DestinationRecord>,
-) -> bool {
-    let Some(state) = DeliveryState::from_stored(state) else {
-        return false;
-    };
-    let reached_the_gateway = match state {
+fn the_gateway_may_hold(state: DeliveryState, dispatched: bool, next_action: Option<&str>) -> bool {
+    match state {
         DeliveryState::Accepted
         | DeliveryState::Duplicate
         | DeliveryState::DuplicateUncertain
@@ -4625,11 +4632,7 @@ fn the_gateway_can_be_asked_about(
             dispatched && next_action == Some(crate::push::NextAction::Receipt.as_str())
         }
         DeliveryState::Admitted | DeliveryState::InFlight | DeliveryState::Cancelled => false,
-    };
-    reached_the_gateway
-        && destination.is_some_and(|record| {
-            matches!(record.destination, Destination::Push(_)) && record.rule.is_some()
-        })
+    }
 }
 
 #[cfg(test)]

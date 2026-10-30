@@ -611,16 +611,17 @@ mod tests {
     /// be sent, on the wire, or retrying with another send to come is listed (its detail is in a
     /// mailbox) and not offered: the gateway would answer that it holds nothing, which stops no
     /// send that is still to come. One the gateway is retrying that this host only reads the
-    /// decision of is offered, and so is one a gateway answer settled after the content left. One
-    /// of a device since unpaired is kept as history and not offered, because the credential it
-    /// is asked under is gone.
+    /// decision of is listed and offered, and so is one a gateway answer settled after the content
+    /// left, with no detail in a mailbox for either. One that settled without the content ever
+    /// leaving is not listed. One of a device since unpaired is kept as history and not offered,
+    /// because the credential it is asked under is gone.
     #[test]
     fn a_notification_is_offered_for_deletion_only_when_the_gateway_may_hold_it_for_a_paired_device()
      {
         use crate::push::NextAction;
 
         let mut journal = journal_with_work();
-        let ids: Vec<NotificationId> = (5..=10u8)
+        let ids: Vec<NotificationId> = (5..=11u8)
             .map(|byte| admit_to_the_phone(&mut journal, byte))
             .collect();
         let [
@@ -630,11 +631,15 @@ mod tests {
             read_back,
             refused,
             accepted,
+            never_sent,
         ] = ids[..]
         else {
-            panic!("six notifications");
+            panic!("seven notifications");
         };
-        for id in [waiting, on_the_wire, to_send_again, read_back, refused] {
+        // Only these three are in a mailbox. The others are listed by what the host does next
+        // and nothing else, since a notification the gateway holds has no mailbox detail to show
+        // for it.
+        for id in [waiting, on_the_wire, to_send_again] {
             journal.note_detail_left(id).expect("a mark");
         }
         // Claimed and not answered: an attempt is on the wire.
@@ -674,14 +679,27 @@ mod tests {
             true,
             NextAction::None,
         );
-        let deletable = |journal: &mut DeliveryJournal, id: NotificationId| {
+        // Refused before its content was ever handed over: the gateway never had it.
+        claim(&mut journal, 11 + 20, 1_500);
+        settle(
+            &mut journal,
+            never_sent,
+            DeliveryState::Refused,
+            false,
+            NextAction::None,
+        );
+        let listed = |journal: &mut DeliveryJournal, id: NotificationId| {
             let outbox = DeliveryOutbox::over(journal, 2_000);
-            let listed = outbox.exported().expect("a list");
-            let copy = listed
-                .iter()
+            outbox
+                .exported()
+                .expect("a list")
+                .into_iter()
                 .find(|copy| copy.reference.starts_with(&id.to_string()))
-                .unwrap_or_else(|| panic!("{id} is listed: {listed:?}"));
-            copy.deletable
+        };
+        let deletable = |journal: &mut DeliveryJournal, id: NotificationId| {
+            listed(journal, id)
+                .unwrap_or_else(|| panic!("{id} is listed"))
+                .deletable
         };
 
         assert!(!deletable(&mut journal, waiting), "it has not gone yet");
@@ -699,6 +717,10 @@ mod tests {
         );
         assert!(deletable(&mut journal, refused), "the gateway answered");
         assert!(deletable(&mut journal, accepted), "the gateway took it");
+        assert!(
+            listed(&mut journal, never_sent).is_none(),
+            "nothing of it left this host"
+        );
 
         journal
             .remove_destination(&DestinationId::new("phone").expect("an identifier"), 3_000)
