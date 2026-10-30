@@ -1070,3 +1070,65 @@ async fn a_failed_catalogue_action_does_not_show_a_device_where_the_generation_w
     raw.close();
     host.stop().await;
 }
+
+/// A catalogue action that fails without naming anything of the host is read back by the device that
+/// submitted it as the host wrote it, with nothing marked as withheld.
+///
+/// The action asks for a repository that was never enrolled, so the failure is the catalogue's own
+/// sentence and carries no path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_catalogue_action_that_names_nothing_of_the_host_is_read_back_whole() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let device = net_support::Device::create().await;
+    let record = net_support::pair_with(
+        &host,
+        &device,
+        &owner,
+        net_support::proposal(CATALOGUE_RIGHTS),
+    )
+    .await;
+    let raw = net_support::RawDevice::connect(&host, &device, &record).await;
+    raw.claim();
+    let environment_id = host.environment_id;
+    let sync = wire::CatalogueSyncParams {
+        environment_id,
+        catalogue_id: "never-enrolled".to_owned(),
+    };
+    let action_id = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
+    let told = net_support::refusal(
+        raw.mutate(
+            Method::CatalogueSync,
+            action_id,
+            ActionTarget::environment(environment_id),
+            &sync,
+        )
+        .await,
+    );
+    let read: kr_protocol::receipt::ActionReadResult = typed(
+        &raw.read(
+            Method::ActionRead,
+            &kr_protocol::receipt::ActionReadParams {
+                action_id,
+                session_id: None,
+            },
+        )
+        .await
+        .expect("action.read answers for a catalogue action"),
+    );
+    let recorded = read
+        .receipt
+        .error
+        .0
+        .clone()
+        .expect("the failure is recorded");
+    assert_eq!(recorded, told, "the receipt says what the answer said");
+    assert!(
+        !read.receipt.error_withheld,
+        "a message that names nothing of the host is not marked as withheld: {:?}",
+        read.receipt
+    );
+
+    raw.close();
+    host.stop().await;
+}

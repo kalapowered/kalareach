@@ -4559,4 +4559,73 @@ pub(crate) mod tests {
             "{shown:?}"
         );
     }
+
+    /// The pairing surface the transport is given for a candidate does not show it what this host's
+    /// own store reported.
+    ///
+    /// The store the invitations are read from stops answering, which a candidate meets as a
+    /// storage failure; the transport reaches the surface through the host's handler.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_pairing_surface_a_candidate_reaches_does_not_show_what_the_store_reported() {
+        use kr_protocol::envelope::ParamsValue;
+        use kr_protocol::error::ErrorCode;
+        use kr_protocol::ids::{ConnectionId, InvitationId};
+        use kr_protocol::preauth::PairRedeemParams;
+        use kr_protocol::scalars::EndpointKey;
+        use kr_transport::listener::HostHandler as _;
+        use kr_transport::preauth::{ConnectionPeer, PairingMethod};
+
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = daemon(&temp).await;
+        let network = super::register(
+            &controller,
+            super::NetworkSetup {
+                settings: super::config::NetworkSettings {
+                    endpoint: kr_transport::config::EndpointConfig {
+                        bind_addr: Some("127.0.0.1:0".parse().expect("a loopback address")),
+                        ..kr_transport::config::EndpointConfig::default()
+                    },
+                    ..super::config::NetworkSettings::default()
+                },
+                secrets: Arc::new(kr_crypto::store::MemoryStore::new()),
+                rendezvous: None,
+            },
+        )
+        .await
+        .expect("the daemon joins the network");
+
+        network
+            .guard
+            .host
+            .devices
+            .with(|connection| {
+                connection.execute_batch(
+                    "ALTER TABLE pairing_invitations RENAME TO pairing_invitations_gone",
+                )
+            })
+            .expect("the invitations are put out of reach");
+        let surface = network
+            .guard
+            .host
+            .pairing_surface()
+            .expect("this host serves pairing");
+        let peer = ConnectionPeer::new(
+            EndpointKey::from_bytes([1; 32]),
+            false,
+            ConnectionId::new(kr_ipc::new_uuid()),
+        );
+        let params = ParamsValue::from_typed(&PairRedeemParams::Challenge {
+            invitation_id: InvitationId::new(kr_ipc::new_uuid()),
+        })
+        .expect("encodes");
+        let told = surface
+            .call(PairingMethod::Redeem, &peer, &params)
+            .expect_err("the store does not answer");
+        assert_eq!(told.code, ErrorCode::StorageUnavailable, "{told:?}");
+        assert!(
+            told.message.contains("not sent to a candidate"),
+            "what the store reported is not shown to a candidate: {told:?}"
+        );
+        network.shutdown().await;
+    }
 }
