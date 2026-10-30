@@ -15,7 +15,7 @@ use kr_client::services::matrix::{
 };
 use kr_crypto::keys::AuthorisationKeyPair;
 use kr_protocol::error::ErrorCode;
-use kr_protocol::hello::PackageVersion;
+use kr_protocol::hello::{PACKAGE_VERSION, PackageVersion};
 use kr_protocol::scalars::AuthorisationKey;
 use kr_protocol::service::GatewayOrigin;
 use kr_service_stand_in::signed_release_matrix;
@@ -220,18 +220,34 @@ mod the_deployed_document {
         assert_eq!(document.serve(build(0, 80, 0)), Verdict::Skew);
     }
 
-    /// The first revision a release reads is above the one that listed no build of this product,
-    /// and not above the revision the service has published: a floor over the deployed revision
-    /// would close the gate on every host.
+    /// The first revision a release reads is the first that lists a build of the release, so it is
+    /// above revision 1, which listed no build of this product, and not above the revision the
+    /// service has published (a floor over it leaves no host a copy, and the release program
+    /// refuses such a release). The signed reply of that revision is kept beside the tests, named
+    /// for it: it verifies under the pin this build carries and serves this build. A cut that
+    /// raises the floor has to keep the reply of the new revision, and one that leaves the floor
+    /// at a revision that no longer lists the release fails here.
     #[test]
     fn is_read_from_a_revision_that_leaves_out_the_first_publication() {
         let pins = Pins::production();
+        let first = pins.first_revision();
         assert!(
-            pins.first_revision() > 1,
+            first > 1,
             "revision 1 lists clients up to 0.4.99 and so no build of this product"
         );
-        let document = Document::verify(DEPLOYED, &pins).expect("the deployed matrix verifies");
-        assert!(document.revision() >= pins.first_revision());
+        let kept = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/release-matrix")
+            .join(format!("deployed-revision-{first}.json"));
+        let reply = std::fs::read(&kept).unwrap_or_else(|error| {
+            panic!("the signed reply of revision {first} is kept at {kept:?}: {error}")
+        });
+        let document =
+            Document::verify(&reply, &pins).expect("the reply verifies under the production pin");
+        assert_eq!(document.revision(), first);
+        assert!(
+            matches!(document.serve(PACKAGE_VERSION), Verdict::Served { .. }),
+            "revision {first} lists the release this build is"
+        );
     }
 
     #[test]
