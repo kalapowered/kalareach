@@ -136,6 +136,24 @@ const FAILURE_TEXTS: [FailureText; 6] = [
     },
 ];
 
+/// The reasons the host gives, as its own, for refusing the argument of a call that reaches the
+/// agent of a session. A `{}` stands for one word of the argument.
+///
+/// The worker puts the upstream's words under the same code with nothing before them, so the host's
+/// own reasons are told apart from them by their shape, and a message that is not one of these is
+/// the upstream's.
+const OWN_ARGUMENT_REASONS: [&str; 6] = [
+    "a prompt names either a draft or inline text",
+    "a prompt names a draft or inline text, not both",
+    "{} does not declare a parameter named {}",
+    "the parameter {} of {} does not accept this value",
+    "the package accepts {} bytes of an attachment and this one is {}",
+    "the package does not accept {} as an attachment",
+];
+
+/// The longest word of an argument that stands for a `{}` of an own reason.
+const LONGEST_ARGUMENT_WORD: usize = 128;
+
 /// The error `error` is for a device: itself when it names nothing of this host, and otherwise the
 /// error the module note describes.
 #[must_use]
@@ -262,7 +280,9 @@ pub(crate) fn too_large_for_the_device(frame: &ControlFrame) -> Option<ControlFr
 /// cancellation, an approval or a plugin's action to the agent a session runs.
 ///
 /// An agent's refusal is the agent's own words about what it was asked, and they quote what it
-/// was working on. This host cannot tell them from its own sentences about the request, so a
+/// was working on. The worker gives them under the same code as its own refusals of the argument,
+/// so a refusal of the argument is kept when it is one of the host's own reasons
+/// ([`OWN_ARGUMENT_REASONS`]), which a device needs to correct what it sent, and every other
 /// refusal of the argument, of the agent itself, or an end that left the outcome unknown, is
 /// replaced by a sentence composed from its code. The code and the retry category stay.
 #[must_use]
@@ -274,21 +294,52 @@ pub(crate) fn upstream_words(method: Option<Method>, frame: ControlFrame) -> Con
         ControlFrame::Response(Response {
             request_id,
             outcome: Outcome::Error(error),
-        }) if matches!(
-            error.code,
-            ErrorCode::InvalidArgument | ErrorCode::UpstreamUnavailable | ErrorCode::OutcomeUnknown
-        ) =>
-        {
-            ControlFrame::Response(Response {
-                request_id,
-                outcome: Outcome::Error(with_message(
-                    &error,
-                    sentence_for(error.code, WHY_WHATEVER_IT_SAYS),
-                )),
-            })
-        }
+        }) if may_carry_the_upstreams(&error) => ControlFrame::Response(Response {
+            request_id,
+            outcome: Outcome::Error(with_message(
+                &error,
+                sentence_for(error.code, WHY_WHATEVER_IT_SAYS),
+            )),
+        }),
         other => other,
     }
+}
+
+/// Whether `error`, the refusal of a call that reaches the agent of a session, can hold the
+/// upstream's words.
+fn may_carry_the_upstreams(error: &ProtocolError) -> bool {
+    match error.code {
+        ErrorCode::UpstreamUnavailable | ErrorCode::OutcomeUnknown => true,
+        ErrorCode::InvalidArgument => !is_an_own_reason(&error.message),
+        _ => false,
+    }
+}
+
+/// Whether `message` is one of the host's own reasons for refusing an argument.
+fn is_an_own_reason(message: &str) -> bool {
+    OWN_ARGUMENT_REASONS
+        .iter()
+        .any(|shape| fits_shape(shape, message))
+}
+
+/// Whether `message` is `shape` with one word of the argument, up to the next space, in place of
+/// each `{}`.
+fn fits_shape(shape: &str, message: &str) -> bool {
+    let mut pieces = shape.split("{}");
+    let Some(mut rest) = pieces.next().and_then(|first| message.strip_prefix(first)) else {
+        return false;
+    };
+    for piece in pieces {
+        let word = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        if word == 0 || word > LONGEST_ARGUMENT_WORD {
+            return false;
+        }
+        let Some(after) = rest[word..].strip_prefix(piece) else {
+            return false;
+        };
+        rest = after;
+    }
+    rest.is_empty()
 }
 
 /// Whether `method` hands words to the agent of a session and takes its refusal back.
@@ -1543,5 +1594,110 @@ mod tests {
                 "{user}: {shown:?}"
             );
         }
+    }
+
+    /// What a device is told when `method` is answered with `message` under `code`.
+    fn told_on(method: Method, code: ErrorCode, message: &str) -> ProtocolError {
+        let answer = ControlFrame::Response(Response {
+            request_id: RequestId::new(8),
+            outcome: Outcome::Error(error(code, message)),
+        });
+        let ControlFrame::Response(Response {
+            outcome: Outcome::Error(told),
+            ..
+        }) = frame_for_a_device(&upstream_words(Some(method), answer)).into_owned()
+        else {
+            panic!("an error");
+        };
+        told
+    }
+
+    #[test]
+    fn the_hosts_own_reasons_for_refusing_a_devices_argument_reach_it_on_the_agent_methods() {
+        use kr_protocol::agent::{
+            AgentMutationTarget, AgentPromptParams, AgentSubject, PromptText,
+        };
+        let target = AgentMutationTarget {
+            subject: AgentSubject {
+                session_id: SessionId::new(kr_ipc::new_uuid()),
+                application_instance_id: kr_protocol::ids::ApplicationInstanceId::new(
+                    kr_ipc::new_uuid(),
+                ),
+            },
+            binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
+        };
+        let prompt = |draft: bool, text: bool| AgentPromptParams {
+            target,
+            draft_id: if draft {
+                Nullable::some(kr_protocol::ids::DraftId::new(kr_ipc::new_uuid()))
+            } else {
+                Nullable::null()
+            },
+            text: if text {
+                Nullable::some(PromptText::new("go").expect("a prompt"))
+            } else {
+                Nullable::null()
+            },
+        };
+        let neither = prompt(false, false).validate().expect_err("no prompt");
+        let both = prompt(true, true).validate().expect_err("two prompts");
+        for (method, message) in [
+            (Method::AgentPromptSubmit, neither),
+            (Method::AgentPromptQueue, both),
+            // The worker's refusals of an action's parameters and of an attachment it was offered.
+            (
+                Method::PluginActionInvoke,
+                "summarise does not declare a parameter named depth",
+            ),
+            (
+                Method::PluginActionInvoke,
+                "the parameter depth of summarise does not accept this value",
+            ),
+            (
+                Method::PluginActionInvoke,
+                "the package accepts 1048576 bytes of an attachment and this one is 2097152",
+            ),
+            (
+                Method::PluginActionInvoke,
+                "the package does not accept application/zip as an attachment",
+            ),
+        ] {
+            let told = told_on(method, ErrorCode::InvalidArgument, message);
+            assert_eq!(told.message, message, "{method:?}");
+            assert_eq!(told.code, ErrorCode::InvalidArgument);
+        }
+    }
+
+    #[test]
+    fn what_the_upstream_said_is_withheld_from_a_device_on_the_agent_methods() {
+        // The upstream's own words come back under the same code as the host's own reasons.
+        let upstream = |said: &str| {
+            kr_worker::broker::BrokerError::UpstreamRefused {
+                detail: said.to_owned(),
+            }
+            .to_protocol_error()
+        };
+        for said in [
+            "account marguerite cannot run git status",
+            "invalid params: cwd must be inside the project",
+            // The words of a reason of the host's, with more after them.
+            "the package does not accept application/zip as an attachment, said marguerite",
+        ] {
+            let refused = upstream(said);
+            assert_eq!(refused.code, ErrorCode::InvalidArgument);
+            let told = told_on(Method::AgentPromptSubmit, refused.code, &refused.message);
+            assert_eq!(told.code, ErrorCode::InvalidArgument);
+            assert!(
+                !told.message.contains("marguerite") && !told.message.contains("cwd"),
+                "{told:?}"
+            );
+        }
+        // A reason of the host's that quotes a place is cut as any message is.
+        let told = told_on(
+            Method::PluginActionInvoke,
+            ErrorCode::InvalidArgument,
+            "the package does not accept /Users/marguerite/x.zip as an attachment",
+        );
+        assert!(!told.message.contains("marguerite"), "{told:?}");
     }
 }
