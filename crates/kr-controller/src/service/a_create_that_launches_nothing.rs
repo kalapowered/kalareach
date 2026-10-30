@@ -254,12 +254,12 @@ async fn reserved(controller: &Controller) {
 /// number, so the refusal was the resource's and not the request's, and it recorded and allocated
 /// nothing.
 ///
-/// Returns the text of the refusal and the state directory of the environment, for a case that has
-/// more to say about either.
+/// Returns the text of the refusal and the paths of the environment, for a case that has more to
+/// say about either.
 async fn a_create_short_of(
     resource: &str,
     shorten: impl FnOnce(&mut super::resources::HostResources),
-) -> (String, std::path::PathBuf) {
+) -> (String, kr_ipc::paths::EnvironmentPaths) {
     let (temp, controller, asked) = daemon().await;
     let environment_id = temp.environment_id();
     let (connection_id, actor_id) = admitted(&controller).await;
@@ -333,7 +333,7 @@ async fn a_create_short_of(
         1,
         "the refused create took no display number"
     );
-    (message, controller.paths.state_dir().to_path_buf())
+    (message, controller.paths.clone())
 }
 
 /// KR-REQ-07.14: a create is refused with `RESOURCE_UNAVAILABLE` before anything is spawned when
@@ -341,11 +341,11 @@ async fn a_create_short_of(
 /// needs. A filesystem cannot be filled without harm to the machine the test runs on, so the
 /// reading is a stand-in that notes which directory it was asked about; the filesystem's own
 /// reading is `resources::tests`. The refusal names the resource and the quantities, and no path:
-/// it reaches a paired device as it is.
+/// it reaches a paired device as it is, and a path below the home directory names the account.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_create_is_refused_before_a_spawn_when_storage_is_short() {
     static ASKED_ABOUT: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
-    let (message, state_dir) = a_create_short_of("storage", |resources| {
+    let (message, paths) = a_create_short_of("storage", |resources| {
         resources.free_storage = |directory| {
             *ASKED_ABOUT
                 .lock()
@@ -360,13 +360,29 @@ async fn a_create_is_refused_before_a_spawn_when_storage_is_short() {
         .clone()
         .expect("the reading was asked about a directory");
     assert_eq!(
-        asked, state_dir,
+        asked,
+        paths.state_dir(),
         "the filesystem asked about is the environment's state directory's"
     );
-    assert!(
-        !message.contains(&state_dir.display().to_string()),
-        "the refusal names no path: {message}"
-    );
+    // A text that named only the state root, or the home directory the default roots lie in, would
+    // pass a check against the state directory alone.
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .map(std::path::PathBuf::from)
+        .filter(|home| home.as_os_str().len() > 1);
+    for path in [
+        Some(paths.state_dir()),
+        Some(paths.state_root()),
+        home.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        assert!(
+            !message.contains(&path.display().to_string()),
+            "the refusal names no path ({}): {message}",
+            path.display()
+        );
+    }
     assert!(
         message.contains("1024")
             && message.contains(&super::resources::MINIMUM_FREE_STORAGE_BYTES.to_string()),

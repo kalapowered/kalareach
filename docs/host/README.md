@@ -976,7 +976,7 @@ three resources at that moment, and a create finds the first that is short:
 
 | Resource | A create is refused when | Why |
 | --- | --- | --- |
-| `storage` | the filesystem that holds the state directory has less than 64 MiB free to this account | a session writes its history, its journal and the worker's record from its first moments, and its closure writes the final status there |
+| `storage` | the filesystem that holds the environment's state directory, `<state>/environments/<prefix>`, has less than 64 MiB free to this account | a session writes its history, its journal and the worker's record from its first moments, and its closure writes the final status there |
 | `terminals` | this host cannot open a pseudo-terminal pair: grant and unlock the master, and open the slave it names, each closed on exec | the worker opens a pair for the root shell, and a host out of terminals or of descriptors to open them with says so here and not in a worker that has already started |
 | `processes` | this account may start fewer than 64 more processes under the daemon's own `RLIMIT_NPROC`, counted over every thread on Linux and every process on macOS | a session starts a worker and a root shell, and the shell's startup files and the person's first commands start more |
 

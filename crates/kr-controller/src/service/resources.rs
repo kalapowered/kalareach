@@ -53,8 +53,8 @@ pub(crate) struct Shortfall {
 pub(crate) struct HostResources {
     /// The bytes free to this account on the filesystem that holds a directory, when it can be said.
     pub(crate) free_storage: fn(&Path) -> Option<u64>,
-    /// Opens a pseudo-terminal and closes it again.
-    pub(crate) open_terminal: fn() -> std::io::Result<()>,
+    /// Opens a pseudo-terminal pair, which the reading closes again.
+    pub(crate) open_terminal: fn() -> std::io::Result<OpenedTerminal>,
     /// How many more processes this account may start, or `None` when it has no limit.
     pub(crate) process_headroom: fn() -> std::io::Result<Option<u64>>,
     /// The free storage a create needs.
@@ -113,23 +113,28 @@ impl HostResources {
     }
 }
 
-/// Opens a pseudo-terminal pair and closes it again.
+/// What the terminal probe opened, held open until the reading that asked for it is made.
+#[cfg(unix)]
+pub(crate) type OpenedTerminal = (std::os::fd::OwnedFd, std::os::fd::OwnedFd);
+
+/// Nothing is opened on Windows.
+#[cfg(not(unix))]
+pub(crate) type OpenedTerminal = ();
+
+/// Opens a pseudo-terminal pair, the master first, with both ends closed on exec.
 ///
 /// The worker opens a pair for the root shell: the master, then the slave once the master is
 /// granted and unlocked. Whether this host can do all of it is the reading: a host out of
 /// terminals, or of descriptors to open them with, says so here and not in a worker that has
 /// already been started.
-#[cfg(unix)]
-fn measure_terminal() -> std::io::Result<()> {
-    open_pair().map(drop)
-}
-
-/// A pseudo-terminal pair, the master first, with both ends closed on exec.
 ///
-/// Closed on exec, as the worker's own are: this daemon starts programs from other threads, and
-/// one that started while a pair was open would hold the terminal for its whole life.
+/// Neither end is opened as this process's controlling terminal. The daemon leads a session of its
+/// own (`--own-session`) and has no controlling terminal, so a slave opened without `O_NOCTTY`
+/// would become its controlling terminal, and closing the master would then hang the daemon up.
+/// Both ends are closed on exec, as the worker's own are: this daemon starts programs from other
+/// threads, and one that started while a pair was open would hold the terminal for its whole life.
 #[cfg(unix)]
-fn open_pair() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+fn measure_terminal() -> std::io::Result<OpenedTerminal> {
     #[cfg(target_os = "linux")]
     let master = rustix::pty::openpt(
         rustix::pty::OpenptFlags::RDWR
@@ -156,7 +161,7 @@ fn open_pair() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> 
 
 /// A Windows worker's console is not measured here.
 #[cfg(not(unix))]
-fn measure_terminal() -> std::io::Result<()> {
+fn measure_terminal() -> std::io::Result<OpenedTerminal> {
     Ok(())
 }
 
@@ -216,23 +221,80 @@ mod tests {
         assert_eq!(host.shortfall(&directory), None);
     }
 
-    /// The terminal the probe opens is a pair: the master and a slave that is a terminal, both
-    /// closed on exec. The probe is the pair's opening, so a host that can open a master and not
-    /// the slave it grants is short of terminals.
+    /// The terminal the probe opens is a pair: the master and the slave it names, both closed on
+    /// exec. The probe is the pair's opening, so a host that can open a master and not the slave
+    /// it grants is short of terminals, and a slave that is not the master's is no reading of it.
     #[cfg(unix)]
     #[test]
     fn the_terminal_the_probe_opens_is_a_pair_closed_on_exec() {
-        use std::os::fd::AsFd as _;
-
-        let (master, slave) = open_pair().expect("this host opens a terminal pair");
+        let (master, slave) = measure_terminal().expect("this host opens a terminal pair");
         for end in [&master, &slave] {
             let flags = rustix::io::fcntl_getfd(end).expect("reads the descriptor's flags");
             assert!(flags.contains(rustix::io::FdFlags::CLOEXEC), "{end:?}");
         }
-        assert!(
-            rustix::termios::isatty(slave.as_fd()),
-            "the slave end is a terminal"
+        let named = rustix::pty::ptsname(&master, Vec::new()).expect("the master names its slave");
+        assert_eq!(
+            rustix::fs::fstat(&slave).expect("reads the slave").st_rdev,
+            rustix::fs::stat(named.as_c_str())
+                .expect("reads the slave the master names")
+                .st_rdev,
+            "the second end is the slave of the first"
         );
+    }
+
+    /// The daemon leads a session of its own and has no controlling terminal. The probe must not
+    /// give it one: a slave opened as the controlling terminal of a session leader hangs it up
+    /// when the probe closes the master, which ends the daemon at its first create. A test
+    /// process does not lead a session, so the probe runs in a copy of this program that does:
+    /// `/dev/tty` must not open while the pair is open, and the program must still be running
+    /// when the pair is closed. The hang-up that closing the master brings takes the terminal
+    /// from the session again, so only the check made while the pair is open sees it.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_leaves_a_session_leader_alive_and_without_a_controlling_terminal() {
+        const THE_CASE: &str = "service::resources::tests::\
+             the_probe_leaves_a_session_leader_alive_and_without_a_controlling_terminal";
+        const AS_A_LEADER: &str = "KR_TERMINAL_PROBE_AS_A_SESSION_LEADER";
+
+        if std::env::var_os(AS_A_LEADER).is_none() {
+            let output =
+                std::process::Command::new(std::env::current_exe().expect("this test program"))
+                    .args(["--exact", THE_CASE, "--test-threads=1"])
+                    .env(AS_A_LEADER, "1")
+                    .output()
+                    .expect("this test program runs again");
+            let report = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && report.contains("1 passed"),
+                "{}: {report}{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        rustix::process::setsid().expect("this program leads a session of its own");
+        // `/dev/tty` opens for a process that has a controlling terminal. Without one the kernel
+        // answers `ENXIO`; any other answer says nothing about this process's terminal, and would
+        // let a probe that gave the session one pass.
+        let controlling_terminal = || match rustix::fs::open(
+            "/dev/tty",
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOCTTY | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        ) {
+            Ok(_) => true,
+            Err(rustix::io::Errno::NXIO) => false,
+            Err(error) => panic!("/dev/tty answers neither as a terminal nor as none: {error}"),
+        };
+        assert!(
+            !controlling_terminal(),
+            "the session starts with no controlling terminal"
+        );
+        let pair = measure_terminal().expect("this host opens a terminal pair");
+        assert!(
+            !controlling_terminal(),
+            "and the pair the probe opened gave the session none"
+        );
+        drop(pair);
     }
 
     /// The filesystem's own reading, against a limit no filesystem meets, names storage. The
