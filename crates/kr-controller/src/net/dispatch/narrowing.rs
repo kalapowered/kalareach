@@ -243,21 +243,14 @@ impl RemoteConnection {
     /// and the revision it is based on, so one captured for a session the grant does not reach, or
     /// before the moment its history reaches back to, is not listed.
     pub(super) async fn within_the_grant(&self, answer: ControlFrame) -> ControlFrame {
-        let ControlFrame::Response(Response {
-            request_id,
-            outcome: Outcome::Ok(value),
-        }) = &answer
-        else {
-            return answer;
-        };
-        let request_id = *request_id;
-        let Ok(mut read) = value.to_typed::<kr_protocol::changeset::ChangesetReadResult>() else {
-            return answer;
+        let (request_id, mut read) = match change_set_read(answer) {
+            Ok(read) => read,
+            Err(answer) => return *answer,
         };
         let Some(scope) = self.version_scope() else {
             // A grant that retains no history is refused further on, with the sentence every
             // other read of a recorded version gives it.
-            return answer;
+            return encoded(request_id, &read);
         };
         let service = std::sync::Arc::clone(self.controller.changesets().service());
         let summaries = std::mem::take(&mut read.versions);
@@ -741,6 +734,33 @@ pub(super) fn shown_working_tree_change(answer: ControlFrame, method: Method) ->
     }
 }
 
+/// The read an answer to a device's `changeset.read` carries, or the answer to give in its place.
+///
+/// A refusal is passed on as it is. An answer that is not a change-set read is not: it may carry
+/// what narrowing a read exists to leave out.
+fn change_set_read(
+    answer: ControlFrame,
+) -> Result<(RequestId, kr_protocol::changeset::ChangesetReadResult), Box<ControlFrame>> {
+    let ControlFrame::Response(Response {
+        request_id,
+        outcome: Outcome::Ok(value),
+    }) = &answer
+    else {
+        return Err(Box::new(answer));
+    };
+    let request_id = *request_id;
+    match value.to_typed::<kr_protocol::changeset::ChangesetReadResult>() {
+        Ok(read) => Ok((request_id, read)),
+        Err(_) => Err(Box::new(failure(
+            request_id,
+            ProtocolError::new(
+                ErrorCode::OutcomeUnknown,
+                "this host read the change set and could not state its answer to a paired device",
+            ),
+        ))),
+    }
+}
+
 /// Refuses a read of a subject in an environment this device's grant does not reach.
 fn outside_the_grant(subject: &str) -> ProtocolError {
     ProtocolError::new(
@@ -816,5 +836,28 @@ mod tests {
         );
         let (code, _) = said(&shown_materialisation(other));
         assert_eq!(code, ErrorCode::OutcomeUnknown);
+    }
+
+    /// An answer to a device's `changeset.read` that cannot be decoded as one is refused rather
+    /// than passed on, as an answer to a materialisation is. A refusal that came before it is
+    /// passed on as it was.
+    #[test]
+    fn an_answer_to_a_change_set_read_that_cannot_be_decoded_is_refused() {
+        let other = encoded(
+            RequestId::new(9),
+            &kr_protocol::scalars::Nullable::<u8>::null(),
+        );
+        let refusal = change_set_read(other).expect_err("an answer that is no change-set read");
+        let (code, _) = said(&refusal);
+        assert_eq!(code, ErrorCode::OutcomeUnknown);
+
+        let denied = refused(
+            ErrorCode::PermissionDenied,
+            "this device's grant does not reach it",
+        );
+        let passed = change_set_read(denied).expect_err("a refusal is not a read");
+        let (code, message) = said(&passed);
+        assert_eq!(code, ErrorCode::PermissionDenied);
+        assert_eq!(message, "this device's grant does not reach it");
     }
 }
