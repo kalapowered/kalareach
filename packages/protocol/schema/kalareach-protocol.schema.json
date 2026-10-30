@@ -22860,6 +22860,11 @@
           "type": "string"
         },
         {
+          "const": "session.processes",
+          "description": "Read the processes one session's worker had recorded, each checked against the operating system now: the process and its start, its role in the session, whether it is running, ended or unknown, and for a running one its parent as an identity and the base name of its executable. The list is labelled recorded: it is what the worker last wrote, not a live enumeration, and a process that started and ended between two of the worker's observations is not in it. The answer is the local owner's and holds no argument, environment, directory or path.",
+          "type": "string"
+        },
+        {
           "const": "session.open",
           "description": "Open a paired connection for one session under one grant, or for the host alone. The connection then refuses a request for another session or under another grant, or, opened for the host, serves the host's own reads and no worker; the answer carries the rights the host decided the open with, or says the share has ended.",
           "type": "string"
@@ -29281,6 +29286,81 @@
         "background"
       ],
       "type": "object"
+    },
+    "ProcessBoot": {
+      "description": "How the boot the record was written in compares with this boot.",
+      "oneOf": [
+        {
+          "const": "same",
+          "description": "The same boot: the recorded start values mean what the kernel reads now.",
+          "type": "string"
+        },
+        {
+          "const": "earlier",
+          "description": "An earlier boot: no recorded process can still be running.",
+          "type": "string"
+        },
+        {
+          "const": "unrecorded",
+          "description": "The record names no boot, so its start values cannot be tied to one.",
+          "type": "string"
+        },
+        {
+          "const": "incomparable",
+          "description": "The record's boot and this boot cannot be compared.",
+          "type": "string"
+        }
+      ]
+    },
+    "ProcessListing": {
+      "description": "What the list is.",
+      "oneOf": [
+        {
+          "const": "recorded",
+          "description": "What the session's worker recorded at its last write, each identity checked against the\noperating system at the moment of the call.",
+          "type": "string"
+        }
+      ]
+    },
+    "ProcessRole": {
+      "description": "What a listed process is to the session.",
+      "oneOf": [
+        {
+          "const": "root",
+          "description": "The session's root shell.",
+          "type": "string"
+        },
+        {
+          "const": "backend",
+          "description": "A process the worker started for the session besides its root shell: an application's\nserver.",
+          "type": "string"
+        },
+        {
+          "const": "descendant",
+          "description": "A process seen below the root or a server.",
+          "type": "string"
+        }
+      ]
+    },
+    "ProcessStanding": {
+      "description": "What the operating system says of a recorded process now.",
+      "oneOf": [
+        {
+          "const": "running",
+          "description": "The recorded process runs, and ran from the first question to the last.",
+          "type": "string"
+        },
+        {
+          "const": "ended",
+          "description": "The recorded process is gone, or its number belongs to another process now.",
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "description": "Nothing established either: the operating system did not answer, the record cannot be tied\nto this boot, or the identity cannot tell two processes apart.",
+          "type": "string"
+        }
+      ]
     },
     "ProcessStartIdentity": {
       "additionalProperties": false,
@@ -37552,6 +37632,130 @@
         }
       ]
     },
+    "SessionProcess": {
+      "additionalProperties": false,
+      "description": "One recorded process.",
+      "properties": {
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The base name of its executable, for a running row whose executable the platform gives, as\nlossy UTF-8 of at most [`MAX_PROCESS_NAME_BYTES`] bytes. Null for every other row."
+        },
+        "parent": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProcessStartIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Its parent when it was read, as an identity, for a running row whose parent the platform\ngives. Null for every other row."
+        },
+        "process": {
+          "$ref": "#/$defs/ProcessStartIdentity",
+          "description": "The process identifier and the start the kernel recorded for it."
+        },
+        "role": {
+          "$ref": "#/$defs/ProcessRole",
+          "description": "What it is to the session."
+        },
+        "state": {
+          "$ref": "#/$defs/ProcessStanding",
+          "description": "What the operating system says of it now."
+        }
+      },
+      "required": [
+        "process",
+        "role",
+        "state",
+        "parent",
+        "name"
+      ],
+      "type": "object"
+    },
+    "SessionProcessesParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `session.processes`.",
+      "properties": {
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session whose processes are listed."
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "SessionProcessesResult": {
+      "additionalProperties": false,
+      "description": "The result of `session.processes`.",
+      "properties": {
+        "boot": {
+          "$ref": "#/$defs/ProcessBoot",
+          "description": "How the boot of the record compares with this one."
+        },
+        "boundary": {
+          "description": "What the session's ownership rests on, in the worker's own words, cut at\n[`MAX_PROCESS_BOUNDARY_BYTES`] bytes.",
+          "type": "string"
+        },
+        "cgroup": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The control group the worker ran in, on a platform that has them, cut at\n[`MAX_PROCESS_CGROUP_BYTES`] bytes."
+        },
+        "limits": {
+          "description": "What cannot be established about the session's processes: the host's own sentences first,\nthen at most [`MAX_PROCESS_LIMITS`] of the worker's, each cut at\n[`MAX_PROCESS_LIMIT_BYTES`] bytes, and a last sentence counting the worker's that were left\nout.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "listing": {
+          "$ref": "#/$defs/ProcessListing",
+          "description": "What the list is."
+        },
+        "omitted": {
+          "$ref": "#/$defs/U64",
+          "description": "How many recorded processes are not listed, beyond [`MAX_PROCESS_ROWS`]."
+        },
+        "processes": {
+          "description": "The recorded processes: the root, then the servers, then the rest by start.",
+          "items": {
+            "$ref": "#/$defs/SessionProcess"
+          },
+          "type": "array"
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session."
+        }
+      },
+      "required": [
+        "session_id",
+        "listing",
+        "boot",
+        "boundary",
+        "limits",
+        "cgroup",
+        "processes",
+        "omitted"
+      ],
+      "type": "object"
+    },
     "SessionReadParams": {
       "additionalProperties": false,
       "description": "Parameters of `session.read`.",
@@ -45282,6 +45486,18 @@
     "privacy_unavailable": {
       "$ref": "#/$defs/PrivacyUnavailable"
     },
+    "process_boot": {
+      "$ref": "#/$defs/ProcessBoot"
+    },
+    "process_listing": {
+      "$ref": "#/$defs/ProcessListing"
+    },
+    "process_role": {
+      "$ref": "#/$defs/ProcessRole"
+    },
+    "process_standing": {
+      "$ref": "#/$defs/ProcessStanding"
+    },
     "project_adopt_params": {
       "$ref": "#/$defs/ProjectAdoptParams"
     },
@@ -45638,6 +45854,15 @@
     },
     "session_open_result": {
       "$ref": "#/$defs/SessionOpenResult"
+    },
+    "session_process": {
+      "$ref": "#/$defs/SessionProcess"
+    },
+    "session_processes_params": {
+      "$ref": "#/$defs/SessionProcessesParams"
+    },
+    "session_processes_result": {
+      "$ref": "#/$defs/SessionProcessesResult"
     },
     "session_read_params": {
       "$ref": "#/$defs/SessionReadParams"

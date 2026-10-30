@@ -962,6 +962,18 @@ methods! {
     confirmation: None, idempotency: READ,
     doc: "Read one session's filtered metadata and current state.";
 
+    SessionProcesses = "session.processes", Sessions,
+    effect: Read, ingress: [LocalIpc], rights: [req(SessionView)], selectors: [Session],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: CurrentAuthority,
+    confirmation: None, idempotency: READ,
+    doc: "Read the processes one session's worker had recorded, each checked against the \
+          operating system now: the process and its start, its role in the session, whether it \
+          is running, ended or unknown, and for a running one its parent as an identity and the \
+          base name of its executable. The list is labelled recorded: it is what the worker \
+          last wrote, not a live enumeration, and a process that started and ended between two \
+          of the worker's observations is not in it. The answer is the local owner's and holds \
+          no argument, environment, directory or path.";
+
     SessionOpen = "session.open", Sessions,
     effect: Read, ingress: [PairedDevice], rights: [basis(PresentViewAuthority)],
     selectors: [Session],
