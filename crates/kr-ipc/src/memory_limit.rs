@@ -317,6 +317,44 @@ mod tests {
         std::process::exit(code);
     }
 
+    /// The variable that makes the child half below ask twice, and the size of each request.
+    const ASK_TWICE: &str = "KR_MEMORY_LIMIT_ASK_TWICE_BYTES";
+
+    /// What the child says between its two requests, when the system refused the first.
+    const REFUSED_FIRST: &str = "the-first-request-was-refused";
+
+    /// The child half of the case that asks twice. Run on its own it asks for nothing and passes.
+    /// Started by the case with the variable set, it asks the system to commit that much, says
+    /// whether the system refused, waits for a line on its input, asks again, and exits with
+    /// whether the system refused the second request.
+    #[test]
+    fn the_child_that_asks_the_system_for_memory_twice() {
+        use std::io::{BufRead as _, Write as _};
+
+        fn refused(ask: usize) -> bool {
+            let mut held: Vec<u8> = Vec::new();
+            held.try_reserve_exact(ask).is_err()
+        }
+
+        let Ok(ask) = std::env::var(ASK_TWICE) else {
+            return;
+        };
+        let ask: usize = ask.parse().expect("a number of bytes");
+        if !refused(ask) {
+            std::process::exit(0);
+        }
+        println!("{REFUSED_FIRST}");
+        std::io::stdout()
+            .flush()
+            .expect("the first answer is written");
+        let mut line = String::new();
+        std::io::stdin()
+            .lock()
+            .read_line(&mut line)
+            .expect("the go-ahead is read");
+        std::process::exit(if refused(ask) { REFUSED } else { 0 });
+    }
+
     /// A child a case started, ended when the case lets go of it, so that a case that fails before
     /// it lets the child run does not leave a held process behind.
     struct Started(Child);
@@ -415,6 +453,56 @@ mod tests {
         let ended = child.wait().expect("the child ends");
         assert_eq!(ended.code(), Some(REFUSED), "the system refused the commit");
         assert!(limit.take_refusal());
+    }
+
+    /// A process that is refused a second commit, after it was refused one and the limit said so,
+    /// is recorded as refused again. This is another refused allocation by the same process under
+    /// the same limit, and not another reading of the first: a limit that said so only once for a
+    /// process would leave every refusal after the first reading as an ordinary end.
+    #[test]
+    fn a_second_commit_the_system_refuses_a_process_is_recorded_as_the_first_was() {
+        use std::io::{BufRead as _, Write as _};
+
+        let mut command = Command::new(std::env::current_exe().expect("this test binary"));
+        command
+            .args([
+                "--exact",
+                "memory_limit::tests::the_child_that_asks_the_system_for_memory_twice",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(ASK_TWICE, (512 * MIB).to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        start_held(&mut command);
+        let mut child = Started(command.spawn().expect("the child starts"));
+        let limit = MemoryLimit::around(child.as_handle(), 256 * MIB)
+            .expect("the limit is applied to the child");
+        resume(child.as_handle()).expect("the child is let run");
+
+        let mut input = child.stdin.take().expect("a pipe");
+        let mut lines = std::io::BufReader::new(child.stdout.take().expect("a pipe")).lines();
+        lines
+            .by_ref()
+            .map_while(Result::ok)
+            .find(|line| line == REFUSED_FIRST)
+            .expect("the child says the system refused its first request");
+        assert!(limit.take_refusal(), "the first refusal is recorded");
+        assert!(!limit.take_refusal(), "and said once");
+
+        writeln!(input, "go").expect("the child is told to ask again");
+        drop(input);
+        let ended = child.wait().expect("the child ends");
+        assert_eq!(
+            ended.code(),
+            Some(REFUSED),
+            "the system refused the second request too"
+        );
+        assert!(
+            limit.take_refusal(),
+            "and the limit recorded that refusal as it did the first"
+        );
     }
 
     /// The variable that makes the daemon half below hold a process and end.
