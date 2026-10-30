@@ -13,23 +13,24 @@
 //! attach that comes before the subscription, the host's answer to each, and the projection it
 //! builds and publishes are all inside the figure.
 //!
-//! The two seconds are the row's figure for the reference host, so they are asserted only where the
-//! host meets the reference host's conditions that a run can read: an optimised build, at least
-//! four processors and 8 GiB of memory, and at most one part in a hundred of the time taken by a
-//! hypervisor, where the platform accounts for it. Everywhere else, which includes every debug
-//! build, the figure is recorded with the shortfall named and its time cannot fail the case. Every
-//! run records the figure beside the host it was taken on, before anything is asserted.
+//! The two seconds are the row's figure for the reference host, so they are asserted only where no
+//! condition of the reference host that a run can read is shown to fall short: an optimised build,
+//! at least four processors, 8 GiB of memory, durable writes on the host's disk in at most 25 ms in
+//! the slowest tenth of a reading, and at most one part in a hundred of the time taken by a
+//! hypervisor, where the platform accounts for them. "Nothing else running" is not among them, so
+//! a figure with no shortfall is a figure with no measured shortfall and not a certified
+//! reference-host run. Where a shortfall is shown, which is every debug build, the figure is
+//! recorded with the shortfall named and its time cannot fail the case. Every run records the
+//! figure beside the host it was taken on, in the form the other performance records take, before
+//! it asserts anything. The timed span is the only part of the case with a figure to meet: the
+//! waits that set the case up and bring it to an end are bounded by a liveness limit of their own.
 
 #![cfg(unix)]
 
 mod net_support;
 
-#[allow(
-    dead_code,
-    reason = "this case reads the host and records a figure, and the module serves other suites"
-)]
-#[path = "../../kr-transport/tests/support/conditions.rs"]
-mod conditions;
+#[path = "../../../tests/perf/src/record.rs"]
+mod record;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -57,6 +58,9 @@ use net_support::{Device, Host, pair_with, paired_dial, proposal};
 /// How long a case waits for something the host does without being asked again: a liveness bound,
 /// and not the figure under test.
 const LIVENESS: Duration = Duration::from_secs(120);
+
+/// The file this case keeps its record in when a run keeps its evidence.
+const RECORD: &str = "kr-controller-reconnect.md";
 
 /// The screen section 27 names.
 const COLUMNS: u64 = 120;
@@ -181,15 +185,15 @@ async fn restored(
 }
 
 /// KR-PERF-006: a paired device that comes back to a real daemon has a painted 120x40 screen of
-/// the session within two seconds of dialling again, on a host that meets the reference host's
-/// conditions.
+/// the session within two seconds of dialling again, on a host that is not shown to fall short of
+/// the reference host.
 ///
 /// The device is attached and subscribed once and goes, and the host has recorded that its
 /// connection ended. It then dials again, resuming the cursors the ended session carried, and the
 /// clock starts as it dials. The two seconds are the row's figure for the reference host: they
-/// are asserted where the host meets its conditions, and the reading is recorded with the host it
-/// was taken on in every run. A shared or unoptimised host that is slow is a host that is not the
-/// reference host, so its figure alone fails nothing.
+/// are asserted where no condition the record reads falls short, and the reading is recorded with
+/// the host it was taken on in every run. A host that is shown to fall short of the reference host
+/// (a debug build, fewer processors, a slow disk) records its figure and fails nothing on time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_paired_device_that_comes_back_has_a_painted_screen_inside_the_reconnect_budget() {
     let kept = tempfile::tempdir().expect("a directory for what the application keeps");
@@ -263,8 +267,12 @@ async fn a_paired_device_that_comes_back_has_a_painted_screen_inside_the_reconne
     })
     .await;
 
+    // The host is read before the clock starts and again after it stops, so that neither reading
+    // is inside the figure. The disk is read in the directory the worker's journal lives in, since
+    // the attach inside the figure waits on a durable write.
+    let window = record::Window::open_with_disk(host.tree().environment().state_root());
+
     // The return: the clock starts as the device dials, and nothing has been asked of the host.
-    let mut stolen = conditions::StolenTime::start();
     let started = Instant::now();
     let transport = dial.dial().await;
     let session = Session::resume(Arc::new(transport), carried.cursors).expect("a resumed session");
@@ -278,36 +286,27 @@ async fn a_paired_device_that_comes_back_has_a_painted_screen_inside_the_reconne
         painted.contains(LAST_LINE),
         "every row of the session's screen is in what a terminal would be sent"
     );
-    let stolen_share = stolen.take();
-    let machine = conditions::Host::read();
-    let shortfalls = machine.shortfalls(stolen_share);
+    let conditions = window.close();
+    let shortfalls = conditions.shortfalls();
     let budget = kr_client::retry::RECONNECT_BUDGET;
-    let mut lines = machine.lines();
-    lines.push(format!(
-        "  taken by the host {}, against a {:.2}% cutoff",
-        stolen_share.map_or_else(
-            || "not accounted for here, so unverified".to_owned(),
-            |share| format!("{:.2}%", share * 100.0)
-        ),
-        conditions::MAX_STOLEN_SHARE * 100.0
-    ));
+    let mut lines = conditions.lines();
     lines.push(format!(
         "  reconnect         {elapsed:?} from the dial to a painted {COLUMNS}x{ROWS} screen, against \
-         a {budget:?} budget (the first connection took {first:?})"
+         a {budget:?} target (the first connection took {first:?})"
     ));
     if shortfalls.is_empty() {
         lines.push(format!(
-            "  verdict           no measured shortfall, and the budget is {} on this host",
+            "  verdict           no measured shortfall, and the target is {} on this host",
             if elapsed < budget { "met" } else { "not met" }
         ));
         lines.push(
-            "  conditions        no measured shortfall, so the budget is asserted here; what the \
+            "  conditions        no measured shortfall, so the target is asserted here; what the \
              lines above call unverified stays unverified"
                 .to_owned(),
         );
     } else {
         lines.push(format!(
-            "  verdict           {} the budget, with a condition missing, so it is recorded and \
+            "  verdict           {} the target, with a condition missing, so it is recorded and \
              not asserted here",
             if elapsed < budget {
                 "inside"
@@ -319,14 +318,14 @@ async fn a_paired_device_that_comes_back_has_a_painted_screen_inside_the_reconne
             lines.push(format!("  condition missing {shortfall}"));
         }
         lines.push(
-            "  conditions        not met, so the figure above is recorded and the budget is not \
-             asserted here; the budget's evidence is a reference-host run of this case in a \
-             release build"
+            "  conditions        not met, so the figure above is recorded and the target is not \
+             asserted here; the target's evidence is a run of this case in a release build on a \
+             reference host"
                 .to_owned(),
         );
     }
-    // Before the assertion, so a run the budget failed on keeps the figure and the verdict.
-    conditions::report("KR-PERF-006 reconnect to a real daemon", &lines);
+    // Before the assertion, so a run the target failed on keeps the figure and the verdict.
+    record::report(RECORD, "KR-PERF-006 reconnect to a real daemon", &lines);
     if shortfalls.is_empty() {
         assert!(
             elapsed < budget,
