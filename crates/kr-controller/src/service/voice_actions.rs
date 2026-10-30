@@ -365,9 +365,11 @@ impl Controller {
         // What this host already holds about this action, if anything. Answered before the claim,
         // so a retry of a completed change is its own result rather than a conflict, and one whose
         // first attempt is running or ended unrecorded is told so rather than performed.
-        if let Some(answered) = self.voice_answered(&actor_id, mutation).await? {
+        // What it finds goes back under the registration the repeat arrived under, a refusal it
+        // kept as much as a result.
+        if let Some(found) = self.voice_answered(&actor_id, mutation).await.transpose() {
             return self
-                .retained_under_authority(&carried, async { Ok(answered) })
+                .retained_under_authority(&carried, async { found })
                 .await;
         }
         // A first admission is asked before anything is claimed or created. A start asks the
