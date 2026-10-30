@@ -401,8 +401,9 @@ fn directory_state(directory: &std::path::Path) -> (Left, Vec<(String, Vec<u8>, 
 }
 
 /// KR-REQ-03.30: the authorised-file check leaves the file the person nominated and everything
-/// beside it as they were: the same names, bytes, modification times and permissions, in the same
-/// directory. The run performed the read: a headless session is asked for that check alone, so
+/// beside it as they were: the same names, bytes, modification times and mode bits (on Windows, the
+/// read-only attribute), in the same directory. The owner, extended attributes and access lists are
+/// not compared. The run performed the read: a headless session is asked for that check alone, so
 /// there is no check that sends a keystroke to hold back. That the one check which sends input is
 /// withheld without an isolated context of its own is the probe's own unit cases.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -412,6 +413,16 @@ async fn the_authorised_file_check_leaves_the_file_and_its_directory_as_they_wer
     let file = directory.path().join("authorised.txt");
     std::fs::write(&file, b"the person nominated this").expect("the nominated file");
     std::fs::write(directory.path().join("beside.txt"), b"not nominated").expect("another file");
+    // A mode the process's umask would not give a new file, so that a read that set the mode to
+    // the usual one, or to the owner's alone, changes it whatever the umask is.
+    #[cfg(unix)]
+    for name in ["authorised.txt", "beside.txt"] {
+        std::fs::set_permissions(
+            directory.path().join(name),
+            std::os::unix::fs::PermissionsExt::from_mode(0o640),
+        )
+        .expect("a mode of the test's choosing");
+    }
     let before = directory_state(directory.path());
     let mut link = daemon(&host, ControllerConnectionRole::Checks).await;
 

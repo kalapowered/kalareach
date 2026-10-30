@@ -1961,11 +1961,12 @@ fn waking_from_a_suspension_does_not_revive_an_expired_action_window() {
     ));
 }
 
-/// KR-REQ-07.58, KR-REQ-07.69: per-user startup uses the platform's own service mechanism, the
-/// worker it starts is outside the daemon's kill tree, and nothing about the host's sleep policy
-/// changes as a side effect.
+/// KR-REQ-07.58, KR-REQ-07.69: per-user startup uses the platform's own service mechanism and says
+/// which, and what a logout does to it is reported rather than assumed. This starts no worker and
+/// no daemon, so it does not show that startup leaves the sleep policy alone; what it shows of
+/// sleep is that a host tree nobody has configured holds no sleep setting and inhibits nothing.
 #[test]
-fn per_user_startup_uses_the_platform_service_mechanism_and_changes_no_sleep_policy() {
+fn per_user_startup_names_the_platform_service_mechanism_and_reports_what_a_logout_does_to_it() {
     let temp = kr_ipc::testing::TempHost::create();
     let supervisor =
         kr_controller::supervision::detect(&temp.environment(), Path::new("kr-controller"));
@@ -2026,7 +2027,7 @@ fn per_user_startup_uses_the_platform_service_mechanism_and_changes_no_sleep_pol
         );
     }
 
-    // Starting a host, and asking it anything, never writes a power setting.
+    // A host tree nobody has configured has no power setting and no configuration document.
     let host = kr_ipc::testing::TempHost::create();
     assert_eq!(
         power::read(&host.environment()),
