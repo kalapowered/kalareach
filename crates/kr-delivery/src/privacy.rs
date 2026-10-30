@@ -889,6 +889,95 @@ mod tests {
         assert!(offered(&mut journal), "the destination is out of service");
     }
 
+    /// The authorisation a notification was sent under is known only while the destination holds
+    /// the registration the notification was admitted for.
+    #[test]
+    fn the_authorisation_a_notification_was_sent_under_is_known_only_while_its_destination_holds_it()
+     {
+        let directory = tempfile::tempdir().expect("a directory");
+        let (mut journal, path) = journal_on_disk_with_work(&directory);
+        let sent = sent_to_the_phone(&mut journal, 5);
+        let older = sent_to_the_phone(&mut journal, 6);
+        let sender = kr_protocol::ids::PushSenderRecordId::new(uuid(42));
+        let under = |journal: &DeliveryJournal, id: NotificationId| {
+            journal.authorisation_of(id).expect("a read")
+        };
+        assert_eq!(
+            under(&journal, sent),
+            Some(sender),
+            "the registration it was admitted for"
+        );
+        assert_eq!(
+            under(&journal, NotificationId::new(uuid(250))),
+            None,
+            "no such notification"
+        );
+
+        // The same values again, as a device that registers a second time sends them.
+        journal
+            .configure_destination(&phone())
+            .expect("the same registration");
+        assert_eq!(under(&journal, sent), Some(sender));
+
+        // A row an earlier build wrote with no digest saved matches no destination.
+        rusqlite::Connection::open(&path)
+            .expect("a second connection")
+            .execute(
+                "UPDATE delivery_notifications SET destination_digest = '' WHERE notification_id = ?1",
+                [older.to_string()],
+            )
+            .expect("the digest is gone");
+        assert_eq!(
+            under(&journal, older),
+            None,
+            "nothing shows what it was admitted for"
+        );
+
+        // Each of these makes the destination another recipient than the one it was admitted for.
+        type Change = fn(&mut DestinationRecord);
+        let changes: [(&str, Change); 4] = [
+            ("another authorisation", |record| {
+                if let Destination::Push(push) = &mut record.destination {
+                    push.sender_record_id = kr_protocol::ids::PushSenderRecordId::new(uuid(43));
+                }
+            }),
+            ("another installation", |record| {
+                if let Destination::Push(push) = &mut record.destination {
+                    push.installation_id = kr_protocol::ids::InstallationId::new(uuid(44));
+                }
+            }),
+            ("another grant", |record| {
+                if let Some(rule) = &mut record.rule {
+                    rule.grant_id = Some(kr_protocol::ids::GrantId::new(uuid(45)));
+                }
+            }),
+            ("another stored-envelope key", |record| {
+                if let Destination::Push(push) = &mut record.destination {
+                    push.mailbox_key = Some(
+                        *kr_crypto::keys::StoredEnvelopeKeyPair::generate()
+                            .expect("a keypair")
+                            .public(),
+                    );
+                }
+            }),
+        ];
+        for (what, change) in changes {
+            let mut changed = phone();
+            change(&mut changed);
+            journal
+                .configure_destination(&changed)
+                .expect("a destination");
+            assert_eq!(under(&journal, sent), None, "{what}");
+            journal.configure_destination(&phone()).expect("put back");
+            assert_eq!(under(&journal, sent), Some(sender), "{what}, put back");
+        }
+
+        journal
+            .remove_destination(&DestinationId::new("phone").expect("an identifier"), 3_000)
+            .expect("the device is unpaired");
+        assert_eq!(under(&journal, sent), None, "a destination kept as history");
+    }
+
     #[test]
     fn a_confirmed_duplicate_delivery_is_shown_as_a_retained_artifact() {
         let mut journal = journal_with_work();
