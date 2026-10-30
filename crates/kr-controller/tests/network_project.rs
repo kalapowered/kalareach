@@ -4603,7 +4603,6 @@ async fn apply_two_paths_while_the_owner_withdraws_the_location(
     Granted,
 )> {
     use kr_protocol::changeset::{AffectedVersion, ApplyOutcomeClass, DiffApplyResult};
-    use kr_protocol::project::ProjectLocationWithdrawParams;
 
     let granted = Granted::on_a_qualified_host_holding(test, CHANGE_RIGHTS).await?;
     let env = granted.host.environment_id;
@@ -4654,24 +4653,7 @@ async fn apply_two_paths_while_the_owner_withdraws_the_location(
     );
     assert_eq!(written_in("control"), 2, "both paths are written");
 
-    let owner = std::sync::Arc::new(tokio::sync::Mutex::new(granted.host.client().await));
-    let location = granted.destination.location_id;
-    let withdraw = move || {
-        let owner = std::sync::Arc::clone(&owner);
-        tokio::runtime::Handle::current().block_on(async move {
-            let mut owner = owner.lock().await;
-            local_mutation(
-                &mut owner,
-                env,
-                Method::ProjectLocationWithdraw,
-                &ProjectLocationWithdrawParams {
-                    location_id: location,
-                },
-            )
-            .await
-            .expect("the owner withdraws the location");
-        });
-    };
+    let withdraw = the_owner_withdrawing_the_devices_destination(&granted).await;
     let service = granted.host.controller().changesets().service();
     service.inject(Some(match at {
         WithdrawnAt::BetweenPaths => kr_changeset::apply::Fault {
@@ -4706,6 +4688,34 @@ async fn apply_two_paths_while_the_owner_withdraws_the_location(
     service.inject(None);
     let written = written_in("withdrawn");
     Some((outcome, written, granted))
+}
+
+/// What the owner does, from inside an apply that is running, to withdraw the destination location
+/// the device's working copies were made through.
+async fn the_owner_withdrawing_the_devices_destination(
+    granted: &Granted,
+) -> impl Fn() + Send + Sync + 'static {
+    use kr_protocol::project::ProjectLocationWithdrawParams;
+
+    let env = granted.host.environment_id;
+    let owner = std::sync::Arc::new(tokio::sync::Mutex::new(granted.host.client().await));
+    let location = granted.destination.location_id;
+    move || {
+        let owner = std::sync::Arc::clone(&owner);
+        tokio::runtime::Handle::current().block_on(async move {
+            let mut owner = owner.lock().await;
+            local_mutation(
+                &mut owner,
+                env,
+                Method::ProjectLocationWithdraw,
+                &ProjectLocationWithdrawParams {
+                    location_id: location,
+                },
+            )
+            .await
+            .expect("the owner withdraws the location");
+        });
+    }
 }
 
 /// Whether no staging directory of an apply is left beside the files of a working copy.
@@ -4786,6 +4796,87 @@ async fn a_location_withdrawn_while_a_path_is_staged_has_nothing_published_into_
     assert_eq!(
         states_of(&answer),
         [PathProgressState::Unresolved, PathProgressState::Skipped],
+        "{answer:?}"
+    );
+    granted.stop().await;
+}
+
+/// KR-REQ-23.44: the owner withdraws the location while an apply is about to remove a path, which
+/// takes a file away with no staging at all. The path is not removed. The control is the same apply
+/// with the location standing, which removes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_location_withdrawn_before_a_removal_leaves_the_path_where_it_is() {
+    use kr_protocol::changeset::{ApplyOutcomeClass, DiffApplyResult, PathProgressState};
+
+    let Some(granted) = Granted::on_a_qualified_host_holding(
+        "a_location_withdrawn_before_a_removal_leaves_the_path_where_it_is",
+        CHANGE_RIGHTS,
+    )
+    .await
+    else {
+        return;
+    };
+    let env = granted.host.environment_id;
+    // The version deletes the tracked file, so applying it removes the file from a destination.
+    let review = a_working_copy(&granted, "review").await;
+    std::fs::remove_file(granted.root.join("review/README.md")).expect("the file");
+    let version = device_captures(&granted, review).await;
+    let control = a_working_copy(&granted, "control").await;
+    let withdrawn = a_working_copy(&granted, "withdrawn").await;
+    let readme = |name: &str| granted.root.join(name).join("README.md");
+
+    let removed: DiffApplyResult = typed(
+        &remote_mutation(
+            &granted.session,
+            env,
+            Method::DiffApply,
+            &expecting_readme(&granted.root, control, version, "control"),
+        )
+        .await
+        .expect("the apply under a standing location"),
+    );
+    assert_eq!(
+        removed.outcome.0,
+        Some(ApplyOutcomeClass::Applied),
+        "{removed:?}"
+    );
+    assert!(!readme("control").exists(), "the control removed the file");
+
+    let withdraw = the_owner_withdrawing_the_devices_destination(&granted).await;
+    let service = granted.host.controller().changesets().service();
+    service.inject(Some(kr_changeset::apply::Fault {
+        after_paths: usize::MAX,
+        act: None,
+        stop: false,
+        before_rename: Some(std::sync::Arc::new(move |_| {
+            withdraw();
+            true
+        })),
+        after_claim: None,
+        refuse_staging_record: false,
+        detail: String::new(),
+    }));
+    let outcome = remote_mutation(
+        &granted.session,
+        env,
+        Method::DiffApply,
+        &expecting_readme(&granted.root, withdrawn, version, "withdrawn"),
+    )
+    .await;
+    service.inject(None);
+    assert!(
+        readme("withdrawn").exists(),
+        "the file is still there: {outcome:?}"
+    );
+    let answer: DiffApplyResult = typed(&outcome.expect("the apply is settled and answered"));
+    assert_eq!(
+        answer.outcome.0,
+        Some(ApplyOutcomeClass::UncertainOutcome),
+        "{answer:?}"
+    );
+    assert_eq!(
+        states_of(&answer),
+        [PathProgressState::Unresolved],
         "{answer:?}"
     );
     granted.stop().await;
