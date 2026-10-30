@@ -3163,7 +3163,8 @@ filter, as it does for every caller under a grant: a device sees a question aske
 moment its grant reaches back to, in any state, and one its grant names however early it was asked,
 while it is open, so a device whose grant keeps no history and names no question sees none. Asking
 for one question outside that scope is refused rather than answered empty. The daemon passes the
-worker's answer on as the worker gave it, and sends a question read with a scope only to a worker
+worker's answer on as the worker gave it (an error in it is held to the rule for what a device is
+told of a failure), and sends a question read with a scope only to a worker
 that says, in its answer to the daemon's hello, that it holds one to it: a worker of an earlier
 build answered with every question it held, so a device's question read to one is refused as
 `UNSUPPORTED_CAPABILITY` before anything reaches it. The agent reads name their session inside the
@@ -3195,6 +3196,26 @@ descriptions* has the rule). `privacy.status` is answered by the daemon under `h
 Three reads are refused as `UNSUPPORTED_CAPABILITY`, with the read and the reason in the message:
 `upload.status`, `download.begin` and `download.chunk`, because a transfer's chunks travel on an
 attachment-chunk stream and this host opens none on a network connection.
+
+What a device is told of a failure passes one rule, applied where this host's words leave it for a
+device: the write boundary of an authorised connection, the refusal of a connection that is not
+admitted, and the pairing surface a candidate reaches before it is paired. An error keeps its code,
+its retry category and its diagnostic identifier. Its message is kept when it names nothing of this
+host. A command quoted in backticks is replaced by `a command` and the rest of the sentence stays.
+A message that names a path of any kind, the number of an account or the program that changes who
+may use a file is not sent: the device is given the clause that comes before the first such name,
+when there is one (`the host could not make the session's directory`), and otherwise a sentence made
+from the code. Two refusals of the project service give their reason in terms of the location the
+grant names and not the place on this host: a filesystem mounted beneath it, and a repository whose
+alternates file names objects outside it. Text that already exists cannot be made again, so the rule holds where an error is
+written, whoever made it: a worker's, one a store kept, one a catalogue receipt holds, and one
+inside a result, such as the presentation error of a create. A receipt whose message was replaced
+says so in `error_withheld`. What a closure records of a resource it left is held to the same rule
+and is replaced by the kind of resource. What the agent of a session says in refusing a prompt, a
+steer, a cancellation or an approval, as `INVALID_ARGUMENT` or `UPSTREAM_UNAVAILABLE`, is the
+agent's own words, so it is replaced by a sentence made from its code whatever it says. A candidate
+that has not paired is never given what the pairing store or the rendezvous service reported. The
+owner at this machine is given the whole text, on the local socket and in the daemon's records.
 
 What the grant decides, for every request:
 
