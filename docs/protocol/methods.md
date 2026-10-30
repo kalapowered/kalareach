@@ -292,7 +292,7 @@ document.
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
-| `grant.create` | write | `local_ipc`, `paired_device` | Delegate a narrower grant. Persistent enlargement requires owner confirmation. | [Pairing: Grants](../pairing/README.md) |
+| `grant.create` | write | `local_ipc`, `paired_device` | Delegate a narrower grant. Persistent enlargement requires owner confirmation. | [Host: Grants, sharing and revocation](../host/README.md) |
 | `grant.revoke` | write | `local_ipc`, `paired_device` | Revoke a grant and its descendants. Completion uses the per-worker dispatch barrier. | [Host: Revocation](../host/README.md) |
 | `grant.list` | read | `local_ipc`, `paired_device` | List grants this issuer may see, with their revisions and expiry. | [Host: Grants, sharing and revocation](../host/README.md) |
 | `grant.redeem` | write | `paired_device` | Redeem a session invitation, once, and activate the grant it carries. Only the device the invitation names redeems it, and a withdrawn, expired or already redeemed invitation activates nothing. The answer is the grant and carries no session text. | [Pairing: Grants](../pairing/README.md) |

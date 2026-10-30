@@ -15,8 +15,8 @@
 //! A link goes to the document and names the section in its words. The check reads lines, not
 //! Markdown: a section is there when the document has a line that is one to six `#`, a space and
 //! exactly the section's heading, outside a fenced block. It runs from that line to the next
-//! heading of the same or a higher level, so its subsections are part of it. Nothing here depends
-//! on how a page renders or anchors a heading.
+//! heading of the same or a higher level, so its heading and its subsections are part of it.
+//! Nothing here depends on how a page renders or anchors a heading.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -293,9 +293,8 @@ pub(crate) const fn described_in(method: Method) -> Section {
         | Method::HistoryPage => at(METHOD_REFERENCE, "Events, snapshots and history"),
         Method::HistoryTimes => at(HOST, "When output was produced"),
 
-        Method::GrantCreate | Method::GrantRedeem | Method::GrantTransfer | Method::GrantHeld => {
-            at(PAIRING, "Grants")
-        }
+        Method::GrantCreate => at(HOST, "Grants, sharing and revocation"),
+        Method::GrantRedeem | Method::GrantTransfer | Method::GrantHeld => at(PAIRING, "Grants"),
         Method::GrantRevoke => at(HOST, "Revocation"),
         Method::GrantList => at(HOST, "Grants, sharing and revocation"),
 
@@ -345,22 +344,45 @@ fn link(section: &Section) -> String {
     )
 }
 
+/// Returns the delimiter and the length of a line that opens or closes a fenced block: three or
+/// more backticks or tildes, after any indentation.
+fn fence(line: &str) -> Option<(u8, usize)> {
+    let bytes = line.trim_start().as_bytes();
+    let mark = *bytes.first()?;
+    if mark != b'`' && mark != b'~' {
+        return None;
+    }
+    let length = bytes.iter().take_while(|byte| **byte == mark).count();
+    (length >= 3).then_some((mark, length))
+}
+
 /// Returns the heading lines of a document as (line number, level, text), in order.
 ///
 /// A line is a heading when it is one to six `#`, a space and the text. A line inside a fenced block
-/// is not: a shell comment there starts with `#` and ends no section.
+/// is not: a shell comment there starts with `#` and ends no section. A block ends at a line of the
+/// delimiter that opened it, at least as long as the opening and with nothing after it, so a fence
+/// of the other kind, or a shorter one, inside a block is text.
 fn headings(lines: &[&str]) -> Vec<(usize, usize, String)> {
     let mut found = Vec::new();
-    let mut fenced = false;
+    let mut open: Option<(u8, usize)> = None;
     for (number, line) in lines.iter().enumerate() {
-        let opening = line.trim_start();
-        if opening.starts_with("```") || opening.starts_with("~~~") {
-            fenced = !fenced;
-        } else if !fenced {
-            let level = line.bytes().take_while(|byte| *byte == b'#').count();
-            if let (true, Some(text)) = ((1..=6).contains(&level), line[level..].strip_prefix(' '))
+        match (open, fence(line)) {
+            (None, Some(start)) => open = Some(start),
+            (Some((mark, length)), Some((closing, run)))
+                if closing == mark
+                    && run >= length
+                    && line.trim().bytes().all(|byte| byte == mark) =>
             {
-                found.push((number, level, text.to_owned()));
+                open = None;
+            }
+            (Some(_), _) => {}
+            (None, None) => {
+                let level = line.bytes().take_while(|byte| *byte == b'#').count();
+                if let (true, Some(text)) =
+                    ((1..=6).contains(&level), line[level..].strip_prefix(' '))
+                {
+                    found.push((number, level, text.to_owned()));
+                }
             }
         }
     }
@@ -375,8 +397,8 @@ pub(crate) fn has_heading(text: &str, heading: &str) -> bool {
         .any(|(_, _, found)| found == heading)
 }
 
-/// Returns the text of each section of a document that has exactly this heading, from the line
-/// after the heading to the next heading of the same or a higher level.
+/// Returns the text of each section of a document that has exactly this heading, from the heading
+/// line to the next heading of the same or a higher level.
 fn sections(text: &str, heading: &str) -> Vec<String> {
     let lines: Vec<&str> = text.lines().collect();
     let marks = headings(&lines);
@@ -389,7 +411,7 @@ fn sections(text: &str, heading: &str) -> Vec<String> {
                 .iter()
                 .find(|(_, later, _)| later <= level)
                 .map_or(lines.len(), |(number, _, _)| *number);
-            lines[start + 1..end].join("\n")
+            lines[*start..end].join("\n")
         })
         .collect()
 }
@@ -570,7 +592,7 @@ mod tests {
 
     use super::{
         INDEX_PATH, broken_links, described_in, has_heading, markdown_documents, names, render,
-        unnamed_methods,
+        sections, unnamed_methods,
     };
 
     fn docs() -> PathBuf {
@@ -676,24 +698,39 @@ mod tests {
             "## What a sync does\n",
             "## What a sync does\n\n### A part\n\n`catalogue.sync` runs here.\n\n## After the sync\n",
         );
-        let about_it = |copy: &DocsCopy| -> Vec<String> {
-            broken_links(copy.path())
-                .into_iter()
-                .filter(|line| line.starts_with("catalogue.sync:"))
-                .collect()
-        };
-        assert_eq!(about_it(&copy), Vec::<String>::new());
+        assert_eq!(broken_links(copy.path()), Vec::<String>::new());
         copy.edit(
             "plugins/catalogue.md",
             "`catalogue.sync` runs here.",
             "The sync runs here.",
         );
         assert_eq!(
-            about_it(&copy),
+            broken_links(copy.path()),
             [
                 "catalogue.sync: the section \"What a sync does\" of plugins/catalogue.md does not name it"
             ]
         );
+    }
+
+    /// KR-REQ-01.24: a line in a fenced block is never a heading and never ends a section, whatever
+    /// else the block holds: a fence of the other kind or a shorter fence is text inside it. A
+    /// heading that names the method is part of its section.
+    #[test]
+    fn a_fenced_block_holds_no_heading_and_ends_no_section() {
+        let document = "## Target\n\n```sh\n# a comment, not a heading\n```\n\n`one.method`\n\n\
+                        ~~~~~text\n## Inside\n````markdown\n```\n````\n## Still inside\n~~~~~\n\n\
+                        `two.method`\n\n## After\n\n## `three.method`\n";
+        assert!(has_heading(document, "Target"));
+        assert!(has_heading(document, "After"));
+        assert!(!has_heading(document, "a comment, not a heading"));
+        assert!(!has_heading(document, "Inside"));
+        assert!(!has_heading(document, "Still inside"));
+        let target = sections(document, "Target");
+        assert_eq!(target.len(), 1);
+        assert!(names(&target[0], "one.method") && names(&target[0], "two.method"));
+        assert!(!names(&target[0], "three.method"));
+        let named_by_its_heading = sections(document, "`three.method`");
+        assert!(names(&named_by_its_heading[0], "three.method"));
     }
 
     #[test]
