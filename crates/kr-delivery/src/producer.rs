@@ -3426,8 +3426,8 @@ mod tests {
         Some(u64::MAX)
     }
 
-    /// A question in session one that the host verified is pending, seen at `continuous_ms` after
-    /// the store opened, with the clock it was stamped on vouched for.
+    /// A question in session one, one the host `verified` or not, pending since `continuous_ms`
+    /// after the store opened, with the clock it was stamped on vouched for.
     fn raise_question(
         attention: &mut Attention,
         sequence: u64,
@@ -3651,31 +3651,36 @@ mod tests {
             .expect("the store records the window");
         raise_approval(&mut attention, 1, NOON, "req-1");
 
-        assert_eq!(
-            deliver(&mut producer, &mut attention, &phone),
-            (0, 0),
-            "nothing is offered while the hours last"
-        );
-        let inbox = || {
-            attention
+        let urgent_in_the_inbox = |attention: &Attention| {
+            let held = attention
                 .inbox(
                     &kr_protocol::ids::ActorId::new("local:501").expect("an actor"),
                     &kr_attention::Viewer::Owner,
                     true,
                 )
-                .expect("the inbox")
+                .expect("the inbox");
+            assert_eq!(held.len(), 1, "the approval is in the inbox");
+            assert_eq!(held[0].level, AttentionLevel::Urgent);
         };
-        let held = inbox();
-        assert_eq!(held.len(), 1, "the approval is in the inbox");
-        assert_eq!(held[0].level, AttentionLevel::Urgent);
 
         let hour = 60 * 60 * 1_000;
+        for at in [0, hour - 1] {
+            advance_to(&mut attention, at);
+            assert_eq!(
+                deliver(&mut producer, &mut attention, &phone),
+                (0, 0),
+                "nothing is offered while the hours last, at {at} ms"
+            );
+            urgent_in_the_inbox(&attention);
+        }
+
         advance_to(&mut attention, hour);
         assert_eq!(
             deliver(&mut producer, &mut attention, &phone),
             (1, 1),
             "the hours have ended"
         );
+        urgent_in_the_inbox(&attention);
     }
 
     /// The take is made only while the journal stands where the published privacy state says.
