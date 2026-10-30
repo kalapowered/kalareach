@@ -1982,8 +1982,10 @@ them as `console_keys`, and the worker spells them as the paragraphs above say. 
 a terminal profile only from `TERM`, which a Windows console does not set. It asks for the input
 lease all the same, and the worker gives the lease to no attachment that declared no profile, so a
 session attached from a Windows console is watched and not typed into until `TERM` names a profile.
-While the application in the session has negotiated an encoding that key records cannot express,
-the worker refuses a write with `INPUT_INCOMPATIBLE` and the attach ends and says so. The client
+While the application in the session has negotiated `modifyOtherKeys` or the Kitty keyboard
+protocol, the worker refuses a write of console keys with `INPUT_INCOMPATIBLE`, a key coming up and a
+modifier on its own included, and the attach ends and says so and that `--no-probe` watches without
+typing. The client
 asks the console for no mouse or window-size records. Nothing reports the fidelity at run time: the
 engine tracks which one the backend asked for and the worker spells records accordingly, but no
 receipt, diagnostic or client message carries the answer, so this page is where the limit is
