@@ -24,13 +24,16 @@ use net_support::{Device, Host, RawDevice, on_the_host, pair_with, proposal};
 
 /// The name of an account on the machine the host runs on, and so of the home directory the host's
 /// directories are under.
-const ACCOUNT: &str = "marguerite";
+///
+/// Short, because a socket address on macOS holds 103 bytes and the daemon's endpoint lies under the
+/// home directory.
+const ACCOUNT: &str = "marge";
 
 /// What a device is told when the host could not make the directory a session works in. It says
 /// what failed, and that the rest stays on the host.
 const THE_DIRECTORY_SENTENCE: &str = "the host could not make the session's directory; the detail names the host and is not sent to a paired device";
 
-/// A host whose directories lie under `<scratch>/home/<account>`, as they do under a person's home
+/// A host whose directories lie under `<scratch>/<account>`, as they do under a person's home
 /// on the default layout, and a device paired with the right to create sessions.
 struct World {
     host: Host,
@@ -43,7 +46,7 @@ struct World {
 impl World {
     async fn start() -> Self {
         let scratch = kr_ipc::testing::PrivateTempDir::create();
-        let home = scratch.path().join("home").join(ACCOUNT);
+        let home = scratch.path().join(ACCOUNT);
         std::fs::create_dir_all(&home).expect("a home directory");
         let owner = DeviceKeys::generate().expect("owner keys");
         let host = Host::start_under(&owner, &home).await;
