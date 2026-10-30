@@ -220,6 +220,20 @@ mod the_deployed_document {
         assert_eq!(document.serve(build(0, 80, 0)), Verdict::Skew);
     }
 
+    /// The first revision a release reads is above the one that listed no build of this product,
+    /// and not above the revision the service has published: a floor over the deployed revision
+    /// would close the gate on every host.
+    #[test]
+    fn is_read_from_a_revision_that_leaves_out_the_first_publication() {
+        let pins = Pins::production();
+        assert!(
+            pins.first_revision() > 1,
+            "revision 1 lists clients up to 0.4.99 and so no build of this product"
+        );
+        let document = Document::verify(DEPLOYED, &pins).expect("the deployed matrix verifies");
+        assert!(document.revision() >= pins.first_revision());
+    }
+
     #[test]
     fn every_pin_this_build_carries_is_a_key() {
         use base64::Engine as _;
@@ -422,6 +436,17 @@ mod nothing_unverified_is_acted_on {
         matrix(revision, ("0.70.0", "0.78.99"), ("0.70.0", "0.78.99"))
     }
 
+    fn take_under(
+        held: &HeldMatrix,
+        pins: &Pins,
+        key: &AuthorisationKeyPair,
+        matrix: &Value,
+        now: u64,
+    ) -> Result<Kept, Refusal> {
+        held.accept(pins, ORIGIN, this_build(), now, &reply(matrix, key))
+            .map(|update| update.kept)
+    }
+
     fn standing(held: &HeldMatrix) -> Option<(u64, Verdict, bool)> {
         held.view(ORIGIN, this_build())
             .map(|view| (view.revision, view.verdict, view.by_this_build))
@@ -544,6 +569,57 @@ mod nothing_unverified_is_acted_on {
         );
         assert_eq!(standing(&held), None, "no verdict is made of it");
         assert!(held.route_error(ORIGIN, this_build(), false).is_none());
+    }
+
+    /// A service rolled back to the revision that listed no build of this product is served to a
+    /// host with no copy, and to one whose kept copy is that old: neither takes it, so the lease
+    /// gate is not closed by a matrix that was never meant for the build.
+    #[test]
+    fn a_revision_below_the_first_a_build_reads_decides_nothing_with_or_without_a_copy() {
+        let key = AuthorisationKeyPair::generate().expect("a key pair");
+        let reads_from_two = pins(&key).from_revision(2);
+
+        // No copy: the first reply is the old publication.
+        let held = HeldMatrix::none();
+        assert_eq!(
+            held.accept(
+                &reads_from_two,
+                ORIGIN,
+                this_build(),
+                NOW,
+                &reply(&skew_matrix("1"), &key)
+            )
+            .err(),
+            Some(Refusal::BelowFirst)
+        );
+        assert_eq!(standing(&held), None, "no verdict is made of it");
+        assert!(held.route_error(ORIGIN, this_build(), false).is_none());
+
+        // The first revision itself is read.
+        assert_eq!(
+            take_under(&held, &reads_from_two, &key, &skew_matrix("2"), NOW + 1),
+            Ok(Kept::Replaced)
+        );
+        assert_eq!(standing(&held).map(|held| held.0), Some(2));
+
+        // A copy kept by an earlier build of the same revision 1 is no copy either.
+        let earlier = HeldMatrix::none();
+        let kept = earlier
+            .accept(
+                &pins(&key),
+                ORIGIN,
+                this_build(),
+                NOW,
+                &reply(&skew_matrix("1"), &key),
+            )
+            .expect("a build that reads from revision 1 took it")
+            .saved;
+        let restored = HeldMatrix::none();
+        assert_eq!(
+            restored.restore(&reads_from_two, &kept).err(),
+            Some(Refusal::BelowFirst)
+        );
+        assert_eq!(standing(&restored), None);
     }
 
     #[test]

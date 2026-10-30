@@ -515,6 +515,10 @@ fn why_refused(refusal: Refusal) -> &'static str {
         }
         Refusal::Older => "it is older than the copy held",
         Refusal::Conflicts => "it has the revision of the copy held over other signed content",
+        Refusal::BelowFirst => {
+            "its revision is below the first this build reads, which a service rolled back to its \
+             first publication would serve"
+        }
     }
 }
 

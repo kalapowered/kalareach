@@ -487,6 +487,8 @@ copy usually predates the build, and until a read for the new build succeeds the
 not been read for this build.
 
 What the host does not do is stop on a matrix it cannot trust. A reply that does not verify, one
+below the first revision the build reads (the service published revision 1 before it listed any
+build of this product, and a host with no copy would take it from a service rolled back to it), one
 older than the copy held, one with the held revision and other content, and a service that does not
 answer leave the held copy deciding, or, with none held, leave the host asking nothing of the matrix.
 The check says which of these happened and that the host asks again by itself.
