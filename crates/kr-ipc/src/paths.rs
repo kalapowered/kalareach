@@ -654,7 +654,7 @@ pub fn create_private_tree(root: &Path, path: &Path) -> Result<()> {
     if let Some(parent) = root.parent()
         && !parent.as_os_str().is_empty()
     {
-        create_missing_parents(parent)?;
+        create_dir_all_owner_only(parent).map_err(|error| IpcError::io("create", parent, error))?;
     }
     let mut current = root.to_path_buf();
     create_private_directory(&current)?;
@@ -665,24 +665,39 @@ pub fn create_private_tree(root: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Creates the directories above a root that are missing, each owner-only, and leaves one that
-/// exists as it is.
+/// Creates a directory and the ones above it that are missing, each owner-only on Unix whatever the
+/// process's umask, and leaves one that exists as it is: it is not checked, and a symbolic link to a
+/// directory is followed.
+///
+/// This is `std::fs::create_dir_all` with a mode of its own, for a directory below a root this
+/// installation verifies, where the root keeps others out and what is left to settle is the mode
+/// of what the host makes. [`create_private_tree`] is for a root and the directories that are
+/// checked each time they are asked for; one that exists with a wider mode is refused there, which
+/// here would refuse a directory an earlier release made with the umask's mode inside a root that
+/// was always owner-only. A directory made on Windows takes the access list of the one above it,
+/// and the check of a root there accepts that list.
+///
+/// # Errors
+///
+/// Returns the failure of the operating system when a directory cannot be created.
 #[cfg(unix)]
-fn create_missing_parents(parent: &Path) -> Result<()> {
+pub fn create_dir_all_owner_only(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt as _;
 
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(OWNER_ONLY_DIRECTORY_MODE)
-        .create(parent)
-        .map_err(|error| IpcError::io("create", parent, error))
+        .create(path)
 }
 
-/// Creates the directories above a root that are missing. A directory made on Windows takes the
-/// access list of the one above it, and the check of a root there accepts that list.
+/// As on Unix, for a platform whose directories take the access list of the one above them.
+///
+/// # Errors
+///
+/// Returns the failure of the operating system when a directory cannot be created.
 #[cfg(windows)]
-fn create_missing_parents(parent: &Path) -> Result<()> {
-    std::fs::create_dir_all(parent).map_err(|error| IpcError::io("create", parent, error))
+pub fn create_dir_all_owner_only(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)
 }
 
 /// Creates one directory owner-only, or checks an existing one.
