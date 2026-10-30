@@ -1748,8 +1748,9 @@ async fn device_changes(
 /// KR-REQ-10.49: a paired device whose history began at its pairing is shown the changes recorded
 /// since, in cursors that count nothing before it, and sends back the number it was shown. The log
 /// keeps its own cursor, so the owner's view of the same session is the log's. A number this host
-/// did not give the device, the log's own cursor among them, is refused, and a device that
-/// acknowledges the end of its view is next shown an empty one from there.
+/// did not give the device, the log's own cursor among them, is refused, a device that
+/// acknowledges a change's number is next shown the changes from there, and one that acknowledges
+/// the end of its view is next shown an empty one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_paired_devices_cursors_count_nothing_before_its_pairing_and_are_sent_back_as_shown() {
     let owner_keys = DeviceKeys::generate().expect("owner keys");
@@ -1811,6 +1812,32 @@ async fn a_paired_devices_cursors_count_nothing_before_its_pairing_and_are_sent_
         .expect_err("a number this host did not give the device");
         assert_eq!(refused.code(), ErrorCode::InvalidArgument, "{foreign}");
     }
+
+    // Acknowledging the number shown for its second change leaves that change unread, which only
+    // holds when the host stores the log's own cursor for the number and not the number itself.
+    let midway: VisitAcknowledgeResult = device_mutation(
+        &device,
+        session_target(&host, session_id),
+        Method::VisitAcknowledge,
+        &VisitAcknowledgeParams {
+            session_id,
+            acknowledged_cursor: U64::new(cursors[1]),
+            views: Vec::new(),
+        },
+    )
+    .await
+    .expect("the number it was shown for the second change is acknowledged");
+    assert_eq!(midway.acknowledged_cursor.get(), cursors[1]);
+    let rest = device_changes(&device, session_id).await;
+    assert_eq!(rest.from_cursor.get(), cursors[1]);
+    assert_eq!(
+        rest.changes
+            .iter()
+            .map(|change| change.cursor.get())
+            .collect::<Vec<_>>(),
+        vec![cursors[1]],
+        "the second change is still unread"
+    );
 
     let visited: VisitAcknowledgeResult = device_mutation(
         &device,
