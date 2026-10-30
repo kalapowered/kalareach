@@ -167,15 +167,16 @@ host did not meet.
 Two measurements are not steps of `scripts/bench-all.sh`, and neither writes a Markdown section.
 KR-PERF-006's reconnect to a real daemon is
 `cargo test --locked --release -p kr-controller --test network_reconnect_time -- --nocapture`: it
-asserts the two seconds on every host and prints its reading with the host's processors and build.
+asserts the two seconds on every host and prints its reading with the host's operating system,
+architecture, processors and build.
 KR-PERF-008's responsiveness in a real browser is
 `pnpm -C apps/companion e2e e2e/performance.spec.ts`: it prints each engine's reading with a verdict
-and attaches the figures to the run. The landing workflow runs both with its other tests.
+and attaches the figures, with the engine, to the run. The landing workflow runs both with its other tests.
 
 ## The records
 
-Every measurement writes each figure under `KR_TEST_ARTIFACTS_DIR` as a Markdown section headed by
-the identifier it measures, and does so before it asserts anything, so a run whose target failed
+Every measurement of `scripts/bench-all.sh` writes each figure under `KR_TEST_ARTIFACTS_DIR` as a
+Markdown section headed by the identifier it measures, and does so before it asserts anything, so a run whose target failed
 keeps the number. A run that asked for its evidence to be kept and could not write it fails, naming
 where and why. The conformance report attaches each section to its identifier (see
 [../conformance/README.md](../conformance/README.md)).
@@ -202,7 +203,8 @@ average, and whether the run's time was read from each thread's time or each pro
 stolen share over it, then the outcome, and whether the figures are reference figures. Figures are
 reference figures only when the run was asked for them, the host met every condition it read, every
 reading could be taken, no record of the step names a shortfall, and the run kept all of its
-evidence. The conditions sections are the last thing a run writes, and are published together in
+evidence. The conditions the script reads count logical processors, so whether four of them are four
+physical cores is read from the processor each record names. The conditions sections are the last thing a run writes, and are published together in
 one step, so a run that could not keep its evidence leaves none that calls its figures reference
 figures.
 
@@ -214,6 +216,9 @@ x86-64 or ARM64 for Windows, each meeting the definition above with nothing else
 and Linux the figures are those of a `scripts/bench-all.sh --reference-host` run that met every
 condition. On Windows they come from the same suites, run on the Windows 11 host.
 
-The four-processor Linux runners that continuous integration uses meet the definition, and their
-figures count as Linux x86-64 figures. The macOS runner it uses has three processors, below the
+The four-processor Linux runners that continuous integration uses meet the definition's count of
+processors, and their figures count as Linux x86-64 figures only where the runner's four processors
+are four physical cores, which the processor recorded beside the figure shows; a runner whose four
+processors are two cores with two hardware threads each records its figures and none of them is a
+release figure. The macOS runner it uses has three processors, below the
 reference host's four, so its figures are recorded and none of them is a release figure.
