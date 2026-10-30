@@ -1510,6 +1510,11 @@ async fn wait_for_daemon(endpoint: &kr_ipc::paths::Endpoint, log: &Path) {
 /// journal's lock taken — and a revocation completing in there has to reach an action that then
 /// does not begin.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the service refuses an adoption before its \
+              transaction begins and the admission is asked once"
+)]
 async fn an_admission_withdrawn_during_a_creation_is_refused_inside_the_services_transaction() {
     let temp = kr_ipc::testing::TempHost::create();
     let work = PrivateTempDir::create();

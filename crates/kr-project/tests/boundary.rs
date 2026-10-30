@@ -810,6 +810,11 @@ fn a_destination_substituted_before_the_spawn_is_not_one_this_operation_owns() {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the service holds no Git program whose execution list \
+              this case could read"
+)]
 fn only_an_invocation_that_reaches_a_repository_may_execute_a_shell() {
     // Git builds two things as command strings and starts them through the system shell: its
     // connection to a repository over its own transport, and its call to a credential helper. Both
