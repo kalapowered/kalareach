@@ -645,6 +645,20 @@ mod unix {
             Ok(Self { handle })
         }
 
+        /// What makes this terminal spell its keys itself, which a Unix terminal never needs: it
+        /// reports bytes already, so nothing is asked of it.
+        ///
+        /// # Errors
+        ///
+        /// Never fails here.
+        pub fn input_switch(&self) -> Result<crate::attach::InputSwitch> {
+            Ok(crate::attach::InputSwitch::new(|| {
+                Err(CliError::Terminal(shown!(
+                    "this terminal reports its keys as bytes already"
+                )))
+            }))
+        }
+
         /// A terminal over `handle`, for a case that runs the attach loop without a terminal.
         #[cfg(test)]
         pub(crate) const fn over(handle: File) -> Self {
