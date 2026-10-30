@@ -91,11 +91,11 @@ fn installation() -> &'static Path {
     })
 }
 
-/// Held by the cases that run a real container runtime and by the cases that stand one in, so that
-/// they do not run together. A `podman exec` on a busy machine has stalled, and these cases are the
-/// ones that start containers and daemons of their own. Running them one at a time has made the
-/// stall rarer and has not explained it, so every call to the runtime is bounded as well: a stall
-/// under this lock still fails its case and names the call.
+/// Held by the cases that run a real container runtime and by the two cases that stand one in, so
+/// that these four do not run beside each other. Without it `podman exec` often stalled in the
+/// real-container cases on the build box, and with it they have passed; why is not known. Every call this harness makes to the runtime is bounded as well, so a stall under the
+/// lock fails the case that made the call and names it. A removal that stalls in `Drop` is
+/// recorded, not raised.
 static CONTAINER_RUNTIME_TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// What a login in the destination gives the helper as its `HOME`.
@@ -3331,8 +3331,8 @@ impl Container {
 
     /// Whether the daemon in this container answers `kr list` now. An asking that has not ended
     /// within the runtime's quick bound is a stall and not a missing answer: it fails the case
-    /// with the command named, where a retry would hide it. A probe that gets an error answer
-    /// at once, as `kr` does while the daemon is not up, is asked again.
+    /// with the command named, where a retry would hide it. A probe that ends with an error, as
+    /// `kr` does while the daemon is not up, is asked again.
     fn answers(&self) -> bool {
         let asked = self
             .runtime
@@ -3434,9 +3434,10 @@ const STAND_IN_STALL_SECONDS: u32 = 40;
 
 /// A stand-in for the container runtime that answers every call with success and no output, and
 /// says no image exists, except the calls whose command it is told to stall (the first argument:
-/// `exec`, `run`, `rm`, `build`, `container`, `--version`): those print nothing and do not end, as
-/// `podman exec` did on the build box. It records every call in `calls` in its directory, one
-/// line of arguments each, whether it stalls the call or not.
+/// `exec`, `run`, `rm`, `build`, `container`, `--version`): those print nothing and do not end
+/// within any bound a case gives them, as `podman exec` did on the build box. It records every
+/// call in `calls` in its directory, one line of arguments each, whether it stalls the call or
+/// not.
 fn stalling_runtime(directory: &Path, stalls: &[&str]) -> Runtime {
     let text = directory.join("runtime.text");
     std::fs::write(
