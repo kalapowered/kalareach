@@ -1,5 +1,5 @@
 {
-  "description": "The four session roles in order of increasing authority, each with the actions the host writes into a grant made for it. The host reads it as SessionRole::default_actions, and the companion's page reads it as the table it names a share's role by.",
+  "description": "The four session roles in order of increasing authority, each with the actions the host writes into a grant made for it. The host's test holds SessionRole::default_actions to it, and the companion's test holds the page's own table, which names a share's role, to it.",
   "roles": [
     {
       "role": "viewer",

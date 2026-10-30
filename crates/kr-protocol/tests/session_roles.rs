@@ -2,7 +2,8 @@
 //!
 //! A grant keeps the actions its role carried when it was written and never the role. The
 //! companion's page keeps its own table of what each role carries, to name a share by the widest
-//! role it holds in full, and reads it from the same fixture this file holds the host to.
+//! role it holds in full, and the page's test holds that table to the same fixture this file holds
+//! the host to.
 
 use std::path::PathBuf;
 

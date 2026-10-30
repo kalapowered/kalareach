@@ -5972,27 +5972,32 @@ in for an event; a gap is not an absence of changes but a statement that the hos
 was there.
 
 A device whose grant does not reach every moment is not told how many changes came before its
-history. The cursors it is shown (`from_cursor`, `to_cursor` and each change's `cursor`) are the log's
-own, taken no lower than the first change its history reaches, plus an offset: a keyed digest of the
-session and of the moment its history reaches back to, under the attention store's secret, in the
-range from 2^60 up to 2^61. The offset is the same whenever it is asked for and nothing stores it.
-It changes with the store, so the numbers of a replaced store stop being valid by themselves. The
-device sends back in `visit.acknowledge` the number it was shown, and the host takes the offset
-away. A number below the first one the device was shown, or past the end of the log, is refused as one
-the host did not give that device, and the log's own cursor is such a number. The line is drawn at
-the first number shown and not at the offset, so that a device cannot find the offset, and with it
-how many changes came before its history, by trying numbers below its first. When retention lets
-go of the changes a device's history started at, its first number moves up, and a number it was
-shown before is refused the same way: it reads its view again. The store and every record of an answer keep
-the log's own cursor, and the answer is numbered as it leaves, for the caller that receives it, so a
-repeat of the action under a later bound is answered in that bound's numbers. The owner and a device
-whose grant starts at the beginning of time are shown the log's own cursors.
+history. The cursors it is shown (`from_cursor`, `to_cursor` and each change's `cursor`) are the
+log's own, taken no lower than the first change its history reaches, plus an offset: a keyed digest
+of the session and of the moment its history reaches back to, under the attention store's secret,
+in the range from 2^60 up to 2^61. The offset is the same whenever it is asked for and nothing
+stores it. It changes with the store, so the numbers of a replaced store stop being valid by
+themselves. The device sends back in `visit.acknowledge` the number it was shown, and the host takes
+the offset away. A number below the first number of its history, or past the last change it was
+shown, is refused as one the host did not give that device, and the log's own cursor is such a
+number. The line is drawn at the first number of its history and not at the offset, so that a device
+cannot find the offset, and with it how many changes came before its history, by trying numbers
+below its first. When retention lets go of the changes a device's history started at, its first
+number moves up, and a number it was shown before is refused the same way: it reads its view again.
+The store and every record of an answer keep the log's own cursor, and the answer is numbered as it
+leaves, for the caller that receives it, so a repeat of the action under a later bound is answered
+in that bound's numbers. The owner and a device whose grant starts at the beginning of time are
+shown the log's own cursors and are not numbered: a number past the end of the log that one of them
+sends is taken as the end, so a number kept from a bounded grant and sent under a grant that reaches
+every moment marks the log read to its end.
 
 The numbering has two limits. The first is the step between two cursors a device is shown. A change
 recorded after the bound but dated before it takes a place in the log that the device cannot read,
 so a step of two between neighbours says that something unreadable was recorded, and a device whose
-first view is empty sees its `from_cursor` move when one is. That shows such changes exist after the
-bound, and never how many came before it. The second is what the numbering does not reach: a
+first view is empty sees its `from_cursor` move when one is. The numbers the host takes back end at
+the last change the device was shown and not at the end of the log, so a refusal does not say how
+many such changes there are beyond that. That shows such changes exist after the bound, and never
+how many came before it. The second is what the numbering does not reach: a
 review's versions, an attention item's revision, the `gaps` and `dropped` count of
 `attention.read`, and a log view's output offsets. They stay the host's own numbers, and the bound
 does not cut them.
@@ -6157,17 +6162,16 @@ model summary either. The changed-since-last-visit view holds only the changes t
 at or after the moment the caller's history reaches back to. Its cursors end after the last change
 it was shown, never at the end of the log, and it names no range that went missing: neither a range
 retention took nor a gap in a source has a date, so a caller whose history has a bound is told of
-none. A review subject whose current version was recorded before that moment is answered as one the
+none. A review subject whose current version is dated before that moment is answered as one the
 host does not hold, by a read and by an acknowledgement alike, and an acknowledged position is kept
 no further than the last change the caller may be shown. The owner, and a device whose grant reaches
 back to the start of time, are served the whole log as before.
 
-Two limits remain. The cursors count the whole log and a subject's version counts the versions
-before the moment, so a device can tell how many changes preceded the first it was shown; a
-numbering that begins at the device's own history needs a base the store keeps for each viewer, and
-the store's format carries none. And a device is not told when retention took changes
-inside its reach, which is more than a thousand since its history began: that is a limit of
-completeness and not a disclosure.
+Two limits remain. A subject's version counts the versions before the moment, so a device can tell
+how many versions of a subject preceded the first it was shown; the cursors are numbered from the
+device's own history (see "Changed since a visit"), and a version is not. And a device is not told
+when retention took changes inside its reach, which is more than a thousand since its history began:
+that is a limit of completeness and not a disclosure.
 
 An item's key carries none of that text either. A key has to be derived rather than allocated, so
 that rebuilding the inbox from the retained events lands on the items it had before, and it travels
@@ -8544,7 +8548,7 @@ cancellation names the turn it acts on and is refused rather than redirected whe
 the one running. An approval answer names a resource that is still open, inside the upstream's own
 deadline, interpreted at the current source generation by a decoder that still holds the
 approval-interpreter grant, with a decision that interpretation offered; it is checked against the
-retained list before the claim is taken, and it happens once. A paired device is also refused an approval its grant's history does not reach, as one the host does not hold.
+retained list before the claim is taken, and it happens once. A paired device is also refused an approval its grant's history does not reach and its grant does not name while it can still be decided, as one the host does not hold.
 
 Every refusal named above is decided before the dispatch marker, so a request this host can refuse
 leaves a rejection rather than an outcome nobody can establish. That includes an instance with no
