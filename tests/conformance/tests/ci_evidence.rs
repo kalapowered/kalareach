@@ -239,7 +239,7 @@ const CLASSES: [ClassOfTest; 10] = [
         conditions: &[],
     },
     ClassOfTest {
-        class: "a Windows machine",
+        class: "a Windows machine's release build of the desktop application",
         job: "windows",
         runner: &["runs-on: windows-2025"],
         tool: "cargo build --locked -p companion-tauri --release",
@@ -286,10 +286,11 @@ const CLASSES: [ClassOfTest; 10] = [
 /// names has a job in the landing workflow that runs its tool on a runner that has it, by a step
 /// that is not disabled: Playwright for browser behaviour, the operating system's own tooling for
 /// native controls and for the iOS Simulator on macOS, an Android emulator for the Android phone,
-/// the Tauri desktop application's native backend on Linux and macOS and in a real window on
-/// Windows, the real-worker host suite on a native Windows machine, and a hosted Windows, Linux and
-/// macOS machine each for its platform's tests. The conformance document's table names the same
-/// jobs. Physical devices are the person's own and no workflow starts them.
+/// the Tauri desktop application's native backend on Linux and macOS, its release build and its
+/// window on Windows, the real-worker host suite on a native Windows machine, and the whole
+/// workspace's tests on a hosted Linux and macOS machine. The Windows job runs many more test
+/// steps than the two this case holds. The conformance document's table names the same jobs.
+/// Physical devices are the person's own and no workflow starts them.
 #[test]
 fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
     let workflow = fs::read_to_string(repository().join(".github/workflows/core-ci.yml"))
