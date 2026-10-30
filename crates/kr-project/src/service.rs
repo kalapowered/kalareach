@@ -17,7 +17,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use kr_ipc::paths::EnvironmentPaths;
@@ -152,7 +152,9 @@ pub struct ProjectService {
     pub(crate) environment_id: EnvironmentId,
     store: Mutex<Store>,
     profile: RestrictedProfile,
-    brokers: BrokerRegistry,
+    /// The credential brokers this host has, found from its Git the first time they are asked for,
+    /// or the ones a caller set.
+    brokers: OnceLock<BrokerRegistry>,
     pub(crate) clock: Arc<dyn Clock>,
     /// The owner's active locations and the handles held for them.
     pub(crate) policy: crate::policy::LocationPolicy,
@@ -192,10 +194,14 @@ impl std::fmt::Debug for Hook {
 impl ProjectService {
     /// Opens the service for an environment, creating its store and profile on first use.
     ///
+    /// Git is not looked for here. A host without a usable Git opens the service, answers what the
+    /// store alone can answer, and refuses each request that runs Git with
+    /// [`ProjectError::GitUnavailable`].
+    ///
     /// # Errors
     ///
-    /// Returns [`ProjectError::StoreUnavailable`], [`ProjectError::StagingUnavailable`] or
-    /// [`ProjectError::GitUnavailable`] when any of the three cannot be prepared.
+    /// Returns [`ProjectError::StoreUnavailable`] or [`ProjectError::StagingUnavailable`] when
+    /// either cannot be prepared.
     pub fn open(paths: &EnvironmentPaths) -> Result<Self> {
         Self::with_clock(paths, Arc::new(SystemClock))
     }
@@ -204,14 +210,13 @@ impl ProjectService {
     ///
     /// # Errors
     ///
-    /// Returns [`ProjectError::StoreUnavailable`], [`ProjectError::StagingUnavailable`] or
-    /// [`ProjectError::GitUnavailable`] when any of the three cannot be prepared.
+    /// Returns [`ProjectError::StoreUnavailable`] or [`ProjectError::StagingUnavailable`] when
+    /// either cannot be prepared.
     pub fn with_clock(paths: &EnvironmentPaths, clock: Arc<dyn Clock>) -> Result<Self> {
         let root = Self::root_of(paths);
         kr_ipc::paths::create_private_tree(paths.state_root(), &root)
             .map_err(ProjectError::staging)?;
         let profile = RestrictedProfile::prepare(&root, paths.environment_id())?;
-        let brokers = BrokerRegistry::discover(profile.git());
         let mut store = Store::open(
             root.join(crate::store::STORE_FILE_NAME),
             paths.environment_id(),
@@ -223,7 +228,7 @@ impl ProjectService {
             environment_id: paths.environment_id(),
             store: Mutex::new(store),
             profile,
-            brokers,
+            brokers: OnceLock::new(),
             clock,
             policy: crate::policy::LocationPolicy::default(),
             challenges: crate::policy::Challenges::default(),
@@ -316,15 +321,31 @@ impl ProjectService {
         &self.profile
     }
 
-    /// Returns the credential brokers this host has.
-    #[must_use]
-    pub const fn brokers(&self) -> &BrokerRegistry {
-        &self.brokers
+    /// Returns the credential brokers this host has, found from its Git the first time they are
+    /// asked for.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::GitUnavailable`] when there is no usable Git to find them from.
+    pub fn brokers(&self) -> Result<&BrokerRegistry> {
+        if let Some(found) = self.brokers.get() {
+            return Ok(found);
+        }
+        let discovered = BrokerRegistry::discover(self.profile.git()?);
+        Ok(self.brokers.get_or_init(|| discovered))
     }
 
     /// Replaces the credential brokers, for a host whose brokers are configured.
     pub fn set_brokers(&mut self, brokers: BrokerRegistry) {
-        self.brokers = brokers;
+        self.brokers = OnceLock::from(brokers);
+    }
+
+    /// Refuses a request that runs Git when the host has no usable Git.
+    ///
+    /// Asked before the request records or makes anything, so a refusal leaves no operation row to
+    /// settle and no directory to clean up.
+    fn require_git(&self) -> Result<()> {
+        self.profile.git().map(|_| ())
     }
 
     pub(crate) fn locked(&self) -> Result<std::sync::MutexGuard<'_, Store>> {
@@ -1201,7 +1222,7 @@ impl ProjectService {
                         .into(),
                     });
                 }
-                return Ok((self.brokers.validate(remote)?, None));
+                return Ok((self.brokers()?.validate(remote)?, None));
             }
             CloneSource::Location {
                 location_id,
@@ -1254,7 +1275,7 @@ impl ProjectService {
             }
             None => self.open_through(&held, &relative, admission)?,
         };
-        let remote = self.brokers.validate(&RemoteSpecification {
+        let remote = self.brokers()?.validate(&RemoteSpecification {
             remote_name: "origin".to_owned(),
             transport: RemoteTransport::LocalPath,
             url: opened.top_level().display().to_string(),
@@ -2013,6 +2034,7 @@ impl ProjectService {
             return Ok((answered.project, answered.operation));
         }
         self.check_environment(request.environment_id)?;
+        self.require_git()?;
         let admitting = Admitting::Caller(performed.grant());
         let destination =
             Destination::resolve(request, self.environment_id, self.locations(), admitting)?;
@@ -2636,6 +2658,7 @@ impl ProjectService {
             params.policy,
             params.destination.0.is_some(),
         )?;
+        self.require_git()?;
         let project = self
             .locked()?
             .project(params.project_repository_id)?
@@ -3180,6 +3203,7 @@ impl ProjectService {
         {
             return Ok(answered);
         }
+        self.require_git()?;
         // Naming a location to remove a workspace through is the owner's route, and only the owner
         // takes it: withdrawal stays withdrawn for every device.
         if let (Some(grant), Some(_)) = (performed.grant(), params.through_location_id.0) {

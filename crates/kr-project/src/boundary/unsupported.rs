@@ -14,6 +14,10 @@ use crate::error::{ProjectError, Result};
 /// What the boundary is, for a person reading a record.
 pub const MECHANISM: &str = "none: this platform has no boundary this service can build";
 
+/// Why no Git is run here.
+pub const NO_GIT: Option<&str> =
+    Some("this platform has no boundary a Git invocation can be enclosed in, so none is run");
+
 /// The boundary as the parent built it, which on this platform is never built at all.
 #[derive(Debug)]
 pub struct Prepared {
