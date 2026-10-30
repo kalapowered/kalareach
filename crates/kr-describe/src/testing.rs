@@ -92,6 +92,9 @@ thread_local! {
     /// What runs the next time a driver on this thread has created its process.
     static AT_SPAWN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+
+    /// Whether a driver on this thread is refused when it next lets its process run.
+    static LET_RUN_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Runs `hook` the next time a driver on this thread has created its process, before the driver has
@@ -120,6 +123,18 @@ pub fn the_system_refuses_the_process_memory() {
 /// forgets it.
 pub(crate) fn memory_refusal_taken() -> bool {
     MEMORY_REFUSED.with(|refused| refused.replace(false))
+}
+
+/// Makes the next time a driver on this thread lets its process run fail as a request the
+/// operating system would not grant, after the process was created and its pipes were handed to
+/// the threads that carry its frames.
+pub fn refuse_to_let_the_process_run() {
+    LET_RUN_REFUSED.with(|refused| refused.set(true));
+}
+
+/// Returns whether letting the process run is to fail, which it does once.
+pub(crate) fn let_run_refused() -> bool {
+    LET_RUN_REFUSED.with(|refused| refused.replace(false))
 }
 
 /// Makes the next reading of its own start identity, by a driver on this thread, fail as a query

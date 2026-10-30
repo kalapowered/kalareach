@@ -702,6 +702,10 @@ impl Driver {
                 }
             }
         })?;
+        // The reader reports the end of this process under the tag, whatever becomes of the
+        // process afterwards, so no later process takes the tag: an end that is told late would
+        // stop the next process.
+        self.tag = tag;
         let mut command = Command::new(&self.launch.program);
         command
             .args(&self.launch.arguments)
@@ -750,23 +754,19 @@ impl Driver {
         }
         #[cfg(windows)]
         let system_limit = if hold {
-            let limit = self.limit_in_the_system(&child);
-            if let Err(why) =
-                kr_ipc::memory_limit::resume(std::os::windows::io::AsHandle::as_handle(&child))
-            {
-                eprintln!(
-                    "kr-describe: {} could not be let run: {why}",
-                    self.launch.program.display()
-                );
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(ProcessEnd::CouldNotStart);
-            }
-            limit
+            self.limit_in_the_system(&child)
         } else {
             None
         };
-        self.tag = tag;
+        if let Err(why) = self.let_run(&child) {
+            eprintln!(
+                "kr-describe: {} could not be let run: {why}",
+                self.launch.program.display()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ProcessEnd::CouldNotStart);
+        }
         self.started = self.started.saturating_add(1);
         reports.push(Report::Started { pid: child.id() });
         self.process = Some(Running {
@@ -795,6 +795,31 @@ impl Driver {
             self.kill_only();
             return Err(why);
         }
+        Ok(())
+    }
+
+    /// Lets the process run, when it was created held. Says why the system would not.
+    fn let_run(&self, child: &Child) -> std::result::Result<(), &'static str> {
+        #[cfg(feature = "testing")]
+        if crate::testing::let_run_refused() {
+            return Err("a test asked for it to be refused");
+        }
+        self.resume_held(child)
+    }
+
+    /// Lets a process run that the system is to hold to a memory limit, which is created held.
+    #[cfg(windows)]
+    fn resume_held(&self, child: &Child) -> std::result::Result<(), &'static str> {
+        if self.launch.system_memory_limit {
+            kr_ipc::memory_limit::resume(std::os::windows::io::AsHandle::as_handle(child))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Only a process on Windows is created held.
+    #[cfg(not(windows))]
+    fn resume_held(&self, _child: &Child) -> std::result::Result<(), &'static str> {
         Ok(())
     }
 

@@ -32,7 +32,7 @@ use kr_describe::supervise::{
 };
 use kr_describe::testing::{
     CATALOGUE_VARIABLE, Raw, SCRIPT_VARIABLE, STARTED_PREFIX, Script, TestAsset, TestCatalogue,
-    TestProfile, refuse_identity_lookup, refuse_thread_start,
+    TestProfile, refuse_identity_lookup, refuse_thread_start, refuse_to_let_the_process_run,
     the_system_refuses_the_process_memory,
 };
 use kr_describe::time::Reading;
@@ -2662,6 +2662,53 @@ fn a_frame_thread_that_cannot_start_leaves_no_process_behind() {
         );
         assert_eq!(rig.processes_started(), 1, "{thread}");
     }
+}
+
+/// A process the system will not let run is ended and collected, and the end its reader tells of
+/// afterwards is not taken for the end of the next process. A check starts a process at once, so
+/// the second check starts one before the first process's end has been handled; a load waits for
+/// the restart delay and would not meet it. The control is the answer of the second check.
+#[test]
+fn an_end_told_late_of_a_process_that_would_not_run_does_not_stop_the_next_process() {
+    let (signed, weights) = tiny();
+    let mut rig = Rig::signed(&Script::default(), &signed);
+    let files = rig.placed.directory("files");
+    std::fs::write(files.join("right"), &weights).expect("the right file");
+
+    refuse_to_let_the_process_run();
+    let reports = rig
+        .driver
+        .verify(&check(1, files.join("right"), 60_000), at(0))
+        .expect("a check");
+    assert_eq!(
+        checks(&reports),
+        vec![(
+            1,
+            Checked::ProcessEnded {
+                why: ProcessEnd::CouldNotStart
+            }
+        )],
+        "{reports:?}"
+    );
+    assert_eq!(rig.driver.pid(), None, "the process is gone");
+
+    rig.driver
+        .verify(&check(2, files.join("right"), 60_000), at(1))
+        .expect("a check");
+    let reports = rig.until(&roomy(), at(10), "the result", |reports, _| {
+        !checks(reports).is_empty()
+    });
+    assert_eq!(
+        checks(&reports),
+        vec![(
+            2,
+            Checked::Answered {
+                result: VerifyResult::Verified,
+                detail: None
+            }
+        )],
+        "{reports:?}"
+    );
 }
 
 /// A daemon that cannot read its own start identity starts no description process: without it, a
