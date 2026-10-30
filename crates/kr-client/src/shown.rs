@@ -290,6 +290,19 @@ impl Shown {
                 expected_uid,
                 found_uid,
                 found_mode,
+            } if found_uid == expected_uid => crate::shown!(
+                "{} must be owned by user {} with mode 0700, found owner {} and mode {}; make it yours alone with: chmod 700 '{}'",
+                Self::host_path(path),
+                *expected_uid,
+                *found_uid,
+                Self::decided(format!("{found_mode:04o}")),
+                Self::host_path(path)
+            ),
+            IpcError::DirectoryNotOwnerOnly {
+                path,
+                expected_uid,
+                found_uid,
+                found_mode,
             } => crate::shown!(
                 "{} must be owned by user {} with mode 0700, found owner {} and mode {}",
                 Self::host_path(path),

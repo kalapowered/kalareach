@@ -629,9 +629,12 @@ pub const ENVIRONMENT_MARKER: &str = "environment";
 /// Only the root and the directories below it are KalaReach's. Their parents are not: `/tmp` is
 /// world-writable by design, and `~/.cache` and `~/.local/state` are ordinarily group-readable.
 /// Demanding 0700 of those would refuse to start on a perfectly normal system, so the boundary is
-/// explicit: everything above `root` is created with the platform's ordinary permissions and
-/// checked for nothing, and `root` itself and every component below it is created owner-only and
-/// verified on every open.
+/// explicit: a directory above `root` that exists is checked for nothing and left as it is, and
+/// `root` itself and every component below it is created owner-only and verified on every open. A
+/// directory above `root` that is missing is made here, and it is made owner-only like the rest,
+/// whatever the process's umask: a parent that one KalaReach program makes is another one's root
+/// (the store of releases lies inside the state root on macOS), and a directory made wider than
+/// that would be refused on the next open.
 ///
 /// # Errors
 ///
@@ -651,7 +654,7 @@ pub fn create_private_tree(root: &Path, path: &Path) -> Result<()> {
     if let Some(parent) = root.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent).map_err(|error| IpcError::io("create", parent, error))?;
+        create_missing_parents(parent)?;
     }
     let mut current = root.to_path_buf();
     create_private_directory(&current)?;
@@ -660,6 +663,26 @@ pub fn create_private_tree(root: &Path, path: &Path) -> Result<()> {
         create_private_directory(&current)?;
     }
     Ok(())
+}
+
+/// Creates the directories above a root that are missing, each owner-only, and leaves one that
+/// exists as it is.
+#[cfg(unix)]
+fn create_missing_parents(parent: &Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(OWNER_ONLY_DIRECTORY_MODE)
+        .create(parent)
+        .map_err(|error| IpcError::io("create", parent, error))
+}
+
+/// Creates the directories above a root that are missing. A directory made on Windows takes the
+/// access list of the one above it, and the check of a root there accepts that list.
+#[cfg(windows)]
+fn create_missing_parents(parent: &Path) -> Result<()> {
+    std::fs::create_dir_all(parent).map_err(|error| IpcError::io("create", parent, error))
 }
 
 /// Creates one directory owner-only, or checks an existing one.

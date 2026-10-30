@@ -32,8 +32,12 @@ pub enum IpcError {
         source: std::io::Error,
     },
     /// A directory that must be owner-only was not.
+    ///
+    /// A directory that this user owns and that is too open is one `chmod 700` mends, and the text
+    /// says so, naming the directory.
     #[error(
-        "{path} must be owned by user {expected_uid} with mode 0700, found owner {found_uid} and mode {found_mode:04o}"
+        "{path} must be owned by user {expected_uid} with mode 0700, found owner {found_uid} and mode {found_mode:04o}{}",
+        owner_only_remedy(.path, *.expected_uid, *.found_uid)
     )]
     DirectoryNotOwnerOnly {
         /// The directory.
@@ -233,6 +237,16 @@ impl IpcError {
 }
 
 /// Whether an I/O failure is a connection's refusal of its caller by account, carried inside it.
+/// What follows the refusal of a directory's mode when the directory is this user's own: the one
+/// command that mends it. A directory of another user is not mended by this user, so it names none.
+fn owner_only_remedy(path: &std::path::Path, expected_uid: u32, found_uid: u32) -> String {
+    if found_uid == expected_uid {
+        format!("; make it yours alone with: chmod 700 '{}'", path.display())
+    } else {
+        String::new()
+    }
+}
+
 fn carries_account_refusal(source: &std::io::Error) -> bool {
     source
         .get_ref()
