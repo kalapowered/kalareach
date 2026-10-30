@@ -486,6 +486,127 @@ pub fn process_state(identity: &ProcessStartIdentity) -> ProcessState {
     current_process(identity).into()
 }
 
+/// The longest executable name [`read_process`] returns, in bytes.
+pub const MAX_PROCESS_NAME_BYTES: usize = 255;
+
+/// What one reading of a running process gave besides the fact that it runs.
+///
+/// Each member is a fact of the platform's own process interface and is `None` where the platform
+/// does not give it, or would not give it for this process. A missing fact leaves the process
+/// running: it says nothing about whether the process ended.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProcessFacts {
+    /// The process that was its parent when it was read, as an identity. A bare process
+    /// identifier names whichever process holds the number by the time anyone looks, so a parent
+    /// is kept only as the process a second reading of the child still names.
+    pub parent: Option<ProcessStartIdentity>,
+    /// The base name of the executable, as lossy UTF-8 cut at [`MAX_PROCESS_NAME_BYTES`] on a
+    /// character boundary. Never the arguments, the environment, the working directory or a path.
+    pub name: Option<String>,
+}
+
+/// What [`read_process`] found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProcessReading {
+    /// The process is the one recorded, and it ran from the first question to the last.
+    Running(ProcessFacts),
+    /// The process is gone, or its identifier belongs to a different process, or it ended while
+    /// it was read.
+    Ended,
+    /// The operating system did not answer, or the identity cannot tell two processes apart.
+    Unknown {
+        /// Why.
+        detail: String,
+    },
+}
+
+/// Reads a recorded process: whether it is still the recorded one, who its parent is and what
+/// executable it runs.
+///
+/// The reading is bracketed by two questions about the recorded identity, so that a process
+/// identifier reused meanwhile is never given another process's facts: a process that answers
+/// running at both ends held its identifier and its start throughout. Between them the process's
+/// lineage is read twice, and the parent's identity is kept only when both readings name the same
+/// parent. A process that ends between the questions is [`ProcessReading::Ended`] with no facts.
+///
+/// An identity in whole seconds ([`ProcessStartSource::WindowsProcessStartSeconds`]) cannot tell
+/// two processes that share an identifier within a second apart, so it is
+/// [`ProcessReading::Unknown`] without a question being asked.
+#[must_use]
+pub fn read_process(identity: &ProcessStartIdentity) -> ProcessReading {
+    if identity.source == ProcessStartSource::WindowsProcessStartSeconds {
+        return ProcessReading::Unknown {
+            detail: "the identity is in whole seconds, which cannot tell a process from one that \
+                     took its identifier within the second"
+                .to_owned(),
+        };
+    }
+    let Ok(pid) = u32::try_from(identity.pid.get()) else {
+        return ProcessReading::Ended;
+    };
+    let current = match current_process(identity) {
+        CurrentProcess::Running(current) => current,
+        CurrentProcess::Ended => return ProcessReading::Ended,
+        CurrentProcess::Unknown { detail } => return ProcessReading::Unknown { detail },
+    };
+    let Some(facts) = facts_of(pid, &current) else {
+        return ProcessReading::Ended;
+    };
+    match current_process(identity) {
+        CurrentProcess::Running(_) => ProcessReading::Running(facts),
+        CurrentProcess::Ended => ProcessReading::Ended,
+        CurrentProcess::Unknown { detail } => ProcessReading::Unknown { detail },
+    }
+}
+
+/// The facts of the process `current` names, or `None` when a reading shows the identifier now
+/// belongs to another process. A reading that fails or a fact the platform does not give leaves
+/// the fact out: the two questions around it decide whether the process ran.
+fn facts_of(pid: u32, current: &ProcessStartIdentity) -> Option<ProcessFacts> {
+    let Ok(first) = process_lineage(pid) else {
+        return Some(ProcessFacts::default());
+    };
+    if first.identity != *current {
+        return None;
+    }
+    let parent = match query_process(first.parent) {
+        ProcessQuery::Present(parent) => Some(parent),
+        ProcessQuery::Gone | ProcessQuery::CannotEstablish(_) => None,
+    };
+    let parent = parent_both_readings_name(current, &first, process_lineage(pid), parent)?;
+    Some(ProcessFacts {
+        parent,
+        name: platform::executable_name(pid).map(|name| cut_name(&name)),
+    })
+}
+
+/// The parent to report once the child has been read a second time, after the parent's identity
+/// was read: `parent` when the second reading names the same process as the child and the same
+/// parent as the first, none when it fails or names another parent (the parent the first reading
+/// named may have ended and the child been adopted, so `parent` may be a stranger's), and `None`
+/// altogether when it shows the identifier now belongs to another process.
+fn parent_both_readings_name(
+    current: &ProcessStartIdentity,
+    first: &Lineage,
+    second: Result<Lineage>,
+    parent: Option<ProcessStartIdentity>,
+) -> Option<Option<ProcessStartIdentity>> {
+    match second {
+        Ok(second) if second.identity != *current => None,
+        Ok(second) if second.parent == first.parent => Some(parent),
+        Ok(_) | Err(_) => Some(None),
+    }
+}
+
+/// Cuts `name` at [`MAX_PROCESS_NAME_BYTES`] on a character boundary.
+fn cut_name(name: &str) -> String {
+    let mut end = name.len().min(MAX_PROCESS_NAME_BYTES);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    name[..end].to_owned()
+}
+
 /// How hard to stop a process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stop {
@@ -1296,6 +1417,16 @@ mod platform {
         lineage_of(pid, &text)
     }
 
+    /// The base name of the executable a process runs, from the link `/proc/<pid>/exe` holds, or
+    /// `None` when the process will not say (another account's or a non-dumpable process) or has
+    /// no executable to name. A name the link marks as deleted keeps the kernel's marking.
+    pub(super) fn executable_name(pid: u32) -> Option<String> {
+        let target = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+        target
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+    }
+
     /// Reads a lineage from a `/proc/<pid>/stat` line.
     pub(super) fn lineage_of(pid: u32, text: &str) -> Result<super::Lineage> {
         let incomplete = |what: &str| {
@@ -1921,6 +2052,16 @@ mod platform {
         super::Stopped::Signalled
     }
 
+    /// The base name of the executable a process runs, from `proc_pidpath`, or `None` when the
+    /// process will not say: another account's process reads as refused.
+    pub(super) fn executable_name(pid: u32) -> Option<String> {
+        let raw = i32::try_from(pid).ok()?;
+        let path = libproc::libproc::proc_pid::pidpath(raw).ok()?;
+        std::path::Path::new(&path)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+    }
+
     /// One `proc_pidinfo` reading: the start and the facts that tie the process to its parent,
     /// group and terminal are the same process's. macOS names no session in it.
     pub(super) fn lineage(pid: u32) -> Result<super::Lineage> {
@@ -2421,6 +2562,11 @@ mod platform {
         ))
     }
 
+    /// A sandboxed application is told no executable of another process.
+    pub(super) fn executable_name(_pid: u32) -> Option<String> {
+        None
+    }
+
     pub(super) fn stop(
         _identity: &kr_protocol::identity::ProcessStartIdentity,
         _stop: super::Stop,
@@ -2474,6 +2620,12 @@ mod platform {
             "process lineage",
             format!("pid {pid}: a Windows process belongs to a session by its job, not by a group"),
         ))
+    }
+
+    /// Windows gives the state of a recorded process and no name: the image name needs the
+    /// process's own handle, which this reading does not keep.
+    pub(super) fn executable_name(_pid: u32) -> Option<String> {
+        None
     }
 
     /// Reads the kernel's boot counter and its System process's creation time, the pair
@@ -3161,6 +3313,62 @@ mod windows_boot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// KR-REQ-25.06: the parent a process view reports is the process the child's two readings
+    /// agree on. A kernel cannot be made to re-parent a process between two reads on request, so
+    /// the decision is made on readings that say it.
+    #[test]
+    fn a_parent_is_reported_only_when_both_readings_of_the_child_name_it() {
+        let identity = |pid: u64, start: u64| {
+            ProcessStartIdentity::new(pid, ProcessStartSource::LinuxProcStat, start)
+        };
+        let reading = |child: ProcessStartIdentity, parent: u32| Lineage {
+            identity: child,
+            parent,
+            group: 1,
+            session: Some(1),
+            terminal: None,
+        };
+        let child = identity(50, 500);
+        let parent = Some(identity(40, 400));
+        let first = reading(child.clone(), 40);
+
+        assert_eq!(
+            parent_both_readings_name(
+                &child,
+                &first,
+                Ok(reading(child.clone(), 40)),
+                parent.clone()
+            ),
+            Some(parent.clone()),
+            "the same child under the same parent"
+        );
+        assert_eq!(
+            parent_both_readings_name(
+                &child,
+                &first,
+                Ok(reading(child.clone(), 1)),
+                parent.clone()
+            ),
+            Some(None),
+            "the parent ended and the child was adopted: the parent read first is nobody's"
+        );
+        assert_eq!(
+            parent_both_readings_name(
+                &child,
+                &first,
+                Err(unavailable("lineage", "gone")),
+                parent.clone()
+            ),
+            Some(None),
+            "a second reading that fails leaves the parent out and the child running"
+        );
+        assert_eq!(
+            parent_both_readings_name(&child, &first, Ok(reading(identity(50, 999), 40)), parent),
+            None,
+            "the identifier now belongs to another process"
+        );
+    }
 
     /// A control daemon's own scope is told from every other control group by its name, and is
     /// outside the service of the session only when the service is not its parent or itself, by

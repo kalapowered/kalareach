@@ -724,6 +724,42 @@ fn a_process_start_identity_is_the_creation_time_the_system_records() {
     }
 }
 
+/// KR-REQ-25.06: a recorded process is read on Windows as running with none of the facts a Unix
+/// platform gives (no parent, no name), as ended once it has gone, and an identity in whole
+/// seconds is unknown without the process being asked about, because it cannot tell a process from
+/// one that took its identifier within the second.
+#[test]
+fn a_recorded_process_is_read_as_its_state_and_an_identity_in_seconds_as_unknown() {
+    use kr_ipc::identity::{ProcessFacts, ProcessReading, read_process};
+
+    let mut child = std::process::Command::new("ping.exe")
+        .args(["-n", "60", "127.0.0.1"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("a process to read");
+    let pid = child.id();
+    let identity = kr_ipc::identity::process_start_identity(pid).expect("the process's identity");
+    let running = read_process(&identity);
+    let in_seconds = ProcessStartIdentity::new(
+        u64::from(pid),
+        ProcessStartSource::WindowsProcessStartSeconds,
+        identity.start_value.get() / 10_000_000,
+    );
+    let legacy = read_process(&in_seconds);
+    let _ = child.kill();
+    let _ = child.wait();
+    let ended = read_process(&identity);
+
+    assert_eq!(running, ProcessReading::Running(ProcessFacts::default()));
+    assert!(
+        matches!(legacy, ProcessReading::Unknown { .. }),
+        "{legacy:?}"
+    );
+    assert_eq!(ended, ProcessReading::Ended);
+}
+
 /// KR-REQ-11.52: two processes started one after the other within one second are two start
 /// identities, because the start value is the creation time at the resolution the kernel records
 /// it.
