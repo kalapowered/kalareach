@@ -4009,6 +4009,18 @@ mod tests {
         let by_other_number = exacl::AclEntry::allow_user(&other_number, exacl::Perm::READ, None);
         assert!(access_list_verdict(Ok(vec![by_other_number]), numbered).is_some());
 
+        // An account called by the text of a GUID is named alike by an entry for a GUID that no
+        // account has: the library gives that entry a user's kind and the GUID as its name.
+        let guid = "7f3c2a10-0b1d-4a52-9d51-6a3f8f0e1c11";
+        let guid_named = || {
+            names_of_this_user(Some(PasswdEntry {
+                name: guid.to_owned(),
+                home: None,
+            }))
+        };
+        let by_guid = exacl::AclEntry::allow_user(guid, exacl::Perm::READ, None);
+        assert!(access_list_verdict(Ok(vec![by_guid]), guid_named).is_some());
+
         let unknown = || names_of_this_user(None);
         assert!(access_list_verdict(Ok(vec![by_own_number]), unknown).is_some());
         assert!(access_list_verdict(Ok(vec![by_name]), unknown).is_some());
@@ -4023,9 +4035,12 @@ mod tests {
         use exacl::{AclEntry, Perm};
 
         let root = temporary_root("access-list-grants");
+        // Another account than the one that runs the case: root is one unless root runs it.
+        let other = if current_uid() == 0 { "nobody" } else { "root" };
         let grants = [
-            AclEntry::allow_user("root", Perm::WRITE, None),
-            AclEntry::allow_user("root", Perm::READ, None),
+            AclEntry::allow_user(other, Perm::WRITE, None),
+            AclEntry::allow_user(other, Perm::READ, None),
+            AclEntry::allow_user(other, Perm::EXECUTE, None),
             AclEntry::allow_group("everyone", Perm::READ, None),
             AclEntry::allow_group("everyone", Perm::EXECUTE, None),
             AclEntry::allow_group("everyone", Perm::WRITE, None),
