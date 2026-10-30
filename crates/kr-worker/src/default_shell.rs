@@ -2,9 +2,10 @@
 //!
 //! The request's own choice comes first and is never replaced. After it, the shell this host is
 //! configured to use, and after that the platform's own. On Windows the platform's own is
-//! PowerShell 7, the primary shell; Windows PowerShell and the command interpreter are what a
-//! machine without it falls back to, in that order, so the shell a session gets never depends on
-//! which of them the system's `ComSpec` happens to name.
+//! PowerShell 7, the primary shell, found where it installs; Windows PowerShell and the command
+//! interpreter are what a machine without it falls back to, in that order, so the shell a session
+//! gets never depends on which of them the system's `ComSpec` happens to name. Each is named by an
+//! absolute path.
 
 use std::path::{Path, PathBuf};
 
@@ -93,7 +94,7 @@ impl WindowsPlaces {
                 .filter_map(directory)
                 .collect(),
             local_app_data: directory("LOCALAPPDATA"),
-            system_root: directory("SystemRoot"),
+            system_root: directory("SystemRoot").or_else(|| directory("windir")),
             command_interpreter: std::env::var("ComSpec").ok(),
         }
     }
@@ -102,11 +103,18 @@ impl WindowsPlaces {
 /// Returns the shell a Windows session starts when nothing names one.
 ///
 /// PowerShell 7 comes first: the directory its installer uses, which names the version and which
-/// an administrator owns, then `pwsh.exe` on the search path for an installation elsewhere (a
-/// per-user one). Windows PowerShell 5.1, which every supported Windows has, is next, and the command
-/// interpreter is the last resort, so a machine that has either of the others never gets it.
-/// A search-path entry that is empty or relative is not searched: it would name the directory the
-/// worker happens to run in, and a program placed there would become the user's shell.
+/// an administrator owns, then a `pwsh.exe` on the search path where PowerShell 7 has a place of
+/// its own (a preview's version directory, or the Store's application execution alias). Another
+/// `pwsh.exe` on the search path is not PowerShell 7: PowerShell 6 has the same file name, and so
+/// can a file in any directory the search path happens to hold. Windows PowerShell 5.1, which
+/// every supported Windows has, is next. The command interpreter is the last resort, so a machine
+/// that has either of the others never gets it.
+///
+/// Every program is named by an absolute path. The system looks for a bare or relative program name
+/// in the worker's own directory first, so a search-path entry that is empty or relative is not
+/// searched, and an interpreter the system names that is not an absolute path to a file that is
+/// there is replaced by the system's own: a program placed in the worker's directory would
+/// otherwise become the user's shell.
 #[must_use]
 pub fn windows_default(places: &WindowsPlaces, is_file: impl Fn(&Path) -> bool) -> String {
     let seven = places
@@ -117,6 +125,7 @@ pub fn windows_default(places: &WindowsPlaces, is_file: impl Fn(&Path) -> bool) 
             places
                 .search_path
                 .iter()
+                .filter(|directory| holds_powershell_seven(directory, places))
                 .map(|directory| directory.join("pwsh.exe")),
         );
     let five = places.system_root.iter().map(|root| {
@@ -133,10 +142,65 @@ pub fn windows_default(places: &WindowsPlaces, is_file: impl Fn(&Path) -> bool) 
         .or_else(|| {
             places
                 .command_interpreter
-                .clone()
-                .filter(|interpreter| !interpreter.is_empty())
+                .as_deref()
+                .map(Path::new)
+                .filter(|interpreter| interpreter.is_absolute() && is_file(interpreter))
+                .and_then(Path::to_str)
+                .map(str::to_owned)
         })
-        .unwrap_or_else(|| "cmd.exe".to_owned())
+        .unwrap_or_else(|| system_command_interpreter(places))
+}
+
+/// The command interpreter in the system directory, by its absolute path.
+///
+/// Windows gives every process `%SystemRoot%`; one without it has lost its environment, and the
+/// standard location is then the best name there is.
+fn system_command_interpreter(places: &WindowsPlaces) -> String {
+    places
+        .system_root
+        .as_deref()
+        .filter(|root| root.is_absolute())
+        .and_then(|root| {
+            root.join("System32")
+                .join("cmd.exe")
+                .to_str()
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| r"C:\Windows\System32\cmd.exe".to_owned())
+}
+
+/// Whether a search-path directory is a place PowerShell 7 lives: a version-7 directory beside the
+/// standard one under a program-files directory (`...\PowerShell\7-preview`), or the directory of
+/// the Store's application execution aliases.
+fn holds_powershell_seven(directory: &Path, places: &WindowsPlaces) -> bool {
+    let version_directory = places.program_files.iter().any(|root| {
+        directory
+            .parent()
+            .is_some_and(|parent| same_directory(parent, &root.join("PowerShell")))
+            && directory
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|name| name.starts_with('7'))
+    });
+    let store_aliases = places
+        .local_app_data
+        .as_ref()
+        .is_some_and(|root| same_directory(directory, &root.join("Microsoft").join("WindowsApps")));
+    version_directory || store_aliases
+}
+
+/// Whether two paths name the same directory by their components. Windows folds the case of a name,
+/// so a directory is the same one however a search path spells it.
+fn same_directory(left: &Path, right: &Path) -> bool {
+    let (mut left, mut right) = (left.components(), right.components());
+    loop {
+        match (left.next(), right.next()) {
+            (None, None) => return true,
+            (Some(first), Some(second))
+                if first.as_os_str().eq_ignore_ascii_case(second.as_os_str()) => {}
+            _ => return false,
+        }
+    }
 }
 
 #[cfg(test)]
