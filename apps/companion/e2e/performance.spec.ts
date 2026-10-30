@@ -8,17 +8,24 @@
  * the event's own time stamp to the start of the second animation frame after it: the frame that
  * follows the one that presented the key's effect. A page that is busy with the stream presents
  * that frame late, so the figure includes input delay, the handler's work and the wait for a
- * paint.
+ * paint. It is an indirect measure of the paint: the figure never reads the composer's pixels. The
+ * composer is a native `textarea`, whose text the browser paints in the frame that follows the
+ * key's event, so the second frame after the event stands for it.
  *
  * The figure is a recording. Section 27 gives this target no number, and a bound on elapsed time
  * would judge the machine the run happens on as much as the interface, so the case asserts only
- * conditions: every key reached the composer in order and was timed, and the stream was being
- * drawn while the keys were typed. The readings are the median of the keys in frame periods of the
- * page's own idle frames and against the same keys with a short history and nothing streaming; each
- * is printed with the engine and with a verdict against the reference bounds below, and attached to
- * the run. The verdict is for a reference run to read: a display's frame period does not change
- * with the processor, so the same bounds are tighter on a slower machine.
+ * conditions: every key reached the composer in order and was timed, and the stream advanced on
+ * the screen while the keys were typed. Playwright's own limits (30 seconds for the case and 5
+ * seconds for each `expect`) still apply, and they are the only time limits. The readings are the
+ * median of the keys in frame periods of the page's own idle frames and against the same keys with
+ * a short history and nothing streaming; each is printed with the engine, the host it was taken on
+ * and a verdict against the reference bounds below, and attached to the run. The verdict is for a
+ * person who runs this spec on a reference host to read, and no run of `scripts/bench-all.sh`
+ * takes it: a display's frame period does not change with the processor, so the same bounds are
+ * tighter on a slower machine.
  */
+
+import { arch, cpus, platform, release, totalmem } from 'node:os'
 
 import { expect, test, type Page } from '@playwright/test'
 
@@ -35,7 +42,9 @@ const PAUSE_MS = 40
 /**
  * The reference bounds the verdict line reads the readings against: the most frame periods the
  * middle key may wait with the stream running over the full history, and how much later it may be
- * than with a short history and nothing streaming. They are not asserted.
+ * than with a short history and nothing streaming. Section 27 gives this target no number, so these
+ * two are this case's own reading of "responsive", chosen to be read and not to be held to. They
+ * are not asserted.
  */
 const REFERENCE_PERIODS = 4
 const REFERENCE_GROWTH = 3
@@ -65,6 +74,18 @@ function median(samples: readonly number[]): number {
 function percentile(samples: readonly number[], fraction: number): number {
   const sorted = [...samples].sort((left, right) => left - right)
   return sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * fraction) - 1)] ?? 0
+}
+
+/** The machine the browser runs on, which a reading depends on and is recorded beside. */
+function host(): { os: string; arch: string; processor: string; logicalProcessors: number; memoryMiB: number } {
+  const processors = cpus()
+  return {
+    os: `${platform()} ${release()}`,
+    arch: arch(),
+    processor: processors[0]?.model ?? 'not reported here',
+    logicalProcessors: processors.length,
+    memoryMiB: Math.round(totalmem() / (1024 * 1024))
+  }
 }
 
 /** The page's frame period when it is idle: the middle of the gaps between 40 frames. */
@@ -111,8 +132,11 @@ async function startTiming(page: Page): Promise<void> {
   })
 }
 
-/** Types the keys and returns the time of each, once the last has been timed. */
-async function typeKeys(page: Page): Promise<number[]> {
+/**
+ * Types the keys and returns the time of each, once the last has been timed, with how far the
+ * stream had been drawn when the first key went in, after the composer was emptied.
+ */
+async function typeKeys(page: Page): Promise<{ times: number[]; drawnBefore: number }> {
   const composer = page.getByTestId('composer-input')
   // Emptying the composer presses a key of its own, so it is done, and timed, before the timing
   // is cleared.
@@ -125,20 +149,21 @@ async function typeKeys(page: Page): Promise<number[]> {
       window.krKeys.names.length = 0
     }
   })
+  const drawnBefore = await page.evaluate(() => window.krKeys?.drawn() ?? -1)
   await page.keyboard.type(KEYS, { delay: PAUSE_MS })
   await page.waitForFunction(() => window.krKeys?.pending === 0 && (window.krKeys?.samples.length ?? 0) > 0)
-  return page.evaluate(() => [...(window.krKeys?.samples ?? [])])
+  return { times: await page.evaluate(() => [...(window.krKeys?.samples ?? [])]), drawnBefore }
 }
 
 test.describe('KR-PERF-008: input stays responsive while output streams over a large history', () => {
-  test('a key is painted and timed while 20 nodes a frame stream over 4000', async ({ page }) => {
+  test('a key is timed to the second frame after it while 20 nodes a frame stream over 4000', async ({ page }) => {
     const engine = test.info().project.name
     await openSession(page)
     await startTiming(page)
     const period = await framePeriod(page)
 
     // Short history, nothing streaming: what a key costs on this machine in this engine.
-    const quiet = await typeKeys(page)
+    const { times: quiet } = await typeKeys(page)
     expect(await page.getByTestId('composer-input').inputValue()).toBe(KEYS)
 
     // The history, appended in one go, and drawn: its last node is in the conversation's window.
@@ -194,8 +219,7 @@ test.describe('KR-PERF-008: input stays responsive while output streams over a l
     // Typed only once the stream is being drawn, so that the readings are of keys against output
     // that is arriving, not before it has begun.
     await page.waitForFunction(() => (window.krKeys?.drawn() ?? -1) >= 0)
-    const drawnBefore = await page.evaluate(() => window.krKeys?.drawn() ?? -1)
-    const streamed = await typeKeys(page)
+    const { times: streamed, drawnBefore } = await typeKeys(page)
     const drawnAfter = await page.evaluate(() => window.krKeys?.drawn() ?? -1)
     await page.evaluate(() => window.krKeys?.stop())
 
@@ -203,8 +227,10 @@ test.describe('KR-PERF-008: input stays responsive while output streams over a l
     const middle = { quiet: median(quiet), streamed: median(streamed) }
     const periods = middle.streamed / period
     const growth = middle.streamed / middle.quiet
+    const machine = host()
     const figures = {
       engine,
+      host: machine,
       framePeriodMs: period,
       keys: streamed.length,
       quiet: { medianMs: middle.quiet, p95Ms: percentile(quiet, 0.95), maxMs: Math.max(...quiet) },
@@ -223,15 +249,16 @@ test.describe('KR-PERF-008: input stays responsive while output streams over a l
     })
     const verdict = periods <= REFERENCE_PERIODS && growth <= REFERENCE_GROWTH ? 'met' : 'missed'
     console.log(
-      `KR-PERF-008 key to painted frame (${engine}): median ${middle.streamed.toFixed(1)} ms = ${periods.toFixed(1)} frame periods of ${period.toFixed(1)} ms ` +
+      `KR-PERF-008 key to the second frame after it (${engine}): median ${middle.streamed.toFixed(1)} ms = ${periods.toFixed(1)} frame periods of ${period.toFixed(1)} ms ` +
         `with ${PER_FRAME} nodes a frame streaming over ${HISTORY}, p95 ${percentile(streamed, 0.95).toFixed(1)} ms, ` +
-        `${growth.toFixed(2)}x the same keys with a short history and no stream (${verdict})`
+        `${growth.toFixed(2)}x the same keys with a short history and no stream (${verdict}); ` +
+        `${machine.os}, ${machine.arch}, ${machine.processor}, ${machine.logicalProcessors} logical processors, ${machine.memoryMiB} MiB`
     )
 
-    // Every key reached the composer, in order, and the stream was being drawn while they were
-    // typed: a run where the keys finished before any of the stream reached the screen would
-    // report the same figures and mean something else. The readings above are recorded, and
-    // judged on a reference run.
+    // Every key reached the composer, in order, and the stream advanced on the screen between the
+    // first key and the last one's timing: a run where the keys finished before any of the stream
+    // reached the screen would report the same figures and mean something else. The readings above
+    // are recorded, and read by a person on a reference host.
     expect(typed).toBe(KEYS)
     expect(await page.evaluate(() => window.krKeys?.names.join('') ?? '')).toBe(KEYS)
     expect(streamed).toHaveLength(KEYS.length)
