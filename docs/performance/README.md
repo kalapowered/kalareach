@@ -116,7 +116,7 @@ minutes, and memory and every view's progress are read every five seconds. The s
 
 ## How each figure is taken
 
-Every measurement runs in a release build, one at a time.
+Every measurement of `scripts/bench-all.sh` runs in a release build, one at a time.
 
 With `KR_PERF_SETTLE_LOAD` set to a load, `scripts/performance.sh` starts each measurement only once
 the one-minute load is under it, and fails without taking the figure if ten minutes pass first. The
@@ -129,7 +129,7 @@ load is waited out, not a host condition.
 | KR-PERF-003 | below 500 MiB and 1% of one core | `crates/kr-worker/tests/performance.rs` (`idle_resources_for_twenty_sessions_and_thirty_two_views`) | The idle configuration's daemon, workers and root shells: processor time over five minutes and resident memory at the end. The processor bound is asserted where the host meets the reference host's conditions, and elsewhere recorded with the shortfall named; the memory bound is asserted on every host. The stress run reports the same readings under stress, which section 27 sets no bound on, and the whole product's memory with the plugin host serving |
 | KR-PERF-004 | a usable 120x40 screen within 500 ms | `performance.rs` (`attach_to_a_usable_screen`) | Five attachments of each presentation, from the connection to a screen a person could look at. The worker makes three journal records durable before it answers an attach, so the 500 ms is asserted unless the disk's durable writes took longer than the reference host admits at either edge, which the record names as a missing condition |
 | KR-PERF-005 | under 25 ms p95 above the path's round trip | `crates/kr-transport/tests/perf.rs` | Remote input over a real connection while a bulk transfer runs, less the path's own round trip. The target is asserted where the host meets the reference host's conditions, and elsewhere recorded with the shortfall named |
-| KR-PERF-006 | usable state within two seconds | `crates/kr-transport/tests/perf.rs`, `crates/kr-client/tests/session.rs` and `crates/kr-controller/tests/network_reconnect_time.rs` | The transport's share is timed: reconnecting, the handshake, a stream and a 120x40 snapshot. The client's share is asserted inside the budget: the subscription through the client library and a painted 120x40 screen, plainly and after one refused read. A reconnect to a real daemon and worker is timed as well: a paired device that has been attached and has gone dials again and resumes the cursors the ended session carried, and the clock runs from the dial through the connection, the attach, the subscription from the carried position and the host's projection to a painted 120x40 screen. The budget is asserted where the host meets the reference host's conditions that a run can read (an optimised build, four processors, 8 GiB, and at most 1% of the time taken by a hypervisor), and elsewhere the figure is recorded with the shortfall named; a debug build always lacks one, so the landing workflow's debug runs record the figure and cannot fail on its time |
+| KR-PERF-006 | usable state within two seconds | `crates/kr-transport/tests/perf.rs`, `crates/kr-client/tests/session.rs` and `crates/kr-controller/tests/network_reconnect_time.rs` | The transport's share is timed: reconnecting, the handshake, a stream and a 120x40 snapshot. The client's share is asserted inside the budget: the subscription through the client library and a painted 120x40 screen, plainly and after one refused read. A reconnect to a real daemon and worker is timed as well: a paired device that has been attached and has gone dials again and resumes the cursors the ended session carried, and the clock runs from the dial through the connection, the attach, the subscription from the carried position and the host's projection to a painted 120x40 screen. The budget is asserted where no condition of the reference host that a run can read is shown to fall short (an optimised build, four processors, 8 GiB, durable writes on the host's disk within the bound above, and at most 1% of the time taken by a hypervisor), and elsewhere the figure is recorded with the shortfall named; a debug build always lacks one, so the landing workflow's debug runs record the figure and cannot fail on its time |
 | KR-PERF-007 | drain 5 MiB/s without unbounded queues; slow observers resynchronise | `crates/kr-term/tests/perf.rs`, and the stress run | The engine's sustained rate on a plain and a scrolling stream, with every bound checked. Two figures against the history behind the screen: what one read costs behind a history at its bound against one behind an emptied history (at most four times as much), and how many rows a session reads over the same reads in each (at most twice as many). In the stress run, the observer that stops reading is told to resynchronise and receives output again once it resubscribes, and no other view goes an interval without output |
 | KR-PERF-008 | one batch per animation frame; input stays responsive | `apps/companion/test/performance.test.tsx` and `apps/companion/e2e/performance.spec.ts` | Events folded into frames, a keystroke's cost against the size of the history while output streams, what a keystroke touches in the document, and how many nodes are drawn for a long history. In a real browser engine, the time from a key's event to the second animation frame after it, typed while twenty nodes a frame stream over a history of four thousand, recorded in frame periods of the page's own idle frames and against the same keys with a short history and nothing streaming. The case asserts only that every key arrived in order and was timed and that the stream was drawn meanwhile; the readings carry a verdict against reference bounds for a person who runs the spec on a reference host to read, and no run of `scripts/bench-all.sh` takes it |
 | KR-PERF-009 | 4 GiB, four threads and 30 seconds per description | `scripts/bench-descriptions.sh` | The selected profile against real weights at 1, 5, 20 and 50 sessions, with the resource pause beside it |
@@ -172,10 +172,14 @@ KR-PERF-006's reconnect to a real daemon is
 `cargo test --locked --release -p kr-controller --test network_reconnect_time -- --nocapture`. The
 case is built for macOS and Linux only; on Windows the command runs no test and exits 0. It records
 its figure in every run, printed and, where `KR_TEST_ARTIFACTS_DIR` is set, written to
-`kr-transport-scheduling.md`, with the build, the operating system and architecture, the processor,
-the processors, the memory, the load average and the share of time a hypervisor took where the
-platform accounts for it, and names each condition of the reference host that the run lacks. It
-asserts the two seconds only in a release build on a host that lacks none.
+`kr-controller-reconnect.md`, in the form the records below take: the build, the operating system
+and architecture, the processor, the processors, the memory, the load average and the host's speed
+at both edges, the disk's durable writes on Linux, and the share of time a hypervisor took where
+the platform accounts for it. It names each condition it reads that the host is shown to lack. It
+asserts the two seconds only where none is lacking, which is a release build on a host that meets
+the conditions it can read; "nothing else running" and four physical cores are not among them, so
+a figure with no shortfall is a figure with no measured shortfall and not a certified
+reference-host figure.
 KR-PERF-008's responsiveness in a real browser is
 `pnpm -C apps/companion e2e e2e/performance.spec.ts`: it prints each engine's reading with a verdict
 and the host's operating system, architecture, processor, logical processors and memory, and
@@ -195,12 +199,16 @@ where and why. The conformance report attaches each section to its identifier (s
 | --- | --- | --- |
 | `kr-worker-input.md` | `input_latency.rs` | KR-PERF-001, KR-PERF-002 |
 | `kr-worker-performance.md` | `performance.rs` | KR-PERF-003, KR-PERF-004 |
-| `kr-transport-scheduling.md` | `crates/kr-transport/tests/perf.rs`, and `crates/kr-controller/tests/network_reconnect_time.rs` when a run sets `KR_TEST_ARTIFACTS_DIR` | KR-PERF-005, KR-PERF-006 |
+| `kr-transport-scheduling.md` | `crates/kr-transport/tests/perf.rs` | KR-PERF-005, KR-PERF-006 |
+| `kr-controller-reconnect.md` | `crates/kr-controller/tests/network_reconnect_time.rs`, when a run sets `KR_TEST_ARTIFACTS_DIR` | KR-PERF-006 |
 | `kr-term-output-handling.md` | `crates/kr-term/tests/perf.rs` | KR-PERF-007 four times |
 | `kr-perf-stress.md` | `tests/perf/tests/stress.rs` | KR-PERF-001, KR-PERF-003 twice, KR-PERF-007 |
 | `bench-all.md` | `scripts/bench-all.sh` | KR-PERF-006's client share, KR-PERF-008, KR-PERF-009, KR-PERF-010, and one conditions section for each identifier the run measured |
 
-A measurement's own section starts with its host: the build, the operating system and architecture,
+A measurement's own section starts with its host (the transport's two sections in
+`kr-transport-scheduling.md` give the build, the operating system and architecture, the processor,
+the processors, the memory, the load average at one edge and the stolen share, and read neither the
+speed nor the disk): the build, the operating system and architecture,
 the processor, the processors and the memory against the reference host's, the load average entering
 and leaving, the time a fixed piece of single-threaded work took entering and leaving (the host's
 speed, so that a figure which reads high can be told from a host that ran slow; a window opened
@@ -225,14 +233,16 @@ A platform's release figures come from a reference host of that platform: an App
 Intel Mac for macOS, an x86-64 or an ARM64 Linux machine for Linux, and a Windows 11 machine on
 x86-64 or ARM64 for Windows, each meeting the definition above with nothing else running. On macOS
 and Linux the figures are those of a `scripts/bench-all.sh --reference-host` run that met every
-condition. On Windows they come from the same suites, run on the Windows 11 host, less the by-name reconnect
-measurement, which is not built there.
+condition. KR-PERF-006's reconnect to a real daemon is not a step of that script, so its figure comes from the
+by-name command above, run on the same reference host. On Windows the figures come from the same
+suites, run on the Windows 11 host, less that reconnect measurement, which is not built there.
 
 The four-processor Linux runners that continuous integration uses meet the definition's count of
 processors, and their figures count as Linux x86-64 figures only where the runner's four processors
 are four physical cores. The record does not show that: a hosted runner records a processor model
-name, which does not say how the runner's processors divide into cores. The topology is read from
-the runner itself and stated beside the figure in the release acceptance record, and a runner whose
-four processors are two cores with two hardware threads each records its figures and none of them
-is a release figure. The macOS runner it uses has three processors, below the reference host's
+name, which does not say how the runner's processors divide into cores. No step of the landing
+workflow reads the topology, so no hosted runner's figure counts as a release figure on the record
+alone; it would count once the runner's topology is read and stated beside the figure in the
+release acceptance record, and a runner whose four processors are two cores with two hardware
+threads each records its figures and none of them is a release figure. The macOS runner it uses has three processors, below the reference host's
 four, so its figures are recorded and none of them is a release figure.
