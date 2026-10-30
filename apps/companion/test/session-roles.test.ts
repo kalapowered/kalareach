@@ -36,12 +36,12 @@ describe('the page names a share by the host’s roles', () => {
         const short = entry.default_actions.filter((right) => right !== missing)
         const named = roleOfRights(short)
         // A role short of an action is named as the widest role whose actions it still holds in
-        // full, and every action beyond that role is said beside it.
-        expect(entries.map((candidate) => candidate.role)).toContain(named)
-        const held = entries.find((candidate) => candidate.role === named)?.default_actions ?? []
-        expect(held.every((right) => short.includes(right))).toBe(true)
-        expect(rightsBeyond(short)).toEqual(short.filter((right) => !held.includes(right)))
-        expect(named).not.toBe(entry.role)
+        // full: the role below it, since the action it lacks is one only it carries. Every action
+        // beyond that role is said beside it.
+        expect(named).toBe(below.role)
+        expect(rightsBeyond(short)).toEqual(
+          short.filter((right) => !below.default_actions.includes(right))
+        )
       }
     }
   })
