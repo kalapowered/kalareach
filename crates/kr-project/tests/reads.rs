@@ -35,10 +35,15 @@ fn a_platform_that_does_not_confine_reads_refuses_a_bounded_caller_with_its_reas
         .profile()
         .run(&kr_project::git::GitRequest::read(&path, &arguments).admitted(bounded()))
         .expect_err("a caller bounded by a grant is refused where reads are not confined");
+    // A platform that runs no Git at all says so before it looks for Git, so a bounded caller is
+    // told that rather than that its reads are not confined.
+    let said = if cfg!(windows) {
+        "cannot bound which ports"
+    } else {
+        "this platform does not confine what Git reads"
+    };
     assert!(
-        refusal
-            .to_string()
-            .contains("this platform does not confine what Git reads"),
+        refusal.to_string().contains(said),
         "the refusal says why: {refusal}"
     );
     // The control: the owner's own invocation of the same command on the same repository runs
