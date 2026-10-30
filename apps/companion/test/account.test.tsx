@@ -213,12 +213,12 @@ describe('the managed services the application holds a client of (KR-REQ-17.14)'
     const sheet = await screen.findByRole('dialog', { name: 'Account' })
     const list = await within(sheet).findByTestId('account-services')
     const items = within(list).getAllByRole('listitem')
-    expect(items.map((item) => item.textContent)).toEqual([
-      'Account loginAn account login service is configured.',
-      'Push registrationA push registration service is configured.',
-      'Sync and backupA sync and backup service is configured.',
-      'Managed inferenceNo managed inference service is configured. You can use your own provider credentials.'
-    ])
+    // Each line shows its service's name and the sentence the application supplied for it.
+    expect(items.map((item) => item.textContent)).toEqual(
+      lines.map(
+        (line) => `${line.service.charAt(0).toUpperCase()}${line.service.slice(1)}${line.explanation}`
+      )
+    )
     const text = (sheet.textContent ?? '').toLowerCase()
     for (const word of PURCHASE_WORDS) {
       expect(text, word).not.toContain(word)
@@ -229,9 +229,10 @@ describe('the managed services the application holds a client of (KR-REQ-17.14)'
     expect(within(list).queryByRole('button')).toBeNull()
   })
 
-  it('leaves the section out when the application reports none', async () => {
+  it('leaves the section out when the application cannot say', async () => {
     const person = userEvent.setup()
-    start()
+    const controls = start()
+    controls.account.failServices()
     await person.click(screen.getByRole('button', { name: /^Account/ }))
     const sheet = await screen.findByRole('dialog', { name: 'Account' })
     await within(sheet).findByRole('button', { name: 'Sign in' })

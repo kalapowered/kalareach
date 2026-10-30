@@ -269,7 +269,7 @@ export function AccountPanel({
           closing={deletion.step.name === 'result'}
         />
 
-        <Services port={port} standing={view.state} />
+        <Services port={port} />
 
         <p className="account-section-title">Working without an account</p>
         <Card>
@@ -313,16 +313,9 @@ function serviceTitle(line: ServiceLine): string {
  * Which managed services this application holds a client of, and what a person does instead of
  * each it does not. It explains availability and nothing more: no control here waits on it, no
  * service is asked, and a read that fails leaves the section out rather than saying a service is
- * missing. It is read again when the account's standing changes, since signing in and out moves
- * what the application holds.
+ * missing.
  */
-function Services({
-  port,
-  standing
-}: {
-  readonly port: HostPort
-  readonly standing: AccountView['state']
-}): ReactNode {
+function Services({ port }: { readonly port: HostPort }): ReactNode {
   const [lines, setLines] = useState<readonly ServiceLine[] | null>(null)
 
   useEffect(() => {
@@ -338,9 +331,9 @@ function Services({
     return () => {
       current = false
     }
-  }, [port, standing])
+  }, [port])
 
-  if (lines === null || lines.length === 0) return null
+  if (lines === null) return null
   return (
     <>
       <p className="account-section-title">Managed services on this device</p>
@@ -354,8 +347,8 @@ function Services({
           ))}
         </ul>
         <p className="account-help">
-          These are the services this app uses. A host keeps its own relay leases, so none is
-          listed here.
+          These are the managed services an app can use. A host keeps its own relay leases, so
+          none is listed here.
         </p>
       </Card>
     </>
