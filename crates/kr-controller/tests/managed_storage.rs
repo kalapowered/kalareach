@@ -4669,6 +4669,18 @@ impl Rig {
         tokio::spawn(async move { enable_at(&endpoint, environment, &params).await })
     }
 
+    /// `backup.enable` in a task of its own, for a call the test watches while it runs and which
+    /// the daemon may refuse.
+    fn enable_outcome_in_the_background(
+        &self,
+        params: &BackupEnableParams,
+    ) -> tokio::task::JoinHandle<Result<BackupEnableResult, ProtocolError>> {
+        let endpoint = self.client_endpoint.clone();
+        let environment = self.host.environment_id();
+        let params = params.clone();
+        tokio::spawn(async move { enable_outcome_at(&endpoint, environment, &params).await })
+    }
+
     /// `backup.status`.
     async fn backup_status(&self) -> BackupStatusResult {
         status_at(&self.client_endpoint).await
@@ -4739,6 +4751,17 @@ async fn enable_at(
     environment: kr_protocol::ids::EnvironmentId,
     params: &BackupEnableParams,
 ) -> BackupEnableResult {
+    enable_outcome_at(endpoint, environment, params)
+        .await
+        .expect("backup.enable answers")
+}
+
+/// `backup.enable`, as the daemon ended it: one of its answers, or its refusal.
+async fn enable_outcome_at(
+    endpoint: &kr_ipc::paths::Endpoint,
+    environment: kr_protocol::ids::EnvironmentId,
+    params: &BackupEnableParams,
+) -> Result<BackupEnableResult, ProtocolError> {
     let mut client = LocalClient::connect(endpoint, LocalClientKind::Cli, build())
         .await
         .expect("connects");
@@ -4751,9 +4774,7 @@ async fn enable_at(
         )
         .await
         .expect("the call reaches the daemon")
-        .expect("backup.enable answers")
-        .to_typed()
-        .expect("a result of the declared shape")
+        .map(|answer| answer.to_typed().expect("a result of the declared shape"))
 }
 
 fn archive_two() -> ArchiveId {
@@ -5545,6 +5566,46 @@ async fn a_sign_in_as_another_account_during_the_call_stops_it_before_anything_i
         }
     );
     assert!(rig.controller.backup().setup().expect("a read").is_none());
+}
+
+/// KR-REQ-09.09: a fence this host comes to owe while a setup call waits on the service stops the
+/// setup being recorded. The call was admitted before the fence and its last request is what it
+/// waits on, so the admission is asked again where the setup is recorded: the call is refused for
+/// the fence and nothing is recorded, and the same call made again once the fence is let go finds
+/// what the service holds and records the setup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_owed_while_the_setup_waits_on_the_service_stops_the_record() {
+    let timer = HeldTimer::held();
+    let (rig, _) = a_host_to_set_up(&timer).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+    web.fail(RETENTION, 1, Moment::Slow);
+    let call = rig.enable_outcome_in_the_background(&made.params);
+    within("the retention change", web.requests_reach(RETENTION, 1)).await;
+    rig.controller.hold_fence(true);
+    web.release_held();
+    let refusal = call
+        .await
+        .expect("the call ends")
+        .expect_err("the record is refused while a fence is owed");
+    assert_eq!(refusal.code, ErrorCode::PermissionDenied);
+    assert!(
+        refusal.message.contains("fence"),
+        "the refusal says why: {}",
+        refusal.message
+    );
+    assert!(
+        rig.controller.backup().setup().expect("a read").is_none(),
+        "nothing was recorded"
+    );
+
+    // The control: with the fence let go, the same call is not refused and records the setup.
+    rig.controller.hold_fence(false);
+    assert!(matches!(
+        rig.enable(&made.params).await,
+        BackupEnableResult::Enabled { .. }
+    ));
+    assert!(rig.controller.backup().setup().expect("a read").is_some());
 }
 
 /// `backup.status` says why a setup that is recorded cannot make backups: the account signed in is

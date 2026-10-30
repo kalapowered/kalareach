@@ -1632,10 +1632,10 @@ impl Controller {
         Ok(())
     }
 
-    /// Holds a published debt, or lets every one go, for this host's own tests of what refuses
-    /// while a barrier is owed. The debt is covered, so the debt pass leaves it to the test.
-    #[cfg(test)]
-    pub(super) fn hold_fence(&self, held: bool) {
+    /// Holds a published debt, or lets every one go, for tests of what refuses while a barrier is
+    /// owed. The debt is covered, so the debt pass leaves it to the test.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn hold_fence(&self, held: bool) {
         let mut debts = self.debts();
         if held {
             debts.published.insert(
