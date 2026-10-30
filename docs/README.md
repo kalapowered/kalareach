@@ -150,9 +150,10 @@ stops, so a limit that a part has is written in that part's own document.
   function. A generic alert is shown if the preview cannot be opened, if the host is unknown, or for
   anything a session itself said, which the seal never holds: [mobile](client/mobile.md).
 - **Attention.** One inbox for every session and workflow of an environment, with escalation rules,
-  quiet hours and review state, and a view of what changed since an actor's last visit. This view of
-  changes is the host's own record of changes, but the client can also ask the host's local model
-  for a summary of changes since the last visit. The summary is kept separate from the changes:
+  quiet hours and review state, and a view of what changed since an actor's last visit. The view is
+  the host's own record of changes. The host will also respond to requests for a summary of what has
+  changed since the last visit, written by its own local model and kept apart from the changes
+  themselves, although no shipped client currently asks for these:
   [host](host/README.md#attention-review-and-what-changed-since-a-visit) and
   [descriptions](describe/README.md).
 - **Sharing and control.** Grants scoped to environments and sessions, and a narrower grant that a
