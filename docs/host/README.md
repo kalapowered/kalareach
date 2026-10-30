@@ -5548,9 +5548,17 @@ kept for the life of the daemon. The first use can be a request, work the daemon
 starts (a workflow run, or an interrupted apply that left staged paths) or, on Linux, the proof made
 at the start that this host confines Git for a paired device. That proof finds none and is refused
 with its reason in the daemon's own log, and the start goes on. Git counts as missing when none is on
-that `PATH`, when it cannot answer `--exec-path` or `--version`, and when it is older than 2.32. The
+that `PATH`, when it cannot answer `--exec-path` or `--version`, when it does not answer both within
+ten seconds or answers with more than a version and a directory, and when it is older than 2.32. The
 `/usr/bin/git` of a Mac without the Command Line Tools is the second case: it asks to install them
 and exits with status 1 whatever it is asked.
+
+A Git that never answers, such as a stand-in that waits for an installer, costs the one look that
+asked it ten seconds and no more. The daemon ends that Git and everything it started, and refuses as
+above. Nothing else waits on it beyond the look: the daemon starts and answers while the look is
+under way, a start that needed Git on Linux or for an interrupted apply goes on once the look has
+ended, requests that arrive during a look wait for it and are refused with it, so the stand-in is
+started once for all of them, and an interrupt ends the daemon when the look under way has ended.
 
 A request that runs Git is then refused with `HOST_NOT_CONFIGURED` before it makes a repository, an
 operation row, a workspace or a directory. Those are `project.init`, `project.clone`,

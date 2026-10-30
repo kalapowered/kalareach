@@ -56,7 +56,7 @@ use kr_protocol::ids::EnvironmentId;
 use kr_protocol::project::{GIT_READ_DEADLINE, MAX_GIT_OUTPUT_BYTES, RemoteTransport};
 
 use crate::boundary::{Confinement, ObjectIdentity, OpenedDirectory, Reach, Reads, SupportSet};
-use crate::error::{ProjectError, Result};
+use crate::error::{Diagnostic, ProjectError, Result};
 
 /// The minimum Git version this host will use.
 ///
@@ -609,20 +609,20 @@ impl GitProgram {
     /// # Errors
     ///
     /// Returns [`ProjectError::GitUnavailable`] when Git is not installed, cannot be resolved to
-    /// an absolute path, cannot answer, or is older than [`MINIMUM_GIT_VERSION`]. The message ends
-    /// with the step that installs Git on this platform.
+    /// an absolute path, does not answer within [`PROBE_BOUND`], or is older than
+    /// [`MINIMUM_GIT_VERSION`]. The message ends with the step that installs Git on this platform.
     pub fn discover() -> Result<Self> {
-        Self::discover_on(std::env::var_os("PATH").as_deref())
+        Self::discover_on(std::env::var_os("PATH").as_deref(), PROBE_BOUND)
     }
 
     /// Resolves the Git that `search` leads to, as [`Self::discover`] resolves the one on this
-    /// process's `PATH`.
-    fn discover_on(search: Option<&OsStr>) -> Result<Self> {
+    /// process's `PATH`, giving it `bound` to answer everything it is asked.
+    fn discover_on(search: Option<&OsStr>, bound: Duration) -> Result<Self> {
         search_in(search, GIT_FILE_NAME)
             .ok_or_else(|| ProjectError::GitUnavailable {
                 detail: "installed Git was not found on this host".to_owned().into(),
             })
-            .and_then(|program| Self::at(&program))
+            .and_then(|program| Self::at_within(&program, bound))
             .map_err(with_install_step)
     }
 
@@ -630,9 +630,16 @@ impl GitProgram {
     ///
     /// # Errors
     ///
-    /// Returns [`ProjectError::GitUnavailable`] when the path cannot be resolved or the version is
-    /// older than [`MINIMUM_GIT_VERSION`].
+    /// Returns [`ProjectError::GitUnavailable`] when the path cannot be resolved, when Git does not
+    /// answer within [`PROBE_BOUND`] or the answer is more than a version and a directory, or when
+    /// the version is older than [`MINIMUM_GIT_VERSION`].
     pub fn at(path: &Path) -> Result<Self> {
+        Self::at_within(path, PROBE_BOUND)
+    }
+
+    /// As [`Self::at`], giving Git `bound` in all to answer everything it is asked.
+    fn at_within(path: &Path, bound: Duration) -> Result<Self> {
+        let deadline = Instant::now() + bound;
         let program = path
             .canonicalize()
             .map_err(|error| ProjectError::GitUnavailable {
@@ -653,7 +660,7 @@ impl GitProgram {
         }
         // Asked of the resolved binary with an environment of nothing, so the answer is the
         // program's own rather than an inherited `GIT_EXEC_PATH`.
-        let reported = PathBuf::from(ask(&program, &["--exec-path"])?.trim_end());
+        let reported = PathBuf::from(ask(&program, &["--exec-path"], deadline)?.trim_end());
         if !reported.is_absolute() {
             return Err(ProjectError::GitUnavailable {
                 detail: format!(
@@ -678,7 +685,9 @@ impl GitProgram {
                 )
                 .into(),
             })?;
-        let version = ask(&program, &["--version"])?.trim_end().to_owned();
+        let version = ask(&program, &["--version"], deadline)?
+            .trim_end()
+            .to_owned();
         let parsed = parse_version(&version).ok_or_else(|| ProjectError::GitUnavailable {
             detail: format!("{version} does not report a version this host can read").into(),
         })?;
@@ -692,7 +701,7 @@ impl GitProgram {
                 .into(),
             });
         }
-        let executable = handed_off_to(&program, &exec_path, &version);
+        let executable = handed_off_to(&program, &exec_path, &version, deadline);
         Ok(Self {
             program,
             executable,
@@ -739,18 +748,43 @@ impl GitProgram {
 /// when the profile was prepared, and a program that was found is kept for the life of the
 /// profile. A search that found nothing usable is not kept: a host that installs Git while the
 /// daemon runs serves the next request that needs it without a restart.
+///
+/// A look is bounded by `bound`, so a Git that never answers costs a request that long and no
+/// more, and it is made by one request at a time. Requests that arrive while a look is under way
+/// wait for it and share its result, found or refused, so a stand-in that hangs is started once
+/// for all of them and not once for each.
 #[derive(Debug)]
 struct Installation {
     search: Option<OsString>,
+    bound: Duration,
     found: OnceLock<GitProgram>,
-    /// Held while Git is looked for, so that requests which arrive together start Git's probes once
-    /// between them when Git is found: the one that finds it keeps it, and the others read what it
-    /// kept. A search that finds nothing keeps nothing, and each request waiting behind it then
-    /// searches in its turn.
-    looking: Mutex<()>,
+    /// How many looks have ended without finding Git. A request reads it before it waits, and a
+    /// look that ended while it waited is the look it shares.
+    refused: AtomicU64,
+    /// Held while Git is looked for. It holds the refusal of the last look that found nothing.
+    looking: Mutex<Option<Diagnostic>>,
 }
 
 impl Installation {
+    /// An installation that has to be looked for on `search`.
+    fn looked_for_on(search: Option<OsString>, bound: Duration) -> Self {
+        Self {
+            search,
+            bound,
+            found: OnceLock::new(),
+            refused: AtomicU64::new(0),
+            looking: Mutex::new(None),
+        }
+    }
+
+    /// An installation that is already the program it was handed.
+    fn holding(git: GitProgram) -> Self {
+        Self {
+            found: OnceLock::from(git),
+            ..Self::looked_for_on(None, PROBE_BOUND)
+        }
+    }
+
     fn program(&self) -> Result<&GitProgram> {
         if let Some(found) = self.found.get() {
             return Ok(found);
@@ -763,15 +797,28 @@ impl Installation {
                 detail: format!("Git is not run on this platform: {why}").into(),
             });
         }
-        let _one_look_at_a_time = self
+        let refused_before = self.refused.load(Ordering::SeqCst);
+        let mut last_refusal = self
             .looking
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(found) = self.found.get() {
             return Ok(found);
         }
-        let resolved = GitProgram::discover_on(self.search.as_deref())?;
-        Ok(self.found.get_or_init(|| resolved))
+        if self.refused.load(Ordering::SeqCst) != refused_before
+            && let Some(detail) = last_refusal.clone()
+        {
+            return Err(ProjectError::GitUnavailable { detail });
+        }
+        match GitProgram::discover_on(self.search.as_deref(), self.bound) {
+            Ok(resolved) => Ok(self.found.get_or_init(|| resolved)),
+            Err(ProjectError::GitUnavailable { detail }) => {
+                *last_refusal = Some(detail.clone());
+                self.refused.fetch_add(1, Ordering::SeqCst);
+                Err(ProjectError::GitUnavailable { detail })
+            }
+            Err(other) => Err(other),
+        }
     }
 }
 
@@ -1324,14 +1371,19 @@ impl RestrictedProfile {
     /// Returns [`ProjectError::StagingUnavailable`] when a directory or the empty file cannot be
     /// created.
     pub fn prepare(root: &Path, environment_id: EnvironmentId) -> Result<Self> {
-        Self::prepare_searching(root, environment_id, std::env::var_os("PATH"))
+        Self::prepare_around(
+            root,
+            environment_id,
+            Installation::looked_for_on(std::env::var_os("PATH"), PROBE_BOUND),
+        )
     }
 
     /// Prepares the profile like [`Self::prepare`], with Git looked for on `search` instead of on
-    /// this process's `PATH`.
+    /// this process's `PATH`, and given `bound` instead of [`PROBE_BOUND`] to answer.
     ///
-    /// Compiled with the fixtures, so that a test can prepare a profile for a host with no Git, or
-    /// with a Git that cannot answer, without changing the environment of the process it runs in.
+    /// Compiled with the fixtures, so that a test can prepare a profile for a host with no Git,
+    /// with a Git that cannot answer or with one that never does, without changing the environment
+    /// of the process it runs in or waiting out the bound a daemon keeps.
     ///
     /// # Errors
     ///
@@ -1342,23 +1394,12 @@ impl RestrictedProfile {
         root: &Path,
         environment_id: EnvironmentId,
         search: Option<OsString>,
-    ) -> Result<Self> {
-        Self::prepare_searching(root, environment_id, search)
-    }
-
-    fn prepare_searching(
-        root: &Path,
-        environment_id: EnvironmentId,
-        search: Option<OsString>,
+        bound: Duration,
     ) -> Result<Self> {
         Self::prepare_around(
             root,
             environment_id,
-            Installation {
-                search,
-                found: OnceLock::new(),
-                looking: Mutex::new(()),
-            },
+            Installation::looked_for_on(search, bound),
         )
     }
 
@@ -1373,15 +1414,7 @@ impl RestrictedProfile {
         environment_id: EnvironmentId,
         git: GitProgram,
     ) -> Result<Self> {
-        Self::prepare_around(
-            root,
-            environment_id,
-            Installation {
-                search: None,
-                found: OnceLock::from(git),
-                looking: Mutex::new(()),
-            },
-        )
+        Self::prepare_around(root, environment_id, Installation::holding(git))
     }
 
     fn prepare_around(
@@ -3045,6 +3078,17 @@ struct Bounded {
 /// was read so far is what the caller gets, with the shortfall reported.
 const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(5);
 
+/// How long Git is given to answer everything this host asks of it while looking for it: its
+/// helper directory and its version, and the same two of the copy under that directory.
+///
+/// Git answers these in milliseconds. A program that takes longer is not one this host can run
+/// work through: it is a stand-in waiting on something, such as an installer or a lookup that never
+/// returns. It is ended, with everything it started, and refused as unavailable.
+pub const PROBE_BOUND: Duration = Duration::from_secs(10);
+
+/// The most one of those answers may hold. A version and a directory are far shorter.
+const PROBE_OUTPUT_LIMIT: usize = 64 * 1024;
+
 /// One pipe being read, and the bytes read so far.
 struct Reader {
     handle: std::thread::JoinHandle<Result<()>>,
@@ -3058,10 +3102,14 @@ struct Reader {
 /// pipe. A short read is reported: `truncated` is what every checked caller refuses on, so a
 /// partial answer is never mistaken for a complete one.
 fn join(reader: Option<Reader>, described: &str) -> Result<Bounded> {
+    join_until(reader, described, Instant::now() + PIPE_DRAIN_GRACE)
+}
+
+/// As [`join`], waiting no later than `deadline`.
+fn join_until(reader: Option<Reader>, described: &str, deadline: Instant) -> Result<Bounded> {
     let Some(reader) = reader else {
         return Ok(Bounded::default());
     };
-    let deadline = Instant::now() + PIPE_DRAIN_GRACE;
     let mut ran_out = false;
     while !reader.handle.is_finished() {
         if Instant::now() >= deadline {
@@ -3100,11 +3148,18 @@ fn join(reader: Option<Reader>, described: &str) -> Result<Bounded> {
 /// on a full pipe and would then be killed for running past its deadline instead of reported for
 /// producing too much.
 fn read_bounded<R: std::io::Read + Send + 'static>(pipe: R) -> Reader {
+    read_up_to(
+        pipe,
+        usize::try_from(MAX_GIT_OUTPUT_BYTES).unwrap_or(usize::MAX),
+    )
+}
+
+/// Reads one pipe to its end, keeping at most `ceiling` bytes, as [`read_bounded`] does.
+fn read_up_to<R: std::io::Read + Send + 'static>(pipe: R, ceiling: usize) -> Reader {
     let read = Arc::new(Mutex::new(Bounded::default()));
     let held = Arc::clone(&read);
     let handle = std::thread::spawn(move || {
         let mut pipe = pipe;
-        let ceiling = usize::try_from(MAX_GIT_OUTPUT_BYTES).unwrap_or(usize::MAX);
         let mut buffer = [0_u8; 64 * 1024];
         loop {
             match pipe.read(&mut buffer) {
@@ -3453,18 +3508,18 @@ impl Drop for PrivateTemporary {
 /// version, reporting the same helper directory. It runs when it is. Where there is no such copy,
 /// or it answers differently, the program this host resolved is what runs, and a stand-in that
 /// then cannot hand off is an honest failure rather than a widened list.
-fn handed_off_to(program: &Path, exec_path: &Path, version: &str) -> PathBuf {
+fn handed_off_to(program: &Path, exec_path: &Path, version: &str, deadline: Instant) -> PathBuf {
     let Ok(candidate) = exec_path.join(GIT_FILE_NAME).canonicalize() else {
         return program.to_owned();
     };
     if candidate == program {
         return program.to_owned();
     }
-    let same_version =
-        ask(&candidate, &["--version"]).is_ok_and(|reported| reported.trim_end() == version);
+    let same_version = ask(&candidate, &["--version"], deadline)
+        .is_ok_and(|reported| reported.trim_end() == version);
     // Compared as the directories the two answers resolve to, because the helper directory is held
     // resolved and either program may report it through a link.
-    let same_helpers = ask(&candidate, &["--exec-path"]).is_ok_and(|reported| {
+    let same_helpers = ask(&candidate, &["--exec-path"], deadline).is_ok_and(|reported| {
         Path::new(reported.trim_end())
             .canonicalize()
             .is_ok_and(|resolved| resolved == exec_path)
@@ -3476,36 +3531,103 @@ fn handed_off_to(program: &Path, exec_path: &Path, version: &str) -> PathBuf {
     }
 }
 
-/// Asks the resolved binary one question with an environment of nothing.
-fn ask(program: &Path, arguments: &[&str]) -> Result<String> {
-    let output = Command::new(program)
+/// Asks the resolved binary one question with an environment of nothing, and waits no later than
+/// `deadline` for the answer.
+///
+/// The question is asked outside every boundary, of a program this host has not yet established is
+/// Git, so it is bounded on every side: by time, by what it may answer, and by what it may leave
+/// running. A program that does not answer in time is ended with everything it started, and so is
+/// one that answers with more than a version and a directory. Either way the refusal says Git is
+/// unavailable, and nothing is kept, so the next look asks again.
+fn ask(program: &Path, arguments: &[&str], deadline: Instant) -> Result<String> {
+    let described = format!(
+        "{} {}",
+        redact(&program.display().to_string()),
+        redact(&arguments.join(" "))
+    );
+    if Instant::now() >= deadline {
+        return Err(ProjectError::GitUnavailable {
+            detail: format!(
+                "{described} was not asked: Git had used the time it is given to answer"
+            )
+            .into(),
+        });
+    }
+    let mut command = Command::new(program);
+    command
         .env_clear()
         .args(arguments)
         .stdin(Stdio::null())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    // The child leads its own group, so ending it ends whatever a wrapper started: a stand-in that
+    // runs a script that runs Git holds the pipe open for as long as any of them lives.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+
+        command.process_group(0);
+    }
+    let mut child = command
+        .spawn()
         .map_err(|error| ProjectError::GitUnavailable {
-            detail: format!(
-                "{} {} could not run: {error}",
-                redact(&program.display().to_string()),
-                redact(&arguments.join(" "))
-            )
-            .into(),
+            detail: format!("{described} could not run: {error}").into(),
         })?;
-    if !output.status.success() {
+    let reader = child
+        .stdout
+        .take()
+        .map(|pipe| read_up_to(pipe, PROBE_OUTPUT_LIMIT));
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                end_probe(&mut child);
+                return Err(ProjectError::GitUnavailable {
+                    detail: format!("{described} could not be waited on: {error}").into(),
+                });
+            }
+        }
+        if Instant::now() >= deadline {
+            end_probe(&mut child);
+            return Err(ProjectError::GitUnavailable {
+                detail: format!("{described} did not answer in time and was stopped").into(),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let answer = join_until(reader, &described, deadline)?;
+    if !status.success() {
         return Err(ProjectError::GitUnavailable {
             detail: format!(
-                "{} {} exited {}",
-                redact(&program.display().to_string()),
-                redact(&arguments.join(" ")),
-                output
-                    .status
+                "{described} exited {}",
+                status
                     .code()
                     .map_or_else(|| "on a signal".to_owned(), |code| code.to_string())
             )
             .into(),
         });
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    if answer.truncated {
+        return Err(ProjectError::GitUnavailable {
+            detail: format!("{described} answered with more than a version and a directory").into(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&answer.bytes).into_owned())
+}
+
+/// Ends a probe that did not finish, with everything it started, and collects it.
+fn end_probe(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    if let Ok(raw) = i32::try_from(child.id())
+        && let Some(group) = rustix::process::Pid::from_raw(raw)
+    {
+        // The child leads its own group, so its identifier is the group's and nothing else on this
+        // machine is in it.
+        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Reads the major and minor version out of `git --version`.
@@ -4531,16 +4653,12 @@ mod tests {
     /// A profile whose directories are named but never created, for the tests that read its lists.
     fn test_profile() -> RestrictedProfile {
         RestrictedProfile {
-            git: Arc::new(Installation {
-                search: None,
-                looking: Mutex::new(()),
-                found: OnceLock::from(GitProgram {
-                    program: PathBuf::from("/usr/bin/git"),
-                    executable: PathBuf::from("/usr/libexec/git-core/git"),
-                    exec_path: PathBuf::from("/usr/libexec/git-core"),
-                    version: "git version 2.50.1".to_owned(),
-                }),
-            }),
+            git: Arc::new(Installation::holding(GitProgram {
+                program: PathBuf::from("/usr/bin/git"),
+                executable: PathBuf::from("/usr/libexec/git-core/git"),
+                exec_path: PathBuf::from("/usr/libexec/git-core"),
+                version: "git version 2.50.1".to_owned(),
+            })),
             environment_id: EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16])),
             empty_config: PathBuf::from("/state/git-profile/empty-config"),
             hooks: PathBuf::from("/state/git-profile/hooks"),

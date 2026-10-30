@@ -14,6 +14,12 @@ daemon resumes when it starts. A host whose Git is missing, or cannot answer, st
 service. Each request that runs Git is refused until a resolution finds one, and a resolution that
 failed is made again at the next request.
 
+Resolution is bounded, because it is made outside every boundary of a program this host has not yet
+shown to be Git. The questions are given ten seconds in all and an answer of 64 KiB. A program that
+takes longer, or answers with more, is ended with everything it started and refused as unavailable.
+One request at a time resolves, and requests that arrive meanwhile share its result, so a program
+that hangs is started once for all of them.
+
 ## Why there is one
 
 The service reads a repository's configuration before it runs Git, blanks every driver the
