@@ -200,20 +200,24 @@ let run all the same. A start that fails or panics between creating the process 
 ends and collects the process. The job also ends the process when the daemon lets go of it, so a
 daemon that ends in that time leaves none that never ran either. One case remains: a daemon killed
 from outside in the few calls between the process's creation and its entry into the job, or before
-it lets run a process the job did not take.
-A commit past the limit is refused by the system. A runtime that cannot allocate ends, and one that
-catches the failed allocation answers that its load or job failed and goes on. The daemon asks the
-job when the process closes its end, when its frames stop short, and when it answers that a load or
-a job failed. If the job recorded a refused commit, the process ended for memory: it is ended,
-inference pauses with `memory_pressure` as it does for a reading past the ceiling, and the job is
-not retried. The answer of the load or the job in hand, when it does not fail, clears what the job
-recorded, so a refusal the runtime got over does not count against a later end. An answer for other
-work, a late or a repeated one, neither clears nor uses it. Windows does not promise to deliver the
-job's message, so a refusal that was not recorded reads as an ordinary end or an ordinary failure.
-The limit is on committed memory and not on the resident set, so it does not count the weights a
-model maps for reading, and the daemon's reading stays the measure of the resident set. A host that
-will not apply the limit says so on its standard error and keeps the daemon's reading as the only
-ender.
+it lets run a process the job did not take. A commit past the limit is refused by the system. A
+runtime that cannot allocate ends, and one that catches the failed allocation answers that its load
+or job failed and goes on. The daemon asks the job when the process closes its end, when its frames
+stop short, and when it answers that a load or a job failed. If the job recorded a refused commit,
+the process ended for memory: it is ended, inference pauses with `memory_pressure` as it does for a
+reading past the ceiling, and the job is not retried. The answer of the load or the job in hand,
+when it does not fail, clears what the job recorded, so a refusal the runtime got over does not
+count against a later end. An answer for other work, a late or a repeated one, neither clears nor
+uses it. Windows does not promise to deliver the job's message, so a refusal that was not recorded
+reads as an ordinary end or an ordinary failure. On the build this was tried on (Windows Server
+2025, build 26100) the system posts the message once for a process: a process refused several
+commits, with memory given back between them or not, had only the first recorded, and the system
+refused every one of them. A later refusal, which a runtime that got over the first can meet,
+therefore reads as an ordinary failure, which unloads the process and restarts inference, and the
+next process records its first refusal. The limit is on committed memory and not on the resident
+set, so it does not count the weights a model maps for reading, and the daemon's reading stays the
+measure of the resident set. A host that will not apply the limit says so on its standard error and
+keeps the daemon's reading as the only ender.
 
 CPU-only is two settings rather than one. Zero GPU layers keeps every layer's weights on the
 processor; turning the library's *operation* offload off keeps the arithmetic there too, because the
