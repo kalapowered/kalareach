@@ -1906,7 +1906,9 @@ mod tests {
     }
 
     /// KR-REQ-24.26: a directory refused as open to others is said with the command that mends it
-    /// only when its path is said whole; one with a name left out names none.
+    /// only when its path is said whole; one with a name left out names none. The refusal is
+    /// raised on Unix only.
+    #[cfg(unix)]
     #[test]
     fn a_too_open_directory_names_its_mending_command_only_where_its_path_is_said_whole() {
         let refused = |path: &str, uid: u32, mode: u32| {
