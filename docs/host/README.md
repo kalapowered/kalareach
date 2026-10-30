@@ -28,10 +28,12 @@ Two roots, both owner-only, both checked rather than assumed on every open.
 | runtime | `$TMPDIR/kalareach` | `$XDG_RUNTIME_DIR/kalareach` | `KR_RUNTIME_DIR` | the control socket, the rendezvous socket, worker endpoints, published descriptors |
 | state | `~/Library/Application Support/KalaReach` | `$XDG_STATE_HOME/kalareach` | `KR_STATE_DIR` | the registry, worker journals, output spools, generated job definitions, the secret-store fallback, the transfer store and its staging area, the backup store and its staged ciphertext, what a daemon `kr new` started writes (`controller.log`), the record of the startup files `kr shell install` put an entry in (`shell-entries.json`), and the record of the terminal profiles `kr host terminal-profile` wrote (`terminal-profiles.json`) |
 
-Everything above a root is created with the platform's ordinary permissions; `/tmp` is
+A directory above a root that exists is left as it is and checked for nothing: `/tmp` is
 world-writable by design and `~/.cache` is usually group-readable, and neither is KalaReach's to
-change. The root and everything below it is created with mode 0700 and verified on every open. A
-directory that is a symbolic link, or that belongs to another user, is refused rather than repaired.
+change. One that is missing is created with mode 0700, whatever the umask, as the root and everything
+below it are, and those are verified on every open. A directory that is a symbolic link, or that
+belongs to another user, is refused rather than repaired. One that this user owns and that is too open
+is refused too, with the `chmod 700` that mends it.
 
 On Linux, $XDG_RUNTIME_DIR/kalareach is the default runtime root, unless that directory would end up
 in a location shared between all WSL distros. WSLg sets $XDG_RUNTIME_DIR to /mnt/wslg/runtime-dir,
