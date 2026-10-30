@@ -683,9 +683,10 @@ fn a_state_directory_that_is_open_to_others_is_refused_with_the_command_that_men
     assert!(started.status.success(), "{}", said(&started));
 }
 
-/// KR-REQ-24.26: a host's state directory whose access list lets another account in is refused, and
-/// the refusal names no command, since the mode a command would set leaves the list as it was: the
-/// directory is refused again once the person has changed its mode.
+/// KR-REQ-24.26: a host's state directory whose access list lets another account in, here every
+/// account listing and searching it, is refused, and the refusal names no command, since the mode a
+/// command would set leaves the list as it was: the directory is refused again once the person has
+/// changed its mode.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_state_directory_whose_access_list_lets_another_account_in_is_refused_without_a_command() {
@@ -705,7 +706,7 @@ fn a_state_directory_whose_access_list_lets_another_account_in_is_refused_withou
     std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).expect("opened");
     let listed = Command::new("/bin/chmod")
         .arg("+a")
-        .arg("user:root allow write")
+        .arg("group:everyone allow list,search")
         .arg(&state)
         .status()
         .expect("chmod runs");
