@@ -1002,7 +1002,7 @@ async fn a_daemon_killed_mid_clone_is_replaced_and_the_destination_is_untouched(
     };
 
     let log = host.root().join("daemon.log");
-    let mut first = start_daemon(&program, &host);
+    let mut first = start_daemon(&program, &host, None);
     wait_for_daemon(&endpoint, &log).await;
     {
         let mut control = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
@@ -1036,7 +1036,7 @@ async fn a_daemon_killed_mid_clone_is_replaced_and_the_destination_is_untouched(
         .stop()
         .unwrap_or_else(|error| panic!("the first daemon ends where it stands: {error}"));
 
-    let mut second = start_daemon(&program, &host);
+    let mut second = start_daemon(&program, &host, None);
     wait_for_daemon(&endpoint, &log).await;
     let mut control = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
         .await
@@ -1144,6 +1144,126 @@ async fn wait_for_operation(journal: &Path) {
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+}
+
+/// The step a refusal names for a host with no usable Git: the one fact a person needs from it.
+#[cfg(unix)]
+fn install_step() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "xcode-select --install"
+    } else {
+        "Install Git"
+    }
+}
+
+/// A host without a working Git starts its daemon, answers what needs no Git, and refuses what
+/// runs it with the step that installs it, leaving nothing behind.
+///
+/// The daemon is the real `kr-controller` program, started with a search path that holds nothing
+/// but the stand-in this case names, so the installed Git on the machine running the test takes no
+/// part. `Some(script)` is a `git` that behaves as the macOS stub does where the developer tools
+/// are absent, printing a note and ending with status 1, and `None` is a search path with no `git`.
+#[cfg(unix)]
+async fn a_daemon_on_a_host_without_a_working_git(script: Option<&str>) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let host = teardown::Tree::create();
+    let environment = host.environment();
+    let environment_id = host.environment_id();
+    let search = host.root().join("search");
+    std::fs::create_dir(&search).expect("a search path of this test's own");
+    if let Some(script) = script {
+        let stand_in = search.join("git");
+        std::fs::write(&stand_in, script).expect("the stand-in for Git");
+        std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755))
+            .expect("the stand-in can run");
+    }
+    let program = host.root().join("kr-controller");
+    kr_ipc::testing::place_and_start_once(
+        std::path::Path::new(env!("CARGO_BIN_EXE_kr-controller")),
+        &program,
+        &["--version"],
+    );
+    let endpoint = environment.controller_endpoint().expect("an endpoint");
+    let work = PrivateTempDir::create();
+
+    let log = host.root().join("daemon.log");
+    let _daemon = start_daemon(&program, &host, Some(&search));
+    wait_for_daemon(&endpoint, &log).await;
+    let mut control = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects to the daemon this test started");
+
+    // What the journal records is answered, because it needs no Git.
+    let listed: ProjectListResult = typed(
+        &control
+            .request(Method::ProjectList, &ProjectListParams { environment_id })
+            .await
+            .expect("the call reaches the daemon")
+            .expect("project.list succeeds"),
+    );
+    assert!(listed.projects.is_empty());
+
+    // What runs Git is refused with the code a host that is not set up for it answers with, and
+    // the message names the step that installs it.
+    let refusal = failure(
+        control
+            .mutate(
+                Method::ProjectInit,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(environment_id),
+                &ProjectInitParams {
+                    destination: DestinationRequest {
+                        environment_id,
+                        parent: kr_protocol::project::DestinationParent::Host {
+                            path: work.path().display().to_string(),
+                        },
+                        name: "fresh".to_owned(),
+                    },
+                    label: "fresh".to_owned(),
+                    initial_branch: Nullable::some("main".to_owned()),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(refusal.code, ErrorCode::HostNotConfigured, "{refusal:?}");
+    assert!(
+        refusal.message.contains(install_step()),
+        "the refusal names the step that installs Git: {}",
+        refusal.message
+    );
+    // The refusal came before anything was made: no destination and no staging sibling.
+    assert_eq!(names_in(work.path()), Vec::<String>::new());
+    let listed: ProjectListResult = typed(
+        &control
+            .request(Method::ProjectList, &ProjectListParams { environment_id })
+            .await
+            .expect("the call reaches the daemon")
+            .expect("project.list succeeds"),
+    );
+    assert!(
+        listed.projects.is_empty(),
+        "no repository was recorded for a creation that was refused"
+    );
+}
+
+/// The Git a Mac without the developer tools has at `/usr/bin/git`: a stub that exits with status
+/// 1 whatever it is asked.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_starts_where_git_exits_with_status_one() {
+    a_daemon_on_a_host_without_a_working_git(Some(
+        "#!/bin/sh\necho 'xcode-select: note: No developer tools were found.' >&2\nexit 1\n",
+    ))
+    .await;
+}
+
+/// A host that has no Git at all.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_starts_where_there_is_no_git() {
+    a_daemon_on_a_host_without_a_working_git(None).await;
 }
 
 /// How long a killed daemon is given to be collected.
@@ -1301,15 +1421,20 @@ fn names_in(directory: &Path) -> Vec<String> {
 /// Starts the placed daemon on this test's own directories, with no worker program.
 ///
 /// The copy was placed by a process of its own, so no child another test starts holds it open for
-/// writing, and the first start is the only one.
+/// writing, and the first start is the only one. The daemon searches `search` for programs when
+/// one is given, and the `PATH` this test has otherwise.
 #[cfg(unix)]
-fn start_daemon(program: &Path, host: &teardown::Tree) -> Daemon {
+fn start_daemon(program: &Path, host: &teardown::Tree, search: Option<&Path>) -> Daemon {
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(host.root().join("daemon.log"))
         .expect("opens the daemon's log");
-    let child = std::process::Command::new(program)
+    let mut command = std::process::Command::new(program);
+    if let Some(search) = search {
+        command.env("PATH", search);
+    }
+    let child = command
         // The daemon starts in a directory on the internal disk rather than inheriting this test's
         // own, which is inside the checkout. A copied binary is a new program as far as the
         // operating system's privacy rules are concerned, and a new program whose working
