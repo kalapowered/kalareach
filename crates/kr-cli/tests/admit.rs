@@ -73,6 +73,29 @@ impl Home {
         finish_within(child, Duration::from_secs(300))
     }
 
+    /// Runs a program as a person's own shell does: under the umask 022 that most systems start a
+    /// login with, with this home, a temporary directory of its own and nothing that names the
+    /// runtime or the state root, so that both are the defaults of this home.
+    fn run_as_a_person(&self, program: &Path, arguments: &[&str]) -> Output {
+        let temporary = self.home.join("tmp");
+        std::fs::create_dir_all(&temporary).expect("a temporary directory");
+        let child = Command::new("/bin/sh")
+            .args(["-c", "umask 022 && exec \"$0\" \"$@\""])
+            .arg(program)
+            .args(arguments)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &self.home)
+            .env("TMPDIR", &temporary)
+            .current_dir(&self.home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|error| panic!("{} did not start: {error}", program.display()));
+        finish_within(child, Duration::from_secs(300))
+    }
+
     /// `kr host versions`, which answers only for a `kr` of a store.
     fn versions(&self, program: &Path) -> (Output, Value) {
         let output = self.run(program, &["--json", "host", "versions"]);
@@ -550,4 +573,89 @@ fn an_update_that_fails_after_it_staged_the_release_is_not_offered_again() {
         home.store.current().expect("reads"),
         Some(one.name().clone())
     );
+}
+
+/// The mode a directory carries, as the permission bits.
+fn mode_of(directory: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::metadata(directory)
+        .unwrap_or_else(|error| panic!("{}: {error}", directory.display()))
+        .permissions()
+        .mode()
+        & 0o777
+}
+
+/// KR-REQ-24.26: an install into a home that has no KalaReach directory, under the umask a login
+/// starts with, makes every directory from the home down to the store owner-only, the directory
+/// that a macOS host also takes for its state included, so that the host's next command accepts it.
+#[test]
+fn an_install_into_a_fresh_home_makes_only_owner_only_directories() {
+    let home = Home::new();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let by_hand = home.prefix("unpacked", &one);
+    assert!(
+        !home.store.root().exists(),
+        "the home has nothing of KalaReach's"
+    );
+
+    let installed = home.run_as_a_person(&kr(&by_hand), &["host", "install"]);
+    assert!(installed.status.success(), "{}", said(&installed));
+
+    let mut directory = home.store.root().to_path_buf();
+    while directory != home.home {
+        assert_eq!(
+            mode_of(&directory),
+            0o700,
+            "{} is made by the install",
+            directory.display()
+        );
+        directory = directory.parent().expect("below the home").to_path_buf();
+    }
+
+    // What the person runs next, as the store's own copy: on macOS the state root is the directory
+    // above the store, and the command refuses one that is open to others.
+    let started = home.run_as_a_person(
+        &home.store.stable(Program::Kr),
+        &["host", "startup", "--set", "standalone"],
+    );
+    assert!(started.status.success(), "{}", said(&started));
+}
+
+/// KR-REQ-24.26: a host's state directory that is open to others, as the first tester release left
+/// it on macOS, is refused, and the refusal names the command that mends it; the command mends it.
+#[test]
+fn a_state_directory_that_is_open_to_others_is_refused_with_the_command_that_mends_it() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let home = Home::new();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let by_hand = home.prefix("unpacked", &one);
+    let installed = home.run_as_a_person(&kr(&by_hand), &["host", "install"]);
+    assert!(installed.status.success(), "{}", said(&installed));
+    let program = home.store.stable(Program::Kr);
+
+    let paths = home.run_as_a_person(&program, &["--json", "host", "paths"]);
+    let shown: Value = serde_json::from_slice(&paths.stdout).expect("the roots as JSON");
+    let state = PathBuf::from(shown["state_root"].as_str().expect("the state root"));
+    std::fs::create_dir_all(&state).expect("the state root");
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).expect("opened");
+
+    let refused = home.run_as_a_person(&program, &["host", "startup", "--set", "standalone"]);
+    assert!(!refused.status.success(), "{}", said(&refused));
+    let remedy = format!("chmod 700 '{}'", state.display());
+    assert!(
+        said(&refused).contains(&remedy),
+        "the refusal names `{remedy}`: {}",
+        said(&refused)
+    );
+
+    // The command the refusal names, run as the person would run it.
+    let mended = Command::new("/bin/sh")
+        .args(["-c", &remedy])
+        .status()
+        .expect("chmod runs");
+    assert!(mended.success());
+    let started = home.run_as_a_person(&program, &["host", "startup", "--set", "standalone"]);
+    assert!(started.status.success(), "{}", said(&started));
 }
