@@ -3193,7 +3193,8 @@ fn programs_for_a_container() -> &'static Path {
         .1
 }
 
-/// A container this test made, removed by the identifier the runtime issued however the test ends.
+/// A container this test made, removed however the test ends: by the identifier the runtime issued,
+/// and until it has issued one by the name this test gave the container.
 struct Container {
     runtime: Runtime,
     id: String,
@@ -3203,18 +3204,26 @@ struct Container {
 impl Container {
     fn start() -> Self {
         image_present();
-        Self::create(Runtime::podman())
+        Self::create(Runtime::podman(), programs_for_a_container())
     }
 
-    fn create(runtime: Runtime) -> Self {
+    /// Starts a container that mounts `programs`.
+    fn create(runtime: Runtime, programs: &Path) -> Self {
         let name = format!("kr-acc-{}", &kr_ipc::new_uuid().to_string()[..8]);
-        let mount = format!("{}:{MOUNTED}:ro", programs_for_a_container().display());
-        let started = runtime.call(&[
+        let mount = format!("{}:{MOUNTED}:ro", programs.display());
+        // The guard exists before the first call that can make the container: a call that makes it
+        // and then stalls or fails still leaves a guard that removes it, by the name just given.
+        let mut container = Self {
+            runtime,
+            id: String::new(),
+            name,
+        };
+        let started = container.runtime.call(&[
             "run",
             "--detach",
             "--pull=never",
             "--name",
-            &name,
+            &container.name,
             "--user",
             "root",
             "--volume",
@@ -3241,7 +3250,18 @@ impl Container {
             kr_protocol::identity::is_container_identifier(&id),
             "the runtime issued a whole identifier: {id}"
         );
-        Self { runtime, id, name }
+        container.id = id;
+        container
+    }
+
+    /// What names the container to the runtime: the identifier it issued, and until it has issued
+    /// one, the name this test gave it. That name is random, and no one else holds it.
+    fn target(&self) -> &str {
+        if self.id.is_empty() {
+            &self.name
+        } else {
+            &self.id
+        }
     }
 
     /// Runs one command inside, as root, and says what it printed.
@@ -3339,11 +3359,19 @@ impl Container {
         String::from_utf8_lossy(&inspected.stdout).trim().to_owned()
     }
 
-    /// Removes the container by the identifier the runtime issued, never by a name somebody else
-    /// might hold now. Says why when it could not, and never panics.
+    /// Removes the container, whether or not the runtime made it. Says why when it could not, and
+    /// never panics.
     fn remove(&self) -> Result<(), String> {
         let removed = self.runtime.run(
-            &["rm", "--force", "--time", "0", "--", &self.id],
+            &[
+                "rm",
+                "--force",
+                "--ignore",
+                "--time",
+                "0",
+                "--",
+                self.target(),
+            ],
             self.runtime.quick,
         )?;
         if removed.status.success() {
@@ -3365,7 +3393,8 @@ impl Drop for Container {
         if let Err(why) = self.remove() {
             eprintln!(
                 "the container {} ({}) was not removed and may still be running: {why}",
-                self.name, self.id
+                self.name,
+                self.target()
             );
         }
     }
@@ -3463,6 +3492,36 @@ fn a_removal_that_stalls_while_an_assertion_fails_is_recorded_and_aborts_nothing
         .filter(|call| call.starts_with("rm "))
         .count();
     assert_eq!(removals, 2, "the unwinding case tried to remove it too");
+}
+
+/// A start that stalls after the runtime made the container leaves it removed: the guard exists
+/// before the call that makes the container, and removes it by the name just given.
+#[test]
+fn a_container_start_that_stalls_after_the_runtime_made_the_container_removes_it() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let runtime = stalling_runtime(directory.path(), &["run"]);
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Container::create(runtime, directory.path())
+    }));
+    let said = panic_message(
+        failed
+            .err()
+            .expect("a start that never ends fails the case"),
+    );
+    assert!(said.contains("\"run\""), "the call is named: {said}");
+
+    let calls = recorded_calls(directory.path());
+    let name = calls
+        .iter()
+        .find(|call| call.starts_with("run "))
+        .and_then(|call| call.split(' ').skip_while(|word| *word != "--name").nth(1))
+        .expect("the start named the container it made");
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.starts_with("rm ") && call.ends_with(&format!(" -- {name}"))),
+        "the container is removed by the name it was given: {calls:?}"
+    );
 }
 
 /// A call to the container runtime that never ends fails the case that made it, with the call
