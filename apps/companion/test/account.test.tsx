@@ -192,6 +192,53 @@ describe('the desktop Account sheet', () => {
   })
 })
 
+describe('the managed services the application holds a client of (KR-REQ-17.14)', () => {
+  /** The lines the backend reports for a phone with its account, sync and push clients and no broker. */
+  const lines = [
+    { service: 'account login', configured: true, explanation: 'A account login service is configured.' },
+    { service: 'push registration', configured: true, explanation: 'A push registration service is configured.' },
+    { service: 'sync and backup', configured: true, explanation: 'A sync and backup service is configured.' },
+    {
+      service: 'managed inference',
+      configured: false,
+      explanation: 'No managed inference service is configured. You can use your own provider credentials.'
+    }
+  ] as const
+
+  it('says what is held and what to do instead of what is not, and offers nothing to buy', async () => {
+    const person = userEvent.setup()
+    const controls = start()
+    controls.account.setServices(lines)
+    await person.click(screen.getByRole('button', { name: /^Account/ }))
+    const sheet = await screen.findByRole('dialog', { name: 'Account' })
+    const list = await within(sheet).findByTestId('account-services')
+    const items = within(list).getAllByRole('listitem')
+    expect(items.map((item) => item.textContent)).toEqual([
+      'Account loginA account login service is configured.',
+      'Push registrationA push registration service is configured.',
+      'Sync and backupA sync and backup service is configured.',
+      'Managed inferenceNo managed inference service is configured. You can use your own provider credentials.'
+    ])
+    const text = (sheet.textContent ?? '').toLowerCase()
+    for (const word of PURCHASE_WORDS) {
+      expect(text, word).not.toContain(word)
+    }
+    expect(sheet.querySelector('a[href]')).toBeNull()
+    expect(sheet.querySelector('form')).toBeNull()
+    // The section explains and offers no control of its own.
+    expect(within(list).queryByRole('button')).toBeNull()
+  })
+
+  it('leaves the section out when the application reports none', async () => {
+    const person = userEvent.setup()
+    start()
+    await person.click(screen.getByRole('button', { name: /^Account/ }))
+    const sheet = await screen.findByRole('dialog', { name: 'Account' })
+    await within(sheet).findByRole('button', { name: 'Sign in' })
+    expect(within(sheet).queryByTestId('account-services')).toBeNull()
+  })
+})
+
 describe('where the device stands is read once the panel is listening (KR-REQ-13.02)', () => {
   /** The application, against a host the test has prepared. */
   function open(port: HostPort): void {

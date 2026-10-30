@@ -1379,6 +1379,25 @@ textarea::placeholder {
   color: var(--faint);
 }
 
+.account-services {
+  display: grid;
+  gap: var(--gap-2);
+  margin: 0 0 var(--gap-2);
+  padding: 0;
+  list-style: none;
+}
+
+.account-services li {
+  display: grid;
+  gap: 2px;
+}
+
+.account-service-name {
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
 .account-usage {
   display: grid;
   gap: var(--gap-1);

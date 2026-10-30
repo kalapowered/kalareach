@@ -220,6 +220,12 @@ impl Account {
         &self.deletion
     }
 
+    /// The client of the account service this account signs in through.
+    #[must_use]
+    pub fn service(&self) -> Arc<dyn AccountService> {
+        Arc::clone(&self.service)
+    }
+
     /// The token source every managed resource on this device asks.
     #[must_use]
     pub fn tokens(&self) -> Arc<SignedInAccount> {
