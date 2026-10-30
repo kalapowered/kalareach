@@ -19,10 +19,10 @@
 //! or as legacy VT input, when they reach it. This reader never learns which.
 //!
 //! When the session cannot take the records, the console is asked to spell its keys itself, and
-//! from then on its bytes are read as bytes ([`RecordReader::read_bytes`]), exactly as the console
-//! hands them over: a record is never turned into bytes here. A read of the console's bytes waits
-//! until the console has a byte to give, and a thread in it cannot be woken without the console
-//! losing the next key, so [`RecordReader::bytes_waiting`] says first whether there is one.
+//! from then on its text is read as text ([`RecordReader::read_text`]), exactly as the console hands
+//! it over: a record is never turned into bytes here. A read of the console's text waits until the
+//! console has some to give, and a thread in it cannot be woken without the console losing the next
+//! key, so [`RecordReader::text_waiting`] says first whether there is any.
 
 #![expect(
     unsafe_code,
@@ -31,14 +31,13 @@
 
 use kr_client::shown;
 use kr_client::shown::Shown;
-use std::io::Read as _;
 use std::os::windows::io::AsRawHandle as _;
 
 use kr_term::win32::{KeyRecord, PairHold};
 use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows_sys::Win32::System::Console::{
     ENABLE_WINDOW_INPUT, GetNumberOfConsoleInputEvents, INPUT_RECORD, KEY_EVENT, MOUSE_EVENT,
-    PeekConsoleInputW, ReadConsoleInputW, WINDOW_BUFFER_SIZE_EVENT,
+    PeekConsoleInputW, ReadConsoleInputW, ReadConsoleW, WINDOW_BUFFER_SIZE_EVENT,
 };
 use windows_sys::Win32::System::Threading::{
     CreateEventW, INFINITE, ResetEvent, SetEvent, WaitForMultipleObjects,
@@ -121,33 +120,61 @@ impl RecordReader {
     ///
     /// A stop that is set is seen first, whatever the console holds. Input the console holds is seen
     /// before a request, so that a reader asked to do something has read everything the console had
-    /// before it does it. A request seen is cleared.
+    /// before it does it, unless `requests_first` says the request has waited long enough: a
+    /// console that never stops having input must not keep a request from being heard. A request
+    /// seen is cleared.
     ///
     /// # Errors
     ///
     /// Returns an error when the system will not wait.
-    pub fn wait(&self, stop: &WakeEvent, asked: &WakeEvent) -> Result<Woken> {
-        let handles: [HANDLE; 3] = [
-            stop.0.as_raw_handle() as HANDLE,
-            self.handle.as_raw_handle() as HANDLE,
-            asked.0.as_raw_handle() as HANDLE,
-        ];
+    pub fn wait(&self, stop: &WakeEvent, asked: &WakeEvent, requests_first: bool) -> Result<Woken> {
+        let stop = stop.0.as_raw_handle() as HANDLE;
+        let console = self.handle.as_raw_handle() as HANDLE;
+        let asked_handle = asked.0.as_raw_handle() as HANDLE;
+        // The first of the handles that is set decides, so the order is the precedence.
+        let (handles, kinds) = if requests_first {
+            (
+                [stop, asked_handle, console],
+                [Woken::Stop, Woken::Asked, Woken::Console],
+            )
+        } else {
+            (
+                [stop, console, asked_handle],
+                [Woken::Stop, Woken::Console, Woken::Asked],
+            )
+        };
         // SAFETY: all three handles are open for the call, the first and third the events' and the
         // second this reader's own, and the array holds exactly the three the count names.
         let woken = unsafe { WaitForMultipleObjects(3, handles.as_ptr(), 0, INFINITE) };
-        if woken == WAIT_OBJECT_0 {
-            Ok(Woken::Stop)
-        } else if woken == WAIT_OBJECT_0 + 1 {
-            Ok(Woken::Console)
-        } else if woken == WAIT_OBJECT_0 + 2 {
-            asked.reset();
-            Ok(Woken::Asked)
-        } else {
-            Err(CliError::Terminal(shown!(
+        let index = woken.wrapping_sub(WAIT_OBJECT_0) as usize;
+        match kinds.get(index) {
+            Some(Woken::Asked) => {
+                asked.reset();
+                Ok(Woken::Asked)
+            }
+            Some(kind) => Ok(*kind),
+            None => Err(CliError::Terminal(shown!(
                 "wait for the console's input: {}",
                 Shown::io(&std::io::Error::last_os_error())
-            )))
+            ))),
         }
+    }
+
+    /// Returns the first half of a character outside the basic plane that is waiting for its second
+    /// half, if one is, and forgets it.
+    ///
+    /// The reader hands it on at the moment it stops reading records, so that what it was is counted
+    /// with the rest and not lost without a trace.
+    pub fn held(&mut self) -> Vec<KeyRecord> {
+        // Any key going down after the half makes it a half that nothing completes, which the hold
+        // lets go; the key used for that is not one of the console's and is not handed on.
+        let after = KeyRecord {
+            key_down: true,
+            ..KeyRecord::DEFAULT
+        };
+        let mut records = self.pairs.take(&[after]);
+        records.pop();
+        records
     }
 
     /// Returns how many events are waiting, without taking any.
@@ -284,18 +311,18 @@ impl RecordReader {
         Ok(out)
     }
 
-    /// Says whether the console holds a key going down, which a read of its bytes answers at once.
+    /// Says whether the console holds text, which a read of it answers at once.
     ///
     /// A console that spells its keys itself keeps what it has not handed over as records, and a
-    /// read of its bytes passes over the records that are not a key going down (a key coming up, a
-    /// resize, a focus change) and then waits for one that is. This takes the records that come
-    /// before a key going down off the front of the queue only when there is none at all, so that the
-    /// console reports no input until there is some. It must be the only reader of the console.
+    /// read of its text passes over the records that make none (a key coming up, a modifier or a
+    /// lock going down, a resize, a focus change) and then waits for one that does. So the records
+    /// that make none are taken off the front of the queue here, and the console reports no input
+    /// until there is some that does. It must be the only reader of the console.
     ///
     /// # Errors
     ///
     /// Returns the console's failure.
-    pub fn bytes_waiting(&self) -> std::io::Result<bool> {
+    pub fn text_waiting(&self) -> std::io::Result<bool> {
         // SAFETY: an `INPUT_RECORD` is a tagged union of plain integers, and all zeroes is a
         // record of event type zero, which this never reads as a key event.
         let mut buffer: [INPUT_RECORD; BATCH] = unsafe { std::mem::zeroed() };
@@ -315,16 +342,25 @@ impl RecordReader {
             return Err(std::io::Error::last_os_error());
         }
         let peeked = usize::try_from(peeked).unwrap_or(0).min(buffer.len());
-        let going_down = buffer[..peeked].iter().any(|record| {
-            // SAFETY: the console reported this record as a key event before the field is read.
-            u32::from(record.EventType) == KEY_EVENT
-                && unsafe { record.Event.KeyEvent.bKeyDown } != 0
+        let makes_text = buffer[..peeked].iter().any(|record| {
+            if u32::from(record.EventType) != KEY_EVENT {
+                return false;
+            }
+            // SAFETY: the console reported this record as a key event, which is the field of the
+            // union that is then live. Both arms of the character's union are the same two bytes.
+            let (key, unicode) = unsafe {
+                (
+                    record.Event.KeyEvent,
+                    record.Event.KeyEvent.uChar.UnicodeChar,
+                )
+            };
+            crate::attach::key_can_make_text(key.wVirtualKeyCode, key.bKeyDown != 0, unicode)
         });
-        if going_down || peeked == 0 {
-            return Ok(going_down);
+        if makes_text || peeked == 0 {
+            return Ok(makes_text);
         }
-        // None of them is a key going down, so a read of the bytes would pass over every one and
-        // wait. They are taken off, which is all that read would have done with them.
+        // None of them makes any, so a read of the text would pass over every one and wait. They are
+        // taken off, which is all that read would have done with them.
         let mut taken = 0_u32;
         // SAFETY: as above; this reads no more records than were peeked, and this thread is the
         // only reader, so they are there.
@@ -342,17 +378,34 @@ impl RecordReader {
         Ok(false)
     }
 
-    /// Reads the bytes the console hands over, waiting for at least one.
+    /// Reads the text the console hands over, as UTF-16, and returns how many units it read.
     ///
-    /// This is a read of the console as a stream of bytes, for a console that has been asked to
-    /// spell its keys itself. It takes what the console gives and changes none of it, a NUL among
-    /// the bytes included. Call it only when [`Self::bytes_waiting`] has said there is one.
+    /// This is a read of the console as a stream of text, for a console that has been asked to spell
+    /// its keys itself. It takes what the console gives and changes none of it, a NUL among the
+    /// units included, and the console's code page has no part in it. Call it only when
+    /// [`Self::text_waiting`] has said there is some.
     ///
     /// # Errors
     ///
     /// Returns the console's failure.
-    pub fn read_bytes(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        self.handle.read(buffer)
+    pub fn read_text(&mut self, units: &mut [u16]) -> std::io::Result<usize> {
+        let mut read = 0_u32;
+        // SAFETY: the handle is this reader's own and open for the call. The buffer is the caller's
+        // and the count it is given is its own length in units; the number read is a local. No input
+        // control is passed.
+        let ok = unsafe {
+            ReadConsoleW(
+                self.handle.as_raw_handle().cast(),
+                units.as_mut_ptr().cast(),
+                u32::try_from(units.len()).unwrap_or(1),
+                &raw mut read,
+                std::ptr::null(),
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(usize::try_from(read).unwrap_or(0).min(units.len()))
     }
 }
 
