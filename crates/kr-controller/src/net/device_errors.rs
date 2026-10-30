@@ -36,9 +36,9 @@ use kr_transport::preauth::{ConnectionPeer, PairingMethod, PairingSurface};
 /// is not here.
 const WHY_NOT_SHOWN: &str = "the detail names the host and is not sent to a paired device";
 
-/// As [`WHY_NOT_SHOWN`], for the words of the agent a session runs, which are withheld whatever
-/// they say.
-const WHY_THE_AGENT: &str = "what the agent said is not sent to a paired device";
+/// As [`WHY_NOT_SHOWN`], for a refusal withheld whatever it says, because the host cannot tell the
+/// agent's words from its own.
+const WHY_WHATEVER_IT_SAYS: &str = "the detail is not sent to a paired device";
 
 /// As [`WHY_NOT_SHOWN`], for what the pairing store or the rendezvous service reported to a
 /// candidate that has not paired.
@@ -55,7 +55,7 @@ const WEB_SCHEMES: [&str; 6] = ["http", "https", "ws", "wss", "socks5", "socks5h
 const ACCOUNT_WORDS: [&str; 7] = ["user", "owner", "uid", "gid", "group", "account", "gui"];
 
 /// The programs whose use on this host a message can tell a person to repeat.
-const COMMAND_WORDS: [&str; 4] = ["chmod", "chown", "sudo", "doas"];
+const COMMAND_WORDS: [&str; 6] = ["chmod", "chown", "sudo", "doas", "systemctl", "launchctl"];
 
 /// Refusals of the project service whose reason a device is told without the place: what the host
 /// says begins to name a directory of its own where `marker` stands, and the device is given the
@@ -175,6 +175,30 @@ pub(crate) fn frame_for_a_device(frame: &ControlFrame) -> Cow<'_, ControlFrame> 
     }
 }
 
+/// Whether `frame` is at most `limit` bytes as the control stream counts them.
+#[must_use]
+pub(crate) fn fits(frame: &ControlFrame, limit: usize) -> bool {
+    kr_cbor::to_canonical_value(frame).is_ok_and(|value| kr_cbor::encoded_len(&value) <= limit)
+}
+
+/// What a device is told of a response that no longer fits its frame once what names the host was
+/// taken out of it, or `None` for a frame that answers no request.
+///
+/// It is refused as a worker refuses an answer larger than the frame the device declared.
+#[must_use]
+pub(crate) fn too_large_for_the_device(frame: &ControlFrame) -> Option<ControlFrame> {
+    let ControlFrame::Response(Response { request_id, .. }) = frame else {
+        return None;
+    };
+    Some(ControlFrame::Response(Response {
+        request_id: *request_id,
+        outcome: Outcome::Error(ProtocolError::new(
+            ErrorCode::InvalidArgument,
+            "this answer is larger than the frame this device said it can receive",
+        )),
+    }))
+}
+
 /// The answer to `method` as a device is given it, when the method puts a prompt, a steer, a
 /// cancellation, an approval or a plugin's action to the agent a session runs.
 ///
@@ -200,7 +224,7 @@ pub(crate) fn upstream_words(method: Option<Method>, frame: ControlFrame) -> Con
                 request_id,
                 outcome: Outcome::Error(with_message(
                     &error,
-                    sentence_for(error.code, WHY_THE_AGENT),
+                    sentence_for(error.code, WHY_WHATEVER_IT_SAYS),
                 )),
             })
         }
@@ -264,6 +288,11 @@ fn clause_before(message: &str, at: usize) -> Option<&str> {
 
 /// The sentence a code gets, for a message of which nothing is kept, with `why` it is not shown.
 fn sentence_for(code: ErrorCode, why: &str) -> String {
+    // An end nobody can establish is not a failure, and a person who reads it as one sends the
+    // work twice.
+    if code == ErrorCode::OutcomeUnknown {
+        return format!("the host cannot say whether this request was carried out; {why}");
+    }
     format!(
         "the host could not complete this request ({}); {why}",
         what_failed(code)
@@ -752,18 +781,21 @@ mod tests {
 
     #[test]
     fn a_message_a_device_is_given_is_never_longer_than_an_error_may_be() {
+        // Short enough to be an error, with a clause that cannot take the reason after it.
         let long = format!(
-            "{}: create /Users/marguerite/x: denied",
-            "the host could not make something it needs ".repeat(24)
+            "{}: create /x",
+            "the host could not make something ".repeat(29)
         );
-        assert!(long.len() > LONGEST_MESSAGE - 40);
-        let shown = error_for_a_device(&error(ErrorCode::ResourceUnavailable, &long)).into_owned();
+        let told = error(ErrorCode::ResourceUnavailable, &long);
+        assert!(told.is_consistent(), "{}", long.len());
+        let shown = error_for_a_device(&told).into_owned();
+        assert!(shown.is_consistent(), "{}", shown.message.len());
         assert!(
-            shown.message.len() <= LONGEST_MESSAGE,
-            "{}",
-            shown.message.len()
+            !shown
+                .message
+                .starts_with("the host could not make something"),
+            "the clause gave way to the sentence of the code"
         );
-        assert!(shown.is_consistent());
     }
 
     #[test]
@@ -1006,9 +1038,11 @@ mod tests {
             panic!("a closure that names the host was passed as it was");
         };
         let shown: ClosureRecord = shown.payload.to_typed().expect("decodes");
-        assert_eq!(
-            shown.surviving[0].detail,
-            "unestablished: the detail names the host and is not sent to a paired device"
+        assert!(
+            shown.surviving[0].detail.starts_with("unestablished")
+                && !shown.surviving[0].detail.contains("/sys"),
+            "{:?}",
+            shown.surviving
         );
         assert_eq!(shown.surviving[0].kind, "unestablished");
         assert_eq!(shown.surviving[1], record.surviving[1]);
@@ -1077,6 +1111,12 @@ mod tests {
             );
             assert_eq!(shown.code, code);
             assert_eq!(shown.retry, code.retry_category());
+            if code == ErrorCode::OutcomeUnknown {
+                assert!(
+                    !shown.message.contains("could not complete"),
+                    "an unknown outcome is not told as a failure: {shown:?}"
+                );
+            }
         }
 
         for (method, code) in [

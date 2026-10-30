@@ -2920,3 +2920,93 @@ fn a_share_issued_under(
         .expect("the share is written");
     grant
 }
+
+/// An answer that fitted the frame a device can receive, until what names this host was taken out
+/// of it, is refused as too large and not written in a size the stream would end the connection
+/// for; a notification in the same case is not written, and the connection ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_answer_the_hosts_edits_make_too_large_for_the_device_is_not_written() {
+    use kr_protocol::envelope::{Notification, Outcome, ParamsValue, Response};
+    use kr_protocol::ids::{
+        EventSequence, EventType, RequestId, SessionEpoch, SessionId, StreamId,
+    };
+    use kr_protocol::session::{
+        ClosureReason, ClosureRecord, Durability, OwnershipCoverage, SurvivingResource,
+    };
+
+    #[derive(serde::Serialize)]
+    struct Closures {
+        closures: Vec<ClosureRecord>,
+    }
+    let size = |frame: &ControlFrame| {
+        kr_cbor::encoded_len(&kr_cbor::to_canonical_value(frame).expect("a frame encodes"))
+    };
+    let closures: Vec<ClosureRecord> = (0..8)
+        .map(|_| ClosureRecord {
+            session_id: SessionId::new(kr_ipc::new_uuid()),
+            session_epoch: SessionEpoch::V1,
+            reason: ClosureReason::RootExit,
+            root_exit_code: Nullable::null(),
+            root_signal: Nullable::null(),
+            terminated: Vec::new(),
+            surviving: vec![SurvivingResource {
+                kind: "unestablished".to_owned(),
+                detail: "/sys/fs/cgroup is not the unified control group hierarchy".to_owned(),
+            }],
+            ownership_coverage: OwnershipCoverage::Incomplete,
+            durability: Durability::Durable,
+            closed_at_ms: kr_protocol::scalars::TimestampMs::new(1),
+        })
+        .collect();
+    let answer = ControlFrame::Response(Response {
+        request_id: RequestId::new(9),
+        outcome: Outcome::Ok(
+            ParamsValue::from_typed(&Closures {
+                closures: closures.clone(),
+            })
+            .expect("encodes"),
+        ),
+    });
+    let notice = ControlFrame::Notification(Notification {
+        stream_id: StreamId::new("session").expect("a stream"),
+        sequence: EventSequence::new(1),
+        event_type: EventType::new(kr_protocol::session::SESSION_CLOSED_EVENT)
+            .expect("an event type"),
+        payload: ParamsValue::from_typed(&closures[0]).expect("encodes"),
+    });
+    let shown =
+        |frame: &ControlFrame| super::super::device_errors::frame_for_a_device(frame).into_owned();
+    let (answer_before, answer_after) = (size(&answer), size(&shown(&answer)));
+    let (notice_before, notice_after) = (size(&notice), size(&shown(&notice)));
+    assert!(answer_after > answer_before && notice_after > notice_before);
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let controller = super::super::tests::daemon(&temp).await;
+
+    // The limit the original fits and the edited answer does not: the answer is refused.
+    let stream = HeldStream::new(false);
+    stream.writer.add_permits(2);
+    let limited = output(&controller, &stream).limited_to(answer_before);
+    assert!(limited.send(&answer).await, "the refusal is written");
+    let ControlFrame::Response(Response {
+        request_id,
+        outcome: Outcome::Error(refused),
+    }) = stream.frames().remove(0)
+    else {
+        panic!("the answer was written although it no longer fits");
+    };
+    assert_eq!(request_id, RequestId::new(9));
+    assert_eq!(refused.code, kr_protocol::error::ErrorCode::InvalidArgument);
+    // A notification has no request to refuse, so the connection ends with nothing written.
+    let limited = output(&controller, &stream).limited_to(notice_before);
+    assert!(!limited.send(&notice).await);
+    assert_eq!(stream.frames().len(), 1, "nothing of the notification went");
+
+    // The limit the edited answer fits: it is written as edited.
+    let stream = HeldStream::new(false);
+    stream.writer.add_permits(1);
+    let roomy = output(&controller, &stream).limited_to(answer_after);
+    assert!(roomy.send(&answer).await);
+    assert_eq!(stream.frames(), vec![shown(&answer)]);
+    drop(controller);
+}
