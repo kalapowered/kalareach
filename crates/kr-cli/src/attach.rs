@@ -634,11 +634,16 @@ pub async fn subscribe(
 /// spelling of records cannot express refuses them, and the attachment then turns to this: the
 /// console's own virtual-terminal input, which spells the keys as a terminal would and which the
 /// reader hands on as bytes from then on. The command spells nothing in either case.
+///
+/// The reader makes the change itself, between two of its reads. Every record it read before is
+/// already on its way as the record it is, none is read or turned into bytes after, and the bytes
+/// are read only once the console has been asked.
 pub struct InputSwitch {
-    /// Set once the console spells its keys, when the reader starts to hand on bytes.
-    spelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Asks the console to spell its keys.
-    ask: Box<dyn Fn() -> Result<()> + Send + Sync>,
+    ask: std::sync::Arc<dyn Fn() -> Result<()> + Send + Sync>,
+    /// The reader, once one that can make the change is running.
+    #[cfg(any(not(unix), test))]
+    reader: std::sync::Mutex<Option<ReaderLine>>,
 }
 
 impl InputSwitch {
@@ -646,8 +651,9 @@ impl InputSwitch {
     #[must_use]
     pub fn new(ask: impl Fn() -> Result<()> + Send + Sync + 'static) -> Self {
         Self {
-            spelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            ask: Box::new(ask),
+            ask: std::sync::Arc::new(ask),
+            #[cfg(any(not(unix), test))]
+            reader: std::sync::Mutex::new(None),
         }
     }
 
@@ -655,36 +661,168 @@ impl InputSwitch {
     ///
     /// # Errors
     ///
-    /// Returns why the console would not, and the reader goes on handing on records.
+    /// Returns why the console would not, and the reader goes on handing on records, or that the
+    /// reader did not answer.
     pub fn engage(&self) -> Result<()> {
-        (self.ask)()?;
-        self.spelled
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        Ok(())
-    }
-
-    /// Whether the console spells its keys now, as the reader looks at it.
-    #[cfg(not(unix))]
-    fn flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
-        std::sync::Arc::clone(&self.spelled)
+        #[cfg(any(not(unix), test))]
+        if let Some(line) = self
+            .reader
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            return line.ask_the_reader();
+        }
+        (self.ask)()
     }
 }
 
-/// The bytes of a run of records a console spelled itself, in virtual-terminal input mode.
-///
-/// The console puts the characters of its sequences in the records of the keys going down, and a
-/// key coming up has nothing to say. They are UTF-16 in the records and UTF-8 on the wire. A
-/// character left half is dropped rather than guessed, as is a record with no character.
+/// How long a switch waits for the reader to make it. The reader answers between two of its reads,
+/// so a wait that long means the reader is gone.
 #[cfg(any(not(unix), test))]
-fn bytes_the_console_spelled(keys: &[kr_term::win32::KeyRecord]) -> Vec<u8> {
-    let units = keys
-        .iter()
-        .filter(|key| key.key_down && key.unicode != 0)
-        .map(|key| key.unicode);
-    char::decode_utf16(units)
-        .filter_map(std::result::Result::ok)
-        .collect::<String>()
-        .into_bytes()
+const READER_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The switch's end of its conversation with the reader.
+#[cfg(any(not(unix), test))]
+struct ReaderLine {
+    /// Wakes the reader out of its wait for the console, so that it hears the request.
+    wake: Box<dyn Fn() + Send + Sync>,
+    /// What the reader answers with once it has asked the console.
+    answers: std::sync::mpsc::Receiver<Result<()>>,
+}
+
+#[cfg(any(not(unix), test))]
+impl ReaderLine {
+    /// Has the reader ask the console, and returns what the console said.
+    fn ask_the_reader(&self) -> Result<()> {
+        (self.wake)();
+        match self.answers.recv_timeout(READER_ANSWER_WAIT) {
+            Ok(answer) => answer,
+            Err(_) => Err(CliError::Terminal(shown!(
+                "the reader of the console's input did not answer"
+            ))),
+        }
+    }
+}
+
+/// The reader's end of that conversation.
+#[cfg(any(not(unix), test))]
+struct Switching {
+    /// Asks the console to spell its keys.
+    ask: std::sync::Arc<dyn Fn() -> Result<()> + Send + Sync>,
+    /// Where the console's answer goes.
+    answers: std::sync::mpsc::Sender<Result<()>>,
+}
+
+/// What ended a wait of the reader.
+#[cfg(any(not(unix), test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Woken {
+    /// The stop was made.
+    Stop,
+    /// The console has input.
+    Console,
+    /// The switch asked the reader to ask the console.
+    Asked,
+}
+
+/// A console, as the thread that reads it needs it.
+#[cfg(any(not(unix), test))]
+pub(crate) trait ConsoleInput {
+    /// Waits until the stop is made, the console has input or the switch asks, in that order of
+    /// precedence, and says which.
+    fn wait(&mut self) -> Result<Woken>;
+
+    /// Reads the key records the console has, as the runs they came in.
+    fn keys(&mut self) -> Result<Vec<Vec<kr_term::win32::KeyRecord>>>;
+
+    /// Reads the bytes the console hands over, waiting for at least one.
+    fn bytes(&mut self, buffer: &mut [u8]) -> std::io::Result<usize>;
+
+    /// Whether the stop has been made.
+    fn stopped(&self) -> bool;
+}
+
+/// Starts the thread that reads `console`, and links it to `switch`.
+///
+/// `wake` ends the reader's wait so that it hears a request of the switch.
+#[cfg(any(not(unix), test))]
+fn start_reader<C: ConsoleInput + Send + 'static>(
+    mut console: C,
+    switch: &InputSwitch,
+    wake: Box<dyn Fn() + Send + Sync>,
+) -> (
+    tokio::sync::mpsc::UnboundedReceiver<TerminalInput>,
+    std::thread::JoinHandle<()>,
+) {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (answer_to, answers) = std::sync::mpsc::channel();
+    let switching = Switching {
+        ask: std::sync::Arc::clone(&switch.ask),
+        answers: answer_to,
+    };
+    *switch
+        .reader
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ReaderLine { wake, answers });
+    let thread = std::thread::spawn(move || read_console(&mut console, &switching, &sender));
+    (receiver, thread)
+}
+
+/// Reads `console` until its input ends, a batch has nowhere to go, or the stop is made.
+///
+/// The console is read as records until the switch asks. The thread then asks the console to spell
+/// its keys, between two reads, and reads its bytes from then on as they come, none of them turned
+/// into anything. A console that would not spell its keys goes on being read as records.
+#[cfg(any(not(unix), test))]
+fn read_console(
+    console: &mut impl ConsoleInput,
+    switching: &Switching,
+    sender: &tokio::sync::mpsc::UnboundedSender<TerminalInput>,
+) {
+    let mut buffer = vec![0_u8; 8 * 1024];
+    let mut spelled = false;
+    loop {
+        if spelled {
+            // Looked at before every read: a stop that came between two reads cancelled nothing,
+            // and this is what ends the thread then.
+            if console.stopped() {
+                return;
+            }
+            match console.bytes(&mut buffer) {
+                Ok(0) => return,
+                Ok(read) => {
+                    if sender
+                        .send(TerminalInput::Bytes(buffer[..read].to_vec()))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return,
+            }
+            continue;
+        }
+        match console.wait() {
+            Ok(Woken::Console) => {
+                let Ok(runs) = console.keys() else {
+                    return;
+                };
+                for keys in runs {
+                    if sender.send(TerminalInput::Keys(keys)).is_err() {
+                        return;
+                    }
+                }
+            }
+            Ok(Woken::Asked) => {
+                let answer = (switching.ask)();
+                spelled = answer.is_ok();
+                let _ = switching.answers.send(answer);
+            }
+            Ok(Woken::Stop) | Err(_) => return,
+        }
+    }
 }
 
 /// One read of the terminal's input.
@@ -821,13 +959,16 @@ pub fn spawn_input_reader(
 /// down or came up, the modifier state and a repeat count, and the session spells it as its
 /// terminal asked for. A record that is not a key is not read as input.
 ///
+/// Once `switch` has the console spell its keys itself, the thread reads the console's bytes
+/// instead, as a command that reads a terminal does, and hands those on.
+///
 /// The thread ends when the console's input does, when a batch has nowhere to go, or when the
-/// returned [`InputStop`] is used. It waits for the console and for the stop together, so the stop
-/// does not depend on a read being cancelled.
+/// returned [`InputStop`] is used. While it reads records it waits for the console, the switch and
+/// the stop together, so the stop does not depend on a read being cancelled.
 ///
 /// # Errors
 ///
-/// Returns an error when the system will not make the event the stop is made with. No thread is
+/// Returns an error when the system will not make the events the thread is woken with. No thread is
 /// started then: one that could not be stopped would take the next key for itself.
 #[cfg(not(unix))]
 pub fn spawn_input_reader(
@@ -838,42 +979,61 @@ pub fn spawn_input_reader(
     InputStop,
 )> {
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
 
-    use crate::windows::records::{ReadEvent, RecordReader, StopEvent};
+    use crate::windows::records::{RecordReader, WakeEvent};
 
-    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-    let stop = Arc::new(StopEvent::new()?);
-    let waker = Arc::clone(&stop);
-    let spelled = switch.flag();
-    let thread = std::thread::spawn(move || {
-        let mut reader = RecordReader::over(console);
-        while let Ok(true) = reader.wait(&waker) {
-            let Ok(events) = reader.read_events() else {
-                break;
-            };
-            for event in events {
-                let ReadEvent::Keys(keys) = event else {
-                    continue;
-                };
-                // Once the console spells its keys, what it spelled is what the session is given,
-                // as bytes. The records are read the same way either side of the switch.
-                let input = if spelled.load(Ordering::SeqCst) {
-                    let bytes = bytes_the_console_spelled(&keys);
-                    if bytes.is_empty() {
-                        continue;
-                    }
-                    TerminalInput::Bytes(bytes)
-                } else {
-                    TerminalInput::Keys(keys)
-                };
-                if sender.send(input).is_err() {
-                    return;
-                }
-            }
-        }
-    });
+    let stop = Arc::new(WakeEvent::new()?);
+    let asked = Arc::new(WakeEvent::new()?);
+    let wake = {
+        let asked = Arc::clone(&asked);
+        Box::new(move || asked.signal())
+    };
+    let console = WindowsConsole {
+        reader: RecordReader::over(console),
+        stop: Arc::clone(&stop),
+        asked,
+    };
+    let (receiver, thread) = start_reader(console, switch, wake);
     Ok((receiver, InputStop { stop, thread }))
+}
+
+/// The Windows console, as the reader thread reads it.
+#[cfg(not(unix))]
+struct WindowsConsole {
+    reader: crate::windows::records::RecordReader,
+    /// Set to end the thread.
+    stop: std::sync::Arc<crate::windows::records::WakeEvent>,
+    /// Set by the switch to have the thread ask the console to spell its keys.
+    asked: std::sync::Arc<crate::windows::records::WakeEvent>,
+}
+
+#[cfg(not(unix))]
+impl ConsoleInput for WindowsConsole {
+    fn wait(&mut self) -> Result<Woken> {
+        self.reader.wait(&self.stop, &self.asked)
+    }
+
+    fn keys(&mut self) -> Result<Vec<Vec<kr_term::win32::KeyRecord>>> {
+        use crate::windows::records::ReadEvent;
+
+        Ok(self
+            .reader
+            .read_events()?
+            .into_iter()
+            .filter_map(|event| match event {
+                ReadEvent::Keys(keys) => Some(keys),
+                ReadEvent::Console(_) => None,
+            })
+            .collect())
+    }
+
+    fn bytes(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.reader.read_bytes(buffer)
+    }
+
+    fn stopped(&self) -> bool {
+        self.stop.is_set()
+    }
 }
 
 /// The thread that reads `terminal` until its input ends or `sender` has no receiver.
@@ -945,19 +1105,23 @@ impl InputStop {
 #[cfg(not(unix))]
 pub struct InputStop {
     /// The event the thread also waits on.
-    stop: std::sync::Arc<crate::windows::records::StopEvent>,
+    stop: std::sync::Arc<crate::windows::records::WakeEvent>,
     /// The reading thread.
     thread: std::thread::JoinHandle<()>,
 }
 
 #[cfg(not(unix))]
 impl InputStop {
-    /// Wakes the thread, which has ended a moment later: it was waiting for the console and for
-    /// this together, and is not part way through a read it cannot leave.
+    /// Wakes the thread, which has ended a moment later while it reads records: it is waiting for
+    /// the console and for this together. A thread in a read of the console's bytes, which nothing
+    /// wakes, has that read cancelled, again and again until it has ended or a second has gone: a
+    /// cancel that came between two reads cancelled nothing, and the thread looks at the stop
+    /// before its next one.
     pub fn stop(self) {
         self.stop.signal();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         while !self.thread.is_finished() && std::time::Instant::now() < deadline {
+            crate::platform::cancel_blocked_read(&self.thread);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
@@ -1030,40 +1194,6 @@ async fn call<P: serde::Serialize + ?Sized, T: kr_protocol::wire::WireMessage>(
 mod tests {
     use super::RestorationGuard;
     use crate::terminal::SavedModes;
-
-    /// A console that spells its keys itself puts the characters of its sequences in the records of
-    /// the keys going down: those are the bytes, in UTF-8, and a key coming up, a record with no
-    /// character and half a character have none.
-    #[test]
-    fn the_bytes_a_console_spelled_are_the_characters_of_the_keys_going_down() {
-        use kr_term::win32::KeyRecord;
-
-        let key = |unicode: u16, key_down: bool| KeyRecord {
-            virtual_key: 0,
-            scan_code: 0,
-            unicode,
-            key_down,
-            control_keys: 0,
-            repeat: 1,
-        };
-        // An arrow's sequence, a letter that is two bytes, and a character outside the basic plane.
-        let records = [
-            key(0x1b, true),
-            key(u16::from(b'['), true),
-            key(u16::from(b'A'), true),
-            key(u16::from(b'A'), false),
-            key(0x00e9, true),
-            key(0xd83d, true),
-            key(0xde00, true),
-            key(0, true),
-        ];
-        assert_eq!(
-            super::bytes_the_console_spelled(&records),
-            "\u{1b}[A\u{e9}\u{1f600}".as_bytes()
-        );
-        assert!(super::bytes_the_console_spelled(&[key(0xd83d, true)]).is_empty());
-        assert!(super::bytes_the_console_spelled(&[key(u16::from(b'a'), false)]).is_empty());
-    }
 
     /// A guard that leaves without answering is reported at once, with how it left.
     ///
@@ -1235,5 +1365,220 @@ mod a_worker_of_another_build {
             said.contains("runs on kr-worker/0.1.0 with protocol"),
             "{said}"
         );
+    }
+}
+
+/// The thread that reads a console, run over a console the case holds both ends of.
+#[cfg(test)]
+mod reader {
+    use std::collections::VecDeque;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+
+    use kr_client::shown::Shown;
+    use kr_term::win32::KeyRecord;
+    use tokio::sync::mpsc::UnboundedReceiver;
+
+    use super::{ConsoleInput, InputSwitch, TerminalInput, Woken, start_reader};
+    use crate::error::{CliError, Result};
+
+    /// What the thread asked of the console, in order.
+    type Steps = Arc<Mutex<Vec<&'static str>>>;
+
+    /// A console that answers a wait with what the case sent it, hands over the key records the case
+    /// scripted, and hands over the bytes the case sends.
+    struct Scripted {
+        wakes: mpsc::Receiver<Woken>,
+        keys: VecDeque<Vec<Vec<KeyRecord>>>,
+        bytes: mpsc::Receiver<Vec<u8>>,
+        steps: Steps,
+    }
+
+    impl ConsoleInput for Scripted {
+        fn wait(&mut self) -> Result<Woken> {
+            Ok(self.wakes.recv().unwrap_or(Woken::Stop))
+        }
+
+        fn keys(&mut self) -> Result<Vec<Vec<KeyRecord>>> {
+            self.steps.lock().expect("steps").push("keys");
+            Ok(self.keys.pop_front().unwrap_or_default())
+        }
+
+        fn bytes(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.steps.lock().expect("steps").push("bytes");
+            let Ok(chunk) = self.bytes.recv() else {
+                return Ok(0);
+            };
+            buffer[..chunk.len()].copy_from_slice(&chunk);
+            Ok(chunk.len())
+        }
+
+        fn stopped(&self) -> bool {
+            false
+        }
+    }
+
+    /// The thread, and the ends of its console the case holds.
+    struct Run {
+        input: UnboundedReceiver<TerminalInput>,
+        switch: InputSwitch,
+        wakes: mpsc::Sender<Woken>,
+        bytes: mpsc::Sender<Vec<u8>>,
+        steps: Steps,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    impl Run {
+        /// Starts the thread over a console whose reads of key records are `keys`, in order, and
+        /// which spells its keys itself when asked if `will_spell`.
+        fn start(will_spell: bool, keys: Vec<Vec<Vec<KeyRecord>>>) -> Self {
+            let (wakes, heard) = mpsc::channel();
+            let (bytes, spelled) = mpsc::channel();
+            let steps: Steps = Arc::default();
+            let asked = Arc::clone(&steps);
+            let switch = InputSwitch::new(move || {
+                asked.lock().expect("steps").push("ask");
+                if will_spell {
+                    Ok(())
+                } else {
+                    Err(CliError::Terminal(Shown::said("the console refused")))
+                }
+            });
+            let console = Scripted {
+                wakes: heard,
+                keys: keys.into(),
+                bytes: spelled,
+                steps: Arc::clone(&steps),
+            };
+            let wake = {
+                let wakes = wakes.clone();
+                Box::new(move || {
+                    let _ = wakes.send(Woken::Asked);
+                })
+            };
+            let (input, thread) = start_reader(console, &switch, wake);
+            Self {
+                input,
+                switch,
+                wakes,
+                bytes,
+                steps,
+                thread,
+            }
+        }
+
+        /// The console has input to read.
+        fn has_input(&self) {
+            self.wakes.send(Woken::Console).expect("the reader waits");
+        }
+
+        /// The next thing the thread handed on.
+        fn next(&mut self) -> TerminalInput {
+            self.input
+                .blocking_recv()
+                .expect("the reader handed something on")
+        }
+
+        /// Ends the thread, and returns what it asked of the console.
+        fn ends(self) -> Vec<&'static str> {
+            drop(self.bytes);
+            let _ = self.wakes.send(Woken::Stop);
+            self.thread.join().expect("the reader ended");
+            self.steps.lock().expect("steps").clone()
+        }
+    }
+
+    fn key(code: u16, unicode: u16, key_down: bool) -> KeyRecord {
+        KeyRecord {
+            virtual_key: code,
+            scan_code: 0,
+            unicode,
+            key_down,
+            control_keys: 0,
+            repeat: 1,
+        }
+    }
+
+    /// What reading the console as records would give once it spells its keys: one character of
+    /// its sequences, and nothing of a NUL or of the keys held down. A reader that read records
+    /// then would hand on this and not what the console spelled.
+    fn the_spelled_keys_as_records() -> Vec<Vec<KeyRecord>> {
+        vec![vec![key(0, u16::from(b'z'), true)]]
+    }
+
+    /// The reader asks the console to spell its keys between two of its reads. It has handed on as
+    /// records every record it read before, reads no record after, and reads the console's bytes
+    /// only once the console has been asked.
+    #[test]
+    fn the_console_is_asked_between_two_reads_and_its_bytes_are_read_after() {
+        let down = key(u16::from(b'A'), u16::from(b'a'), true);
+        let up = key(u16::from(b'A'), u16::from(b'a'), false);
+        let mut run = Run::start(
+            true,
+            vec![
+                vec![vec![down]],
+                vec![vec![up]],
+                the_spelled_keys_as_records(),
+            ],
+        );
+        run.has_input();
+        run.has_input();
+        run.switch.engage().expect("the console spells its keys");
+        assert_eq!(run.next(), TerminalInput::Keys(vec![down]));
+        assert_eq!(run.next(), TerminalInput::Keys(vec![up]));
+
+        run.bytes.send(b"x".to_vec()).expect("the reader waits");
+        run.has_input();
+        assert_eq!(run.next(), TerminalInput::Bytes(b"x".to_vec()));
+
+        let steps = run.ends();
+        let asked = steps.iter().position(|step| *step == "ask").expect("asked");
+        assert_eq!(
+            steps[..asked],
+            ["keys", "keys"],
+            "the records the console held are read before it is asked"
+        );
+        assert!(
+            steps[asked + 1..].iter().all(|step| *step == "bytes"),
+            "nothing but bytes is read after it: {steps:?}"
+        );
+    }
+
+    /// What the console spells reaches the session as it spelled it: a NUL (Ctrl+Space), a key held
+    /// down (three of the same byte) and a sequence.
+    #[test]
+    fn the_bytes_a_console_spells_are_handed_on_as_they_are() {
+        let mut run = Run::start(true, vec![the_spelled_keys_as_records()]);
+        run.switch.engage().expect("the console spells its keys");
+        let spelled = [0x00, b'a', b'a', b'a', 0x1b, b'[', b'A', 0xc3, 0xa9];
+        run.bytes.send(spelled.to_vec()).expect("the reader waits");
+        run.has_input();
+        assert_eq!(run.next(), TerminalInput::Bytes(spelled.to_vec()));
+        run.ends();
+    }
+
+    /// A console that would not spell its keys goes on being read as records.
+    #[test]
+    fn a_console_that_will_not_spell_its_keys_goes_on_being_read_as_records() {
+        let down = key(u16::from(b'A'), u16::from(b'a'), true);
+        let mut run = Run::start(false, vec![vec![vec![down]]]);
+        assert!(run.switch.engage().is_err());
+        run.has_input();
+        assert_eq!(run.next(), TerminalInput::Keys(vec![down]));
+        let steps = run.ends();
+        assert!(
+            !steps.contains(&"bytes"),
+            "no byte was read from a console that did not spell: {steps:?}"
+        );
+    }
+
+    /// A switch asked of a reader that has ended fails at once and does not wait for it.
+    #[test]
+    fn a_reader_that_has_ended_cannot_be_asked() {
+        let run = Run::start(true, Vec::new());
+        run.wakes.send(Woken::Stop).expect("the reader waits");
+        let Run { switch, thread, .. } = run;
+        thread.join().expect("the reader ended");
+        assert!(switch.engage().is_err());
     }
 }

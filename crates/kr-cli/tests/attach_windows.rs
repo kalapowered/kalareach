@@ -394,17 +394,21 @@ async fn the_releases_and_modifiers_of_an_attached_console_reach_the_application
 const SPELL_PROBE: &str = "KR_ATTACH_SPELL_PROBE";
 
 /// KR-REQ-08.53: a console the attachment asks to spell its keys itself spells them, and the reader
-/// that handed on the console's key records hands on the bytes it spelled from then on.
+/// that handed on the console's key records hands on the bytes it spelled from then on, as the
+/// console spelled them.
 ///
 /// A session whose application has negotiated a keyboard encoding that its spelling of key records
 /// cannot express refuses the records, and the attachment then turns its console to its own
 /// virtual-terminal input. This runs the production pieces of that in a console of their own: this
 /// test binary is started in a pseudo-console with the variable above set, and there it takes the
 /// console the way `kr attach` does, in record mode, starts the input reader over it, and reads a key
-/// as the record it is. It then asks the console to spell its keys, and reads an arrow and a letter,
-/// which come back as the bytes a terminal sends for them. The test, outside, writes the keys in the
-/// documented record sequence, and expects the records first and the bytes after. A switch that
-/// changed nothing leaves the arrow a record, as does a reader that kept handing on records.
+/// as the record it is. It then asks the console to spell its keys, and reads an arrow, Ctrl+Space,
+/// a letter held down (a record with a repeat count of three) and another letter, which come back as
+/// the bytes the console spells for them, a NUL and the three letters among them. The test, outside,
+/// writes the keys in the documented record sequence, and expects the records first and the bytes
+/// after. A switch that changed nothing leaves the arrow a record, a reader that kept handing on
+/// records loses the NUL and the repeat, and a reader that turned the records of the keys going down
+/// into bytes loses them too.
 #[test]
 fn a_console_asked_to_spell_its_keys_hands_the_reader_bytes_where_it_handed_records() {
     if std::env::var_os(SPELL_PROBE).is_some() {
@@ -468,9 +472,14 @@ fn a_console_asked_to_spell_its_keys_hands_the_reader_bytes_where_it_handed_reco
         before.contains("kr-probe:key:65:97:down"),
         "the letter was read as the record it is before the console spelled anything: {before:?}"
     );
-    // The up arrow and the letter B, each going down and coming up.
+    // The up arrow, Ctrl+Space, the letter A held down (one record that says it repeated three
+    // times) and the letter B, each going down and coming up.
     press(b"\x1b[38;72;0;1;0;1_");
     press(b"\x1b[38;72;0;0;0;1_");
+    press(b"\x1b[32;57;32;1;8;1_");
+    press(b"\x1b[32;57;32;0;8;1_");
+    press(b"\x1b[65;30;97;1;0;3_");
+    press(b"\x1b[65;30;97;0;0;1_");
     press(b"\x1b[66;48;98;1;0;1_");
     press(b"\x1b[66;48;98;0;0;1_");
     waits_for("kr-probe:done", &mut child);
@@ -479,8 +488,9 @@ fn a_console_asked_to_spell_its_keys_hands_the_reader_bytes_where_it_handed_reco
         .find("kr-probe:switched")
         .expect("the switch is shown")..];
     assert!(
-        after.contains("kr-probe:bytes:1b5b4162"),
-        "the arrow and the letter came back as the bytes a terminal sends for them: {after:?}"
+        after.contains("kr-probe:bytes:1b5b410061616162"),
+        "the keys came back as the bytes the console spells for them, the NUL and the three letters \
+         among them: {after:?}"
     );
     assert!(
         !after.contains("kr-probe:key:"),
@@ -534,9 +544,10 @@ fn spell_probe_in_the_console() {
     }
     switch.engage().expect("the console spells its keys");
     println!("kr-probe:switched");
-    // Whatever comes next is read until four bytes have: the arrow's three and the letter's one.
+    // Whatever comes next is read until the last letter has: the arrow's three bytes, a NUL, the
+    // three letters of the held key and the letter after.
     let mut spelled = Vec::new();
-    while spelled.len() < 4 {
+    while !spelled.ends_with(b"b") {
         match next() {
             TerminalInput::Bytes(bytes) => spelled.extend(bytes),
             TerminalInput::Keys(keys) => {
