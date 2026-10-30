@@ -284,11 +284,12 @@ mod tests {
     /// under a limit that allows it, which the system grants and does not record.
     #[test]
     fn a_process_refused_a_commit_by_the_system_leaves_the_limit_saying_so() {
-        let (code, reached) = child_asking(512 * MIB, 256 * MIB);
+        // A limit that is not a whole number of pages, as a profile's itemised cost is not.
+        let (code, reached) = child_asking(512 * MIB, 256 * MIB + 123);
         assert_eq!(code, Some(REFUSED), "the system refused the commit");
         assert!(reached, "and the limit recorded that it had");
 
-        let (code, reached) = child_asking(512 * MIB, 4096 * MIB);
+        let (code, reached) = child_asking(512 * MIB, 4096 * MIB + 123);
         assert_eq!(
             code,
             Some(0),
