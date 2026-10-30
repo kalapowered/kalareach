@@ -403,13 +403,15 @@ const SPELL_PROBE: &str = "KR_ATTACH_SPELL_PROBE";
 /// test binary is started in a pseudo-console with the variable above set, and there it takes the
 /// console the way `kr attach` does, in record mode, starts the input reader over it, and reads a key
 /// as the record it is. It then asks the console to spell its keys, and reads an arrow, Ctrl+Space,
-/// a letter held down (a record with a repeat count of three) and another letter, which come back as
-/// the bytes the console spells for them, the NUL of Ctrl+Space among them. The test, outside, writes
-/// the keys in the documented record sequence, and expects the records first and the bytes after. A
-/// switch that changed nothing leaves the arrow a record, and a reader that turned the records of the
-/// keys going down into bytes loses the NUL. Last, the probe stops the reader and reads one more key
-/// itself: a reader that was cancelled in the middle of a read of the console leaves its pending
-/// read behind, and the console gives that read the next key.
+/// a letter held down (a record with a repeat count of three), Ctrl+Z, an `é` and another letter,
+/// which come back as UTF-8, the NUL of Ctrl+Space and the Ctrl+Z among them. The test, outside,
+/// writes the keys in the documented record sequence, and expects the records first and the text
+/// after. A switch that changed nothing leaves the arrow a record, a reader that turned the records
+/// of the keys going down into bytes loses the NUL, one that reads the console's bytes loses the
+/// Ctrl+Z and gives `é` in the console's code page. Last, the test presses Ctrl on its own, which
+/// the console keeps as records that make no text, and the probe stops the reader and reads one more
+/// key itself: a reader left in a read of the console, or cancelled in the middle of one, leaves a
+/// pending read behind, and the console gives that read the next key.
 #[test]
 fn a_console_asked_to_spell_its_keys_hands_the_reader_bytes_where_it_handed_records() {
     if std::env::var_os(SPELL_PROBE).is_some() {
@@ -478,15 +480,24 @@ fn a_console_asked_to_spell_its_keys_hands_the_reader_bytes_where_it_handed_reco
         "the letter was read as the record it is before the console spelled anything: {before:?}"
     );
     // The up arrow, Ctrl+Space, the letter A held down (one record that says it repeated three
-    // times) and the letter B, each going down and coming up.
+    // times), Ctrl+Z, an `é` and the letter B, each going down and coming up.
     press(b"\x1b[38;72;0;1;0;1_");
     press(b"\x1b[38;72;0;0;0;1_");
     press(b"\x1b[32;57;32;1;8;1_");
     press(b"\x1b[32;57;32;0;8;1_");
     press(b"\x1b[65;30;97;1;0;3_");
     press(b"\x1b[65;30;97;0;0;1_");
+    press(b"\x1b[90;44;26;1;8;1_");
+    press(b"\x1b[90;44;26;0;8;1_");
+    press(b"\x1b[69;18;233;1;0;1_");
+    press(b"\x1b[69;18;233;0;0;1_");
     press(b"\x1b[66;48;98;1;0;1_");
     press(b"\x1b[66;48;98;0;0;1_");
+    waits_for("kr-probe:bytes:", &mut child);
+    // Ctrl on its own: the console keeps it as a key going down and coming up that make no text,
+    // and a read of the console's text would wait for the next key.
+    press(b"\x1b[17;29;0;1;8;1_");
+    press(b"\x1b[17;29;0;0;0;1_");
     waits_for("kr-probe:stopped", &mut child);
     // The reader has been stopped, so this key is the process's own to read. A reader left in its
     // read of the console's bytes would take it.
@@ -497,20 +508,21 @@ fn a_console_asked_to_spell_its_keys_hands_the_reader_bytes_where_it_handed_reco
     let after = &shown[shown
         .find("kr-probe:switched")
         .expect("the switch is shown")..];
-    // The arrow, the NUL, the held letter as many times as the console spells it, and the letter
-    // after. How many times the console spells a held key is its own; that it is spelled at all and
-    // the NUL stays is the reader's.
+    // The arrow, the NUL, the held letter as many times as the console spells it, Ctrl+Z, `é` as
+    // UTF-8 and the letter after. How many times the console spells a held key is its own; that it is
+    // spelled at all, the NUL, the Ctrl+Z and the encoding are the reader's.
     let spelled = after
         .lines()
         .find_map(|line| line.strip_prefix("kr-probe:bytes:"))
         .expect("the probe shows the bytes it was given");
     let held = spelled
         .strip_prefix("1b5b4100")
-        .and_then(|rest| rest.strip_suffix("62"))
+        .and_then(|rest| rest.strip_suffix("1ac3a962"))
         .unwrap_or_default();
     assert!(
         !held.is_empty() && held.as_bytes().chunks(2).all(|letter| letter == b"61"),
-        "the keys came back as the bytes the console spells for them, the NUL among them: {after:?}"
+        "the keys came back as the text the console spells for them, the NUL and the Ctrl+Z among \
+         them: {after:?}"
     );
     assert!(
         !after.contains("kr-probe:key:"),
@@ -569,7 +581,7 @@ fn spell_probe_in_the_console() {
     switch.engage().expect("the console spells its keys");
     println!("kr-probe:switched");
     // Whatever comes next is read until the last letter has: the arrow's three bytes, a NUL, the
-    // three letters of the held key and the letter after.
+    // letters of the held key, Ctrl+Z, the two bytes of `é` and the letter after.
     let mut spelled = Vec::new();
     while !spelled.ends_with(b"b") {
         match next() {
@@ -582,6 +594,22 @@ fn spell_probe_in_the_console() {
         }
     }
     println!("kr-probe:bytes:{}", hex(&spelled));
+    // The test now presses Ctrl on its own. The reader is stopped once the console has been quiet
+    // for a while and holds no input, which is when the reader has seen it.
+    let waiting = kr_cli::windows::records::RecordReader::over(
+        console
+            .handle()
+            .try_clone()
+            .expect("a handle to count with"),
+    );
+    let quiet_from = Instant::now();
+    while quiet_from.elapsed() < Duration::from_millis(500) || waiting.waiting().unwrap_or(1) != 0 {
+        assert!(
+            quiet_from.elapsed() < LIVENESS_DEADLINE,
+            "the console never held no input"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     stop.stop();
     println!("kr-probe:stopped");
     let mut next = [0_u8; 1];
