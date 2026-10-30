@@ -262,8 +262,10 @@ async fn a_paired_device_that_comes_back_has_a_painted_screen_inside_the_reconne
     );
     eprintln!(
         "KR-PERF-006 reconnect to a real daemon: {elapsed:?} from the dial to a \
-         painted {COLUMNS}x{ROWS} screen (the first connection took {first:?}); {} logical \
+         painted {COLUMNS}x{ROWS} screen (the first connection took {first:?}); {}/{}, {} logical \
          processors, {}",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
         std::thread::available_parallelism().map_or(0, std::num::NonZero::get),
         if cfg!(debug_assertions) {
             "a debug build"
