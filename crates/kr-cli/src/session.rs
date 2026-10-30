@@ -1356,7 +1356,8 @@ where
         .handle()
         .try_clone()
         .map_err(|error| CliError::Terminal(Shown::io(&error)))?;
-    let (mut input, input_stop) = crate::attach::spawn_input_reader(input_handle)?;
+    let switch = terminal.input_switch()?;
+    let (mut input, input_stop) = crate::attach::spawn_input_reader(input_handle, &switch)?;
 
     // The terminal's size can change while the attachment runs. The session is told, so the
     // application sees the resize the way it would in any other terminal.
@@ -1369,6 +1370,9 @@ where
     // expect is the failure they cannot work around.
     let mut display =
         crate::render::ProjectedDisplay::with_keyboard(epoch.is_some(), keyboard.kitty.is_some());
+    // What the attachment has to say about its keys, which waits for the terminal to be the
+    // person's again like everything else it says.
+    let mut said_after: Vec<Shown> = Vec::new();
     let outcome = drive(
         &mut client,
         &attaching,
@@ -1387,6 +1391,8 @@ where
         resized.as_mut(),
         &mut display,
         options.follow_live,
+        &switch,
+        &mut said_after,
     )
     .await;
     // The reader stops before anything else reads this terminal: a command that goes on after the
@@ -1402,6 +1408,9 @@ where
     // Said after the terminal is its own again, never during the attachment: a sentence written
     // into a terminal that is showing a projection would wrap, overwrite cells and scroll the
     // bottom row, which is damage to the very screen it is describing.
+    for line in &said_after {
+        crate::report::say(line);
+    }
     if let Some(detail) = display.degradation() {
         crate::report::say(&shown!(
             "kr: this terminal was showing a projection of the session, and it did not carry all \
@@ -1451,6 +1460,19 @@ struct Attached {
     owns_geometry: bool,
 }
 
+/// What an attachment says once its console spells its own keys: the session refused the records.
+const KEYS_SPELLED_BY_THE_CONSOLE: &str = "kr: the application in the session uses a keyboard \
+     encoding that console keys cannot be sent in, so the session refused them, and from then on \
+     the keys go as this console spells them, with its modifier detail and without key releases. \
+     The keys typed when the session refused them were not sent again.";
+
+/// What an attachment says when the session refused its records and its console would not spell its
+/// keys: it stopped sending keys, and watched.
+const WATCHING_AFTER_A_REFUSAL: &str = "kr: the application in the session uses a keyboard \
+     encoding that console keys cannot be sent in, and this console would not spell its keys \
+     itself, so this attachment stopped sending keys and watched. The keys typed when the session \
+     refused them were not sent again. `kr attach --no-probe` watches without typing.";
+
 /// One `input.write` this terminal sent, and what it held.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Write {
@@ -1490,7 +1512,11 @@ enum Refused {
     LeaseLost,
     /// The session is closing and refuses input. `undelivered` is whether what it refused was typed.
     Closing { undelivered: bool },
-    /// The host took none of the write, and says it cannot take it in the encoding the session is in.
+    /// The host took none of a write of console keys, and says it cannot spell them in the encoding
+    /// the session is in.
+    KeysIncompatible,
+    /// The host took none of a write of bytes, and says it cannot take it in the encoding the
+    /// session is in.
     Incompatible(Shown),
     /// Any other refusal, after which it is not known what the session has.
     Uncertain(Shown),
@@ -1503,6 +1529,7 @@ fn refused_write(write: Write, error: &kr_protocol::error::ProtocolError) -> Ref
         ErrorCode::SessionClosed => Refused::Closing {
             undelivered: write.typed,
         },
+        ErrorCode::InputIncompatible if write.keys => Refused::KeysIncompatible,
         ErrorCode::InputIncompatible => Refused::Incompatible(Shown::protocol(error)),
         code => Refused::Uncertain(shown!(
             "{} at input {}: {}",
@@ -1524,6 +1551,9 @@ enum Outstanding {
     Window,
     /// A fresh screen this terminal asked for after a resynchronisation marker.
     Resubscribe,
+    /// A request whose answer changes nothing: the lease handed back, or a write of console keys
+    /// sent before the console began to spell its keys, which the host refuses or cannot place.
+    Ignored,
 }
 
 /// The sizes this terminal's resizes as the owner asked for, of those still waiting for an answer.
@@ -1556,6 +1586,8 @@ async fn drive(
     resized: Option<&mut WindowChanges>,
     display: &mut crate::render::ProjectedDisplay,
     follow_live: bool,
+    switch: &crate::attach::InputSwitch,
+    said_after: &mut Vec<Shown>,
 ) -> AttachOutcome {
     use std::io::Write as _;
 
@@ -1565,7 +1597,7 @@ async fn drive(
     // the host has already refused it the lease, so every keystroke would be one refused request,
     // and the attachment would end on the first of them. Watching is what is left, and watching is
     // what this attachment asked for when it chose not to be asked about.
-    let epoch = attached.lease_epoch;
+    let mut epoch = attached.lease_epoch;
     let mut geometry_epoch = attached.geometry_epoch;
     let mut owns_geometry = attached.owns_geometry;
     let mut resized = resized;
@@ -1576,6 +1608,9 @@ async fn drive(
     let mut scroll_keys_held: Vec<(u16, bool)> = Vec::new();
     // The keys whose press has been sent to the session and whose release is still to come.
     let mut keys_down: Vec<u16> = Vec::new();
+    // Whether the console spells its keys itself now, because the session refused its records. The
+    // records the reader read before that are not sent again, and none are sent after it.
+    let mut console_spells = false;
     // The pointer reports this terminal sends while its window is above the live page, and the
     // moment a report it is part way through stops waiting for the rest of itself.
     let mut pointers = PointerReports::default();
@@ -1654,7 +1689,7 @@ async fn drive(
                 position: Nullable(report.position),
                 column: U64::ZERO,
             };
-            if !send_geometry(
+            if !send_mutation(
                 client,
                 attaching,
                 request_id,
@@ -1995,7 +2030,7 @@ async fn drive(
                                         dimensions,
                                         expected_geometry_epoch: geometry_epoch,
                                     };
-                                    if !send_geometry(
+                                    if !send_mutation(
                                         client,
                                         attaching,
                                         request_id,
@@ -2021,6 +2056,51 @@ async fn drive(
                                     window.close();
                                     undelivered |= typed;
                                 }
+                                // The session cannot spell this console's records in the
+                                // encoding its application is in, and took none of them. The
+                                // console is asked to spell its keys itself, as a terminal does,
+                                // and what it spells goes as bytes from then on. The host took no
+                                // sequence number for the refused write, so the next is sent under
+                                // it, and the writes sent as records behind it are of no further
+                                // use: whatever the host answers them, they are not read.
+                                Refused::KeysIncompatible => {
+                                    sequence = write.sequence;
+                                    for what in outstanding.values_mut() {
+                                        if matches!(what, Outstanding::Input(sent) if sent.keys) {
+                                            *what = Outstanding::Ignored;
+                                        }
+                                    }
+                                    if switch.engage().is_ok() {
+                                        console_spells = true;
+                                        said_after.push(Shown::said(KEYS_SPELLED_BY_THE_CONSOLE));
+                                    } else {
+                                        // A console that will not spell its keys cannot be typed
+                                        // at: the lease is handed back and the attachment watches.
+                                        if let Some(held) = epoch.take() {
+                                            let request_id =
+                                                kr_protocol::ids::RequestId::new(next_request);
+                                            next_request += 1;
+                                            let params = kr_protocol::input::InputReleaseParams {
+                                                session_id,
+                                                attachment_id,
+                                                epoch: held,
+                                            };
+                                            if !send_mutation(
+                                                client,
+                                                attaching,
+                                                request_id,
+                                                Method::InputRelease,
+                                                &params,
+                                            )
+                                            .await
+                                            {
+                                                return AttachOutcome::Disconnected;
+                                            }
+                                            outstanding.insert(request_id, Outstanding::Ignored);
+                                        }
+                                        said_after.push(Shown::said(WATCHING_AFTER_A_REFUSAL));
+                                    }
+                                }
                                 // A refusal the session made whole: it took none of what was
                                 // sent, and says why. The terminal is told so and the attachment
                                 // ends, rather than being left typing into a session that refuses
@@ -2032,7 +2112,8 @@ async fn drive(
                                     return AttachOutcome::DeliveryUncertain(detail);
                                 }
                             },
-                            (Outstanding::Input(_), kr_protocol::envelope::Outcome::Ok(_)) => {}
+                            (Outstanding::Input(_), kr_protocol::envelope::Outcome::Ok(_))
+                            | (Outstanding::Ignored, _) => {}
                             // The screen follows as ordinary output. A refusal because the session
                             // is closing is answered by the closure, which is still to come; any
                             // other means the session no longer has this attachment, which is the
@@ -2088,7 +2169,7 @@ async fn drive(
                     dimensions,
                     expected_geometry_epoch: geometry_epoch,
                 };
-                if !send_geometry(
+                if !send_mutation(
                     client,
                     attaching,
                     request_id,
@@ -2145,6 +2226,9 @@ async fn drive(
                     // A console reports keys as records. There is no paste delimiter or pointer
                     // report in them to watch for, because those are bytes, and the records go to
                     // the session as they are.
+                    // Records the reader read before the console began to spell its keys. The
+                    // session refused the first of them, and the rest would be refused too.
+                    TerminalInput::Keys(_) if console_spells => continue,
                     TerminalInput::Keys(keys) => {
                         // The scroll-back keys first, on the same terms as for bytes: they move
                         // the window this terminal is looking through and never reach the
@@ -2451,7 +2535,7 @@ async fn send_write(
 ///
 /// Returns whether it reached the socket. The answer comes back through the loop, like every other
 /// answer on this connection.
-async fn send_geometry<T: serde::Serialize + ?Sized>(
+async fn send_mutation<T: serde::Serialize + ?Sized>(
     client: &mut impl Link,
     attaching: &Attaching,
     request_id: kr_protocol::ids::RequestId,
@@ -2528,11 +2612,16 @@ mod tests {
         Sending, Subscriptions, WindowReports, drop_unseen_releases, landed, ownership, presses,
         resizes_in_flight, scroll_keys, scroll_step, scrolled, take_scroll_keys,
     };
+    #[cfg(unix)]
     use crate::error::CliError;
+    #[cfg(unix)]
     use kr_client::error::refusal;
     use kr_client::shown::Shown;
     use kr_protocol::attachment::ViewportPosition;
+    #[cfg(unix)]
     use kr_protocol::error::ErrorCode;
+    #[cfg(unix)]
+    use kr_protocol::method::Method;
     use kr_protocol::scalars::{Nullable, U64};
     use kr_protocol::session::{ClosureReason, ClosureRecord};
 
@@ -2551,7 +2640,7 @@ mod tests {
             ActionWindowId, AttachmentId, EnvironmentId, EventSequence, EventType, InputLeaseEpoch,
             RequestId, SessionId, StreamId,
         };
-        use kr_protocol::input::{InputContent, InputWriteParams};
+        use kr_protocol::input::{InputContent, InputReleaseParams, InputWriteParams};
         use kr_protocol::method::Method;
         use kr_protocol::scalars::Uuid;
         use kr_protocol::session::{
@@ -2564,9 +2653,41 @@ mod tests {
         use crate::error::{CliError, Result};
         use crate::terminal::ControllingTerminal;
 
+        /// The `input.write` requests among the frames the loop sent, as (sequence, content).
+        pub fn writes_in(sent: &[ControlFrame]) -> Vec<(u64, InputContent)> {
+            sent.iter()
+                .filter_map(|frame| match frame {
+                    ControlFrame::Request(request)
+                        if request.method == Method::InputWrite.into() =>
+                    {
+                        let params: InputWriteParams =
+                            request.params.to_typed().expect("write parameters");
+                        Some((params.sequence.get(), params.input))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// The `input.release` mutations among the frames the loop sent.
+        pub fn released_in(sent: &[ControlFrame]) -> Vec<InputReleaseParams> {
+            sent.iter()
+                .filter_map(|frame| match frame {
+                    ControlFrame::Mutation(mutation)
+                        if mutation.method == Method::InputRelease.into() =>
+                    {
+                        Some(mutation.params.to_typed().expect("release parameters"))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
         /// The loop's end of the connection.
         struct Wire {
             sent: mpsc::UnboundedSender<ControlFrame>,
+            /// Everything the loop has sent, in order, for a case that asks at the end.
+            log: Arc<std::sync::Mutex<Vec<ControlFrame>>>,
             heard: mpsc::UnboundedReceiver<ControlFrame>,
         }
 
@@ -2608,6 +2729,10 @@ mod tests {
             }
 
             async fn send(&mut self, frame: ControlFrame) -> Result<()> {
+                self.log
+                    .lock()
+                    .expect("the log is not poisoned")
+                    .push(frame.clone());
                 let _ = self.sent.send(frame);
                 Ok(())
             }
@@ -2620,6 +2745,8 @@ mod tests {
             console: Option<mpsc::UnboundedSender<TerminalInput>>,
             written: mpsc::UnboundedReceiver<ControlFrame>,
             answers: mpsc::UnboundedSender<ControlFrame>,
+            /// How many times the loop has asked the console to spell its keys.
+            asked: Arc<std::sync::atomic::AtomicUsize>,
         }
 
         /// One `input.write` the loop sent.
@@ -2638,6 +2765,15 @@ mod tests {
                     .send(input)
                     .expect("the loop reads the console");
                 self.next_write().await
+            }
+
+            /// Types `input` at the console without waiting for the loop to do anything with it.
+            pub fn types_without_waiting(&self, input: TerminalInput) {
+                self.console
+                    .as_ref()
+                    .expect("the console is open")
+                    .send(input)
+                    .expect("the loop reads the console");
             }
 
             /// The next `input.write` the loop sends, whatever else it sends first.
@@ -2707,15 +2843,53 @@ mod tests {
                     .expect("the loop reads the wire");
             }
 
+            /// Waits until the loop has asked the console to spell its keys, which it does once it
+            /// has read the host's refusal, and says how many times it has.
+            pub async fn waits_for_the_console_to_be_asked(&self) -> usize {
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    loop {
+                        let asked = self.asked.load(std::sync::atomic::Ordering::SeqCst);
+                        if asked > 0 {
+                            return asked;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the loop asked the console")
+            }
+
             /// The console's input ends, which ends the attachment.
             pub fn hangs_up(&mut self) {
                 self.console = None;
             }
         }
 
-        /// Runs the loop with `epoch` as the lease it holds, and `case` for what happens, and
-        /// returns how the attachment ended.
+        /// How the attachment ended, what it said after the terminal was the person's again, and
+        /// every frame it sent.
+        pub struct Ran {
+            pub outcome: AttachOutcome,
+            pub said: Vec<kr_client::shown::Shown>,
+            pub sent: Vec<ControlFrame>,
+        }
+
+        /// Runs the loop with a lease held and a console that will spell its keys, and `case` for
+        /// what happens, and returns how the attachment ended.
         pub async fn run<F, Fut>(holds_lease: bool, case: F) -> AttachOutcome
+        where
+            F: FnOnce(Case) -> Fut,
+            Fut: std::future::Future<Output = ()>,
+        {
+            run_switched(holds_lease, true, case).await.outcome
+        }
+
+        /// Runs the loop with the lease held or not, and a console that will spell its keys
+        /// itself or will not.
+        pub async fn run_switched<F, Fut>(
+            holds_lease: bool,
+            console_will_spell: bool,
+            case: F,
+        ) -> Ran
         where
             F: FnOnce(Case) -> Fut,
             Fut: std::future::Future<Output = ()>,
@@ -2723,7 +2897,12 @@ mod tests {
             let (sent, written) = mpsc::unbounded_channel();
             let (answers, heard) = mpsc::unbounded_channel();
             let (console, mut input) = mpsc::unbounded_channel();
-            let mut wire = Wire { sent, heard };
+            let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut wire = Wire {
+                sent,
+                log: Arc::clone(&log),
+                heard,
+            };
             let device = std::fs::File::options()
                 .read(true)
                 .write(true)
@@ -2745,10 +2924,27 @@ mod tests {
             };
             let mut owed = UndeliveredTyping::new(0);
             let mut display = crate::render::ProjectedDisplay::new();
+            let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = Arc::clone(&asked);
+            let switch = crate::attach::InputSwitch::new(move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if console_will_spell {
+                    Ok(())
+                } else {
+                    Err(CliError::Terminal(kr_client::shown::Shown::said(
+                        "the console refused",
+                    )))
+                }
+            });
+            let mut said_after = Vec::new();
+            // Held until the loop has ended: a wire the case let go of reads as a connection lost,
+            // and the loop looks at the worker's side first.
+            let keep_open = answers.clone();
             let case = case(Case {
                 console: Some(console),
                 written,
                 answers,
+                asked,
             });
             let (outcome, ()) = tokio::join!(
                 super::super::drive(
@@ -2763,10 +2959,18 @@ mod tests {
                     None,
                     &mut display,
                     false,
+                    &switch,
+                    &mut said_after,
                 ),
                 case
             );
-            outcome
+            drop(keep_open);
+            let sent = log.lock().expect("the log is not poisoned").clone();
+            Ran {
+                outcome,
+                said: said_after,
+                sent,
+            }
         }
     }
 
@@ -2923,17 +3127,147 @@ mod tests {
         );
     }
 
-    /// An attachment whose session refused its keys ends as a refusal with the status of one, and
-    /// says how to go on watching.
-    #[test]
-    fn an_attachment_the_session_refused_input_on_ends_with_the_refusals_status() {
-        let outcome = AttachOutcome::InputRefused(Shown::said("INPUT_INCOMPATIBLE"));
+    /// An attachment whose session refused the bytes it sent as unable to take them in the
+    /// encoding the session is in ends as a refusal with the status of one, and says how to go on
+    /// watching.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn bytes_the_session_refused_as_incompatible_end_the_attachment_as_a_refusal() {
+        let outcome = wire::run(true, |mut case| async move {
+            let typed = case
+                .types(crate::attach::TerminalInput::Bytes(b"x".to_vec()))
+                .await;
+            case.refuses(&typed, ErrorCode::InputIncompatible);
+        })
+        .await;
+        assert!(
+            matches!(outcome, AttachOutcome::InputRefused(_)),
+            "{outcome:?}"
+        );
         assert!(outcome.is_failure());
         assert_eq!(
             status(&outcome),
             CliError::Refused(refusal(ErrorCode::InputIncompatible, Shown::said(""))).exit_code()
         );
         assert!(outcome.detail().as_str().contains("--no-probe"));
+    }
+
+    /// The session cannot spell the records of a console whose application has negotiated an
+    /// encoding they cannot express, and refuses them. The attachment keeps its lease and goes on
+    /// typing, as the console spells the keys and as bytes: the keys that were refused are not sent
+    /// again, the writes sent behind them are not read, and the next write takes the number the
+    /// refused one was sent under, which the host never took.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_refusal_of_console_keys_turns_the_attachment_to_the_bytes_the_console_spells() {
+        use kr_protocol::input::InputContent;
+
+        let ran = wire::run_switched(true, true, |mut case| async move {
+            // Two batches of records are on their way when the host refuses the first. The host
+            // cannot place the second under the number it was sent with, and says so.
+            let first = case.types(key_down(b'A')).await;
+            let second = case.types(key_down(b'B')).await;
+            assert_eq!((first.sequence, second.sequence), (0, 1));
+            case.refuses(&first, ErrorCode::InputIncompatible);
+            case.refuses(&second, ErrorCode::InvalidArgument);
+            assert_eq!(case.waits_for_the_console_to_be_asked().await, 1);
+
+            let typed = case
+                .types(crate::attach::TerminalInput::Bytes(b"c".to_vec()))
+                .await;
+            assert_eq!(
+                typed.sequence, first.sequence,
+                "the refused write took no number"
+            );
+            assert!(matches!(typed.content, InputContent::Bytes { .. }));
+            case.takes(&typed);
+            // A batch of records the reader had read before the console began to spell its keys
+            // reaches the loop now, and is not sent.
+            case.types_without_waiting(key_down(b'D'));
+            let next = case
+                .types(crate::attach::TerminalInput::Bytes(b"e".to_vec()))
+                .await;
+            assert_eq!(next.sequence, typed.sequence + 1);
+            case.takes(&next);
+            case.hangs_up();
+        })
+        .await;
+        assert!(
+            matches!(ran.outcome, AttachOutcome::Detached),
+            "{:?}",
+            ran.outcome
+        );
+        assert_eq!(
+            ran.said.len(),
+            1,
+            "the person is told once, after the terminal is theirs again: {:?}",
+            ran.said
+        );
+        assert!(ran.said[0].as_str().contains("this console spells"));
+        assert!(
+            ran.said[0].as_str().contains("were not sent again"),
+            "the line names what is lost: {:?}",
+            ran.said[0]
+        );
+        assert!(
+            wire::released_in(&ran.sent).is_empty(),
+            "the lease is kept while the console spells the keys"
+        );
+        assert_eq!(
+            wire::writes_in(&ran.sent).len(),
+            4,
+            "the two records, then two byte writes"
+        );
+    }
+
+    /// A console that will not spell its keys cannot be typed at once the session has refused its
+    /// records: the attachment hands the lease back, goes on watching, and says so afterwards.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_console_that_will_not_spell_its_keys_hands_the_lease_back_and_watches() {
+        let ran = wire::run_switched(true, false, |mut case| async move {
+            let first = case.types(key_down(b'A')).await;
+            case.refuses(&first, ErrorCode::InputIncompatible);
+            case.next_mutation(Method::InputRelease).await;
+            // What is typed now is dropped and not sent, and the attachment goes on.
+            case.types_without_waiting(crate::attach::TerminalInput::Bytes(b"x".to_vec()));
+            case.types_without_waiting(key_down(b'B'));
+            case.hangs_up();
+        })
+        .await;
+        assert!(
+            matches!(ran.outcome, AttachOutcome::Detached),
+            "{:?}",
+            ran.outcome
+        );
+        let released = wire::released_in(&ran.sent);
+        assert_eq!(released.len(), 1, "the lease goes back once");
+        assert_eq!(
+            released[0].epoch.get(),
+            5,
+            "and it is the one the attachment held"
+        );
+        assert_eq!(
+            wire::writes_in(&ran.sent).len(),
+            1,
+            "nothing is sent after the refusal"
+        );
+        assert_eq!(ran.said.len(), 1);
+        assert!(ran.said[0].as_str().contains("would not spell its keys"));
+        assert!(ran.said[0].as_str().contains("--no-probe"));
+    }
+
+    /// A key going down at the console, as the case types it.
+    #[cfg(unix)]
+    fn key_down(code: u8) -> crate::attach::TerminalInput {
+        crate::attach::TerminalInput::Keys(vec![kr_term::win32::KeyRecord {
+            virtual_key: u16::from(code),
+            scan_code: 0,
+            unicode: u16::from(code.to_ascii_lowercase()),
+            key_down: true,
+            control_keys: 0,
+            repeat: 1,
+        }])
     }
 
     /// A closure this build cannot read ends the attachment as a failure: the session ended, and

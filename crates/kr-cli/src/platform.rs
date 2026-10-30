@@ -210,6 +210,26 @@ mod console {
             })
         }
 
+        /// What makes this console spell its keys itself: its virtual-terminal input, which turns
+        /// the keys into the sequences a terminal sends. It is asked for on the mode the console
+        /// has then, and put back with the rest when the attachment ends.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error when the console's input handle cannot be duplicated.
+        pub fn input_switch(&self) -> Result<crate::attach::InputSwitch> {
+            use windows_sys::Win32::System::Console::ENABLE_VIRTUAL_TERMINAL_INPUT;
+
+            let input = self
+                .input
+                .try_clone()
+                .map_err(|error| CliError::Terminal(Shown::io(&error)))?;
+            Ok(crate::attach::InputSwitch::new(move || {
+                let mode = console_mode(&input)?;
+                set_console_mode(&input, mode | ENABLE_VIRTUAL_TERMINAL_INPUT)
+            }))
+        }
+
         /// Puts the console into the mode an attachment needs, and returns what it replaced.
         ///
         /// Keys come back as the records the console reports them as, with no translation into
