@@ -32,7 +32,7 @@ use kr_describe::supervise::{
 };
 use kr_describe::testing::{
     CATALOGUE_VARIABLE, Raw, SCRIPT_VARIABLE, STARTED_PREFIX, Script, TestAsset, TestCatalogue,
-    TestProfile, at_next_spawn, refuse_identity_lookup, refuse_thread_start,
+    TestProfile, refuse_identity_lookup, refuse_thread_start,
     the_system_refuses_the_process_memory,
 };
 use kr_describe::time::Reading;
@@ -2129,6 +2129,8 @@ fn a_runtime_that_answers_a_refused_allocation_as_failed_still_ends_as_memory_pr
 #[cfg(windows)]
 #[test]
 fn a_process_that_commits_memory_as_it_starts_is_refused_by_the_systems_limit() {
+    use kr_describe::testing::at_next_spawn;
+
     const MIB: u64 = 1 << 20;
     let (catalogue, _) = tiny();
     let fits = catalogue
