@@ -4938,12 +4938,14 @@ enum WithdrawnAt {
 }
 
 /// Applies a version of two paths to a working copy of a device twice, and returns what the second
-/// apply was told and how many of its paths are in the working copy. The first apply is the
-/// control: the location stands, and both paths are written. During the second the owner withdraws
-/// the location at `at`.
+/// apply was told and how many of its paths are in the working copy. The first path is
+/// `README.md`; the second is an untracked file at `second`. The first apply is the control: the
+/// location stands, and both paths are written. During the second the owner withdraws the location
+/// at `at`.
 async fn apply_two_paths_while_the_owner_withdraws_the_location(
     test: &str,
     at: WithdrawnAt,
+    second: &str,
 ) -> Option<(
     std::result::Result<ParamsValue, ClientError>,
     usize,
@@ -4954,8 +4956,10 @@ async fn apply_two_paths_while_the_owner_withdraws_the_location(
     let granted = Granted::on_a_qualified_host_holding(test, CHANGE_RIGHTS).await?;
     let env = granted.host.environment_id;
     let review = a_working_copy(&granted, "review").await;
-    std::fs::write(granted.root.join("review/extra.txt"), "an untracked file\n")
-        .expect("an untracked file");
+    let untracked = granted.root.join("review").join(second);
+    std::fs::create_dir_all(untracked.parent().expect("a path beneath the working copy"))
+        .expect("the directory of an untracked file");
+    std::fs::write(&untracked, "an untracked file\n").expect("an untracked file");
     let version = device_captures(&granted, review).await;
     let mut destinations = Vec::new();
     for name in ["control", "withdrawn"] {
@@ -4967,7 +4971,7 @@ async fn apply_two_paths_while_the_owner_withdraws_the_location(
     let both_paths = |workspace, name: &str| {
         let mut params = expecting_readme(&granted.root, workspace, version, name);
         params.affected.push(AffectedVersion {
-            path: "extra.txt".to_owned(),
+            path: second.to_owned(),
             expected_worktree_digest: Nullable::null(),
             expected_index_object_id: Nullable::null(),
             expected_index_mode: Nullable::null(),
@@ -4979,7 +4983,7 @@ async fn apply_two_paths_while_the_owner_withdraws_the_location(
         let directory = granted.root.join(name);
         let readme = std::fs::read_to_string(directory.join("README.md")).expect("the file")
             == "changed after the commit\n";
-        usize::from(readme) + usize::from(directory.join("extra.txt").exists())
+        usize::from(readme) + usize::from(directory.join(second).exists())
     };
 
     // The control: the location stands throughout.
@@ -5091,12 +5095,53 @@ async fn a_location_withdrawn_between_two_paths_of_an_apply_receives_the_second_
     let Some((outcome, written, granted)) = apply_two_paths_while_the_owner_withdraws_the_location(
         "a_location_withdrawn_between_two_paths_of_an_apply_receives_the_second_no_write",
         WithdrawnAt::BetweenPaths,
+        "extra.txt",
     )
     .await
     else {
         return;
     };
     assert_eq!(written, 1, "the path after the withdrawal is not written");
+    assert!(
+        no_staging_left_in(&granted.root.join("withdrawn")),
+        "the apply left nothing of its own beside the destination"
+    );
+    let answer: DiffApplyResult = typed(&outcome.expect("the apply is settled and answered"));
+    assert_eq!(
+        answer.outcome.0,
+        Some(ApplyOutcomeClass::UncertainOutcome),
+        "{answer:?}"
+    );
+    assert_eq!(
+        states_of(&answer),
+        [PathProgressState::Written, PathProgressState::Skipped],
+        "{answer:?}"
+    );
+    granted.stop().await;
+}
+
+/// KR-REQ-23.44: the first change an apply makes for a path in a directory that is not there yet
+/// is that directory, so the location is asked before it, and a path after a withdrawal makes no
+/// directory. The second of two paths is `sub/extra.txt`; the owner withdraws the location when the
+/// first is written; the second is not written and its directory is not made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_location_withdrawn_between_two_paths_of_an_apply_makes_no_directory_for_the_second() {
+    use kr_protocol::changeset::{ApplyOutcomeClass, DiffApplyResult, PathProgressState};
+
+    let Some((outcome, written, granted)) = apply_two_paths_while_the_owner_withdraws_the_location(
+        "a_location_withdrawn_between_two_paths_of_an_apply_makes_no_directory_for_the_second",
+        WithdrawnAt::BetweenPaths,
+        "sub/extra.txt",
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(written, 1, "the path after the withdrawal is not written");
+    assert!(
+        !granted.root.join("withdrawn/sub").exists(),
+        "the directory above the path after the withdrawal is not made"
+    );
     assert!(
         no_staging_left_in(&granted.root.join("withdrawn")),
         "the apply left nothing of its own beside the destination"
@@ -5124,6 +5169,7 @@ async fn a_location_withdrawn_while_a_path_is_staged_has_nothing_published_into_
     let Some((outcome, written, granted)) = apply_two_paths_while_the_owner_withdraws_the_location(
         "a_location_withdrawn_while_a_path_is_staged_has_nothing_published_into_it",
         WithdrawnAt::BeforePublishing,
+        "extra.txt",
     )
     .await
     else {
