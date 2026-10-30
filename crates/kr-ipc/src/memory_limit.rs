@@ -612,6 +612,7 @@ mod tests {
         drop(input);
         let status = exit_of(&mut child, "the child that asked four times");
         assert_eq!(status.code(), Some(0), "the child ends when it is done");
+        println!("recorded after each of the four requests: {recorded:?}");
         assert!(
             recorded[3],
             "the refusal after the process gave memory back is recorded; recorded after each \
