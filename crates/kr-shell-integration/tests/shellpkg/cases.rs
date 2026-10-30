@@ -487,6 +487,44 @@ pub fn half_a_character_the_terminal_delivered_is_input_the_reader_has_not_taken
     unread_input_is_not_drained(kind, b"\xc3", b"\xa9");
 }
 
+/// KR-REQ-08.49: a byte waiting in the terminal's queue, which the runtime has not read, is input
+/// the reader has not taken.
+///
+/// The runtime reads its terminal when the editor asks for a key, so a byte that arrives between
+/// two keys is in the terminal's queue and in none of the runtime's. The reader counts it by asking
+/// the runtime whether the terminal has input, and that is the whole of the count here: the runtime
+/// holds nothing of it, and the editor's queue is empty. The case runs the module's count on a
+/// terminal nobody reads, before a line is typed at it and after, and expects none and then the
+/// line.
+///
+/// # Panics
+///
+/// Panics when the count is not nothing at first, or does not see the line.
+#[cfg(unix)]
+pub fn a_byte_waiting_in_the_terminals_queue_is_input_the_reader_has_not_taken(kind: ShellKind) {
+    let package = Package::built(kind);
+    let module = package
+        .directory()
+        .join("modules/KalaReach.ShellBridge/KalaReach.ShellBridge.psd1")
+        .display()
+        .to_string();
+    let script = format!(
+        "Import-Module '{module}'; $module = Get-Module KalaReach.ShellBridge; \
+         Write-Output (('kr-be' + 'fore=[') + (& $module {{ Read-KrRuntimeUnread }}) + ']'); \
+         Start-Sleep -Seconds 2; \
+         Write-Output (('kr-af' + 'ter=[') + (& $module {{ Read-KrRuntimeUnread }}) + ']')"
+    );
+    let shown = package.ask_with_input_typed_after(&script, "kr-before=[", b"x\n");
+    assert!(
+        shown.contains("kr-before=[0]"),
+        "a terminal nobody typed at has nothing unread: {shown:?}"
+    );
+    assert!(
+        shown.contains("kr-after=[1]"),
+        "a line waiting in the terminal's queue is input the runtime has not read: {shown:?}"
+    );
+}
+
 /// Types `unread` into the terminal of an idle reader that is stopped, asks it for its queues, and
 /// expects it to say they are not drained. Then types `completion`, which the reader needs to take
 /// what it has, and expects it to say they are.

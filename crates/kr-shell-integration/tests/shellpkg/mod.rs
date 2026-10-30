@@ -225,6 +225,83 @@ impl Package {
             .expect("the package's host runs")
     }
 
+    /// Runs `script` in the package's host on a terminal of its own, and once the script has
+    /// printed `marker`, types `typed` at that terminal. Returns what the terminal showed once the
+    /// host had ended.
+    ///
+    /// The script reads nothing from its terminal, so what is typed stays in the terminal's queue
+    /// for as long as the script runs. A terminal is read in lines until a program says otherwise,
+    /// so `typed` is a line.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the host cannot be started, or has not printed `marker` or ended in time.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn ask_with_input_typed_after(&self, script: &str, marker: &str, typed: &[u8]) -> String {
+        let pty = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 100,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("a pseudo-terminal");
+        let mut command = CommandBuilder::new(&self.executable);
+        command.args(["-NoLogo", "-NoProfile", "-Command", script]);
+        for (name, value) in self.launch() {
+            command.env(name, value);
+        }
+        for name in ["KR_SHELL_BRIDGE", "KR_SHELL_BRIDGE_SECRET", "KR_SESSION"] {
+            command.env_remove(name);
+        }
+        command.env("TERM", "xterm-256color");
+        let mut child = pty
+            .slave
+            .spawn_command(command)
+            .expect("the package's host starts");
+        drop(pty.slave);
+        let mut reader = pty.master.try_clone_reader().expect("a terminal reader");
+        let mut writer = pty.master.take_writer().expect("a terminal writer");
+        let shown = Arc::new(Mutex::new(Vec::new()));
+        let collected = Arc::clone(&shown);
+        let thread = std::thread::spawn(move || {
+            let mut buffer = [0u8; 4096];
+            while let Ok(taken) = reader.read(&mut buffer) {
+                if taken == 0 {
+                    break;
+                }
+                collected
+                    .lock()
+                    .expect("the output lock")
+                    .extend_from_slice(&buffer[..taken]);
+            }
+        });
+        let text = || String::from_utf8_lossy(&shown.lock().expect("the output lock")).into_owned();
+        let deadline = Instant::now() + REPLY;
+        while !text().contains(marker) {
+            assert!(
+                Instant::now() < deadline,
+                "the host did not print {marker:?}:\n{}",
+                text()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        writer.write_all(typed).expect("types at the terminal");
+        writer.flush().expect("flushes the terminal");
+        while child.try_wait().expect("the host's state").is_none() {
+            if Instant::now() >= deadline + REPLY {
+                let _ = child.kill();
+                panic!("the host did not end:\n{}", text());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(writer);
+        drop(pty.master);
+        let _ = thread.join();
+        text()
+    }
+
     /// Finds this tree's own built package, or says why it is not there.
     ///
     /// The installation's `current` names a build, and a build is named by a digest of what it was
