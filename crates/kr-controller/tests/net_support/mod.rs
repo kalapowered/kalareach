@@ -1452,12 +1452,7 @@ pub async fn bootstrap_owner(host: &Host, owner: &DeviceKeys) -> (Device, Device
         "the bootstrap establishes the first owner"
     );
     connection.close(0u32.into(), b"paired");
-    let record = host
-        .network
-        .devices()
-        .record_for_device(confirmed.device_id)
-        .expect("readable")
-        .expect("the owner device's record");
+    let record = host.record_of(confirmed.device_id);
     (device, record)
 }
 
@@ -1526,11 +1521,7 @@ pub async fn pair_with(
         status.status
     );
     connection.close(0u32.into(), b"paired");
-    host.network
-        .devices()
-        .record_for_device(confirmed.device_id)
-        .expect("readable")
-        .expect("the device's record")
+    host.record_of(confirmed.device_id)
 }
 
 /// Connects a paired device to the host it was paired with.
