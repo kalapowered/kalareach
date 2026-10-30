@@ -689,15 +689,10 @@ fn mode_of(directory: &Path) -> u32 {
         & 0o777
 }
 
-/// KR-REQ-24.26: the first command of a fresh install that asks the terminal what it can do, run
-/// under the mask a login starts with, leaves the runtime root and the record of the question
-/// owner-only. The probe is the first thing to make the runtime root, and a root left open would
-/// refuse the start that follows.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_probe_on_a_fresh_install_leaves_the_runtime_root_owner_only() {
-    let base = kr_ipc::testing::PrivateTempDir::create();
-    let above = base.path().join("fresh");
-    let runtime = above.join("runtime");
+/// Runs `kr new --attach --palette probe` on a terminal that answers nothing, under the mask a
+/// login starts with and over the given roots, and returns once it has failed. The probe writes
+/// its record of the unanswered question before it asks, in the runtime root.
+async fn unanswered_probe(runtime: &Path, state: &Path) {
     let pty = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -709,8 +704,8 @@ async fn a_probe_on_a_fresh_install_leaves_the_runtime_root_owner_only() {
     let mut shell = pty
         .slave
         .spawn_command(shell_over(
-            &runtime,
-            &base.path().join("state"),
+            runtime,
+            state,
             &format!(
                 "umask 022; {} new --attach --palette probe; printf 'create-finished-%s\\n' \"$?\"",
                 kr().display()
@@ -725,19 +720,56 @@ async fn a_probe_on_a_fresh_install_leaves_the_runtime_root_owner_only() {
     );
     let _ = shell.kill();
     let _ = shell.wait();
+}
+
+/// How many records of an unanswered question a runtime root holds.
+fn records_in(probes: &Path) -> usize {
+    std::fs::read_dir(probes)
+        .unwrap_or_else(|error| panic!("the probe's records are in {}: {error}", probes.display()))
+        .count()
+}
+
+/// KR-REQ-24.26: the first command of a fresh install that asks the terminal what it can do, run
+/// under the mask a login starts with, leaves the runtime root and the record of the question
+/// owner-only. The probe is the first thing to make the runtime root, and a root left open would
+/// refuse the start that follows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_probe_on_a_fresh_install_leaves_the_runtime_root_owner_only() {
+    let base = kr_ipc::testing::PrivateTempDir::create();
+    let above = base.path().join("fresh");
+    let runtime = above.join("runtime");
+    unanswered_probe(&runtime, &base.path().join("state")).await;
 
     let probes = runtime.join("probes");
     assert_eq!(
-        std::fs::read_dir(&probes)
-            .unwrap_or_else(|error| panic!(
-                "the probe's record is in {}: {error}",
-                probes.display()
-            ))
-            .count(),
+        records_in(&probes),
         1,
         "the question that went unanswered is recorded"
     );
     for made in [&above, &runtime, &probes] {
         assert_eq!(mode_of(made), 0o700, "{}", made.display());
     }
+}
+
+/// KR-REQ-24.26: the directory of the records that an earlier release made with the umask's mode,
+/// inside a runtime root that was always owner-only, is used as it is: a probe still records the
+/// question it asks, and the directory is not refused for its mode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_probe_over_a_records_directory_an_earlier_release_left_open_still_records() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let base = kr_ipc::testing::PrivateTempDir::create();
+    let runtime = base.path().join("runtime");
+    let probes = runtime.join("probes");
+    kr_ipc::paths::create_private_tree(&runtime, &runtime).expect("an owner-only runtime root");
+    std::fs::create_dir(&probes).expect("the records' directory");
+    std::fs::set_permissions(&probes, std::fs::Permissions::from_mode(0o755)).expect("opened");
+
+    unanswered_probe(&runtime, &base.path().join("state")).await;
+
+    assert_eq!(
+        records_in(&probes),
+        1,
+        "the question that went unanswered is recorded"
+    );
 }

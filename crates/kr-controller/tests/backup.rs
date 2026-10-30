@@ -4216,6 +4216,22 @@ fn the_staging_directory_of_a_backup_store_is_owner_only_under_a_login_mask() {
     assert_eq!(mode, 0o700, "{}", staging.display());
 }
 
+/// KR-REQ-24.26: a staging directory that an earlier release made with the umask's mode, inside a
+/// state directory that was always owner-only, is used as it is: the store opens over it.
+#[cfg(unix)]
+#[test]
+fn a_backup_store_opens_over_a_staging_directory_an_earlier_release_left_open() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tempfile::tempdir().expect("a disposable directory on the internal disk");
+    let state = root.path().join("state");
+    let staging = state.join("backup");
+    std::fs::create_dir_all(&staging).expect("the staging directory");
+    std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755)).expect("opened");
+
+    drop(BackupStore::open(&state).expect("the store opens over the directory"));
+}
+
 /// A store whose schema is not the one this build writes is refused, whatever its version says.
 ///
 /// The rules a store enforces are part of its schema. A database written when one of them was
