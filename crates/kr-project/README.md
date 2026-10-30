@@ -16,17 +16,19 @@ failed is made again by the next request that arrives when no resolution is unde
 
 Resolution is bounded, because it is made outside every boundary of a program this host has not yet
 shown to be Git. The questions are given ten seconds in all to answer, and an answer of 64 KiB; the
-clean-up that follows takes a few seconds more at most. A program still under way when the time
-ends is ended with the processes in its group, one that has ended has the rest of its group ended
-with it, and one that answers with more is refused when it does, whatever it exits with. A process
-that has left the group and keeps the pipe is out of reach: the answer is refused after a second and
-the pipe is closed, so it costs a descriptor for as long as it runs. A look is made by one request
-at a time, and a request that arrives while one is under way waits for that look and shares its
-result, so a program that hangs is started once for all of them. A copy of Git under the helper
-directory that does not answer in time, or answers with more, refuses the whole look. One that
-cannot run, or answers differently, leaves the program on the search path as the one that runs. A
-host that is short of descriptors, processes or memory when a copy is started refuses the look
-rather than taking the copy for one that cannot run.
+clean-up that follows takes a few seconds more at most. A program still under way when the time ends
+is ended with the processes in its group, and one that has ended has the rest of its group ended
+with it. A program whose answer passes 64 KiB is ended at that point and refused, whatever it would
+have exited with, and no more than that is kept. A process that has left the group and keeps the
+pipe is out of reach: the answer is refused after a second and this host closes its end of the pipe,
+so the process runs on with its own end and this host holds nothing of it. A child that cannot be
+waited on is refused, and nothing is signalled by its number, which may be another process's by now.
+A look is made by one request at a time, and a request that arrives while one is under way waits for
+that look and shares its result, so a program that hangs is started once for all of them. A copy of
+Git under the helper directory that does not answer in time, or answers with more, refuses the whole
+look. One that cannot run, or answers differently, leaves the program on the search path as the one
+that runs. A host that is short of descriptors, processes or memory when a copy is started refuses
+the look rather than taking the copy for one that cannot run.
 
 ## Why there is one
 
