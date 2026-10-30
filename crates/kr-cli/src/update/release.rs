@@ -13,8 +13,9 @@
 //! something other than a file: a link, a device, a path that is absolute or climbs out of the
 //! archive's one top directory. What the archive says about a file's mode or owner is not read:
 //! a file is a program when the manifest says it is. A release is a `.tar.gz` where the system
-//! has symbolic links, and a `.zip` on Windows, where the archive is read by [`super::archive`]
-//! under bounds of its own, since it is parsed before any signature is checked.
+//! has symbolic links, and a `.zip` on Windows, where the archive is read by the update module's
+//! `archive` module, which only a Windows build has, under bounds of its own, since it is parsed
+//! before any signature is checked.
 
 use std::collections::BTreeMap;
 #[cfg(unix)]
