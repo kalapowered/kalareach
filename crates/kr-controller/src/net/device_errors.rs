@@ -82,6 +82,54 @@ const POINTER_ENDS: [&str; 3] = [
     " carries a member of an extension that is not negotiated there",
 ];
 
+/// A member of a protocol record that holds a failure as plain text, found by its key.
+struct FailureText {
+    /// The member's key.
+    key: &'static str,
+    /// The members beside it that say which record it belongs to: each key, and the text it must
+    /// hold when the record is one of several under a tag.
+    beside: &'static [(&'static str, Option<&'static str>)],
+    /// What the text says, for the sentence a device is given when none of it can be kept.
+    of: &'static str,
+}
+
+/// The records whose members hold a failure as plain text, which no error carries: the reason a
+/// privacy step could not answer, what a workspace or a repository operation records of its own
+/// state, and why an agent instance's bridges are refused. A device reads them in results and in
+/// announcements, so they are held to the rule as an error's message is.
+const FAILURE_TEXTS: [FailureText; 6] = [
+    FailureText {
+        key: "reason",
+        beside: &[("subsystem", None)],
+        of: "what the subsystem's store reported",
+    },
+    FailureText {
+        key: "reason",
+        beside: &[("state", Some("unavailable"))],
+        of: "why the session's cleanup is unavailable",
+    },
+    FailureText {
+        key: "detail",
+        beside: &[("kind", None), ("change_set_id", None)],
+        of: "what the workspace holds",
+    },
+    FailureText {
+        key: "detail",
+        beside: &[("display_path", None)],
+        of: "why the workspace is in this state",
+    },
+    FailureText {
+        key: "detail",
+        beside: &[("retained_staging_paths", None)],
+        of: "why the operation ended",
+    },
+    FailureText {
+        key: "refusal",
+        beside: &[("application_instance_id", None)],
+        of: "why the instance's bridges are refused",
+    },
+];
+
 /// The error `error` is for a device: itself when it names nothing of this host, and otherwise the
 /// error the module note describes.
 #[must_use]
@@ -95,22 +143,28 @@ pub(crate) fn error_for_a_device(error: &ProtocolError) -> Cow<'_, ProtocolError
 /// What a device is told in place of `message`, the text of an error of `code`, or `None` when it
 /// is told the message itself.
 fn message_for_a_device(code: ErrorCode, message: &str) -> Option<String> {
-    let without_commands = without_quoted_commands(message);
-    let text = without_commands.as_deref().unwrap_or(message);
+    told_in_place(message, || sentence_for(code, WHY_NOT_SHOWN))
+}
+
+/// What a device is told in place of `text`, or `None` when it is told the text itself. `fixed` is
+/// what stands where nothing of the text can be kept.
+fn told_in_place(text: &str, fixed: impl Fn() -> String) -> Option<String> {
+    let without_commands = without_quoted_commands(text);
+    let text = without_commands.as_deref().unwrap_or(text);
     let told = match first_naming(text) {
         None => without_commands?,
         Some(at) => match known_reason(text) {
             Some(reason) => reason.to_owned(),
             None => match clause_before(text, at) {
                 Some(clause) => format!("{clause}; {WHY_NOT_SHOWN}"),
-                None => sentence_for(code, WHY_NOT_SHOWN),
+                None => fixed(),
             },
         },
     };
-    // An error never carries more than its limit, so a clause kept from a long message gives way to
-    // the sentence of its code.
+    // A text never carries more than an error's limit, so a clause kept from a long one gives way
+    // to what stands for it.
     Some(if told.len() > LONGEST_MESSAGE {
-        sentence_for(code, WHY_NOT_SHOWN)
+        fixed()
     } else {
         told
     })
@@ -125,7 +179,8 @@ fn known_reason(text: &str) -> Option<&'static str> {
 }
 
 /// `frame` as a device is given it: every error in it as [`error_for_a_device`] gives it, and
-/// every closure's account of what it left behind held to the same rule.
+/// every closure's account of what it left behind and every failure a record holds as plain text
+/// ([`FAILURE_TEXTS`]) held to the same rule, in a result and in an announcement.
 ///
 /// A receipt whose message was replaced says so, with the flag the receipt has for it. A frame
 /// that carries nothing to replace is returned as it is.
@@ -160,9 +215,7 @@ pub(crate) fn frame_for_a_device(frame: &ControlFrame) -> Cow<'_, ControlFrame> 
             response.receipt.error_withheld = true;
             Cow::Owned(ControlFrame::Receipt(Box::new(response)))
         }
-        ControlFrame::Notification(notification)
-            if notification.event_type.as_str() == kr_protocol::session::SESSION_CLOSED_EVENT =>
-        {
+        ControlFrame::Notification(notification) => {
             match shown_value(notification.payload.as_value()) {
                 None => Cow::Borrowed(frame),
                 Some(payload) => Cow::Owned(ControlFrame::Notification(Notification {
@@ -341,13 +394,7 @@ fn shown_value(value: &CanonicalValue) -> Option<CanonicalValue> {
             let shown: Vec<Option<CanonicalValue>> = map
                 .entries()
                 .iter()
-                .map(|(key, child)| {
-                    if key == "surviving" {
-                        shown_survivors(child)
-                    } else {
-                        shown_value(child)
-                    }
-                })
+                .map(|(key, child)| shown_member(map, key, child))
                 .collect();
             if shown.iter().all(Option::is_none) {
                 return None;
@@ -385,6 +432,36 @@ fn shown_value(value: &CanonicalValue) -> Option<CanonicalValue> {
         }
         _ => None,
     }
+}
+
+/// One member of `map` as a device is given it, or `None` when it is given as it is.
+fn shown_member(map: &CanonicalMap, key: &str, child: &CanonicalValue) -> Option<CanonicalValue> {
+    if key == "surviving" {
+        return shown_survivors(child);
+    }
+    if let (CanonicalValue::Text(text), Some(of)) = (child, failure_text_of(map, key)) {
+        let fixed = || format!("{of}; {WHY_NOT_SHOWN}");
+        return told_in_place(text, fixed).map(CanonicalValue::Text);
+    }
+    shown_value(child)
+}
+
+/// What the text under `key` in `map` says, when it is a failure a record holds as plain text.
+fn failure_text_of(map: &CanonicalMap, key: &str) -> Option<&'static str> {
+    FAILURE_TEXTS
+        .iter()
+        .find(|field| {
+            field.key == key
+                && field
+                    .beside
+                    .iter()
+                    .all(|(name, value)| match (map.get(name), value) {
+                        (Some(CanonicalValue::Text(found)), Some(wanted)) => found == wanted,
+                        (Some(_), None) => true,
+                        _ => false,
+                    })
+        })
+        .map(|field| field.of)
 }
 
 /// The code and the message of `map`, when it is exactly the shape of a protocol error: the three
@@ -1060,16 +1137,21 @@ mod tests {
     }
 
     #[test]
-    fn an_event_other_than_a_closure_is_passed_as_it_is() {
-        let record = closure_leaving(&[("unestablished", "cannot read /proc/1/cgroup")]);
+    fn an_event_that_carries_no_failure_that_names_the_host_is_passed_as_it_is() {
+        let record = closure_leaving(&[("process", "process 4521 is still running")]);
         let ControlFrame::Notification(closed) = closed(&record) else {
             unreachable!("a notification");
         };
-        let output = ControlFrame::Notification(Notification {
-            event_type: EventType::new("session.output").expect("an event type"),
-            ..closed
-        });
-        assert!(matches!(frame_for_a_device(&output), Cow::Borrowed(_)));
+        for event in ["session.closed", "session.output", "session.agent.instance"] {
+            let announced = ControlFrame::Notification(Notification {
+                event_type: EventType::new(event).expect("an event type"),
+                ..closed.clone()
+            });
+            assert!(
+                matches!(frame_for_a_device(&announced), Cow::Borrowed(_)),
+                "{event}"
+            );
+        }
     }
 
     #[test]
@@ -1173,5 +1255,255 @@ mod tests {
         assert_eq!(shown(expired.clone()), expired);
         let named = shown(error(ErrorCode::InvalidArgument, "bad /Users/marguerite/x"));
         assert!(!named.message.contains("marguerite"), "{named:?}");
+    }
+
+    /// What the privacy record writes of a step it could not take: a clause, the place and the
+    /// accounts that own it, and the command that would mend it.
+    const AN_OWNERSHIP_FAILURE: &str = "the recovery directory could not be used: \
+         /Users/marguerite/.local/state/kr/recoveries must be owned by user 501 with mode 0700, \
+         found owner 502; make it yours alone with: chmod 700 \
+         '/Users/marguerite/.local/state/kr/recoveries'";
+
+    /// A failure that begins with the place it is about.
+    const A_FAILURE_AT_A_PATH: &str =
+        "/Users/marguerite/.nvm/versions/node/v22/bin/codex cannot be read: permission denied";
+
+    /// Whether `text` holds something only the owner at this machine is told.
+    fn tells_the_owner_alone(text: &str) -> bool {
+        ["marguerite", "501", "502", "chmod", "/"]
+            .iter()
+            .any(|name| text.contains(name))
+    }
+
+    /// `carrier` as a device is given it in the result of a call.
+    fn written_in_a_result<T: serde::Serialize + serde::de::DeserializeOwned>(carrier: &T) -> T {
+        let frame = ControlFrame::Response(Response {
+            request_id: RequestId::new(9),
+            outcome: Outcome::Ok(ParamsValue::from_typed(carrier).expect("encodes")),
+        });
+        let Cow::Owned(ControlFrame::Response(Response {
+            outcome: Outcome::Ok(value),
+            ..
+        })) = frame_for_a_device(&frame)
+        else {
+            panic!("a result with a failure that names the host was passed as it was");
+        };
+        kr_cbor::from_canonical_value(value.as_value()).expect("decodes")
+    }
+
+    fn privacy_report(reason: &str) -> kr_protocol::privacy::PrivacyReport {
+        use kr_protocol::privacy::{
+            PrivacyCompletion, PrivacyReport, PrivacySession, PrivacySessionStanding,
+            PrivacyUnavailable,
+        };
+        let unavailable = || PrivacyUnavailable {
+            subsystem: "archive".to_owned(),
+            reason: reason.to_owned(),
+        };
+        PrivacyReport {
+            generation: U64::new(3),
+            enabled: true,
+            changed_at_ms: kr_protocol::scalars::TimestampMs::new(1),
+            completion: PrivacyCompletion::Unavailable {
+                unavailable: vec![unavailable()],
+                outstanding: Vec::new(),
+            },
+            sessions: vec![PrivacySession {
+                session_id: SessionId::new(kr_protocol::scalars::Uuid::from_bytes([6; 16])),
+                generation: U64::new(3),
+                standing: PrivacySessionStanding::Unavailable {
+                    reason: reason.to_owned(),
+                },
+            }],
+            disabled: Vec::new(),
+            kept: Vec::new(),
+            exported: Vec::new(),
+            unlisted: vec![unavailable()],
+        }
+    }
+
+    fn workspace(detail: &str, retained: &str) -> kr_protocol::project::WorkspaceSummary {
+        use kr_protocol::ids::{ChangeSetId, EnvironmentId, ProjectRepositoryId, WorkspaceId};
+        use kr_protocol::project::{
+            InclusionPolicy, IsolationMechanism, RetainedItem, RetainedKind, WorkspaceKind,
+            WorkspaceState, WorkspaceSummary,
+        };
+        use kr_protocol::scalars::{TimestampMs, Uuid};
+        WorkspaceSummary {
+            workspace_id: WorkspaceId::new(Uuid::from_bytes([1; 16])),
+            project_repository_id: ProjectRepositoryId::new(Uuid::from_bytes([2; 16])),
+            environment_id: EnvironmentId::new(Uuid::from_bytes([3; 16])),
+            label: "a label the caller chose".to_owned(),
+            kind: WorkspaceKind::Isolated,
+            isolation: Nullable::some(IsolationMechanism::GitWorktree),
+            policy: InclusionPolicy::base_only(),
+            state: WorkspaceState::RemovalPending,
+            base_revision: "a".repeat(40),
+            base_change_set_id: Nullable::null(),
+            filesystem_identity: Nullable::null(),
+            display_path: "/work/a-tree".to_owned(),
+            detail: Nullable::some(detail.to_owned()),
+            bound_sessions: Vec::new(),
+            bound_runs: Vec::new(),
+            retained: vec![RetainedItem {
+                kind: RetainedKind::PinnedChangeSet,
+                detail: retained.to_owned(),
+                change_set_id: Nullable::some(ChangeSetId::new(Uuid::from_bytes([4; 16]))),
+            }],
+            created_at_ms: TimestampMs::new(1),
+        }
+    }
+
+    fn operation(detail: &str) -> kr_protocol::project::OperationRecord {
+        use kr_protocol::ids::{ActionId, EnvironmentId, ProjectRepositoryId};
+        use kr_protocol::project::{DestinationState, OperationRecord, OperationState};
+        use kr_protocol::scalars::{TimestampMs, Uuid};
+        OperationRecord {
+            action_id: ActionId::new(Uuid::from_bytes([5; 16])),
+            environment_id: EnvironmentId::new(Uuid::from_bytes([3; 16])),
+            project_repository_id: ProjectRepositoryId::new(Uuid::from_bytes([2; 16])),
+            method: "project.clone".to_owned(),
+            state: OperationState::Failed,
+            remote: Nullable::null(),
+            destination_state: DestinationState::Absent,
+            retained_staging_paths: Vec::new(),
+            removed_staging_paths: Vec::new(),
+            detail: Nullable::some(detail.to_owned()),
+            started_at_ms: TimestampMs::new(1),
+            ended_at_ms: Nullable::null(),
+        }
+    }
+
+    fn instance(refusal: &str) -> kr_protocol::projection::AgentInstanceSummary {
+        kr_protocol::projection::AgentInstanceSummary {
+            application_instance_id: kr_protocol::ids::ApplicationInstanceId::new(
+                kr_ipc::new_uuid(),
+            ),
+            plugin_id: Nullable::null(),
+            profile_id: Nullable::null(),
+            mode: kr_protocol::broker::IntegrationMode::NativeTerminal,
+            bypass: Nullable::null(),
+            started_at: kr_protocol::scalars::TimestampMs::new(1),
+            ended_at: Nullable::null(),
+            refusal: Nullable::some(refusal.to_owned()),
+        }
+    }
+
+    #[test]
+    fn the_failure_of_a_privacy_step_is_held_to_the_rule_by_its_key() {
+        use kr_protocol::privacy::{PrivacyCompletion, PrivacySessionStanding};
+        let owner = privacy_report(AN_OWNERSHIP_FAILURE);
+        let device = written_in_a_result(&owner);
+        let PrivacyCompletion::Unavailable { unavailable, .. } = &device.completion else {
+            panic!("{:?}", device.completion);
+        };
+        let PrivacySessionStanding::Unavailable { reason } = &device.sessions[0].standing else {
+            panic!("{:?}", device.sessions);
+        };
+        for told in [&unavailable[0].reason, reason, &device.unlisted[0].reason] {
+            assert!(!tells_the_owner_alone(told), "{told}");
+            assert!(
+                told.starts_with("the recovery directory could not be used"),
+                "the clause before the place is kept: {told}"
+            );
+        }
+        // Nothing else in the report changed, and the owner's own value is as the record made it.
+        assert_eq!(device, privacy_report(&device.unlisted[0].reason));
+        assert_eq!(owner.unlisted[0].reason, AN_OWNERSHIP_FAILURE);
+    }
+
+    #[test]
+    fn the_detail_of_a_project_or_a_workspace_is_held_to_the_rule_by_its_key() {
+        use kr_protocol::project::{
+            ProjectOperationCancelResult, RetainedItem, RetainedKind, WorkspaceRemoveResult,
+        };
+        let removed = WorkspaceRemoveResult {
+            workspace: workspace(
+                "the staging directory /Users/marguerite/work/.kr-staging-1 is still there",
+                A_FAILURE_AT_A_PATH,
+            ),
+            working_files_removed: false,
+            retained: vec![RetainedItem {
+                kind: RetainedKind::DirtyContent,
+                detail: "the repository could not be inspected: open \
+                         /Users/marguerite/work/.git: permission denied"
+                    .to_owned(),
+                change_set_id: Nullable::null(),
+            }],
+        };
+        let device = written_in_a_result(&removed);
+        for told in [
+            device.workspace.detail.0.as_deref().expect("kept"),
+            &device.workspace.retained[0].detail,
+            &device.retained[0].detail,
+        ] {
+            assert!(!tells_the_owner_alone(told), "{told}");
+        }
+        assert!(
+            device.retained[0]
+                .detail
+                .starts_with("the repository could not be inspected"),
+            "{:?}",
+            device.retained
+        );
+        // What is not a failure is as it was: the workspace's place is given to a device by design.
+        assert_eq!(
+            device.workspace.display_path,
+            removed.workspace.display_path
+        );
+        assert_eq!(device.workspace.state, removed.workspace.state);
+
+        let cancelled = ProjectOperationCancelResult {
+            operation: operation(
+                "removing the staging path stopped: /Users/marguerite/p/.kr-stage-7: denied",
+            ),
+            stopped_processes: U64::new(0),
+        };
+        let device = written_in_a_result(&cancelled);
+        let told = device.operation.detail.0.as_deref().expect("kept");
+        assert!(!tells_the_owner_alone(told), "{told}");
+        assert!(
+            told.starts_with("removing the staging path stopped"),
+            "{told}"
+        );
+    }
+
+    #[test]
+    fn the_refusal_of_an_agent_instance_is_held_to_the_rule_in_a_result_and_in_an_event() {
+        use kr_protocol::projection::{AgentInstanceEvent, AgentInstanceList};
+        let list = AgentInstanceList {
+            sequence: U64::new(2),
+            instances: vec![
+                instance(A_FAILURE_AT_A_PATH),
+                instance("no bridge is offered"),
+            ],
+        };
+        let device = written_in_a_result(&list);
+        let told = device.instances[0].refusal.0.as_deref().expect("kept");
+        assert!(!tells_the_owner_alone(told), "{told}");
+        assert_eq!(device.instances[1], list.instances[1]);
+
+        let event = AgentInstanceEvent {
+            session_id: SessionId::new(kr_ipc::new_uuid()),
+            sequence: U64::new(3),
+            instance: instance(A_FAILURE_AT_A_PATH),
+        };
+        let announced = ControlFrame::Notification(Notification {
+            stream_id: StreamId::new("s").expect("a stream"),
+            sequence: kr_protocol::ids::EventSequence::new(1),
+            event_type: EventType::new(kr_protocol::projection::AGENT_INSTANCE_EVENT)
+                .expect("an event type"),
+            payload: ParamsValue::from_typed(&event).expect("encodes"),
+        });
+        let Cow::Owned(ControlFrame::Notification(written)) = frame_for_a_device(&announced) else {
+            panic!("an announcement that names the host was passed as it was");
+        };
+        let written: AgentInstanceEvent = written.payload.to_typed().expect("decodes");
+        let told = written.instance.refusal.0.as_deref().expect("kept");
+        assert!(!tells_the_owner_alone(told), "{told}");
+        assert_eq!(
+            written.instance.application_instance_id,
+            event.instance.application_instance_id
+        );
     }
 }
