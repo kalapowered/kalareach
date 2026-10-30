@@ -67,8 +67,9 @@ fn names(cases: &[ReportCase]) -> Vec<(String, ReportOutcome)> {
 
 use ReportOutcome::{Errored, Failed, Flaky, Skipped};
 
-/// Each tool's report decodes to the counts and the cases the tool itself states: totals are the
-/// cases', and a case that passed after a rerun is a pass that is also flaky.
+/// KR-REQ-25.06: each tool's report, JUnit XML or `go test -json`, decodes to the counts and the
+/// cases the tool itself states: totals are the cases', and a case that passed after a rerun is a
+/// pass that is also flaky.
 #[test]
 fn a_report_decodes_to_what_its_tool_says() {
     // tests, passed, failed, errored, skipped, flaky
@@ -130,8 +131,9 @@ fn a_report_decodes_to_what_its_tool_says() {
     assert_eq!(cases[0].group.0.as_deref(), Some("example.test/sample/ok"));
 }
 
-/// A package that does not build is a stream whose first events are the go command's build events,
-/// and it is one errored case, not one for the build and another for the package it left failed.
+/// KR-REQ-25.06: a package that does not build is a `go test -json` stream whose first events are the
+/// go command's build events, and it is one errored case, not one for the build and another for the
+/// package it left failed.
 #[test]
 fn a_go_package_that_did_not_build_is_one_errored_case() {
     let (format, totals, cases, _) = parsed(&fixture("go-1.27.1.build-failure.json"));
@@ -146,8 +148,8 @@ fn a_go_package_that_did_not_build_is_one_errored_case() {
     );
 }
 
-/// A package that failed with no test failing is a case of its own, named by the package, and a
-/// package that failed because a test did is not counted twice.
+/// KR-REQ-25.06: in a `go test -json` stream, a package that failed with no test failing is a case of
+/// its own, named by the package, and a package that failed because a test did is not counted twice.
 #[test]
 fn a_package_failure_with_no_failed_test_is_a_case_of_its_own() {
     let stream = concat!(
@@ -172,8 +174,8 @@ fn a_package_failure_with_no_failed_test_is_a_case_of_its_own() {
     );
 }
 
-/// Two packages whose names agree up to the cut that is kept for display are two packages: a test
-/// failing in one does not hide the failure of the other.
+/// KR-REQ-25.06: in a `go test -json` stream, two packages whose names agree up to the cut that is
+/// kept for display are two packages: a test failing in one does not hide the failure of the other.
 #[test]
 fn packages_whose_names_agree_up_to_the_cut_are_told_apart() {
     let shared = "p".repeat(MAX_REPORT_NAME_BYTES + 10);
