@@ -562,8 +562,9 @@ impl AppState {
         let _ = self.sync_service.set(service);
     }
 
-    /// Replaces the clients of the sync service this computer reaches. It takes effect for the
-    /// desks opened afterwards, and the first call is the one that stands.
+    /// Replaces the clients of the sync service this computer reaches. The first call is the one
+    /// that stands, and it stands only if it comes before [`Self::sync_clients`] first runs: after
+    /// that the clients are set, and this call changes nothing.
     pub fn sync_clients_replaced(&self, clients: Arc<dyn crate::services::SyncServices>) {
         let _ = self.sync_clients.set(clients);
     }

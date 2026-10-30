@@ -874,7 +874,7 @@ impl Calls {
     }
 
     /// The client of the voice service's broker, presenting the tokens of `tokens`, when this
-    /// application makes calls.
+    /// application makes calls and the broker factory can make one: its error is dropped.
     #[must_use]
     pub fn broker(
         &self,

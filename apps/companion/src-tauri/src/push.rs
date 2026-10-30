@@ -1470,8 +1470,9 @@ impl PushDesk {
         Ok((origin, gateway))
     }
 
-    /// The client of the push service this phone talks to now, for the application's set of
-    /// service clients. It is the one a registration is proposed through.
+    /// A client of the push service this phone talks to now, made by the gateway factory for the
+    /// Account sheet's report. A registration is proposed through a client the same factory makes.
+    /// None when the factory cannot make one: the error is dropped.
     #[must_use]
     pub fn client(&self) -> Option<Arc<dyn PushService>> {
         self.gateway().ok().map(|(_, gateway)| gateway)
