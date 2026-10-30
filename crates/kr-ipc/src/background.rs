@@ -10,7 +10,7 @@
 //!
 //! | Platform | CPU | I/O |
 //! | --- | --- | --- |
-//! | Windows | the idle priority class of the process | very low I/O priority of the process |
+//! | Windows | the idle priority class of the process | very low I/O priority of the process and of the calling thread |
 //! | macOS | the caller's own (this module sets none) | the throttled disk policy of the process |
 //! | Linux | the caller's own (this module sets none) | the idle class of the calling thread, which threads it starts afterwards inherit |
 //! | the remaining platforms | none | none |
@@ -55,8 +55,9 @@ pub enum IoClass {
 pub type Refusal = &'static str;
 
 /// Lowers the I/O class of the calling thread on Linux, where a thread starts the threads that
-/// read the model, and of the calling process on macOS and Windows, where the class is the
-/// process's.
+/// read the model, of the calling process on macOS, where the class is the process's, and of both
+/// the calling thread and the calling process on Windows, where the system keeps an I/O priority
+/// for each and a thread begun before the process's was lowered keeps its own.
 ///
 /// Returns the class the system reports once it was set. A system that refuses the call, or that
 /// reports something else afterwards, is a refusal.
@@ -68,8 +69,9 @@ pub fn lower_io_class() -> std::result::Result<IoClass, Refusal> {
     platform::lower_io_class()
 }
 
-/// Reads the I/O class the system holds for the calling thread on Linux and for the calling
-/// process on macOS and Windows, when it is one this module sets.
+/// Reads the I/O class the system holds for the calling thread on Linux, for the calling process
+/// on macOS, and on Windows for the calling thread and the calling process together, which have the
+/// class only when both hold it, when it is one this module sets.
 #[must_use]
 pub fn io_class() -> Option<IoClass> {
     platform::io_class()
@@ -113,6 +115,14 @@ pub fn process_class() -> Option<ProcessClass> {
 #[must_use]
 pub fn process_class_of(pid: u32) -> Option<ProcessClass> {
     platform::process_class_of(pid)
+}
+
+/// Reads the I/O class the system holds for the calling thread alone, when it is one this module
+/// names.
+#[cfg(all(windows, any(test, feature = "testing")))]
+#[must_use]
+pub fn thread_io_class() -> Option<IoClass> {
+    platform::thread_io_priority().and_then(platform::io_class_named)
 }
 
 /// The classes a test found its process or thread in, so that it can leave them as it found them.
@@ -282,10 +292,14 @@ mod platform {
     )]
 
     use super::{IoClass, Refusal};
-    use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessIoPriority};
+    use windows_sys::Wdk::System::Threading::{
+        NtQueryInformationProcess, NtQueryInformationThread, NtSetInformationThread,
+        ProcessIoPriority, ThreadIoPriority,
+    };
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, GetPriorityClass, IDLE_PRIORITY_CLASS, SetPriorityClass,
+        GetCurrentProcess, GetCurrentThread, GetPriorityClass, IDLE_PRIORITY_CLASS,
+        SetPriorityClass,
     };
 
     #[link(name = "ntdll")]
@@ -302,16 +316,61 @@ mod platform {
     /// The I/O priority of a process that has been asked to stay out of the way.
     const IO_VERY_LOW: u32 = 0;
 
+    /// Lowers the I/O priority of the calling process, for the threads it starts afterwards, and of
+    /// the calling thread, which the process's value does not reach once the thread exists.
     pub(super) fn lower_io_class() -> std::result::Result<IoClass, Refusal> {
         set_io_priority(IO_VERY_LOW).map_err(|()| "this host refused the very low I/O priority")?;
+        set_thread_io_priority(IO_VERY_LOW)
+            .map_err(|()| "this host refused the very low I/O priority of the thread")?;
         io_class().ok_or("this host did not report the I/O priority it was given")
     }
 
+    /// The class the calling thread has only when the thread and the process both hold it, because
+    /// either one left at the normal priority is a path the weights can be read by.
     pub(super) fn io_class() -> Option<IoClass> {
         // SAFETY: the call takes no argument and returns the pseudo-handle of the calling process,
         // which needs no closing.
-        let io = io_priority_of(unsafe { GetCurrentProcess() })?;
+        let process = io_priority_of(unsafe { GetCurrentProcess() })?;
+        let thread = thread_io_priority()?;
+        (process == IO_VERY_LOW && thread == IO_VERY_LOW).then_some(IoClass::VeryLow)
+    }
+
+    /// The class this module names for an I/O priority the system reported.
+    #[cfg(any(test, feature = "testing"))]
+    pub(super) fn io_class_named(io: u32) -> Option<IoClass> {
         (io == IO_VERY_LOW).then_some(IoClass::VeryLow)
+    }
+
+    /// Sets the I/O priority of the calling thread.
+    fn set_thread_io_priority(priority: u32) -> std::result::Result<(), ()> {
+        // SAFETY: the call takes the pseudo-handle of the calling thread, which needs no closing, and
+        // reads one 32-bit value through a pointer to a live local of that size.
+        let status = unsafe {
+            NtSetInformationThread(
+                GetCurrentThread(),
+                ThreadIoPriority,
+                (&raw const priority).cast(),
+                4,
+            )
+        };
+        if status < 0 { Err(()) } else { Ok(()) }
+    }
+
+    /// Reads the I/O priority of the calling thread.
+    pub(super) fn thread_io_priority() -> Option<u32> {
+        let mut io = 0_u32;
+        // SAFETY: the call takes the pseudo-handle of the calling thread, which needs no closing,
+        // and writes one 32-bit value through a pointer to a live local of that size.
+        let queried = unsafe {
+            NtQueryInformationThread(
+                GetCurrentThread(),
+                ThreadIoPriority,
+                (&raw mut io).cast(),
+                4,
+                std::ptr::null_mut(),
+            )
+        };
+        (queried >= 0).then_some(io)
     }
 
     pub(super) fn lower_priority_class() -> std::result::Result<(), Refusal> {
@@ -404,12 +463,14 @@ mod platform {
         })
     }
 
-    /// The priority class and the I/O priority of the calling process when they were noted.
+    /// The priority class and the I/O priorities of the calling process and thread when they were
+    /// noted.
     #[cfg(any(test, feature = "testing"))]
     #[derive(Debug)]
     pub(super) struct Saved {
         priority_class: u32,
         io_priority: Option<u32>,
+        thread_io_priority: Option<u32>,
     }
 
     #[cfg(any(test, feature = "testing"))]
@@ -422,6 +483,7 @@ mod platform {
         Saved {
             priority_class,
             io_priority: io_priority_of(process),
+            thread_io_priority: thread_io_priority(),
         }
     }
 
@@ -429,6 +491,10 @@ mod platform {
     pub(super) fn restore(saved: Saved) -> std::result::Result<(), Refusal> {
         if let Some(io) = saved.io_priority {
             set_io_priority(io).map_err(|()| "this host refused to put the I/O priority back")?;
+        }
+        if let Some(io) = saved.thread_io_priority {
+            set_thread_io_priority(io)
+                .map_err(|()| "this host refused to put the thread's I/O priority back")?;
         }
         // SAFETY: the call takes the pseudo-handle of the calling process and a class, and reads
         // no memory of this process.
@@ -528,6 +594,11 @@ mod tests {
         assert_eq!(io_class(), None, "and the read-back follows it back");
     }
 
+    /// The tests that change this process's class take turns, since the class is the process's and
+    /// each starts from the class the process was found in.
+    #[cfg(windows)]
+    static CLASS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// The process enters the background class, and the system reports the idle priority class and
     /// the very low I/O priority, both to the process itself and to a handle opened on it by its
     /// identifier. The process is put back as it was found, so the tests that run beside this one
@@ -540,6 +611,9 @@ mod tests {
             process_class_of, save,
         };
 
+        let _turn = CLASS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let before = process_class().expect("the class this process started with is readable");
         assert!(!before.idle_priority_class);
         assert_eq!(before.io, None);
@@ -559,5 +633,55 @@ mod tests {
         assert_eq!(seen_from_outside, Some(in_the_class));
         assert_eq!(left, Ok(()));
         assert_eq!(process_class(), Some(before), "and the class is left");
+    }
+
+    /// The class is read from the thread that asks. A thread that lowered it finds the system
+    /// holding it, for the thread and for the process, and a thread that was already running when
+    /// the process's class was lowered, and lowered none of its own, does not have the class: the
+    /// process's value does not reach a thread that exists, so a thread reporting the process's
+    /// value would say it is in the class while it reads the weights at the normal priority.
+    #[cfg(windows)]
+    #[test]
+    fn the_io_class_a_windows_thread_reads_is_its_own_and_not_the_process() {
+        use super::{IoClass, io_class, lower_io_class, save, thread_io_class};
+        use std::sync::mpsc::channel;
+
+        let _turn = CLASS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (running, hears_running) = channel();
+        let (go, goes) = channel::<()>();
+        let bystander = std::thread::spawn(move || {
+            running.send(()).expect("the test listens");
+            goes.recv().expect("the test goes on");
+            (io_class(), thread_io_class())
+        });
+        hears_running.recv().expect("the thread is running");
+
+        let (lowered, hears_lowered) = channel();
+        let (read, reads) = channel::<()>();
+        let lowering = std::thread::spawn(move || {
+            let saved = save();
+            let while_lowered = (lower_io_class(), io_class(), thread_io_class());
+            lowered.send(()).expect("the test listens");
+            reads.recv().expect("the test goes on");
+            let put_back = saved.restore();
+            (while_lowered, put_back, io_class(), thread_io_class())
+        });
+        hears_lowered.recv().expect("the thread lowered its class");
+        go.send(()).expect("the other thread waits");
+        let (bystander_class, bystander_thread) = bystander.join().expect("the thread ends");
+        read.send(()).expect("the lowering thread waits");
+        let (while_lowered, put_back, class_after, thread_after) =
+            lowering.join().expect("the thread ends");
+
+        assert_eq!(while_lowered.0, Ok(IoClass::VeryLow));
+        assert_eq!(while_lowered.1, Some(IoClass::VeryLow));
+        assert_eq!(while_lowered.2, Some(IoClass::VeryLow));
+        assert_eq!(put_back, Ok(()));
+        assert_eq!(class_after, None, "and the class is put back");
+        assert_eq!(thread_after, None, "for the thread as well");
+        assert_eq!(bystander_thread, None, "a thread that lowered nothing");
+        assert_eq!(bystander_class, None, "has no class to report");
     }
 }
