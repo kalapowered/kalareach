@@ -126,6 +126,18 @@ pub fn thread_io_class() -> Option<IoClass> {
     platform::thread_io_priority().and_then(platform::io_class_named)
 }
 
+/// Sets the I/O priority of the calling thread alone to the normal one, whatever the process's is,
+/// which is how a test shows that the thread's own value is read apart from the process's.
+///
+/// # Errors
+///
+/// Returns why the system refused.
+#[cfg(all(windows, any(test, feature = "testing")))]
+pub fn set_thread_io_class_normal() -> std::result::Result<(), Refusal> {
+    platform::set_thread_io_priority(platform::IO_NORMAL)
+        .map_err(|()| "this host refused the normal I/O priority for the thread")
+}
+
 /// The classes a test found its process or thread in, so that it can leave them as it found them.
 #[cfg(any(test, feature = "testing"))]
 #[derive(Debug)]
@@ -293,6 +305,8 @@ mod platform {
     )]
 
     use super::{IoClass, Refusal};
+    #[cfg(any(test, feature = "testing"))]
+    use windows_sys::Wdk::System::Threading::NtSetInformationThread;
     use windows_sys::Wdk::System::Threading::{
         NtQueryInformationProcess, NtQueryInformationThread, ProcessIoPriority, ThreadIoPriority,
     };
@@ -315,6 +329,10 @@ mod platform {
 
     /// The I/O priority of a process that has been asked to stay out of the way.
     const IO_VERY_LOW: u32 = 0;
+
+    /// The I/O priority a thread has when nothing has asked it to stay out of the way.
+    #[cfg(any(test, feature = "testing"))]
+    pub(super) const IO_NORMAL: u32 = 2;
 
     /// Lowers the I/O priority of the calling process, and reads it back from the process and from
     /// the calling thread, which reads the process's value once it is set.
@@ -354,6 +372,22 @@ mod platform {
             )
         };
         (queried >= 0).then_some(io)
+    }
+
+    /// Sets the I/O priority of the calling thread.
+    #[cfg(any(test, feature = "testing"))]
+    pub(super) fn set_thread_io_priority(priority: u32) -> std::result::Result<(), ()> {
+        // SAFETY: the call takes the pseudo-handle of the calling thread, which needs no closing,
+        // and reads one 32-bit value through a pointer to a live local of that size.
+        let status = unsafe {
+            NtSetInformationThread(
+                GetCurrentThread(),
+                ThreadIoPriority,
+                (&raw const priority).cast(),
+                4,
+            )
+        };
+        if status < 0 { Err(()) } else { Ok(()) }
     }
 
     pub(super) fn lower_priority_class() -> std::result::Result<(), Refusal> {
@@ -670,5 +704,45 @@ mod tests {
         assert_eq!(put_back, Ok(()));
         assert_eq!(class_after, None, "and the class is put back");
         assert_eq!(thread_after, None, "for the thread as well");
+    }
+
+    /// The thread's own value is part of the class apart from the process's: with the process's
+    /// I/O priority lowered and the calling thread's set back to normal, the process reads very low
+    /// and the thread reads normal, and the class is not applied to the thread that loads the
+    /// model, because either one left at the normal priority is a path the weights can be read by.
+    #[cfg(windows)]
+    #[test]
+    fn a_thread_set_back_to_normal_is_not_in_the_class_though_its_process_is() {
+        use super::{
+            IoClass, io_class, lower_io_class, process_class, save, set_thread_io_class_normal,
+            thread_io_class,
+        };
+
+        let _turn = CLASS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let thread = std::thread::spawn(|| {
+            let saved = save();
+            let lowered = lower_io_class();
+            let set_back = set_thread_io_class_normal();
+            let seen = (
+                process_class().and_then(|class| class.io),
+                thread_io_class(),
+                io_class(),
+            );
+            (lowered, set_back, seen, saved.restore())
+        });
+        let (lowered, set_back, seen, put_back) = thread.join().expect("the thread ends");
+
+        assert_eq!(lowered, Ok(IoClass::VeryLow));
+        assert_eq!(set_back, Ok(()));
+        assert_eq!(
+            seen.0,
+            Some(IoClass::VeryLow),
+            "the process is still lowered"
+        );
+        assert_eq!(seen.1, None, "the thread's own value is normal");
+        assert_eq!(seen.2, None, "so the class is not applied to the thread");
+        assert_eq!(put_back, Ok(()));
     }
 }
