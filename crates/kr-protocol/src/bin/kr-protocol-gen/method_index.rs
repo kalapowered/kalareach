@@ -363,35 +363,129 @@ fn fence(line: &str) -> Option<(u8, usize, &str)> {
     (length >= 3).then(|| (mark, length, &line[indent + length..]))
 }
 
+/// Reads a line as an ATX heading and returns its level and its text: up to three spaces, one to
+/// six `#`, then a space or a tab, or the end of the line. The text is what follows that one
+/// character, as written.
+fn atx(line: &str) -> Option<(usize, &str)> {
+    let indent = line.bytes().take_while(|byte| *byte == b' ').count();
+    if indent > 3 {
+        return None;
+    }
+    let rest = &line[indent..];
+    let level = rest.bytes().take_while(|byte| *byte == b'#').count();
+    if !(1..=6).contains(&level) {
+        return None;
+    }
+    match rest[level..].chars().next() {
+        None => Some((level, "")),
+        Some(' ' | '\t') => Some((level, &rest[level + 1..])),
+        Some(_) => None,
+    }
+}
+
+/// Reads a line as a Setext underline and returns the level it gives the paragraph above it: up to
+/// three spaces, then only `=` for level one or only `-` for level two, then any spaces and tabs.
+fn setext_underline(line: &str) -> Option<usize> {
+    let indent = line.bytes().take_while(|byte| *byte == b' ').count();
+    if indent > 3 {
+        return None;
+    }
+    let rest = line[indent..].trim_end_matches([' ', '\t']);
+    let mark = *rest.as_bytes().first()?;
+    if !rest.bytes().all(|byte| byte == mark) {
+        return None;
+    }
+    match mark {
+        b'=' => Some(1),
+        b'-' => Some(2),
+        _ => None,
+    }
+}
+
+/// Returns true when a line can be a line of a paragraph that a Setext underline then turns into a
+/// heading: it has text, is indented at most three spaces, and is not a rule, a list item, a quote,
+/// a table row or markup.
+fn paragraph_line(line: &str) -> bool {
+    let indent = line.bytes().take_while(|byte| *byte == b' ').count();
+    if indent > 3 {
+        return false;
+    }
+    let rest = line[indent..].trim_end();
+    if rest.is_empty() || rest.starts_with(['>', '|', '<']) {
+        return false;
+    }
+    let marks = rest
+        .bytes()
+        .filter(|byte| matches!(byte, b'-' | b'*' | b'_'))
+        .count();
+    let a_rule = marks >= 3
+        && rest
+            .bytes()
+            .all(|byte| matches!(byte, b'-' | b'*' | b'_' | b' ' | b'\t'));
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let a_list_item = match rest.as_bytes().get(digits) {
+        Some(b'-' | b'*' | b'+') if digits == 0 => true,
+        Some(b'.' | b')') => (1..=9).contains(&digits),
+        _ => false,
+    } && rest[digits + 1..]
+        .chars()
+        .next()
+        .is_none_or(|next| matches!(next, ' ' | '\t'));
+    !(a_rule || a_list_item)
+}
+
 /// Returns the heading lines of a document as (line number, level, text), in order.
 ///
-/// A line is a heading when it is one to six `#`, a space and the text. A line inside a fenced block
-/// is not: a shell comment there starts with `#` and ends no section. A block opens at a fence whose
-/// text after the run holds no backtick when the run is of backticks, and ends at a fence of the
-/// delimiter that opened it, at least as long as the opening and with nothing after the run, so a
-/// fence of the other kind, a shorter one, or one with text after it, inside a block, is text.
+/// A heading is an ATX heading (see [`atx`]) or a Setext heading: the lines of a paragraph above a
+/// Setext underline, the line number being that of the paragraph's first line and the text its lines
+/// joined by a space. A line inside a fenced block is no heading, and nor is a line inside an HTML
+/// comment: a shell comment in a fence starts with `#` and ends no section. A block opens at a fence
+/// whose text after the run holds no backtick when the run is of backticks, and ends at a fence of
+/// the delimiter that opened it, at least as long as the opening and with nothing after the run, so
+/// a fence of the other kind, a shorter one, or one with text after it, inside a block, is text. A
+/// comment opens at `<!--` and ends at the first line that holds `-->`; the line that opens it is
+/// read as any other line.
 fn headings(lines: &[&str]) -> Vec<(usize, usize, String)> {
     let mut found = Vec::new();
     let mut open: Option<(u8, usize)> = None;
+    let mut comment = false;
+    let mut paragraph: Vec<(usize, &str)> = Vec::new();
     for (number, line) in lines.iter().enumerate() {
-        let fenced = fence(line);
         if let Some((mark, length)) = open {
-            if fenced.is_some_and(|(closing, run, rest)| {
+            if fence(line).is_some_and(|(closing, run, rest)| {
                 closing == mark && run >= length && rest.trim_matches([' ', '\t']).is_empty()
             }) {
                 open = None;
             }
-        } else if let Some((mark, length, rest)) = fenced
+            continue;
+        }
+        if comment {
+            comment = !line.contains("-->");
+            continue;
+        }
+        if let Some((mark, length, rest)) = fence(line)
             && (mark == b'~' || !rest.contains('`'))
         {
             open = Some((mark, length));
-        } else {
-            let level = line.bytes().take_while(|byte| *byte == b'#').count();
-            if let (true, Some(text)) = ((1..=6).contains(&level), line[level..].strip_prefix(' '))
-            {
-                found.push((number, level, text.to_owned()));
-            }
+            paragraph.clear();
+            continue;
         }
+        if let Some((level, text)) = atx(line) {
+            found.push((number, level, text.to_owned()));
+            paragraph.clear();
+        } else if let (Some(level), Some((start, _))) = (setext_underline(line), paragraph.first())
+        {
+            let text: Vec<&str> = paragraph.iter().map(|(_, text)| text.trim()).collect();
+            found.push((*start, level, text.join(" ")));
+            paragraph.clear();
+        } else if paragraph_line(line) {
+            paragraph.push((number, line));
+        } else {
+            paragraph.clear();
+        }
+        comment = line
+            .find("<!--")
+            .is_some_and(|start| !line[start + 4..].contains("-->"));
     }
     found
 }
@@ -806,6 +900,136 @@ mod tests {
             found("~~~ info with `ticks`\n## X\n~~~\n## Y\n  ```sh\n## X\n  ```\n"),
             ["Y"],
             "a tilde fence takes any text, and a fence indented up to three spaces is one"
+        );
+    }
+
+    /// KR-REQ-01.24: a heading is read as a reader reads it: an ATX heading indented up to three
+    /// spaces or separated from its marker by a tab, and a Setext heading under a line of `=` or
+    /// `-`; and the text of an HTML comment holds none. In each document `X` is what a reader does
+    /// not see as a heading and `Y` what it does.
+    #[test]
+    fn a_heading_is_read_as_a_reader_reads_it() {
+        let found = |document: &str| -> Vec<String> {
+            let lines: Vec<&str> = document.lines().collect();
+            headings(&lines)
+                .into_iter()
+                .map(|(_, _, text)| text)
+                .collect()
+        };
+        let cases: [(&str, &str, &[&str]); 16] = [
+            ("up to three spaces of indentation", "   ## Y\n", &["Y"]),
+            ("four spaces are code", "    ## X\n## Y\n", &["Y"]),
+            ("a tab between the marker and the text", "##\tY\n", &["Y"]),
+            ("a heading with no text", "##\n## Y\n", &["", "Y"]),
+            ("a Setext heading under equals signs", "Y\n===\n", &["Y"]),
+            ("a Setext heading under dashes", "Y\n---\n", &["Y"]),
+            (
+                "a Setext underline indented three spaces, and spaces after the text and the line",
+                "Y  \n   ===  \n",
+                &["Y"],
+            ),
+            (
+                "the lines of a paragraph are one Setext heading",
+                "one\ntwo\n---\n",
+                &["one two"],
+            ),
+            (
+                "a rule after a blank line is no heading",
+                "text\n\n---\n## Y\n",
+                &["Y"],
+            ),
+            (
+                "dashes under a list item are a rule",
+                "- item\n---\n## Y\n",
+                &["Y"],
+            ),
+            (
+                "dashes under a table row are no heading",
+                "| a | b |\n---\n## Y\n",
+                &["Y"],
+            ),
+            (
+                "a comment holds no heading",
+                "<!--\n## X\n-->\n## Y\n",
+                &["Y"],
+            ),
+            (
+                "a comment on one line holds nothing after it",
+                "<!-- ## X -->\n## Y\n",
+                &["Y"],
+            ),
+            (
+                "a fence in a comment opens no block",
+                "<!--\n```\n-->\n## Y\n",
+                &["Y"],
+            ),
+            (
+                "a comment in a fenced block is text",
+                "```\n<!--\n```\n## Y\n-->\n",
+                &["Y"],
+            ),
+            (
+                "a heading that ends in a comment is a heading, and the comment runs on",
+                "## Y <!-- note\n## X\n-->\n",
+                &["Y <!-- note"],
+            ),
+        ];
+        let problems: Vec<String> = cases
+            .into_iter()
+            .filter(|(_, document, expected)| found(document) != *expected)
+            .map(|(rule, document, expected)| {
+                format!(
+                    "{rule}: {document:?} read as {:?}, not {expected:?}",
+                    found(document)
+                )
+            })
+            .collect();
+        assert_eq!(problems, Vec::<String>::new());
+    }
+
+    /// KR-REQ-01.24: a section runs to the next heading of its own level or a higher one, however
+    /// that heading is written, and not to a line a reader does not see as a heading: a method named
+    /// after a sibling heading is in the sibling, and one named after a `###` heading is in it.
+    #[test]
+    fn a_section_ends_at_the_next_heading_of_its_level_or_a_higher_one() {
+        let named = |document: &str, heading: &str, method: &str| -> bool {
+            let found = sections(document, heading);
+            assert_eq!(found.len(), 1, "{document:?}");
+            names(&found[0], method)
+        };
+        let after = "### Target\n\n`one.method`\n\n## Next\n\n`two.method`\n";
+        assert!(named(after, "Target", "one.method"));
+        assert!(
+            !named(after, "Target", "two.method"),
+            "a heading of a higher level ends the section"
+        );
+        let below = "## Target\n\n### Part\n\n`one.method`\n\n## Next\n\n`two.method`\n";
+        assert!(named(below, "Target", "one.method"));
+        assert!(!named(below, "Target", "two.method"));
+        let confused: Vec<&str> = [
+            ("an indented heading", " ## Elsewhere"),
+            ("a tab-separated heading", "##\tElsewhere"),
+            ("a Setext heading", "Elsewhere\n---"),
+        ]
+        .into_iter()
+        .filter(|(_, sibling)| {
+            named(
+                &format!("## Target\n\n{sibling}\n`one.method`\n"),
+                "Target",
+                "one.method",
+            )
+        })
+        .map(|(how, _)| how)
+        .collect();
+        assert_eq!(
+            confused,
+            Vec::<&str>::new(),
+            "a method after these is in the sibling, not in the section above"
+        );
+        let hidden = "## Target\n\n<!--\n## Fake\n-->\n`one.method`\n";
+        assert!(
+            named(hidden, "Target", "one.method"),
+            "a heading in a comment ends nothing"
         );
     }
 
