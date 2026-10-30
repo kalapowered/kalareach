@@ -1022,24 +1022,24 @@ sheet says so. A phone shows the setting and offers no recovery.
 
 ## The managed services the application holds
 
-`src-tauri/src/services.rs` is where the application decides which client each use of a managed
-service gets. `kr-client` names the clients as traits (account login, relay leases, push, encrypted
-sync and backup, managed inference), and the application works without any of them. A fork replaces
-a client by supplying its implementation of the trait where the desk that uses it is opened; the
-calls that desk makes through the seams below then go to that client. Two reads stay outside them:
-recovery's reads of the bundle for the archive list and the offline copy, which go through
-`kr-client`'s `AccountSource` and its own clients, and the voice control socket, which
-`Service::connector` opens. Neither is a slot of `ServiceClients`.
+`kr-client` names the clients of the managed services as traits (account login, relay leases, push,
+encrypted sync and backup, managed inference), and the application works without any of them. Each
+use takes its client from the place that decides it, and a fork replaces a client by supplying its
+implementation of the trait there: `src-tauri/src/services.rs` for the sync service,
+`push::Wiring` for the push gateway, `voice::Service` for the voice broker, and `build_account` in
+`src-tauri/src/lib.rs` for the account. The calls a desk makes through those seams then go to that
+client.
 
 - **Sync and backup.** `SyncServices` gives the client of the sync service at an origin, as a
   `SharedSyncService`. `installation(&origin)` signs as this installation, and
   `presenting(&origin, tokens, scope)` also presents the account's token for `scope`, which
   recovery's bundle store uses. Settings sync, its drafts and its members, and recovery's bundle
-  store ask only through it. The origin is an argument because a record keeps the origin it was made at: a record
-  made while the setting named one service goes on asking for that service after the setting names
-  another, and only a new record reads the setting. `ManagedSyncServices` is the production
-  implementation. `AppState::sync_clients_replaced` installs another before the desks open, and the
-  first installation stands.
+  store ask only through it. The origin is an argument because a record keeps the origin it was
+  made at: a record made while the setting named one service goes on asking for that service after
+  the setting names another, and only a new record reads the setting. `ManagedSyncServices` is the
+  production implementation. `AppState::sync_clients_replaced` installs another, and only before
+  the first desk asks for its clients: the first installation stands, and a call after
+  `AppState::sync_clients` has run changes nothing.
 - **Push.** `push::Wiring::gateway` makes the client of the push gateway for an origin and the
   installation's signer, `push::gateway_over` makes the managed one over a transport, and
   `PushDesk::client` returns the client the desk registers through now.
@@ -1047,20 +1047,40 @@ recovery's reads of the bundle for the archive list and the offline copy, which 
   the client of its broker, and `Calls::broker` returns the client it makes.
 - **Account login.** `Account::service` is the client the account signs in through.
 
+These stay outside the seams, each making its own client, and a fork that points one at its own
+service changes it where it is made:
+
+- the mailbox reader (`src-tauri/src/mailbox.rs`) and the authority feed
+  (`src-tauri/src/revocation.rs`), which make their clients at the sync service's origin; the feed
+  also publishes;
+- the pairing admission (`src-tauri/src/device/mod.rs`), a `ManagedPairingAdmission` over the
+  managed service's origin;
+- account deletion (`src-tauri/src/lib.rs`), a `ManagedAccountDeletion`;
+- recovery's reads of the bundle for the archive list and the offline copy, which go through
+  `kr-client`'s `AccountSource` and its own clients;
+- the answer to a push challenge, which the native receivers post (`companion_platform::push`), so
+  the companion's push client never calls `PushService::answer`;
+- the voice control socket, which `Service::connector` opens and over which the call sends its
+  `VoiceCommand`s.
+
 Relay leases, managed storage and the backup manifest are not held here: a host keeps the leases of
 the pairs it serves and makes the uploads of its backups. The lease desk builds the membership
 lease client for each account mark.
 
 The Account sheet lists, under "Managed services on this device", the services the application can
 hold a client of: account login, push registration, sync and backup, and managed inference. The
-`account_services` command puts the clients the desks hold now into a `ServiceClients`
-(`services::Held::of`) and gives `ServiceClients::availability_of` for each. The sync line is made from
-the client the installed `SyncServices` gives for the origin the setting names. A service whose
-client is held reads as configured, which says nothing of whether a call will succeed; one with no
-client, because its desk is not open on this device, reads as the library says, with what a person
-can do instead. The list asks no service, has no control, link or form, and nothing consults it
-before local work. The sheet leaves it out when the command fails. Under it the sheet says these are
-the managed services an app can use and that a host keeps its own relay leases, so none is listed.
+`account_services` command puts clients into a `ServiceClients` (`services::Held::of`) and gives
+`ServiceClients::availability_of` for each. Only the account's client is one the application holds.
+`Held::of` asks the installed `SyncServices` for the sync client at the origin the setting names
+now, which after a change is not the origin of a record made earlier, and makes the push and
+inference clients again through `PushDesk::client` and `Calls::broker`. A service whose client
+exists reads as configured, which says nothing of whether a call will succeed. One with no client
+reads as the library says, with what a person can do instead. It has none when its desk is not
+open on this device, and also when its factory could not make the client: `Held::of` drops that
+error, and the sheet does not say why. The list asks no service, has no control, link or form, and
+nothing consults it before local work. The sheet leaves it out when the command fails. Under it the
+sheet says these are the managed services an app can use and that a host keeps its own relay
+leases, so none is listed.
 
 ## What a phone reads once
 
