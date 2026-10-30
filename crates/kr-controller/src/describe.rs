@@ -1035,8 +1035,10 @@ impl crate::service::Controller {
                     kr_protocol::describe::DescriptionDownloadAction::Start => {
                         self.start_fetch(&host, &carried).await?;
                     }
+                    // A cancellation changes what the fetch is doing, so it stands on the
+                    // admission it was accepted under as a start does.
                     kr_protocol::describe::DescriptionDownloadAction::Cancel => {
-                        self.descriptions.fetches.cancel();
+                        self.under_registration(&carried, || self.descriptions.fetches.cancel())?;
                     }
                 }
                 self.description_setup()
