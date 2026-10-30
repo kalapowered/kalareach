@@ -1780,9 +1780,9 @@ mod launching {
     /// A headless worker has no business on the person's desktop, so it is made one of its own,
     /// named for the worker. A desktop-bound worker belongs to that desktop, and so does every
     /// service: they are created on the starter's own.
-    fn own_desktop(profile: WorkerProfile, label: String) -> Option<String> {
-        match profile {
-            WorkerProfile::HeadlessUser => Some(label),
+    fn own_desktop(launch: &WorkerLaunch) -> Option<String> {
+        match launch.profile {
+            WorkerProfile::HeadlessUser => Some(launch.label()),
             WorkerProfile::DesktopBound => None,
         }
     }
@@ -1792,19 +1792,32 @@ mod launching {
         use kr_protocol::identity::WorkerProfile;
 
         use super::own_desktop;
+        use crate::supervision::WorkerLaunch;
+
+        fn launch(profile: WorkerProfile) -> WorkerLaunch {
+            WorkerLaunch {
+                reservation_id: kr_protocol::worker::ReservationId::new(kr_ipc::new_uuid()),
+                session_id: kr_protocol::ids::SessionId::new(kr_ipc::new_uuid()),
+                environment_id: kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid()),
+                display_number: kr_protocol::session::DisplayNumber::new(1),
+                program: "kr-worker.exe".into(),
+                rendezvous: "rendezvous".into(),
+                runtime_directory: "runtime".into(),
+                state_directory: "state".into(),
+                jobs_directory: "jobs".into(),
+                working_directory: "work".into(),
+                desktop_environment: Vec::new(),
+                profile,
+            }
+        }
 
         /// KR-REQ-03.24: a headless worker is made on a desktop of its own, named for the worker,
         /// and a desktop-bound worker is not: it is made on the starter's own.
         #[test]
         fn only_a_headless_worker_is_made_on_a_desktop_of_its_own() {
-            assert_eq!(
-                own_desktop(WorkerProfile::HeadlessUser, "kr-worker-7".to_owned()),
-                Some("kr-worker-7".to_owned())
-            );
-            assert_eq!(
-                own_desktop(WorkerProfile::DesktopBound, "kr-worker-7".to_owned()),
-                None
-            );
+            let headless = launch(WorkerProfile::HeadlessUser);
+            assert_eq!(own_desktop(&headless), Some(headless.label()));
+            assert_eq!(own_desktop(&launch(WorkerProfile::DesktopBound)), None);
         }
     }
 
@@ -2082,7 +2095,7 @@ mod launching {
             self.hand_over(
                 &launch.service(),
                 &launch.desktop_environment,
-                own_desktop(launch.profile, launch.label()),
+                own_desktop(launch),
             )
         }
 

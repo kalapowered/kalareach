@@ -2,10 +2,14 @@
 //! worker.
 //!
 //! KR-REQ-03.24: a `headless_user` session has no inherited GUI access. Its worker is started on a
-//! window station and desktop of its own, so neither it nor a program it starts inherits the
-//! interactive desktop of the person signed in, while a `desktop_bound` session is on that desktop.
-//! The same probe runs in each session's shell, which is a console program in a pseudo-console, so
-//! that the shell answering at all shows that such a program still runs on a desktop of its own.
+//! desktop of its own, so neither it nor a program it starts inherits the interactive desktop of
+//! the person signed in. The probe runs in a headless session's shell, which is a console program
+//! in a pseudo-console, so that the shell answering at all shows that such a program still runs on
+//! a desktop of its own. As a control, the same probe runs in a process the task's starter creates
+//! with no desktop of its own, which is what it does for a desktop-bound worker, and finds the
+//! interactive desktop. That is not a desktop-bound session: an account without administrative
+//! rights cannot have one bound here, because the login reader cannot read the start time of its
+//! logon process. Which profile gets a desktop of its own is the supervisor's `placement` case.
 //!
 //! This is not a boundary against a process of the same account, which can still open the
 //! interactive desktop by name; nothing here claims that it is.
@@ -31,8 +35,9 @@ const WINDOW_MILLISECONDS: u32 = 60_000;
 /// window it can make and look for.
 ///
 /// `Run` reports the process's own station and desktop, whether the interactive window station
-/// and its `Default` desktop open, and whether the input desktop opens from where the process is.
-/// It switches nothing, so what it reports is where the process was started. `Show` makes a
+/// `WinSta0` opens, whether a desktop named `Default` opens on the process's own station (which is
+/// the interactive one only for a process that is on it), and whether the input desktop opens from
+/// where the process is. It switches nothing, so what it reports is where the process was started. `Show` makes a
 /// visible window with the title it is given, says so, and keeps it for a while; `Seen` says
 /// whether a window with that title is on the desktop of the process that asks. The strings it
 /// prints hold the pieces of the marker apart, so what a terminal waits for is the output and not
@@ -224,16 +229,18 @@ async fn on_the_starters_desktop(host: &WorkerHost, title: &str) -> Found {
     found
 }
 
-/// KR-REQ-03.24: a headless session's shell is on a station and desktop of its own, away from the
-/// interactive ones, draws nothing on them, and still runs; a desktop-bound session's shell is on
-/// the interactive desktop and its window is there.
+/// KR-REQ-03.24: a headless session's shell is on a desktop of its own, not on the interactive
+/// one, draws nothing on it, and still runs; a process the starter creates with no desktop of its
+/// own is on the interactive desktop and its window is there.
 ///
 /// The control is this test's own probe: if it is not on the interactive desktop, the machine this
-/// runs on has no signed-in session and nothing here would show anything. The desktop-bound
-/// session's window is the control for the headless session's: the same call, on the interactive
-/// desktop, is seen from here.
+/// runs on has no signed-in session and nothing here would show anything. The window of the
+/// starter's own process is the control for the headless session's: the same call, on the
+/// interactive desktop, is seen from here. Nothing here says a headless process cannot open the
+/// interactive desktop by name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_headless_session_is_not_on_the_interactive_desktop_and_a_desktop_bound_one_is() {
+async fn a_headless_session_is_not_on_the_interactive_desktop_and_a_process_on_the_starters_own_is()
+{
     let control = probe_here();
     assert!(
         control.on_the_interactive_desktop(),

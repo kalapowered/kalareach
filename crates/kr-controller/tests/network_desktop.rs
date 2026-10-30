@@ -639,7 +639,9 @@ async fn kr_req_03_27_what_an_agent_waits_for_is_a_pending_request_a_device_read
 ///
 /// The session is managed, so it counts launches and says so; a `native_compat` session cannot have
 /// one and says nothing. What the reader would answer is not what this shows, so the caller stays
-/// waiting until the returned transaction is forgotten.
+/// waiting until the returned transaction is forgotten. The launch is registered through the
+/// session's own call, so this does not show that the `shell.launch` handler registers one: that
+/// is the worker's own case.
 fn a_launch_waiting_for_its_reader(
     worker: &net_support::worker::Worker,
 ) -> (
