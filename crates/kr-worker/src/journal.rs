@@ -3461,7 +3461,9 @@ impl Journal {
     ///
     /// A controller reads a closed session's journal to recover what the worker recorded: the
     /// closure it wrote, and the session it described. Opening read-only is what makes that safe
-    /// to do beside a store the worker may still be finishing with.
+    /// to do beside a store the worker may still be finishing with. The one read it makes of a
+    /// live worker's journal is the record of the processes the worker owns, for the process view:
+    /// one row the worker replaces whole, read in one short transaction.
     ///
     /// # Errors
     ///
