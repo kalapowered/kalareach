@@ -531,7 +531,7 @@ impl KeyboardState {
 #[must_use]
 pub fn input_context(terminal: &ControllingTerminal) -> kr_term::probe::InputContext {
     match contamination_marker(terminal) {
-        Some(path) if path.exists() => kr_term::probe::InputContext::Contaminated,
+        Some((_, path)) if path.exists() => kr_term::probe::InputContext::Contaminated,
         _ => kr_term::probe::InputContext::Clean,
     }
 }
@@ -543,17 +543,23 @@ pub fn input_context(terminal: &ControllingTerminal) -> kr_term::probe::InputCon
 /// stream may still deliver a reply. [`clear_contamination`] removes it once the terminator has
 /// arrived, which is the only thing that proves nothing else is coming.
 ///
-/// Returns whether the record was written. A host whose runtime directory cannot be written, or a
-/// terminal with no name to record it under, cannot be recorded, and the caller does not send the
-/// exchange then, since a failure of it could not be retried safely. What the record buys is the
-/// *next* attempt.
+/// Returns whether the record was written. A host whose runtime root is not owner-only or cannot
+/// be written, or a terminal with no name to record it under, cannot be recorded, and the caller
+/// does not send the exchange then, since a failure of it could not be retried safely. What the
+/// record buys is the *next* attempt.
 pub fn mark_contaminated(terminal: &ControllingTerminal) -> bool {
-    let Some(path) = contamination_marker(terminal) else {
+    let Some((runtime_root, path)) = contamination_marker(terminal) else {
         return false;
     };
+    // The first command of a fresh install can be the one that makes the runtime root, and the
+    // daemon's start that follows verifies it. The probe comes first, so it verifies the root
+    // itself: a record is not written below a root that others can change.
+    if kr_ipc::paths::create_private_tree(&runtime_root, &runtime_root).is_err() {
+        return false;
+    }
     if let Some(parent) = path.parent() {
-        // The first command of a fresh install can be the one that makes the runtime root, and a
-        // root made with the umask's mode is one the start that follows refuses.
+        // The directory of the records is below a root that is owner-only. One an earlier release
+        // made with the umask's mode is used as it is.
         let _ = kr_ipc::paths::create_dir_all_owner_only(parent);
     }
     std::fs::write(&path, b"a probe on this terminal did not finish\n").is_ok()
@@ -565,21 +571,23 @@ pub fn mark_contaminated(terminal: &ControllingTerminal) -> bool {
 /// first question goes out and removed only here, so a process that died in the middle of asking
 /// leaves the record behind for the next attempt to find.
 pub fn clear_contamination(terminal: &ControllingTerminal) {
-    if let Some(path) = contamination_marker(terminal) {
+    if let Some((_, path)) = contamination_marker(terminal) {
         let _ = std::fs::remove_file(path);
     }
 }
 
-/// The file that records a contaminated terminal, named after the terminal itself.
-fn contamination_marker(terminal: &ControllingTerminal) -> Option<std::path::PathBuf> {
+/// The runtime root, and under it the file that records a contaminated terminal, named after the
+/// terminal itself.
+fn contamination_marker(
+    terminal: &ControllingTerminal,
+) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     let paths = kr_ipc::paths::HostPaths::discover().ok()?;
     let name = terminal.identity()?;
-    Some(
-        paths
-            .runtime_root()
-            .join("probes")
-            .join(format!("{name}.contaminated")),
-    )
+    let record = paths
+        .runtime_root()
+        .join("probes")
+        .join(format!("{name}.contaminated"));
+    Some((paths.runtime_root().to_path_buf(), record))
 }
 
 /// The size of a terminal, in character cells.
@@ -847,7 +855,7 @@ mod unix {
                 return Err(CliError::TerminalProbeFailed(Shown::said(
                     "this host cannot record that this terminal has been asked, so a handshake \
                      here could not be retried safely; attach with --no-probe, or make the \
-                     runtime directory writable",
+                     runtime directory yours alone and writable",
                 )));
             }
             let mut asking = saved.clone();
