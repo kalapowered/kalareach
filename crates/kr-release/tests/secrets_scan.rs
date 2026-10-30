@@ -382,21 +382,31 @@ fn sealing_refuses_an_archive_that_holds_a_private_key_the_scan_of_the_tree_did_
 // The case holds the three workflows in the plain style they are written in today, reading each
 // line as it stands. In that style it refuses every change the cases after it make: a scan or a
 // sealing that is not the exact command on the exact path, one that can fail without stopping its
-// step (an optional or conditional step or job, another shell, `set +`, `||`, `&&`, `;`, `&`, a
-// branch, a loop or a group around it, an `exit` before it), a value of `run`, `shell`, `if` or
-// `path` that goes on to the next line, a step that keeps or uploads before its scan, after a
-// failure, or from a wider path than the scan read, and an upload that the case does not name.
+// step (a step with `if` or `continue-on-error`, a job with `continue-on-error`, another shell,
+// `set +`, `shopt`, `||`, `&&`, `;`, `&`, a branch, a loop or a group around it, an `exit` before
+// it), a value of `run`, `shell`, `if` or `path` that goes on to the next line or opens a quote it
+// does not close, a step that keeps or uploads before its scan, or after a failure (a condition
+// that names a status function and is not `success()` alone or `success() && <rest>` with no `||`
+// in the rest), or from another path than the one the file holds today, and an upload that the
+// case does not name.
+//
+// Each kept path is the one in the file today (`HOLDS`), not a path derived from what its scan
+// read. The Windows tree upload keeps the directory above the scanned tree (`tree`, where the scan
+// reads `tree/$TOP`), so a step before the scan that writes into that directory, beside the tree,
+// puts its files in the artefact unread; the same holds for every kept directory. The case does not
+// look for such a step, nor for a step between a scan and a step that keeps, which can change what
+// is there.
 //
 // It is not a YAML parser and not a shell parser, and it does not hold what they would read
 // differently: a value continued on the next line under another key, an anchor or an alias, an
-// escape in a double-quoted value, a folded scalar, an inline mapping; shell quoting (a quoted
-// string that makes a comment of the scan), and the shell's grammar (`true; if false; then`, a
-// function nothing calls, `exec`, a backslash before a command). Nor does it hold a loop that runs
-// no time, a function, an alias or a search path that takes the place of a command, a step between
-// a scan and a step that keeps, which can change what is there, a step that keeps by another
-// action than `actions/upload-artifact`, a step of another job or workflow that takes what a job
-// assembled, or that the runner runs the file as written (`actionlint` and a run of the workflow
-// show that). A check that parses the YAML replaces it when it is built.
+// escape in a double-quoted value, a folded scalar, an inline mapping, an `if` on a job (a job
+// that does not run keeps nothing); shell quoting (a quoted string that makes a comment of the
+// scan), and the shell's grammar (`true; if false; then`, a function nothing calls, `exec`, a
+// backslash before a command). Nor does it hold a loop that runs no time, a function, an alias or
+// a search path that takes the place of a command, a step that keeps by another action than
+// `actions/upload-artifact`, a step of another job or workflow that takes what a job assembled, or
+// that the runner runs the file as written (`actionlint` and a run of the workflow show that). A
+// check that parses the YAML replaces it when it is built.
 
 /// What a workflow can do that lets a private key past its scan. Each is refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -413,7 +423,7 @@ enum Refusal {
     /// The command sits where it can be skipped: in a branch, a group or a loop that may not run,
     /// after an `exit`, or in a here-document.
     Skippable,
-    /// `set +` in any form, which turns off the stop at a failing command.
+    /// `set +` in any form, or `shopt`, which turn off the stop at a failing command.
     ErrexitOff,
     /// A shell other than `bash` (or `pwsh`, where a workflow runs it by default), whose
     /// fail-fast options a different `shell:` leaves off, or a variable that changes how it starts.
@@ -428,11 +438,13 @@ enum Refusal {
     UnknownUpload,
     /// A step that keeps what a job assembled, before the scan it has to come after.
     KeptBeforeScan,
-    /// A status function that lets a step run after a failure (`always()`, `failure()`,
-    /// `cancelled()`, or `!success()`) on a step that keeps what a job assembled. `success()` is
-    /// what a step without a condition has, and is not refused.
+    /// A condition on a step that keeps what a job assembled that names a status function
+    /// (`always()`, `failure()`, `cancelled()`, `success()`) and is not `success()` alone or
+    /// `success() && <rest>` with no `||` and no status function in the rest: `!success()`,
+    /// `success() || x`, `success() == false` and `success() && a || b` run after a failure.
     KeptOnFailure,
-    /// A step that keeps what a job assembled from another path than the one its scan read.
+    /// A step that keeps what a job assembled from another path or by another command than the
+    /// one the file holds today.
     KeptPath,
     /// A value of `run`, `shell`, `if` or `path` that goes on to the next line, where the case reads
     /// the first line only.
@@ -580,8 +592,9 @@ enum Holds {
     Command(&'static str),
 }
 
-/// The steps that keep, and what each keeps: the path its scan read, or the command that packs
-/// the tree it scanned.
+/// The steps that keep, and what each keeps: the path or the command that the file holds today,
+/// which the scan of its job read or is taken to have read. A path is not derived from the scan's:
+/// the Windows tree upload keeps `tree`, the directory above the scanned `tree/$TOP`.
 static HOLDS: [(&str, &str, Holds); 13] = [
     (
         "release-tree.yml",
@@ -696,6 +709,30 @@ fn pair(text: &str) -> Option<(&str, &str)> {
     Some((key.trim(), value.trim()))
 }
 
+/// Whether a YAML value opens a quoted string that it does not close on its line: `"bash` and
+/// `'bash {0}`. A double-quoted string closes at a `"` that no `\` escapes, a single-quoted one at
+/// a `'` that is not doubled.
+fn opens_a_quote_it_does_not_close(value: &str) -> bool {
+    let mut characters = value.chars();
+    let Some(quote @ ('"' | '\'')) = characters.next() else {
+        return false;
+    };
+    let mut rest = characters.peekable();
+    while let Some(character) = rest.next() {
+        match character {
+            '\\' if quote == '"' => {
+                rest.next();
+            }
+            '\'' if quote == '\'' && rest.peek() == Some(&'\'') => {
+                rest.next();
+            }
+            found if found == quote => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
 /// A command of a step's `run`: its lines joined, where a line ends in a backslash.
 struct Statement {
     first: usize,
@@ -794,7 +831,8 @@ impl<'a> Workflow<'a> {
 
     /// Whether the value of the key on line `at` goes on to the next line, where the case reads the
     /// first only: the next line of code is indented further than the key, or the value is a folded
-    /// block, or a literal one for any key but `run`.
+    /// block, or a literal one for any key but `run`, or it opens a quote that it does not close on
+    /// its line (YAML takes the next line into a quoted value at any indent).
     fn goes_on(&self, at: usize) -> bool {
         let line = self.lines[at];
         let Some((key, value)) = pair(line.trim_start().trim_start_matches("- ")) else {
@@ -802,6 +840,9 @@ impl<'a> Workflow<'a> {
         };
         if value.starts_with('|') {
             return key != "run";
+        }
+        if opens_a_quote_it_does_not_close(value) {
+            return true;
         }
         let column = indent(line)
             + if line.trim_start().starts_with("- ") {
@@ -931,12 +972,27 @@ fn turns_errexit_off(words: &[&str]) -> bool {
         .any(|(at, _)| words[at + 1..].iter().any(|word| word.starts_with('+')))
 }
 
-/// Whether a branch or a loop on one line ends on that line: `if [ -d x ]; then echo x; fi`.
+/// The words that open a branch or a loop, and the words that close one.
+const OPENING: [&str; 6] = ["if", "for", "while", "until", "case", "select"];
+const CLOSING: [&str; 3] = ["fi", "done", "esac"];
+
+/// How many branches and loops a line opens and how many it closes, by its words.
+fn opened_and_closed(text: &str) -> (usize, usize) {
+    let words = words(text);
+    let count = |names: &[&str]| words.iter().filter(|word| names.contains(word)).count();
+    (count(&OPENING), count(&CLOSING))
+}
+
+/// Whether a branch or a loop on one line ends on that line: `if [ -d x ]; then echo x; fi`. A `#`
+/// makes what follows a comment, so a line with one is never taken to close, and a line closes only
+/// when it ends in a closing word and has as many closing words as opening words.
 fn ends_on_its_line(text: &str) -> bool {
-    let text = text.trim_end().trim_end_matches(';').trim_end();
-    ["fi", "done", "esac"]
-        .iter()
-        .any(|end| text.ends_with(&format!(";{end}")) || text.ends_with(&format!("; {end}")))
+    let (opened, closed) = opened_and_closed(text);
+    !text.contains('#')
+        && opened == closed
+        && words(text)
+            .last()
+            .is_some_and(|word| CLOSING.contains(word))
 }
 
 /// The branches, loops and groups still open where the command at `at` starts, by their first word.
@@ -948,9 +1004,10 @@ fn open_before(commands: &[Statement], at: usize) -> Vec<String> {
         let unbalanced = |opening: char, closing: char| {
             text.matches(opening).count() != text.matches(closing).count()
         };
-        if ["if", "for", "while", "until", "case", "select"].contains(&word) {
+        if OPENING.contains(&word) {
             if !ends_on_its_line(text) {
-                open.push(word.to_owned());
+                let (opened, closed) = opened_and_closed(text);
+                open.extend(vec![word.to_owned(); opened.saturating_sub(closed).max(1)]);
             }
         } else if matches!(word, "fi" | "done" | "esac") || text == ")" || text == "}" {
             open.pop();
@@ -965,24 +1022,52 @@ fn open_before(commands: &[Statement], at: usize) -> Vec<String> {
     open
 }
 
-/// Whether lines name a status function of a workflow's expressions, which are not case-sensitive.
-fn names_a_status_function(lines: &[&str]) -> bool {
-    let squeezed: String = lines
-        .iter()
-        .flat_map(|line| line.chars())
+/// The text of a workflow's expression without its blanks and in lower case, since expressions are
+/// not case-sensitive, and without the `${{ }}` around it.
+fn squeezed(condition: &str) -> String {
+    let text: String = condition
+        .chars()
         .filter(|character| !character.is_whitespace())
         .flat_map(char::to_lowercase)
         .collect();
-    // `success()` is what a step without a condition has; its negation is a failure.
-    [
-        "always(",
-        "failure(",
-        "cancelled(",
-        "!success(",
-        "!(success(",
-    ]
-    .iter()
-    .any(|name| squeezed.contains(name))
+    let text = text.strip_prefix("${{").unwrap_or(&text);
+    text.strip_suffix("}}").unwrap_or(text).to_owned()
+}
+
+/// Whether a squeezed expression names a status function.
+fn names_a_status_function(squeezed: &str) -> bool {
+    ["always(", "failure(", "cancelled(", "success("]
+        .iter()
+        .any(|name| squeezed.contains(name))
+}
+
+/// Whether a condition keeps a step to the jobs that have not failed, or says nothing of failure.
+/// A step with a status function in its condition runs by that condition alone: GitHub adds
+/// `success() &&` only to a step without one. So a condition that names a status function is
+/// accepted only as `success()` alone, or as `success() && <rest>` where the rest names no status
+/// function and has no `||`, which could make the whole of it true after a failure.
+fn stops_after_a_failure(condition: &str) -> bool {
+    let condition = squeezed(condition);
+    if !names_a_status_function(&condition) || condition == "success()" {
+        return true;
+    }
+    condition
+        .strip_prefix("success()&&")
+        .is_some_and(|rest| !rest.contains("||") && !names_a_status_function(rest))
+}
+
+/// Whether a step of these lines can run after a failure: a line that names a status function and
+/// is not the condition of the step, or a condition that does not stop after a failure.
+fn runs_after_a_failure(lines: &[&str]) -> bool {
+    lines.iter().any(|line| {
+        let condition = pair(line.trim_start().trim_start_matches("- "))
+            .filter(|(key, _)| *key == "if")
+            .map(|(_, value)| value);
+        match condition {
+            Some(condition) => !stops_after_a_failure(condition),
+            None => names_a_status_function(&squeezed(line)),
+        }
+    })
 }
 
 /// One thing a workflow does that the case refuses: the rule, and the line (1-based; 0 for a
@@ -1055,7 +1140,7 @@ fn check_guard(workflow: &Workflow, step: &Step, guard: &Guard, found: &mut Vec<
         if text.contains("<<") || text.matches('"').count() % 2 == 1 || escapes(&words) {
             refuse(found, Refusal::Skippable, at, text);
         }
-        if turns_errexit_off(&words) {
+        if turns_errexit_off(&words) || words.contains(&"shopt") {
             refuse(found, Refusal::ErrexitOff, at, text);
         }
         if text.contains("||") || text.ends_with('&') || text.ends_with('|') {
@@ -1224,7 +1309,7 @@ fn problems_in(name: &str, text: &str) -> Vec<Problem> {
                 continue;
             };
             let first = step.range.start;
-            if names_a_status_function(&workflow.code(&step.range)) {
+            if runs_after_a_failure(&workflow.code(&step.range)) {
                 refuse(
                     &mut found,
                     Refusal::KeptOnFailure,
@@ -1518,6 +1603,34 @@ impl Mutant {
         self.continue_line(at);
     }
 
+    /// Puts the end of a quoted value, `{0}` and the quote, on a line at the indent of its key.
+    fn close_quote_on_next_line(&mut self, name: &str, key: &str, quote: char) {
+        let (at, _) = self
+            .key(name, key)
+            .unwrap_or_else(|| panic!("no key {key:?} in {name:?}"));
+        self.changes
+            .push(format!("the quote of line {} closes on the next", at + 1));
+        let pad = " ".repeat(indent(&self.lines[at]));
+        self.lines.insert(at + 1, format!("{pad}{{0}}{quote}"));
+    }
+
+    /// Opens a quote on the default shell's line and closes it on the next, at the same indent.
+    fn quote_default_shell_across_lines(&mut self, quote: char) {
+        let is_shell = |line: &String| pair(line).is_some_and(|(key, _)| key == "shell");
+        let at = self
+            .lines
+            .iter()
+            .position(is_shell)
+            .expect("a default shell");
+        self.changes.push(format!(
+            "the default shell opens a quote on line {}",
+            at + 1
+        ));
+        let pad = " ".repeat(indent(&self.lines[at]));
+        self.lines[at] = format!("{pad}shell: {quote}bash");
+        self.lines.insert(at + 1, format!("{pad}{{0}}{quote}"));
+    }
+
     /// Makes the default shell go on to the next line.
     fn continue_default_shell(&mut self) {
         let is_shell = |line: &String| pair(line).is_some_and(|(key, _)| key == "shell");
@@ -1589,13 +1702,28 @@ fn a_workflow_that_keeps_what_a_failed_scan_refused_is_refused() {
                 "${{ cancelled() }}",
                 "${{ !cancelled() }}",
                 "${{ !success() }}",
+                // `success()` beside something that is true after a failure: GitHub adds no
+                // `success() &&` to a condition that names a status function.
+                "success() || true",
+                "${{ Success() || true }}",
+                "${{ success() == false }}",
+                "success() != true",
+                "${{ success() && runner.os == 'Linux' || github.ref_type == 'tag' }}",
+                "${{ success() && always() }}",
+                "${{ success() && !success() }}",
             ] {
                 let mut mutant = Mutant::of(workflow);
                 mutant.set_key(step, "if", condition);
                 mutant.is_refused_as(Refusal::KeptOnFailure);
             }
-            // The control: the status a step without a condition has is not a failure.
-            for condition in ["success()", "${{ success() && runner.os == 'Linux' }}"] {
+            // The controls: the status a step without a condition has is not a failure, nor is a
+            // condition that names no status function.
+            for condition in [
+                "success()",
+                "${{ success() && runner.os == 'Linux' }}",
+                "${{ success() && (github.ref_type == 'tag') }}",
+                "runner.os == 'Linux'",
+            ] {
                 let mut mutant = Mutant::of(workflow);
                 mutant.set_key(step, "if", condition);
                 mutant.is_not_refused_as(Refusal::KeptOnFailure);
@@ -1680,19 +1808,73 @@ fn a_value_that_goes_on_to_the_next_line_is_refused() {
     }
 }
 
-/// KR-REQ-26.41: a branch that ends on its own line, before a scan or a sealing, does not hide it.
+/// KR-REQ-26.41: a quoted value that opens on one line and closes on the next, at the indent of its
+/// key, is refused: YAML takes `"bash` and `{0}"` as `bash {0}`, a shell that does not stop at a
+/// failing command.
+#[test]
+fn a_quoted_value_that_closes_on_a_later_line_is_refused() {
+    for (workflow, step, _) in guards() {
+        for quote in ['"', '\''] {
+            let mut mutant = Mutant::of(workflow);
+            mutant.set_key(step, "shell", &format!("{quote}bash"));
+            mutant.close_quote_on_next_line(step, "shell", quote);
+            mutant.is_refused_as(Refusal::Continued);
+        }
+    }
+    for (workflow, _, kept) in KEPT {
+        for step in kept {
+            let mut mutant = Mutant::of(workflow);
+            mutant.set_key(step, "if", "'success()");
+            mutant.close_quote_on_next_line(step, "if", '\'');
+            mutant.is_refused_as(Refusal::Continued);
+        }
+    }
+    for workflow in [
+        "release-tree.yml",
+        "release-host.yml",
+        "release-windows.yml",
+    ] {
+        for quote in ['"', '\''] {
+            let mut mutant = Mutant::of(workflow);
+            mutant.quote_default_shell_across_lines(quote);
+            mutant.is_refused_as(Refusal::Continued);
+        }
+    }
+    // The control: a quoted value that closes on its line goes on to nothing.
+    for (workflow, step, _) in guards() {
+        let mut mutant = Mutant::of(workflow);
+        mutant.set_key(step, "shell", "\"bash\"");
+        mutant.is_not_refused_as(Refusal::Continued);
+    }
+}
+
+/// KR-REQ-26.41: a branch that ends on its own line, before a scan or a sealing, does not hide it,
+/// and one that only looks as if it did is refused: a `#` that makes the closing word a comment,
+/// and an inner branch that closes while the outer one stays open.
 #[test]
 fn a_branch_that_ends_on_its_line_before_a_scan_is_not_taken_for_one_that_hides_it() {
     for (workflow, step, guard) in guards() {
+        let start = guard.start();
         if !matches!(guard, Guard::Scan(_, true)) {
+            for closed in [
+                "if [ ! -d x ]; then mkdir -p x; fi",
+                "if [ ! -d x ];  then mkdir -p x;  fi",
+                "for x in 1 2; do echo $x; done",
+            ] {
+                let mut mutant = Mutant::of(workflow);
+                mutant.wrap(step, start, &[closed], &[]);
+                mutant.is_not_refused_as(Refusal::Skippable);
+            }
+        }
+        for (before, after) in [
+            ("if false; then #; fi", "fi"),
+            ("if false; then if :; then :; fi", "fi"),
+            ("while false; do for x in 1; do :; done", "done"),
+            ("case x in y) if :; then :; fi", "esac"),
+        ] {
             let mut mutant = Mutant::of(workflow);
-            mutant.wrap(
-                step,
-                guard.start(),
-                &["if [ ! -d x ]; then mkdir -p x; fi"],
-                &[],
-            );
-            mutant.is_not_refused_as(Refusal::Skippable);
+            mutant.wrap(step, start, &[before], &[after]);
+            mutant.is_refused_as(Refusal::Skippable);
         }
     }
 }
@@ -1790,6 +1972,8 @@ fn a_scan_that_can_fail_without_stopping_its_step_is_refused() {
             "set +xe",
             "set  +e",
             "set -x +e",
+            "shopt -u -o errexit",
+            "shopt -u inherit_errexit",
         ] {
             let mut mutant = Mutant::of(workflow);
             mutant.prepend_to_run(step, line);
