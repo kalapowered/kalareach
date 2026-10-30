@@ -42,6 +42,11 @@ use windows_sys::Win32::System::SystemServices::JOB_OBJECT_MSG_PROCESS_MEMORY_LI
 /// Why a limit was not applied.
 pub type Refusal = &'static str;
 
+/// How far the figure the system holds may be from the one asked for. The system keeps a limit as a
+/// whole number of pages, so a figure that is not one reads back a little different, and the
+/// allocation granularity of 64 KiB is more than a page on every platform it runs on.
+const ROUNDING: usize = 64 * 1024;
+
 /// A process memory limit the system holds around one process.
 ///
 /// Dropping it closes the job and its port. The process outlives that, and the limit with it for as
@@ -60,7 +65,8 @@ pub struct MemoryLimit {
 
 impl MemoryLimit {
     /// Puts the process behind `process` into a job that refuses it more committed memory than
-    /// `limit_bytes`, and reads the limit and the membership back from the system.
+    /// `limit_bytes`, and reads the limit and the membership back from the system. The limit read back is
+    /// allowed to differ from the one asked for by the rounding the system applies to it.
     ///
     /// The handle must be open on the process with the right to set its quota and to terminate it,
     /// as the one a parent holds of the child it started is.
@@ -140,7 +146,7 @@ impl MemoryLimit {
         };
         if read == 0
             || held.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_PROCESS_MEMORY == 0
-            || held.ProcessMemoryLimit != wanted
+            || held.ProcessMemoryLimit.abs_diff(wanted) >= ROUNDING
         {
             return Err("this host did not report the memory limit it was given");
         }
@@ -164,7 +170,7 @@ impl MemoryLimit {
         })
     }
 
-    /// The limit the system holds, in bytes.
+    /// The limit asked for, in bytes. The system holds it to a whole number of pages.
     #[must_use]
     pub const fn limit_bytes(&self) -> u64 {
         self.limit_bytes
