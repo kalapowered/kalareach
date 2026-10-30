@@ -181,9 +181,10 @@ stops, so a limit that a part has is written in that part's own document.
   [organisation policy](host/README.md#organisation-policy).
 - **Teams.** Signed leases of membership and the signed chain for the organisation's policy, which a
   host verifies without contacting the service
-  ([account authority objects](protocol/README.md#account-authority-objects)). The owner can enrol a
-  host in an organisation with `kr organisation`. When a host is enrolled in an organisation, the
-  organisation's signed policy is applied to the host and the host can be made exclusively
+  ([account authority objects](protocol/README.md#account-authority-objects)). The owner enrols a
+  host in an organisation with `kr organisation enrol`, which pins the keys that sign the
+  organisation's policy, and applies a policy the organisation signed with `kr organisation policy`.
+  The host applies that policy's adapter allowlist, and the owner can make the host exclusively
   organisation-managed ([host](host/README.md#organisation-policy)). The roles, single sign-on and
   SCIM that issue the leases and the chain run in the website's account system.
 - **External notification destinations.** Webhook, Slack, Discord, Telegram and email destinations,
