@@ -143,6 +143,14 @@ fn pending(device: DeviceId, revoked: &RevocationResult) -> Option<CliError> {
     )
 }
 
+/// How many affected workers the host counted and left out of the list it sent.
+pub(crate) fn unlisted_workers(barrier: &kr_protocol::action::RevocationBarrier) -> u64 {
+    barrier
+        .workers_total
+        .get()
+        .saturating_sub(barrier.workers.len() as u64)
+}
+
 /// The failure a change that fences the host is reported as, or none when every affected worker's
 /// barrier holds. `what` names the change as the sentence's subject.
 pub(crate) fn pending_fence(
@@ -155,7 +163,7 @@ pub(crate) fn pending_fence(
     }
     // A cut list names the workers still waiting before any that is not, so what it shows is a
     // floor: how many are waiting in all is not said.
-    let cut = barrier.workers_total.get() > barrier.workers.len() as u64;
+    let cut = unlisted_workers(barrier) > 0;
     Some(CliError::Unfinished {
         code: ErrorCode::ResourceUnavailable,
         message: shown!(
@@ -339,10 +347,7 @@ pub(crate) fn barrier_lines(
     barrier: &kr_protocol::action::RevocationBarrier,
 ) -> Vec<Line> {
     let mut lines = vec![first];
-    let workers_left_out = barrier
-        .workers_total
-        .get()
-        .saturating_sub(barrier.workers.len() as u64);
+    let workers_left_out = unlisted_workers(barrier);
     if barrier.workers.is_empty() {
         // The host counts the workers it affected before it cuts the list, so an empty list is not
         // always an empty count: it can be a count it kept no names for.

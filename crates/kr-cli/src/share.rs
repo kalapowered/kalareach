@@ -1531,9 +1531,15 @@ fn finish_revocation(
     let error = (!pending.is_empty()).then(|| CliError::Unfinished {
         code: ErrorCode::ResourceUnavailable,
         message: shown!(
-            "the revocation of grant {} is recorded and still pending: {} session worker{} {} \
+            "the revocation of grant {} is recorded and still pending: {}{} session worker{} {} \
              not fenced it yet, and `{}` again reports how far it has got",
             grant_id,
+            // A cut list names the workers still waiting first, so its count is a floor.
+            if crate::device::unlisted_workers(&revoked.barrier) > 0 {
+                "at least "
+            } else {
+                ""
+            },
             pending.len(),
             if pending.len() == 1 { "" } else { "s" },
             if pending.len() == 1 { "has" } else { "have" },
@@ -2173,6 +2179,55 @@ mod tests {
                 assert!(!line.contains(right.as_str()), "{role}: {line}");
             }
         }
+    }
+
+    /// A revocation one session's worker has not fenced, in an answer where the host counted
+    /// `total` workers and listed that one.
+    fn waiting_on_one_of(total: u64) -> RevocationResult {
+        use kr_protocol::action::{BarrierState, RevocationBarrier, WorkerBarrier};
+        use kr_protocol::ids::AuthorityRevision;
+        use kr_protocol::scalars::U64;
+
+        let worker = WorkerBarrier {
+            session_id: SessionId::new(Uuid::from_bytes([2; 16])),
+            state: BarrierState::Pending,
+            acknowledged_revision: Nullable::null(),
+            rejected_actions: Vec::new(),
+            rejected_actions_total: U64::new(0),
+            possibly_executed: Vec::new(),
+            possibly_executed_total: U64::new(0),
+            omitted_actions: U64::new(0),
+            names_pending: U64::new(0),
+            detail: String::new(),
+        };
+        let mut barrier = RevocationBarrier::new(AuthorityRevision::new(4), vec![worker]);
+        barrier.workers_total = U64::new(total);
+        RevocationResult {
+            authority_revision: AuthorityRevision::new(4),
+            revoked_grants: CanonicalSet::new(),
+            revoked_grants_total: U64::new(0),
+            barrier,
+        }
+    }
+
+    /// When the host cut its list of workers it named those still waiting first, so how many it
+    /// names is a floor, and the failure says "at least"; a whole list gives the count.
+    #[test]
+    fn a_revocation_whose_list_the_host_cut_is_pending_for_at_least_the_workers_it_names() {
+        let reported = |total| {
+            let revoke = Shown::said("kr share revoke");
+            let grant = GrantId::new(Uuid::from_bytes([9; 16]));
+            match finish_revocation(grant, Some(&waiting_on_one_of(total)), &revoke, false) {
+                Ok(Completion::Reported(error)) => error.to_string(),
+                _ => panic!("a pending revocation is a reported failure"),
+            }
+        };
+        assert!(
+            reported(5_000).contains("at least 1 session worker has not fenced it"),
+            "{}",
+            reported(5_000)
+        );
+        assert!(!reported(1).contains("at least"), "{}", reported(1));
     }
 
     /// The list document carries the device's own name only as asked-for text, and every other leaf
