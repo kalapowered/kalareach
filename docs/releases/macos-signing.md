@@ -75,13 +75,13 @@ resume it with `xcrun notarytool wait <submission id>` and the same key options.
 A tar archive of executables cannot carry a stapled ticket, because a ticket attaches to an
 application, a package or a disk image. Apple keeps it. The first time a person opens a program that
 came from a browser or a quarantining tool, Gatekeeper asks Apple's service whether it is notarised,
-so that first launch needs a network. Safari decompresses a `.tar.gz` to a `.tar` that carries the flag,
-and Archive Utility and `tar` put it on every file they unpack from a flagged archive. On a macOS 26.6.2 guest
-the first run of `kr` took about ten seconds with a network. With none, the system refused it with a
-"Not Opened" window and the command waited behind the window. That copy kept refusing when the network
-came back, and a fresh unpack of the same archive ran. A program fetched by `curl`, or put in the store by
-`kr host install`, carries no quarantine flag and meets no check: the tree `curl` fetched ran with the
-network blocked, and the store held no flagged file.
+so that first launch needs a network. On a macOS 26.6.2 guest, Safari with its default settings
+decompressed a `.tar.gz` to a `.tar` that carries the flag, and Archive Utility and `tar` put the flag on
+every file they unpacked from a flagged archive. With the guest's network blocked, the system refused the
+first run of a flagged `kr` with a "Not Opened" window, and the command waited behind the window. That copy
+kept refusing when the network came back, and a fresh unpack of the same archive ran. A program fetched by
+`curl`, or put in the store by `kr host install`, carries no quarantine flag: the tree `curl` fetched ran
+with the network blocked, and the store held no flagged file.
 
 ## The files that sign
 
@@ -182,31 +182,34 @@ shows that, and it cannot undo it.
 | `is not the pinned rcodesign` | the signer was handed a program of its own choosing for the Developer ID | unset `KR_RCODESIGN`, or give it the pinned executable |
 | `is in no tier of the release matrix`, or `the published release matrix was not accepted` | the matrix the managed service publishes does not list the commit's package version, or does not verify | publish a matrix revision that lists the version, then re-run the failed job; its sealed archives are kept for one day, and a refusal at `matrix`, before the approval, is a new dispatch |
 | `nothing shows that this repository makes releases immutable` | the setting reads as off, or the most recently published release is not immutable | turn the setting on and publish a package release, then re-run the failed `publish` job within the day the sealed archives are kept; later, dispatch again |
-| `the system does not accept <file> as a Notarized Developer ID`, with `source=Unnotarized Developer ID`, for every Mach-O file of one target in its `check` job | the macOS runner asked Apple's service about files that the signing script saw accepted, and was told they are not notarised | re-run the failed job once, as [below](#a-check-job-that-refuses-every-file-of-one-target); a second refusal is investigated, not re-run |
+| `the system does not accept <file> as a Notarized Developer ID`, with `source=Unnotarized Developer ID`, for Mach-O files of one target in its `check` job while the other checks pass | the system on the macOS runner assessed files as not notarised that the signing script had seen accepted: Apple's answer to the runner can lag its answer to the signing machine | re-run the failed job once, as [below](#a-check-job-that-refuses-the-files-of-one-target); a second refusal is investigated, not re-run |
 
-### A check job that refuses every file of one target
+### A check job that refuses the files of one target
 
 A `check` job for a macOS target holds each Mach-O file of the unpacked archive to `Notarized Developer ID`
 with `scripts/check-macos-signatures.sh`. The archive carries no stapled ticket, so the system answers
-from Apple's service, and the runner's answer can be `Unnotarized Developer ID` for files that Apple
-accepted. The first host release hit this: in its first attempt, `release-host` run 40909452060 refused
-every Mach-O file of the Intel macOS target on files the signing script had seen accepted, while the
-other three checks passed, and its second attempt passed on the same bytes. When a `check` job
-refuses every Mach-O file of one target with `Unnotarized Developer ID` and the other checks
-pass, re-run it once:
+from Apple's service, and the answer on a runner can be `Unnotarized Developer ID` for files that the
+signing script saw accepted. The first host release hit this: in its first attempt, `release-host` run
+40909452060 refused 86 of the 89 Mach-O files of the Intel macOS target, each with `source=Unnotarized
+Developer ID`, while the other three checks passed, and its second attempt passed on the same bytes. When a `check` job refuses Mach-O
+files of one target with `Unnotarized Developer ID` and the other checks pass, re-run it once:
 
 ```sh
 gh run rerun --failed <run id>
 ```
 
 That runs the failed job again, and `publish` after it. `channel` keeps its result, so nobody is asked
-to approve again. The sealed archives are kept for one day, so the re-run has to start within it.
+to approve again. A re-run on the same bytes cannot make a file that is not notarised pass, so it costs
+a job and no safety. The sealed archives are kept for one day after the sealing, and both `check` and
+`publish` take them, so start the re-run early enough for the two jobs to finish within that day; a
+`check` job can wait for a runner for a while before it starts.
 
-A second refusal is investigated, not re-run, and so is any other refusal of a notarised tree, such
-as one that spares some files. Compare the digests in `source`'s summary with what the signing script
-printed, read the submission's status and log with `xcrun notarytool info <submission id>` and
-`xcrun notarytool log <submission id>` (the notary key options as for `wait`), and assess a file of
-the tree on the signing machine with
+A second refusal is investigated, not re-run, and so is any other refusal of a notarised tree. Compare
+the digests in `source`'s summary with what the signing script printed. Read the submission's status and
+log with `xcrun notarytool info <submission id>` and `xcrun notarytool log <submission id>` (the notary
+key options as for `wait`), and compare the `CDHash` of a refused file (`codesign -dvv <file>`) with the
+`ticketContents` of the log the signing script saved beside the tree. Assess a file of the run's sealed
+archive, and not only of the tree on the signing machine, with
 `/usr/sbin/spctl --assess --type open --context context:primary-signature -vv <file>`.
 
 ## Keys, and replacing them
