@@ -4,8 +4,9 @@
 //! make sure of that. The method index is generated from the registry, so it lists every method in
 //! the registry's groups and order and cannot list one the registry does not have. The check reads
 //! the registry and every Markdown document under the documentation root other than the index,
-//! which names every method by construction. It names each method that no other document mentions
-//! and each index link whose document or section is not there any more.
+//! which names every method by construction. It names each method that no other document mentions,
+//! each index link whose document or section is not there any more, and each index link whose
+//! section does not name the method it is linked from.
 //!
 //! What a link points at is decided here, in [`described_in`], one arm per method. The match is
 //! exhaustive, so a method added to the registry does not build until somebody has decided which
@@ -13,7 +14,9 @@
 //!
 //! A link goes to the document and names the section in its words. The check reads lines, not
 //! Markdown: a section is there when the document has a line that is one to six `#`, a space and
-//! exactly the section's heading. Nothing here depends on how a page renders or anchors a heading.
+//! exactly the section's heading, outside a fenced block. It runs from that line to the next
+//! heading of the same or a higher level, so its subsections are part of it. Nothing here depends
+//! on how a page renders or anchors a heading.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -318,8 +321,8 @@ pub(crate) const fn described_in(method: Method) -> Section {
         Method::VoicePrepare | Method::VoiceStart => at(VOICE, "The rate a call runs under"),
         Method::VoiceStop => at(VOICE, "A voice session is not a terminal session"),
         Method::VoiceGrant => at(VOICE, "The voice grant"),
-        Method::VoiceDelegate => at(VOICE, "What is never authority"),
-        Method::VoiceContext => at(VOICE, "What the coordinator may send back"),
+        Method::VoiceDelegate => at(VOICE, "What a delegation carries, and who reads it"),
+        Method::VoiceContext => at(VOICE, "What the coordinator may read"),
 
         Method::WorkflowInstall
         | Method::WorkflowEnable
@@ -342,12 +345,53 @@ fn link(section: &Section) -> String {
     )
 }
 
+/// Returns the heading lines of a document as (line number, level, text), in order.
+///
+/// A line is a heading when it is one to six `#`, a space and the text. A line inside a fenced block
+/// is not: a shell comment there starts with `#` and ends no section.
+fn headings(lines: &[&str]) -> Vec<(usize, usize, String)> {
+    let mut found = Vec::new();
+    let mut fenced = false;
+    for (number, line) in lines.iter().enumerate() {
+        let opening = line.trim_start();
+        if opening.starts_with("```") || opening.starts_with("~~~") {
+            fenced = !fenced;
+        } else if !fenced {
+            let level = line.bytes().take_while(|byte| *byte == b'#').count();
+            if let (true, Some(text)) = ((1..=6).contains(&level), line[level..].strip_prefix(' '))
+            {
+                found.push((number, level, text.to_owned()));
+            }
+        }
+    }
+    found
+}
+
 /// Returns true when a document has a heading line with exactly this text.
 pub(crate) fn has_heading(text: &str, heading: &str) -> bool {
-    text.lines().any(|line| {
-        let level = line.bytes().take_while(|byte| *byte == b'#').count();
-        (1..=6).contains(&level) && line[level..].strip_prefix(' ') == Some(heading)
-    })
+    let lines: Vec<&str> = text.lines().collect();
+    headings(&lines)
+        .iter()
+        .any(|(_, _, found)| found == heading)
+}
+
+/// Returns the text of each section of a document that has exactly this heading, from the line
+/// after the heading to the next heading of the same or a higher level.
+fn sections(text: &str, heading: &str) -> Vec<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let marks = headings(&lines);
+    marks
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, _, found))| found == heading)
+        .map(|(position, (start, level, _))| {
+            let end = marks[position + 1..]
+                .iter()
+                .find(|(_, later, _)| later <= level)
+                .map_or(lines.len(), |(number, _, _)| *number);
+            lines[start + 1..end].join("\n")
+        })
+        .collect()
 }
 
 /// Returns a group's title, from its wire name.
@@ -417,7 +461,8 @@ pub(crate) fn render() -> String {
     out
 }
 
-/// Returns a description of every index link whose document or section is not there.
+/// Returns a description of every index link whose document or section is not there, and of every
+/// one whose section does not name the method that links to it.
 pub(crate) fn broken_links(docs: &Path) -> Vec<String> {
     let mut documents: BTreeMap<&str, Option<String>> = BTreeMap::new();
     let mut broken = Vec::new();
@@ -437,6 +482,16 @@ pub(crate) fn broken_links(docs: &Path) -> Vec<String> {
                 "{}: {path} has no heading line \"{}\"",
                 entry.name, section.heading
             )),
+            Some(text)
+                if !sections(text, section.heading)
+                    .iter()
+                    .any(|body| names(body, entry.name)) =>
+            {
+                broken.push(format!(
+                    "{}: the section \"{}\" of {path} does not name it",
+                    entry.name, section.heading
+                ));
+            }
             Some(_) => {}
         }
     }
@@ -581,8 +636,10 @@ mod tests {
         );
     }
 
+    /// KR-REQ-01.24: a reader who follows a method's link in the index finds the method in the
+    /// section it lands on, by its wire name, and not only a section of that title.
     #[test]
-    fn every_index_link_lands_on_its_heading() {
+    fn every_index_link_lands_on_a_section_that_names_its_method() {
         assert_eq!(broken_links(&docs()), Vec::<String>::new());
     }
 
@@ -605,6 +662,37 @@ mod tests {
         assert_eq!(
             broken_links(copy.path()),
             ["catalogue.sync: plugins/catalogue.md has no heading line \"What a sync does\""]
+        );
+    }
+
+    /// KR-REQ-01.24: a section that does not name a method is a broken link for that method alone:
+    /// the method named in another section of the same document does not mend it, and a name in
+    /// the section's subsection is a name in the section.
+    #[test]
+    fn a_link_to_a_section_that_does_not_name_its_method_is_broken() {
+        let copy = DocsCopy::of_the_documentation("section-without-the-name");
+        copy.edit(
+            "plugins/catalogue.md",
+            "## What a sync does\n",
+            "## What a sync does\n\n### A part\n\n`catalogue.sync` runs here.\n\n## After the sync\n",
+        );
+        let about_it = |copy: &DocsCopy| -> Vec<String> {
+            broken_links(copy.path())
+                .into_iter()
+                .filter(|line| line.starts_with("catalogue.sync:"))
+                .collect()
+        };
+        assert_eq!(about_it(&copy), Vec::<String>::new());
+        copy.edit(
+            "plugins/catalogue.md",
+            "`catalogue.sync` runs here.",
+            "The sync runs here.",
+        );
+        assert_eq!(
+            about_it(&copy),
+            [
+                "catalogue.sync: the section \"What a sync does\" of plugins/catalogue.md does not name it"
+            ]
         );
     }
 
