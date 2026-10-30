@@ -91,6 +91,13 @@ fn installation() -> &'static Path {
     })
 }
 
+/// Held by the cases that run a real container runtime and by the cases that stand one in, so that
+/// they do not run together. A `podman exec` on a busy machine has stalled, and these cases are the
+/// ones that start containers and daemons of their own. Running them one at a time has made the
+/// stall rarer and has not explained it, so every call to the runtime is bounded as well: a stall
+/// under this lock still fails its case and names the call.
+static CONTAINER_RUNTIME_TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// What a login in the destination gives the helper as its `HOME`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Login {
@@ -1660,6 +1667,7 @@ fn podman_invocations(world: &World) -> Vec<String> {
 /// stopped is reported stopped by a refresh, which starts neither it nor a helper in it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_container_is_enrolled_by_name_and_a_refresh_of_it_starts_nothing() {
+    let _turn = CONTAINER_RUNTIME_TURN.lock().await;
     let world = World::start().await;
     world.stand_in_for_the_container_runtime();
     // The destination's daemon is started by a create, as for any environment that is running.
@@ -1742,6 +1750,7 @@ async fn a_container_is_enrolled_by_name_and_a_refresh_of_it_starts_nothing() {
 /// refresh established for the record is taken back rather than left standing beside the failure.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_connection_that_fails_claims_nothing_for_an_ssh_host_or_a_container() {
+    let _turn = CONTAINER_RUNTIME_TURN.lock().await;
     let world = World::start().await;
     world.stand_in_for_the_container_runtime();
     world.enrol_destination();
@@ -3641,6 +3650,7 @@ async fn an_enrolled_container_answers_a_bridge_and_a_session_made_through_it_li
     if !runtime_available() {
         return;
     }
+    let _turn = CONTAINER_RUNTIME_TURN.lock().await;
     let container = Container::start();
     container.serve();
     let world = World::start().await;
@@ -3741,6 +3751,7 @@ async fn a_stopped_container_is_started_by_a_create_and_keeps_its_identity() {
     if !runtime_available() {
         return;
     }
+    let _turn = CONTAINER_RUNTIME_TURN.lock().await;
     let container = Container::start();
     container.serve();
     let world = World::start().await;
