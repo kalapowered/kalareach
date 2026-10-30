@@ -23,8 +23,8 @@ use kr_protocol::ids::SessionId;
 use kr_protocol::scalars::{Nullable, U64};
 use kr_protocol::session_processes::{
     MAX_PROCESS_BOUNDARY_BYTES, MAX_PROCESS_CGROUP_BYTES, MAX_PROCESS_LIMIT_BYTES,
-    MAX_PROCESS_LIMITS, MAX_PROCESS_NAME_BYTES, MAX_PROCESS_ROWS, ProcessBoot, ProcessListing,
-    ProcessRole, ProcessStanding, SessionProcess, SessionProcessesResult,
+    MAX_PROCESS_LIMITS, MAX_PROCESS_ROWS, ProcessBoot, ProcessListing, ProcessRole,
+    ProcessStanding, SessionProcess, SessionProcessesResult,
 };
 use kr_worker::journal::Journal;
 use kr_worker::ownership::OwnedRecord;
@@ -34,7 +34,7 @@ use crate::error::{ControllerError, Result};
 /// What the platform gives, said once in the answer's limits.
 #[cfg(windows)]
 const PLATFORM_LIMIT: Option<&str> = Some(
-    "this platform gives the state of a recorded process and neither its parent nor its executable",
+    "this host reads the state of a recorded process on this platform and neither its parent nor its executable",
 );
 #[cfg(not(windows))]
 const PLATFORM_LIMIT: Option<&str> = None;
@@ -55,7 +55,16 @@ pub fn session_processes(
     session_id: SessionId,
 ) -> Result<SessionProcessesResult> {
     let path = paths.journal_database(session_id);
-    if !path.exists() {
+    let storage = |detail: String| ControllerError::Storage {
+        operation: "read a worker's record of its processes",
+        detail,
+    };
+    // A path that cannot be examined is not a path that is not there: only absence is a refusal to
+    // try again.
+    if !path
+        .try_exists()
+        .map_err(|error| storage(error.to_string()))?
+    {
         return Err(ControllerError::Refused {
             code: ErrorCode::ResourceUnavailable,
             detail: format!(
@@ -65,28 +74,20 @@ pub fn session_processes(
             ),
         });
     }
-    let storage = |detail: String| ControllerError::Storage {
-        operation: "read a worker's record of its processes",
-        detail,
+    let record = {
+        let journal = Journal::open_read_only(&path).map_err(|error| storage(error.to_string()))?;
+        journal
+            .read_owned(session_id)
+            .map_err(|error| storage(error.to_string()))?
     };
-    let journal = Journal::open_read_only(&path).map_err(|error| storage(error.to_string()))?;
-    let record = journal
-        .read_owned(session_id)
-        .map_err(|error| storage(error.to_string()))?;
-    Ok(view(
-        session_id,
-        record,
-        boot_identity().ok().as_ref(),
-        &read_process,
-    ))
+    Ok(view(session_id, record, boot_identity().ok().as_ref()))
 }
 
-/// The answer for a record, its boot compared with `now`, each row read by `read`.
+/// The answer for a record, its boot compared with `now`, each row read from the system.
 fn view(
     session_id: SessionId,
     record: Option<OwnedRecord>,
     now: Option<&BootIdentity>,
-    read: &dyn Fn(&ProcessStartIdentity) -> ProcessReading,
 ) -> SessionProcessesResult {
     let mut limits: Vec<String> = PLATFORM_LIMIT.map(str::to_owned).into_iter().collect();
     let Some(record) = record else {
@@ -150,12 +151,10 @@ fn view(
                 ProcessBoot::Unrecorded | ProcessBoot::Incomparable => {
                     (ProcessStanding::Unknown, None, None)
                 }
-                ProcessBoot::Same => match read(&process) {
-                    ProcessReading::Running(facts) => (
-                        ProcessStanding::Running,
-                        facts.parent,
-                        facts.name.map(|name| cut(&name, MAX_PROCESS_NAME_BYTES)),
-                    ),
+                ProcessBoot::Same => match read_process(&process) {
+                    ProcessReading::Running(facts) => {
+                        (ProcessStanding::Running, facts.parent, facts.name)
+                    }
                     ProcessReading::Ended => (ProcessStanding::Ended, None, None),
                     ProcessReading::Unknown { .. } => (ProcessStanding::Unknown, None, None),
                 },

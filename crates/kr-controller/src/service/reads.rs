@@ -483,7 +483,8 @@ impl Controller {
 
     /// Returns whether anything this host can read says the session's worker may still be there.
     ///
-    /// This is the one question every read and every migration asks. It is deliberately
+    /// This is the one question every archive read and every migration asks; `session.processes`
+    /// reads a live worker's record of its processes, read-only, and does not ask it. It is deliberately
     /// pessimistic: a query the platform declines establishes nothing, and nothing is the answer
     /// that keeps a store shut.
     async fn a_worker_may_still_own(self: &Arc<Self>, session_id: SessionId) -> Result<bool> {
@@ -615,7 +616,8 @@ impl Controller {
         // The same question every archive read asks first. A session whose registry record names
         // a process this daemon has not seen end is refused here rather than read from: the
         // worker owns its own stores while it is alive, and a closure written over a death this
-        // host could not confirm is not a licence to open them.
+        // host could not confirm is not a licence to open them. (The one read of a live worker's
+        // store this daemon makes is its record of the processes it owns: `crate::processes`.)
         self.refuse_if_live(session_id).await?;
         let recorded = self.registry.lock().await.closure(session_id)?;
         self.archive().archive_beside(session_id, recorded)
