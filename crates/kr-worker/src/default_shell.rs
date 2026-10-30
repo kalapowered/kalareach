@@ -12,18 +12,20 @@ use std::path::{Path, PathBuf};
 /// Returns the shell a session starts: the request's, else the configured one, else the platform's.
 #[must_use]
 pub fn resolve(requested: Option<&str>) -> String {
-    choose(requested, configured(), platform_default)
+    choose(requested, configured, platform_default)
 }
 
-/// The request's shell, else the configured one, else the platform's.
+/// The request's shell, else the configured one, else the platform's. The configured shell is
+/// looked for only when the request names none: looking costs a file lookup, which may be a slow
+/// one for a path that is on a network share.
 fn choose(
     requested: Option<&str>,
-    configured: Option<String>,
+    configured: impl FnOnce() -> Option<String>,
     platform: impl FnOnce() -> String,
 ) -> String {
     requested
         .map(str::to_owned)
-        .or(configured)
+        .or_else(configured)
         .unwrap_or_else(platform)
 }
 
@@ -534,15 +536,26 @@ mod tests {
     #[test]
     fn a_request_names_the_shell_before_the_configured_one_and_that_before_the_platforms() {
         let platform = || "/platform/shell".to_owned();
+        let configured = || Some("/configured".to_owned());
         assert_eq!(
-            choose(Some("/requested"), Some("/configured".to_owned()), platform),
+            choose(Some("/requested"), configured, platform),
             "/requested"
         );
-        assert_eq!(
-            choose(None, Some("/configured".to_owned()), platform),
-            "/configured"
+        assert_eq!(choose(None, configured, platform), "/configured");
+        assert_eq!(choose(None, || None, platform), "/platform/shell");
+        let looked = std::cell::Cell::new(false);
+        choose(
+            Some("/requested"),
+            || {
+                looked.set(true);
+                None
+            },
+            platform,
         );
-        assert_eq!(choose(None, None, platform), "/platform/shell");
+        assert!(
+            !looked.get(),
+            "a request that names a shell does not look for the configured one"
+        );
         assert_eq!(
             resolve(Some("/requested/shell")),
             "/requested/shell",
