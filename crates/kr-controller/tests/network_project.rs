@@ -5959,9 +5959,16 @@ async fn a_device_reads_nothing_outside_its_location_through_repository_content(
             ),
         )
         .await;
+    // The refusal keeps its code and gives its reason in terms of the device's own location: it
+    // names neither the repository it was found in nor the one the alternates file points at.
     assert!(
-        said(&refused).contains("objects/info/alternates"),
-        "the refusal names the alternates file: {refused}"
+        refused.to_string().starts_with("PERMISSION_DENIED"),
+        "the refusal keeps its code: {refused}"
+    );
+    assert_eq!(
+        said(&refused),
+        "the repository names objects outside the location the grant names",
+        "the refusal gives its reason without its place"
     );
     assert!(!granted.root.join("from-borrowing").exists());
 
@@ -6346,10 +6353,16 @@ async fn a_filesystem_mounted_beneath_a_granted_directory_refuses_a_devices_clon
             return;
         };
         let refusal = outcome.expect_err("a clone from a repository with a mount beneath it");
-        let said = said(&refusal);
+        // A device is told the reason in terms of its own location, under the code the refusal has,
+        // and is not told where on this host the filesystem is mounted.
         assert!(
-            said.contains(&format!("a filesystem is mounted at {}", mounted.display())),
-            "the refusal names the mount point: {said}"
+            refusal.to_string().starts_with("UPSTREAM_UNAVAILABLE"),
+            "the refusal keeps its code: {refusal}"
+        );
+        let said = said(&refusal);
+        assert_eq!(
+            said, "a filesystem is mounted inside the location the grant names",
+            "the refusal gives its reason without its place"
         );
         assert!(!root.join("inside").exists(), "nothing was cloned");
         println!("{INNER_ASSERTED}");

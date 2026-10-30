@@ -638,7 +638,7 @@ impl Controller {
             // occupying the environment.
             hold.end_wait().await;
             self.resolve_failed(reservation.reservation_id).await?;
-            return Err(error.into());
+            return Err(ControllerError::SessionDirectory(error));
         }
 
         // The session owes its cleanup from the moment its worker is asked for, if privacy mode is

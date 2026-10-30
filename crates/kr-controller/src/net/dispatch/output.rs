@@ -493,6 +493,10 @@ impl RemoteOutput {
         answer: bool,
         read_under: Option<&ReadUnder>,
     ) -> Written {
+        // What this host's failures say of the host is not for a device. It is decided here, before
+        // the turn is taken, for the one frame every attempt below writes.
+        let shown = super::super::device_errors::frame_for_a_device(frame);
+        let frame: &ControlFrame = &shown;
         #[cfg(test)]
         self.queued.fetch_add(1, Ordering::SeqCst);
         let _turn = self.turn.lock().await;

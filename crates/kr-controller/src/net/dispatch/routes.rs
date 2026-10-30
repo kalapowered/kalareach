@@ -213,6 +213,11 @@ impl RemoteConnection {
     ) -> Option<Answered> {
         let mut asked = None;
         let (frame, received_at) = received.into_parts();
+        let method = match &frame {
+            ControlFrame::Request(request) => request.method.method(),
+            ControlFrame::Mutation(mutation) => mutation.method.method(),
+            _ => None,
+        };
         let frame = match frame {
             ControlFrame::Request(request) => self.read_decided(&request, &mut asked).await,
             ControlFrame::Mutation(mutation) => {
@@ -265,6 +270,8 @@ impl RemoteConnection {
             | ControlFrame::DesktopChecks(_)
             | ControlFrame::DesktopChecksAnswer(_) => return None,
         };
+        // What an agent said in refusing what a device put to it is the agent's, not this host's.
+        let frame = super::super::device_errors::upstream_words(method, frame);
         Some(Answered { frame, asked })
     }
 
