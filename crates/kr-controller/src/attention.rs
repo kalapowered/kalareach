@@ -2227,8 +2227,13 @@ impl AttentionModule {
                     ));
                 }
                 check_visit(&params)?;
-                self.cursor_of(caller, params.session_id, params.acknowledged_cursor.get())
-                    .map(|_| ())
+                cursor_of(
+                    &store,
+                    caller,
+                    params.session_id,
+                    params.acknowledged_cursor.get(),
+                )
+                .map(|_| ())
             }
             _ => Err(ProtocolError::new(
                 ErrorCode::InvalidArgument,
@@ -2387,23 +2392,6 @@ impl AttentionModule {
             return self.shown_visit(caller, mutation, answer);
         }
         Ok(answer)
-    }
-
-    /// Returns the log's own cursor for the number a caller sent back, or the refusal when this
-    /// host did not give the caller that number.
-    fn cursor_of(&self, caller: &Caller, session_id: SessionId, shown: u64) -> Answer<u64> {
-        let numbering = {
-            let store = self.store()?;
-            caller
-                .view(|viewer| store.numbering(viewer, session_id))
-                .map_err(refusal)?
-        };
-        match numbering {
-            None => Ok(shown),
-            Some(numbering) => numbering
-                .cursor(shown)
-                .ok_or_else(|| ProtocolError::new(ErrorCode::InvalidArgument, NOT_GIVEN_CURSOR)),
-        }
     }
 
     /// Writes the answer to a visit's acknowledgement in the numbers its caller is shown.
@@ -4369,6 +4357,20 @@ fn parse<T: kr_protocol::wire::WireMessage>(params: &ParamsValue) -> Result<T> {
 fn encode<T: serde::Serialize>(value: &T) -> Answer<ParamsValue> {
     ParamsValue::from_typed(value)
         .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))
+}
+
+/// Returns the log's own cursor for the number a caller sent back, or the refusal when this host
+/// did not give the caller that number.
+fn cursor_of(store: &Attention, caller: &Caller, session_id: SessionId, shown: u64) -> Answer<u64> {
+    let numbering = caller
+        .view(|viewer| store.numbering(viewer, session_id))
+        .map_err(refusal)?;
+    match numbering {
+        None => Ok(shown),
+        Some(numbering) => numbering
+            .cursor(shown)
+            .ok_or_else(|| ProtocolError::new(ErrorCode::InvalidArgument, NOT_GIVEN_CURSOR)),
+    }
 }
 
 /// What a caller is told when it sends back a cursor this host did not give it.
