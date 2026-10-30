@@ -388,3 +388,170 @@ async fn the_releases_and_modifiers_of_an_attached_console_reach_the_application
     let _ = console.child.kill();
     drop(typist);
 }
+
+/// The variable that makes this test binary, started in a console of its own, run the console half
+/// of [`a_console_asked_to_spell_its_keys_hands_the_reader_bytes_where_it_handed_records`].
+const SPELL_PROBE: &str = "KR_ATTACH_SPELL_PROBE";
+
+/// KR-REQ-08.53: a console the attachment asks to spell its keys itself spells them, and the reader
+/// that handed on the console's key records hands on the bytes it spelled from then on.
+///
+/// A session whose application has negotiated a keyboard encoding that its spelling of key records
+/// cannot express refuses the records, and the attachment then turns its console to its own
+/// virtual-terminal input. This runs the production pieces of that in a console of their own: this
+/// test binary is started in a pseudo-console with the variable above set, and there it takes the
+/// console the way `kr attach` does, in record mode, starts the input reader over it, and reads a key
+/// as the record it is. It then asks the console to spell its keys, and reads an arrow and a letter,
+/// which come back as the bytes a terminal sends for them. The test, outside, writes the keys in the
+/// documented record sequence, and expects the records first and the bytes after. A switch that
+/// changed nothing leaves the arrow a record, as does a reader that kept handing on records.
+#[test]
+fn a_console_asked_to_spell_its_keys_hands_the_reader_bytes_where_it_handed_records() {
+    if std::env::var_os(SPELL_PROBE).is_some() {
+        spell_probe_in_the_console();
+        return;
+    }
+
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("opens a console");
+    let mut command = CommandBuilder::new(std::env::current_exe().expect("this test binary"));
+    command.args([
+        "--exact",
+        "a_console_asked_to_spell_its_keys_hands_the_reader_bytes_where_it_handed_records",
+        "--nocapture",
+        "--test-threads=1",
+    ]);
+    command.env(SPELL_PROBE, "1");
+    let mut child = pty.slave.spawn_command(command).expect("starts the probe");
+    drop(pty.slave);
+    let writer: Arc<Mutex<Box<dyn Write + Send>>> =
+        Arc::new(Mutex::new(pty.master.take_writer().expect("a writer")));
+    let output = ConsoleOutput::collect(
+        pty.master.try_clone_reader().expect("a reader"),
+        Arc::clone(&writer),
+    );
+    let press = |bytes: &[u8]| {
+        let mut keyboard = writer.lock().expect("the console input is not poisoned");
+        keyboard.write_all(bytes).expect("writes the console input");
+        keyboard.flush().expect("flushes the console input");
+    };
+    let started = Instant::now();
+    let waits_for = |what: &str, child: &mut Box<dyn portable_pty::Child + Send + Sync>| {
+        while !output.text().contains(what) {
+            assert!(
+                child.try_wait().expect("the probe's state").is_none(),
+                "the probe ended before the console showed {what:?}: {:?}",
+                output.text()
+            );
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "waited for the console to show {what:?}: {:?}",
+                output.text()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+
+    waits_for("kr-probe:ready", &mut child);
+    // The letter A, going down and coming up, as a console is written a key.
+    press(b"\x1b[65;30;97;1;0;1_");
+    press(b"\x1b[65;30;97;0;0;1_");
+    waits_for("kr-probe:switched", &mut child);
+    let before = output.text();
+    assert!(
+        before.contains("kr-probe:key:65:97:down"),
+        "the letter was read as the record it is before the console spelled anything: {before:?}"
+    );
+    // The up arrow and the letter B, each going down and coming up.
+    press(b"\x1b[38;72;0;1;0;1_");
+    press(b"\x1b[38;72;0;0;0;1_");
+    press(b"\x1b[66;48;98;1;0;1_");
+    press(b"\x1b[66;48;98;0;0;1_");
+    waits_for("kr-probe:done", &mut child);
+    let shown = output.text();
+    let after = &shown[shown
+        .find("kr-probe:switched")
+        .expect("the switch is shown")..];
+    assert!(
+        after.contains("kr-probe:bytes:1b5b4162"),
+        "the arrow and the letter came back as the bytes a terminal sends for them: {after:?}"
+    );
+    assert!(
+        !after.contains("kr-probe:key:"),
+        "a key was handed on as a record after the console spelled its keys: {after:?}"
+    );
+}
+
+/// The console half of the test above, run in a console of its own.
+fn spell_probe_in_the_console() {
+    use kr_cli::attach::{TerminalInput, spawn_input_reader};
+    use kr_cli::platform::ControllingTerminal;
+
+    let console = ControllingTerminal::open().expect("this process has a console");
+    let _saved = console
+        .enter_record_mode()
+        .expect("the console takes record mode");
+    let switch = console.input_switch().expect("a switch over the console");
+    let handle = console.handle().try_clone().expect("a handle on the input");
+    let (mut input, stop) = spawn_input_reader(handle, &switch).expect("the reader starts");
+    let deadline = Instant::now() + LIVENESS_DEADLINE;
+    let mut next = || loop {
+        match input.try_recv() {
+            Ok(read) => return read,
+            Err(_) => {
+                assert!(Instant::now() < deadline, "the console gave no input");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    };
+    println!("kr-probe:ready");
+    // Records until the letter comes up.
+    loop {
+        match next() {
+            TerminalInput::Keys(keys) => {
+                let mut up = false;
+                for key in keys {
+                    println!(
+                        "kr-probe:key:{}:{}:{}",
+                        key.virtual_key,
+                        key.unicode,
+                        if key.key_down { "down" } else { "up" }
+                    );
+                    up |= !key.key_down && key.virtual_key == 65;
+                }
+                if up {
+                    break;
+                }
+            }
+            TerminalInput::Bytes(bytes) => println!("kr-probe:early:{}", hex(&bytes)),
+        }
+    }
+    switch.engage().expect("the console spells its keys");
+    println!("kr-probe:switched");
+    // Whatever comes next is read until four bytes have: the arrow's three and the letter's one.
+    let mut spelled = Vec::new();
+    while spelled.len() < 4 {
+        match next() {
+            TerminalInput::Bytes(bytes) => spelled.extend(bytes),
+            TerminalInput::Keys(keys) => {
+                for key in keys {
+                    println!("kr-probe:key:{}:{}", key.virtual_key, key.unicode);
+                }
+            }
+        }
+    }
+    println!("kr-probe:bytes:{}", hex(&spelled));
+    stop.stop();
+    println!("kr-probe:done");
+}
+
+/// `bytes` as lower-case hexadecimal.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
