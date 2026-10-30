@@ -2176,10 +2176,9 @@ async fn kr_req_11_27_a_transport_that_panics_after_the_marker_leaves_the_answer
     );
 }
 
-/// KR-REQ-11.27 and KR-REQ-27.05, an upstream that disconnects after dispatch: one resolution per
-/// pending resource, and the end of the connection an answer went on reconciles that answer without
-/// reissuing it: the answer that went and was not confirmed is uncertain, the request nothing was
-/// sent for is cancelled, and nothing is asked a second time.
+/// KR-REQ-11.27: one resolution per pending resource, and the end of the connection an answer went
+/// on reconciles that answer without reissuing it: the answer that went and was not confirmed is
+/// uncertain, the request nothing was sent for is cancelled, and nothing is asked a second time.
 ///
 /// A request the upstream still holds and nothing was sent for stays answerable on a connection
 /// that stays open; that is the recovery's pass over an open connection, in the gateway suite.
