@@ -5,11 +5,13 @@
 //! suspension. The client library's own case times its half against a host that answers at once,
 //! and the transport's times a frame carried. This case times the whole of what lies between: one
 //! real daemon on the loopback network, a real worker it adopts, and a paired device that has been
-//! attached and subscribed before and has gone. The clock starts where the row starts it, with the
-//! transport returned and nothing yet asked of the host; it stops when the restoration has
-//! installed the screen the host projects and the client has painted it. The attach that comes
-//! before the subscription, the host's answer to each, and the projection it builds and publishes
-//! are all inside the figure.
+//! attached and subscribed before and has gone, and that comes back the way the client library
+//! comes back: with the cursors the ended session carried, subscribing from the position it held.
+//! The clock starts as the device dials, which on the loopback network with direct addresses is
+//! the moment the transport is available, and it stops when the restoration has installed the
+//! screen the host projects and the client has painted it. The connection and its handshake, the
+//! attach that comes before the subscription, the host's answer to each, and the projection it
+//! builds and publishes are all inside the figure.
 
 #![cfg(unix)]
 
@@ -18,9 +20,10 @@ mod net_support;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kr_client::cursors::Restoration;
+use kr_client::cursors::{Restoration, RestorationStep};
 use kr_client::projection::paint::{Keyboard, Window};
 use kr_client::projection::{Applied, Projection};
+use kr_client::reconnect::ClientState;
 use kr_client::session::Session;
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::attachment::{
@@ -31,7 +34,7 @@ use kr_protocol::ids::{EnvironmentId, SessionId, StreamId};
 use kr_protocol::method::Method;
 use kr_protocol::recovery::EventStream;
 use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::{DurationMs, Nullable};
+use kr_protocol::scalars::{DurationMs, Nullable, U64};
 use kr_protocol::session::Dimensions;
 
 use net_support::worker::Worker;
@@ -67,13 +70,15 @@ fn output_stream() -> StreamId {
 ///
 /// Everything a reconnecting client does after the transport returns is in here, in the order it
 /// does it: the attach, the subscription named by the cursors, the projection's snapshot and rows,
-/// and the paint.
+/// and the paint. The step the restoration began at is returned, so a caller can say whether the
+/// subscription resumed from a position or began at the start. The position the installed screen
+/// describes is recorded as applied, which is what a later reconnect carries.
 async fn restored(
     session: &Session,
     environment_id: EnvironmentId,
     session_id: SessionId,
     started: Instant,
-) -> (Duration, String) {
+) -> (Duration, String, RestorationStep) {
     // The events are read from before the subscription, so nothing it queues is missed.
     let mut events = session.events();
     let attached: SessionAttachResult = session
@@ -106,6 +111,7 @@ async fn restored(
         .expect("an attachment");
 
     let mut restoration = Restoration::start(output_stream(), &session.cursors().await);
+    let began = restoration.step();
     let params = restoration
         .subscribe_params(
             session_id,
@@ -149,19 +155,24 @@ async fn restored(
     let painted =
         kr_client::projection::paint::install(screen, Window::of(screen), Keyboard::EVERYTHING);
     let elapsed = started.elapsed();
+    let base = projection.base().expect("the installed screen has a base");
+    session
+        .applied_content(&output_stream(), U64::new(base.cursor))
+        .await;
     (
         elapsed,
         String::from_utf8(painted.bytes).expect("the paint is text and escapes"),
+        began,
     )
 }
 
 /// KR-PERF-006: a paired device that comes back to a real daemon has a painted 120x40 screen of
-/// the session within two seconds of the transport's return.
+/// the session within two seconds of dialling again.
 ///
 /// The device is attached and subscribed once and goes, and the host has recorded that its
-/// connection ended. It then dials again and the clock starts when the transport is returned. The
-/// two seconds are the row's figure, so they are asserted, and the reading is printed with the
-/// conditions it was taken under.
+/// connection ended. It then dials again, resuming the cursors the ended session carried, and the
+/// clock starts as it dials. The two seconds are the row's figure, so they are asserted, and the
+/// reading is printed with the conditions it was taken under.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_paired_device_that_comes_back_has_a_painted_screen_inside_the_reconnect_budget() {
     let kept = tempfile::tempdir().expect("a directory for what the application keeps");
@@ -207,39 +218,50 @@ async fn a_paired_device_that_comes_back_has_a_painted_screen_inside_the_reconne
     .await;
     let dial = paired_dial(&host, &device, &record);
 
-    // The first connection: attached, subscribed and restored, then gone.
-    let first_transport = dial.dial().await;
+    // The first connection: attached, subscribed and restored, then gone. What it applied is what
+    // the client library carries to the next one.
     let first_started = Instant::now();
+    let first_transport = dial.dial().await;
     let session = Session::start(Arc::new(first_transport)).expect("a session");
-    let (first, painted) = restored(
+    let (first, painted, began) = restored(
         &session,
         host.environment_id,
         worker.session_id,
         first_started,
     )
     .await;
+    assert_eq!(
+        began,
+        RestorationStep::SubscribeFromStart,
+        "a device with nothing applied subscribes from the start"
+    );
     assert!(
         painted.contains(LAST_LINE),
         "the screen carries the session's text"
     );
+    let carried = ClientState::from_session(&session, None).await;
     session.close();
     until("the host to record that the connection ended", || async {
         (host.connections_of(&record) == 0).then_some(())
     })
     .await;
 
-    // The return: the clock starts with the transport, and nothing has been asked of the host.
-    let transport = dial.dial().await;
+    // The return: the clock starts as the device dials, and nothing has been asked of the host.
     let started = Instant::now();
-    let session = Session::start(Arc::new(transport)).expect("a session");
-    let (elapsed, painted) =
+    let transport = dial.dial().await;
+    let session = Session::resume(Arc::new(transport), carried.cursors).expect("a resumed session");
+    let (elapsed, painted, began) =
         restored(&session, host.environment_id, worker.session_id, started).await;
+    assert!(
+        matches!(began, RestorationStep::SubscribeFrom(_)),
+        "a reconnect subscribes from the position it carried: {began:?}"
+    );
     assert!(
         painted.contains(LAST_LINE),
         "every row of the session's screen is in what a terminal would be sent"
     );
     eprintln!(
-        "KR-PERF-006 reconnect to a real daemon: {elapsed:?} from the transport's return to a \
+        "KR-PERF-006 reconnect to a real daemon: {elapsed:?} from the dial to a \
          painted {COLUMNS}x{ROWS} screen (the first connection took {first:?}); {} logical \
          processors, {}",
         std::thread::available_parallelism().map_or(0, std::num::NonZero::get),
