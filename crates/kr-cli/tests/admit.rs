@@ -603,7 +603,8 @@ fn an_install_into_a_fresh_home_makes_only_owner_only_directories() {
     assert!(installed.status.success(), "{}", said(&installed));
 
     // Every directory the install made is owner-only: the store's, the ones above it that were
-    // missing, and nothing else is there but the test's own temporary directory.
+    // missing, and nothing else is there but the test's own temporary directory. An installed
+    // release is read-only by design, so the walk stops at the releases themselves.
     let mut pending = vec![home.store.root().to_path_buf()];
     let mut above = home.store.root().parent().map(Path::to_path_buf);
     while let Some(directory) = above.filter(|directory| *directory != home.home) {
@@ -619,6 +620,9 @@ fn an_install_into_a_fresh_home_makes_only_owner_only_directories() {
             directory.display()
         );
         made += 1;
+        if directory.file_name().is_some_and(|name| name == "versions") {
+            continue;
+        }
         for entry in std::fs::read_dir(&directory)
             .expect("a directory")
             .flatten()
