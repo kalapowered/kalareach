@@ -3131,21 +3131,30 @@ host. A command quoted in backticks is replaced by `a command` and the rest of t
 message that names a path of any kind, the number of an account, the program `kr` followed by
 another word or the program that changes who may use a file is not sent: the device is given the
 clause that comes before the first such name, when there is one (`the host could not make the
-session's directory`), and otherwise a sentence made from the code. Two refusals of the project
-service give their reason in terms of the location the grant names and not the place on this host: a
-filesystem mounted beneath it, and a repository whose alternates file names objects outside it. Text
-that already exists cannot be made again, so the rule holds where an error is written, whoever made
-it: a worker's, one a store kept, one a catalogue receipt holds, and one inside a result, such as
-the presentation error of a create. A receipt whose message was replaced says so in
-`error_withheld`. What a closure records of a resource it left is held to the same rule and is
-replaced by the kind of resource. What the agent of a session says in refusing a prompt, a steer, a
-cancellation, an approval or a plugin's action, as `INVALID_ARGUMENT`, `UPSTREAM_UNAVAILABLE` or
-`OUTCOME_UNKNOWN`, is the agent's own words, and the host cannot tell them from its own refusals of
-the request, so every message with one of those codes on these methods is replaced by a sentence
-made from its code, the host's own refusals included. The code and the retry category stay. A
-candidate that has not paired is never given what the pairing store or the rendezvous service
-reported. The owner at this machine is given the whole text, on the local socket and in the daemon's
-records.
+session's directory`), and otherwise a sentence made from the code. Three refusals give a fixed
+reason, because their text names a place or an account: a filesystem mounted beneath the location a
+grant names and a repository whose alternates file names objects outside it, both told in terms of
+that location, and a worker that could not be started over a scheduled task another account holds
+under the environment's name. Text that already exists cannot be made again, so the rule holds where
+an error is written, whoever made it: a worker's, one a store kept, one a catalogue receipt holds,
+and one inside a result, such as the presentation error of a create. A receipt whose message was
+replaced says so in `error_withheld`. A record that holds a failure as plain text is held to the
+rule by the member that carries it, in a result and in an announcement of any kind: the `reason` of
+a privacy step that could not answer and of a session's cleanup, the `detail` of a workspace, of a
+retained item and of a repository operation, and the `refusal` of an agent instance. The rest of
+the record is sent as it is. What a closure records of a resource it left is held to the same rule
+and is replaced by the kind of resource. What the agent of a session says in refusing a prompt, a
+steer, a cancellation, an approval or a plugin's action is the agent's own words, and they quote
+what it was working on. The worker gives them as `INVALID_ARGUMENT`, `UPSTREAM_UNAVAILABLE` or
+`OUTCOME_UNKNOWN`, so on these methods a message with one of those codes is replaced by a sentence
+made from its code. The exception is the host's own reasons for refusing the device's argument,
+which the device needs to correct what it sent, and which are told apart by their wording and not
+by their code: a prompt that names neither a draft nor inline text or names both, a parameter an
+action does not declare or does not accept, and an attachment over the package's size or of a type
+it does not accept. The rule above still cuts any place such a reason quotes. The code and the retry
+category stay. A candidate that has not paired is never given what the pairing store or the
+rendezvous service reported. The owner at this machine is given the whole text, on the local
+socket.
 
 What the grant decides, for every request:
 
