@@ -6086,9 +6086,9 @@ of the session and of the moment its history reaches back to, under the attentio
 in the range from 2^60 up to 2^61. The offset is the same whenever it is asked for and nothing
 stores it. It changes with the store, so the numbers of a replaced store stop being valid by
 themselves. The device sends back in `visit.acknowledge` the number it was shown, and the host takes
-the offset away. A number below the first number of its history, or past the last change it was
-shown, is refused as one the host did not give that device, and the log's own cursor is such a
-number. The line is drawn at the first number of its history and not at the offset, so that a device
+the offset away. A number below the first number of its history, or past the last change its
+history reaches (or where its own stored visit stands, when that is further), is refused as one the
+host did not give that device, and the log's own cursor is such a number. The line is drawn at the first number of its history and not at the offset, so that a device
 cannot find the offset, and with it how many changes came before its history, by trying numbers
 below its first. When retention lets go of the changes a device's history started at, its first
 number moves up, and a number it was shown before is refused the same way: it reads its view again.
@@ -6103,8 +6103,9 @@ The numbering has two limits. The first is the step between two cursors a device
 recorded after the bound but dated before it takes a place in the log that the device cannot read,
 so a step of two between neighbours says that something unreadable was recorded, and a device whose
 first view is empty sees its `from_cursor` move when one is. The numbers the host takes back end at
-the last change the device was shown and not at the end of the log, so a refusal does not say how
-many such changes there are beyond that. That shows such changes exist after the bound, and never
+the last change the device's history reaches, or where its own stored visit stands when that is
+further, and not at the end of the log, so a refusal does not say how many such changes there are
+beyond that. That shows such changes exist after the bound, and never
 how many came before it. This holds for an invitation because the host refuses one whose history
 would start after the moment it is issued: a bound still ahead would count each change recorded
 before it, and a device clock far ahead of the host's can name one. An invitation that an earlier
