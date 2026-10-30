@@ -75,8 +75,13 @@ resume it with `xcrun notarytool wait <submission id>` and the same key options.
 A tar archive of executables cannot carry a stapled ticket, because a ticket attaches to an
 application, a package or a disk image. Apple keeps it. The first time a person opens a program that
 came from a browser or a quarantining tool, Gatekeeper asks Apple's service whether it is notarised,
-so that first launch needs a network. A program fetched by `curl`, or put in the store by
-`kr host install`, carries no quarantine flag and meets no check.
+so that first launch needs a network. Safari decompresses a `.tar.gz` to a `.tar` that carries the flag,
+and Archive Utility and `tar` put it on every file they unpack from a flagged archive. On a macOS 26.6.2 guest
+the first run of `kr` took about ten seconds with a network. With none, the system refused it with a
+"Not Opened" window and the command waited behind the window. That copy kept refusing when the network
+came back, and a fresh unpack of the same archive ran. A program fetched by `curl`, or put in the store by
+`kr host install`, carries no quarantine flag and meets no check: the tree `curl` fetched ran with the
+network blocked, and the store held no flagged file.
 
 ## The files that sign
 
