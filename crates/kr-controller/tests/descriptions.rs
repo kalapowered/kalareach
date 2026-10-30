@@ -1176,7 +1176,7 @@ impl Environment {
             )
             .await
             .expect("the call reaches the daemon")
-            .expect_err("a host with no model to fetch refuses the fetch")
+            .expect_err("the daemon refuses the download action")
             .message
     }
 
@@ -3403,6 +3403,51 @@ async fn a_fetch_cancelled_mid_body_leaves_no_file_and_a_new_fetch_starts_from_n
         .await;
     assert!(environment.marker());
     assert_eq!(fixture.requests().len(), 2);
+    environment.stop().await;
+}
+
+/// KR-REQ-09.09: a cancellation of a running fetch is refused while this host owes a fence, and the
+/// fetch goes on. The control: with nothing owed, the same cancellation stops it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fetch_is_not_cancelled_while_a_fence_is_owed() {
+    let fixture = Fixture::start().await;
+    fixture.reply("/tiny.gguf", Reply::HalfThenHold(WEIGHTS.to_vec()));
+    let environment = Environment::start(Setup {
+        catalogue: Some(catalogue_at(1, fixture.url("/tiny.gguf"), WEIGHTS)),
+        held: false,
+        ..Setup::new()
+    })
+    .await;
+
+    let started = environment.download(DescriptionDownloadAction::Start).await;
+    assert_eq!(started.download, DescriptionDownload::Running);
+    fixture.until_half_sent().await;
+
+    environment.controller().hold_fence(true);
+    let refused = environment
+        .download_refused(DescriptionDownloadAction::Cancel)
+        .await;
+    environment.controller().hold_fence(false);
+    assert!(refused.contains("fence"), "{refused}");
+    assert_eq!(
+        environment
+            .setup_until("the fetch still runs", |shown| {
+                shown.download == DescriptionDownload::Running
+            })
+            .await
+            .download,
+        DescriptionDownload::Running,
+        "the refused cancellation changed nothing"
+    );
+
+    environment
+        .download(DescriptionDownloadAction::Cancel)
+        .await;
+    environment
+        .setup_until("the cancelled fetch", |shown| {
+            shown.download == DescriptionDownload::Cancelled
+        })
+        .await;
     environment.stop().await;
 }
 
