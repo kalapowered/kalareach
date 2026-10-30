@@ -240,15 +240,15 @@ curl -fL -o kalareach-<target>-<release>.tar.gz <the archive's link>
 curl -fL -o SHA256SUMS <the link of SHA256SUMS>
 ```
 
-The links use `%2B` to encode the `+` in the release name, so you should not use `curl -O`: it keeps that spelling in the file name, and the check below will not find the archive. Also, if you use your browser to download the archive instead of `curl`, on macOS 26.6.2 Safari with its default settings decompresses it, leaving the `.tar` file but not the `.tar.gz` file, which leaves nothing to check. Once you have both files, you can check the archive's integrity, unpack it and run the install command:
+The links use `%2B` to encode the `+` in the release name, so you should not use `curl -O`: it keeps that spelling in the file name, and the check below will not find the archive. Also, if you use your browser to download the archive instead of `curl`, on macOS 26.6.2 Safari with its default settings decompresses it, leaving the `.tar` file but not the `.tar.gz` file, which leaves nothing to check. Once you have both files, the following commands check the archive's integrity and, only if the check passes, unpack it and run the install command:
 
 ```sh
-shasum -a 256 --ignore-missing -c SHA256SUMS   # sha256sum --ignore-missing -c SHA256SUMS on Linux
-tar -xzf kalareach-<target>-<release>.tar.gz
+shasum -a 256 --ignore-missing -c SHA256SUMS &&
+tar -xzf kalareach-<target>-<release>.tar.gz &&
 kalareach-<target>-<release>/bin/kr host install
 ```
 
-The check should output `kalareach-<target>-<release>.tar.gz: OK`. If it says `FAILED`, the archive you downloaded is not the one published with the release; if it says `no file was verified`, the archive is not named as `SHA256SUMS` names it. In both cases, you should not unpack it.
+On Linux, run `sha256sum --ignore-missing -c SHA256SUMS` instead of the first command. The check has to print `kalareach-<target>-<release>.tar.gz: OK`, and the two commands after it run only if it does. If it ends with a line ending in `FAILED`, the archive you downloaded is not the one that was released. If it says `no file was verified` and there is no line ending in `FAILED`, you do not have an archive with the name `SHA256SUMS` lists. In both cases the block stops there, and nothing is unpacked or installed.
 
 The command `kr host install` verifies the signed manifest of the release and checks every file against it before making the release current. It then prints the directory to add to your `PATH`. A first install can check the manifest only against the update channel root that the archive carries, so `SHA256SUMS` and the address you downloaded from are what vouch for the archive; the release notes list the key identifiers of that root. On macOS, every program in the archive is signed by Kala Holdings Inc. and notarised by Apple. If you downloaded the archive with `curl`, the programs carry no quarantine flag, and on macOS 26.6.2 `kr` ran with no network. A download from a browser carries the flag, and so does every file that Archive Utility or `tar` unpacks from it. On macOS 26.6.2, the first flagged `kr` you run asks Apple's service about it, so it needs a network. Without one, the system refused it: a window titled "“kr” Not Opened" said "Apple could not verify “kr” is free of malware that may harm your Mac or compromise your privacy", and the command waited behind that window. A copy refused this way kept refusing when the network came back. Run the first command with the network on, and unpack the archive again if it was refused. The copies that `kr host install` puts in the store carry no flag.
 
