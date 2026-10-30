@@ -2107,9 +2107,10 @@ async fn kr_req_11_35_a_journal_fault_after_the_rich_marker_leaves_the_rich_answ
     );
 }
 
-/// KR-REQ-11.33 and KR-REQ-11.35: a committed marker followed by a transmission that fails is not
-/// a refusal. The answer's fate is unknown, the connection a failed write ends serves the terminal
-/// nothing more, the request stays uncertain, and nobody sends it again.
+/// KR-REQ-11.33, KR-REQ-11.35 and KR-REQ-27.05, an upstream that disconnects after dispatch: a
+/// committed marker followed by a transmission that fails is not a refusal. The answer's fate is
+/// unknown, the connection a failed write ends serves the terminal nothing more, the request stays
+/// uncertain, and nobody sends it again.
 ///
 /// Not claimed: Windows, where no gateway runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
