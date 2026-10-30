@@ -367,6 +367,9 @@ pub struct ReleaseMatrixStage {
     /// The proxy the configuration document sends every request of the daemon's through, when the
     /// suite puts one in the way.
     pub proxy_url: Option<String>,
+    /// Whether the configuration document says the host uses relays only. The daemon's endpoint is
+    /// still the one the suite gives it.
+    pub relay_only: bool,
 }
 
 impl Host {
@@ -697,14 +700,24 @@ impl Host {
         .expect("the host's keys are stored");
         drop(secrets);
         write_relay_document(&temp, origin);
-        if let Some(proxy) = matrix.as_ref().and_then(|stage| stage.proxy_url.as_deref()) {
+        if let Some(stage) = matrix
+            .as_ref()
+            .filter(|stage| stage.proxy_url.is_some() || stage.relay_only)
+        {
             let mut document = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
             document.revision = 1;
             document.relay.origin = origin
                 .map_or_else(kr_protocol::scalars::Nullable::null, |origin| {
                     kr_protocol::scalars::Nullable::some(origin.to_owned())
                 });
-            document.network.proxy_url = kr_protocol::scalars::Nullable::some(proxy.to_owned());
+            if let Some(proxy) = &stage.proxy_url {
+                document.network.proxy_url = kr_protocol::scalars::Nullable::some(proxy.clone());
+            }
+            if stage.relay_only {
+                document.network.relay_only = kr_protocol::scalars::Nullable::some(true);
+                document.network.relay_urls =
+                    kr_protocol::scalars::Nullable::some(vec!["https://relay.example".to_owned()]);
+            }
             write_document(&temp, &document);
         }
         let mut host = Self::start_on(

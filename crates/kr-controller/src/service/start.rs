@@ -915,6 +915,7 @@ impl Controller {
                 Some(crate::relay_leases::RelayKeeper::new(
                     Arc::clone(service),
                     &origin,
+                    started.network.relay_only(),
                     Arc::clone(&account),
                     lease_record,
                     Arc::clone(&timer),

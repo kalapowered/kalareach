@@ -479,7 +479,8 @@ release that does not know it leaves it alone.
 If the verified matrix lists no tier for the build this daemon is, the host asks the lease service
 for no new lease and no pairing admission, and the owner is told: the `release-matrix` check warns
 and names the paths that still work, and the `relay-leases` check warns that new leases are
-refused. A lease the host holds is still refilled, so a route that works stays up. The refusal holds
+refused, naming the paths the host can use: a host with `network.relay_only` is offered a relay of
+its own and never a direct connection. A lease the host holds is still refilled, so a route that works stays up. The refusal holds
 the keeper's next requests for five minutes, refills included, and a refill falls due with ten
 minutes of a fifteen-minute lease left, so no lease runs out for it. Sessions, workers, grants, direct connections and the `kr host update` command are not
 touched. A copy another package version read is not acted on as a skew: after an update the held
