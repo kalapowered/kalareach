@@ -1042,7 +1042,7 @@ fn a_host_with_a_slow_disk_records_the_attach_figure_without_asserting_it() {
         slow.shortfalls()
             .iter()
             .any(|shortfall| shortfall.contains("170.0 ms")),
-        "the host's shortfalls, which a measurement asserts only without, name the slow disk: {:?}",
+        "the host's shortfalls name the slow disk, so a measurement that asserts only without shortfalls does not assert here: {:?}",
         slow.shortfalls()
     );
     let attached = Attached::new(Duration::from_millis(520), &slow);

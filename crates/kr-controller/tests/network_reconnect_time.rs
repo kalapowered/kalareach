@@ -20,11 +20,13 @@
 //! hypervisor, where the platform accounts for them. "Nothing else running" is not among them, so
 //! a figure with no shortfall is a figure with no measured shortfall and not a certified
 //! reference-host run. Where a shortfall is shown, which is every debug build, the figure is
-//! recorded with the shortfall named and the target cannot fail the case. A run that gets as far as
-//! the timed span's end records the figure beside the host it was taken on, in the form the other
-//! performance records take, before the target is asserted. The case has no other limit on time
-//! than a liveness bound of 120 seconds on each wait, including the wait for the screen inside the
-//! timed span, so a host that never publishes one fails the case whatever it lacks.
+//! recorded with the shortfall named and the target cannot fail the case. A run whose restored
+//! screen passes the case's checks records the figure beside the host it was taken on, in the form
+//! the other performance records take, before the target is asserted. The target is not the case's
+//! only limit on time: its own waits for the host (to settle after the first connection, and for
+//! the screen inside the timed span) have a liveness bound of 120 seconds, and the harness's dial
+//! and set-up have limits of their own, so a host that never answers fails the case whatever it
+//! lacks.
 
 #![cfg(unix)]
 
@@ -192,9 +194,10 @@ async fn restored(
 /// The device is attached and subscribed once and goes, and the host has recorded that its
 /// connection ended. It then dials again, resuming the cursors the ended session carried, and the
 /// clock starts as it dials. The two seconds are the row's figure for the reference host: they
-/// are asserted where no condition the record reads falls short, and the reading is recorded with
-/// the host it was taken on in every run. A host that is shown to fall short of the reference host
-/// (a debug build, fewer processors, a slow disk) records its figure and fails nothing on time.
+/// are asserted where no condition the record reads falls short, and a run whose screen passes
+/// the case's checks records the reading with the host it was taken on. A host that is shown to
+/// fall short of the reference host (a debug build, fewer processors, a slow disk) records its
+/// figure and does not assert the target.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_paired_device_that_comes_back_has_a_painted_screen_inside_the_reconnect_budget() {
     let kept = tempfile::tempdir().expect("a directory for what the application keeps");
