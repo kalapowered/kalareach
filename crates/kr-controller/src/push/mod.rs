@@ -74,18 +74,22 @@ pub mod sender;
 pub mod status;
 pub mod transport;
 
-/// Takes back from the host's secret store the delivery credential of every push destination in
-/// service, so a restarted daemon delivers under the bearer it had.
+/// Takes back from the host's secret store the delivery credential of every push destination that
+/// has a rule, so a restarted daemon delivers under the bearer it had and can still ask its
+/// gateway about what it sent.
 ///
 /// A destination whose credential is not kept holds none: it is delivered to once its device
 /// registers again, and until then its notifications settle as revoked, which is what a host that
-/// holds no credential for an authorisation says. A destination out of service, and an
-/// authorisation the host owes the gateway a revocation of, take nothing back, and the item
-/// either has in the store is removed: a host that stopped between ending a destination and
-/// deleting its item would otherwise renew a credential for a device that is no longer paired. A
-/// store that will not delete one is reported and the start goes on, because nothing loads that
-/// item; a store that cannot be read stops the start, as one that cannot say whether privacy mode
-/// is on does.
+/// holds no credential for an authorisation says. A destination put out of service by a rejected
+/// token keeps its rule and the authorisation behind it, and so its credential, as it does while
+/// the daemon runs: it is delivered nothing, and the host can still ask the gateway what became of
+/// what it sent and to delete what it holds. A destination an unpairing or a removal ended (it
+/// has no rule), and an authorisation the host owes the gateway a revocation of, take nothing
+/// back, and the item either has in the store is removed: a host that stopped between ending a
+/// destination and deleting its item would otherwise renew a credential for a device that is no
+/// longer paired. A store that will not delete one is reported and the start goes on, because
+/// nothing loads that item; a store that cannot be read stops the start, as one that cannot say
+/// whether privacy mode is on does.
 ///
 /// # Errors
 ///
@@ -115,10 +119,7 @@ pub fn load_held_credentials(
         let Some(push) = destination.as_push() else {
             continue;
         };
-        if !destination.enabled
-            || destination.rule.is_none()
-            || owed.contains(&push.sender_record_id)
-        {
+        if destination.rule.is_none() || owed.contains(&push.sender_record_id) {
             forget_at_start(credentials, push.sender_record_id);
             continue;
         }

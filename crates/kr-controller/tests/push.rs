@@ -8285,6 +8285,54 @@ async fn the_gateway_is_asked_only_about_a_listed_notification_the_host_holds_a_
     host.stop().await;
 }
 
+/// KR-REQ-24.29: a notification stays offered for deletion when its device's destination is put
+/// out of service by a rejected token, and the offer holds through a start of the daemon. A
+/// destination out of service keeps its rule and the authorisation behind it, so the credential
+/// the host asks the gateway under is still the host's to hold when the daemon starts again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_notification_of_a_destination_out_of_service_is_still_deleted_after_a_start() {
+    let gateway = Arc::new(DeliveringGateway::default());
+    let (host, copy, sender) = a_host_whose_alert_left(&gateway).await;
+    assert!(copy.deletable);
+    let controller = host.controller();
+    // The credential is kept where a daemon that starts again reads it from.
+    let credentials = controller.delivery_runtime().credentials();
+    credentials
+        .keep(credentials.held(sender).expect("a credential is held"))
+        .expect("the credential is kept");
+    let phone = DestinationId::new(DeviceId::new(uuid(10)).to_string()).expect("an identifier");
+    let record = controller
+        .delivery()
+        .with(|producer| Ok(producer.journal().destination(&phone).expect("a read")))
+        .expect("a read")
+        .expect("the phone is a destination");
+    controller
+        .delivery()
+        .disable(&record)
+        .expect("the provider rejects the token");
+
+    let host = host.restart().await;
+    assert!(
+        host.controller()
+            .attach_delivery_transport(Arc::new(OneTransport(
+                Arc::clone(&gateway) as Arc<dyn kr_client::services::ServiceHttp>
+            )))
+    );
+
+    let listed = privacy_report(&host).await.exported;
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert!(
+        listed[0].deletable,
+        "the destination is out of service, not ended"
+    );
+    let result = delete_retained(&host, &copy.reference)
+        .await
+        .expect("the host still holds the credential to ask under");
+    assert!(result.deleted);
+    assert_eq!(gateway.forgets().len(), 1, "the gateway was asked");
+    host.stop().await;
+}
+
 /// KR-REQ-24.29: the request is made under the authorisation the notification was sent under. The
 /// journal keeps only a digest of the destination the notification was admitted for, so a device
 /// that registers under another authorisation leaves the host unable to show which authorisation
