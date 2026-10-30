@@ -161,6 +161,16 @@ fn window_here(title: &str) -> bool {
     .contains("kr-seen True")
 }
 
+/// What this test can read of the logon process that anchors a desktop-bound session, for the
+/// failure message of a session that could not be bound to a desktop.
+fn the_logon_process_as_seen_here() -> String {
+    here(
+        "Get-Process -Name winlogon | ForEach-Object { 'winlogon pid=' + $_.Id + ' session=' + \
+         $_.SessionId + ' start=' + $(try { $_.StartTime.ToString('o') } catch { 'unreadable' }) }; \
+         'this process session=' + (Get-Process -Id $PID).SessionId",
+    )
+}
+
 /// KR-REQ-03.24: a headless session's shell is on a station and desktop of its own, away from the
 /// interactive ones, draws nothing on them, and still runs; a desktop-bound session's shell is on
 /// the interactive desktop and its window is there.
@@ -224,6 +234,12 @@ async fn a_headless_session_is_not_on_the_interactive_desktop_and_a_desktop_boun
         document: serde_json::from_slice(&output.stdout).unwrap_or(serde_json::Value::Null),
         output,
     };
+    assert!(
+        created.succeeded(),
+        "a desktop-bound session was not created: {} {}",
+        created.said(),
+        the_logon_process_as_seen_here()
+    );
     let bound_title = title("bound");
     let (bound, _holding_too) = probe_in_session(&host, &created, &bound_title).await;
     assert!(
