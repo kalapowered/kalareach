@@ -321,3 +321,56 @@ async fn a_revision_that_lists_the_build_opens_the_gate_again() {
         "the next new lease reaches the service"
     );
 }
+
+/// KR-REQ-17.46: hosts on the previous, the current and the next supported version read the same
+/// signed matrix, the document the managed service publishes, and are routed alike: each is served a
+/// new lease and a pairing admission, and a build on either side of that range is refused both with
+/// the route error. Each host reads the document as its own build; the matrix does not depend on
+/// which of them read it first.
+#[tokio::test]
+async fn hosts_on_every_supported_version_read_one_matrix_and_are_routed_alike() {
+    const DEPLOYED: &[u8] = include_bytes!("fixtures/release-matrix/deployed-revision-2.json");
+    let previous = PackageVersion::new(0, 77, 0);
+    let next = PackageVersion::new(0, 79, 99);
+    let (below, above) = (
+        PackageVersion::new(0, 76, 99),
+        PackageVersion::new(0, 80, 0),
+    );
+
+    let web = Arc::new(ServiceWeb::new());
+    let origin = GatewayOrigin::new(web.origin()).expect("an origin");
+    let signer = Arc::new(Installation(
+        AuthorisationKeyPair::generate().expect("a key pair"),
+    ));
+    let gated = |build| {
+        let held = HeldMatrix::none();
+        held.accept(&Pins::production(), origin.as_str(), build, 1, DEPLOYED)
+            .expect("the published matrix is accepted under the pin this build carries");
+        let gate = Arc::new(ReleaseGate::new(held, origin.clone(), build, false));
+        (
+            ManagedRelayLeaseService::new(origin.clone(), Arc::clone(&web) as _, signer.clone())
+                .gated_by(Arc::clone(&gate)),
+            ManagedPairingAdmission::new(origin.clone(), Arc::clone(&web) as _, signer.clone())
+                .gated_by(gate),
+        )
+    };
+
+    let mut asked = 0;
+    for build in [previous, this_build(), next] {
+        let (leases, admissions) = gated(build);
+        granted(&leases).await;
+        assert!(admissions.admit(&admission()).await.is_ok(), "{build}");
+        asked += 1;
+        assert_eq!(web.requests_to(LEASE), asked, "{build} was served a lease");
+        assert_eq!(web.requests_to(ADMISSION), asked, "{build} was admitted");
+    }
+    for build in [below, above] {
+        let (leases, admissions) = gated(build);
+        let refused = leases.issue(&lease(None)).await.expect_err("a refusal");
+        assert!(is_the_route_error(&refused), "{build}");
+        let refused = admissions.admit(&admission()).await.expect_err("a refusal");
+        assert!(is_the_route_error(&refused), "{build}");
+        assert_eq!(web.requests_to(LEASE), asked, "{build} sent nothing");
+        assert_eq!(web.requests_to(ADMISSION), asked, "{build} sent nothing");
+    }
+}
