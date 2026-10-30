@@ -147,13 +147,15 @@ impl Rig {
     /// As [`Self::start`], not waiting for the first read, with the configuration document sending
     /// the daemon's requests through `proxy` when one is given.
     async fn start_without_waiting(published: Option<&Value>, proxy: Option<String>) -> Self {
-        Self::start_reading_from(1, published, proxy).await
+        Self::start_configured(1, false, published, proxy).await
     }
 
     /// As [`Self::start_without_waiting`], for a host that reads no revision below
-    /// `first_revision`.
-    async fn start_reading_from(
+    /// `first_revision` and, when `relay_only` is set, whose configuration document says it uses
+    /// relays only.
+    async fn start_configured(
         first_revision: u64,
+        relay_only: bool,
         published: Option<&Value>,
         proxy: Option<String>,
     ) -> Self {
@@ -186,6 +188,7 @@ impl Rig {
                 timer: Arc::clone(&matrix_timer),
                 pins: Pins::of(vec![*matrix_key.public()]).from_revision(first_revision),
                 proxy_url: proxy,
+                relay_only,
             }),
         )
         .await;
@@ -506,7 +509,7 @@ async fn a_skewed_host_is_refused_new_leases_keeps_its_working_route_and_gets_ne
 /// requests go on, nothing is kept, and the first revision the host reads is read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_first_publication_below_the_first_revision_a_host_reads_gates_nothing() {
-    let rig = Rig::start_reading_from(2, Some(&skewing("1")), None).await;
+    let rig = Rig::start_configured(2, false, Some(&skewing("1")), None).await;
     rig.until_a_matrix_pass(1).await;
     let owner = rig.owner_device();
     rig.until("the owner's device holds a lease", || rig.holds(&owner))
@@ -530,6 +533,33 @@ async fn a_first_publication_below_the_first_revision_a_host_reads_gates_nothing
     rig.pass().await;
     assert!(!rig.holds(&other), "a skew at the first revision gates");
     assert_eq!(rig.requests_for(&other), 0);
+}
+
+/// KR-REQ-17.46: what the lease check offers a skewed host in place of a lease is a path that host
+/// can use. A host that uses relays only is not told to connect directly; a host that does not is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_skewed_host_is_offered_only_the_paths_it_can_use() {
+    for relay_only in [false, true] {
+        let rig = Rig::start_configured(1, relay_only, Some(&skewing("2")), None).await;
+        let (_device, record) = rig.pairs().await;
+        rig.pass().await;
+        assert_eq!(rig.requests_for(&record), 0, "the gate is closed");
+        let keeper = rig.check("relay-leases").await;
+        assert_eq!(keeper.status, DoctorStatus::Warning);
+        let remedy = keeper
+            .remedy()
+            .expect("the check offers a remedy")
+            .to_owned();
+        assert!(
+            remedy.contains("relay you run yourself"),
+            "relay_only {relay_only}: {remedy}"
+        );
+        assert_eq!(
+            remedy.contains("directly"),
+            !relay_only,
+            "relay_only {relay_only}: {remedy}"
+        );
+    }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -775,6 +805,7 @@ async fn a_test_build_never_reads_the_managed_origin_itself() {
             timer: HeldTimer::held(),
             pins: Pins::of(vec![*matrix_key.public()]),
             proxy_url: Some(format!("http://127.0.0.1:{}", refusing.port)),
+            relay_only: false,
         }),
     )
     .await;

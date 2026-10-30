@@ -394,6 +394,9 @@ fn relay_of_the_leases(rows: &[Row], now: u64, landing: Option<&str>) -> Option<
 struct Shared {
     service: Arc<dyn RelayLeaseService>,
     origin: String,
+    /// Whether this host uses relays only (`network.relay_only`), so that a remedy never offers
+    /// it a direct connection.
+    relay_only: bool,
     /// The account that pays, from this host's sign-in.
     payer: HostPayer,
     /// The authorisation the leases are asked for under now, as the pass in progress found it: none
@@ -546,11 +549,14 @@ impl std::fmt::Debug for RelayKeeper {
 
 impl RelayKeeper {
     /// Builds the keeper of the leases at `origin`, asking for them under the account `account` is
-    /// signed in to. Nothing runs and nothing is sent until [`Self::run`].
+    /// signed in to. `relay_only` says that this host uses relays only, which keeps a direct
+    /// connection out of what its check offers instead of a lease. Nothing runs and nothing is
+    /// sent until [`Self::run`].
     #[must_use]
     pub fn new(
         service: Arc<dyn RelayLeaseService>,
         origin: &GatewayOrigin,
+        relay_only: bool,
         account: Arc<HostAccount>,
         record: Record,
         timer: Arc<dyn Timer>,
@@ -559,6 +565,7 @@ impl RelayKeeper {
             shared: Arc::new(Shared {
                 service,
                 origin: origin.as_str().to_owned(),
+                relay_only,
                 payer: HostPayer::new(account, origin.as_str()),
                 current: Mutex::new(None),
                 record: Arc::new(record),
@@ -789,8 +796,13 @@ impl RelayKeeper {
             };
             let remedy = match standing {
                 Standing::Exhausted { .. } | Standing::NoLease | Standing::NoRoom => {
-                    "A direct connection between the devices needs no relay, and so does a relay \
-                     you run yourself. This host asks the service again by itself."
+                    if self.shared.relay_only {
+                        "A relay you run yourself, named in network.relay_urls, needs no lease \
+                         from the service. This host asks the service again by itself."
+                    } else {
+                        "A direct connection between the devices needs no relay, and so does a \
+                         relay you run yourself. This host asks the service again by itself."
+                    }
                 }
                 Standing::Refused(ErrorCode::PermissionDenied) => {
                     "Check that this host is signed in (`kr account status`), that the account has \
@@ -805,8 +817,13 @@ impl RelayKeeper {
                      was handled. This host asks the service again by itself."
                 }
                 Standing::Refused(ErrorCode::UnsupportedCapability) => {
-                    "Update KalaReach on this host, or connect the devices directly or through a \
-                     relay you run yourself. This host asks again by itself."
+                    if self.shared.relay_only {
+                        "Update KalaReach on this host, or use a relay you run yourself, named in \
+                         network.relay_urls. This host asks again by itself."
+                    } else {
+                        "Update KalaReach on this host, or connect the devices directly or \
+                         through a relay you run yourself. This host asks again by itself."
+                    }
                 }
                 Standing::Refused(_) => {
                     "Check `relay.origin` in the configuration document and that this host is \
