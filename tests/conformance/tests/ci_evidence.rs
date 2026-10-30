@@ -150,10 +150,18 @@ fn steps_holding(job: &str, needle: &str) -> Vec<String> {
     holding
 }
 
-/// The part of a job before its steps: its name, runner, condition and limits.
+/// The part of a job that is not its steps: its name, runner, condition and limits, wherever the
+/// job's own keys stand, before the steps or after them.
 fn header(job: &str) -> String {
+    let mut before_steps = true;
     job.lines()
-        .take_while(|line| *line != "    steps:")
+        .filter(|line| {
+            if *line == "    steps:" {
+                before_steps = false;
+                return false;
+            }
+            before_steps || key_value(line).is_some_and(|(indent, ..)| indent == 4)
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -173,27 +181,70 @@ fn is_disabled(text: &str) -> bool {
 }
 
 /// A condition without the spaces it is written with, so that how it is spaced does not matter.
+/// The spaces inside a quoted string are part of the string, and stay.
 fn compact(condition: &str) -> String {
-    condition.chars().filter(|c| !c.is_whitespace()).collect()
+    let mut quoted = false;
+    condition
+        .chars()
+        .filter(|c| {
+            if *c == '\'' {
+                quoted = !quoted;
+                return true;
+            }
+            quoted || !c.is_whitespace()
+        })
+        .collect()
 }
 
-/// The `if` that a job's header or a step carries of its own, at one of the `keys` that start its
-/// line, without the spaces and the trailing comment. A step with none runs whenever its job does.
-fn own_condition(text: &str, keys: &[&str]) -> Option<String> {
+/// A line of the workflow that reads `key: value`: how far in the key stands, counting the `- ` that
+/// starts a step as indentation, the key without its quotes and the spaces before its colon, and
+/// the rest of the line.
+fn key_value(line: &str) -> Option<(usize, String, &str)> {
+    let rest = line.trim_start();
+    let indent = line.len() - rest.len();
+    let (extra, rest) = match rest.strip_prefix("- ") {
+        Some(after) => (
+            2 + after.len() - after.trim_start().len(),
+            after.trim_start(),
+        ),
+        None => (0, rest),
+    };
+    let (key, value) = rest.split_once(':')?;
+    let key = key.trim().trim_matches(['\'', '"']);
+    Some((indent + extra, key.to_owned(), value))
+}
+
+/// The `if` that the keys at `indent` carry in `text`, without the spaces and the trailing comment.
+/// A step with none runs whenever its job does.
+fn own_condition(text: &str, indent: usize) -> Option<String> {
     text.lines().find_map(|line| {
-        let value = keys.iter().find_map(|key| line.strip_prefix(key))?;
-        Some(compact(value.split(" #").next().unwrap_or_default()))
+        let (at, key, value) = key_value(line)?;
+        (at == indent && key == "if").then(|| compact(value.split(" #").next().unwrap_or_default()))
     })
 }
 
-/// The condition a job's header gives the job, if it has one.
-fn job_condition(header: &str) -> Option<String> {
-    own_condition(header, &["    if:"])
+/// The condition a job gives itself, if it has one.
+fn job_condition(job: &str) -> Option<String> {
+    own_condition(&header(job), 4)
 }
 
 /// The condition a step gives itself, if it has one.
 fn step_condition(step: &str) -> Option<String> {
-    own_condition(step, &["        if:", "      - if:"])
+    own_condition(step, 8)
+}
+
+/// The steps a condition reads the outcome of (`steps.desktop-build.outcome`).
+fn steps_named(condition: &str) -> Vec<String> {
+    condition
+        .split("steps.")
+        .skip(1)
+        .map(|after| {
+            after
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .collect()
+        })
+        .collect()
 }
 
 /// The matrix leg a condition names (`matrix.part == 'second'`), if it names one.
@@ -205,10 +256,13 @@ fn leg_named(condition: &str) -> Option<String> {
     Some(after.split('\'').next()?.to_owned())
 }
 
-/// The `part` of each leg that the job's matrix includes.
+/// The `part` of each leg that the job's matrix includes: the line after a `- name:` entry.
 fn legs(job: &str) -> Vec<String> {
-    job.lines()
-        .filter_map(|line| line.trim().strip_prefix("part:"))
+    let lines: Vec<&str> = job.lines().collect();
+    lines
+        .windows(2)
+        .filter(|pair| pair[0].trim_start().starts_with("- name:"))
+        .filter_map(|pair| pair[1].trim().strip_prefix("part:"))
         .map(|part| part.trim().to_owned())
         .collect()
 }
@@ -373,7 +427,7 @@ fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
             "{class}: the {name} job is disabled or lets its failure pass"
         );
         assert_eq!(
-            job_condition(&header(&text)),
+            job_condition(&text),
             job_when.map(compact),
             "{class}: the {name} job runs under a condition other than {job_when:?}"
         );
@@ -406,6 +460,16 @@ fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
                      never runs"
                 );
             }
+            // A step the condition reads the outcome of is a step of the job that runs, and runs.
+            for id in when.map(steps_named).unwrap_or_default() {
+                for named in steps_holding(&text, &format!("id: {id}")) {
+                    assert!(
+                        !is_disabled(&named) && step_condition(&named).is_none(),
+                        "{class}: the step {id}, whose outcome decides whether the step that runs \
+                         {tool} runs, is disabled or does not always run"
+                    );
+                }
+            }
         }
     }
 
@@ -415,6 +479,23 @@ fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
     assert!(
         !is_disabled(&header(&companion)),
         "the companion job is disabled or lets its failure pass"
+    );
+    // Both runners on every push and pull request: a manual run started with the macOS jobs turned
+    // off may leave the macOS leg out, and nothing else may.
+    let runners = companion
+        .lines()
+        .find_map(|line| {
+            let (indent, key, value) = key_value(line)?;
+            (indent == 8 && key == "os").then(|| compact(value))
+        })
+        .expect("the companion job's matrix names its runners");
+    assert_eq!(
+        runners,
+        compact(
+            "${{ fromJSON(github.event_name == 'workflow_dispatch' && !inputs.macos && \
+             '[\"ubuntu-24.04\"]' || '[\"ubuntu-24.04\", \"macos-15\"]') }}"
+        ),
+        "the companion job's matrix takes both runners on every run but a manual one without macOS"
     );
     for guard in steps_running(&companion, "scripts/check-test-evidence.sh") {
         assert!(!is_disabled(&guard), "the evidence check is disabled");
@@ -484,7 +565,8 @@ fn the_wsl2_acceptance_has_a_workflow_that_runs_its_script_on_windows() {
         .lines()
         .skip_while(|line| *line != "on:")
         .skip(1)
-        .take_while(|line| line.starts_with(' '))
+        .take_while(|line| line.is_empty() || line.starts_with([' ', '#']))
+        .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
         .collect();
     assert_eq!(
         triggers,
@@ -497,7 +579,7 @@ fn the_wsl2_acceptance_has_a_workflow_that_runs_its_script_on_windows() {
         "the acceptance job is disabled or lets its failure pass"
     );
     assert_eq!(
-        job_condition(&header(&text)),
+        job_condition(&text),
         None,
         "the acceptance job runs under a condition"
     );
@@ -528,7 +610,7 @@ fn the_wsl2_acceptance_has_a_workflow_that_runs_its_script_on_windows() {
         "the Linux set's job is disabled or lets its failure pass"
     );
     assert_eq!(
-        job_condition(&header(&set)),
+        job_condition(&set),
         None,
         "the Linux set's job runs under a condition"
     );
