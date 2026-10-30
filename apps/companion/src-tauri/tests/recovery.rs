@@ -742,11 +742,42 @@ async fn turning_recovery_on_puts_the_bundle_at_the_service_and_hands_over_a_kit
     }
 }
 
-/// A factory of sync clients that records each ask and makes the managed client.
+/// A factory of sync clients of a fork, in the place of the managed ones: it records each ask and
+/// answers with the client of a sync service of its own, whatever origin is asked for.
 #[derive(Debug)]
 struct Recording {
-    clients: companion_tauri::services::ManagedSyncServices,
+    service: GatewayOrigin,
+    key: AuthorisationKeyPair,
     asked: Mutex<Vec<(String, bool)>>,
+}
+
+impl Recording {
+    fn at(service: &Served, key: AuthorisationKeyPair) -> Arc<Self> {
+        Arc::new(Self {
+            service: GatewayOrigin::new(service.origin()).expect("an origin"),
+            key,
+            asked: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// The fork's client, after noting that `origin` was asked for.
+    fn answer(&self, origin: &GatewayOrigin, presenting: bool) -> ManagedSyncService {
+        self.asked
+            .lock()
+            .expect("the record")
+            .push((origin.as_str().to_owned(), presenting));
+        let http = HttpService::with(
+            self.service.clone(),
+            HttpDeadlines::default(),
+            managed_response_limits(),
+        )
+        .expect("a transport");
+        ManagedSyncService::new(
+            self.service.clone(),
+            Arc::new(http),
+            Arc::new(Installation(self.key.clone())),
+        )
+    }
 }
 
 impl companion_tauri::services::SyncServices for Recording {
@@ -754,11 +785,7 @@ impl companion_tauri::services::SyncServices for Recording {
         &self,
         origin: &GatewayOrigin,
     ) -> companion_tauri::error::Result<Arc<dyn kr_client::services::SharedSyncService>> {
-        self.asked
-            .lock()
-            .expect("the record")
-            .push((origin.as_str().to_owned(), false));
-        self.clients.installation(origin)
+        Ok(Arc::new(self.answer(origin, false)))
     }
 
     fn presenting(
@@ -767,27 +794,25 @@ impl companion_tauri::services::SyncServices for Recording {
         tokens: Arc<dyn kr_client::services::AccountTokenSource>,
         scope: &'static str,
     ) -> companion_tauri::error::Result<Arc<dyn kr_client::services::SharedSyncService>> {
-        self.asked
-            .lock()
-            .expect("the record")
-            .push((origin.as_str().to_owned(), true));
-        self.clients.presenting(origin, tokens, scope)
+        Ok(Arc::new(
+            self.answer(origin, true).presenting(tokens, scope),
+        ))
     }
 }
 
 /// KR-REQ-17.14: recovery reaches the sync service through the clients the application was given,
-/// and at the origin its record names. A record made while the setting named one service keeps
-/// talking to that service after the setting names another; only a record made now reads the
-/// setting.
+/// and at the origin its record names. The bundle is written through the client it is given: a
+/// fork's client of a service of its own receives the write and the service the setting names
+/// receives none. A record made while the setting named one service keeps asking for that service
+/// after the setting names another; only a record made now reads the setting.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_asks_its_clients_for_the_service_its_record_names() {
     let computer = Computer::new().await;
-    let recording = Arc::new(Recording {
-        clients: companion_tauri::services::ManagedSyncServices::new(
-            AuthorisationKeyPair::generate().expect("a key"),
-        ),
-        asked: Mutex::new(Vec::new()),
-    });
+    let fork_service = serve().await;
+    let recording = Recording::at(
+        &fork_service,
+        computer.identity().keys.authorisation.clone(),
+    );
     let page = computer.page_with(Some(Arc::clone(&recording) as _)).await;
     let ours = computer.served.origin().to_owned();
 
@@ -803,6 +828,18 @@ async fn recovery_asks_its_clients_for_the_service_its_record_names() {
             .iter()
             .all(|(origin, presenting)| *origin == ours && *presenting),
         "{asked:?}: the bundle is written at the chosen service, presenting the account"
+    );
+    let arrived = fork_service.web().arrived();
+    assert_eq!(arrived.len(), 1, "{arrived:?}");
+    assert_eq!(arrived[0].path, SYNC_PATH);
+    assert_eq!(arrived[0].token.as_deref(), Some(TOKEN));
+    assert_eq!(
+        arrived[0].body["exchange"]["kind"], "recovery_bundle",
+        "the bundle was written through the client the application was given"
+    );
+    assert!(
+        computer.served.web().arrived().is_empty(),
+        "the service the setting names received none"
     );
 
     // The setting now names another service. The record still names the first, and every ask that
