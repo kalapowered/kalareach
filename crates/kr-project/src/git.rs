@@ -3664,12 +3664,12 @@ impl Asked {
 /// Git, so it is bounded on every side: by time, by what it may answer, and by what it may leave
 /// running. A program still under way at the deadline is ended with the processes in its group. One
 /// that has ended has the rest of its group ended with it, and one that answers with more than a
-/// version and a directory is ended where its output passes the limit and refused, whatever it
-/// would have exited with. A child that cannot be waited on is refused and nothing is signalled by
-/// its number, which may be another process's by now. A process that left the group and kept the
-/// pipe is out of reach: the answer is refused after a short wait for the end of its output, and
-/// this host closes its end of the pipe, so the process runs on with its own end and this host
-/// holds nothing of it.
+/// version and a directory is refused, whatever it would have exited with, and on Unix ended where
+/// its output passes the limit. A child that cannot be waited on is refused and nothing is
+/// signalled by its number, which may be another process's by now. A process that left the group
+/// and kept the pipe is out of reach: the answer is refused after a short wait for the end of its
+/// output, and this host closes its end of the pipe, so it holds nothing of the process. The
+/// process may go on, and a write it makes to the closed pipe fails.
 fn ask(
     program: &Path,
     arguments: &[&str],
@@ -3717,10 +3717,9 @@ fn ask(
     let mut heard = match Heard::of(child.stdout.take()) {
         Ok(heard) => heard,
         Err(error) => {
-            // The child was started a moment ago and is this process's own.
-            end_probe(child);
+            end_if_own(child);
             return Err(Asked::Overran(unavailable(format!(
-                "{described} was ended because its output could not be read without blocking: {error}"
+                "{described} was refused because its output could not be read without blocking: {error}"
             ))));
         }
     };
@@ -3734,7 +3733,7 @@ fn ask(
         // At the limit, not when the program ends: what a program writes without end is not an
         // answer, and reading it on would hold this look for as long as the program writes.
         if heard.overflowed() {
-            end_probe(child);
+            end_if_own(child);
             return Err(too_much());
         }
         match has_ended(&mut child) {
@@ -4051,6 +4050,23 @@ fn end_group(child: &std::process::Child) {
     }
     #[cfg(not(unix))]
     let _ = child;
+}
+
+/// Ends a probe that is to be refused before the loop has asked after its child in this pass, but
+/// only once the child is seen to be this process's own.
+///
+/// A child that cannot be waited on, or that has been collected, may have a number that belongs to
+/// another process by now, so nothing is signalled by it.
+fn end_if_own(mut child: std::process::Child) {
+    match has_ended(&mut child) {
+        Ended::No => end_probe(child),
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        Ended::Uncollected => {
+            end_group(&child);
+            let _ = child.wait();
+        }
+        Ended::Collected(_) | Ended::Failed(_) => {}
+    }
 }
 
 /// Ends a probe that did not finish, with the processes in its group, and collects it.
