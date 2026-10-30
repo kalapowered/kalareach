@@ -33,6 +33,9 @@ pub const SCRIPT_VARIABLE: &str = "KR_DESCRIBE_STUB";
 /// The exit status of a stub whose script ended it inside a job, as a crashed model would.
 pub const CRASH_EXIT: i32 = 9;
 
+/// The exit status of a stub that the system refused the memory its script commits as it starts.
+pub const COMMIT_REFUSED_EXIT: i32 = 10;
+
 /// How often a stub looks at its token while it waits.
 const LOOK: Duration = Duration::from_millis(2);
 
@@ -85,6 +88,24 @@ thread_local! {
     /// Whether the system has refused the process of a driver on this thread memory since the
     /// driver last asked.
     static MEMORY_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// What runs the next time a driver on this thread has created its process.
+    static AT_SPAWN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `hook` the next time a driver on this thread has created its process, before the driver has
+/// done anything else with it: the moment a process that is not held yet is running, and has the
+/// time the hook takes to do what it likes before any limit is put around it.
+pub fn at_next_spawn(hook: impl FnOnce() + 'static) {
+    AT_SPAWN.with(|held| *held.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// Runs the hook [`at_next_spawn`] set, once.
+pub(crate) fn spawned() {
+    if let Some(hook) = AT_SPAWN.with(|held| held.borrow_mut().take()) {
+        hook();
+    }
 }
 
 /// Makes the driver on this thread find, the next time it asks, that the system refused its process
@@ -184,6 +205,10 @@ pub struct Script {
     /// Whether a load ends as failed, as a runtime does that catches an allocation it was refused
     /// while it reads the weights.
     pub fail_load: bool,
+    /// How many bytes the process commits, each page written, as the first thing it does and
+    /// before it reads a word of the wire. The process leaves a mark named `committed` when the
+    /// system let it, and one named `refused` and ends when the system did not.
+    pub commit_at_start_bytes: u64,
     /// What a job's answer looks like.
     pub output: Output,
     /// Whether the process ends inside a job, as a crashed model would.
@@ -310,6 +335,7 @@ impl Script {
         number("generate-ms", self.generate_ms);
         number("ignore-token-ms", self.ignore_token_ms);
         number("hold-bytes", self.hold_bytes);
+        number("commit-at-start", self.commit_at_start_bytes);
         if let Some(bytes) = self.peak_rss_bytes {
             parts.push(format!("peak-rss={bytes}"));
         }
@@ -395,6 +421,7 @@ impl Script {
                 "generate-ms" => script.generate_ms = number()?,
                 "ignore-token-ms" => script.ignore_token_ms = number()?,
                 "hold-bytes" => script.hold_bytes = number()?,
+                "commit-at-start" => script.commit_at_start_bytes = number()?,
                 "peak-rss" => script.peak_rss_bytes = Some(number()?),
                 "wedge-input-after" => script.wedge_input_after = Some(number()?),
                 "wedge-output-from" => script.wedge_output_from = Some(number()?),
@@ -1048,6 +1075,10 @@ pub fn stub_main() -> i32 {
             return 64;
         }
     };
+    let _committed = match commit_at_start(&script, &runtime_dir) {
+        Ok(held) => held,
+        Err(code) => return code,
+    };
     if script.mark_start {
         let mark = runtime_dir.join(format!("{STARTED_PREFIX}{}", std::process::id()));
         let given = serde_json::to_string(&daemon).unwrap_or_default();
@@ -1079,6 +1110,31 @@ pub fn stub_main() -> i32 {
     let output = Wedging::writing(std::io::stdout(), script.wedge_output_from);
     let model = StubModel::new(script).in_runtime_dir(options.runtime_dir.clone());
     crate::serve::run(options, model, input, output).code()
+}
+
+/// Commits what the script says the process commits as it starts, and leaves a mark of what the
+/// system did: the memory when it was let, to be held for the life of the process, and the exit
+/// status of a process the system refused.
+fn commit_at_start(script: &Script, runtime_dir: &std::path::Path) -> Result<Vec<u8>, i32> {
+    let wanted = usize::try_from(script.commit_at_start_bytes).unwrap_or(0);
+    if wanted == 0 {
+        return Ok(Vec::new());
+    }
+    let mark = |kind: &str| {
+        let name = format!("{BEGAN_PREFIX}{kind}-{}", std::process::id());
+        let _ = std::fs::write(runtime_dir.join(name), kind);
+    };
+    let mut held: Vec<u8> = Vec::new();
+    if held.try_reserve_exact(wanted).is_err() {
+        mark("refused");
+        eprintln!(
+            "kr-describe-stub: the system refused the memory the script commits at the start"
+        );
+        return Err(COMMIT_REFUSED_EXIT);
+    }
+    held.resize(wanted, 0xA5_u8);
+    mark("committed");
+    Ok(held)
 }
 
 /// Runs a stub daemon, which a test ends to see its description process go with it.

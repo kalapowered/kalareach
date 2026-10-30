@@ -702,7 +702,8 @@ impl Driver {
                 }
             }
         })?;
-        let mut child = Command::new(&self.launch.program)
+        let mut command = Command::new(&self.launch.program);
+        command
             .args(&self.launch.arguments)
             .arg(DAEMON_IDENTITY_ARGUMENT)
             .arg(&identity)
@@ -716,15 +717,24 @@ impl Driver {
             )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|error| {
-                eprintln!(
-                    "kr-describe: {} could not be started: {error}",
-                    self.launch.program.display()
-                );
-                ProcessEnd::CouldNotStart
-            })?;
+            .stderr(Stdio::inherit());
+        // A process the system is to hold to a memory limit is created held and let run only when
+        // it is behind the limit, so that it never runs outside it.
+        #[cfg(windows)]
+        let hold = self.launch.system_memory_limit;
+        #[cfg(windows)]
+        if hold {
+            kr_ipc::memory_limit::start_held(&mut command);
+        }
+        let mut child = command.spawn().map_err(|error| {
+            eprintln!(
+                "kr-describe: {} could not be started: {error}",
+                self.launch.program.display()
+            );
+            ProcessEnd::CouldNotStart
+        })?;
+        #[cfg(feature = "testing")]
+        crate::testing::spawned();
         // The threads end on their own when what they wait for is dropped, which is what happens
         // to both on every return below.
         let handed = match (child.stdin.take(), child.stdout.take()) {
@@ -739,7 +749,23 @@ impl Driver {
             return Err(ProcessEnd::CouldNotStart);
         }
         #[cfg(windows)]
-        let system_limit = self.limit_in_the_system(&child);
+        let system_limit = if hold {
+            let limit = self.limit_in_the_system(&child);
+            if let Err(why) =
+                kr_ipc::memory_limit::resume(std::os::windows::io::AsHandle::as_handle(&child))
+            {
+                eprintln!(
+                    "kr-describe: {} could not be let run: {why}",
+                    self.launch.program.display()
+                );
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ProcessEnd::CouldNotStart);
+            }
+            limit
+        } else {
+            None
+        };
         self.tag = tag;
         self.started = self.started.saturating_add(1);
         reports.push(Report::Started { pid: child.id() });
@@ -772,17 +798,12 @@ impl Driver {
         Ok(())
     }
 
-    /// Asks the operating system to refuse the process memory past the ceiling in force, when the
-    /// launch asks for it, and says nothing of the process otherwise. A limit the system would not
-    /// hold leaves the daemon's own reading as the only ender, which the process's report of its
-    /// ceiling says too.
+    /// Asks the operating system to refuse the process memory past the ceiling in force. A limit
+    /// the system would not hold leaves the daemon's own reading as the only ender of the process.
     #[cfg(windows)]
     fn limit_in_the_system(&self, child: &Child) -> Option<kr_ipc::memory_limit::MemoryLimit> {
         use std::os::windows::io::AsHandle as _;
 
-        if !self.launch.system_memory_limit {
-            return None;
-        }
         kr_ipc::memory_limit::MemoryLimit::around(child.as_handle(), self.service.ceiling_bytes())
             .inspect_err(|why| {
                 eprintln!(
