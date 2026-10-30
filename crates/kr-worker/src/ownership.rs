@@ -1236,7 +1236,10 @@ impl OwnedProcesses {
         #[cfg(target_os = "linux")]
         {
             match crate::session_group::members(path) {
-                Ok(held) if held.is_empty() => self.the_service_holds_only_the_workers(path),
+                Ok(held) if held.is_empty() => {
+                    self.the_group_is_not_populated(path)
+                        && self.the_service_holds_only_the_workers(path)
+                }
                 Ok(held) => {
                     self.note_unestablished(format!(
                         "the session's control group still held {} process(es) when the closure \
@@ -1265,24 +1268,50 @@ impl OwnedProcesses {
         }
     }
 
-    /// Whether the service the session's group is below holds, beside that group, only this worker
-    /// and processes the session recorded.
+    /// Whether the kernel says the session's group, with every group below it, holds no process.
     ///
-    /// A process can write its own number into the service's list and leave the session's group,
-    /// and with its session and parent gone it is in nothing the session reads. It is the
-    /// service's, not the session's, and the closure does not call the session covered while one
-    /// runs.
+    /// The lists are read one group at a time, and a process that moves between two groups while
+    /// they are read can be missed by every one; the group's `populated` line is the kernel's
+    /// answer for the whole of it at once. A group that is not there is not populated.
+    #[cfg(target_os = "linux")]
+    fn the_group_is_not_populated(&self, session: &std::path::Path) -> bool {
+        match crate::session_group::populated(session) {
+            Ok(false) => true,
+            Ok(true) => {
+                self.note_unestablished(format!(
+                    "the session's control group at {} lists no process and is populated all the \
+                     same",
+                    session.display()
+                ));
+                false
+            }
+            Err(error) => {
+                self.note_unestablished(format!(
+                    "the session's control group at {} would not say whether it is populated: \
+                     {error}",
+                    session.display()
+                ));
+                false
+            }
+        }
+    }
+
+    /// Whether the service the session's group is below holds, in every group of it, only this
+    /// worker and processes the session recorded.
+    ///
+    /// A process can write its own number into the service's list, or make a group of its own below
+    /// the service and move there, and leave the session's group; with its session and parent gone
+    /// it is in nothing the session reads. It is the service's, not the session's, and the closure
+    /// does not call the session covered while one runs. A process the worker runs for itself
+    /// (a probe, a query of the login manager) is one the session did not record, and a close that
+    /// finds one still running reads incomplete rather than complete.
     #[cfg(target_os = "linux")]
     fn the_service_holds_only_the_workers(&self, session: &std::path::Path) -> bool {
         let Some(service) = session.parent() else {
             return true;
         };
-        let listed = match crate::session_group::list_of(std::fs::read_to_string(
-            service.join("cgroup.procs"),
-        )) {
-            Ok(crate::session_group::List::Read(listed)) => listed,
-            Ok(crate::session_group::List::Gone) => return true,
-            Ok(crate::session_group::List::Threaded) => Vec::new(),
+        let listed = match crate::session_group::members(service) {
+            Ok(listed) => listed,
             Err(error) => {
                 self.note_unestablished(format!(
                     "the worker's service at {} would not say what it holds: {error}",
@@ -1291,12 +1320,24 @@ impl OwnedProcesses {
                 return false;
             }
         };
-        let strangers = listed
-            .into_iter()
-            .filter(|pid| *pid != std::process::id())
-            .filter_map(|pid| kr_ipc::identity::process_lineage(pid).ok())
-            .filter(|lineage| !self.seen.contains_key(&key(&lineage.identity)))
-            .count();
+        let mut strangers = 0_usize;
+        for pid in listed.into_iter().filter(|pid| *pid != std::process::id()) {
+            match kr_ipc::identity::query_process(pid) {
+                kr_ipc::identity::ProcessQuery::Present(identity) => {
+                    if !self.seen.contains_key(&key(&identity)) {
+                        strangers += 1;
+                    }
+                }
+                // Listed a moment ago and held by nobody now: it ended.
+                kr_ipc::identity::ProcessQuery::Gone => {}
+                kr_ipc::identity::ProcessQuery::CannotEstablish(error) => {
+                    self.note_unestablished(format!(
+                        "process {pid} in the worker's service could not be described: {error}"
+                    ));
+                    return false;
+                }
+            }
+        }
         if strangers == 0 {
             return true;
         }
@@ -2225,6 +2266,8 @@ mod tests {
         std::fs::write(root.path().join("service").join("cgroup.procs"), "")
             .expect("the service's list");
         std::fs::write(session.join("cgroup.procs"), "").expect("the session's list");
+        std::fs::write(session.join("cgroup.events"), "populated 0\nfrozen 0\n")
+            .expect("the session's events");
         (root, session)
     }
 
@@ -2237,6 +2280,54 @@ mod tests {
             identity(u64::from(u32::MAX) + 1),
         );
         assert_eq!(owned.coverage(), OwnershipCoverage::Complete);
+    }
+
+    /// KR-REQ-07.60: lists are read one group at a time, and a process that moved between two of
+    /// them while they were read can be in none; the kernel's `populated` line is the answer for
+    /// the whole group, and a group it says is populated is not empty whatever the lists said.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_group_the_kernel_says_is_populated_is_not_empty_whatever_its_lists_say() {
+        let (_groups, session) = an_empty_group();
+        std::fs::write(session.join("cgroup.events"), "populated 1\nfrozen 0\n")
+            .expect("the session's events");
+        let owned = OwnedProcesses::establish(
+            OwnershipBoundary::ControlGroup { path: session },
+            identity(u64::from(u32::MAX) + 1),
+        );
+        assert_eq!(owned.coverage(), OwnershipCoverage::Incomplete);
+        assert!(
+            owned
+                .unestablished()
+                .iter()
+                .any(|note| note.contains("populated")),
+            "and the receipt says why: {:?}",
+            owned.unestablished()
+        );
+    }
+
+    /// KR-REQ-07.60: the same for a group the process made of its own below the service, beside
+    /// the session's.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_in_a_group_beside_the_sessions_keeps_the_cover_incomplete() {
+        let (groups, session) = an_empty_group();
+        let mut stranger = std::process::Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .expect("starts a process");
+        let beside = groups.path().join("service").join("escaped");
+        std::fs::create_dir(&beside).expect("a group of its own");
+        std::fs::write(beside.join("cgroup.procs"), format!("{}\n", stranger.id()))
+            .expect("its list");
+        let owned = OwnedProcesses::establish(
+            OwnershipBoundary::ControlGroup { path: session },
+            identity(u64::from(u32::MAX) + 1),
+        );
+        let coverage = owned.coverage();
+        stranger.kill().expect("ends the process");
+        let _ = stranger.wait();
+        assert_eq!(coverage, OwnershipCoverage::Incomplete);
     }
 
     /// KR-REQ-07.60: a process that wrote its own number into the service's list left the session's

@@ -828,19 +828,28 @@ impl Session {
                 // Ownership is established with the shell, not at closure: a process that started
                 // and ended while the session ran is still one this session owned, and a boundary
                 // created afterwards would never have seen it.
-                let owned = OwnedProcesses::establish(
-                    crate::ownership::boundary_after_placement(
-                        shell.foreground_group(),
-                        shell.identity(),
-                        placed,
-                    ),
-                    shell.identity().clone(),
+                let had_a_group = placed.is_some();
+                let boundary = crate::ownership::boundary_after_placement(
+                    shell.foreground_group(),
+                    shell.identity(),
+                    placed,
                 );
+                let owned = OwnedProcesses::establish(boundary, shell.identity().clone());
                 if let Some(why) = group_refused {
                     owned.note_unestablished(format!(
                         "the worker runs as a service of its own and could not give the session a \
                          control group, so it rests on its terminal and process group: {why}"
                     ));
+                } else if had_a_group
+                    && !matches!(
+                        owned.boundary(),
+                        crate::ownership::OwnershipBoundary::ControlGroup { .. }
+                    )
+                {
+                    owned.note_unestablished(
+                        "the root shell was not shown to be in the session's control group, so the \
+                         session rests on its terminal and process group",
+                    );
                 }
                 self.owned = Some(owned);
                 self.shell = Some(shell);

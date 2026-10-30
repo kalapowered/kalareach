@@ -90,6 +90,15 @@ impl SessionGroup {
     pub fn make() -> Result<Option<Self>, String> {
         #[cfg(target_os = "linux")]
         {
+            // The unified hierarchy's files are the only ones this reads; on a host that mounts
+            // anything else there, a group is owed nowhere.
+            if !matches!(
+                rustix::fs::statfs(CONTROL_GROUP_ROOT),
+                // The unified hierarchy's file system type, as `statfs` names it.
+                Ok(stat) if stat.f_type == 0x6367_7270
+            ) {
+                return Ok(None);
+            }
             let Some(service) = crate::ownership::own_cgroup() else {
                 return Ok(None);
             };
@@ -137,7 +146,7 @@ impl SessionGroup {
     ///
     /// # Errors
     ///
-    /// Returns why a group that was owed could not be made, as [`Self::make`] does.
+    /// Returns why a group that was owed could not be made or used, as [`Self::make`] does.
     pub fn prepare(terminal: &mut crate::pty::Pty) -> Result<Option<Self>, String> {
         #[cfg(target_os = "linux")]
         {
@@ -227,7 +236,8 @@ pub enum List {
 ///
 /// # Errors
 ///
-/// Returns why the list is not one: a failure to read it, or a line that is not a process number.
+/// Returns why the list is not one: a failure to read it, a line that is not a process number, or
+/// a process this host cannot name (listed as zero).
 #[cfg(target_os = "linux")]
 pub fn list_of(read: std::io::Result<String>) -> Result<List, String> {
     match read {
@@ -343,6 +353,46 @@ pub fn members(directory: &Path) -> Result<Vec<u32>, String> {
 #[cfg(not(target_os = "linux"))]
 pub fn members(_path: &Path) -> Result<Vec<u32>, String> {
     Err("this platform makes no session group".to_owned())
+}
+
+/// Whether the kernel says the control group at `directory`, with every group below it, holds a
+/// process: its `populated` line, which answers for the whole at once where a walk of the lists
+/// can miss a process that moves between two groups while they are read. A group that is not there
+/// is not populated, if its parent is there to say the file system answers.
+///
+/// # Errors
+///
+/// Returns why the line could not be read, or is not one.
+#[cfg(target_os = "linux")]
+pub fn populated(directory: &Path) -> Result<bool, String> {
+    match std::fs::read_to_string(directory.join("cgroup.events")) {
+        Ok(events) => match events
+            .lines()
+            .find_map(|line| line.strip_prefix("populated "))
+            .map(str::trim)
+        {
+            Some("0") => Ok(false),
+            Some("1") => Ok(true),
+            _ => Err(format!(
+                "{} has no populated line",
+                directory.join("cgroup.events").display()
+            )),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if directory.parent().is_some_and(Path::is_dir) {
+                Ok(false)
+            } else {
+                Err(format!(
+                    "{} and its parent are not there",
+                    directory.display()
+                ))
+            }
+        }
+        Err(error) => Err(format!(
+            "{}: {error}",
+            directory.join("cgroup.events").display()
+        )),
+    }
 }
 
 /// Ends every process in the group and in the groups below it, at once.
@@ -564,6 +614,24 @@ mod tests {
             "a shell not shown to be in the group is not held by it: {boundary:?}"
         );
         assert!(!path.exists(), "and the group nothing entered is removed");
+    }
+
+    /// KR-REQ-07.60: the kernel's `populated` line is read as it is: 0 and 1 are answers, a group
+    /// that is gone is not populated when its parent is there, and anything else is an error and
+    /// not an empty group.
+    #[test]
+    fn the_populated_line_of_a_group_is_read_and_a_line_that_is_not_there_is_an_error() {
+        let root = tempfile::tempdir().expect("a directory");
+        let group = root.path().join("session");
+        std::fs::create_dir(&group).expect("a group");
+        std::fs::write(group.join("cgroup.events"), "populated 1\nfrozen 0\n").expect("events");
+        assert_eq!(populated(&group), Ok(true));
+        std::fs::write(group.join("cgroup.events"), "frozen 0\npopulated 0\n").expect("events");
+        assert_eq!(populated(&group), Ok(false));
+        std::fs::write(group.join("cgroup.events"), "frozen 0\n").expect("events");
+        assert!(populated(&group).is_err());
+        assert_eq!(populated(&root.path().join("gone")), Ok(false));
+        assert!(populated(&root.path().join("no-parent").join("gone")).is_err());
     }
 
     /// KR-REQ-07.60: the end of a group is a write to a file that is opened as it is. On a kernel

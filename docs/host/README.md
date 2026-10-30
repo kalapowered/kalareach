@@ -4313,10 +4313,14 @@ parent, is in it still. The session's ownership then rests on that group, once t
 be in it. While the session runs, the worker records the processes the group lists, each from its
 identity as read when the group still names it afterwards, beside the worker's own tree; a closure
 ends the group with one write to `cgroup.kill` (and then, as before, the recorded processes), and its
-coverage is complete only when the group read empty afterwards and the worker's service holds, beside
-the session's group, nothing but the worker and processes the session recorded. The account may
-write a process into its service's own list, which leaves the session's group and everything the
-session reads; the closure does not call the session covered while one is there. A group that is not
+coverage is complete only when the group read empty afterwards, with the kernel's `populated` line
+saying the same, and the worker's service holds, beside the session's group, nothing but the worker
+and processes the session recorded. The account may write a process into its service's own list, or
+make a group of its own below the service and move there, which leaves the session's group and
+everything the session reads; the closure walks the whole service and does not call the session
+covered while one is there. A process the worker runs for itself (a probe, a query of the login
+manager) is one the session did not record, so a close that finds one still running reads
+incomplete rather than complete. A group that is not
 there holds nothing when its parent is there to say so, as the kernel removes only an empty group; a
 group below it that goes while the listing runs holds nothing and does not void the rest; a group
 that cannot be listed, or that holds more groups than a session makes, is something the host could

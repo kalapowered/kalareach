@@ -123,13 +123,19 @@ fn measure_terminal() -> std::io::Result<()> {
     // Closed on exec, as the worker's own are: this daemon starts programs from other threads, and
     // one that started while this was open would hold the terminal for its whole life.
     #[cfg(target_os = "linux")]
-    let flags = rustix::pty::OpenptFlags::RDWR
-        | rustix::pty::OpenptFlags::NOCTTY
-        | rustix::pty::OpenptFlags::CLOEXEC;
-    // `posix_openpt` takes no such flag here; the descriptor is closed within this call.
+    let master = rustix::pty::openpt(
+        rustix::pty::OpenptFlags::RDWR
+            | rustix::pty::OpenptFlags::NOCTTY
+            | rustix::pty::OpenptFlags::CLOEXEC,
+    )?;
+    // `posix_openpt` takes no such flag here, and it opens this file.
     #[cfg(not(target_os = "linux"))]
-    let flags = rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY;
-    drop(rustix::pty::openpt(flags)?);
+    let master = rustix::fs::open(
+        "/dev/ptmx",
+        rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NOCTTY | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?;
+    drop(master);
     Ok(())
 }
 
@@ -195,9 +201,9 @@ mod tests {
         assert_eq!(host.shortfall(&directory), None);
     }
 
-    /// The filesystem's own reading, against a limit no filesystem meets, names storage; against
-    /// none it names nothing. The create-level case stands a reading in, so that it runs where the
-    /// reading cannot be made; this is the reading itself.
+    /// The filesystem's own reading, against a limit no filesystem meets, names storage. The
+    /// create-level case stands a reading in, so that it runs where the reading cannot be made;
+    /// this is the reading itself, and `a_healthy_host_is_short_of_nothing` is the control.
     #[cfg(unix)]
     #[test]
     fn the_filesystems_own_reading_is_short_of_a_limit_no_filesystem_meets() {

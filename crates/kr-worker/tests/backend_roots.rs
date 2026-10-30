@@ -381,6 +381,8 @@ fn kr_req_07_60_a_session_that_had_a_server_never_reads_complete() {
     std::fs::write(groups.path().join("service").join("cgroup.procs"), "")
         .expect("the service's list");
     std::fs::write(session.join("cgroup.procs"), "").expect("the session's list");
+    std::fs::write(session.join("cgroup.events"), "populated 0\nfrozen 0\n")
+        .expect("the session's events");
     let mut owned = OwnedProcesses::establish(
         OwnershipBoundary::ControlGroup { path: session },
         kr_ipc::identity::ended_process_identity(4_000_003),
