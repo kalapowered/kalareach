@@ -152,9 +152,9 @@ the state is `resource_paused`, the reason is named, and the deterministic title
 - **Thermal or memory pressure** pauses it even on mains. Heat is read from what each platform
   reports: the system's thermal pressure level on macOS, on Intel and on Apple silicon alike
   (nominal reads as cool, moderate as elevated, and heavy or beyond as critical; a level that is
-  never posted reads as nominal), the passive limit of each thermal zone on Windows, and each thermal zone's temperature against its own first trip
-  point on Linux. A platform that reports nothing leaves heat unread, and an unread signal does not
-  pause.
+  never posted reads as nominal), the passive limit of each thermal zone on Windows, and each
+  thermal zone's temperature against the lowest trip point it declares on Linux. A platform that
+  reports nothing leaves heat unread, and an unread signal does not pause.
 - When pressure clears, the host resumes on the next evaluation. Nothing is restarted: the queue
   keeps its positions, the sessions keep their titles, and no worker is touched.
 - A host that cannot read a memory signal refuses to load rather than assuming the reserve holds.
@@ -172,8 +172,10 @@ reading alone, publishes nothing, is not queued again, and pauses inference the 
 The first reading of a load or a job is due one reading period (one second) after it starts, and
 each later one a period after the last, until the work answers. A process that passes the ceiling
 while it works is therefore ended by the first reading taken after it did, and it can stay over the
-ceiling for at most one period plus the time the daemon takes to run the turn that reads it. Nothing
-reads the process between jobs or while it checks a file. The bound is in time: the daemon does not
+ceiling for at most one period plus the time the daemon takes to run the turn that reads it, when
+the platform gives the reading. A reading it does not give leaves the process alone until the next
+one, and a platform that never gives one leaves only the process's own check, so there is no bound
+in time. Nothing reads the process between jobs or while it checks a file. The bound is in time: the daemon does not
 bound how much memory a process adds in that period. What keeps the growth small is the process's
 own check between tokens, which looks at its resident set every eight tokens, and the admission of
 a profile only when its itemised cost fits under the ceiling.
@@ -238,9 +240,11 @@ reason.
   the process and not the thread, because a thread that another thread starts begins at the normal
   priority, and the compute threads of the model runtime are started by the thread that loads it.
   Windows also keeps an I/O priority for each thread, and the thread that loads the model exists
-  before the process's priority is set. A thread that was running when the priority was lowered
-  reads the lowered value for itself, and the process reports the I/O class as applied only when
-  the system reads back very low for the process and for the model thread's own value.
+  before the process's priority is set. On the Windows build this was tried on (Windows Server
+  2025, build 26100), a thread that was waiting when the priority was lowered read the lowered
+  value for itself, and this build does not rely on that: the process reports the I/O class as
+  applied only when the system reads back very low for the process and for the model thread's own
+  value.
   The idle class is served only when nothing else wants the processor, and the process's control
   thread and watchdog are in it too. When other work keeps every core busy for longer than a few
   seconds (Windows lifts a thread that has waited that long), the daemon can wait past its bound
@@ -489,7 +493,7 @@ A page of facts is applied under privacy mode's admission at the generation it w
 
 The host reads the memory, power and thermal conditions of the machine every ten seconds, on a thread of its own, because reading the state of the platform can start a program. A reading more than a minute old says nothing: every signal is then unqualified, and the policy pauses rather than trusting the last answer.
 
-Power and heat come from the facility each platform documents. On macOS, power comes from `pmset -g ps` and heat from the system's thermal pressure level, which Intel and Apple silicon Macs both post: nominal reads as cool, moderate as elevated, and heavy or beyond as critical. A level that is never posted reads as nominal, because the system gives the same state for a name nobody posts as for a cool machine, so a Mac that never posts one reads as cool and not as unread. On Linux, power comes from the kernel's power-supply class and heat from each thermal zone against its own first trip point. On Windows, power comes from the system's power-status call, which puts a machine with no battery on mains, and heat from the passive limit of each thermal zone's performance counters, the share of the processors' top speed the platform allows because of heat. The worst zone that was read decides there. A zone that was listed and gave no usable reading keeps the host from reading as nominal, so heat is unqualified unless another zone shows it, and a machine that lists no zone says nothing about heat. A platform with no reader says nothing about either: the policy treats that as battery for power and does not pause for heat.
+Power and heat come from the facility each platform documents. On macOS, power comes from `pmset -g ps` and heat from the system's thermal pressure level, which Intel and Apple silicon Macs both post: nominal reads as cool, moderate as elevated, and heavy or beyond as critical. A level that is never posted reads as nominal, because the system gives the same state for a name nobody posts as for a cool machine, so a Mac that never posts one reads as cool and not as unread. On Linux, power comes from the kernel's power-supply class and heat from each thermal zone against the lowest trip point it declares, among its first eight, which is the one the platform acts on before a critical point. A zone with no trip point above zero, or whose temperature cannot be read, is left out. On Windows, power comes from the system's power-status call, which puts a machine with no battery on mains, and heat from the passive limit of each thermal zone's performance counters, the share of the processors' top speed the platform allows because of heat. The worst zone that was read decides there. A zone that was listed and gave no usable reading keeps the host from reading as nominal, so heat is unqualified unless another zone shows it, and a machine that lists no zone says nothing about heat. A platform with no reader says nothing about either: the policy treats that as battery for power and does not pause for heat.
 
 The description process is a child of the control daemon. It is located next to the executable of the worker. It is started when work is first due.
 

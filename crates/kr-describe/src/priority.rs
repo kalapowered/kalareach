@@ -46,10 +46,11 @@
 //! cost.
 //!
 //! Windows keeps an I/O priority for each thread as well as for the process, and the thread that
-//! loads the model exists before the process's priority is set. A thread that was running when the
-//! process's I/O priority was lowered reads the lowered value for itself, so the model thread takes
-//! the process's, and the I/O class counts as applied only when the system reads back very low
-//! for the process and for the model thread's own value.
+//! loads the model exists before the process's priority is set. On the Windows build this was tried
+//! on (Windows Server 2025, build 26100), a thread that was waiting when the process's I/O
+//! priority was lowered read the lowered value for itself, so the model thread takes the process's.
+//! This module does not rely on that: the I/O class counts as applied only when the system reads
+//! back very low for the process and for the model thread's own value.
 //!
 //! The class is the idle priority class and the very low IO priority, set on their own. Windows
 //! also has a background mode for a process, which lowers the CPU, IO and memory priority together,

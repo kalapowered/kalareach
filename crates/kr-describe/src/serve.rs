@@ -60,6 +60,8 @@ pub const CONTROL_BOUND_MS: u64 = 2_000;
 pub const OVERDUE_GRACE_MS: u64 = 2_000;
 
 /// How this process's memory ceiling is enforced: by the daemon's own reading of its resident set.
+/// It is what the process reports on every platform, whether or not the daemon also asks the
+/// operating system to hold a limit around it, which the process does not know.
 pub const CEILING_MECHANISM: &str = "sampler";
 
 /// The file in the runtime directory whose lock one description process holds.
