@@ -34,7 +34,8 @@
 //! ends when the daemon does, and its watchdog looks for the daemon by the start identity it is
 //! given, which covers a control thread that never sees that end. A process created held on
 //! Windows has run neither of them, so the job it is put in ends it with the daemon, and a start
-//! that fails or panics ends it too.
+//! that fails or panics ends it too. A daemon killed from outside in the few calls before the
+//! process is in its job is the one case that leaves it.
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
