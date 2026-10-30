@@ -3225,7 +3225,7 @@ impl Container {
 
     /// Starts a container that mounts `programs`.
     fn create(runtime: Runtime, programs: &Path) -> Self {
-        let name = format!("kr-acc-{}", &kr_ipc::new_uuid().to_string()[..8]);
+        let name = format!("kr-acc-{}", kr_ipc::new_uuid());
         let mount = format!("{}:{MOUNTED}:ro", programs.display());
         // The guard exists before the first call that can make the container: a call that makes it
         // and then stalls or fails still leaves a guard that removes it, by the name just given.
@@ -3271,7 +3271,8 @@ impl Container {
     }
 
     /// What names the container to the runtime: the identifier it issued, and until it has issued
-    /// one, the name this test gave it. That name is random, and no one else holds it.
+    /// one, the name this test gave it. That name holds a whole random UUID, so no other container
+    /// has it.
     fn target(&self) -> &str {
         if self.id.is_empty() {
             &self.name
