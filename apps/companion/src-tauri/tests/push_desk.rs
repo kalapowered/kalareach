@@ -1055,10 +1055,11 @@ async fn the_keys_filed_for_the_receivers_are_the_preview_key_the_host_was_told_
         &filed.senders[0].id,
         kr_protocol::pairing::key_id(KeyPurpose::NotificationPreview, key.as_bytes()).as_bytes()
     );
-    // The control: every other secret the phone holds, and the other public keys it and the host
-    // declared, are things the application's secure store and the pairing record give back, and
-    // none of them is what is filed. The receivers' store is the one an extension reads, so
-    // anything filed there is within its reach.
+    // The control: the seeds of the phone's other key purposes, and the other public keys it and
+    // the host declared for them, are things the application's secure store and the pairing record
+    // give back, and none of them is what is filed. The loop covers every key purpose and no other
+    // secret the phone keeps (its recovery seed, for one). The receivers' store is the one an
+    // extension reads, so anything filed there is within its reach.
     let filed_bytes: Vec<&[u8]> = filed
         .recipients
         .iter()
