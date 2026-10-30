@@ -177,6 +177,32 @@ shows that, and it cannot undo it.
 | `is not the pinned rcodesign` | the signer was handed a program of its own choosing for the Developer ID | unset `KR_RCODESIGN`, or give it the pinned executable |
 | `is in no tier of the release matrix`, or `the published release matrix was not accepted` | the matrix the managed service publishes does not list the commit's package version, or does not verify | publish a matrix revision that lists the version, then re-run the failed job; its sealed archives are kept for one day, and a refusal at `matrix`, before the approval, is a new dispatch |
 | `nothing shows that this repository makes releases immutable` | the setting reads as off, or the most recently published release is not immutable | turn the setting on and publish a package release, then re-run the failed `publish` job within the day the sealed archives are kept; later, dispatch again |
+| `the system does not accept <file> as a Notarized Developer ID`, with `source=Unnotarized Developer ID`, for every Mach-O file of one target in its `check` job | the macOS runner asked Apple's service about files that the signing script saw accepted, and was told they are not notarised | re-run the failed job once, as [below](#a-check-job-that-refuses-every-file-of-one-target); a second refusal is investigated, not re-run |
+
+### A check job that refuses every file of one target
+
+A `check` job for a macOS target holds each Mach-O file of the unpacked archive to `Notarized Developer ID`
+with `scripts/check-macos-signatures.sh`. The archive carries no stapled ticket, so the system answers
+from Apple's service, and the runner's answer can be `Unnotarized Developer ID` for files that Apple
+accepted. The first host release hit this: in its first attempt, `release-host` run 40909452060 refused
+every Mach-O file of the Intel macOS target on files the signing script had seen accepted, while the
+other three checks passed, and its second attempt passed on the same bytes. When a `check` job
+refuses every Mach-O file of one target with `Unnotarized Developer ID` and the other checks
+pass, re-run it once:
+
+```sh
+gh run rerun --failed <run id>
+```
+
+That runs the failed job again, and `publish` after it. `channel` keeps its result, so nobody is asked
+to approve again. The sealed archives are kept for one day, so the re-run has to start within it.
+
+A second refusal is investigated, not re-run, and so is any other refusal of a notarised tree, such
+as one that spares some files. Compare the digests in `source`'s summary with what the signing script
+printed, read the submission's status and log with `xcrun notarytool info <submission id>` and
+`xcrun notarytool log <submission id>` (the notary key options as for `wait`), and assess a file of
+the tree on the signing machine with
+`/usr/sbin/spctl --assess --type open --context context:primary-signature -vv <file>`.
 
 ## Keys, and replacing them
 
