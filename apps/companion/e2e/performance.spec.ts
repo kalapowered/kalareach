@@ -15,8 +15,9 @@
  * The figure is a recording. Section 27 gives this target no number, and a bound on elapsed time
  * would judge the machine the run happens on as much as the interface, so the case asserts only
  * conditions: every key reached the composer in order and was timed, and the stream advanced on
- * the screen while the keys were typed. Playwright's own limits (30 seconds for the case and 5
- * seconds for each `expect`) still apply, and they are the only time limits. The readings are the
+ * the screen while the keys were typed. The only time limits are Playwright's: 90 seconds for the
+ * case, which is raised from the default of 30 because a slower engine on a hosted runner draws
+ * 4,000 nodes slowly, and the default 5 seconds for each `expect`. The readings are the
  * median of the keys in frame periods of the page's own idle frames and against the same keys with
  * a short history and nothing streaming; each is printed with the engine, the host it was taken on
  * and a verdict against the reference bounds below, and attached to the run. The verdict is for a
@@ -157,6 +158,7 @@ async function typeKeys(page: Page): Promise<{ times: number[]; drawnBefore: num
 
 test.describe('KR-PERF-008: input stays responsive while output streams over a large history', () => {
   test('a key is timed to the second frame after it while 20 nodes a frame stream over 4000', async ({ page }) => {
+    test.setTimeout(90_000)
     const engine = test.info().project.name
     await openSession(page)
     await startTiming(page)
@@ -256,7 +258,7 @@ test.describe('KR-PERF-008: input stays responsive while output streams over a l
     )
 
     // Every key reached the composer, in order, and the stream advanced on the screen between the
-    // first key and the last one's timing: a run where the keys finished before any of the stream
+    // first key and the end of the last key's timing: a run where the keys finished before any of the stream
     // reached the screen would report the same figures and mean something else. The readings above
     // are recorded, and read by a person on a reference host.
     expect(typed).toBe(KEYS)
