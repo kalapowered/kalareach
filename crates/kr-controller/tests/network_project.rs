@@ -2432,8 +2432,13 @@ async fn a_read_of_one_version_lists_no_other_version_the_grant_does_not_reach()
 
 /// KR-REQ-23.44 and the host's rule for derived content: a `changeset.read` names the version a
 /// version was derived from only where the grant reaches that source. A version captured before
-/// the moment the grant's history reaches back to is not listed, is not named as the source of one
-/// captured after it, and its number, digest and change set appear nowhere in the answer.
+/// the moment the grant's history reaches back to is not listed and is not named as the source of
+/// one captured after it. The summaries and the selected version's provenance carry no reference
+/// to it and no sentence about why. For the changed copy's version, whose source is in its own
+/// change set, the answer is searched for the source's digest. For the proposal, whose source is in
+/// another change set, it is searched for that change set's identifier. The answer still shows the
+/// provenance method, the consistency detail and the evidence of a derived version, which this
+/// case does not look at.
 ///
 /// Two versions are derived after the grant's bound. One is the result of a test run on a changed
 /// copy of the version, derived within its own change set, which is how a summary names its
@@ -2626,7 +2631,7 @@ async fn a_read_of_a_derived_version_names_no_source_the_grant_does_not_reach() 
         "the source's digest is nowhere in the answer: {answer}"
     );
 
-    // The same grant, and the proposal, whose source is in another change set.
+    // A grant with a later bound, and the proposal, whose source is in another change set.
     let (_b, narrow) = recorded
         .device(|grant| {
             grant.history.lower_bound_ms = Nullable::some(of_the_proposal.version.captured_at_ms);
@@ -2681,7 +2686,9 @@ async fn a_read_of_a_derived_version_names_no_source_the_grant_does_not_reach() 
 
 /// KR-REQ-23.44: a `changeset.read` of a version captured before the moment the grant's history
 /// reaches back to is refused with the code and the words a number the change set does not have is
-/// refused with, so a device learns nothing about which versions a change set holds.
+/// refused with, so the refusal does not tell the two apart. A read that names no version, and the
+/// gaps in the numbers a device is listed, still show that a version the grant does not reach
+/// exists; this case does not look at them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(
     windows,

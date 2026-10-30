@@ -240,8 +240,9 @@ impl RemoteConnection {
     /// A version also names the version it was derived from, in its summary and, for the one that
     /// was asked for, in its provenance beside a sentence about why. Where the grant does not
     /// reach that source the reference is left empty and the sentence is not given, because they
-    /// would tell the device that the source exists, which number it has and how the version it
-    /// reads relates to it.
+    /// would name the source and say how the version it reads relates to it. What the version
+    /// holds of its own is not narrowed: its provenance method, its consistency detail and its
+    /// evidence rows can still show that it was derived.
     pub(super) async fn within_the_grant(&self, answer: ControlFrame) -> ControlFrame {
         let (request_id, read) = match change_set_read(answer) {
             Ok(read) => read,
@@ -310,7 +311,9 @@ impl RemoteConnection {
     /// at or after the moment the grant's history reaches back to. A grant with no lower bound
     /// retains none of it. A version outside the grant, one captured before the moment its
     /// history reaches back to and one this host cannot read are each refused in the same words,
-    /// so a device learns nothing about which identifiers and which numbers exist.
+    /// so the refusal does not tell a device which of the three it is. It does not hide every
+    /// version: a read that names no version reads the latest one and is refused when the grant
+    /// does not reach it, which tells a device that a later version exists.
     ///
     /// Returns the number of the version it checked, which is the latest one when none was named:
     /// what is then read has to be that version, and not the one that is latest by then.
