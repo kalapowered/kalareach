@@ -300,15 +300,24 @@ mod tests {
 
     /// KR-REQ-03.24: the answer for a headless worker is about the supervisor the daemon selected,
     /// whatever the platform offers at the moment it is asked. A daemon that started a detached
-    /// process says so and claims no service manager; one that selected the platform's own names
-    /// that and not a detached process.
+    /// process says so; one that selected the platform's own names that and not a detached
+    /// process. A Linux host with no user service manager says it has none to ask. A Mac has
+    /// launchd whichever supervisor its daemon chose, so it never says that: what a logout does to
+    /// a detached process is not established.
     #[cfg(unix)]
     #[test]
     fn the_headless_answer_follows_the_supervisor_the_daemon_selected() {
         use crate::supervision::DETACHED_DESCRIPTION;
 
         let detached = headless_persistence(DETACHED_DESCRIPTION);
-        assert_eq!(detached.persistence, LogoutPersistence::NoServiceManager);
+        assert_eq!(
+            detached.persistence,
+            if cfg!(target_os = "macos") {
+                LogoutPersistence::NotEstablished
+            } else {
+                LogoutPersistence::NoServiceManager
+            }
+        );
         assert!(
             detached.mechanism().as_str().contains("detached"),
             "{}",

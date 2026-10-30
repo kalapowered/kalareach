@@ -2001,18 +2001,28 @@ fn per_user_startup_uses_the_platform_service_mechanism_and_changes_no_sleep_pol
             persistence.detail()
         );
     }
-    // The report is about the mechanism this host selected: a Mac whose daemon chose launchd says
-    // its background domain outlives the graphical login without establishing how long, and one
-    // that chose a detached process says that, and neither names the other.
+    // The report is about the mechanism this host selected, and neither names the other. A Mac has
+    // launchd whichever its daemon chose, so both answers leave what a logout does to a headless
+    // worker not established.
     #[cfg(target_os = "macos")]
-    if described == kr_controller::supervision::DETACHED_DESCRIPTION {
-        assert_eq!(persistence.persistence, LogoutPersistence::NoServiceManager);
-    } else {
+    {
+        let detached = described == kr_controller::supervision::DETACHED_DESCRIPTION;
+        assert_eq!(
+            persistence.mechanism().as_str().contains("detached"),
+            detached,
+            "{}",
+            persistence.mechanism()
+        );
+        assert_eq!(
+            persistence.mechanism().as_str().contains("launchd"),
+            !detached,
+            "{}",
+            persistence.mechanism()
+        );
         assert_eq!(
             persistence.persistence,
             LogoutPersistence::NotEstablished,
-            "this platform's background domain outlives the graphical login and this host does \
-             not read how long it lasts"
+            "this host does not read how long a logout leaves a headless worker running"
         );
     }
 
