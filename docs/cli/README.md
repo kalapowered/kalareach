@@ -1936,7 +1936,10 @@ is complete when every affected session's worker has fenced it; until then it is
 command names each session whose worker has not fenced it and exits with 1. Asking again is a new
 revocation. What the device already saw stays with it. With `--json` it returns `grant_id` and the
 revocation result: `authority_revision`, `revoked_grants`, `revoked_grants_total` and the `barrier`,
-which lists each affected worker with its session and state.
+which lists each affected worker with its session and state. It also returns `barrier_holds`, true
+when every worker has fenced the revocation. That member is kept for scripts written before the
+`barrier` listed workers, and a release that changes the command line's JSON removes it; read `ok`
+and `barrier.workers[].state` instead.
 
 `kr share transfer` hands a session's control to another device. The host describes the transfer
 from its own records, an owner device confirms exactly that plan, and the command then sends the

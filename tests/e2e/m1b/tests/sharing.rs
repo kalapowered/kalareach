@@ -531,6 +531,11 @@ fn a_revocation_a_session_worker_has_not_fenced_is_pending_in_kr_and_complete_on
     let pending_document: serde_json::Value = serde_json::from_slice(&scripted.stdout)
         .unwrap_or_else(|why| panic!("no document ({why}): {:?}", scripted.stdout));
     assert_eq!(pending_document["ok"], false, "{pending_document}");
+    // The member older scripts read is kept beside the barrier until a release removes it.
+    assert_eq!(
+        pending_document["barrier_holds"], false,
+        "a script that reads barrier_holds sees a pending revocation as pending: {pending_document}"
+    );
     let workers = pending_document["barrier"]["workers"]
         .as_array()
         .unwrap_or_else(|| panic!("no list of workers: {pending_document}"));
@@ -559,6 +564,10 @@ fn a_revocation_a_session_worker_has_not_fenced_is_pending_in_kr_and_complete_on
         );
     };
     assert_eq!(revoked["ok"], true, "{revoked}");
+    assert_eq!(
+        revoked["barrier_holds"], true,
+        "a script that reads barrier_holds sees a complete revocation as complete: {revoked}"
+    );
     let fenced = revoked["barrier"]["workers"]
         .as_array()
         .unwrap_or_else(|| panic!("no list of workers: {revoked}"));
