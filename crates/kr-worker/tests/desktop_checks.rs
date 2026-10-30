@@ -359,20 +359,29 @@ async fn a_pipe_in_place_of_the_named_file_is_answered_and_not_waited_for() {
     }
 }
 
-/// What the person owns around one nominated file: every name in its directory with the bytes and
-/// the modification time of each, and the directory's own modification time, which moves when a
-/// name is added, removed or renamed.
-fn owned_state(
-    directory: &std::path::Path,
-) -> (
-    std::time::SystemTime,
-    Vec<(String, Vec<u8>, std::time::SystemTime)>,
-) {
-    let modified = |path: &std::path::Path| {
-        std::fs::metadata(path)
-            .and_then(|metadata| metadata.modified())
-            .expect("a modification time")
-    };
+/// One path as the person left it: its modification time and its permissions.
+#[derive(Debug, PartialEq, Eq)]
+struct Left {
+    modified: std::time::SystemTime,
+    mode: u32,
+}
+
+fn left(path: &std::path::Path) -> Left {
+    let metadata = std::fs::metadata(path).expect("the path's metadata");
+    #[cfg(unix)]
+    let mode = std::os::unix::fs::PermissionsExt::mode(&metadata.permissions());
+    #[cfg(not(unix))]
+    let mode = u32::from(metadata.permissions().readonly());
+    Left {
+        modified: metadata.modified().expect("a modification time"),
+        mode,
+    }
+}
+
+/// What is around one nominated file: the directory as the person left it, which moves its
+/// modification time when a name is added, removed or renamed, and every name in it with its bytes,
+/// its modification time and its permissions.
+fn directory_state(directory: &std::path::Path) -> (Left, Vec<(String, Vec<u8>, Left)>) {
     let mut names: Vec<_> = std::fs::read_dir(directory)
         .expect("lists the directory")
         .map(|entry| {
@@ -383,27 +392,27 @@ fn owned_state(
                     .to_string_lossy()
                     .into_owned(),
                 std::fs::read(&path).expect("reads the file"),
-                modified(&path),
+                left(&path),
             )
         })
         .collect();
-    names.sort();
-    (modified(directory), names)
+    names.sort_by(|first, second| first.0.cmp(&second.0));
+    (left(directory), names)
 }
 
-/// KR-REQ-03.30: the worker performing the checks changes no user data. The file the person
-/// nominated and everything beside it are as they were once the checks have run, and the run
-/// performed the read: a headless session is asked for that check alone, so there is no check that
-/// sends a keystroke to hold back. That the one check which sends input is withheld without an
-/// isolated context of its own is the probe's own unit cases.
+/// KR-REQ-03.30: the authorised-file check leaves the file the person nominated and everything
+/// beside it as they were: the same names, bytes, modification times and permissions, in the same
+/// directory. The run performed the read: a headless session is asked for that check alone, so
+/// there is no check that sends a keystroke to hold back. That the one check which sends input is
+/// withheld without an isolated context of its own is the probe's own unit cases.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn performing_the_checks_changes_nothing_the_person_owns() {
+async fn the_authorised_file_check_leaves_the_file_and_its_directory_as_they_were() {
     let host = host().await;
     let directory = tempfile::tempdir().expect("a directory of this test's own");
     let file = directory.path().join("authorised.txt");
     std::fs::write(&file, b"the person nominated this").expect("the nominated file");
     std::fs::write(directory.path().join("beside.txt"), b"not nominated").expect("another file");
-    let before = owned_state(directory.path());
+    let before = directory_state(directory.path());
     let mut link = daemon(&host, ControllerConnectionRole::Checks).await;
 
     for id in 1..=2 {
@@ -425,7 +434,7 @@ async fn performing_the_checks_changes_nothing_the_person_owns() {
             other => panic!("the checks were not performed: {other:?}"),
         }
         assert_eq!(
-            owned_state(directory.path()),
+            directory_state(directory.path()),
             before,
             "the person's files are as they were after request {id}"
         );
