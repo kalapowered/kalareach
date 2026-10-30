@@ -326,30 +326,35 @@ the person presses it again.
 
 A Windows console reports keys, not bytes, so there the command reads the console with
 `ReadConsoleInputW` and asks it for none of its own translation into terminal sequences. The key
-records of a read go to the session as a `console_keys` write: for every key, the virtual key, the
-scan code, the UTF-16 code unit, whether the key went down or came up, the modifier state and the
-repeat count, as the console reported them. A record that is not a key ends the run, and the first
-half of a character outside the basic plane waits for its second half. The command spells nothing
-and invents no scan code. The worker spells the records for the session's terminal, in the win32
-input mode format when that terminal asked for it and as legacy terminal input otherwise (see the
-host reference). Under legacy terminal input (`Fidelity::LegacyVt`: every session of a Unix worker,
-and a Windows session whose pseudo-console did not ask for records) the worker spells console keys
-only as ordinary terminal input, which is a different key while the application has negotiated
-`modifyOtherKeys` or the Kitty keyboard protocol, so it refuses the write. Records the backend asked
-for are carried unchanged in any keyboard state, and nothing is refused then. When the session
-refuses the records, the command asks the console to spell its keys itself (its own virtual-terminal
-input) and sends what the console spells as bytes from then on, which the session takes in that
-encoding. The attachment keeps its input lease and invents no spelling. After the terminal is the
-person's again it says once that its keys went as the console spells them, with the console's own
-modifier detail and without key releases. The keys of the batch the session refused, and the
-records the command had read before the console began to spell, are not sent again. A console that
-will not spell its keys gives the lease back, goes on watching, and says that. Bytes the session
-refuses as incompatible end the attachment, which says why and that `--no-probe` watches without
-typing. The scroll-back keys above are taken
-from the records of Shift and Page Up or Page Down, key by key: the key going down and the same key
-coming up are the window's, and every other record, a release among them, is the session's. The
-command does not ask the console for mouse or window-size records, so the console keeps the mouse
-for selecting text.
+records of a read go to the session as a `console_keys` write: for each key it sends, the virtual
+key, the scan code, the UTF-16 code unit, whether the key went down or came up, the modifier state
+and the repeat count, as the console reported them. A record that is not a key ends the run, and the
+first half of a character outside the basic plane waits for its second half. The command spells
+nothing and invents no scan code. The worker spells the records for the session's terminal, in the
+win32 input mode format when that terminal asked for it and as legacy terminal input otherwise (see
+the host reference). Under legacy terminal input (`Fidelity::LegacyVt`: every session of a Unix
+worker, and a Windows session whose pseudo-console did not ask for records) the worker spells
+console keys only as ordinary terminal input, which is a different key while the application has
+negotiated `modifyOtherKeys` or the Kitty keyboard protocol, so it refuses the write. Under
+`Fidelity::Records` the worker carries the records unchanged in any keyboard state, and the keyboard
+state refuses none of them.
+
+When the session refuses the records, the command stops reading records, asks the console to spell
+its keys itself (its own virtual-terminal input), and reads the bytes the console spells from then
+on. It sends them exactly as the console gives them, a NUL included, and the session takes them in
+that encoding. The attachment keeps its input lease and invents no spelling. After the terminal is
+the person's again, the command says once that its keys went as the console spells them, with the
+console's own modifier detail and without key releases. Keys typed just before the session refused
+them are lost, and the command says so only when a typed key was lost: a modifier on its own, a key
+coming up and a lock key are not typed keys. What is lost is the batch the session refused, the
+writes already sent as records behind it, whose answers the command ignores, and the records it had
+already read, which it drops and does not turn into bytes. A console that will not spell its keys
+gives the lease back, goes on watching, and says that and what was lost. The scroll-back keys above
+are taken from the records of Shift and Page Up or Page Down, key by key: the key going down and the
+same key coming up are the window's. The release of a key this attachment did not see go down, the
+Return that started the command among them, is not sent, and every other record is the session's.
+The command does not ask the console for mouse or window-size records, so the console keeps the
+mouse for selecting text.
 
 Bracketed paste is the one piece of context the command keeps, and it keeps it by watching the
 bytes as they go past rather than by holding any of them: a start delimiter opens a paste and an
