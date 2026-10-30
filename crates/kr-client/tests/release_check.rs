@@ -104,6 +104,22 @@ async fn a_matrix_signed_by_another_key_is_refused() {
     assert_eq!(refused.exit_code(), 1);
 }
 
+/// The program is the one check against a floor set too high: a matrix below the first revision a
+/// build reads is no matrix to that build, so the release is refused.
+#[tokio::test]
+async fn a_matrix_below_the_first_revision_the_build_reads_is_refused() {
+    let key = AuthorisationKeyPair::generate().expect("a key pair");
+    let served = publishing(&matrix("4", "0.78.99", "0.78.99"), &key).await;
+    let origin = GatewayOrigin::new(served.origin()).expect("a loopback origin");
+    let http = HttpService::new(origin.clone()).expect("a transport");
+    let reads_from_five = Pins::of(vec![*key.public()]).from_revision(5);
+    let refused = check_release(&http, &origin, &reads_from_five, release())
+        .await
+        .expect_err("a refusal");
+    assert_eq!(refused, Unsupported::NotVerified(Refusal::BelowFirst));
+    assert_eq!(refused.exit_code(), 1);
+}
+
 #[tokio::test]
 async fn a_service_with_no_matrix_is_refused_and_one_that_does_not_answer_may_be_asked_again() {
     let key = AuthorisationKeyPair::generate().expect("a key pair");
