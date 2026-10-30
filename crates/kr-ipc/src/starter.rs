@@ -333,6 +333,11 @@ pub use self::windows::{Job, end_process};
 #[cfg(windows)]
 mod desktop;
 
+/// What a window station or a desktop admits, read from its descriptor's text, and whether one
+/// admits no more than another.
+#[cfg(any(windows, test))]
+mod security;
+
 /// The calls into the operating system: the launch pipe, the facts of a process, and the child a
 /// starter creates.
 ///

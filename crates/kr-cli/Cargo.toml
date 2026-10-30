@@ -155,6 +155,10 @@ zip.workspace = true
 # the folder the handle holds and not from the text the person typed, which a junction can change.
 winx = "=0.36.4"
 
+[target.'cfg(windows)'.dev-dependencies]
+# The cases that change the security of the logon's window station and of the interactive one.
+windows-sys = { workspace = true, features = ["Win32_Security_Authorization", "Win32_System_StationsAndDesktops", "Win32_System_SystemServices"] }
+
 # The workspace forbids unsafe code, which a crate that calls the console API cannot honour. This
 # crate denies it instead and allows it in exactly one module, `terminal::windows::console`, which
 # owns every call into the operating system. Nothing else in this crate may relax the rule.

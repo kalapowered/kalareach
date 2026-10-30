@@ -260,3 +260,35 @@ async fn a_session_that_names_no_profile_is_desktop_bound_where_the_account_has_
         created.document
     );
 }
+
+/// KR-REQ-03.24: two headless sessions of one logon, started by two daemons at the same moment,
+/// are on desktops of their own: the same window station, two desktops, and neither is the
+/// interactive one.
+///
+/// Two daemons, each with a task and a starter of its own, are what makes the starts concurrent:
+/// the starters meet at the logon's window station.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_headless_sessions_started_together_are_on_different_desktops() {
+    let (one, other) = tokio::join!(WorkerHost::start(), WorkerHost::start());
+    let (first, second) = tokio::join!(
+        one.kr_new(&["--shell-mode", "native_compat"]),
+        other.kr_new(&["--shell-mode", "native_compat"])
+    );
+    let (first, _holding_first) = probe_in_session(&one, &first, &title("first")).await;
+    let (second, _holding_second) = probe_in_session(&other, &second, &title("second")).await;
+    for found in [&first, &second] {
+        assert!(
+            !found.station.eq_ignore_ascii_case("WinSta0")
+                && found.desktop.starts_with("kr-worker-"),
+            "a headless session's shell is not on a desktop of its own: {found:?}"
+        );
+    }
+    assert!(
+        first.station.eq_ignore_ascii_case(&second.station),
+        "the headless sessions of one logon share its window station: {first:?} {second:?}"
+    );
+    assert_ne!(
+        first.desktop, second.desktop,
+        "two headless sessions are on one desktop"
+    );
+}

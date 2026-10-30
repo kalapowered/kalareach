@@ -1248,14 +1248,20 @@ one's into the background domain, because a headless worker inside the graphical
 that login's access however little of its environment it was given. On Windows the starter of
 the environment's scheduled task creates the worker in the logon session of the user the task logs
 on as. A desktop-bound worker is on that session's interactive window station and desktop. A
-headless worker is started on a desktop of its own, named for the worker, on the window station
-the system forms for that logon, so neither it nor a program it starts inherits access to the
-interactive desktop. The station is shared by the headless workers of a logon, and with it their
-clipboard and atoms; it and the desktop have the access list and integrity label of the starter's
-own station and desktop, and a station that has others is refused, so that no worker is started on
-it. That is not a boundary against a process of the same account, which can still open the
-interactive desktop by name. A worker an earlier release started stays where it was started until
-it ends.
+headless worker starts on the window station of its logon, which the logon's headless workers share,
+and a desktop of its own, named for the worker, and inherits no access to the interactive desktop;
+it is not a boundary against a process of the same account, which can still open the interactive
+desktop by name. The workers of a logon share the station's clipboard and atoms. The station and
+the desktop are made with the access list and integrity label of the starter's own station and
+desktop. A station that exists already keeps the security it was made with, so the starter reads
+back the security of each station and desktop and refuses to start a worker on one that admits more
+than its own: an allowing entry the starter's own has not, a denying entry it lacks, entries in
+another order, a null or absent list where there are entries, or a lower integrity level or a
+weaker policy. It starts the worker on one that admits less. That matters when the interactive
+station gains an entry while a logon lasts, as it does when a person uses "Run as different user":
+the station the headless workers already hold has not that entry, and the next headless worker is
+started on it all the same. A worker an earlier release started stays where it was started until it
+ends.
 
 Linux places a job in no login session at all: a user service manager started at boot has no
 display, no compositor socket and no session message bus, because those belong to a graphical login

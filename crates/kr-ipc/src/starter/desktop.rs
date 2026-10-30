@@ -16,9 +16,19 @@
 //! the starter does, is admitted to them exactly as it would be to the starter's desktop. A
 //! station that exists already keeps what it has, because creating it again ignores the security
 //! asked for, so the starter reads the access list and label of each object it is about to use
-//! and refuses to start a child on one that differs from its own. A desktop on a station that
-//! shows nothing is given a smaller heap than the interactive one, which bounds how many windows
-//! the processes of one headless session can make at once.
+//! and refuses to start a child on one that admits more than its own does. An object that admits
+//! less is used: a station made before an entry was added to the interactive one, as "Run as
+//! different user" does, has not that entry, and the worker, which runs as the starter does, is
+//! admitted to it all the same. [`super::security`] says what admitting more is.
+//!
+//! A desktop on a window station that shows nothing has the heap the system gives such a desktop,
+//! which is much smaller than the interactive one's, and all the processes of one headless session
+//! share it. A session that starts very many programs which each make windows can use it up, and
+//! the system then fails the next program's start without naming the desktop as the cause.
+//!
+//! The starter can end between lending the child its handles and letting it run only by being
+//! killed there. The child is then left suspended with its handles, and the daemon, which was told
+//! nothing, records a launch it cannot vouch for.
 
 #![expect(
     unsafe_code,
@@ -28,6 +38,8 @@
 
 use std::io;
 use std::os::windows::ffi::OsStrExt as _;
+
+use super::security::{access_list, access_list_admits_more, label, label_admits_more};
 
 use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
@@ -113,7 +125,7 @@ impl OwnDesktop {
         let station = Station(station);
         station_source.label_onto(station.0);
         station_source
-            .require_same_on(station.0)
+            .require_no_more_on(station.0)
             .map_err(step("check the window station's security"))?;
         let station_name = name_of(station.0).map_err(step("read the new station's name"))?;
 
@@ -141,7 +153,7 @@ impl OwnDesktop {
             let created = Desktop(created);
             desktop_source.label_onto(created.0);
             desktop_source
-                .require_same_on(created.0)
+                .require_no_more_on(created.0)
                 .map_err(step("check the desktop's security"))?;
             created
         };
@@ -355,7 +367,7 @@ impl Source {
     /// Gives `target` this object's integrity label, if it has one and the starter may set it.
     ///
     /// A refusal is not looked at here: a station that exists already is not the starter's to
-    /// relabel. What decides is [`Self::require_same_on`], which reads the label back.
+    /// relabel. What decides is [`Self::require_no_more_on`], which reads the label back.
     fn label_onto(&self, target: HANDLE) {
         if self.label.is_null() {
             return;
@@ -376,40 +388,53 @@ impl Source {
         }
     }
 
-    /// Requires `target` to have the access list and the integrity label this object has.
+    /// Requires `target` to admit no more than this object does, by its access list and by its
+    /// integrity label.
     ///
-    /// The lists are compared by their entries, in order of their text, with the flags that say
-    /// how a list was made left out: two objects whose entries are the same admit the same
-    /// processes. An object that differs is refused, and a child is not started on it.
+    /// An object that admits less is used. One that admits more, or whose security cannot be shown
+    /// to admit no more, is refused, and a child is not started on it.
     ///
     /// # Errors
     ///
-    /// Returns a permission error when the entries differ, or the operating system's error when
-    /// the target's security cannot be read.
-    fn require_same_on(&self, target: HANDLE) -> io::Result<()> {
+    /// Returns a permission error naming what the target admits more of, or the operating system's
+    /// error when the target's security cannot be read.
+    fn require_no_more_on(&self, target: HANDLE) -> io::Result<()> {
         let there = security_of(target)?;
-        for (name, information) in [
-            ("access list", DACL_SECURITY_INFORMATION),
-            ("integrity label", LABEL_SECURITY_INFORMATION),
-        ] {
-            let (own, found) = (self.entries(information)?, there.entries(information)?);
-            if own != found {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!(
-                        "its {name} is not the starter's own: {} here, {} there",
-                        found.join(""),
-                        own.join("")
-                    ),
-                ));
-            }
+        let unread = |what: &str, why: String| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("its {what} could not be read: {why}"),
+            )
+        };
+        let refused = |what: &str, why: String| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("its {what} admits more than the starter's own does: {why}"),
+            )
+        };
+        let (own, found) = (
+            access_list(&self.text(DACL_SECURITY_INFORMATION)?)
+                .map_err(|why| unread("access list", why))?,
+            access_list(&there.text(DACL_SECURITY_INFORMATION)?)
+                .map_err(|why| unread("access list", why))?,
+        );
+        if let Some(why) = access_list_admits_more(&own, &found) {
+            return Err(refused("access list", why));
         }
-        Ok(())
+        let (own, found) = (
+            label(&self.text(LABEL_SECURITY_INFORMATION)?)
+                .map_err(|why| unread("integrity label", why))?,
+            label(&there.text(LABEL_SECURITY_INFORMATION)?)
+                .map_err(|why| unread("integrity label", why))?,
+        );
+        match label_admits_more(own, found) {
+            Some(why) => Err(refused("integrity label", why)),
+            None => Ok(()),
+        }
     }
 
-    /// The entries of one of this object's lists, as the text security descriptors are written
-    /// in, one string for each and in order.
-    fn entries(&self, information: u32) -> io::Result<Vec<String>> {
+    /// The text of one of this object's lists, as security descriptors are written in.
+    fn text(&self, information: u32) -> io::Result<String> {
         let mut text: *mut u16 = std::ptr::null_mut();
         // SAFETY: the descriptor was returned by `GetSecurityInfo` and lives in this value, the
         // length is not asked for, and `text` is a live out parameter.
@@ -435,35 +460,8 @@ impl Source {
         // SAFETY: the string was allocated by the conversion, which asks for it to be freed with
         // this call, and nothing else holds it.
         unsafe { LocalFree(text.cast()) };
-        Ok(parenthesised(&written))
+        Ok(written)
     }
-}
-
-/// The parenthesised entries of a security descriptor's text, sorted, without the flags before
-/// the first one.
-fn parenthesised(written: &str) -> Vec<String> {
-    let mut entries = Vec::new();
-    let mut depth = 0_u32;
-    let mut start = 0;
-    for (index, character) in written.char_indices() {
-        match character {
-            '(' => {
-                if depth == 0 {
-                    start = index;
-                }
-                depth += 1;
-            }
-            ')' if depth > 0 => {
-                depth -= 1;
-                if depth == 0 {
-                    entries.push(written[start..=index].to_owned());
-                }
-            }
-            _ => {}
-        }
-    }
-    entries.sort();
-    entries
 }
 
 /// The access list and the integrity label of an object: what decides who may use it and from
@@ -521,27 +519,4 @@ fn wide(text: &str) -> Vec<u16> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parenthesised;
-
-    /// The entries of a list are compared whatever flags and order the text has them in.
-    #[test]
-    fn entries_are_compared_without_their_flags_and_in_any_order() {
-        assert_eq!(
-            parenthesised("D:PAI(A;;GA;;;SY)(A;;GA;;;S-1-5-5-0-1)"),
-            parenthesised("D:(A;;GA;;;S-1-5-5-0-1)(A;;GA;;;SY)")
-        );
-        assert_ne!(
-            parenthesised("D:(A;;GA;;;SY)"),
-            parenthesised("D:(A;;GA;;;SY)(A;;GA;;;WD)")
-        );
-        assert_eq!(parenthesised(""), Vec::<String>::new());
-        assert_eq!(
-            parenthesised("S:(ML;;NW;;;ME)"),
-            vec!["(ML;;NW;;;ME)".to_owned()]
-        );
-    }
 }
