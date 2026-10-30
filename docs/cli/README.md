@@ -2274,6 +2274,19 @@ and running the same command again asks again, or this host sends it once privac
 `--json` prints `{ "ok": ..., "deleted": ..., "report": ... }`, the report in the shape
 `kr privacy status --json` prints.
 
+`kr privacy delete` also takes a notification that `kr privacy status` lists as deletable. It asks
+the push gateway to delete what it still holds for that one notification, under the authorisation
+the notification was sent under, and it prints what that does in place of the backup generation's
+warnings. This host writes nothing down for it. When the gateway answers, the command prints that
+the gateway holds no record of the notification now and exits with 0; a notification a provider
+accepted or a device holds stays where it is, the status keeps listing it, and running the command
+again asks the gateway again. When the gateway does not answer, refuses the credential or refuses
+the request, the command fails with `STORAGE_UNAVAILABLE` and the notification stays listed, so run
+the command again later. When the gateway takes no more deletions from this host for now, it fails
+with `RATE_LIMITED`. A notification whose device was unpaired or registered again since is not
+listed as deletable, and the command refuses it with `PERMISSION_DENIED` without asking the gateway.
+`--json` prints the same document as for a backup generation.
+
 ## `kr destination`
 
 A paired device is a place this host sends notifications because the device registered itself.

@@ -12,6 +12,7 @@
 //! | [`transport`] | The one managed transport per origin every exchange goes through |
 //! | [`client`] | Presenting a notification to the gateway its credential names |
 //! | [`status`] | Asking that gateway what became of one, by its identifier |
+//! | [`forget`] | Asking that gateway to delete what it still holds for one, on a person's request |
 //! | [`credentials`] | The bearer this host delivers under |
 //! | [`sender`] | Renewing and revoking it through the gateway's two-step signed exchanges |
 //! | [`external`] | The sender every external destination is handed to, and delivering to a webhook |
