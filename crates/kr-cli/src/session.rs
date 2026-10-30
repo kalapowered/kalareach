@@ -342,14 +342,19 @@ const VK_MENU: u16 = 0x12;
 /// one by one: the modifier going down, the key going down and coming up, the modifier coming up,
 /// and nothing says they arrive in one read, so the chord is taken key by key. The key going down
 /// is taken, by its repeat count, and the same key coming up is taken after it, wherever it
-/// arrives; `taken` is the keys whose release is still to come. The modifier's own records are the
-/// session's, going down and coming up, so that what the application is told of it is balanced.
-/// Every other record is returned in its place, a release among them: a key the session was sent
-/// going down has its release sent too. When the chord is not this terminal's (`mine` is false) no
-/// key is taken, and the release of one that was is still taken.
+/// arrives. The modifier's own records are the session's, going down and coming up, so that what
+/// the application is told of it is balanced. Every other record is returned in its place, a
+/// release among them.
+///
+/// Where a scroll key's first record went is where the rest of the hold goes: `held` is the
+/// scroll keys down now, each with whether it is the window's. A key the session was sent going
+/// down has its repeats and its release sent too, whatever the modifiers do meanwhile, and a key
+/// taken is taken until it comes up. A chord that is not this terminal's (`mine` is false) is the
+/// session's, and a repeat of a key the window has, when the window is no longer this terminal's,
+/// is dropped.
 fn take_scroll_keys(
     keys: Vec<kr_term::win32::KeyRecord>,
-    taken: &mut Vec<u16>,
+    held: &mut Vec<(u16, bool)>,
     mine: bool,
 ) -> (Vec<kr_term::win32::KeyRecord>, i64) {
     use kr_term::win32::control_keys::{
@@ -364,22 +369,33 @@ fn take_scroll_keys(
         let direction = match key.virtual_key {
             VK_PRIOR => 1_i64,
             VK_NEXT => -1_i64,
-            _ => 0,
-        };
-        if direction != 0
-            && key.key_down
-            && mine
-            && key.control_keys & SHIFT_PRESSED != 0
-            && key.control_keys & OTHERS == 0
-        {
-            if !taken.contains(&key.virtual_key) {
-                taken.push(key.virtual_key);
+            _ => {
+                rest.push(key);
+                continue;
             }
-            steps = steps.saturating_add(direction.saturating_mul(i64::from(key.repeat.max(1))));
-        } else if direction != 0 && !key.key_down && taken.contains(&key.virtual_key) {
-            taken.retain(|held| *held != key.virtual_key);
-        } else {
+        };
+        let place = held.iter().position(|(code, _)| *code == key.virtual_key);
+        if !key.key_down {
+            // The key comes up where it went down. One not seen going down is the session's.
+            match place.map(|at| held.remove(at)) {
+                Some((_, true)) => {}
+                _ => rest.push(key),
+            }
+            continue;
+        }
+        let window = match place {
+            Some(at) => held[at].1,
+            None => {
+                let window =
+                    mine && key.control_keys & SHIFT_PRESSED != 0 && key.control_keys & OTHERS == 0;
+                held.push((key.virtual_key, window));
+                window
+            }
+        };
+        if !window {
             rest.push(key);
+        } else if mine {
+            steps = steps.saturating_add(direction.saturating_mul(i64::from(key.repeat.max(1))));
         }
     }
     (rest, steps)
@@ -1451,8 +1467,8 @@ async fn drive(
 
     // Whether a bracketed paste is open, so that nothing inside one is read as a key.
     let mut paste = PasteWatch::default();
-    // The keys of the scroll-back chord this terminal has taken whose release has not come.
-    let mut scroll_keys_taken: Vec<u16> = Vec::new();
+    // The scroll keys that are down now, each with whether this terminal took it.
+    let mut scroll_keys_held: Vec<(u16, bool)> = Vec::new();
     // The pointer reports this terminal sends while its window is above the live page, and the
     // moment a report it is part way through stops waiting for the rest of itself.
     let mut pointers = PointerReports::default();
@@ -2030,7 +2046,7 @@ async fn drive(
                         let mine = size.is_some()
                             && display.holds_screen()
                             && display.showing_history_buffer();
-                        let (keys, steps) = take_scroll_keys(keys, &mut scroll_keys_taken, mine);
+                        let (keys, steps) = take_scroll_keys(keys, &mut scroll_keys_held, mine);
                         if let (Some(size), true) = (size, steps != 0) {
                             let shown = display
                                 .window_rows()
@@ -2618,59 +2634,104 @@ mod tests {
             control_keys,
             repeat,
         };
-        let mut taken = Vec::new();
+        let mut held = Vec::new();
 
         // The modifier is the session's, going down and coming up.
         let shift_down = key(0x10, true, SHIFT_PRESSED, 1);
-        let (rest, steps) = take_scroll_keys(vec![shift_down], &mut taken, true);
+        let (rest, steps) = take_scroll_keys(vec![shift_down], &mut held, true);
         assert_eq!((rest, steps), (vec![shift_down], 0));
         // Page Up going down moves the window by its repeat count and is not the session's.
         let (rest, steps) =
-            take_scroll_keys(vec![key(0x21, true, SHIFT_PRESSED, 3)], &mut taken, true);
+            take_scroll_keys(vec![key(0x21, true, SHIFT_PRESSED, 3)], &mut held, true);
         assert_eq!((rest.len(), steps), (0, 3));
         // Its release arrives in a read of its own, and goes the same way.
         let (rest, steps) =
-            take_scroll_keys(vec![key(0x21, false, SHIFT_PRESSED, 1)], &mut taken, true);
+            take_scroll_keys(vec![key(0x21, false, SHIFT_PRESSED, 1)], &mut held, true);
         assert_eq!(
             (rest.len(), steps),
             (0, 0),
             "the release of a key taken is taken"
         );
-        assert!(taken.is_empty());
+        assert!(held.is_empty());
         let shift_up = key(0x10, false, 0, 1);
-        let (rest, steps) = take_scroll_keys(vec![shift_up], &mut taken, true);
+        let (rest, steps) = take_scroll_keys(vec![shift_up], &mut held, true);
         assert_eq!((rest, steps), (vec![shift_up], 0));
 
         // Page Down goes the other way.
-        let (_, steps) =
-            take_scroll_keys(vec![key(0x22, true, SHIFT_PRESSED, 1)], &mut taken, true);
+        let (_, steps) = take_scroll_keys(vec![key(0x22, true, SHIFT_PRESSED, 1)], &mut held, true);
         assert_eq!(steps, -1);
-        let _ = take_scroll_keys(vec![key(0x22, false, SHIFT_PRESSED, 1)], &mut taken, true);
+        let _ = take_scroll_keys(vec![key(0x22, false, SHIFT_PRESSED, 1)], &mut held, true);
 
         // A key the chord shares a read with is not taken with it: a letter's release is the
         // session's, whatever is beside it.
         let a_up = key(u16::from(b'A'), false, SHIFT_PRESSED, 1);
         let (rest, steps) = take_scroll_keys(
             vec![a_up, key(0x21, true, SHIFT_PRESSED, 1)],
-            &mut taken,
+            &mut held,
             true,
         );
         assert_eq!((rest, steps), (vec![a_up], 1));
-        let _ = take_scroll_keys(vec![key(0x21, false, SHIFT_PRESSED, 1)], &mut taken, true);
+        let _ = take_scroll_keys(vec![key(0x21, false, SHIFT_PRESSED, 1)], &mut held, true);
 
         // Unshifted, it is the application's.
         let plain = key(0x21, true, 0, 1);
-        let (rest, steps) = take_scroll_keys(vec![plain], &mut taken, true);
+        let (rest, steps) = take_scroll_keys(vec![plain], &mut held, true);
         assert_eq!((rest, steps), (vec![plain], 0));
-        // Where the chord is not this terminal's it is the session's too, going down; and the
-        // release of a key already taken is still taken.
+        let _ = take_scroll_keys(vec![key(0x21, false, 0, 1)], &mut held, true);
+        // Where the chord is not this terminal's it is the session's too.
         let chord = key(0x21, true, SHIFT_PRESSED, 1);
-        let (rest, steps) = take_scroll_keys(vec![chord], &mut taken, false);
+        let (rest, steps) = take_scroll_keys(vec![chord], &mut held, false);
         assert_eq!((rest, steps), (vec![chord], 0));
-        let _ = take_scroll_keys(vec![chord], &mut taken, true);
-        let (rest, _) =
-            take_scroll_keys(vec![key(0x21, false, SHIFT_PRESSED, 1)], &mut taken, false);
-        assert!(rest.is_empty(), "a taken key's release goes with it");
+        let _ = take_scroll_keys(vec![key(0x21, false, SHIFT_PRESSED, 1)], &mut held, false);
+        assert!(held.is_empty());
+    }
+
+    /// The modifier can change while a scroll key is held, and the key goes where it went down:
+    /// the session that was sent a key going down is sent its repeats and its release, and a key
+    /// the window took is the window's until it comes up.
+    #[test]
+    fn a_scroll_key_held_goes_where_it_went_down_whatever_the_modifier_does_meanwhile() {
+        use kr_term::win32::{KeyRecord, control_keys::SHIFT_PRESSED};
+
+        let key = |key_down: bool, control_keys: u32| KeyRecord {
+            virtual_key: 0x21,
+            scan_code: 0,
+            unicode: 0,
+            key_down,
+            control_keys,
+            repeat: 1,
+        };
+
+        // Down without Shift, then Shift joins and the key repeats, then it comes up: all the
+        // session's, so the application sees a key go down and come up.
+        let mut held = Vec::new();
+        let sent = [
+            key(true, 0),
+            key(true, SHIFT_PRESSED),
+            key(false, SHIFT_PRESSED),
+        ];
+        let (rest, steps) = take_scroll_keys(sent.to_vec(), &mut held, true);
+        assert_eq!((rest.len(), steps), (3, 0));
+        assert!(held.is_empty());
+
+        // Down with Shift, then Shift is let go and the key repeats, then it comes up: all the
+        // window's, which moves for the repeat as well.
+        let taken = [key(true, SHIFT_PRESSED), key(true, 0), key(false, 0)];
+        let (rest, steps) = take_scroll_keys(taken.to_vec(), &mut held, true);
+        assert_eq!((rest.len(), steps), (0, 2));
+        assert!(held.is_empty());
+
+        // The window stops being this terminal's part way through a hold: its repeats are dropped
+        // and its release is taken.
+        let (_, steps) = take_scroll_keys(vec![key(true, SHIFT_PRESSED)], &mut held, true);
+        assert_eq!(steps, 1);
+        let (rest, steps) = take_scroll_keys(
+            vec![key(true, SHIFT_PRESSED), key(false, 0)],
+            &mut held,
+            false,
+        );
+        assert_eq!((rest.len(), steps), (0, 0));
+        assert!(held.is_empty());
     }
 
     /// A release, and a modifier on its own, are not something the person typed: they neither take
