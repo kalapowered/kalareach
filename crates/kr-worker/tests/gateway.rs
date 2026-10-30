@@ -1797,8 +1797,8 @@ fn kr_req_12_10_gateway_request_state_survives_reopening_the_workers_own_journal
     let _ = std::fs::remove_dir_all(path.parent().expect("a directory"));
 }
 
-/// KR-REQ-11.27 and KR-REQ-11.33: one exclusive admission carries one answer, whichever writer
-/// takes it, and the second writer is refused before its bytes go.
+/// KR-REQ-11.27, KR-REQ-11.33 and KR-REQ-27.05, approval races: one exclusive admission carries
+/// one answer, whichever writer takes it, and the second writer is refused before its bytes go.
 ///
 /// A rich answer holds the admission from its marker, the point after which its bytes are the
 /// transport's to carry. Until then it holds only a reservation, and a native answer that reaches
