@@ -1539,9 +1539,12 @@ async fn a_host_on_every_interface_hints_the_addresses_it_found_there() {
 // silently when that binary was absent would report a pass for something it never ran.
 /// KR-REQ-27.05, revoked devices: a paired device that the owner revokes with `device.revoke`
 /// while its connection is authorised and its subscription is running has the connection ended,
-/// not noticed at its next request, and its record is withdrawn so that it cannot come back. A
-/// record that is not marked fails the case at the reconnect; the barrier of the same revocation
-/// also ends the connection, so the case does not tell the live fence from the barrier.
+/// not noticed at its next request, and its record is withdrawn so that it cannot come back. The
+/// worker lets go of a connection's attachments when the host lets go of its link, so the
+/// session's attachment count reaching none, before the device sends anything, shows the
+/// connection ended on the revocation alone. A connection that is not fenced keeps its
+/// attachments and fails the case at that wait; a record that is not marked fails it at the
+/// reconnect.
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_revoked_device_is_fenced_before_it_is_served_again() {
@@ -1575,8 +1578,18 @@ async fn a_revoked_device_is_fenced_before_it_is_served_again() {
         .expect("a revocation result");
 
     // The fence is not a recorded state the next request happens to notice: withdrawing the
-    // registration takes the connection's write boundary with it and ends the connection, so there
-    // is no further read and no further dispatch on it at all.
+    // registration takes the connection's write boundary with it and ends the connection. The
+    // device has sent nothing since the revocation, so the owner's view of the session is the
+    // only thing that can show it: both of the device's attachments are let go of.
+    waits_for_attachments(
+        &mut local,
+        session_id,
+        0,
+        "the revoked device's connection ends before it asks for anything",
+    )
+    .await;
+
+    // And what it sends after that is refused, not answered.
     let refused = session
         .read::<_, SessionReadResult>(Method::SessionRead, &SessionReadParams { session_id })
         .await
