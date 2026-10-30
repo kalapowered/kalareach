@@ -4232,6 +4232,35 @@ fn a_backup_store_opens_over_a_staging_directory_an_earlier_release_left_open() 
     drop(BackupStore::open(&state).expect("the store opens over the directory"));
 }
 
+/// KR-REQ-24.26: the directory a generation's ciphertext is staged in is owner-only under the mask
+/// a login starts with, as the staging directory above it is.
+#[cfg(unix)]
+#[test]
+fn the_directory_of_a_staged_generation_is_owner_only_under_a_login_mask() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let _login = kr_ipc::testing::LoginUmask::hold();
+    let environment = Environment::open();
+    let service = environment.service();
+    let lease = service.begin_production().expect("a lease");
+    let staged = lease
+        .stage(
+            archive_id(),
+            BackupGeneration::new(1),
+            object_id(1),
+            b"ciphertext",
+        )
+        .expect("an object is staged");
+
+    let generation = staged.path.parent().expect("the generation's directory");
+    let mode = std::fs::metadata(generation)
+        .expect("the generation's directory")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o700, "{}", generation.display());
+}
+
 /// A store whose schema is not the one this build writes is refused, whatever its version says.
 ///
 /// The rules a store enforces are part of its schema. A database written when one of them was

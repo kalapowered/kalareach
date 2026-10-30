@@ -3966,26 +3966,71 @@ mod tests {
     }
 
     /// KR-REQ-24.26: an entry the library names by a number is not this user's, whether or not the
-    /// system has a record of this user, since an account can be called by a number; this user's
-    /// own entry, by the name the system's record gives, is.
+    /// system has a record of this user, since an account can be called by a number and a user
+    /// number with no record is named by itself; this user's own entry, by the name the system's
+    /// record gives, is. The numbers come from the account that runs the case, so the case does not
+    /// depend on which account that is.
     #[cfg(target_os = "macos")]
     #[test]
     fn an_entry_called_by_a_number_is_not_this_users() {
-        let by_number = exacl::AclEntry::allow_user("501", exacl::Perm::READ, None);
+        let own_number = current_uid().to_string();
+        let by_own_number = exacl::AclEntry::allow_user(&own_number, exacl::Perm::READ, None);
         let by_name = exacl::AclEntry::allow_user("someone", exacl::Perm::READ, None);
-        let record = || {
-            Some(PasswdEntry {
+        let known = || {
+            names_of_this_user(Some(PasswdEntry {
                 name: "someone".to_owned(),
                 home: None,
-            })
+            }))
         };
-        let known = || names_of_this_user(record());
-        assert!(access_list_verdict(Ok(vec![by_number.clone()]), known).is_some());
+        assert!(access_list_verdict(Ok(vec![by_own_number.clone()]), known).is_some());
         assert_eq!(access_list_verdict(Ok(vec![by_name.clone()]), known), None);
 
+        // A user whose account is called by a number: a list names another user number that has no
+        // record by that number too, so the entry is not known to be this user's.
+        let other_number = (u64::from(current_uid()) + 424_242).to_string();
+        let numbered = || {
+            names_of_this_user(Some(PasswdEntry {
+                name: other_number.clone(),
+                home: None,
+            }))
+        };
+        let by_other_number = exacl::AclEntry::allow_user(&other_number, exacl::Perm::READ, None);
+        assert!(access_list_verdict(Ok(vec![by_other_number]), numbered).is_some());
+
         let unknown = || names_of_this_user(None);
-        assert!(access_list_verdict(Ok(vec![by_number]), unknown).is_some());
+        assert!(access_list_verdict(Ok(vec![by_own_number]), unknown).is_some());
         assert!(access_list_verdict(Ok(vec![by_name]), unknown).is_some());
+    }
+
+    /// KR-REQ-24.26: an entry that gives another account any one of reading, writing and searching
+    /// refuses an owner-only directory, whether it names a user or a group, with no command: the
+    /// owner check does not look at one kind of grant only.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_entry_that_gives_another_account_any_access_refuses_the_directory() {
+        use exacl::{AclEntry, Perm};
+
+        let root = temporary_root("access-list-grants");
+        let grants = [
+            AclEntry::allow_user("root", Perm::WRITE, None),
+            AclEntry::allow_user("root", Perm::READ, None),
+            AclEntry::allow_group("everyone", Perm::READ, None),
+            AclEntry::allow_group("everyone", Perm::EXECUTE, None),
+            AclEntry::allow_group("everyone", Perm::WRITE, None),
+        ];
+        for (index, grant) in grants.iter().enumerate() {
+            let directory = root.join(format!("granted-{index}"));
+            create_private_tree(&root, &directory).expect("creates");
+            give_list(&directory, std::slice::from_ref(grant));
+            let error = create_private_tree(&root, &directory)
+                .expect_err(&format!("{grant:?} refuses the directory"));
+            assert!(
+                matches!(error, IpcError::DirectoryAccessRefused { .. }),
+                "{grant:?}: {error}"
+            );
+            assert_eq!(error.mending_command(), None, "{grant:?}: {error}");
+        }
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
