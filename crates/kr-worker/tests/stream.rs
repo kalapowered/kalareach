@@ -2168,7 +2168,10 @@ async fn kr_req_11_35_a_committed_marker_followed_by_a_failed_transmission_leave
         .broker
         .admit_approval(&World::owner_caller(), &world.rich_answer("accept"), NOW)
         .expect_err("an answer that may have gone is not asked for again");
-    assert_eq!(again.code(), ErrorCode::QuestionResolved);
+    assert_eq!(
+        again.code(),
+        kr_protocol::error::ErrorCode::QuestionResolved
+    );
     assert_eq!(
         world.broker.pending(id).expect("held").state,
         PendingState::Uncertain
