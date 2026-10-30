@@ -1225,8 +1225,9 @@ given. On macOS a desktop-bound worker's job goes into the user's graphical doma
 one's into the background domain, because a headless worker inside the graphical login would have
 that login's access however little of its environment it was given. On Windows the starter of
 the environment's scheduled task creates the worker in the logon session of the user the task logs
-on as, so a headless session there is one with no desktop handles and no promise about the desktop
-rather than one that cannot reach it.
+on as. That session has the interactive window station and desktop, so a headless session there
+runs on them: it is given no desktop variables and no capability claim, and nothing keeps it from
+reaching the desktop.
 
 Linux places a job in no login session at all: a user service manager started at boot has no
 display, no compositor socket and no session message bus, because those belong to a graphical login
@@ -1573,7 +1574,10 @@ shell's own behaviour and can close the session, a launch installs no command, a
 remains available. It is an explicit choice and never an automatic substitution for a managed
 request that could not be served. A request that names no shell gets the one the host is configured
 to use (`SHELL`), and otherwise the platform's own: `/bin/zsh` on macOS, `/bin/bash` on Linux, and on
-Windows PowerShell 7, then Windows PowerShell 5.1, then the command interpreter `ComSpec` names.
+Windows PowerShell 7, then Windows PowerShell 5.1, then the command interpreter. PowerShell 7 is the
+one in its program-files directory or the Store's alias; a `pwsh.exe` elsewhere on the search path is
+not taken, because it may be an older PowerShell. The command interpreter is the one `ComSpec` names
+when that is an absolute path to a file, and otherwise the system directory's `cmd.exe`.
 
 [docs/shell-integration/host.md](../shell-integration/host.md) describes the endpoint, the handshake,
 the phases, the launch transaction and the guarded startup entries `kr shell` writes.
