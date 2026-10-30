@@ -7282,11 +7282,14 @@ async fn a_sessions_processes_are_read_from_the_system_and_a_console_uses_the_te
             .is_some_and(|name| !name.contains('/')),
         "the system gives the executable's base name: {console_row:?}"
     );
-    // Nothing the console printed is a process of the view.
+    // Nothing the console printed is a process of the view: not the number it printed, which is
+    // above any process identifier a system hands out (Linux's limit is 2^22, macOS's 99,999), and
+    // not the names it printed beside that number and beside its own.
     assert!(
         view.processes
             .iter()
-            .all(|row| row.process.pid.get() != 31337 && row.name.0.as_deref() != Some("fakeproc")),
+            .all(|row| row.process.pid.get() != 999_999_999
+                && !matches!(row.name.0.as_deref(), Some("fakeproc" | "liar"))),
         "text on the terminal is not a process: {view:?}"
     );
 
