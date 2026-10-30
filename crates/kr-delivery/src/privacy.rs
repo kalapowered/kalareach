@@ -751,7 +751,7 @@ mod tests {
     /// registers under another authorisation leaves the host unable to show which authorisation
     /// sent it. Such a notification is listed and not offered.
     #[test]
-    fn a_notification_is_not_offered_once_its_device_has_registered_again() {
+    fn a_notification_is_not_offered_once_its_device_registers_under_another_authorisation() {
         use crate::push::NextAction;
 
         let mut journal = journal_with_work();
