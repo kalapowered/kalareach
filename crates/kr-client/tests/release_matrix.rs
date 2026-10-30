@@ -472,13 +472,14 @@ mod nothing_unverified_is_acted_on {
         let key = AuthorisationKeyPair::generate().expect("a key pair");
         let stranger = AuthorisationKeyPair::generate().expect("a key pair");
         let pins = pins(&key);
+        let reads_from_two = pins.clone().from_revision(2);
 
-        let refusals = |held: &HeldMatrix, forged: Vec<(Vec<u8>, Refusal)>| {
+        let refusals = |held: &HeldMatrix, pins: &Pins, forged: Vec<(Vec<u8>, Refusal)>| {
             for (body, expected) in forged {
                 let before = standing(held);
                 let gated = held.route_error(ORIGIN, this_build(), false).is_some();
                 assert_eq!(
-                    held.accept(&pins, ORIGIN, this_build(), NOW + 1, &body)
+                    held.accept(pins, ORIGIN, this_build(), NOW + 1, &body)
                         .err(),
                     Some(expected)
                 );
@@ -534,6 +535,7 @@ mod nothing_unverified_is_acted_on {
             take(&held, &key, &held_matrix, this_build(), NOW).expect("a held copy");
             refusals(
                 &held,
+                &pins,
                 vec![
                     forged(signed_by_stranger.clone(), Refusal::Signature),
                     forged(after_signing.clone(), Refusal::Signature),
@@ -546,6 +548,13 @@ mod nothing_unverified_is_acted_on {
                     forged(reply(&skew_matrix("4"), &key), Refusal::Older),
                     forged(reply(&other_content, &key), Refusal::Conflicts),
                 ],
+            );
+            // A build that reads from revision 2 meets the publication that lists no build of this
+            // product: the copy it holds stays.
+            refusals(
+                &held,
+                &reads_from_two,
+                vec![forged(reply(&skew_matrix("1"), &key), Refusal::BelowFirst)],
             );
         }
     }
