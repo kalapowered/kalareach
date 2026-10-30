@@ -313,9 +313,11 @@ impl Shown {
                 }
             }
             // The detail can name an account, so it is not said; the reason is in fixed words, and
-            // holds for the owner and the access list on every platform that refuses this way.
+            // claims only what every route that refuses this way knows: the directory is not known
+            // to keep other accounts out, whether its list lets one in or could not be read.
             IpcError::DirectoryAccessRefused { path, .. } => crate::shown!(
-                "{} is not owner-only: its owner or its access list does not keep other accounts out",
+                "{} is not owner-only: its owner or its access list is not known to keep other \
+                 accounts out",
                 Self::host_path(path)
             ),
             IpcError::SocketPathTooLong { path, len, limit } => crate::shown!(
