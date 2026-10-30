@@ -1068,6 +1068,21 @@ impl Host {
         self.network.connections_of(device.device_id)
     }
 
+    /// The record the host committed for `device_id`: the grant it was paired under and the keys
+    /// it presents, as the host holds them.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the record cannot be read or the host holds none for the device.
+    #[must_use]
+    pub fn record_of(&self, device_id: DeviceId) -> DeviceRecord {
+        self.network
+            .devices()
+            .record_for_device(device_id)
+            .expect("readable")
+            .expect("the device's record")
+    }
+
     /// Signs the owner's confirmation of one sensitive action against this host's own ledger.
     ///
     /// The challenge is the host's, issued here and consumed exactly once when the method presents
