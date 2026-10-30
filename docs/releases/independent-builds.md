@@ -19,21 +19,33 @@ configured for.
 - **An APNs authentication key of its own**, uploaded to that Firebase project. Firebase uses it to
   reach iOS devices, so the key is the project's and never the app's.
 - **A gateway origin.** The build input `KR_PUSH_GATEWAY_ORIGIN` names the push gateway the app
-  registers with, an `https://host[:port]` origin with no path. An Android build takes it from the
-  environment, beside `KR_GOOGLE_SERVICES_JSON`. An iOS build takes it from
+  registers with. The value is an origin in its canonical form: `https://`, a host in lower-case
+  ASCII (an international name in its `xn--` spelling), a port only when it is not 443, and nothing
+  after that, so no path and no trailing slash. The whole text is at most 128 bytes. An Android
+  build takes it from the environment, beside `KR_GOOGLE_SERVICES_JSON`. An iOS build takes it from
   `apps/companion/src-tauri/gen/apple/Local.xcconfig`, beside `KR_GOOGLE_SERVICE_INFO`, because
   `tauri ios build` does not hand its environment to the Xcode build; `//` starts a comment in that
-  file, so the line reads `KR_PUSH_GATEWAY_ORIGIN = https:/$()/push.builder.example`. A build given
-  no value uses the official gateway, `https://reach.kala.to`, and sends the same requests as the
-  official build. A value that is not such an origin stops the build, and a build given one prints
-  `this build registers with the push gateway at <origin>` among its cargo warnings, which is the
-  sign that the input reached the build. A debug build also reads an origin from a device test's
-  file in its data directory; a release build has no other way to change the origin. The input
-  moves only the push gateway: the account the app signs in to and its other services stay where
-  they are. Each request is bound to the exact origin it was addressed to, so a signature made for
-  one deployment cannot be replayed against another, and a gateway refuses a request authorised for
-  somebody else's origin. The gateway compares the origin as exact text, so its setting
-  `PUSH_GATEWAY_ORIGIN` is the same text as the build input.
+  file, so the line reads `KR_PUSH_GATEWAY_ORIGIN = https:/$()/push.builder.example`. A debug
+  simulator build (`tauri ios build --debug --target aarch64-sim`) with that line printed the
+  warning described below; a device archive takes the same route and has not been built with the
+  line. A build given no value uses the official gateway, `https://reach.kala.to`, and sends the
+  same requests as the official build. A value that is not such an origin stops the build. A build
+  given one prints `this build registers with the push gateway at <origin>` among its cargo
+  warnings, which is the sign that the input reached the build. The app takes its gateway from what
+  the build accepted, so the warning and the app cannot name different gateways. A
+  Cargo configuration file's `[env]` table reaches the build as the environment does. A debug build
+  also reads an origin from a device test's file in its data directory; a release build has no
+  other way to change the origin. The input moves only the push gateway: the account the app signs
+  in to and its other services stay where they are. Each request is bound to the exact origin it
+  was addressed to, so a signature made for one deployment cannot be replayed against another, and
+  a gateway refuses a request authorised for somebody else's origin. The gateway compares the
+  origin as exact text, so its setting `PUSH_GATEWAY_ORIGIN` is the same text as the build input.
+
+The official build takes no gateway of its own. The store scripts start it with
+`KR_OFFICIAL_BUILD=1` and without `KR_PUSH_GATEWAY_ORIGIN`, and a build marked that way stops when
+the gateway input reaches it by any route, a Cargo configuration file's `[env]` table included.
+The store bundle check then reads the gateway back from the library in the package and refuses a
+bundle whose library names one. A builder of an independently signed app does not set the mark.
 
 The official gateway sends through the official Firebase project, so it reaches the apps registered
 in that project and no others. A host that is self-hosted forwards encrypted envelopes through the
@@ -45,7 +57,7 @@ A host delivers notifications only through the official gateway. The origin a cr
 where the host sends every notification, status question and renewal under it, so a paired device
 does not get to choose that address: a host refuses, when a device registers, a credential that
 names another gateway. An independently signed app that registers with its own gateway is therefore
-reached by no host that delivers through the official one.
+reached by no host.
 
 ## What the repository holds
 
