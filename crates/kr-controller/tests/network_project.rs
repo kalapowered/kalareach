@@ -105,6 +105,12 @@ fn said(error: &ClientError) -> String {
         .map_or(rendered.clone(), |(_, message)| message.to_owned())
 }
 
+/// Whether a refusal carries none of this host's own words: a refusal that came out of a service
+/// reaches a device as its class and length.
+fn withheld(error: &ClientError) -> bool {
+    said(error).starts_with("[message withheld, ")
+}
+
 /// How long a mutation asks for. A clone reaches the filesystem and a materialisation copies it.
 const LIFETIME: DurationMs = DurationMs::new(120_000);
 
@@ -3375,14 +3381,24 @@ impl Granted {
 
     /// Sets the scene for a device that holds `rights`.
     async fn on_a_qualified_host_holding(test: &str, rights: &[ActionRight]) -> Option<Self> {
+        Self::on_a_qualified_host_with(test, rights, |_| {}).await
+    }
+
+    /// Sets the scene for a device that holds `rights` under the grant `adjust` leaves.
+    async fn on_a_qualified_host_with(
+        test: &str,
+        rights: &[ActionRight],
+        adjust: impl FnOnce(&mut kr_protocol::pairing::ProposedGrant),
+    ) -> Option<Self> {
         use kr_protocol::project::LocationPurpose;
 
         let owner = DeviceKeys::generate().expect("owner keys");
         let host = qualified_host(&owner, test).await?;
         let mut control = host.client().await;
         let device = net_support::Device::create().await;
-        let record =
-            net_support::pair_with(&host, &device, &owner, a_proposal_holding(rights)).await;
+        let mut proposal = a_proposal_holding(rights);
+        adjust(&mut proposal);
+        let record = net_support::pair_with(&host, &device, &owner, proposal).await;
         let session = net_support::connect(&host, &device, &record).await;
         let grant = record.grant.grant_id;
         let root = host.work().join("granted");
@@ -3746,6 +3762,16 @@ async fn a_device_captures_reads_applies_and_reverts_inside_the_location_its_gra
     for told in [format!("{applied:?}"), format!("{reverted:?}")] {
         assert!(!told.contains(&root), "{told}");
     }
+    // The host's own sentence about each path is replaced by its class and length.
+    for answer in [&applied, &reverted] {
+        assert!(!answer.progress.is_empty(), "{answer:?}");
+        for progress in &answer.progress {
+            assert!(
+                progress.detail.starts_with("[message withheld, "),
+                "{progress:?}"
+            );
+        }
+    }
     granted.stop().await;
 }
 
@@ -3788,10 +3814,7 @@ async fn a_device_reaches_no_working_copy_through_a_location_that_is_not_its_own
         .refused(Method::ChangesetCapture, &a_capture_of(owners))
         .await;
     assert_eq!(captured.code(), ErrorCode::PermissionDenied);
-    assert!(
-        said(&captured).contains("reaches it through none"),
-        "{captured}"
-    );
+    assert!(withheld(&captured), "{captured}");
     let diff = granted
         .session
         .read::<_, kr_protocol::changeset::DiffReadResult>(
@@ -3805,7 +3828,7 @@ async fn a_device_reaches_no_working_copy_through_a_location_that_is_not_its_own
         .await
         .expect_err("the diff of a working copy no location reaches");
     assert_eq!(diff.code(), ErrorCode::PermissionDenied);
-    assert!(said(&diff).contains("reaches it through none"), "{diff}");
+    assert!(withheld(&diff), "{diff}");
     // And a version cannot be applied onto it, whichever version it is.
     let review = a_working_copy(&granted, "review").await;
     let version: kr_protocol::changeset::ChangesetCaptureResult = typed(
@@ -3829,10 +3852,7 @@ async fn a_device_reaches_no_working_copy_through_a_location_that_is_not_its_own
         )
         .await;
     assert_eq!(applied.code(), ErrorCode::PermissionDenied);
-    assert!(
-        said(&applied).contains("reaches it through none"),
-        "{applied}"
-    );
+    assert!(withheld(&applied), "{applied}");
     assert_eq!(
         std::fs::read(granted.host.work().join("owners/README.md")).expect("the file"),
         before,
@@ -3921,10 +3941,7 @@ async fn a_device_reads_the_repositorys_own_tree_through_its_source_location_and
             )
             .await;
         assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{method:?}");
-        assert!(
-            said(&refused).contains("does not write"),
-            "{method:?}: {refused}"
-        );
+        assert!(withheld(&refused), "{method:?}: {refused}");
     }
     assert_eq!(
         std::fs::read(granted.root.join("src/README.md")).expect("the file"),
@@ -3997,6 +4014,1102 @@ async fn a_device_without_the_right_captures_reads_and_applies_nothing() {
         before,
         "nothing was written to the working copy"
     );
+    granted.stop().await;
+}
+
+// ----- what a device's working-tree request may take, and where it may write ------------------
+
+/// The version a record names.
+fn named_by(
+    record: &kr_protocol::changeset::ChangeSetVersionRecord,
+) -> kr_protocol::changeset::VersionRef {
+    kr_protocol::changeset::VersionRef {
+        change_set_id: record.change_set_id,
+        version: record.version,
+    }
+}
+
+/// The version the owner's capture of `workspace` over the owner's own socket records, for
+/// `session` when one is named.
+async fn owner_captures(
+    granted: &mut Granted,
+    workspace: kr_protocol::ids::WorkspaceId,
+    session: Option<SessionId>,
+) -> kr_protocol::changeset::VersionRef {
+    let captured: kr_protocol::changeset::ChangesetCaptureResult = typed(
+        &local_mutation(
+            &mut granted.control,
+            granted.host.environment_id,
+            Method::ChangesetCapture,
+            &kr_protocol::changeset::ChangesetCaptureParams {
+                session_id: Nullable(session),
+                ..a_capture_of(workspace)
+            },
+        )
+        .await
+        .expect("the owner captures the working copy"),
+    );
+    named_by(&captured.version)
+}
+
+/// The version the device captures of its own `workspace`.
+async fn device_captures(
+    granted: &Granted,
+    workspace: kr_protocol::ids::WorkspaceId,
+) -> kr_protocol::changeset::VersionRef {
+    let captured: kr_protocol::changeset::ChangesetCaptureResult = typed(
+        &remote_mutation(
+            &granted.session,
+            granted.host.environment_id,
+            Method::ChangesetCapture,
+            &a_capture_of(workspace),
+        )
+        .await
+        .expect("the device captures its own working copy"),
+    );
+    named_by(&captured.version)
+}
+
+/// The number of the newest version of a change set, as the owner reads it.
+async fn newest_version_of(
+    granted: &mut Granted,
+    change_set_id: kr_protocol::ids::ChangeSetId,
+) -> u64 {
+    let read: kr_protocol::changeset::ChangesetReadResult = locally(
+        &mut granted.control,
+        Method::ChangesetRead,
+        &kr_protocol::changeset::ChangesetReadParams {
+            change_set_id,
+            version: Nullable::null(),
+        },
+    )
+    .await;
+    read.version.version.get()
+}
+
+/// A device that is paired to reach only the session `session`, and the scene it works in.
+async fn granted_for_one_session(test: &str, session: SessionId) -> Option<Granted> {
+    use kr_protocol::grant::SessionSelector;
+
+    Granted::on_a_qualified_host_with(test, CHANGE_RIGHTS, |grant| {
+        grant.session_selector = SessionSelector::These {
+            session_ids: [session].into_iter().collect(),
+        };
+    })
+    .await
+}
+
+/// KR-REQ-23.44: an apply and a revert install the content of one recorded version, so the version
+/// has to be inside the device's grant by the rule every other read of a version is held to. A
+/// version captured for no session is out of a grant that names one; the refusal comes before
+/// anything is read or written, and says what it says of a version that does not exist. The
+/// control is the version captured for the session the grant names, which the same device applies
+/// and reverts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_applies_and_reverts_no_version_its_grant_does_not_reach() {
+    use kr_protocol::changeset::{ApplyOutcomeClass, DestinationClass, DiffApplyResult};
+
+    let session = SessionId::new(kr_ipc::new_uuid());
+    let Some(mut granted) = granted_for_one_session(
+        "a_device_applies_and_reverts_no_version_its_grant_does_not_reach",
+        session,
+    )
+    .await
+    else {
+        return;
+    };
+    let env = granted.host.environment_id;
+    let review = a_working_copy(&granted, "review").await;
+    let second = a_working_copy(&granted, "second").await;
+    let inside = owner_captures(&mut granted, review, Some(session)).await;
+    let outside = owner_captures(&mut granted, review, None).await;
+    let root = granted.root.clone();
+    let readme = root.join("second/README.md");
+    std::fs::write(&readme, "a repository\n").expect("the file");
+
+    for method in [Method::DiffApply, Method::DiffRevert] {
+        let refused = granted
+            .refused(method, &expecting_readme(&root, second, outside, "second"))
+            .await;
+        assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{method:?}");
+        assert!(
+            said(&refused).contains("does not reach change set"),
+            "{method:?}: {refused}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&readme).expect("the file"),
+            "a repository\n",
+            "{method:?}: the working copy is as it was"
+        );
+    }
+
+    // A proposal that names no workspace was refused for the missing workspace after the version's
+    // manifest had been read, which told a device whether the version exists. It is refused for
+    // the grant first, in the words a version nobody recorded is refused in.
+    let bare =
+        |version: kr_protocol::changeset::VersionRef| kr_protocol::changeset::DiffApplyParams {
+            destination: DestinationClass::Proposal,
+            workspace_id: Nullable::null(),
+            affected: Vec::new(),
+            acknowledged_limitations: kr_changeset::apply::limitations(DestinationClass::Proposal),
+            ..expecting_readme(&root, second, version, "second")
+        };
+    let nobody_recorded = kr_protocol::changeset::VersionRef {
+        change_set_id: kr_protocol::ids::ChangeSetId::new(kr_ipc::new_uuid()),
+        version: outside.version,
+    };
+    let mut told = Vec::new();
+    for version in [outside, nobody_recorded] {
+        let refused = granted.refused(Method::DiffApply, &bare(version)).await;
+        assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+        told.push(said(&refused).replace(&version.change_set_id.to_string(), "<change set>"));
+    }
+    assert_eq!(
+        told[0], told[1],
+        "an existing version and a missing one are refused alike"
+    );
+    assert!(told[0].contains("does not reach change set"), "{}", told[0]);
+    assert_eq!(
+        newest_version_of(&mut granted, outside.change_set_id).await,
+        1,
+        "the refused requests recorded nothing"
+    );
+    // The control for the proposal: a version the grant reaches gets past the scope and meets the
+    // missing workspace.
+    let reached = granted.refused(Method::DiffApply, &bare(inside)).await;
+    assert_eq!(reached.code(), ErrorCode::InvalidArgument, "{reached}");
+
+    // The control for the two: the version captured for the session is applied and reverted.
+    let applied: DiffApplyResult = typed(
+        &remote_mutation(
+            &granted.session,
+            env,
+            Method::DiffApply,
+            &expecting_readme(&root, second, inside, "second"),
+        )
+        .await
+        .expect("a version the grant reaches is applied"),
+    );
+    assert_eq!(
+        applied.outcome.0,
+        Some(ApplyOutcomeClass::Applied),
+        "{applied:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&readme).expect("the file"),
+        "changed after the commit\n"
+    );
+    let reverted: DiffApplyResult = typed(
+        &remote_mutation(
+            &granted.session,
+            env,
+            Method::DiffRevert,
+            &expecting_readme(&root, second, inside, "second"),
+        )
+        .await
+        .expect("a version the grant reaches is reverted"),
+    );
+    assert_eq!(
+        reverted.outcome.0,
+        Some(ApplyOutcomeClass::Applied),
+        "{reverted:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&readme).expect("the file"),
+        "a repository\n"
+    );
+    granted.stop().await;
+}
+
+/// KR-REQ-23.44: a capture that names a change set adds a version to it, and answers with the
+/// change set's label and its number of versions, so the change set has to be inside the device's
+/// grant as a read of it is. One the grant does not reach is refused in the words a change set
+/// nobody made is refused in, and gets no version. The control is the change set captured for the
+/// session the grant names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_adds_no_version_to_a_change_set_its_grant_does_not_reach() {
+    let session = SessionId::new(kr_ipc::new_uuid());
+    let Some(mut granted) = granted_for_one_session(
+        "a_device_adds_no_version_to_a_change_set_its_grant_does_not_reach",
+        session,
+    )
+    .await
+    else {
+        return;
+    };
+    let env = granted.host.environment_id;
+    let review = a_working_copy(&granted, "review").await;
+    let inside = owner_captures(&mut granted, review, Some(session)).await;
+    let outside = owner_captures(&mut granted, review, None).await;
+    let appending = |change_set_id: kr_protocol::ids::ChangeSetId| {
+        kr_protocol::changeset::ChangesetCaptureParams {
+            change_set_id: Nullable::some(change_set_id),
+            ..a_capture_of(review)
+        }
+    };
+    let nobody_made = kr_protocol::ids::ChangeSetId::new(kr_ipc::new_uuid());
+    let mut told = Vec::new();
+    for change_set_id in [outside.change_set_id, nobody_made] {
+        let refused = granted
+            .refused(Method::ChangesetCapture, &appending(change_set_id))
+            .await;
+        assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+        told.push(said(&refused).replace(&change_set_id.to_string(), "<change set>"));
+    }
+    assert_eq!(
+        told[0], told[1],
+        "an existing change set and a missing one are refused alike"
+    );
+    assert!(told[0].contains("does not reach change set"), "{}", told[0]);
+    assert_eq!(
+        newest_version_of(&mut granted, outside.change_set_id).await,
+        1,
+        "the refused capture added no version"
+    );
+
+    let appended: kr_protocol::changeset::ChangesetCaptureResult = typed(
+        &remote_mutation(
+            &granted.session,
+            env,
+            Method::ChangesetCapture,
+            &appending(inside.change_set_id),
+        )
+        .await
+        .expect("a change set the grant reaches takes a version"),
+    );
+    assert_eq!(appended.version.version.get(), 2);
+    assert_eq!(
+        newest_version_of(&mut granted, inside.change_set_id).await,
+        2
+    );
+    granted.stop().await;
+}
+
+/// What each of the four working-tree methods is told when it names `workspace`, a working copy at
+/// `root/name` that this device's grant does not reach, with a version the device may apply: a
+/// refusal, with the working copy as it was.
+async fn is_refused_all_four_on(
+    granted: &Granted,
+    workspace: kr_protocol::ids::WorkspaceId,
+    version: kr_protocol::changeset::VersionRef,
+    root: &Path,
+    name: &str,
+    why: &str,
+) {
+    let before = std::fs::read(root.join(name).join("README.md")).expect("the file");
+    let captured = granted
+        .refused(Method::ChangesetCapture, &a_capture_of(workspace))
+        .await;
+    assert_eq!(
+        captured.code(),
+        ErrorCode::PermissionDenied,
+        "{why}: {captured}"
+    );
+    let diff = granted
+        .session
+        .read::<_, kr_protocol::changeset::DiffReadResult>(
+            Method::DiffRead,
+            &kr_protocol::changeset::DiffReadParams {
+                workspace_id: Nullable::some(workspace),
+                change_set_id: Nullable::null(),
+                version: Nullable::null(),
+            },
+        )
+        .await
+        .expect_err("a diff of a working copy the grant does not reach");
+    assert_eq!(diff.code(), ErrorCode::PermissionDenied, "{why}: {diff}");
+    for method in [Method::DiffApply, Method::DiffRevert] {
+        let refused = granted
+            .refused(method, &expecting_readme(root, workspace, version, name))
+            .await;
+        assert_eq!(
+            refused.code(),
+            ErrorCode::PermissionDenied,
+            "{why}: {method:?}: {refused}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(root.join(name).join("README.md")).expect("the file"),
+        before,
+        "{why}: nothing was written to it"
+    );
+}
+
+/// KR-REQ-23.44: a device reaches a working copy through a location the owner authorised for its
+/// own grant. A working copy in the owner's own location, or in the device's own location after
+/// the owner withdrew it, is refused for all four methods and nothing is written. The control is
+/// the device's own working copy, which it captures and reads before the withdrawal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_reaches_no_working_copy_in_the_owners_location_or_a_withdrawn_one() {
+    use kr_protocol::project::{DestinationParent, LocationPurpose, ProjectLocationWithdrawParams};
+
+    let Some(mut granted) = Granted::on_a_qualified_host_holding(
+        "a_device_reaches_no_working_copy_in_the_owners_location_or_a_withdrawn_one",
+        CHANGE_RIGHTS,
+    )
+    .await
+    else {
+        return;
+    };
+    let env = granted.host.environment_id;
+    let review = a_working_copy(&granted, "review").await;
+    let version = device_captures(&granted, review).await;
+    granted
+        .session
+        .read::<_, kr_protocol::changeset::DiffReadResult>(
+            Method::DiffRead,
+            &kr_protocol::changeset::DiffReadParams {
+                workspace_id: Nullable::some(review),
+                change_set_id: Nullable::null(),
+                version: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the control: the device reads its own working copy");
+
+    // The owner's own destination location, and a working copy the owner makes in it.
+    let owners_root = granted.host.work().join("owners-root");
+    std::fs::create_dir(&owners_root).expect("a directory to authorise");
+    let owners = authorise_owner_location(
+        &mut granted.control,
+        &granted.host,
+        &granted.owner,
+        &owners_root,
+        LocationPurpose::Destination,
+    )
+    .await;
+    // A repository of the owner's own, bound to a source location of the owner's own, so that the
+    // owner makes the working copy in its own destination location.
+    let owners_source_root = granted.host.work().join("owners-source-root");
+    std::fs::create_dir(&owners_source_root).expect("a directory to authorise");
+    repository(&owners_source_root, "src");
+    let owners_source = authorise_owner_location(
+        &mut granted.control,
+        &granted.host,
+        &granted.owner,
+        &owners_source_root,
+        LocationPurpose::Source,
+    )
+    .await;
+    let adopted: ProjectAdoptResult = typed(
+        &local_mutation(
+            &mut granted.control,
+            env,
+            Method::ProjectAdopt,
+            &ProjectAdoptParams {
+                destination: DestinationRequest {
+                    environment_id: env,
+                    parent: DestinationParent::Host {
+                        path: owners_source_root.display().to_string(),
+                    },
+                    name: "src".to_owned(),
+                },
+                label: "owners-source".to_owned(),
+                flow: AdoptionFlow::ExistingCheckout,
+            },
+        )
+        .await
+        .expect("the owner adopts its own repository"),
+    );
+    bind_for(
+        &mut granted.control,
+        &granted.host,
+        &granted.owner,
+        adopted.project.project_repository_id,
+        owners_source.location_id,
+    )
+    .await;
+    let created: WorkspaceCreateResult = typed(
+        &local_mutation(
+            &mut granted.control,
+            env,
+            Method::WorkspaceCreate,
+            &WorkspaceCreateParams {
+                isolation: Nullable::some(IsolationMechanism::IndependentClone),
+                destination: Nullable::some(DestinationRequest {
+                    environment_id: env,
+                    parent: DestinationParent::Location {
+                        location_id: owners.location_id,
+                    },
+                    name: "owners".to_owned(),
+                }),
+                ..workspace_params(
+                    &granted.host,
+                    adopted.project.project_repository_id,
+                    "owners",
+                )
+            },
+        )
+        .await
+        .expect("the owner makes a working copy in its own location"),
+    );
+    let owners_copy = created
+        .workspace
+        .0
+        .expect("a creation returns the workspace")
+        .workspace_id;
+    is_refused_all_four_on(
+        &granted,
+        owners_copy,
+        version,
+        &owners_root,
+        "owners",
+        "the working copy in the owner's location",
+    )
+    .await;
+
+    // The owner withdraws the device's own destination location: the working copy it made through
+    // it is no longer the device's to reach.
+    local_mutation(
+        &mut granted.control,
+        env,
+        Method::ProjectLocationWithdraw,
+        &ProjectLocationWithdrawParams {
+            location_id: granted.destination.location_id,
+        },
+    )
+    .await
+    .expect("the owner withdraws the location");
+    let root = granted.root.clone();
+    is_refused_all_four_on(
+        &granted,
+        review,
+        version,
+        &root,
+        "review",
+        "a withdrawn location",
+    )
+    .await;
+    granted.stop().await;
+}
+
+/// The fault that runs `act` once the first path of an apply is written and confirmed.
+fn after_the_first_path(
+    act: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+) -> kr_changeset::apply::Fault {
+    kr_changeset::apply::Fault {
+        after_paths: 1,
+        act,
+        stop: false,
+        before_rename: None,
+        after_claim: None,
+        refuse_staging_record: false,
+        detail: String::new(),
+    }
+}
+
+/// KR-REQ-23.44: an apply writes into a working copy only while the location it is reached through
+/// still admits the device. Two paths are applied; the owner withdraws the location when the first
+/// is written, and the second is not. The control is the same apply with the location standing,
+/// which writes both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_location_withdrawn_while_an_apply_runs_receives_no_further_write() {
+    use kr_protocol::changeset::{AffectedVersion, ApplyOutcomeClass, DiffApplyResult};
+    use kr_protocol::project::ProjectLocationWithdrawParams;
+
+    let Some(granted) = Granted::on_a_qualified_host_holding(
+        "a_location_withdrawn_while_an_apply_runs_receives_no_further_write",
+        CHANGE_RIGHTS,
+    )
+    .await
+    else {
+        return;
+    };
+    let env = granted.host.environment_id;
+    let review = a_working_copy(&granted, "review").await;
+    std::fs::write(granted.root.join("review/extra.txt"), "an untracked file\n")
+        .expect("an untracked file");
+    let version = device_captures(&granted, review).await;
+    let mut destinations = Vec::new();
+    for name in ["control", "withdrawn"] {
+        let workspace = a_working_copy(&granted, name).await;
+        std::fs::write(granted.root.join(name).join("README.md"), "a repository\n")
+            .expect("the file");
+        destinations.push(workspace);
+    }
+    let both_paths = |workspace, name: &str| {
+        let mut params = expecting_readme(&granted.root, workspace, version, name);
+        params.affected.push(AffectedVersion {
+            path: "extra.txt".to_owned(),
+            expected_worktree_digest: Nullable::null(),
+            expected_index_object_id: Nullable::null(),
+            expected_index_mode: Nullable::null(),
+            check_index: false,
+        });
+        params
+    };
+    let written_in = |name: &str| {
+        let directory = granted.root.join(name);
+        let readme = std::fs::read_to_string(directory.join("README.md")).expect("the file")
+            == "changed after the commit\n";
+        usize::from(readme) + usize::from(directory.join("extra.txt").exists())
+    };
+    let service = granted.host.controller().changesets().service();
+
+    // The control: the location stands throughout.
+    service.inject(Some(after_the_first_path(None)));
+    let applied: DiffApplyResult = typed(
+        &remote_mutation(
+            &granted.session,
+            env,
+            Method::DiffApply,
+            &both_paths(destinations[0], "control"),
+        )
+        .await
+        .expect("the apply under a standing location"),
+    );
+    service.inject(None);
+    assert_eq!(
+        applied.outcome.0,
+        Some(ApplyOutcomeClass::Applied),
+        "{applied:?}"
+    );
+    assert_eq!(written_in("control"), 2, "both paths are written");
+
+    // The owner withdraws the location the instant the first path is written.
+    let owner = std::sync::Arc::new(tokio::sync::Mutex::new(granted.host.client().await));
+    let location = granted.destination.location_id;
+    let withdraw: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+        let owner = std::sync::Arc::clone(&owner);
+        tokio::runtime::Handle::current().block_on(async move {
+            let mut owner = owner.lock().await;
+            local_mutation(
+                &mut owner,
+                env,
+                Method::ProjectLocationWithdraw,
+                &ProjectLocationWithdrawParams {
+                    location_id: location,
+                },
+            )
+            .await
+            .expect("the owner withdraws the location");
+        });
+    });
+    service.inject(Some(after_the_first_path(Some(withdraw))));
+    let outcome = remote_mutation(
+        &granted.session,
+        env,
+        Method::DiffApply,
+        &both_paths(destinations[1], "withdrawn"),
+    )
+    .await;
+    service.inject(None);
+    assert_eq!(
+        written_in("withdrawn"),
+        1,
+        "the path after the withdrawal is not written: {outcome:?}"
+    );
+    if let Ok(value) = &outcome {
+        let answer: DiffApplyResult = typed(value);
+        assert_ne!(
+            answer.outcome.0,
+            Some(ApplyOutcomeClass::Applied),
+            "{answer:?}"
+        );
+    }
+    granted.stop().await;
+}
+
+/// KR-REQ-23.44 and section 9: a device that lost the reply to a capture, an apply or a revert
+/// asks again on a new connection, carrying the action window its first attempt was admitted
+/// under, and is answered from the record the first attempt left: the same answer, with nothing
+/// done twice. The control is a new action under that same window, which the new connection
+/// refuses for the window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeat_of_a_capture_an_apply_and_a_revert_on_a_new_connection_gets_the_retained_result()
+{
+    use kr_protocol::changeset::{ApplyOutcomeClass, ChangesetCaptureResult, DiffApplyResult};
+
+    let Some(granted) = Granted::on_a_qualified_host_holding(
+        "a_repeat_of_a_capture_an_apply_and_a_revert_on_a_new_connection_gets_the_retained_result",
+        CHANGE_RIGHTS,
+    )
+    .await
+    else {
+        return;
+    };
+    let target = ActionTarget::environment(granted.host.environment_id);
+    let review = a_working_copy(&granted, "review").await;
+    let second = a_working_copy(&granted, "second").await;
+    let readme = granted.root.join("second/README.md");
+    std::fs::write(&readme, "a repository\n").expect("the file");
+
+    let first =
+        net_support::RawDevice::connect(&granted.host, &granted._device, &granted.record).await;
+    first.claim();
+    let window = first.action_window_id();
+    let capture = a_capture_of(review);
+    let capture_id = ActionId::new(kr_ipc::new_uuid());
+    let captured: ChangesetCaptureResult = typed(
+        &first
+            .mutate_in(
+                window.clone(),
+                Method::ChangesetCapture,
+                capture_id,
+                target.clone(),
+                &capture,
+            )
+            .await
+            .expect("the device captures"),
+    );
+    let version = named_by(&captured.version);
+    let apply = expecting_readme(&granted.root, second, version, "second");
+    let apply_id = ActionId::new(kr_ipc::new_uuid());
+    let applied: DiffApplyResult = typed(
+        &first
+            .mutate_in(
+                window.clone(),
+                Method::DiffApply,
+                apply_id,
+                target.clone(),
+                &apply,
+            )
+            .await
+            .expect("the device applies"),
+    );
+    assert_eq!(
+        applied.outcome.0,
+        Some(ApplyOutcomeClass::Applied),
+        "{applied:?}"
+    );
+    let revert = expecting_readme(&granted.root, second, version, "second");
+    let revert_id = ActionId::new(kr_ipc::new_uuid());
+    let reverted: DiffApplyResult = typed(
+        &first
+            .mutate_in(
+                window.clone(),
+                Method::DiffRevert,
+                revert_id,
+                target.clone(),
+                &revert,
+            )
+            .await
+            .expect("the device reverts"),
+    );
+    assert_eq!(
+        reverted.outcome.0,
+        Some(ApplyOutcomeClass::Applied),
+        "{reverted:?}"
+    );
+    // Someone else's edit, so that performing the apply or the revert again would meet a conflict
+    // and be refused, where answering it from the record leaves the file alone.
+    std::fs::write(&readme, "someone else's edit\n").expect("the file");
+    first.close();
+
+    let again =
+        net_support::RawDevice::connect(&granted.host, &granted._device, &granted.record).await;
+    again.claim();
+    let stale = again
+        .mutate_in(
+            window.clone(),
+            Method::ChangesetCapture,
+            ActionId::new(kr_ipc::new_uuid()),
+            target.clone(),
+            &capture,
+        )
+        .await
+        .expect_err("a new action under the window of another connection");
+    assert_eq!(stale.code, ErrorCode::PermissionDenied, "{stale:?}");
+
+    let repeated: ChangesetCaptureResult = typed(
+        &again
+            .mutate_in(
+                window.clone(),
+                Method::ChangesetCapture,
+                capture_id,
+                target.clone(),
+                &capture,
+            )
+            .await
+            .expect("the repeat of the capture is answered from its record"),
+    );
+    assert_eq!(repeated, captured, "the capture was not taken twice");
+    let repeated: DiffApplyResult = typed(
+        &again
+            .mutate_in(
+                window.clone(),
+                Method::DiffApply,
+                apply_id,
+                target.clone(),
+                &apply,
+            )
+            .await
+            .expect("the repeat of the apply is answered from its record"),
+    );
+    assert_eq!(repeated, applied);
+    let repeated: DiffApplyResult = typed(
+        &again
+            .mutate_in(window, Method::DiffRevert, revert_id, target, &revert)
+            .await
+            .expect("the repeat of the revert is answered from its record"),
+    );
+    assert_eq!(repeated, reverted);
+    assert_eq!(
+        std::fs::read_to_string(&readme).expect("the file"),
+        "someone else's edit\n",
+        "neither was done again"
+    );
+    again.close();
+    granted.stop().await;
+}
+
+/// The names in a directory.
+fn names_in(directory: &Path) -> std::collections::BTreeSet<String> {
+    std::fs::read_dir(directory)
+        .expect("the directory")
+        .map(|entry| {
+            entry
+                .expect("an entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect()
+}
+
+/// Applies `version` to the working copy `name` beneath `root`, as the device or as the owner, and
+/// stops the apply where a daemon that dies between staging a path and publishing it does. Returns
+/// the names the apply left beside the destination.
+async fn interrupted_apply(
+    granted: &mut Granted,
+    by_the_owner: bool,
+    workspace: kr_protocol::ids::WorkspaceId,
+    root: &Path,
+    name: &str,
+    version: kr_protocol::changeset::VersionRef,
+) -> Vec<String> {
+    let env = granted.host.environment_id;
+    let directory = root.join(name);
+    let before = names_in(&directory);
+    let service = granted.host.controller().changesets().service();
+    service.inject(Some(kr_changeset::apply::Fault {
+        after_paths: usize::MAX,
+        act: None,
+        stop: false,
+        before_rename: Some(std::sync::Arc::new(|_| false)),
+        after_claim: None,
+        refuse_staging_record: false,
+        detail: "the daemon stopped here".to_owned(),
+    }));
+    let params = expecting_readme(root, workspace, version, name);
+    if by_the_owner {
+        local_mutation(&mut granted.control, env, Method::DiffApply, &params)
+            .await
+            .expect_err("an apply the daemon did not settle");
+    } else {
+        remote_mutation(&granted.session, env, Method::DiffApply, &params)
+            .await
+            .expect_err("an apply the daemon did not settle");
+    }
+    service.inject(None);
+    let left: Vec<String> = names_in(&directory).difference(&before).cloned().collect();
+    assert!(!left.is_empty(), "the apply left a temporary beside {name}");
+    left
+}
+
+/// Whether every name is in the directory.
+fn all_in(directory: &Path, names: &[String]) -> bool {
+    names.iter().all(|name| directory.join(name).exists())
+}
+
+/// KR-REQ-23.44: the recovery that settles an interrupted apply before the daemon serves takes
+/// away the temporary it left beside a destination only where this host may still reach the
+/// working copy. The owner's working copy is reached by its own path. A device's is reached
+/// through its location: while the location admits it the temporary is taken away, and once the
+/// owner has withdrawn the location the temporary is left where it is and counted, and no Git
+/// starts in that tree. A daemon that starts afterwards reaches the owner's working copy by its
+/// path and none of the device's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recovery_clears_an_interrupted_device_apply_only_through_a_location_that_still_admits_it()
+{
+    use kr_protocol::project::ProjectLocationWithdrawParams;
+
+    let Some(mut granted) = Granted::on_a_qualified_host_holding(
+        "recovery_clears_an_interrupted_device_apply_only_through_a_location_that_still_admits_it",
+        CHANGE_RIGHTS,
+    )
+    .await
+    else {
+        return;
+    };
+    let env = granted.host.environment_id;
+    let review = a_working_copy(&granted, "review").await;
+    let standing = a_working_copy(&granted, "standing").await;
+    let withdrawn = a_working_copy(&granted, "withdrawn").await;
+    let owners: WorkspaceCreateResult = typed(
+        &local_mutation(
+            &mut granted.control,
+            env,
+            Method::WorkspaceCreate,
+            &WorkspaceCreateParams {
+                isolation: Nullable::some(IsolationMechanism::IndependentClone),
+                ..workspace_params(&granted.host, granted.project, "owners")
+            },
+        )
+        .await
+        .expect("the owner makes a working copy at a path"),
+    );
+    let owners = owners
+        .workspace
+        .0
+        .expect("a creation returns the workspace")
+        .workspace_id;
+    let version = device_captures(&granted, review).await;
+    let root = granted.root.clone();
+    let work = granted.host.work().to_path_buf();
+    for directory in [
+        root.join("standing"),
+        root.join("withdrawn"),
+        work.join("owners"),
+    ] {
+        std::fs::write(directory.join("README.md"), "a repository\n").expect("the file");
+    }
+    let service = std::sync::Arc::clone(granted.host.controller().changesets().service());
+
+    // The location stands: the device's temporary and the owner's are both taken away.
+    let devices =
+        interrupted_apply(&mut granted, false, standing, &root, "standing", version).await;
+    let owners_own = interrupted_apply(&mut granted, true, owners, &work, "owners", version).await;
+    let recovery = service.recover_before_serving().expect("recovery runs");
+    assert_eq!(
+        (recovery.staged_removed, recovery.staged_left),
+        (2, 0),
+        "{recovery:?}"
+    );
+    assert!(!all_in(&root.join("standing"), &devices));
+    assert!(!all_in(&work.join("owners"), &owners_own));
+
+    // The owner withdraws the device's location after the device's apply stopped. The device's
+    // temporary is left where it is and counted; the owner's is still taken away.
+    let devices =
+        interrupted_apply(&mut granted, false, withdrawn, &root, "withdrawn", version).await;
+    let owners_own = interrupted_apply(&mut granted, true, owners, &work, "owners", version).await;
+    local_mutation(
+        &mut granted.control,
+        env,
+        Method::ProjectLocationWithdraw,
+        &ProjectLocationWithdrawParams {
+            location_id: granted.destination.location_id,
+        },
+    )
+    .await
+    .expect("the owner withdraws the location");
+    let recovery = service.recover_before_serving().expect("recovery runs");
+    assert_eq!(
+        (recovery.staged_removed, recovery.staged_left),
+        (1, 1),
+        "{recovery:?}"
+    );
+    assert!(
+        all_in(&root.join("withdrawn"), &devices),
+        "the device's temporary is left where it is"
+    );
+    assert!(!all_in(&work.join("owners"), &owners_own));
+
+    // A daemon that starts after another apply of the owner's stopped does the same: the
+    // location is still not one it reaches, so the device's temporary stays, and the owner's goes.
+    let owners_again =
+        interrupted_apply(&mut granted, true, owners, &work, "owners", version).await;
+    let Granted {
+        host,
+        control,
+        _device,
+        session,
+        ..
+    } = granted;
+    drop(control);
+    session.close();
+    drop(session);
+    drop(_device);
+    let host = host.restart().await;
+    assert!(
+        all_in(&root.join("withdrawn"), &devices),
+        "the device's temporary is left where it is by the daemon that starts"
+    );
+    assert!(!all_in(&work.join("owners"), &owners_again));
+    host.stop().await;
+}
+
+/// Asks for a capture on the raw connection, addressed as `target` says, as a new action.
+async fn capture_by(
+    raw: &net_support::RawDevice,
+    target: ActionTarget,
+    params: kr_protocol::changeset::ChangesetCaptureParams,
+) -> std::result::Result<ParamsValue, ProtocolError> {
+    raw.mutate(
+        Method::ChangesetCapture,
+        ActionId::new(kr_ipc::new_uuid()),
+        target,
+        &params,
+    )
+    .await
+}
+
+/// KR-REQ-23.44: a capture records the session and the workflow run it was taken for, and a version
+/// is reached by a grant through the session it records. A device labels a capture only for the
+/// session its request is addressed to, which its grant has to reach, and for no workflow run: a
+/// run names itself. The control is a capture for the session the grant names, which records it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_labels_a_capture_only_for_a_session_its_grant_reaches_and_for_no_run() {
+    let session = SessionId::new(kr_ipc::new_uuid());
+    let another = SessionId::new(kr_ipc::new_uuid());
+    let Some(granted) = granted_for_one_session(
+        "a_device_labels_a_capture_only_for_a_session_its_grant_reaches_and_for_no_run",
+        session,
+    )
+    .await
+    else {
+        return;
+    };
+    let review = a_working_copy(&granted, "review").await;
+    let labelled =
+        |session_id: Option<SessionId>, run: bool| kr_protocol::changeset::ChangesetCaptureParams {
+            session_id: Nullable(session_id),
+            workflow_run_id: if run {
+                Nullable::some(kr_protocol::ids::WorkflowRunId::new(kr_ipc::new_uuid()))
+            } else {
+                Nullable::null()
+            },
+            ..a_capture_of(review)
+        };
+    let raw =
+        net_support::RawDevice::connect(&granted.host, &granted._device, &granted.record).await;
+    raw.claim();
+    // A session the grant does not name, addressed and labelled alike.
+    let refused = capture_by(
+        &raw,
+        net_support::on_the_session(&granted.host, another),
+        labelled(Some(another), false),
+    )
+    .await
+    .expect_err("a session the grant does not reach");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    // A label for a session the request is not addressed to.
+    let refused = capture_by(
+        &raw,
+        net_support::on_the_session(&granted.host, session),
+        labelled(Some(another), false),
+    )
+    .await
+    .expect_err("a label for another session than the one addressed");
+    assert_eq!(refused.code, ErrorCode::InvalidArgument, "{refused:?}");
+    // A workflow run, which a capture a device asks for never names.
+    let refused = capture_by(
+        &raw,
+        net_support::on_the_session(&granted.host, session),
+        labelled(Some(session), true),
+    )
+    .await
+    .expect_err("a workflow run");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+
+    // The control: the session the grant names, addressed and labelled alike.
+    let captured: kr_protocol::changeset::ChangesetCaptureResult = typed(
+        &capture_by(
+            &raw,
+            net_support::on_the_session(&granted.host, session),
+            labelled(Some(session), false),
+        )
+        .await
+        .expect("a capture for the session the grant names"),
+    );
+    assert_eq!(
+        captured.version.provenance.session_id.0,
+        Some(session),
+        "{:?}",
+        captured.version.provenance
+    );
+    assert!(captured.version.provenance.workflow_run_id.0.is_none());
+    raw.close();
+    granted.stop().await;
+}
+
+/// KR-REQ-23.44: what a device is told of a refusal that came out of the host's services names no
+/// directory of this host, whatever the refusal's code: the code travels and the sentence is
+/// replaced by its class and length. A working copy whose own configuration sets `core.worktree`
+/// is refused in a sentence that names the directory; a device is told none of it on the first
+/// attempt, on a read, and on a repeat over a new connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_of_a_working_tree_request_names_no_directory_of_this_host() {
+    let Some(granted) = Granted::on_a_qualified_host_holding(
+        "a_refusal_of_a_working_tree_request_names_no_directory_of_this_host",
+        CHANGE_RIGHTS,
+    )
+    .await
+    else {
+        return;
+    };
+    let env = granted.host.environment_id;
+    let target = ActionTarget::environment(env);
+    let review = a_working_copy(&granted, "review").await;
+    // The device's own clone says its working tree is somewhere else.
+    let directory = granted.root.join("review");
+    git_raw(
+        &directory,
+        [
+            "config",
+            "core.worktree",
+            directory.to_str().expect("a path"),
+        ],
+    );
+
+    let directory_text = granted.root.display().to_string();
+    let capture = a_capture_of(review);
+    let capture_id = ActionId::new(kr_ipc::new_uuid());
+    let first =
+        net_support::RawDevice::connect(&granted.host, &granted._device, &granted.record).await;
+    first.claim();
+    let window = first.action_window_id();
+    let told = first
+        .mutate_in(
+            window.clone(),
+            Method::ChangesetCapture,
+            capture_id,
+            target.clone(),
+            &capture,
+        )
+        .await
+        .expect_err("the device's capture is refused for the setting");
+    assert_eq!(told.code, ErrorCode::PermissionDenied, "{told:?}");
+    assert!(told.message.starts_with("[message withheld, "), "{told:?}");
+    assert!(!told.message.contains(&directory_text), "{told:?}");
+    let diff = granted
+        .session
+        .read::<_, kr_protocol::changeset::DiffReadResult>(
+            Method::DiffRead,
+            &kr_protocol::changeset::DiffReadParams {
+                workspace_id: Nullable::some(review),
+                change_set_id: Nullable::null(),
+                version: Nullable::null(),
+            },
+        )
+        .await
+        .expect_err("the device's read is refused for the setting");
+    assert_eq!(diff.code(), ErrorCode::PermissionDenied, "{diff}");
+    assert!(withheld(&diff), "{diff}");
+
+    first.close();
+    let again =
+        net_support::RawDevice::connect(&granted.host, &granted._device, &granted.record).await;
+    again.claim();
+    let repeated = again
+        .mutate_in(
+            window,
+            Method::ChangesetCapture,
+            capture_id,
+            target,
+            &capture,
+        )
+        .await
+        .expect_err("the repeat is refused as the first attempt was");
+    assert_eq!(repeated.code, told.code);
+    assert_eq!(repeated.message, told.message);
+    again.close();
+
+    // The control: with the setting gone the same capture is served, so the refusals were the
+    // setting's.
+    git_raw(&directory, ["config", "--unset", "core.worktree"]);
+    device_captures(&granted, review).await;
     granted.stop().await;
 }
 
