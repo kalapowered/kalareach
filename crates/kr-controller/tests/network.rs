@@ -1842,8 +1842,8 @@ async fn a_fence_a_narrowing_could_not_raise_is_raised_by_the_next_reading() {
     daemon.stop().await;
 }
 
-/// A grant this host's clock floor has passed has expired, whatever the deadline its connection
-/// anchored still says.
+/// KR-REQ-27.05, expired grants: a grant this host's clock floor has passed has expired, whatever
+/// the deadline its connection anchored still says.
 ///
 /// Another decision on this host read a wall clock past the grant's expiry, and the floor moved
 /// with it. The next request the device makes finds the grant expired: the connection is ended
