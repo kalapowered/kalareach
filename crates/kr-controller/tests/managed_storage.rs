@@ -28,7 +28,7 @@ use kr_controller::account::{HostAccount, Service};
 use kr_controller::backup::runtime::{OPERATOR_CEILING, TOKEN_CHECK};
 use kr_controller::backup::store::{AttemptStatus, MadeFrom, Production, Remote};
 use kr_controller::quiet::{LONGEST_DELAY, Timer};
-use kr_controller::service::{Controller, ControllerSetup};
+use kr_controller::service::{Clocks, Controller, ControllerSetup, WallClock};
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
 use kr_controller::testing::HeldTimer;
 use kr_crypto::backup::{
@@ -68,6 +68,7 @@ use kr_protocol::privacy::{
 use kr_protocol::scalars::{AuthorisationKey, Nullable, Signature64, TimestampMs, Uuid};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
 use kr_service_stand_in::{ACCOUNT, Moment, Served, TOKEN, serve};
+use kr_transport::clock::ManualClock;
 
 const CREATE: &str = "/api/storage/upload/create";
 const PART: &str = "/api/storage/upload/part";
@@ -207,6 +208,16 @@ impl Rig {
         timer: Arc<HeldTimer>,
         prepare: impl FnOnce(&kr_ipc::testing::TempHost),
     ) -> Self {
+        Self::start_on(arrangement, timer, Clocks::system(), prepare).await
+    }
+
+    /// Starts as [`Self::start_with`] does, on the clocks given.
+    async fn start_on(
+        arrangement: Arrangement,
+        timer: Arc<HeldTimer>,
+        clocks: Clocks,
+        prepare: impl FnOnce(&kr_ipc::testing::TempHost),
+    ) -> Self {
         let host = kr_ipc::testing::TempHost::create();
         prepare(&host);
         let served = serve().await;
@@ -223,7 +234,8 @@ impl Rig {
             write_document(&host, Some(served.origin()));
         }
         sign_in(&host, arrangement.token, served.origin()).await;
-        let (controller, client_endpoint, serving) = start_daemon(&host, Arc::clone(&timer)).await;
+        let (controller, client_endpoint, serving) =
+            start_daemon_on(&host, Arc::clone(&timer), clocks).await;
         let writer = daemon_writer(&host);
         let rig = Self {
             host,
@@ -780,7 +792,20 @@ async fn start_daemon(
     kr_ipc::paths::Endpoint,
     Vec<tokio::task::JoinHandle<kr_controller::Result<()>>>,
 ) {
-    let controller = try_start_controller(host, timer, selected_origin_of(host))
+    start_daemon_on(host, timer, Clocks::system()).await
+}
+
+/// As [`start_daemon`], on the clocks given.
+async fn start_daemon_on(
+    host: &kr_ipc::testing::TempHost,
+    timer: Arc<HeldTimer>,
+    clocks: Clocks,
+) -> (
+    Arc<Controller>,
+    kr_ipc::paths::Endpoint,
+    Vec<tokio::task::JoinHandle<kr_controller::Result<()>>>,
+) {
+    let controller = try_start_controller_on(host, timer, selected_origin_of(host), clocks)
         .await
         .unwrap_or_else(|error| panic!("the daemon starts: {error}"));
     let endpoint = host
@@ -813,6 +838,16 @@ async fn try_start_controller(
     timer: Arc<HeldTimer>,
     account_at: Option<String>,
 ) -> kr_controller::Result<Arc<Controller>> {
+    try_start_controller_on(host, timer, account_at, Clocks::system()).await
+}
+
+/// As [`try_start_controller`], on the clocks given.
+async fn try_start_controller_on(
+    host: &kr_ipc::testing::TempHost,
+    timer: Arc<HeldTimer>,
+    account_at: Option<String>,
+    clocks: Clocks,
+) -> kr_controller::Result<Arc<Controller>> {
     let environment = host.environment();
     let environment_id = host.environment_id();
     environment.create().expect("the environment's directories");
@@ -821,7 +856,7 @@ async fn try_start_controller(
         let secrets = secrets.clone();
         kr_controller::testing::with_account_origin(
             account_at.clone(),
-            Controller::start_on_timer(
+            Controller::start_on_clocks_and_timer(
                 ControllerSetup {
                     paths: environment.clone(),
                     environment_id,
@@ -842,6 +877,7 @@ async fn try_start_controller(
                     shell_packages: None,
                     terminal: Box::new(kr_controller::supervision::NoTerminal),
                 },
+                clocks.clone(),
                 Arc::clone(&timer) as Arc<dyn Timer>,
             ),
         )
@@ -4785,14 +4821,39 @@ fn archive_two() -> ArchiveId {
 
 /// A host with no setup, no enrolment and backup storage off, and a closed session to back up.
 async fn a_host_to_set_up(timer: &Arc<HeldTimer>) -> (Rig, kr_protocol::ids::SessionId) {
+    a_host_to_set_up_on(timer, Clocks::system()).await
+}
+
+/// As [`a_host_to_set_up`], on a continuous clock the test moves by hand, which it is given beside
+/// the host.
+async fn a_host_to_set_up_on_a_clock(
+    timer: &Arc<HeldTimer>,
+) -> (Rig, kr_protocol::ids::SessionId, ManualClock) {
+    let clock = ManualClock::new();
+    let (rig, session) = a_host_to_set_up_on(
+        timer,
+        Clocks {
+            continuous: Arc::new(clock.clone()),
+            wall: WallClock::system(),
+        },
+    )
+    .await;
+    (rig, session, clock)
+}
+
+async fn a_host_to_set_up_on(
+    timer: &Arc<HeldTimer>,
+    clocks: Clocks,
+) -> (Rig, kr_protocol::ids::SessionId) {
     let mut closed = None;
-    let rig = Rig::start_with(
+    let rig = Rig::start_on(
         Arrangement {
             enrolled: false,
             backup_on: false,
             ..Arrangement::NORMAL
         },
         Arc::clone(timer),
+        clocks,
         |host| closed = Some(closed_session(host, b"a line\r\n", 9_000)),
     )
     .await;
@@ -5745,6 +5806,215 @@ async fn a_fence_owed_while_the_call_waits_for_its_token_stops_the_bundle_write(
     assert_eq!(web.requests_to(SYNC), 0, "the bundle was not written");
     assert_eq!(web.requests_to(MANIFEST), 0, "the writer was not enrolled");
     assert!(rig.controller.backup().setup().expect("a read").is_none());
+}
+
+/// KR-REQ-09.09: a fence this host comes to owe while a call waits for another stops it before it
+/// sends anything. The calls reach the service one at a time, so the second is admitted, waits
+/// behind the first and has its turn after a fence it was not admitted under: its bundle is not
+/// written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_owed_while_a_call_waits_for_another_stops_it_before_it_sends_anything() {
+    let timer = HeldTimer::held();
+    let (rig, _) = a_host_to_set_up(&timer).await;
+    let web = Arc::clone(rig.served.web());
+    let first = rig.prepared_setup(archive_id(), false);
+    let second = rig.prepared_setup(archive_two(), false);
+    web.fail(SYNC, 1, Moment::Slow);
+    let earlier = rig.enable_outcome_in_the_background(&first.params);
+    within("the first call's bundle write", web.requests_reach(SYNC, 1)).await;
+    let later = rig.enable_outcome_in_the_background(&second.params);
+    within("both calls are told", async {
+        loop {
+            if let BackupSetupState::InProgress { kit_fingerprints } =
+                rig.backup_status().await.setup
+                && kit_fingerprints.len() == 2
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    rig.controller.hold_fence(true);
+    web.release_held();
+    for call in [earlier, later] {
+        let refusal = call
+            .await
+            .expect("the call ends")
+            .expect_err("a call is refused while a fence is owed");
+        assert_eq!(refusal.code, ErrorCode::PermissionDenied);
+        assert!(refusal.message.contains("fence"), "{}", refusal.message);
+    }
+    assert_eq!(
+        web.requests_to(SYNC),
+        1,
+        "only the first call wrote its bundle"
+    );
+    assert_eq!(web.requests_to(MANIFEST), 0, "no writer was enrolled");
+    assert!(rig.controller.backup().setup().expect("a read").is_none());
+}
+
+/// KR-REQ-09.09: a deadline that passes while the call waits on the service stops the request that
+/// follows and the record. The deadline is the one the call was admitted under, on the clock the
+/// daemon decides it on, and the requests of a slow service are what it runs out in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deadline_that_passes_while_the_call_waits_on_the_service_stops_what_follows() {
+    // During the bundle write: the enrolment does not leave.
+    let (rig, _, clock) = a_host_to_set_up_on_a_clock(&HeldTimer::held()).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+    web.fail(SYNC, 1, Moment::Slow);
+    let call = rig.enable_outcome_in_the_background(&made.params);
+    within("the bundle write", web.requests_reach(SYNC, 1)).await;
+    clock.advance(Duration::from_millis(
+        kr_protocol::limits::DEFAULT_MUTATION_TTL.get() + 1_000,
+    ));
+    web.release_held();
+    let refusal = call
+        .await
+        .expect("the call ends")
+        .expect_err("a call whose deadline has passed is refused");
+    assert!(refusal.message.contains("deadline"), "{}", refusal.message);
+    assert_eq!(web.requests_to(MANIFEST), 0, "the writer was not enrolled");
+    assert!(rig.controller.backup().setup().expect("a read").is_none());
+
+    // During the last request: the setup is not recorded.
+    let (rig, _, clock) = a_host_to_set_up_on_a_clock(&HeldTimer::held()).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+    web.fail(RETENTION, 1, Moment::Slow);
+    let call = rig.enable_outcome_in_the_background(&made.params);
+    within("the retention change", web.requests_reach(RETENTION, 1)).await;
+    clock.advance(Duration::from_millis(
+        kr_protocol::limits::DEFAULT_MUTATION_TTL.get() + 1_000,
+    ));
+    web.release_held();
+    let refusal = call
+        .await
+        .expect("the call ends")
+        .expect_err("a call whose deadline has passed is refused");
+    assert!(refusal.message.contains("deadline"), "{}", refusal.message);
+    assert!(
+        rig.controller.backup().setup().expect("a read").is_none(),
+        "nothing was recorded"
+    );
+
+    // The control: the same call made again, with a deadline that stands, records the setup.
+    assert!(matches!(
+        rig.enable(&made.params).await,
+        BackupEnableResult::Enabled { .. }
+    ));
+}
+
+/// KR-REQ-09.09: a registration withdrawn while the call waits on the service stops the request
+/// that follows and the record. The authority the call was admitted under is the host's, and it is
+/// withdrawn as the host withdraws it, which takes the connection's registration with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_registration_withdrawn_while_the_call_waits_on_the_service_stops_what_follows() {
+    // During the bundle write: the enrolment does not leave.
+    let (rig, _) = a_host_to_set_up(&HeldTimer::held()).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+    web.fail(SYNC, 1, Moment::Slow);
+    let call = rig.enable_outcome_in_the_background(&made.params);
+    within("the bundle write", web.requests_reach(SYNC, 1)).await;
+    rig.controller
+        .revoke_authority()
+        .await
+        .expect("the authority is withdrawn");
+    web.release_held();
+    let refusal = call
+        .await
+        .expect("the call ends")
+        .expect_err("a call whose registration is gone is refused");
+    assert!(refusal.message.contains("withdrawn"), "{}", refusal.message);
+    assert_eq!(web.requests_to(MANIFEST), 0, "the writer was not enrolled");
+    assert!(rig.controller.backup().setup().expect("a read").is_none());
+
+    // During the last request: the setup is not recorded.
+    let (rig, _) = a_host_to_set_up(&HeldTimer::held()).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+    web.fail(RETENTION, 1, Moment::Slow);
+    let call = rig.enable_outcome_in_the_background(&made.params);
+    within("the retention change", web.requests_reach(RETENTION, 1)).await;
+    rig.controller
+        .revoke_authority()
+        .await
+        .expect("the authority is withdrawn");
+    web.release_held();
+    let refusal = call
+        .await
+        .expect("the call ends")
+        .expect_err("a call whose registration is gone is refused");
+    assert!(refusal.message.contains("withdrawn"), "{}", refusal.message);
+    assert!(
+        rig.controller.backup().setup().expect("a read").is_none(),
+        "nothing was recorded"
+    );
+
+    // The control: the same call on a connection of the authority now in force records the setup.
+    assert!(matches!(
+        rig.enable(&made.params).await,
+        BackupEnableResult::Enabled { .. }
+    ));
+}
+
+/// KR-REQ-09.09: a repeat of a call that finished is answered from the setup it recorded, to a
+/// caller whose registration stands. A fence this host comes to owe after the repeat was admitted
+/// and before it is answered stops the answer, as it stops a call that has something to do. The
+/// repeat waits behind a call of another kit, which the fence ends; the control is the same repeat
+/// made again with the fence let go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeat_answered_from_the_recorded_setup_is_refused_when_a_fence_lands_before_it_is_answered()
+ {
+    let timer = HeldTimer::held();
+    let (rig, _) = a_host_to_set_up(&timer).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+    assert!(matches!(
+        rig.enable(&made.params).await,
+        BackupEnableResult::Enabled { .. }
+    ));
+
+    // A replacement holds the service's turn at its bundle write; the repeat is admitted behind it.
+    let replacement = rig.prepared_setup(archive_two(), true);
+    web.fail(SYNC, 1, Moment::Slow);
+    let holding = rig.enable_outcome_in_the_background(&replacement.params);
+    within(
+        "the replacement's bundle write",
+        web.requests_reach(SYNC, 2),
+    )
+    .await;
+    let repeat = rig.enable_outcome_in_the_background(&made.params);
+    within("both calls are told", async {
+        loop {
+            if let BackupSetupState::InProgress { kit_fingerprints } =
+                rig.backup_status().await.setup
+                && kit_fingerprints.len() == 2
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    rig.controller.hold_fence(true);
+    web.release_held();
+    for call in [holding, repeat] {
+        let refusal = call
+            .await
+            .expect("the call ends")
+            .expect_err("a call is refused while a fence is owed");
+        assert_eq!(refusal.code, ErrorCode::PermissionDenied);
+        assert!(refusal.message.contains("fence"), "{}", refusal.message);
+    }
+
+    rig.controller.hold_fence(false);
+    assert!(matches!(
+        rig.enable(&made.params).await,
+        BackupEnableResult::Enabled { .. }
+    ));
 }
 
 /// `backup.status` says why a setup that is recorded cannot make backups: the account signed in is
