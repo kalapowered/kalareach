@@ -251,12 +251,17 @@ mod tests {
             named_shell(this_program.to_str().expect("text")),
             this_program.to_str().map(str::to_owned)
         );
-        let name = this_program
-            .file_name()
-            .expect("a name")
-            .to_str()
-            .expect("text");
-        assert_eq!(named_shell(name), None, "a bare name");
+        // Cargo runs a crate's unit cases in the crate's directory, where its manifest is a file
+        // a relative name reaches.
+        assert!(
+            Path::new("Cargo.toml").is_file(),
+            "the case needs a file the current directory holds"
+        );
+        assert_eq!(
+            named_shell("Cargo.toml"),
+            None,
+            "a relative name for a file that is there"
+        );
         assert_eq!(named_shell(""), None, "nothing");
         assert_eq!(
             named_shell(
