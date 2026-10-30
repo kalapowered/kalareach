@@ -1156,6 +1156,75 @@ fn install_step() -> &'static str {
     }
 }
 
+/// Puts a `git` that is the script `body` on `search`.
+#[cfg(unix)]
+fn stand_in(search: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let program = search.join("git");
+    let _ = std::fs::remove_file(&program);
+    std::fs::write(&program, format!("#!/bin/sh\n{body}\n")).expect("the stand-in for Git");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+        .expect("the stand-in can run");
+}
+
+/// How many lines a file holds, none when there is no such file yet.
+#[cfg(unix)]
+fn lines_in(path: &Path) -> usize {
+    std::fs::read_to_string(path).map_or(0, |text| text.lines().count())
+}
+
+/// Places the daemon program on the internal disk, started once where nothing is timed.
+#[cfg(unix)]
+fn placed_daemon(host: &teardown::Tree) -> PathBuf {
+    let program = host.root().join("kr-controller");
+    kr_ipc::testing::place_and_start_once(
+        std::path::Path::new(env!("CARGO_BIN_EXE_kr-controller")),
+        &program,
+        &["--version"],
+    );
+    program
+}
+
+/// Connects to the daemon on `endpoint`.
+#[cfg(unix)]
+async fn connect(endpoint: &kr_ipc::paths::Endpoint) -> LocalClient {
+    LocalClient::connect(endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects to the daemon this test started")
+}
+
+/// `project.list`, which needs no Git.
+#[cfg(unix)]
+async fn listed_projects(
+    control: &mut LocalClient,
+    environment_id: EnvironmentId,
+) -> ProjectListResult {
+    typed(
+        &control
+            .request(Method::ProjectList, &ProjectListParams { environment_id })
+            .await
+            .expect("the call reaches the daemon")
+            .expect("project.list succeeds"),
+    )
+}
+
+/// A `project.init` in a directory of the person's, under an action of its own.
+#[cfg(unix)]
+fn init_params(environment_id: EnvironmentId, parent: &Path, name: &str) -> ProjectInitParams {
+    ProjectInitParams {
+        destination: DestinationRequest {
+            environment_id,
+            parent: kr_protocol::project::DestinationParent::Host {
+                path: parent.display().to_string(),
+            },
+            name: name.to_owned(),
+        },
+        label: name.to_owned(),
+        initial_branch: Nullable::some("main".to_owned()),
+    }
+}
+
 /// A host without a working Git starts its daemon, answers what needs no Git, and refuses what
 /// runs it with the step that installs it, leaving nothing behind.
 ///
@@ -1165,44 +1234,30 @@ fn install_step() -> &'static str {
 /// are absent, printing a note and ending with status 1, and `None` is a search path with no `git`.
 #[cfg(unix)]
 async fn a_daemon_on_a_host_without_a_working_git(script: Option<&str>) {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let host = teardown::Tree::create();
     let environment = host.environment();
     let environment_id = host.environment_id();
     let search = host.root().join("search");
     std::fs::create_dir(&search).expect("a search path of this test's own");
     if let Some(script) = script {
-        let stand_in = search.join("git");
-        std::fs::write(&stand_in, script).expect("the stand-in for Git");
-        std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755))
-            .expect("the stand-in can run");
+        stand_in(&search, script);
     }
-    let program = host.root().join("kr-controller");
-    kr_ipc::testing::place_and_start_once(
-        std::path::Path::new(env!("CARGO_BIN_EXE_kr-controller")),
-        &program,
-        &["--version"],
-    );
+    let program = placed_daemon(&host);
     let endpoint = environment.controller_endpoint().expect("an endpoint");
     let work = PrivateTempDir::create();
 
     let log = host.root().join("daemon.log");
     let _daemon = start_daemon(&program, &host, Some(&search));
     wait_for_daemon(&endpoint, &log).await;
-    let mut control = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
-        .await
-        .expect("connects to the daemon this test started");
+    let mut control = connect(&endpoint).await;
 
     // What the journal records is answered, because it needs no Git.
-    let listed: ProjectListResult = typed(
-        &control
-            .request(Method::ProjectList, &ProjectListParams { environment_id })
+    assert!(
+        listed_projects(&mut control, environment_id)
             .await
-            .expect("the call reaches the daemon")
-            .expect("project.list succeeds"),
+            .projects
+            .is_empty()
     );
-    assert!(listed.projects.is_empty());
 
     // What runs Git is refused with the code a host that is not set up for it answers with, and
     // the message names the step that installs it.
@@ -1213,17 +1268,7 @@ async fn a_daemon_on_a_host_without_a_working_git(script: Option<&str>) {
                 Method::ProjectInit,
                 refused,
                 ActionTarget::environment(environment_id),
-                &ProjectInitParams {
-                    destination: DestinationRequest {
-                        environment_id,
-                        parent: kr_protocol::project::DestinationParent::Host {
-                            path: work.path().display().to_string(),
-                        },
-                        name: "fresh".to_owned(),
-                    },
-                    label: "fresh".to_owned(),
-                    initial_branch: Nullable::some("main".to_owned()),
-                },
+                &init_params(environment_id, work.path(), "fresh"),
             )
             .await
             .expect("the call reaches the daemon"),
@@ -1252,15 +1297,11 @@ async fn a_daemon_on_a_host_without_a_working_git(script: Option<&str>) {
             .expect("the call reaches the daemon"),
     );
     assert_eq!(unrecorded.code, ErrorCode::ResourceUnavailable);
-    let listed: ProjectListResult = typed(
-        &control
-            .request(Method::ProjectList, &ProjectListParams { environment_id })
-            .await
-            .expect("the call reaches the daemon")
-            .expect("project.list succeeds"),
-    );
     assert!(
-        listed.projects.is_empty(),
+        listed_projects(&mut control, environment_id)
+            .await
+            .projects
+            .is_empty(),
         "no repository was recorded for a creation that was refused"
     );
 }
@@ -1271,7 +1312,7 @@ async fn a_daemon_on_a_host_without_a_working_git(script: Option<&str>) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_daemon_starts_where_git_exits_with_status_one() {
     a_daemon_on_a_host_without_a_working_git(Some(
-        "#!/bin/sh\necho 'xcode-select: note: No developer tools were found.' >&2\nexit 1\n",
+        "echo 'xcode-select: note: No developer tools were found.' >&2\nexit 1",
     ))
     .await;
 }
@@ -1281,6 +1322,119 @@ async fn a_daemon_starts_where_git_exits_with_status_one() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_daemon_starts_where_there_is_no_git() {
     a_daemon_on_a_host_without_a_working_git(None).await;
+}
+
+/// A Git that never answers holds nothing else: the daemon starts and answers, a request that
+/// needs Git is refused when Git has had the time it is given, and the daemon ends when it is
+/// interrupted instead of waiting for Git.
+///
+/// The stand-in waits for much longer than a daemon gives Git, and writes a mark if it is ever
+/// allowed to finish.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_whose_git_never_answers_answers_refuses_and_ends_when_interrupted() {
+    let host = teardown::Tree::create();
+    let environment = host.environment();
+    let environment_id = host.environment_id();
+    let search = host.root().join("search");
+    std::fs::create_dir(&search).expect("a search path of this test's own");
+    let (started, finished) = (host.root().join("started"), host.root().join("finished"));
+    stand_in(
+        &search,
+        &format!(
+            "echo started >> '{}'\nsleep 300\n: > '{}'",
+            started.display(),
+            finished.display()
+        ),
+    );
+    let program = placed_daemon(&host);
+    let endpoint = environment.controller_endpoint().expect("an endpoint");
+    let work = PrivateTempDir::create();
+    // Longer than a daemon gives Git to answer, so a request that is not refused is a hang.
+    let guard = 3 * kr_project::git::PROBE_BOUND;
+
+    let log = host.root().join("daemon.log");
+    let mut daemon = start_daemon(&program, &host, Some(&search));
+    wait_for_daemon(&endpoint, &log).await;
+    let mut control = connect(&endpoint).await;
+    assert!(
+        listed_projects(&mut control, environment_id)
+            .await
+            .projects
+            .is_empty()
+    );
+
+    // A request that needs Git, while the stand-in is under way, and another connection's answer
+    // to a request that does not.
+    let before = lines_in(&started);
+    let mut asking = connect(&endpoint).await;
+    let first = tokio::spawn({
+        let params = init_params(environment_id, work.path(), "first");
+        async move {
+            asking
+                .mutate(
+                    Method::ProjectInit,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    ActionTarget::environment(environment_id),
+                    &params,
+                )
+                .await
+        }
+    });
+    wait_until("the stand-in is asked for the request", || {
+        lines_in(&started) > before
+    })
+    .await;
+    assert!(
+        listed_projects(&mut control, environment_id)
+            .await
+            .projects
+            .is_empty(),
+        "the daemon answers while Git is being waited for"
+    );
+    let refusal = failure(
+        tokio::time::timeout(guard, first)
+            .await
+            .expect("the request is refused rather than waited on for ever")
+            .expect("the request task ends")
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(refusal.code, ErrorCode::HostNotConfigured, "{refusal:?}");
+    assert!(
+        refusal.message.contains("did not answer"),
+        "the refusal says why: {}",
+        refusal.message
+    );
+    assert_eq!(names_in(work.path()), Vec::<String>::new());
+
+    // A later request is refused the same way, and the daemon is interrupted while it waits.
+    let before = lines_in(&started);
+    let mut asking = connect(&endpoint).await;
+    let later = tokio::spawn({
+        let params = init_params(environment_id, work.path(), "later");
+        async move {
+            asking
+                .mutate(
+                    Method::ProjectInit,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    ActionTarget::environment(environment_id),
+                    &params,
+                )
+                .await
+        }
+    });
+    wait_until("the stand-in is asked for the later request", || {
+        lines_in(&started) > before
+    })
+    .await;
+    daemon
+        .interrupt()
+        .unwrap_or_else(|error| panic!("the daemon ends when it is interrupted: {error}"));
+    later.abort();
+    assert!(
+        !finished.exists(),
+        "the stand-in was ended by the daemon and never finished by itself"
+    );
 }
 
 /// How long a killed daemon is given to be collected.
@@ -1328,6 +1482,54 @@ impl Daemon {
             self.child = None;
         }
         ended
+    }
+
+    /// Interrupts it, as a person at its terminal does, and waits for it to end by itself.
+    ///
+    /// A daemon that is waiting on something it should not wait on is the one that does not end,
+    /// and the wait is the bound this test gives a daemon to be collected.
+    fn interrupt(&mut self) -> Result<(), String> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(());
+        };
+        let signalled = std::process::Command::new("kill")
+            .arg("-INT")
+            .arg(child.id().to_string())
+            .status()
+            .map_err(|error| format!("the daemon could not be signalled: {error}"))?;
+        if !signalled.success() {
+            return Err(format!("the daemon could not be signalled: {signalled}"));
+        }
+        let deadline = std::time::Instant::now() + COLLECT_BOUND;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    self.child = None;
+                    return Ok(());
+                }
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    return Err(format!(
+                        "the daemon had not ended {COLLECT_BOUND:?} after it was interrupted"
+                    ));
+                }
+                Err(error) => {
+                    return Err(format!("the daemon could not be waited for: {error}"));
+                }
+            }
+        }
+    }
+}
+
+/// Waits until `condition` holds, for no longer than a guard that only a hang reaches.
+#[cfg(unix)]
+async fn wait_until(what: &str, condition: impl Fn() -> bool) {
+    let guard = std::time::Instant::now() + COLLECT_BOUND;
+    while !condition() {
+        assert!(std::time::Instant::now() < guard, "{what}");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 }
 
