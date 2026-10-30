@@ -1541,16 +1541,8 @@ fn finish_revocation(
         ),
     });
     if json {
-        let document = Document::new()
-            .with("grant_id", closed(&grant_id))
-            .with("authority_revision", closed(&revoked.authority_revision))
-            .with("revoked_grants", closed(&revoked.revoked_grants))
-            .with(
-                "revoked_grants_total",
-                closed(&revoked.revoked_grants_total),
-            )
-            .with("barrier_holds", revoked.barrier.holds())
-            .with("ok", true);
+        let mut document = Document::new().with("grant_id", closed(&grant_id));
+        document.merge(crate::device::revocation_document(revoked));
         match &error {
             None => output::document(&document),
             Some(error) => output::document(&report::with_failure(document, error)),
@@ -1564,10 +1556,12 @@ fn finish_revocation(
     Ok(error.map_or(Completion::Done, Completion::Reported))
 }
 
-/// What a revocation did, as lines for a person.
+/// What a revocation did, as lines for a person: the grants it took, and how far each affected
+/// session's worker has got in fencing it. A revocation some worker has not fenced is said to be
+/// pending, not done.
 fn revocation_lines(grant_id: GrantId, revoked: &RevocationResult) -> Vec<Line> {
     let grants = usize::try_from(revoked.revoked_grants_total.get()).unwrap_or(usize::MAX);
-    let mut lines = vec![if revoked.barrier.holds() {
+    let first = if revoked.barrier.holds() {
         stdout_line!(
             "Revoked grant {} and {} grant{} in all, at authority revision {}. What the device \
              already saw stays with it.",
@@ -1585,17 +1579,8 @@ fn revocation_lines(grant_id: GrantId, revoked: &RevocationResult) -> Vec<Line> 
             grants,
             if grants == 1 { "" } else { "s" }
         )
-    }];
-    for worker in &revoked.barrier.workers {
-        if !worker.state.holds() {
-            lines.push(stdout_line!(
-                "  session {}: {}",
-                worker.session_id,
-                worker.state.as_str()
-            ));
-        }
-    }
-    lines
+    };
+    crate::device::barrier_lines(first, &revoked.barrier)
 }
 
 // ---------------------------------------------------------------------------------------------

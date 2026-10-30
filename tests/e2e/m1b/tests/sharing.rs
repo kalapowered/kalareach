@@ -522,6 +522,26 @@ fn a_revocation_a_session_worker_has_not_fenced_is_pending_in_kr_and_complete_on
         "the worker that has not fenced it is named with its state: {said}"
     );
 
+    // For a script the same answer names each affected worker with its state, and is not a success.
+    let scripted = host.kr(&["share", "revoke", &grant_id, "--json"]);
+    assert!(
+        !scripted.status.success(),
+        "a pending revocation is not a success"
+    );
+    let pending_document: serde_json::Value = serde_json::from_slice(&scripted.stdout)
+        .unwrap_or_else(|why| panic!("no document ({why}): {:?}", scripted.stdout));
+    assert_eq!(pending_document["ok"], false, "{pending_document}");
+    let workers = pending_document["barrier"]["workers"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no list of workers: {pending_document}"));
+    assert_eq!(workers.len(), 1, "{pending_document}");
+    assert_eq!(workers[0]["session_id"], session_id.to_string().as_str());
+    assert_eq!(workers[0]["state"], "pending", "{pending_document}");
+    assert!(
+        counter(&pending_document["barrier"]["authority_revision"]) > before,
+        "the document states the revision the revocation took: {pending_document}"
+    );
+
     // The worker answers again, and the same command now completes.
     drop(stopped);
     let started = std::time::Instant::now();
@@ -539,7 +559,16 @@ fn a_revocation_a_session_worker_has_not_fenced_is_pending_in_kr_and_complete_on
         );
     };
     assert_eq!(revoked["ok"], true, "{revoked}");
-    assert_eq!(revoked["barrier_holds"], true, "{revoked}");
+    let fenced = revoked["barrier"]["workers"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no list of workers: {revoked}"));
+    assert!(
+        !fenced.is_empty()
+            && fenced
+                .iter()
+                .all(|worker| worker["state"] == "acknowledged" || worker["state"] == "ended"),
+        "every worker's barrier holds: {revoked}"
+    );
     assert!(
         counter(&revoked["authority_revision"]) >= stated,
         "the completed revocation states the revision: {revoked}"
@@ -936,6 +965,81 @@ fn an_invitation_from_kr_carries_the_role_the_person_named_and_each_option() {
         let withdrawn = host.kr(&["share", "revoke", &grant_id, "--json"]);
         assert!(withdrawn.status.success(), "{role}: the withdrawal");
     }
+
+    guest.close();
+    owner.close();
+    runtime.block_on(guest_device.close());
+    runtime.block_on(owner_device.close());
+    host.stop()
+        .unwrap_or_else(|problem| panic!("the host did not stop cleanly: {problem}"));
+    run.closing_check()
+        .unwrap_or_else(|left| panic!("the leg left processes running: {left}"));
+}
+
+/// KR-REQ-18.14, from `kr`: the owner withdraws an invitation nobody has accepted. The command
+/// states the authority revision the host holds and that every affected worker's barrier holds;
+/// `kr share list` shows the share revoked; the device is no longer offered it, and accepting it
+/// afterwards is refused and gives the device no share.
+#[test]
+fn an_invitation_nobody_accepted_is_withdrawn_from_kr_and_is_refused_when_accepted_after() {
+    let runtime = runtime();
+    let run = Run::start("sharing-withdraw");
+    let host = Host::start(&run, &HostOptions::default());
+    let owner_device = runtime.block_on(Device::create("owner", &run.root().join("o")));
+    let (_, owner) = ceremony::pair_first_owner(&host, &owner_device, &runtime);
+    let (_, display) = new_session(&host);
+    let guest_device = runtime.block_on(Device::create("guest", &run.root().join("g")));
+    let (guest_paired, guest) = ceremony::pair_guest(&host, &owner, &guest_device, &runtime, "60");
+    let device_id = guest_paired.device_id.to_string();
+
+    let issued = host.kr_json(&["share", "invite", &display, "--to", &device_id, "--yes"]);
+    let grant_id = issued["grant_id"].as_str().expect("a grant").to_owned();
+    let offer = held(&runtime, &guest).offers.remove(0);
+
+    let withdrawn = host.kr_json(&["share", "revoke", &grant_id]);
+    assert_eq!(withdrawn["ok"], true, "{withdrawn}");
+    assert_eq!(
+        counter(&withdrawn["authority_revision"]),
+        counter(&host.kr_json(&["device", "list"])["authority_revision"]),
+        "the command states the revision the host holds: {withdrawn}"
+    );
+    let workers = withdrawn["barrier"]["workers"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no list of workers: {withdrawn}"));
+    assert!(
+        workers
+            .iter()
+            .all(|worker| worker["state"] == "acknowledged" || worker["state"] == "ended"),
+        "no worker owes a fence: {withdrawn}"
+    );
+
+    let listed = host.kr_json(&["share", "list", &display, "--all"]);
+    let share = listed["grants"]
+        .as_array()
+        .expect("grants")
+        .iter()
+        .find(|share| share["grant_id"] == grant_id.as_str())
+        .unwrap_or_else(|| panic!("the withdrawn share is listed: {listed}"));
+    assert_eq!(share["state"], "revoked", "{share}");
+
+    assert!(
+        held(&runtime, &guest).offers.is_empty(),
+        "no longer offered"
+    );
+    let accepted: Result<GrantRedeemResult, _> = runtime.block_on(guest.mutate_environment(
+        Method::GrantRedeem,
+        &GrantRedeemParams {
+            invitation_id: offer.invitation_id,
+        },
+    ));
+    assert_eq!(
+        refused_with(accepted, "the acceptance of a withdrawn invitation"),
+        ErrorCode::PermissionDenied
+    );
+    assert!(
+        held(&runtime, &guest).shares.is_empty(),
+        "and gives no share"
+    );
 
     guest.close();
     owner.close();

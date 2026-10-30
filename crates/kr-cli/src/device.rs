@@ -208,6 +208,85 @@ fn list_document(listed: &DeviceListResult) -> Document {
         .with("ok", true)
 }
 
+/// A revocation's barrier, for a script: the revision it installs and, for each affected worker,
+/// its session, how far it has got, and the actions it fenced or could not show were fenced.
+pub(crate) fn barrier_document(barrier: &kr_protocol::action::RevocationBarrier) -> Document {
+    Document::new()
+        .with("authority_revision", closed(&barrier.authority_revision))
+        .with("workers_total", closed(&barrier.workers_total))
+        .with(
+            "workers",
+            barrier
+                .workers
+                .iter()
+                .map(|worker| {
+                    Document::new()
+                        .with("session_id", closed(&worker.session_id))
+                        .with("state", closed(&worker.state))
+                        .with(
+                            "acknowledged_revision",
+                            closed(&worker.acknowledged_revision),
+                        )
+                        .with(
+                            "rejected_actions",
+                            worker
+                                .rejected_actions
+                                .iter()
+                                .map(|action| {
+                                    Document::new()
+                                        .with(
+                                            "actor_id",
+                                            Asked::text(
+                                                Request::Devices,
+                                                &action.actor_id.to_string(),
+                                            ),
+                                        )
+                                        .with("action_id", closed(&action.action_id))
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                        .with(
+                            "possibly_executed",
+                            worker
+                                .possibly_executed
+                                .iter()
+                                .map(|action| {
+                                    Document::new()
+                                        .with("action_id", closed(&action.action_id))
+                                        .with(
+                                            "actor_id",
+                                            Asked::text(
+                                                Request::Devices,
+                                                &action.actor_id.to_string(),
+                                            ),
+                                        )
+                                        .with(
+                                            "method",
+                                            Asked::text(Request::Devices, action.method.as_str()),
+                                        )
+                                        .with("state", closed(&action.state))
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                        .with(
+                            "rejected_actions_total",
+                            closed(&worker.rejected_actions_total),
+                        )
+                        .with(
+                            "possibly_executed_total",
+                            closed(&worker.possibly_executed_total),
+                        )
+                        .with("omitted_actions", closed(&worker.omitted_actions))
+                        .with("names_pending", closed(&worker.names_pending))
+                        .with(
+                            "detail",
+                            crate::shown::exported("WorkerBarrier", "detail", &worker.detail),
+                        )
+                })
+                .collect::<Vec<_>>(),
+        )
+}
+
 /// A revocation, for a script, in the shape the protocol answers it: the actors and the methods of
 /// the actions it names are what the host recorded for the person revoking, and a worker's detail
 /// is the host's sentence, said as its class and length.
@@ -219,94 +298,7 @@ pub(crate) fn revocation_document(revoked: &RevocationResult) -> Document {
             "revoked_grants_total",
             closed(&revoked.revoked_grants_total),
         )
-        .with(
-            "barrier",
-            Document::new()
-                .with(
-                    "authority_revision",
-                    closed(&revoked.barrier.authority_revision),
-                )
-                .with("workers_total", closed(&revoked.barrier.workers_total))
-                .with(
-                    "workers",
-                    revoked
-                        .barrier
-                        .workers
-                        .iter()
-                        .map(|worker| {
-                            Document::new()
-                                .with("session_id", closed(&worker.session_id))
-                                .with("state", closed(&worker.state))
-                                .with(
-                                    "acknowledged_revision",
-                                    closed(&worker.acknowledged_revision),
-                                )
-                                .with(
-                                    "rejected_actions",
-                                    worker
-                                        .rejected_actions
-                                        .iter()
-                                        .map(|action| {
-                                            Document::new()
-                                                .with(
-                                                    "actor_id",
-                                                    Asked::text(
-                                                        Request::Devices,
-                                                        &action.actor_id.to_string(),
-                                                    ),
-                                                )
-                                                .with("action_id", closed(&action.action_id))
-                                        })
-                                        .collect::<Vec<_>>(),
-                                )
-                                .with(
-                                    "possibly_executed",
-                                    worker
-                                        .possibly_executed
-                                        .iter()
-                                        .map(|action| {
-                                            Document::new()
-                                                .with("action_id", closed(&action.action_id))
-                                                .with(
-                                                    "actor_id",
-                                                    Asked::text(
-                                                        Request::Devices,
-                                                        &action.actor_id.to_string(),
-                                                    ),
-                                                )
-                                                .with(
-                                                    "method",
-                                                    Asked::text(
-                                                        Request::Devices,
-                                                        action.method.as_str(),
-                                                    ),
-                                                )
-                                                .with("state", closed(&action.state))
-                                        })
-                                        .collect::<Vec<_>>(),
-                                )
-                                .with(
-                                    "rejected_actions_total",
-                                    closed(&worker.rejected_actions_total),
-                                )
-                                .with(
-                                    "possibly_executed_total",
-                                    closed(&worker.possibly_executed_total),
-                                )
-                                .with("omitted_actions", closed(&worker.omitted_actions))
-                                .with("names_pending", closed(&worker.names_pending))
-                                .with(
-                                    "detail",
-                                    crate::shown::exported(
-                                        "WorkerBarrier",
-                                        "detail",
-                                        &worker.detail,
-                                    ),
-                                )
-                        })
-                        .collect::<Vec<_>>(),
-                ),
-        )
+        .with("barrier", barrier_document(&revoked.barrier))
         .with("ok", true)
 }
 
