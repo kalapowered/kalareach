@@ -736,11 +736,9 @@ pub(crate) trait ConsoleInput {
     /// Reads the key records the console has, as the runs they came in.
     fn keys(&mut self) -> Result<Vec<Vec<kr_term::win32::KeyRecord>>>;
 
-    /// Reads the bytes the console hands over, waiting for at least one.
+    /// Reads the bytes the console has spelled, without waiting for more, and returns how many it
+    /// put in `buffer`: none when what the console holds is no byte, which it then takes off.
     fn bytes(&mut self, buffer: &mut [u8]) -> std::io::Result<usize>;
-
-    /// Whether the stop has been made.
-    fn stopped(&self) -> bool;
 }
 
 /// Starts the thread that reads `console`, and links it to `switch`.
@@ -773,7 +771,9 @@ fn start_reader<C: ConsoleInput + Send + 'static>(
 ///
 /// The console is read as records until the switch asks. The thread then asks the console to spell
 /// its keys, between two reads, and reads its bytes from then on as they come, none of them turned
-/// into anything. A console that would not spell its keys goes on being read as records.
+/// into anything. A console that would not spell its keys goes on being read as records. The thread
+/// is only ever waiting for the console and for the stop together, and reads the console only when
+/// it has something to give, so the stop never has to cancel a read.
 #[cfg(any(not(unix), test))]
 fn read_console(
     console: &mut impl ConsoleInput,
@@ -783,14 +783,9 @@ fn read_console(
     let mut buffer = vec![0_u8; 8 * 1024];
     let mut spelled = false;
     loop {
-        if spelled {
-            // Looked at before every read: a stop that came between two reads cancelled nothing,
-            // and this is what ends the thread then.
-            if console.stopped() {
-                return;
-            }
-            match console.bytes(&mut buffer) {
-                Ok(0) => return,
+        match console.wait() {
+            Ok(Woken::Console) if spelled => match console.bytes(&mut buffer) {
+                Ok(0) => {}
                 Ok(read) => {
                     if sender
                         .send(TerminalInput::Bytes(buffer[..read].to_vec()))
@@ -801,10 +796,7 @@ fn read_console(
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(_) => return,
-            }
-            continue;
-        }
-        match console.wait() {
+            },
             Ok(Woken::Console) => {
                 let Ok(runs) = console.keys() else {
                     return;
@@ -816,7 +808,8 @@ fn read_console(
                 }
             }
             Ok(Woken::Asked) => {
-                let answer = (switching.ask)();
+                // A console that already spells its keys is not asked again.
+                let answer = if spelled { Ok(()) } else { (switching.ask)() };
                 spelled = answer.is_ok();
                 let _ = switching.answers.send(answer);
             }
@@ -1028,11 +1021,13 @@ impl ConsoleInput for WindowsConsole {
     }
 
     fn bytes(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        self.reader.read_bytes(buffer)
-    }
-
-    fn stopped(&self) -> bool {
-        self.stop.is_set()
+        if !self.reader.bytes_waiting()? {
+            return Ok(0);
+        }
+        match self.reader.read_bytes(buffer)? {
+            0 => Err(std::io::ErrorKind::UnexpectedEof.into()),
+            read => Ok(read),
+        }
     }
 }
 
@@ -1112,16 +1107,21 @@ pub struct InputStop {
 
 #[cfg(not(unix))]
 impl InputStop {
-    /// Wakes the thread, which has ended a moment later while it reads records: it is waiting for
-    /// the console and for this together. A thread in a read of the console's bytes, which nothing
-    /// wakes, has that read cancelled, again and again until it has ended or a second has gone: a
-    /// cancel that came between two reads cancelled nothing, and the thread looks at the stop
-    /// before its next one.
+    /// Wakes the thread, which has ended a moment later: it is waiting for the console and for this
+    /// together, and is not part way through a read it cannot leave. A thread that has not ended
+    /// after a tenth of a second is in a read of the console that nothing but a cancel ends, and
+    /// has that read cancelled, again and again until it has ended or a second has gone. The
+    /// console gives the next key to a read that was cancelled, so this is for a thread that would
+    /// otherwise go on taking keys.
     pub fn stop(self) {
         self.stop.signal();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_secs(1);
+        let cancel_from = started + std::time::Duration::from_millis(100);
         while !self.thread.is_finished() && std::time::Instant::now() < deadline {
-            crate::platform::cancel_blocked_read(&self.thread);
+            if std::time::Instant::now() >= cancel_from {
+                crate::platform::cancel_blocked_read(&self.thread);
+            }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
@@ -1385,8 +1385,8 @@ mod reader {
     /// What the thread asked of the console, in order.
     type Steps = Arc<Mutex<Vec<&'static str>>>;
 
-    /// A console that answers a wait with what the case sent it, hands over the key records the case
-    /// scripted, and hands over the bytes the case sends.
+    /// A console that answers a wait with what the case sent it, hands over the key records the
+    /// case scripted, and hands over the bytes the case sends.
     struct Scripted {
         wakes: mpsc::Receiver<Woken>,
         keys: VecDeque<Vec<Vec<KeyRecord>>>,
@@ -1406,15 +1406,11 @@ mod reader {
 
         fn bytes(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
             self.steps.lock().expect("steps").push("bytes");
-            let Ok(chunk) = self.bytes.recv() else {
+            let Ok(chunk) = self.bytes.try_recv() else {
                 return Ok(0);
             };
             buffer[..chunk.len()].copy_from_slice(&chunk);
             Ok(chunk.len())
-        }
-
-        fn stopped(&self) -> bool {
-            false
         }
     }
 
@@ -1481,7 +1477,6 @@ mod reader {
 
         /// Ends the thread, and returns what it asked of the console.
         fn ends(self) -> Vec<&'static str> {
-            drop(self.bytes);
             let _ = self.wakes.send(Woken::Stop);
             self.thread.join().expect("the reader ended");
             self.steps.lock().expect("steps").clone()
@@ -1499,13 +1494,6 @@ mod reader {
         }
     }
 
-    /// What reading the console as records would give once it spells its keys: one character of
-    /// its sequences, and nothing of a NUL or of the keys held down. A reader that read records
-    /// then would hand on this and not what the console spelled.
-    fn the_spelled_keys_as_records() -> Vec<Vec<KeyRecord>> {
-        vec![vec![key(0, u16::from(b'z'), true)]]
-    }
-
     /// The reader asks the console to spell its keys between two of its reads. It has handed on as
     /// records every record it read before, reads no record after, and reads the console's bytes
     /// only once the console has been asked.
@@ -1513,13 +1501,12 @@ mod reader {
     fn the_console_is_asked_between_two_reads_and_its_bytes_are_read_after() {
         let down = key(u16::from(b'A'), u16::from(b'a'), true);
         let up = key(u16::from(b'A'), u16::from(b'a'), false);
+        // What a reader of records would get once the console spells its keys: a character of a
+        // sequence and nothing of a NUL. A reader that kept reading records would hand this on.
+        let records_after = key(0, u16::from(b'z'), true);
         let mut run = Run::start(
             true,
-            vec![
-                vec![vec![down]],
-                vec![vec![up]],
-                the_spelled_keys_as_records(),
-            ],
+            vec![vec![vec![down]], vec![vec![up]], vec![vec![records_after]]],
         );
         run.has_input();
         run.has_input();
@@ -1530,6 +1517,9 @@ mod reader {
         run.bytes.send(b"x".to_vec()).expect("the reader waits");
         run.has_input();
         assert_eq!(run.next(), TerminalInput::Bytes(b"x".to_vec()));
+        run.switch
+            .engage()
+            .expect("a console that spells its keys already is not asked again");
 
         let steps = run.ends();
         let asked = steps.iter().position(|step| *step == "ask").expect("asked");
@@ -1540,20 +1530,29 @@ mod reader {
         );
         assert!(
             steps[asked + 1..].iter().all(|step| *step == "bytes"),
-            "nothing but bytes is read after it: {steps:?}"
+            "nothing but bytes is read after it, and it is asked once: {steps:?}"
         );
     }
 
     /// What the console spells reaches the session as it spelled it: a NUL (Ctrl+Space), a key held
-    /// down (three of the same byte) and a sequence.
+    /// down (the same byte again) and a sequence. A console that has no byte to give hands on
+    /// nothing.
     #[test]
     fn the_bytes_a_console_spells_are_handed_on_as_they_are() {
-        let mut run = Run::start(true, vec![the_spelled_keys_as_records()]);
+        let mut run = Run::start(true, Vec::new());
         run.switch.engage().expect("the console spells its keys");
+        run.has_input();
         let spelled = [0x00, b'a', b'a', b'a', 0x1b, b'[', b'A', 0xc3, 0xa9];
         run.bytes.send(spelled.to_vec()).expect("the reader waits");
         run.has_input();
         assert_eq!(run.next(), TerminalInput::Bytes(spelled.to_vec()));
+        run.bytes.send(b"b".to_vec()).expect("the reader waits");
+        run.has_input();
+        assert_eq!(
+            run.next(),
+            TerminalInput::Bytes(b"b".to_vec()),
+            "nothing was handed on for the input that held no byte"
+        );
         run.ends();
     }
 

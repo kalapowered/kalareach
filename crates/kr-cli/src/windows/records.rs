@@ -20,7 +20,9 @@
 //!
 //! When the session cannot take the records, the console is asked to spell its keys itself, and
 //! from then on its bytes are read as bytes ([`RecordReader::read_bytes`]), exactly as the console
-//! hands them over: a record is never turned into bytes here.
+//! hands them over: a record is never turned into bytes here. A read of the console's bytes waits
+//! until the console has a byte to give, and a thread in it cannot be woken without the console
+//! losing the next key, so [`RecordReader::bytes_waiting`] says first whether there is one.
 
 #![expect(
     unsafe_code,
@@ -36,10 +38,10 @@ use kr_term::win32::{KeyRecord, PairHold};
 use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows_sys::Win32::System::Console::{
     ENABLE_WINDOW_INPUT, GetNumberOfConsoleInputEvents, INPUT_RECORD, KEY_EVENT, MOUSE_EVENT,
-    ReadConsoleInputW, WINDOW_BUFFER_SIZE_EVENT,
+    PeekConsoleInputW, ReadConsoleInputW, WINDOW_BUFFER_SIZE_EVENT,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, INFINITE, ResetEvent, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
+    CreateEventW, INFINITE, ResetEvent, SetEvent, WaitForMultipleObjects,
 };
 
 use crate::attach::Woken;
@@ -92,13 +94,6 @@ impl WakeEvent {
     fn reset(&self) {
         // SAFETY: the handle is this event's own and open for the call.
         let _ = unsafe { ResetEvent(self.0.as_raw_handle() as HANDLE) };
-    }
-
-    /// Whether the event is set now, without waiting.
-    #[must_use]
-    pub fn is_set(&self) -> bool {
-        // SAFETY: the handle is this event's own and open for the call.
-        unsafe { WaitForSingleObject(self.0.as_raw_handle() as HANDLE, 0) == WAIT_OBJECT_0 }
     }
 }
 
@@ -289,15 +284,73 @@ impl RecordReader {
         Ok(out)
     }
 
+    /// Says whether the console holds a key going down, which a read of its bytes answers at once.
+    ///
+    /// A console that spells its keys itself keeps what it has not handed over as records, and a
+    /// read of its bytes passes over the records that are not a key going down (a key coming up, a
+    /// resize, a focus change) and then waits for one that is. This takes the records that come
+    /// before a key going down off the front of the queue only when there is none at all, so that the
+    /// console reports no input until there is some. It must be the only reader of the console.
+    ///
+    /// # Errors
+    ///
+    /// Returns the console's failure.
+    pub fn bytes_waiting(&self) -> std::io::Result<bool> {
+        // SAFETY: an `INPUT_RECORD` is a tagged union of plain integers, and all zeroes is a
+        // record of event type zero, which this never reads as a key event.
+        let mut buffer: [INPUT_RECORD; BATCH] = unsafe { std::mem::zeroed() };
+        let mut peeked = 0_u32;
+        // SAFETY: the handle is this reader's own and open for the call. The buffer is a local this
+        // thread owns and the count it is given is its own length; the number peeked is another
+        // local.
+        let ok = unsafe {
+            PeekConsoleInputW(
+                self.handle.as_raw_handle().cast(),
+                buffer.as_mut_ptr(),
+                u32::try_from(buffer.len()).unwrap_or(1),
+                &raw mut peeked,
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let peeked = usize::try_from(peeked).unwrap_or(0).min(buffer.len());
+        let going_down = buffer[..peeked].iter().any(|record| {
+            // SAFETY: the console reported this record as a key event before the field is read.
+            u32::from(record.EventType) == KEY_EVENT
+                && unsafe { record.Event.KeyEvent.bKeyDown } != 0
+        });
+        if going_down || peeked == 0 {
+            return Ok(going_down);
+        }
+        // None of them is a key going down, so a read of the bytes would pass over every one and
+        // wait. They are taken off, which is all that read would have done with them.
+        let mut taken = 0_u32;
+        // SAFETY: as above; this reads no more records than were peeked, and this thread is the
+        // only reader, so they are there.
+        let ok = unsafe {
+            ReadConsoleInputW(
+                self.handle.as_raw_handle().cast(),
+                buffer.as_mut_ptr(),
+                u32::try_from(peeked).unwrap_or(1),
+                &raw mut taken,
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(false)
+    }
+
     /// Reads the bytes the console hands over, waiting for at least one.
     ///
     /// This is a read of the console as a stream of bytes, for a console that has been asked to
     /// spell its keys itself. It takes what the console gives and changes none of it, a NUL among
-    /// the bytes included.
+    /// the bytes included. Call it only when [`Self::bytes_waiting`] has said there is one.
     ///
     /// # Errors
     ///
-    /// Returns the console's failure, or the end of its input as `Ok(0)`.
+    /// Returns the console's failure.
     pub fn read_bytes(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         self.handle.read(buffer)
     }
