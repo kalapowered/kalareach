@@ -162,11 +162,6 @@ pub struct HeldCredentials {
     changing: Mutex<()>,
     /// The authorisations whose held credential the vault does not have yet.
     unsaved: Mutex<BTreeSet<PushSenderRecordId>>,
-    /// The bearer, for each authorisation, that this host has seen belong to it: its own renewal
-    /// handed it over, or the gateway accounted for a record under it. Only in memory. A bearer a
-    /// device handed over names an authorisation in the device's words, and a host that has just
-    /// started holds what the vault kept; neither is shown until the gateway shows it.
-    shown: Mutex<BTreeMap<PushSenderRecordId, kr_protocol::scalars::SecretBytes32>>,
     /// When each authorisation whose renewal was refused may be asked about again.
     waits: Mutex<BTreeMap<PushSenderRecordId, Refusal>>,
     /// The clock the waits are counted on.
@@ -318,9 +313,6 @@ impl HeldCredentials {
         if let Ok(mut unsaved) = self.unsaved.lock() {
             unsaved.remove(&sender_record_id);
         }
-        if let Ok(mut shown) = self.shown.lock() {
-            shown.remove(&sender_record_id);
-        }
         self.clear_wait(sender_record_id);
         match &self.vault {
             Some(vault) => vault
@@ -328,29 +320,6 @@ impl HeldCredentials {
                 .map_err(|error| error.to_string()),
             None => Ok(()),
         }
-    }
-
-    /// Records that the gateway has shown `credential`'s bearer to be the one its authorisation
-    /// is asked with: it accounted for a record under it, or this host's own renewal, which names
-    /// the authorisation, handed it over.
-    ///
-    /// It is the bearer that is recorded, so a credential that replaces it, as a registration can
-    /// without changing anything else the host keeps, is not shown by what was shown of the one
-    /// before.
-    pub fn show(&self, credential: &PushDeliveryCredential) {
-        if let Ok(mut shown) = self.shown.lock() {
-            shown.insert(credential.sender_record_id, credential.secret.clone());
-        }
-    }
-
-    /// Whether `credential`'s bearer is one the gateway has shown to be its authorisation's.
-    #[must_use]
-    pub fn is_shown(&self, credential: &PushDeliveryCredential) -> bool {
-        self.shown.lock().is_ok_and(|shown| {
-            shown
-                .get(&credential.sender_record_id)
-                .is_some_and(|bearer| *bearer == credential.secret)
-        })
     }
 
     /// The credential held for one authorisation, if any, without renewing it.
@@ -515,7 +484,6 @@ impl SenderCredentials for HeldCredentials {
         }
         self.clear_wait(renewed.sender_record_id);
         self.hold(renewed.clone());
-        self.show(&renewed);
         Ok(renewed)
     }
 }
