@@ -408,7 +408,8 @@ const SPELL_PROBE: &str = "KR_ATTACH_SPELL_PROBE";
 /// writes the keys in the documented record sequence, and expects the records first and the bytes
 /// after. A switch that changed nothing leaves the arrow a record, a reader that kept handing on
 /// records loses the NUL and the repeat, and a reader that turned the records of the keys going down
-/// into bytes loses them too.
+/// into bytes loses them too. Last, it stops the reader and reads one more key itself, which a
+/// reader left in its read of the console's bytes would have taken.
 #[test]
 fn a_console_asked_to_spell_its_keys_hands_the_reader_bytes_where_it_handed_records() {
     if std::env::var_os(SPELL_PROBE).is_some() {
@@ -482,6 +483,11 @@ fn a_console_asked_to_spell_its_keys_hands_the_reader_bytes_where_it_handed_reco
     press(b"\x1b[65;30;97;0;0;1_");
     press(b"\x1b[66;48;98;1;0;1_");
     press(b"\x1b[66;48;98;0;0;1_");
+    waits_for("kr-probe:stopped", &mut child);
+    // The reader has been stopped, so this key is the process's own to read. A reader left in its
+    // read of the console's bytes would take it.
+    press(b"\x1b[67;46;99;1;0;1_");
+    press(b"\x1b[67;46;99;0;0;1_");
     waits_for("kr-probe:done", &mut child);
     let shown = output.text();
     let after = &shown[shown
@@ -495,6 +501,10 @@ fn a_console_asked_to_spell_its_keys_hands_the_reader_bytes_where_it_handed_reco
     assert!(
         !after.contains("kr-probe:key:"),
         "a key was handed on as a record after the console spelled its keys: {after:?}"
+    );
+    assert!(
+        after.contains("kr-probe:next:63"),
+        "the key typed after the reader was stopped reached the process and not the reader: {after:?}"
     );
 }
 
@@ -559,6 +569,12 @@ fn spell_probe_in_the_console() {
     }
     println!("kr-probe:bytes:{}", hex(&spelled));
     stop.stop();
+    println!("kr-probe:stopped");
+    let mut next = [0_u8; 1];
+    (&*console.handle())
+        .read_exact(&mut next)
+        .expect("the console hands the process the next key");
+    println!("kr-probe:next:{}", hex(&next));
     println!("kr-probe:done");
 }
 
