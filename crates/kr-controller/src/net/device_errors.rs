@@ -36,6 +36,21 @@ use kr_transport::preauth::{ConnectionPeer, PairingMethod, PairingSurface};
 /// is not here.
 const WHY_NOT_SHOWN: &str = "the detail names the host and is not sent to a paired device";
 
+/// As [`WHY_NOT_SHOWN`], for the words of the agent a session runs, which are withheld whatever
+/// they say.
+const WHY_THE_AGENT: &str = "what the agent said is not sent to a paired device";
+
+/// As [`WHY_NOT_SHOWN`], for what the pairing store or the rendezvous service reported to a
+/// candidate that has not paired.
+const WHY_THE_STORE: &str = "what the service reported is not sent to a candidate";
+
+/// The longest message an error carries.
+const LONGEST_MESSAGE: usize = kr_protocol::error::MAX_ERROR_MESSAGE_LEN;
+
+/// The schemes of the web addresses a message may quote: they name another host and not this one.
+/// Any other scheme (`file`, `unix`, `ssh`) names a place on this machine or an account on another.
+const WEB_SCHEMES: [&str; 6] = ["http", "https", "ws", "wss", "socks5", "socks5h"];
+
 /// The words that introduce an account's number.
 const ACCOUNT_WORDS: [&str; 7] = ["user", "owner", "uid", "gid", "group", "account", "gui"];
 
@@ -82,16 +97,23 @@ pub(crate) fn error_for_a_device(error: &ProtocolError) -> Cow<'_, ProtocolError
 fn message_for_a_device(code: ErrorCode, message: &str) -> Option<String> {
     let without_commands = without_quoted_commands(message);
     let text = without_commands.as_deref().unwrap_or(message);
-    match first_naming(text) {
-        None => without_commands,
-        Some(at) => Some(match known_reason(text) {
+    let told = match first_naming(text) {
+        None => without_commands?,
+        Some(at) => match known_reason(text) {
             Some(reason) => reason.to_owned(),
             None => match clause_before(text, at) {
                 Some(clause) => format!("{clause}; {WHY_NOT_SHOWN}"),
-                None => sentence_for(code),
+                None => sentence_for(code, WHY_NOT_SHOWN),
             },
-        }),
-    }
+        },
+    };
+    // An error never carries more than its limit, so a clause kept from a long message gives way to
+    // the sentence of its code.
+    Some(if told.len() > LONGEST_MESSAGE {
+        sentence_for(code, WHY_NOT_SHOWN)
+    } else {
+        told
+    })
 }
 
 /// The sentence a device is given for a refusal whose reason the host's text says beside its place.
@@ -154,11 +176,12 @@ pub(crate) fn frame_for_a_device(frame: &ControlFrame) -> Cow<'_, ControlFrame> 
 }
 
 /// The answer to `method` as a device is given it, when the method puts a prompt, a steer, a
-/// cancellation or an approval to the agent a session runs.
+/// cancellation, an approval or a plugin's action to the agent a session runs.
 ///
 /// An agent's refusal is the agent's own words about what it was asked, and they quote what it
 /// was working on. This host cannot tell them from its own sentences about the request, so a
-/// refusal of the argument or of the agent itself is replaced by a sentence composed from its code.
+/// refusal of the argument, of the agent itself, or an end that left the outcome unknown, is
+/// replaced by a sentence composed from its code. The code and the retry category stay.
 #[must_use]
 pub(crate) fn upstream_words(method: Option<Method>, frame: ControlFrame) -> ControlFrame {
     if !method.is_some_and(puts_to_the_agent) {
@@ -170,12 +193,15 @@ pub(crate) fn upstream_words(method: Option<Method>, frame: ControlFrame) -> Con
             outcome: Outcome::Error(error),
         }) if matches!(
             error.code,
-            ErrorCode::InvalidArgument | ErrorCode::UpstreamUnavailable
+            ErrorCode::InvalidArgument | ErrorCode::UpstreamUnavailable | ErrorCode::OutcomeUnknown
         ) =>
         {
             ControlFrame::Response(Response {
                 request_id,
-                outcome: Outcome::Error(with_message(&error, sentence_for(error.code))),
+                outcome: Outcome::Error(with_message(
+                    &error,
+                    sentence_for(error.code, WHY_THE_AGENT),
+                )),
             })
         }
         other => other,
@@ -191,6 +217,7 @@ const fn puts_to_the_agent(method: Method) -> bool {
             | Method::AgentTurnSteer
             | Method::AgentTurnCancel
             | Method::AgentApprovalRespond
+            | Method::PluginActionInvoke
     )
 }
 
@@ -215,7 +242,7 @@ impl PairingSurface for ForACandidate {
                     | ErrorCode::RendezvousUnavailable
                     | ErrorCode::RendezvousConfigError
             ) {
-                with_message(&error, sentence_for(error.code))
+                with_message(&error, sentence_for(error.code, WHY_THE_STORE))
             } else {
                 error_for_a_device(&error).into_owned()
             }
@@ -235,10 +262,10 @@ fn clause_before(message: &str, at: usize) -> Option<&str> {
     (!clause.is_empty()).then_some(clause)
 }
 
-/// The sentence a code gets, for a message of which nothing is kept.
-fn sentence_for(code: ErrorCode) -> String {
+/// The sentence a code gets, for a message of which nothing is kept, with `why` it is not shown.
+fn sentence_for(code: ErrorCode, why: &str) -> String {
     format!(
-        "the host could not complete this request ({}); {WHY_NOT_SHOWN}",
+        "the host could not complete this request ({}); {why}",
         what_failed(code)
     )
 }
@@ -421,9 +448,11 @@ fn first_naming(text: &str) -> Option<usize> {
             found = Some(found.map_or(at, |earlier| earlier.min(at)));
         }
     };
-    for (at, word) in words(text) {
-        if names_a_place(word) || is_command_word(word) {
-            note(at);
+    let all = words(text);
+    for (index, (at, word)) in all.iter().enumerate() {
+        let program_run = *word == "kr" && index + 1 < all.len();
+        if names_a_place(word) || is_command_word(word) || program_run {
+            note(*at);
         }
     }
     if let Some(at) = account_number(text) {
@@ -472,7 +501,8 @@ fn pointer_place(text: &str) -> Option<std::ops::Range<usize>> {
 ///
 /// A backslash, or a slash that does not sit between two letters, digits or hyphens, which is what
 /// `src/main.rs` and `and/or` are and a path from a root, a drive, a home or the current directory
-/// is not. A web address is set aside unless it names a file, an account or a query.
+/// is not. A web address is set aside unless it carries an account or a query; an address of any
+/// other scheme (`file`, `unix`) is read as a path.
 fn names_a_place(word: &str) -> bool {
     if let Some(scheme_end) = word.find("://") {
         let scheme_start = word[..scheme_end]
@@ -482,12 +512,17 @@ fn names_a_place(word: &str) -> bool {
                 !(character.is_ascii_alphanumeric() || "+.-".contains(*character))
             })
             .map_or(0, |(at, character)| at + character.len_utf8());
-        if word[scheme_start..scheme_end].eq_ignore_ascii_case("file") {
-            return true;
+        let scheme = &word[scheme_start..scheme_end];
+        if WEB_SCHEMES
+            .iter()
+            .any(|web| scheme.eq_ignore_ascii_case(web))
+        {
+            let rest = &word[scheme_end + 3..];
+            let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+            return rest[..authority_end].contains('@') || rest[authority_end..].contains('?');
         }
-        let rest = &word[scheme_end + 3..];
-        let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-        return rest[..authority_end].contains('@') || rest[authority_end..].contains('?');
+        // A scheme that is not the web's names a file, a socket or an account, and is read as a
+        // path below.
     }
     if word.contains('\\') {
         return true;
@@ -512,6 +547,9 @@ fn is_command_word(word: &str) -> bool {
 /// Where in `text` an account's number begins to be named: a word for an account (or a service
 /// manager's domain for one) and then digits, with at most one of a space, `=`, `:`, `@`, `/` or
 /// `-` between, or a Windows security identifier.
+///
+/// The digits are a number when no letter or hyphen follows them: `user 501` and `user-1000.slice`
+/// are, and `group 0193abcd-...`, the start of an identifier, is not.
 fn account_number(text: &str) -> Option<usize> {
     let lower = text.to_ascii_lowercase();
     let boundary = |at: usize| {
@@ -520,13 +558,25 @@ fn account_number(text: &str) -> Option<usize> {
             .next_back()
             .is_none_or(|before| !before.is_alphanumeric())
     };
+    // The text after `from` begins with digits that end at a place no identifier continues.
+    let ends_as_a_number = |from: usize| {
+        let digits = lower[from..]
+            .find(|character: char| !character.is_ascii_digit())
+            .unwrap_or(lower.len() - from);
+        digits > 0
+            && lower[from + digits..]
+                .chars()
+                .next()
+                .is_none_or(|after| !(after.is_alphanumeric() || after == '-'))
+    };
     let digits_after = |from: usize, separated: bool| {
         let mut rest = lower[from..].chars();
-        let first = rest.next();
-        match first {
-            Some(digit) if digit.is_ascii_digit() => true,
+        match rest.next() {
+            Some(digit) if digit.is_ascii_digit() => ends_as_a_number(from),
             Some(separator) if separated && " =:@/-".contains(separator) => {
-                rest.next().is_some_and(|digit| digit.is_ascii_digit())
+                lower[from + separator.len_utf8()..]
+                    .starts_with(|digit: char| digit.is_ascii_digit())
+                    && ends_as_a_number(from + separator.len_utf8())
             }
             _ => false,
         }
@@ -543,7 +593,11 @@ fn account_number(text: &str) -> Option<usize> {
         .chain(
             lower
                 .match_indices("s-1-")
-                .filter(|(at, _)| boundary(*at) && digits_after(at + "s-1-".len(), false))
+                .filter(|(at, _)| {
+                    boundary(*at)
+                        && lower[at + "s-1-".len()..]
+                            .starts_with(|digit: char| digit.is_ascii_digit())
+                })
                 .map(|(at, _)| at),
         )
         .min()
@@ -586,7 +640,7 @@ mod tests {
     };
 
     /// Everything a path, an account or a command can look like in the text of a failure.
-    const NAMES_THE_HOST: [&str; 23] = [
+    const NAMES_THE_HOST: [&str; 27] = [
         "create /Users/marguerite/Library/Application Support/KalaReach/workers/1: denied",
         "create '/home/marguerite/.local/state/kr': denied",
         "could not read (/var/lib/kr/registry) at all",
@@ -610,10 +664,14 @@ mod tests {
         "run `kr host clock --establish` at the host",
         "a `chmod 700 /x` was run",
         "see https://marguerite:secret@example.com/x",
+        "connect unix:///Users/marguerite/socket: refused",
+        "ssh://marguerite@example.com/x was refused",
+        "the environment has no task to start workers: run kr host startup --set standalone",
+        "the unit group 20 is not private",
     ];
 
     /// Text that is the host's own sentence, or the device's own words back, and names nothing.
-    const NAMES_NOTHING: [&str; 16] = [
+    const NAMES_NOTHING: [&str; 19] = [
         "the invitation expired",
         "session 0193 has closed",
         "src/main.rs is not tracked",
@@ -630,6 +688,9 @@ mod tests {
         "the `session.open` method is not served",
         "a window of 10/30 seconds",
         "the relay at https://relay.example.com answered 503",
+        "this environment is already in machine group 0193abcd-1111-4222-8333-444455556666",
+        "this environment is already in machine group 01234567-89ab-4cde-8f01-234567890abc",
+        "the page read 42 users and 7 groups",
     ];
 
     fn error(code: ErrorCode, message: &str) -> ProtocolError {
@@ -649,11 +710,12 @@ mod tests {
                     refuses remote access until the person at this machine has confirmed it with \
                     `kr host policy --confirm`, which removes the record";
         let shown = error_for_a_device(&error(ErrorCode::PermissionDenied, said)).into_owned();
-        assert_eq!(
-            shown.message,
-            "this host found the policy it holds restored from an earlier state, so it refuses \
-             remote access until the person at this machine has confirmed it with a command, \
-             which removes the record"
+        assert!(
+            shown
+                .message
+                .contains("confirmed it with a command, which removes the record")
+                && !shown.message.contains("kr host"),
+            "{shown:?}"
         );
         // One word between backticks is a name and not a command, and stays.
         assert!(!names_the_host("the `session.open` method is not served"));
@@ -686,6 +748,22 @@ mod tests {
             error_for_a_device(&mount).code,
             ErrorCode::UpstreamUnavailable
         );
+    }
+
+    #[test]
+    fn a_message_a_device_is_given_is_never_longer_than_an_error_may_be() {
+        let long = format!(
+            "{}: create /Users/marguerite/x: denied",
+            "the host could not make something it needs ".repeat(24)
+        );
+        assert!(long.len() > LONGEST_MESSAGE - 40);
+        let shown = error_for_a_device(&error(ErrorCode::ResourceUnavailable, &long)).into_owned();
+        assert!(
+            shown.message.len() <= LONGEST_MESSAGE,
+            "{}",
+            shown.message.len()
+        );
+        assert!(shown.is_consistent());
     }
 
     #[test]
@@ -731,12 +809,9 @@ mod tests {
             ),
         ] {
             let shown = error_for_a_device(&error(code, message)).into_owned();
-            assert_eq!(
-                shown.message,
-                format!(
-                    "the host could not complete this request ({said}); the detail names the host \
-                     and is not sent to a paired device"
-                )
+            assert!(
+                shown.message.contains(said) && shown.message.ends_with(WHY_NOT_SHOWN),
+                "{shown:?}"
             );
             assert_eq!(shown.code, code);
         }
@@ -984,6 +1059,25 @@ mod tests {
         };
         assert!(!shown.message.contains("marguerite"), "{shown:?}");
         assert_eq!(shown.code, ErrorCode::InvalidArgument);
+
+        for (method, code) in [
+            (Some(Method::PluginActionInvoke), ErrorCode::InvalidArgument),
+            (Some(Method::AgentTurnSteer), ErrorCode::OutcomeUnknown),
+        ] {
+            let ControlFrame::Response(Response {
+                outcome: Outcome::Error(shown),
+                ..
+            }) = upstream_words(method, refused(code, said))
+            else {
+                panic!("an error");
+            };
+            assert!(
+                !shown.message.contains("marguerite"),
+                "{method:?} {shown:?}"
+            );
+            assert_eq!(shown.code, code);
+            assert_eq!(shown.retry, code.retry_category());
+        }
 
         for (method, code) in [
             (Some(Method::AgentPromptSubmit), ErrorCode::DraftConflict),
