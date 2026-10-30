@@ -332,8 +332,10 @@ repeat count, as the console reported them. A record that is not a key ends the 
 half of a character outside the basic plane waits for its second half. The command spells nothing
 and invents no scan code. The worker spells the records for the session's terminal, in the win32
 input mode format when that terminal asked for it and as legacy terminal input otherwise (see the
-host reference); while the application has negotiated an encoding that records cannot express, the
-worker refuses the write, and the attachment ends and says why. The scroll-back keys above are taken
+host reference); while the application has negotiated `modifyOtherKeys` or the Kitty keyboard
+protocol, the worker spells console keys only as ordinary terminal input, which would be a different
+key, so it refuses the write, and the attachment ends and says why and that `--no-probe` watches
+without typing. The scroll-back keys above are taken
 from the records of Shift and Page Up or Page Down, key by key: the key going down and the same key
 coming up are the window's, and every other record, a release among them, is the session's. The
 command does not ask the console for mouse or window-size records, so the console keeps the mouse
