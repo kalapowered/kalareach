@@ -32,7 +32,9 @@
 //! The process is started with no environment but what the launch names, in the working directory
 //! the launch names, and it is the daemon's own child. Nothing in it outlives the daemon: its input
 //! ends when the daemon does, and its watchdog looks for the daemon by the start identity it is
-//! given, which covers a control thread that never sees that end.
+//! given, which covers a control thread that never sees that end. A process created held on
+//! Windows has run neither of them, so the job it is put in ends it with the daemon, and a start
+//! that fails or panics ends it too.
 
 use std::collections::VecDeque;
 use std::ffi::OsString;

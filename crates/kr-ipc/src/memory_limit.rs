@@ -217,7 +217,7 @@ impl MemoryLimit {
         // The assignment was accepted, so the process is in the job. A system that answers that it
         // is not is believed over that. One that cannot answer (the handle may lack the right to
         // ask) is not: the job holds the process whatever is done with it here, so dropping it now
-        // would close the port that records a refusal, and the limit would hold unseen.
+        // would end the process with the job and close the port that records a refusal.
         if asked != 0 && inside == 0 {
             return Err("this host did not report the process in the job");
         }

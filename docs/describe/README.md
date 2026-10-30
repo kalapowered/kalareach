@@ -196,10 +196,11 @@ runs only behind the limit, so memory it commits as it starts is refused when it
 The daemon counts the limit applied when the system reads it back as asked and does not say the
 process is outside the job; a system that accepted the assignment and cannot answer the question of
 membership leaves the limit in force and recording. When the limit is not applied, the process is
-let run all the same. The job also ends the process when the daemon lets go of it, so a start that
-fails or panics, and a daemon that ends, between creating the process and letting it run leave no
-process that never ran. One case remains: a daemon killed from outside in the few calls between the
-process's creation and its entry into the job, or before it lets run a process the job did not take.
+let run all the same. A start that fails or panics between creating the process and letting it run
+ends and collects the process. The job also ends the process when the daemon lets go of it, so a
+daemon that ends in that time leaves none that never ran either. One case remains: a daemon killed
+from outside in the few calls between the process's creation and its entry into the job, or before
+it lets run a process the job did not take.
 A commit past the limit is refused by the system. A runtime that cannot allocate ends, and one that
 catches the failed allocation answers that its load or job failed and goes on. The daemon asks the
 job when the process closes its end, when its frames stop short, and when it answers that a load or
