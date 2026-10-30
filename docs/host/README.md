@@ -32,16 +32,17 @@ A directory above a root that exists is left as it is and checked for nothing: `
 world-writable by design and `~/.cache` is usually group-readable, and neither is KalaReach's to
 change. One that is missing is created with mode 0700 on Unix, and the umask can only narrow that
 mode. On Windows it takes the access list of the directory above it, and on macOS the inheritable
-entries of that list; the check of a root refuses those when they name another account. Each root,
-and each directory below it that the host makes through `create_private_tree`, is made with mode
-0700 on Unix and verified each time the host asks for it that way. The host makes other directories
-below a root another way, among them the terminal probe's record directory, the backup store's
-staging directory and the directory of each generation staged in it, and the description model
-directories. A missing one of these is made with mode 0700 on Unix as well. One that exists is used
-as it is, with a wider mode or as a symbolic link to a larger disk, since each lies inside a root
-the host verifies; the target of a link keeps the protection it was given. The terminal probe
-verifies the runtime root before it writes a record, since the probe can come before the start that
-verifies it. The directories of an installed release are read-only (mode 0555 on Unix) by design.
+entries of that list; the check of a root below refuses those that allow an account not known to be
+this user. Each root, and each directory below it that the host makes through `create_private_tree`,
+is made with mode 0700 on Unix and verified each time the host asks for it that way. The host makes
+other directories below a root another way, among them the terminal probe's record directory, the
+backup store's staging directory, the directory of each generation staged in it and the description
+model directories. A missing one of these four is made with mode 0700 on Unix as well. One that
+exists is used as it is, with a wider mode or as a symbolic link to a larger disk, since each lies
+inside a root the host verifies; the target of a link keeps the protection it was given. The
+terminal probe verifies the runtime root before it writes a record, since the probe can come before
+the start that verifies it. The directories of an installed release are read-only (mode 0555 on
+Unix) by design.
 
 A verified directory that is a symbolic link, or that belongs to another user, is refused rather
 than repaired. A root given with a final separator is looked up as the name it ends in, so
@@ -55,17 +56,17 @@ directories, are not on that list, and for them `kr` prints the owner and the mo
 that others can write to the refusal names no command, since a mode does not remove what they put
 in it.
 
-On macOS a verified directory whose access list has an allow entry for an account that is not
-known to be this user is refused with no command, since `chmod 700` leaves the list as it is, and
-`kr` says that its owner or its access list does not keep other accounts out. The rule is
-conservative. An entry that grants nothing, an allow that a deny before it cancels, an entry for a
-group of one and an entry that only what is made inside inherits refuse the directory as well. So
-does an entry for this user when the account's name is a number or the system has no record of it,
-since the list names a user number without a record by that number. A list that cannot be read is
-refused alike, except on a file system that keeps no lists. Either is passed again once its owner
-and mode are right and its readable list has no allow entry for another account. The check is the
-host's own, so the directories that the macOS companion makes through `create_private_tree` get it
-too.
+On macOS a verified directory whose access list has an allow entry for an account that is not known
+to be this user is refused with no command, since `chmod 700` leaves the list as it is, and `kr`
+says that its owner or its access list is not known to keep other accounts out. The rule is
+conservative. An allow entry that grants nothing, an allow that a deny before it cancels, an entry
+for a group of one and an entry that only what is made inside inherits refuse the directory as well.
+So does an entry for this user when the account's name is a number or the text of a GUID, or the
+system has no record of it, since the list names a user number or an identity without a record by
+that number or text. A list that cannot be read is refused alike, except on a file system that keeps
+no lists. Either is passed again once its owner and mode are right and every allow entry of its
+readable list is known to be this user's. The check is the host's own, so the directories that the
+macOS companion makes through `create_private_directory` get it too.
 
 On Linux, $XDG_RUNTIME_DIR/kalareach is the default runtime root, unless that directory would end up
 in a location shared between all WSL distros. WSLg sets $XDG_RUNTIME_DIR to /mnt/wslg/runtime-dir,
