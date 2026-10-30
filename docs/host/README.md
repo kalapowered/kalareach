@@ -6105,7 +6105,11 @@ so a step of two between neighbours says that something unreadable was recorded,
 first view is empty sees its `from_cursor` move when one is. The numbers the host takes back end at
 the last change the device was shown and not at the end of the log, so a refusal does not say how
 many such changes there are beyond that. That shows such changes exist after the bound, and never
-how many came before it. The second is what the numbering does not reach: a
+how many came before it. This holds for an invitation because the host refuses one whose history
+would start after the moment it is issued: a bound still ahead would count each change recorded
+before it, and a device clock far ahead of the host's can name one. An invitation that an earlier
+build issued with such a bound shows that count until it expires. The second is what the numbering
+does not reach: a
 review's versions, an attention item's revision, the `gaps` and `dropped` count of
 `attention.read`, and a log view's output offsets. They stay the host's own numbers, and the bound
 does not cut them.
