@@ -972,7 +972,7 @@ methods! {
           base name of its executable. The list is labelled recorded: it is what the worker \
           last wrote, not a live enumeration, and a process that started and ended between two \
           of the worker's observations is not in it. The answer is the local owner's and holds \
-          no argument, environment, directory or path.";
+          no argument, environment, working directory or executable path.";
 
     SessionOpen = "session.open", Sessions,
     effect: Read, ingress: [PairedDevice], rights: [basis(PresentViewAuthority)],

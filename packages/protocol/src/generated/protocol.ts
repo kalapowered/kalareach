@@ -29233,7 +29233,8 @@ export interface SessionOpenParams {
 export interface SessionProcess {
   /**
    * The base name of its executable, for a running row whose executable the platform gives, as
-   * lossy UTF-8 of at most [`MAX_PROCESS_NAME_BYTES`] bytes. Null for every other row.
+   * lossy UTF-8 of at most [`MAX_PROCESS_NAME_BYTES`] bytes. Null for every other row. A name
+   * that was cut cannot be told from one of exactly that length.
    */
   name: string | null
   /**

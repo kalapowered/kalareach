@@ -3902,7 +3902,7 @@ Each worker has its own SQLite journal in write-ahead-logging mode with full syn
 | `observations` | additive evidence about an action: its provenance, the subject and version it saw, the source cursor and what it claims |
 | `closure` | the session's final record |
 | `session` | the session's own summary, so a reader with no worker can still say what the session was |
-| `owned_processes` | one row: the processes the session owns that had not ended when last observed, each by identifier and start value, with the boot, the control group the worker ran in, and what it could not establish, so a control daemon can stop what a crashed worker left |
+| `owned_processes` | one row: the processes the session owns that had not ended when last observed, each by identifier and start value, with the boot, the control group the worker ran in, and what it could not establish, so a control daemon can stop what a crashed worker left, and so `session.processes` can list what the worker had recorded of a live session |
 | `host_events` | an application notice that had no attachment to go to, and where in the output stream it happened; an agent turn that ended and a command that failed, each by a line of identifiers and fixed words |
 | `outbox` | the event each state transition committed with: its immutable identifier, the stream, the subsystem, the actor and action, the subject revision and the content class |
 | `outbox_cursors` | one row per consumer: how far it has taken the outbox and how much it has taken |
@@ -4361,6 +4361,10 @@ fact that puts it in the session's tree (its parent, its session, its terminal, 
 session's job), so an identifier the kernel gave to a stranger after the process it listed ended is
 not recorded. A process stays in the record until the kernel says it has ended, so one that left
 the tree after it was seen is still stopped, unless it left for a control daemon's own scope.
+The control daemon also reads this record while the worker runs, for `session.processes`: read-only,
+in one short transaction, with no migration, and each recorded identity checked against the
+operating system at the moment of the call. The list is what the worker had recorded at its last
+write, not a live enumeration.
 The record belongs to one boot. A record that names an earlier boot, of the same kind and length as
 this host's own, says the worker went with that boot. Nothing is stopped, since no process of one
 boot runs in another, and nothing is listed as surviving. The closure gives the host's restart as
