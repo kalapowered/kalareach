@@ -337,6 +337,9 @@ pub use self::windows::{Job, end_process};
 /// checked before it runs are `kernel32` and `advapi32` calls with no safe interface. Every handle
 /// is owned as soon as it exists, so every path closes it.
 #[cfg(windows)]
+mod desktop;
+
+#[cfg(windows)]
 mod windows {
     #![expect(
         unsafe_code,
@@ -1105,6 +1108,9 @@ mod windows {
         /// which the child is given and nothing else of the starter's is. `None` hands it no file:
         /// it writes to the console it is given, which shows no window.
         pub output: Option<BorrowedHandle<'a>>,
+        /// The name of a desktop the child is made on, of its own and apart from the person's
+        /// interactive one, or `None` for the starter's own desktop.
+        pub own_desktop: Option<&'a str>,
     }
 
     /// A child the starter created, checked and let run.
@@ -1147,6 +1153,13 @@ mod windows {
     /// fails either check, or whose membership cannot be read, is ended through its own handle
     /// before it has run an instruction. The identity returned is read from that handle, never
     /// from a process identifier looked up again.
+    ///
+    /// A command that names a desktop of its own has the child created on it: on this logon's
+    /// window station for processes that show nothing, with the access list of the starter's own
+    /// station and desktop, and a handle of each lent to the child before it runs. A child
+    /// started that way inherits no access to the starter's interactive desktop, and neither does
+    /// anything it starts. That is not a boundary against a process of the same account, which can
+    /// still open the interactive desktop by name.
     ///
     /// # Errors
     ///
@@ -1203,6 +1216,21 @@ mod windows {
         // the first is set next.
         let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
         startup.StartupInfo.cb = u32::try_from(std::mem::size_of::<STARTUPINFOW>()).unwrap_or(0);
+        // A child that must not reach the person's desktop is given one of its own, which lives as
+        // long as this value does and is lent to the child before it runs.
+        let own_desktop = match command.own_desktop.map(super::desktop::OwnDesktop::create) {
+            Some(Ok(own)) => Some(own),
+            Some(Err(error)) => {
+                return Err(ChildRefusal::nothing_created(format!(
+                    "a desktop of its own could not be made for {}: {error}",
+                    command.application.display()
+                )));
+            }
+            None => None,
+        };
+        startup.StartupInfo.lpDesktop = own_desktop
+            .as_ref()
+            .map_or(std::ptr::null_mut(), |own| own.name().as_ptr().cast_mut());
         let mut inherit = 0;
         if let Some(handed) = &handed {
             startup.StartupInfo.cb =
@@ -1257,6 +1285,15 @@ mod windows {
             thread: unsafe { OwnedHandle::from_raw_handle(created.hThread) },
             pid: created.dwProcessId,
         };
+        if let Some(Err(error)) = own_desktop
+            .as_ref()
+            .map(|own| own.lend_to(child.process.as_raw_handle()))
+        {
+            return Err(child.end(format!(
+                "the new process could not be given the desktop made for it, so it was ended: \
+                 {error}"
+            )));
+        }
         let in_job = match child.in_any_job() {
             Ok(in_job) => in_job,
             Err(error) => {
@@ -2955,6 +2992,7 @@ mod tests {
                 environment: &[],
                 session,
                 output: None,
+                own_desktop: None,
             });
             match (plan, outcome) {
                 (JobPlan::Refuse, Err(refusal)) => {
@@ -3067,6 +3105,7 @@ mod tests {
                 environment: &environment,
                 session,
                 output: written.as_ref().map(|file| file.as_handle()),
+                own_desktop: None,
             });
             match outcome {
                 Ok(started) => println!(

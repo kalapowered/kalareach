@@ -39,8 +39,10 @@ widestring.workspace = true
 # declares, and the version of the system is the structure `Win32_System_SystemInformation` declares.
 # The machine's power source, the passive limit of its thermal zones and the background class of a
 # process are read through the power status, the performance counters and the process queries: the
-# last three features declare them.
-windows-sys = { workspace = true, features = ["Win32_Security_Authorization", "Win32_System_Memory", "Win32_System_SystemServices", "Wdk_System_SystemInformation", "Wdk_System_SystemServices", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_System_Ioctl", "Win32_System_SystemInformation", "Win32_System_Power", "Win32_System_Performance", "Wdk_System_Threading"] }
+# last three features declare them. A headless worker's own window station and desktop are made
+# with the stations-and-desktops calls, whose desktop constructor takes the display-mode structure
+# the graphics feature declares.
+windows-sys = { workspace = true, features = ["Win32_Security_Authorization", "Win32_Graphics_Gdi", "Win32_System_StationsAndDesktops", "Win32_System_Memory", "Win32_System_SystemServices", "Wdk_System_SystemInformation", "Wdk_System_SystemServices", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_System_Ioctl", "Win32_System_SystemInformation", "Win32_System_Power", "Win32_System_Performance", "Wdk_System_Threading"] }
 
 [features]
 # A disposable owner-only host tree for the other host crates' tests.

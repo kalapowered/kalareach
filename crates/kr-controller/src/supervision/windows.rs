@@ -1677,13 +1677,15 @@ mod launching {
     use serde::{Deserialize, Serialize};
 
     use super::{Standing, TaskDefinition, run, standing};
+    use kr_protocol::identity::WorkerProfile;
+
     use crate::supervision::{
         LaunchOutcome, Readiness, RunFailure, ServiceLaunch, TASK_SCHEDULER_BOUND, WorkerLaunch,
         WorkerSupervisor,
     };
 
     /// The version of the exchange on the launch pipe.
-    const LAUNCH_PROTOCOL: u32 = 1;
+    const LAUNCH_PROTOCOL: u32 = 2;
 
     /// How long the task's starter is given to reach a launch once the task has been run: the
     /// Task Scheduler starts a process within a second or two, and a machine under load is slower.
@@ -1734,6 +1736,9 @@ mod launching {
         environment: Vec<Variable>,
         /// The daemon's login session, which the process must run in.
         session: u32,
+        /// The name of a desktop of its own to make the process on, apart from the person's
+        /// interactive one, or `None` to run it on the starter's.
+        own_desktop: Option<String>,
     }
 
     /// What the daemon answers a starter's hello with.
@@ -1838,6 +1843,7 @@ mod launching {
             &self,
             launch: &ServiceLaunch,
             variables: &[(String, String)],
+            own_desktop: Option<String>,
         ) -> LaunchOutcome {
             let not_started = |detail: String| LaunchOutcome::NotStarted { detail };
             match standing(&self.expected) {
@@ -1935,6 +1941,7 @@ mod launching {
                     })
                     .collect(),
                 session,
+                own_desktop,
             };
             let bytes = match encode(&Answer::Launch(handed)) {
                 // A frame the pipe would refuse to carry is refused here, before anything leaves
@@ -2039,11 +2046,17 @@ mod launching {
 
     impl WorkerSupervisor for TaskSupervisor {
         fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome {
-            self.hand_over(&launch.service(), &launch.desktop_environment)
+            // A headless worker has no business on the person's desktop, so it is made one of its
+            // own, named for the worker. A desktop-bound worker belongs to that desktop.
+            let own_desktop = match launch.profile {
+                WorkerProfile::HeadlessUser => Some(launch.label()),
+                WorkerProfile::DesktopBound => None,
+            };
+            self.hand_over(&launch.service(), &launch.desktop_environment, own_desktop)
         }
 
         fn start_service(&self, launch: &ServiceLaunch) -> LaunchOutcome {
-            self.hand_over(launch, &[])
+            self.hand_over(launch, &[], None)
         }
 
         fn describe(&self) -> &'static str {
@@ -2168,6 +2181,7 @@ mod launching {
             environment: &variables,
             session: launch.session,
             output: None,
+            own_desktop: launch.own_desktop.as_deref(),
         });
         let (report, exit) = match started {
             Ok(child) => (
@@ -2242,6 +2256,7 @@ mod launching {
             environment: &[],
             session,
             output: log.as_ref().map(std::os::windows::io::AsHandle::as_handle),
+            own_desktop: None,
         }) {
             Ok(_) => StarterExit::Done,
             Err(_) => StarterExit::Refused,
