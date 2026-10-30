@@ -3663,9 +3663,10 @@ impl Asked {
 /// Git, so it is bounded on every side: by time, by what it may answer, and by what it may leave
 /// running. A program still under way at the deadline is ended with the processes in its group. One
 /// that has ended has the rest of its group ended with it, and one that answers with more than a
-/// version and a directory is refused when it does. A process that left the group and kept the
-/// pipe is out of reach: the answer is refused after a short wait for the end of its output, and
-/// the pipe is closed, so it costs this host no more than the descriptor for as long as it runs.
+/// version and a directory is ended where its output passes the limit and refused, whatever it
+/// would have exited with. A process that left the group and kept the pipe is out of reach: the
+/// answer is refused after a short wait for the end of its output, and the pipe is closed, so it
+/// costs this host no more than the descriptor for as long as it runs.
 fn ask(
     program: &Path,
     arguments: &[&str],
@@ -3711,8 +3712,19 @@ fn ask(
         }
     })?;
     let mut heard = Heard::of(child.stdout.take());
+    let too_much = || {
+        Asked::Overran(unavailable(format!(
+            "{described} answered with more than a version and a directory"
+        )))
+    };
     let status = loop {
         heard.take_in(deadline);
+        // At the limit, not when the program ends: what a program writes without end is not an
+        // answer, and reading it on would hold this look for as long as the program writes.
+        if heard.overflowed() {
+            end_probe(child);
+            return Err(too_much());
+        }
         match has_ended(&mut child) {
             Ended::No => {}
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3753,6 +3765,9 @@ fn ask(
     let drain = deadline.min(Instant::now() + PROBE_DRAIN);
     loop {
         heard.take_in(drain);
+        if heard.overflowed() {
+            return Err(too_much());
+        }
         if heard.ended() {
             break;
         }
@@ -3771,9 +3786,7 @@ fn ask(
     // Before the status: what an answer holds beyond the limit is not an answer, whatever the
     // program then exited with.
     if answer.truncated {
-        return Err(Asked::Overran(unavailable(format!(
-            "{described} answered with more than a version and a directory"
-        ))));
+        return Err(too_much());
     }
     if !status.success() {
         return Err(Asked::Declined(unavailable(format!(
@@ -3841,8 +3854,8 @@ impl Heard {
         }
     }
 
-    /// Takes in what has arrived, keeping at most [`PROBE_OUTPUT_LIMIT`] bytes and discarding the
-    /// rest, so that a program that writes without end is read and not waited on.
+    /// Takes in what has arrived, for no longer than `deadline` and no further than
+    /// [`PROBE_OUTPUT_LIMIT`] bytes, past which [`Self::overflowed`] says so.
     fn take_in(&mut self, deadline: Instant) {
         #[cfg(unix)]
         {
@@ -3860,6 +3873,18 @@ impl Heard {
         }
         #[cfg(not(unix))]
         let _ = deadline;
+    }
+
+    /// Whether the output has passed [`PROBE_OUTPUT_LIMIT`], which is not an answer.
+    fn overflowed(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.seen.truncated
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
     }
 
     /// Whether the end of the output has been reached.
@@ -3905,10 +3930,15 @@ enum Gathered {
 
 /// Takes in what `pipe` holds without blocking, keeping at most [`PROBE_OUTPUT_LIMIT`] bytes in
 /// `seen`.
+///
+/// The pass ends when the pipe is empty or closed, and also when `seen` has passed the limit or
+/// `deadline` has come, checked after every read. A writer that is never behind the reader keeps
+/// the pipe from ever being empty, so without those two the pass would last as long as the writer
+/// does, and so would the memory it is given. Nothing is read once the limit is passed.
 #[cfg(unix)]
-fn gather(pipe: &mut impl std::io::Read, seen: &mut Bounded, _deadline: Instant) -> Gathered {
+fn gather(pipe: &mut impl std::io::Read, seen: &mut Bounded, deadline: Instant) -> Gathered {
     let mut buffer = [0_u8; 4096];
-    loop {
+    while !seen.truncated {
         match pipe.read(&mut buffer) {
             Ok(0) => return Gathered::Closed,
             Ok(read) => {
@@ -3926,7 +3956,11 @@ fn gather(pipe: &mut impl std::io::Read, seen: &mut Bounded, _deadline: Instant)
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) => return Gathered::Unreadable(error),
         }
+        if Instant::now() >= deadline {
+            break;
+        }
     }
+    Gathered::Open
 }
 
 /// Makes reads of a probe's pipe return at once when nothing has arrived.
