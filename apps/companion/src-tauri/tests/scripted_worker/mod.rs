@@ -337,6 +337,7 @@ impl ScriptedWorker {
                     writer,
                     sequence: 0,
                     session_id,
+                    connection_id,
                 });
             }
         });
@@ -390,6 +391,8 @@ pub struct Link {
     /// The sequence of the next notification on the output stream.
     sequence: u64,
     session_id: SessionId,
+    /// The identity the worker gave this connection when it answered the opening exchange.
+    connection_id: ConnectionId,
 }
 
 /// How a call reached the worker: as a plain request, or as a mutation with an action identifier.
@@ -430,6 +433,11 @@ pub fn written(asked: &kr_protocol::input::InputWriteParams) -> &[u8] {
 }
 
 impl Link {
+    /// The identity the worker gave this connection.
+    pub fn connection_id(&self) -> ConnectionId {
+        self.connection_id
+    }
+
     /// The next call the view makes.
     pub async fn call(&mut self) -> Call {
         let frame = tokio::time::timeout(WATCHDOG, self.reader.read_message::<ControlFrame>())
@@ -1186,6 +1194,8 @@ pub fn keys_delta(frame: &Frame, base: u64, next: u64, keys: Keys) -> Projection
 pub struct WorkerLease {
     pub epoch: u64,
     pub holder: Option<AttachmentId>,
+    /// The connection the holder's attachment is on, which its input stream belongs to.
+    pub connection: Option<ConnectionId>,
     /// The next number the holder's ordered input stream has to write.
     pub next: u64,
     /// The encoding the program reads, as the host reads it.
@@ -1207,7 +1217,7 @@ impl WorkerLease {
         kr_protocol::input::InputLeaseState {
             epoch: kr_protocol::ids::InputLeaseEpoch::new(self.epoch),
             holder: Nullable(self.holder),
-            connection_id: Nullable::null(),
+            connection_id: Nullable(self.connection),
             next_sequence: kr_protocol::ids::InputSequence::new(self.next),
         }
     }
@@ -1236,6 +1246,7 @@ impl WorkerLease {
             }
             self.epoch += 1;
             self.holder = Some(asked.attachment_id);
+            self.connection = Some(link.connection_id());
             self.next = 0;
             let answer = kr_protocol::input::InputAcquireResult {
                 lease: self.state(),
@@ -1257,6 +1268,7 @@ impl WorkerLease {
             }
             self.epoch += 1;
             self.holder = None;
+            self.connection = None;
             self.next = 0;
             let answer = kr_protocol::input::InputLeaseResult {
                 lease: self.state(),
@@ -1322,6 +1334,7 @@ impl WorkerLease {
     pub fn taken_over(&mut self) {
         self.epoch += 1;
         self.holder = Some(AttachmentId::new(kr_ipc::new_uuid()));
+        self.connection = Some(ConnectionId::new(kr_ipc::new_uuid()));
         self.next = 0;
     }
 
@@ -1331,6 +1344,7 @@ impl WorkerLease {
         self.negotiated = negotiated;
         if !negotiated.supplied() && self.holder.take().is_some() {
             self.epoch += 1;
+            self.connection = None;
             self.next = 0;
         }
     }

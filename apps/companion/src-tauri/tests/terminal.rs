@@ -2585,6 +2585,80 @@ async fn another_refusal_ends_control_and_gives_the_epoch_back() {
     }
 }
 
+/// KR-REQ-09.20, the part about a reconnect: what the person types while a view's link is lost goes
+/// nowhere, and a view opened on a new link takes a lease of its own on that connection, writes from
+/// the first number of a new input stream, and carries none of what the lost link was sent and never
+/// answered, nor anything typed after it was lost.
+#[tokio::test(flavor = "multi_thread")]
+async fn keystrokes_typed_while_the_link_was_lost_are_never_sent_on_a_new_link() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let mut lease = WorkerLease::at(4);
+    let (view, mut link) = controlling(
+        &page_view,
+        &mut worker,
+        3,
+        &reporting(Mouse::Sgr),
+        &mut lease,
+    )
+    .await;
+    let first_connection = link.connection_id();
+    assert_eq!(
+        lease.connection,
+        Some(first_connection),
+        "the lease belongs to the connection that took it"
+    );
+    page_view.text(&view, 1, "a").expect("the text is taken");
+    let write = link.expect(Method::InputWrite).await;
+    lease.answer(&mut link, &write).await;
+    // One more is on the wire when the link goes: delivery of it is uncertain, and it is not sent
+    // again on any other link.
+    page_view.text(&view, 1, "b").expect("the text is taken");
+    let unanswered = link.expect(Method::InputWrite).await;
+    assert_eq!(unanswered.params::<InputWriteParams>().sequence.get(), 1);
+    drop(link);
+    page_view.newest(3, |state| state["state"] == "ended").await;
+    let refused = page_view
+        .text(&view, 1, "c")
+        .expect_err("a view whose link is lost takes no input");
+    assert_eq!(code(&refused), "LEASE_LOST");
+
+    // The person opens the session again: a view of its own, on a new connection.
+    let (second_view, mut second_link) =
+        panned(&page_view, &mut worker, 4, &reporting(Mouse::Sgr)).await;
+    assert_ne!(second_link.connection_id(), first_connection);
+    page_view.take(&second_view, 1);
+    let acquire = second_link.expect(Method::InputAcquire).await;
+    lease.answer(&mut second_link, &acquire).await;
+    page_view
+        .newest(4, |state| control(state) == (1, "controlling".to_owned()))
+        .await;
+    assert_eq!(
+        lease.connection,
+        Some(second_link.connection_id()),
+        "the new lease is on the new connection"
+    );
+    page_view
+        .text(&second_view, 1, "d")
+        .expect("the text is taken");
+    let write = second_link.expect(Method::InputWrite).await;
+    let asked: InputWriteParams = write.params();
+    assert_eq!(
+        (asked.epoch.get(), asked.sequence.get(), written(&asked)),
+        (6, 0, b"d".as_slice()),
+        "a new epoch, and the new stream's first number, carrying only what was typed after"
+    );
+    lease.answer(&mut second_link, &write).await;
+    assert!(
+        second_link.quiet_for(QUIET).await,
+        "nothing typed before the new link is sent on it"
+    );
+    assert_eq!(
+        lease.written,
+        vec![(5, 0, b"a".to_vec()), (6, 0, b"d".to_vec())]
+    );
+}
+
 /// Looking around gives the lease back at once: the page is told the view watches, the epoch is
 /// released, and an input made under the take before it is refused.
 #[tokio::test(flavor = "multi_thread")]
