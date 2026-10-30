@@ -1519,31 +1519,39 @@ async fn a_fence_that_lands_once_an_environment_change_holds_the_record_stops_it
     assert!(!recorded(1));
 }
 
-/// A platform that raises a fence on this host while it answers, and starts what it is told to: it
-/// says the environment is stopped until it has been started.
-struct FenceRaisingPlatform {
+/// Where a platform raises the fence this host owes while a refresh waits on it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RaisesAt {
+    /// Never: the test raises it, or none.
+    Never,
+    /// While it looks at the environment for the first time.
+    TheFirstLook,
+    /// While it starts the environment.
+    TheStart,
+}
+
+/// A platform that says the environment is stopped until it has been started, or that it is
+/// running, and raises a fence on this host where it is told to.
+struct SteppedPlatform {
     controller: std::sync::Weak<Controller>,
-    /// Whether the fence is raised while the platform answers, or left to the test.
-    raises: bool,
+    raises_at: RaisesAt,
     /// Whether the environment answers as running without being started.
     running: bool,
     started: std::sync::atomic::AtomicBool,
 }
 
-impl FenceRaisingPlatform {
-    fn new(controller: &Arc<Controller>, raises: bool, running: bool) -> Arc<Self> {
+impl SteppedPlatform {
+    fn new(controller: &Arc<Controller>, raises_at: RaisesAt, running: bool) -> Arc<Self> {
         Arc::new(Self {
             controller: Arc::downgrade(controller),
-            raises,
+            raises_at,
             running,
             started: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
     fn raise(&self) {
-        if self.raises
-            && let Some(controller) = self.controller.upgrade()
-        {
+        if let Some(controller) = self.controller.upgrade() {
             controller.hold_fence(true);
         }
     }
@@ -1553,71 +1561,121 @@ impl FenceRaisingPlatform {
     }
 }
 
-impl crate::bridge::store::Observer for FenceRaisingPlatform {
+impl crate::bridge::store::Observer for SteppedPlatform {
     fn observe(
         &self,
         _: &kr_protocol::identity::EnvironmentEnrolment,
     ) -> crate::error::Result<kr_protocol::identity::EnvironmentPresence> {
         use kr_protocol::identity::EnvironmentPresence;
         if self.running || self.was_started() {
-            Ok(EnvironmentPresence::Running)
-        } else {
-            self.raise();
-            Ok(EnvironmentPresence::EnvironmentStopped)
+            return Ok(EnvironmentPresence::Running);
         }
+        if self.raises_at == RaisesAt::TheFirstLook {
+            self.raise();
+        }
+        Ok(EnvironmentPresence::EnvironmentStopped)
     }
 
     fn start(&self, _: &kr_protocol::identity::EnvironmentEnrolment) -> crate::error::Result<()> {
         self.started
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        self.raise();
+        if self.raises_at == RaisesAt::TheStart {
+            self.raise();
+        }
         Ok(())
     }
 }
 
-/// KR-REQ-09.09: a fence that lands while a refresh waits on the platform stops the record of what
-/// the platform said, and a refresh that started the environment is then an outcome this host does
-/// not know and not a refusal it keeps: the start is not undone by the record not being made. A
-/// fence that lands after the record, before a bridge is opened, leaves the refresh as it ran and
-/// says no bridge was opened.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_fence_that_lands_while_a_refresh_waits_on_the_platform_stops_the_record() {
-    use kr_protocol::identity::{
-        EnvironmentEnrolParams, EnvironmentPresence, EnvironmentRefreshParams,
-        EnvironmentRefreshResult,
-    };
-    let (temp, controller, _clock) = daemon().await;
-    let (connection_id, actor_id) = admitted(&controller).await;
-    let carried = crate::authority::AdmittedMutation {
-        connection_id,
-        admitted_revision: controller
-            .admitted_revision(connection_id)
-            .expect("the connection is registered"),
-        deadline: None,
-    };
-    let change = |method: Method, params: ParamsValue| {
-        let controller = Arc::clone(&controller);
-        let mutation = mutation_of(&temp, method, params);
-        let actor =
-            super::routes::local_actor(actor_id.clone(), connection_id, controller.generation);
+/// A daemon with three enrolled environments and one connection, for tests of what a fence that
+/// lands while an environment refresh runs stops.
+struct Refreshing {
+    temp: kr_ipc::testing::TempHost,
+    controller: Arc<Controller>,
+    carried: crate::authority::AdmittedMutation,
+    actor_id: ActorId,
+    connection_id: ConnectionId,
+    _clock: ManualClock,
+}
+
+impl Refreshing {
+    async fn start() -> Self {
+        use kr_protocol::identity::EnvironmentEnrolParams;
+        let (temp, controller, clock) = daemon().await;
+        let (connection_id, actor_id) = admitted(&controller).await;
+        let carried = crate::authority::AdmittedMutation {
+            connection_id,
+            admitted_revision: controller
+                .admitted_revision(connection_id)
+                .expect("the connection is registered"),
+            deadline: None,
+        };
+        let rig = Self {
+            temp,
+            controller,
+            carried,
+            actor_id,
+            connection_id,
+            _clock: clock,
+        };
+        for byte in [1, 2, 3] {
+            let mutation = mutation_of(
+                &rig.temp,
+                Method::EnvironmentEnrol,
+                ParamsValue::from_typed(&EnvironmentEnrolParams {
+                    enrolment: enrolment_of(byte),
+                })
+                .expect("encodes"),
+            );
+            rig.record_change(Method::EnvironmentEnrol, mutation)
+                .await
+                .expect("enrolled");
+        }
+        rig
+    }
+
+    fn record_change(
+        &self,
+        method: Method,
+        mutation: MutationRequest,
+    ) -> impl std::future::Future<Output = crate::error::Result<ParamsValue>> + Send + 'static {
+        let controller = Arc::clone(&self.controller);
+        let actor = super::routes::local_actor(
+            self.actor_id.clone(),
+            self.connection_id,
+            controller.generation,
+        );
+        let carried = self.carried;
         async move {
             controller
                 .environment_record(&actor, false, &mutation, method, carried)
                 .await
         }
-    };
-    let refresh = |byte: u8, start: bool| {
-        change(
+    }
+
+    /// A refresh of the environment `byte` enrolled, asked to start it or not.
+    fn refresh(
+        &self,
+        byte: u8,
+        start: bool,
+    ) -> impl std::future::Future<Output = crate::error::Result<ParamsValue>> + Send + 'static {
+        use kr_protocol::identity::EnvironmentRefreshParams;
+        self.record_change(
             Method::EnvironmentRefresh,
-            ParamsValue::from_typed(&EnvironmentRefreshParams {
-                environment_id: enrolment_of(byte).environment_id,
-                start,
-            })
-            .expect("encodes"),
+            mutation_of(
+                &self.temp,
+                Method::EnvironmentRefresh,
+                ParamsValue::from_typed(&EnvironmentRefreshParams {
+                    environment_id: enrolment_of(byte).environment_id,
+                    start,
+                })
+                .expect("encodes"),
+            ),
         )
-    };
-    let status_of = |byte: u8| {
-        let state_dir = controller.paths.state_dir().to_path_buf();
+    }
+
+    /// What this host last recorded of the environment `byte` enrolled.
+    fn recorded_status(&self, byte: u8) -> kr_protocol::identity::EnvironmentPresence {
+        let state_dir = self.controller.paths.state_dir().to_path_buf();
         let environment_id = enrolment_of(byte).environment_id;
         crate::bridge::store::Store::with_locked(&state_dir, |store| {
             Ok(store
@@ -1628,42 +1686,49 @@ async fn a_fence_that_lands_while_a_refresh_waits_on_the_platform_stops_the_reco
         })
         .expect("the record opens")
         .expect("the environment is enrolled")
-    };
-    for byte in [1, 2, 3] {
-        change(
-            Method::EnvironmentEnrol,
-            ParamsValue::from_typed(&EnvironmentEnrolParams {
-                enrolment: enrolment_of(byte),
-            })
-            .expect("encodes"),
-        )
-        .await
-        .expect("enrolled");
     }
+}
 
-    // A refresh that only looks: the fence lands while the platform answers, and nothing is
-    // recorded of what it said.
-    let platform = FenceRaisingPlatform::new(&controller, true, false);
-    controller.ask_instead(platform.clone());
-    let refused = refresh(1, false).await.expect_err("the record is refused");
-    controller.hold_fence(false);
-    refused_for_a_fence(&refused.to_protocol_error());
-    assert_eq!(
-        status_of(1),
-        EnvironmentPresence::Stale,
-        "the answer was not recorded"
-    );
-    assert!(!platform.was_started());
+/// KR-REQ-09.09: a fence that lands while a refresh waits on the platform stops what it was about
+/// to do next. One that lands during the first look stops the start, and the refresh is refused
+/// with nothing recorded and nothing started; with no start asked for it stops the record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_that_lands_while_a_refresh_looks_at_the_environment_stops_the_start_and_the_record()
+ {
+    use kr_protocol::identity::EnvironmentPresence;
+    let rig = Refreshing::start().await;
+    for (byte, start) in [(1, false), (2, true)] {
+        let platform = SteppedPlatform::new(&rig.controller, RaisesAt::TheFirstLook, false);
+        rig.controller.ask_instead(platform.clone());
+        let refused = rig
+            .refresh(byte, start)
+            .await
+            .expect_err("the refresh is refused");
+        rig.controller.hold_fence(false);
+        refused_for_a_fence(&refused.to_protocol_error());
+        assert!(!platform.was_started(), "start asked for: {start}");
+        assert_eq!(
+            rig.recorded_status(byte),
+            EnvironmentPresence::Stale,
+            "start asked for: {start}"
+        );
+    }
+}
 
-    // A refresh that started the environment: the same fence, and the start is not undone by the
-    // record not being made, so the answer is an unknown outcome, which no claim keeps as a
-    // refusal.
-    let platform = FenceRaisingPlatform::new(&controller, true, false);
-    controller.ask_instead(platform.clone());
-    let unknown = refresh(2, true)
+/// KR-REQ-09.09: a fence that lands while a refresh starts the environment stops the record, and
+/// the refresh is then an outcome this host does not know and not a refusal it keeps: the start is
+/// not undone by the record not being made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_that_lands_while_a_refresh_starts_the_environment_is_an_unknown_outcome() {
+    use kr_protocol::identity::EnvironmentPresence;
+    let rig = Refreshing::start().await;
+    let platform = SteppedPlatform::new(&rig.controller, RaisesAt::TheStart, false);
+    rig.controller.ask_instead(platform.clone());
+    let unknown = rig
+        .refresh(1, true)
         .await
         .expect_err("the record is refused after a start");
-    controller.hold_fence(false);
+    rig.controller.hold_fence(false);
     assert!(platform.was_started());
     assert_eq!(unknown.code(), ErrorCode::OutcomeUnknown, "{unknown}");
     assert!(
@@ -1674,21 +1739,27 @@ async fn a_fence_that_lands_while_a_refresh_waits_on_the_platform_stops_the_reco
         ),
         "no claim keeps it as a refusal"
     );
-    assert_eq!(status_of(2), EnvironmentPresence::Stale);
+    assert_eq!(rig.recorded_status(1), EnvironmentPresence::Stale);
+}
 
-    // A fence that lands after the record is made: the refresh has run and is answered, and no
-    // bridge is opened for it.
-    controller.ask_instead(FenceRaisingPlatform::new(&controller, false, true));
-    let (arrived, release) = controller.after_the_environment_is_recorded.arm();
-    let waiting = tokio::spawn(refresh(3, false));
+/// KR-REQ-09.09: a fence that lands after a refresh has recorded what the platform said leaves the
+/// refresh answered, with the observation recorded, and says that no bridge was opened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_that_lands_after_a_refresh_is_recorded_leaves_it_answered_with_no_bridge() {
+    use kr_protocol::identity::{EnvironmentPresence, EnvironmentRefreshResult};
+    let rig = Refreshing::start().await;
+    rig.controller
+        .ask_instead(SteppedPlatform::new(&rig.controller, RaisesAt::Never, true));
+    let (arrived, release) = rig.controller.after_the_environment_is_recorded.arm();
+    let waiting = tokio::spawn(rig.refresh(1, false));
     arrival(arrived).await;
-    controller.hold_fence(true);
+    rig.controller.hold_fence(true);
     release.send(()).expect("the refresh goes on");
     let answered = waiting
         .await
         .expect("the refresh finishes")
         .expect("a refresh that has run is answered");
-    controller.hold_fence(false);
+    rig.controller.hold_fence(false);
     let result: EnvironmentRefreshResult = answered.to_typed().expect("a result");
     assert_eq!(result.row.status, EnvironmentPresence::Running);
     assert!(result.verification.0.is_none());
@@ -1697,11 +1768,42 @@ async fn a_fence_that_lands_while_a_refresh_waits_on_the_platform_stops_the_reco
         "{}",
         result.connection
     );
-    assert_eq!(
-        status_of(3),
-        EnvironmentPresence::Running,
-        "it was recorded"
+    assert_eq!(rig.recorded_status(1), EnvironmentPresence::Running);
+}
+
+/// KR-REQ-09.09: a fence that lands while a bridge is being opened leaves the refresh answered
+/// and not refused: the refresh has run, and what cannot be recorded of the bridge is said in the
+/// answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_that_lands_while_a_refresh_opens_a_bridge_leaves_it_answered() {
+    use kr_protocol::identity::{EnvironmentPresence, EnvironmentRefreshResult};
+    let rig = Refreshing::start().await;
+    rig.controller
+        .ask_instead(SteppedPlatform::new(&rig.controller, RaisesAt::Never, true));
+    // The record's pause fires first where the refresh takes the record and again where the
+    // bridge's outcome is recorded; the second is armed while the first holds the refresh.
+    let (first, release_first) = rig.controller.after_the_environment_record_is_taken.arm();
+    let waiting = tokio::spawn(rig.refresh(1, false));
+    arrival(first).await;
+    let (second, release_second) = rig.controller.after_the_environment_record_is_taken.arm();
+    release_first.send(()).expect("the refresh goes on");
+    arrival(second).await;
+    rig.controller.hold_fence(true);
+    release_second.send(()).expect("the refresh goes on");
+    let answered = waiting
+        .await
+        .expect("the refresh finishes")
+        .expect("a refresh that has run is answered");
+    rig.controller.hold_fence(false);
+    let result: EnvironmentRefreshResult = answered.to_typed().expect("a result");
+    assert_eq!(result.row.status, EnvironmentPresence::Running);
+    assert!(result.verification.0.is_none());
+    assert!(
+        result.connection.contains("did not record") && result.connection.contains("fence"),
+        "{}",
+        result.connection
     );
+    assert_eq!(rig.recorded_status(1), EnvironmentPresence::Running);
 }
 
 /// KR-REQ-09.09, 09.12 and 26.16: a machine group step another attempt recorded is not given back

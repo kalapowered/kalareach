@@ -372,18 +372,21 @@ impl Store {
     /// changes nothing in the record.
     ///
     /// The platform command can take seconds, and what the caller was admitted under can lapse
-    /// meanwhile. So what it saw is not recorded here: [`Self::record`] takes it in, under the
-    /// admission asked again.
+    /// meanwhile. So `admitted` is asked again after the first look and before the start, the one
+    /// thing here that changes the environment, and what the platform said is not recorded here:
+    /// [`Self::record`] takes it in, under the admission asked again.
     ///
     /// # Errors
     ///
-    /// Returns a not-found failure when nothing is enrolled under that identity, and whatever the
-    /// observer reported otherwise.
+    /// Returns a not-found failure when nothing is enrolled under that identity, `admitted`'s
+    /// refusal when it no longer stands at the start, whatever the observer reported otherwise,
+    /// and [`ControllerError::Uncertain`] when the look after a start failed: the start was made.
     pub fn observe(
         &self,
         environment_id: EnvironmentId,
         start: bool,
         observer: &dyn Observer,
+        admitted: &dyn Fn() -> Result<()>,
     ) -> Result<Observed> {
         let enrolment = self
             .enrolment(environment_id)
@@ -400,10 +403,21 @@ impl Store {
         })?;
         let mut started = false;
         if start && observer.observe(&enrolment)? != EnvironmentPresence::Running {
+            admitted()?;
             observer.start(&enrolment)?;
             started = true;
         }
-        let status = observer.observe(&enrolment)?;
+        let status = observer.observe(&enrolment).map_err(|error| {
+            if started {
+                ControllerError::Uncertain {
+                    detail: format!(
+                        "the environment was started and the look at it afterwards failed: {error}"
+                    ),
+                }
+            } else {
+                error
+            }
+        })?;
         Ok(Observed {
             enrolment,
             instance,
@@ -917,7 +931,7 @@ mod tests {
         observer: &dyn Observer,
         now_ms: u64,
     ) -> Result<Refreshed> {
-        let observed = store.observe(environment_id, start, observer)?;
+        let observed = store.observe(environment_id, start, observer, &|| Ok(()))?;
         store.record(observed, now_ms)
     }
 
