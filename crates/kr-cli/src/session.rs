@@ -3470,7 +3470,11 @@ mod tests {
             key(false, SHIFT_PRESSED),
         ];
         let (rest, steps) = take_scroll_keys(sent.to_vec(), &mut held, true);
-        assert_eq!((rest.len(), steps), (3, 0));
+        assert_eq!(
+            (rest, steps),
+            (sent.to_vec(), 0),
+            "the session is sent every record, in the order the console reported them"
+        );
         assert!(held.is_empty());
 
         // Down with Shift, then Shift is let go and the key repeats, then it comes up: all the
@@ -3478,6 +3482,25 @@ mod tests {
         let taken = [key(true, SHIFT_PRESSED), key(true, 0), key(false, 0)];
         let (rest, steps) = take_scroll_keys(taken.to_vec(), &mut held, true);
         assert_eq!((rest.len(), steps), (0, 2));
+        assert!(held.is_empty());
+
+        // Records of other keys among a held one's keep their order, and the held key's own go where
+        // it went down.
+        let other = |virtual_key: u16, key_down: bool| KeyRecord {
+            virtual_key,
+            ..key(key_down, 0)
+        };
+        let mixed = [
+            other(0x41, true),
+            key(true, 0),
+            other(0x42, true),
+            key(true, SHIFT_PRESSED),
+            other(0x41, false),
+            key(false, 0),
+            other(0x42, false),
+        ];
+        let (rest, steps) = take_scroll_keys(mixed.to_vec(), &mut held, true);
+        assert_eq!((rest, steps), (mixed.to_vec(), 0));
         assert!(held.is_empty());
 
         // The window stops being this terminal's part way through a hold: its repeats are dropped
