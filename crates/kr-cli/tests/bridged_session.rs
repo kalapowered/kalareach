@@ -3045,56 +3045,90 @@ async fn an_export_of_a_session_on_this_host_is_the_same_file() {
 }
 
 fn runtime_available() -> bool {
-    let present = std::process::Command::new(RUNTIME)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success());
-    if !present {
-        eprintln!("skipped, because {RUNTIME} is not installed on this machine");
+    Runtime::podman().is_available()
+}
+
+/// How long a call that asks about or acts on one container is given: `exec`, `inspect`, `stop`,
+/// `rm`, `image exists`.
+const QUICK_CALL_BOUND: Duration = Duration::from_secs(60);
+
+/// How long a call that fetches or builds an image is given.
+const SLOW_CALL_BOUND: Duration = Duration::from_secs(300);
+
+/// The container runtime a case drives, and how long it gives each call. A runtime that never
+/// answers fails the case that called it, with the call named, and does not hold the suite.
+#[derive(Clone)]
+struct Runtime {
+    program: PathBuf,
+    quick: Duration,
+    slow: Duration,
+}
+
+impl Runtime {
+    fn podman() -> Self {
+        Self {
+            program: PathBuf::from(RUNTIME),
+            quick: QUICK_CALL_BOUND,
+            slow: SLOW_CALL_BOUND,
+        }
     }
-    present
-}
 
-/// How long one call to the container runtime may take. A runtime that never answers must fail the
-/// case that called it with the call named, not hold the whole suite.
-const RUNTIME_CALL_BOUND: Duration = Duration::from_secs(300);
+    /// Runs one call to its end within `bound`, or says what went wrong with the call named.
+    fn run(&self, arguments: &[&str], bound: Duration) -> Result<std::process::Output, String> {
+        let mut command = std::process::Command::new(&self.program);
+        command.args(arguments);
+        user_manager::bounded(command, bound)
+    }
 
-/// How long one asking of the daemon in a container is given before it counts as no answer.
-const ASKING_BOUND: Duration = Duration::from_secs(30);
+    /// Runs one quick call. A call that does not end fails the case.
+    fn call(&self, arguments: &[&str]) -> std::process::Output {
+        self.run(arguments, self.quick)
+            .unwrap_or_else(|why| panic!("{why}"))
+    }
 
-fn podman(arguments: &[&str]) -> std::process::Output {
-    let mut command = std::process::Command::new(RUNTIME);
-    command.args(arguments);
-    user_manager::bounded(command, RUNTIME_CALL_BOUND).unwrap_or_else(|why| panic!("{why}"))
-}
+    /// Whether this machine has the runtime. A case skips itself where it has not.
+    fn is_available(&self) -> bool {
+        let present = std::process::Command::new(&self.program)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !present {
+            eprintln!(
+                "skipped, because {} is not installed on this machine",
+                self.program.display()
+            );
+        }
+        present
+    }
 
-/// Puts the images in the runtime's store, once per run of this suite, before any container starts:
-/// the base image, and the one that adds Git to it.
-fn image_present() {
-    static PULLED: std::sync::Once = std::sync::Once::new();
-    PULLED.call_once(|| {
-        if !podman(&["image", "exists", CONTAINER_IMAGE])
+    /// Puts the images in the runtime's store: the base image, and the one that adds Git to it.
+    fn ensure_images(&self) {
+        if !self
+            .call(&["image", "exists", CONTAINER_IMAGE])
             .status
             .success()
         {
-            let pulled = podman(&["pull", "--quiet", CONTAINER_IMAGE]);
+            let pulled = self
+                .run(&["pull", "--quiet", CONTAINER_IMAGE], self.slow)
+                .unwrap_or_else(|why| panic!("{why}"));
             assert!(
                 pulled.status.success(),
                 "the image is pulled: {}",
                 String::from_utf8_lossy(&pulled.stderr)
             );
         }
-        if podman(&["image", "exists", INSTALLED_IMAGE])
+        if self
+            .call(&["image", "exists", INSTALLED_IMAGE])
             .status
             .success()
         {
             return;
         }
         let context = tempfile::tempdir().expect("an empty build context");
-        let mut build = std::process::Command::new(RUNTIME)
+        let mut build = std::process::Command::new(&self.program)
             .args(["build", "--quiet", "--pull=never", "--tag", INSTALLED_IMAGE])
             .args(["--file", "-"])
             .arg(context.path())
@@ -3122,7 +3156,13 @@ fn image_present() {
             "the image that adds Git is built: {}",
             String::from_utf8_lossy(&built.stderr)
         );
-    });
+    }
+}
+
+/// Puts the images in the runtime's store, once per run of this suite, before any container starts.
+fn image_present() {
+    static PULLED: std::sync::Once = std::sync::Once::new();
+    PULLED.call_once(|| Runtime::podman().ensure_images());
 }
 
 /// The directory mounted into the container: `kr`, the daemon that adds the one thing a test must
@@ -3155,6 +3195,7 @@ fn programs_for_a_container() -> &'static Path {
 
 /// A container this test made, removed by the identifier the runtime issued however the test ends.
 struct Container {
+    runtime: Runtime,
     id: String,
     name: String,
 }
@@ -3162,9 +3203,13 @@ struct Container {
 impl Container {
     fn start() -> Self {
         image_present();
+        Self::create(Runtime::podman())
+    }
+
+    fn create(runtime: Runtime) -> Self {
         let name = format!("kr-acc-{}", &kr_ipc::new_uuid().to_string()[..8]);
         let mount = format!("{}:{MOUNTED}:ro", programs_for_a_container().display());
-        let started = podman(&[
+        let started = runtime.call(&[
             "run",
             "--detach",
             "--pull=never",
@@ -3196,14 +3241,14 @@ impl Container {
             kr_protocol::identity::is_container_identifier(&id),
             "the runtime issued a whole identifier: {id}"
         );
-        Self { id, name }
+        Self { runtime, id, name }
     }
 
     /// Runs one command inside, as root, and says what it printed.
     fn inside(&self, arguments: &[&str]) -> std::process::Output {
         let mut command = vec!["exec", "--user", "root", "--", self.id.as_str()];
         command.extend_from_slice(arguments);
-        podman(&command)
+        self.runtime.call(&command)
     }
 
     /// Chooses the standalone start for the daemon in this container, as a person sets one up,
@@ -3221,7 +3266,7 @@ impl Container {
             "{}",
             String::from_utf8_lossy(&chosen.stderr)
         );
-        let started = podman(&[
+        let started = self.runtime.call(&[
             "exec",
             "--detach",
             "--user",
@@ -3248,13 +3293,23 @@ impl Container {
     }
 
     /// Whether the daemon in this container answers `kr list` now. An asking that has not ended
-    /// within [`ASKING_BOUND`] is ended and counts as no answer, so that the wait for the daemon
-    /// is bounded by its own deadline and not by one call that never returns.
+    /// within the runtime's quick bound is ended and counts as no answer, so that the wait for the
+    /// daemon is bounded by its own deadline and not by one call that never returns.
     fn answers(&self) -> bool {
-        let mut command = std::process::Command::new(RUNTIME);
-        command.args(["exec", "--user", "root", "--", self.id.as_str()]);
-        command.args([&format!("{MOUNTED}/kr"), "list"]);
-        user_manager::bounded(command, ASKING_BOUND).is_ok_and(|output| output.status.success())
+        self.runtime
+            .run(
+                &[
+                    "exec",
+                    "--user",
+                    "root",
+                    "--",
+                    self.id.as_str(),
+                    &format!("{MOUNTED}/kr"),
+                    "list",
+                ],
+                self.runtime.quick,
+            )
+            .is_ok_and(|output| output.status.success())
     }
 
     /// The environment identity the daemon in this container reports for itself.
@@ -3273,7 +3328,7 @@ impl Container {
     }
 
     fn state(&self) -> String {
-        let inspected = podman(&[
+        let inspected = self.runtime.call(&[
             "container",
             "inspect",
             "--format",
@@ -3288,9 +3343,84 @@ impl Container {
 impl Drop for Container {
     fn drop(&mut self) {
         // By the identifier this test recorded, never by a name somebody else might hold now.
-        let _ = podman(&["rm", "--force", "--time", "0", "--", &self.id]);
+        let _ = self
+            .runtime
+            .call(&["rm", "--force", "--time", "0", "--", &self.id]);
         let _ = &self.name;
     }
+}
+
+/// How long a stand-in runtime gives each call in the cases that stall it: far less than a stall
+/// lasts, and far more than a call that answers takes.
+const STAND_IN_BOUND: Duration = Duration::from_secs(5);
+
+/// How long a stalled call of a stand-in runtime lasts: longer than [`STAND_IN_BOUND`], so that a
+/// harness that does not end the call by its bound waits for it, and a case that shows the bound
+/// fails instead of hanging.
+const STAND_IN_STALL_SECONDS: u32 = 40;
+
+/// A stand-in for the container runtime that answers every call with success and no output, except
+/// the calls whose command it is told to stall (`exec`, `build`, `--version`): those print nothing
+/// and do not end, as `podman exec` did on the build box. It records every call in `calls` in its
+/// directory, one line of arguments each, whether it stalls the call or not.
+fn stalling_runtime(directory: &Path, stalls: &[&str]) -> Runtime {
+    let text = directory.join("runtime.text");
+    std::fs::write(
+        &text,
+        format!(
+            r##"#!/bin/sh
+printf '%s\n' "$*" >>'{calls}'
+case "$1" in
+  {stalled}) exec sleep {STAND_IN_STALL_SECONDS} ;;
+  image) exit 1 ;;
+esac
+exit 0
+"##,
+            calls = directory.join("calls").display(),
+            stalled = stalls.join("|"),
+        ),
+    )
+    .expect("the stand-in runtime");
+    let program = directory.join("podman");
+    kr_ipc::testing::place_program(&text, &program);
+    Runtime {
+        program,
+        quick: STAND_IN_BOUND,
+        slow: STAND_IN_BOUND,
+    }
+}
+
+/// A container the harness holds by the identifier a stand-in runtime issued.
+fn held_in(runtime: Runtime) -> Container {
+    Container {
+        runtime,
+        id: STAND_IN_CONTAINER_ID.to_owned(),
+        name: "kr-acc-stand-in".to_owned(),
+    }
+}
+
+/// What a panic said.
+fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
+    panic
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+        .unwrap_or_default()
+}
+
+/// A call to the container runtime that never ends fails the case that made it, with the call
+/// named, and does not hold the suite.
+#[test]
+fn a_runtime_call_that_never_ends_fails_the_case_that_made_it_and_names_the_call() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let container = held_in(stalling_runtime(directory.path(), &["container"]));
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| container.state()));
+    let said = panic_message(failed.expect_err("a call that never ends fails the case"));
+    assert!(
+        said.contains("\"inspect\"") && said.contains(STAND_IN_CONTAINER_ID),
+        "the call is named: {said}"
+    );
+    assert!(said.contains("did not end within"), "{said}");
 }
 
 impl World {
@@ -3441,7 +3571,9 @@ async fn a_stopped_container_is_started_by_a_create_and_keeps_its_identity() {
     let identity = container.environment_id();
     assert_eq!(enrolled["row"]["enrolment"]["environment_id"], identity);
 
-    let stopped = podman(&["stop", "--time", "0", "--", &container.id]);
+    let stopped = container
+        .runtime
+        .call(&["stop", "--time", "0", "--", &container.id]);
     assert!(
         stopped.status.success(),
         "{}",
