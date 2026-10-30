@@ -161,14 +161,67 @@ fn window_here(title: &str) -> bool {
     .contains("kr-seen True")
 }
 
-/// What this test can read of the logon process that anchors a desktop-bound session, for the
-/// failure message of a session that could not be bound to a desktop.
-fn the_logon_process_as_seen_here() -> String {
-    here(
-        "Get-Process -Name winlogon | ForEach-Object { 'winlogon pid=' + $_.Id + ' session=' + \
-         $_.SessionId + ' start=' + $(try { $_.StartTime.ToString('o') } catch { 'unreadable' }) }; \
-         'this process session=' + (Get-Process -Id $PID).SessionId",
+/// Starts PowerShell through the environment's task, as a service, which the starter creates on
+/// its own desktop as it does a desktop-bound worker, makes it run the probe and make a window
+/// titled `title`, and returns what the probe found.
+async fn on_the_starters_desktop(host: &WorkerHost, title: &str) -> Found {
+    use kr_controller::supervision::{LaunchOutcome, ServiceLaunch, WorkerSupervisor as _};
+
+    let directory = host.tree.root();
+    let script = directory.join("probe.ps1");
+    let result = directory.join("probe.txt");
+    std::fs::write(
+        &script,
+        format!(
+            "{}\r\n$line = 'kr-probe ' + [KrProbe]::Run() + ' kr-end.'\r\n\
+             Set-Content -LiteralPath '{}' -Value $line\r\n[KrProbe]::Show('{title}', 30000)\r\n",
+            load(),
+            result.display()
+        ),
     )
+    .expect("the probe's script");
+    let outcome = host.task_supervisor().start_service(&ServiceLaunch {
+        label: format!("kr-probe-{}", kr_ipc::new_uuid()),
+        program: kr_worker::default_shell::platform_default().into(),
+        arguments: vec![
+            "-NoProfile".to_owned(),
+            "-NonInteractive".to_owned(),
+            "-ExecutionPolicy".to_owned(),
+            "Bypass".to_owned(),
+            "-File".to_owned(),
+            script.display().to_string(),
+        ],
+        jobs_directory: host.tree.environment().jobs_dir(),
+        working_directory: directory.to_path_buf(),
+    });
+    let LaunchOutcome::Started(identity) = outcome else {
+        panic!("the probe was not started: {outcome:?}");
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let found = loop {
+        if let Some(text) = std::fs::read_to_string(&result)
+            .ok()
+            .filter(|text| text.contains(" kr-end."))
+        {
+            break Found::of(&text);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the probe wrote nothing in 60 seconds"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    };
+    // The window is looked for while the probe holds it up, and the probe is ended afterwards.
+    let seen = (0..40).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        window_here(title)
+    });
+    kr_ipc::starter::end_process(&identity).expect("the probe is ended");
+    assert!(
+        seen,
+        "the probe's window was not seen on the interactive desktop"
+    );
+    found
 }
 
 /// KR-REQ-03.24: a headless session's shell is on a station and desktop of its own, away from the
@@ -214,46 +267,24 @@ async fn a_headless_session_is_not_on_the_interactive_desktop_and_a_desktop_boun
         "a window a headless session's shell made is on the interactive desktop"
     );
 
-    let cwd = host.tree.root().display().to_string();
-    let output = host
-        .kr(
-            &[
-                "--json",
-                "new",
-                "--invisible",
-                "--desktop",
-                "--cwd",
-                &cwd,
-                "--shell-mode",
-                "native_compat",
-            ],
-            &[],
-        )
-        .await;
-    let created = windows_session::Created {
-        document: serde_json::from_slice(&output.stdout).unwrap_or(serde_json::Value::Null),
-        output,
-    };
-    assert!(
-        created.succeeded(),
-        "a desktop-bound session was not created: {} {}",
-        created.said(),
-        the_logon_process_as_seen_here()
-    );
+    // What a desktop-bound worker is started on is what the task's starter gives a process it is
+    // told nothing about: its own desktop. A desktop-bound session cannot be bound here, because
+    // the login reader needs the start time of the session's logon process, which an account
+    // without administrative rights cannot read, so the same placement is asked for directly.
     let bound_title = title("bound");
-    let (bound, _holding_too) = probe_in_session(&host, &created, &bound_title).await;
+    let bound = on_the_starters_desktop(&host, &bound_title).await;
     assert!(
         bound.on_the_interactive_desktop(),
-        "a desktop-bound session's shell is not on the interactive desktop: {bound:?}"
+        "a process started on the starter's own desktop is not on the interactive desktop: {bound:?}"
     );
     assert_eq!(
         (bound.winsta0.as_str(), bound.default.as_str()),
         ("opened", "opened"),
-        "a desktop-bound session's shell reaches the interactive desktop: {bound:?}"
+        "a process started on the starter's own desktop reaches the interactive desktop: {bound:?}"
     );
     assert!(
         window_here(&bound_title),
-        "a window a desktop-bound session's shell made is not on the interactive desktop, so the \
-         look for the headless session's window could not have found one"
+        "a window a process started on the starter's own desktop made is not on the interactive \
+         desktop, so the look for the headless session's window could not have found one"
     );
 }

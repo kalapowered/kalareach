@@ -487,6 +487,11 @@ impl Prepared {
 }
 
 impl WorkerHost {
+    /// A supervisor that starts through this host's task, as the daemon's does.
+    pub fn task_supervisor(&self) -> kr_controller::supervision::windows::TaskSupervisor {
+        self._task.supervisor(&self.tree.environment())
+    }
+
     pub async fn start() -> Self {
         Prepared::new().start(None).await
     }

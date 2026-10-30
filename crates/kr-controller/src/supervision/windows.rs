@@ -1775,6 +1775,39 @@ mod launching {
             .map_err(|error| format!("decode: {error}"))
     }
 
+    /// The desktop a worker is made on, by its profile.
+    ///
+    /// A headless worker has no business on the person's desktop, so it is made one of its own,
+    /// named for the worker. A desktop-bound worker belongs to that desktop, and so does every
+    /// service: they are created on the starter's own.
+    fn own_desktop(profile: WorkerProfile, label: String) -> Option<String> {
+        match profile {
+            WorkerProfile::HeadlessUser => Some(label),
+            WorkerProfile::DesktopBound => None,
+        }
+    }
+
+    #[cfg(test)]
+    mod placement {
+        use kr_protocol::identity::WorkerProfile;
+
+        use super::own_desktop;
+
+        /// KR-REQ-03.24: a headless worker is made on a desktop of its own, named for the worker,
+        /// and a desktop-bound worker is not: it is made on the starter's own.
+        #[test]
+        fn only_a_headless_worker_is_made_on_a_desktop_of_its_own() {
+            assert_eq!(
+                own_desktop(WorkerProfile::HeadlessUser, "kr-worker-7".to_owned()),
+                Some("kr-worker-7".to_owned())
+            );
+            assert_eq!(
+                own_desktop(WorkerProfile::DesktopBound, "kr-worker-7".to_owned()),
+                None
+            );
+        }
+    }
+
     /// The Windows supervisor: every worker, and every service, is created by the environment's
     /// scheduled task's starter, never by this daemon, so none of them is ever in a job this daemon
     /// runs in.
@@ -2046,13 +2079,11 @@ mod launching {
 
     impl WorkerSupervisor for TaskSupervisor {
         fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome {
-            // A headless worker has no business on the person's desktop, so it is made one of its
-            // own, named for the worker. A desktop-bound worker belongs to that desktop.
-            let own_desktop = match launch.profile {
-                WorkerProfile::HeadlessUser => Some(launch.label()),
-                WorkerProfile::DesktopBound => None,
-            };
-            self.hand_over(&launch.service(), &launch.desktop_environment, own_desktop)
+            self.hand_over(
+                &launch.service(),
+                &launch.desktop_environment,
+                own_desktop(launch.profile, launch.label()),
+            )
         }
 
         fn start_service(&self, launch: &ServiceLaunch) -> LaunchOutcome {
