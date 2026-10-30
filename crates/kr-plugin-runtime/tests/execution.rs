@@ -928,7 +928,7 @@ fn kr_req_11_41_the_compatibility_hash_covers_the_engine_release() {
         )),
         "the engine's compatibility hash is not the one of the release this host names"
     );
-    for earlier in ["48.0.3", "48.0.6"] {
+    for earlier in ["48.0.3", "48.0.6", "48.0.7"] {
         assert_ne!(
             this_release,
             compatibility_under(wasmtime::ModuleVersionStrategy::Custom(earlier.to_owned())),
