@@ -978,6 +978,18 @@ async fn kr_req_25_28_a_guest_pairing_shares_no_session_and_no_screen_until_one_
             .any(|summary| summary.session_id == session_id),
         "and the open session is among them"
     );
+    // This file starts no worker, so nothing runs behind the open session. A viewer is authorised
+    // to read it, so the host answers that it serves no such session, where it refuses the guest
+    // the right to read it below.
+    let read = served
+        .read::<_, SessionReadResult>(Method::SessionRead, &SessionReadParams { session_id })
+        .await
+        .expect_err("nothing runs behind the open session");
+    assert_eq!(
+        read.code(),
+        ErrorCode::UnknownSession,
+        "a device paired as a viewer is authorised to read the open session: {read}"
+    );
 
     // A guest is refused the sessions of its host, listed or read.
     let session = net_support::connect(&host, &guest, &record).await;
