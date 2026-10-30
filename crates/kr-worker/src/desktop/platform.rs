@@ -1180,10 +1180,16 @@ mod tests {
             ),
             Presence::Ended
         );
-        assert_eq!(
-            super::named_presence("123456789", login.generation, 0),
-            Presence::Ended,
-            "a session number nobody holds is a login that has ended"
-        );
+        for nobody in [
+            "123456789".to_owned(),
+            format!("99{session}"),
+            "992".to_owned(),
+        ] {
+            assert_eq!(
+                super::named_presence(&nobody, login.generation, 0),
+                Presence::Ended,
+                "session {nobody}, which nobody holds, is a login that has ended"
+            );
+        }
     }
 }
