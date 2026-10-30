@@ -170,9 +170,14 @@ impl HeldDeviceAction {
     }
 }
 
-/// KR-ACC-022 and KR-REQ-27.05, revoked devices: a paired device's intent that the worker accepted
-/// durably and has not dispatched is taken back by a revocation committed while it is held, and
-/// never executes.
+/// KR-ACC-022 and KR-REQ-27.05, revoked devices, the part at the worker: a paired device's intent
+/// that the worker accepted durably and has not dispatched is taken back by a revocation committed
+/// while it is held, and never executes.
+///
+/// The case announces the revision itself, at host reach, and does not revoke the device through
+/// the daemon. The worker's fence takes every undispatched intent whatever the reach, so a
+/// device's revocation takes the intent back the same way; the revocation of a paired device
+/// through `device.revoke` is `network.rs`'s `a_revoked_device_is_fenced_before_it_is_served_again`.
 ///
 /// The sequence is section 9's. The device's action is accepted and held: its receipt says
 /// `accepted`, with no dispatch marker, and nothing is written to the upstream. The revocation is
