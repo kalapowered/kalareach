@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use companion_platform::call::{CallId, CallPlatform, Mute};
 use kr_client::services::account::SignedInAccount;
-use kr_client::services::voice::{ManagedVoiceBroker, ManagedVoiceService as _};
+use kr_client::services::voice::{ManagedVoiceBroker, ManagedVoiceService};
 use kr_client::services::voice_control::ControlConnector;
 use kr_client::services::{AccountTokenSource, ServiceHttp};
 use kr_protocol::ids::{ActionId, SessionId, VoiceSessionId};
@@ -82,6 +82,26 @@ impl Default for Timings {
     }
 }
 
+/// The client of the voice service at an origin, reached over `http` and presenting the tokens of
+/// an account: the managed inference client in the application's set of service clients.
+pub type BrokerFor = dyn Fn(
+        &str,
+        Arc<dyn ServiceHttp>,
+        Arc<dyn AccountTokenSource>,
+    ) -> std::result::Result<Arc<dyn ManagedVoiceService>, String>
+    + Send
+    + Sync;
+
+/// The managed voice broker, which is the client of the voice service the product uses.
+#[must_use]
+pub fn managed_brokers() -> Arc<BrokerFor> {
+    Arc::new(|origin, http, tokens| {
+        ManagedVoiceBroker::new(origin, http, tokens)
+            .map(|broker| Arc::new(broker) as Arc<dyn ManagedVoiceService>)
+            .map_err(|error| error.to_string())
+    })
+}
+
 /// The voice service this device's account is signed in at.
 #[derive(Clone)]
 pub struct Service {
@@ -91,9 +111,41 @@ pub struct Service {
     pub http: Arc<dyn ServiceHttp>,
     /// How its control sockets are opened.
     pub connector: ControlConnector,
+    /// How the client of its broker is got.
+    pub brokers: Arc<BrokerFor>,
 }
 
 impl Service {
+    /// A service at `origin`, whose broker is the managed one.
+    #[must_use]
+    pub fn new(origin: String, http: Arc<dyn ServiceHttp>, connector: ControlConnector) -> Self {
+        Self {
+            origin,
+            http,
+            connector,
+            brokers: managed_brokers(),
+        }
+    }
+
+    /// The same service, with another client of its broker.
+    #[must_use]
+    pub fn with_brokers(mut self, brokers: Arc<BrokerFor>) -> Self {
+        self.brokers = brokers;
+        self
+    }
+
+    /// The client of this service's broker, presenting the tokens of `tokens`.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the broker's client cannot be made.
+    pub fn broker(
+        &self,
+        tokens: Arc<dyn AccountTokenSource>,
+    ) -> std::result::Result<Arc<dyn ManagedVoiceService>, String> {
+        (self.brokers)(&self.origin, Arc::clone(&self.http), tokens)
+    }
+
     /// The managed voice service, at the fixed origin the account is signed in at, reached the way
     /// the account service is.
     ///
@@ -109,11 +161,11 @@ impl Service {
         let http = HttpService::with(gateway, HttpDeadlines::default(), managed_response_limits())
             .map_err(|error| error.to_string())?;
         let connector = ControlConnector::platform().map_err(|error| error.to_string())?;
-        Ok(Self {
-            origin: ACCOUNT_ORIGIN.to_owned(),
-            http: Arc::new(http),
+        Ok(Self::new(
+            ACCOUNT_ORIGIN.to_owned(),
+            Arc::new(http),
             connector,
-        })
+        ))
     }
 }
 
@@ -561,11 +613,10 @@ impl Shared {
         tokens: &Arc<SignedInAccount>,
         call_id: &str,
     ) -> bool {
-        let Ok(broker) = ManagedVoiceBroker::new(
-            self.service.origin.clone(),
-            Arc::clone(&self.service.http),
-            Arc::clone(tokens) as Arc<dyn AccountTokenSource>,
-        ) else {
+        let Ok(broker) = self
+            .service
+            .broker(Arc::clone(tokens) as Arc<dyn AccountTokenSource>)
+        else {
             return false;
         };
         let call_id = call_id.to_owned();
@@ -820,6 +871,16 @@ impl Calls {
     #[must_use]
     pub const fn absent() -> Self {
         Self { shared: None }
+    }
+
+    /// The client of the voice service's broker, presenting the tokens of `tokens`, when this
+    /// application makes calls.
+    #[must_use]
+    pub fn broker(
+        &self,
+        tokens: Arc<dyn AccountTokenSource>,
+    ) -> Option<Arc<dyn ManagedVoiceService>> {
+        self.shared.as_ref()?.service.broker(tokens).ok()
     }
 
     /// The calls of a phone, made through `platform` and controlled at `service`, taking up what

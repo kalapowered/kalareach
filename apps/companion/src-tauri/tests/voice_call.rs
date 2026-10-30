@@ -191,9 +191,9 @@ fn service_at(origin: &str) -> Service {
 
 /// The voice service at `origin`, with the deadlines its HTTP exchanges are given.
 fn service_with(origin: &str, deadlines: HttpDeadlines) -> Service {
-    Service {
-        origin: origin.to_owned(),
-        http: Arc::new(
+    Service::new(
+        origin.to_owned(),
+        Arc::new(
             HttpService::with(
                 kr_protocol::service::GatewayOrigin::new(origin).expect("an origin"),
                 deadlines,
@@ -201,8 +201,8 @@ fn service_with(origin: &str, deadlines: HttpDeadlines) -> Service {
             )
             .expect("a transport"),
         ),
-        connector: ControlConnector::platform().expect("a connector"),
-    }
+        ControlConnector::platform().expect("a connector"),
+    )
 }
 
 /// Everything one test holds.
