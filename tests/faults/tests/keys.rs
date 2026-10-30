@@ -38,9 +38,11 @@ fn files(root: &Path) -> BTreeSet<PathBuf> {
 }
 
 /// KR-REQ-27.05, missing keys: a collection key taken out of the device's store between two calls
-/// is reported as missing, by the epoch it belongs to, for reading and for writing; no key is made
-/// in its place and the store gains no file; the epoch whose key is still there goes on working;
-/// and the sealed object, which nothing touched, opens again once the key is back.
+/// is reported as missing for reading and for writing, with the code for a host that lacks what it
+/// needs and not a failure to authenticate; the refusal to write names the epoch, and the one to
+/// read is held to the code alone; no key is made in its place and the store gains no file; the
+/// epoch whose key is still there goes on working; and the sealed object, which nothing touched,
+/// opens again once the key is back.
 #[test]
 fn a_collection_key_that_vanishes_from_the_device_store_is_reported_and_never_replaced() {
     let parent = tempfile::tempdir().expect("a place for the store");

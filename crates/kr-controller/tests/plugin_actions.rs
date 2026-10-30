@@ -726,8 +726,10 @@ async fn kr_req_23_30_a_connection_that_ended_while_the_component_prepared_rejec
 }
 
 /// KR-REQ-23.30 and KR-REQ-27.05, plugin timeouts: an action is answered whatever its component
-/// does. With the host's replies kept back, a call that reached the component and is never
-/// answered is given up on, and the action is rejected, while they are still kept back.
+/// does. With the host's replies kept back, a call that is on its way to the plugin host (a frame
+/// passed the gate that holds the replies) and is never answered is given up on, and the action is
+/// rejected, while they are still kept back. The case does not show the component itself took the
+/// call.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_23_30_a_component_that_does_not_answer_costs_its_action_and_nothing_else() {
     let Some(acting) = Acting::start().await else {
@@ -746,7 +748,7 @@ async fn kr_req_23_30_a_component_that_does_not_answer_costs_its_action_and_noth
         .expect("the action was not answered: the silent component held it");
     assert!(
         acting.gate().frames_sent() > before,
-        "the call reached the plugin host before the action was given up on"
+        "a frame for the plugin host passed the gate before the action was given up on"
     );
     let Outcome::Error(refusal) = outcome else {
         panic!("an action whose component is silent was carried: {outcome:?}");

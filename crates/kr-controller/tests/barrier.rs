@@ -2369,12 +2369,17 @@ impl Drop for ApartWorker {
     }
 }
 
-/// KR-ACC-022 and KR-REQ-27.05, revoked devices: the whole sequence through this daemon's own
-/// revocation path - a worker isolated after its intents were durably accepted, a revocation
-/// announced while it cannot answer, the barrier reported pending in the meantime, and no affected
-/// undispatched action executed.
+/// KR-ACC-022 and KR-REQ-27.05, revoked devices, the part at the worker: the whole sequence
+/// through this daemon's revocation of the host's authority - a worker isolated after its intents
+/// were durably accepted, a revocation announced while it cannot answer, the barrier reported
+/// pending in the meantime, and no affected undispatched action executed.
 /// KR-REQ-02.08, the part that is about current state: an intent accepted under authority that a
 /// revocation then withdrew is rejected as revoked, and never reaches its dispatch marker.
+///
+/// The case revokes at host reach, with `revoke_authority`, and does not revoke a device. The
+/// worker's fence takes every undispatched intent whatever the reach, so a device's revocation
+/// takes the intent back the same way; the revocation of a paired device through `device.revoke`
+/// is `network.rs`'s `a_revoked_device_is_fenced_before_it_is_served_again`.
 ///
 /// The worker is held for the daemon's whole round, which is as long as the daemon bounds its
 /// steps, and the worker's session runtime and connections run on runtimes of their own for it,

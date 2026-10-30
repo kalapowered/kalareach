@@ -2113,6 +2113,10 @@ async fn kr_req_11_35_a_journal_fault_after_the_rich_marker_leaves_the_rich_answ
 /// failed write ends serves the terminal nothing more, the request stays uncertain, and nobody
 /// sends it again: a second answer from either writer is refused.
 ///
+/// The key is for an approval's answer. A dispatched mutation whose connection ends is
+/// `agent_service.rs`'s `kr_req_09_05_a_connection_that_ended_settles_nothing`, which carries no key
+/// of this row.
+///
 /// Not claimed: Windows, where no gateway runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_11_35_a_committed_marker_followed_by_a_failed_transmission_leaves_the_request_uncertain()
