@@ -669,13 +669,13 @@ pub fn create_private_tree(root: &Path, path: &Path) -> Result<()> {
 /// process's umask, and leaves one that exists as it is: it is not checked, and a symbolic link to a
 /// directory is followed.
 ///
-/// This is `std::fs::create_dir_all` with a mode of its own, for a directory below a root this
-/// installation verifies, where the root keeps others out and what is left to settle is the mode
-/// of what the host makes. [`create_private_tree`] is for a root and the directories that are
-/// checked each time they are asked for; one that exists with a wider mode is refused there, which
-/// here would refuse a directory an earlier release made with the umask's mode inside a root that
-/// was always owner-only. A directory made on Windows takes the access list of the one above it,
-/// and the check of a root there accepts that list.
+/// This is `std::fs::create_dir_all` with a mode of its own. [`create_private_tree`] uses it for
+/// the directories above a root that are missing, which it makes owner-only and does not check. A
+/// caller that makes a directory below a root this installation verifies uses it where the root
+/// keeps others out and what is left to settle is the mode of what the host makes: a directory
+/// that exists there with a wider mode is one an earlier release made with the umask's mode, which
+/// [`create_private_tree`] would refuse. A directory made on Windows takes the access list of the
+/// one above it, and the check of a root there accepts that list.
 ///
 /// # Errors
 ///
@@ -738,8 +738,8 @@ pub fn create_private_directory(path: &Path) -> Result<()> {
         Err(error) => return Err(IpcError::io("inspect", path, error)),
     }
     build_owner_only_directory(path)?;
-    let metadata =
-        std::fs::symlink_metadata(path).map_err(|error| IpcError::io("inspect", path, error))?;
+    let metadata = std::fs::symlink_metadata(without_final_separator(path))
+        .map_err(|error| IpcError::io("inspect", path, error))?;
     check_owner_only(path, &metadata)
 }
 
@@ -747,7 +747,7 @@ pub fn create_private_directory(path: &Path) -> Result<()> {
 ///
 /// The operating system resolves a symbolic link whose name ends in a separator, so the name `link/`
 /// is looked up as the directory the link points to, and the link goes unseen. A root given that
-/// way has to be looked at as the name it is. Only the lookup drops the separator: the path in an
+/// way has to be looked at as the name it is. Only the lookups drop the separator: the path in an
 /// error stays as it was given, so that a caller that shows the configured root finds it.
 fn without_final_separator(path: &Path) -> &Path {
     path.components().as_path()
