@@ -12,8 +12,11 @@ A reference host has:
 * at least four processors, counted as the processors the operating system makes available to the
   measuring process. Section 27 says CPU cores, and this count is of logical processors: a host
   with two cores and two hardware threads each passes it. A figure that is to stand for the
-  reference host is taken on a host with four physical cores, which the processor recorded beside
-  the figure shows;
+  reference host is taken on a host with four physical cores. The record does not show that. It
+  holds the processor's model name and the count of logical processors, and it reads neither the
+  physical cores nor the threads per core. The person who takes a reference figure reads that
+  topology from the host itself (`lscpu` on Linux, `sysctl hw.physicalcpu hw.logicalcpu` on macOS)
+  and states it beside the figure in the release acceptance record;
 * at least 8 GiB of memory, as the operating system reports it (`MemTotal` on Linux, `hw.memsize` on
   macOS);
 * its operating system and architecture recorded beside every figure taken on it;
@@ -126,9 +129,9 @@ load is waited out, not a host condition.
 | KR-PERF-003 | below 500 MiB and 1% of one core | `crates/kr-worker/tests/performance.rs` (`idle_resources_for_twenty_sessions_and_thirty_two_views`) | The idle configuration's daemon, workers and root shells: processor time over five minutes and resident memory at the end. The processor bound is asserted where the host meets the reference host's conditions, and elsewhere recorded with the shortfall named; the memory bound is asserted on every host. The stress run reports the same readings under stress, which section 27 sets no bound on, and the whole product's memory with the plugin host serving |
 | KR-PERF-004 | a usable 120x40 screen within 500 ms | `performance.rs` (`attach_to_a_usable_screen`) | Five attachments of each presentation, from the connection to a screen a person could look at. The worker makes three journal records durable before it answers an attach, so the 500 ms is asserted unless the disk's durable writes took longer than the reference host admits at either edge, which the record names as a missing condition |
 | KR-PERF-005 | under 25 ms p95 above the path's round trip | `crates/kr-transport/tests/perf.rs` | Remote input over a real connection while a bulk transfer runs, less the path's own round trip. The target is asserted where the host meets the reference host's conditions, and elsewhere recorded with the shortfall named |
-| KR-PERF-006 | usable state within two seconds | `crates/kr-transport/tests/perf.rs`, `crates/kr-client/tests/session.rs` and `crates/kr-controller/tests/network_reconnect_time.rs` | The transport's share is timed: reconnecting, the handshake, a stream and a 120x40 snapshot. The client's share is asserted inside the budget: the subscription through the client library and a painted 120x40 screen, plainly and after one refused read. A reconnect to a real daemon and worker is asserted inside the budget as well: a paired device that has been attached and has gone dials again and resumes the cursors the ended session carried, and the clock runs from the dial through the connection, the attach, the subscription from the carried position and the host's projection to a painted 120x40 screen |
+| KR-PERF-006 | usable state within two seconds | `crates/kr-transport/tests/perf.rs`, `crates/kr-client/tests/session.rs` and `crates/kr-controller/tests/network_reconnect_time.rs` | The transport's share is timed: reconnecting, the handshake, a stream and a 120x40 snapshot. The client's share is asserted inside the budget: the subscription through the client library and a painted 120x40 screen, plainly and after one refused read. A reconnect to a real daemon and worker is timed as well: a paired device that has been attached and has gone dials again and resumes the cursors the ended session carried, and the clock runs from the dial through the connection, the attach, the subscription from the carried position and the host's projection to a painted 120x40 screen. The budget is asserted where the host meets the reference host's conditions that a run can read (an optimised build, four processors, 8 GiB, and at most 1% of the time taken by a hypervisor), and elsewhere the figure is recorded with the shortfall named; a debug build always lacks one, so the landing workflow's debug runs record the figure and cannot fail on its time |
 | KR-PERF-007 | drain 5 MiB/s without unbounded queues; slow observers resynchronise | `crates/kr-term/tests/perf.rs`, and the stress run | The engine's sustained rate on a plain and a scrolling stream, with every bound checked. Two figures against the history behind the screen: what one read costs behind a history at its bound against one behind an emptied history (at most four times as much), and how many rows a session reads over the same reads in each (at most twice as many). In the stress run, the observer that stops reading is told to resynchronise and receives output again once it resubscribes, and no other view goes an interval without output |
-| KR-PERF-008 | one batch per animation frame; input stays responsive | `apps/companion/test/performance.test.tsx` and `apps/companion/e2e/performance.spec.ts` | Events folded into frames, a keystroke's cost against the size of the history while output streams, what a keystroke touches in the document, and how many nodes are drawn for a long history. In a real browser engine, the time from a key's event to the second animation frame after it, typed while twenty nodes a frame stream over a history of four thousand, recorded in frame periods of the page's own idle frames and against the same keys with a short history and nothing streaming. The case asserts only that every key arrived in order and was timed and that the stream was drawn meanwhile; the readings carry a verdict against reference bounds for a reference run to read |
+| KR-PERF-008 | one batch per animation frame; input stays responsive | `apps/companion/test/performance.test.tsx` and `apps/companion/e2e/performance.spec.ts` | Events folded into frames, a keystroke's cost against the size of the history while output streams, what a keystroke touches in the document, and how many nodes are drawn for a long history. In a real browser engine, the time from a key's event to the second animation frame after it, typed while twenty nodes a frame stream over a history of four thousand, recorded in frame periods of the page's own idle frames and against the same keys with a short history and nothing streaming. The case asserts only that every key arrived in order and was timed and that the stream was drawn meanwhile; the readings carry a verdict against reference bounds for a person who runs the spec on a reference host to read, and no run of `scripts/bench-all.sh` takes it |
 | KR-PERF-009 | 4 GiB, four threads and 30 seconds per description | `scripts/bench-descriptions.sh` | The selected profile against real weights at 1, 5, 20 and 50 sessions, with the resource pause beside it |
 | KR-PERF-010 | first audio and delegation latency recorded | none: the target's method is a paired phone with a connected media path to the voice provider | A host cannot take it. The phones' call classes report the remote audio track where it is added (iOS's `didAdd` receiver, Android's `onAddTrack`), which shows that a track exists, not that its audio has played. The voice service records, for each call, the time from creating it to releasing its answer and to its sideband being ready, which the web repository's voice tests check. Neither is a measurement of delegation latency or of the first audio a person hears |
 
@@ -164,14 +167,21 @@ host did not meet.
 
 ### Two measurements taken by name
 
-Two measurements are not steps of `scripts/bench-all.sh`, and neither writes a Markdown section.
+Two measurements are not steps of `scripts/bench-all.sh`.
 KR-PERF-006's reconnect to a real daemon is
-`cargo test --locked --release -p kr-controller --test network_reconnect_time -- --nocapture`: it
-asserts the two seconds on every host and prints its reading with the host's operating system,
-architecture, processors and build.
+`cargo test --locked --release -p kr-controller --test network_reconnect_time -- --nocapture`. The
+case is built for macOS and Linux only; on Windows the command runs no test and exits 0. It records
+its figure in every run, printed and, where `KR_TEST_ARTIFACTS_DIR` is set, written to
+`kr-transport-scheduling.md`, with the build, the operating system and architecture, the processor,
+the processors, the memory, the load average and the share of time a hypervisor took where the
+platform accounts for it, and names each condition of the reference host that the run lacks. It
+asserts the two seconds only in a release build on a host that lacks none.
 KR-PERF-008's responsiveness in a real browser is
 `pnpm -C apps/companion e2e e2e/performance.spec.ts`: it prints each engine's reading with a verdict
-and attaches the figures, with the engine, to the run. The landing workflow runs both with its other tests.
+and the host's operating system, architecture, processor, logical processors and memory, and
+attaches the figures, with the engine and the host, to the run. It asserts no time of its own;
+Playwright's limits of 30 seconds for the case and 5 seconds for each `expect` still apply.
+The landing workflow runs both with its other tests, the reconnect case in a debug build.
 
 ## The records
 
@@ -185,7 +195,7 @@ where and why. The conformance report attaches each section to its identifier (s
 | --- | --- | --- |
 | `kr-worker-input.md` | `input_latency.rs` | KR-PERF-001, KR-PERF-002 |
 | `kr-worker-performance.md` | `performance.rs` | KR-PERF-003, KR-PERF-004 |
-| `kr-transport-scheduling.md` | `crates/kr-transport/tests/perf.rs` | KR-PERF-005, KR-PERF-006 |
+| `kr-transport-scheduling.md` | `crates/kr-transport/tests/perf.rs`, and `crates/kr-controller/tests/network_reconnect_time.rs` when a run sets `KR_TEST_ARTIFACTS_DIR` | KR-PERF-005, KR-PERF-006 |
 | `kr-term-output-handling.md` | `crates/kr-term/tests/perf.rs` | KR-PERF-007 four times |
 | `kr-perf-stress.md` | `tests/perf/tests/stress.rs` | KR-PERF-001, KR-PERF-003 twice, KR-PERF-007 |
 | `bench-all.md` | `scripts/bench-all.sh` | KR-PERF-006's client share, KR-PERF-008, KR-PERF-009, KR-PERF-010, and one conditions section for each identifier the run measured |
@@ -203,8 +213,9 @@ average, and whether the run's time was read from each thread's time or each pro
 stolen share over it, then the outcome, and whether the figures are reference figures. Figures are
 reference figures only when the run was asked for them, the host met every condition it read, every
 reading could be taken, no record of the step names a shortfall, and the run kept all of its
-evidence. The conditions the script reads count logical processors, so whether four of them are four
-physical cores is read from the processor each record names. The conditions sections are the last thing a run writes, and are published together in
+evidence. The conditions the script reads count logical processors, and a record names the processor's model
+and says nothing of how its processors divide into cores, so whether four of them are four
+physical cores is not shown by the record. The conditions sections are the last thing a run writes, and are published together in
 one step, so a run that could not keep its evidence leaves none that calls its figures reference
 figures.
 
@@ -214,11 +225,14 @@ A platform's release figures come from a reference host of that platform: an App
 Intel Mac for macOS, an x86-64 or an ARM64 Linux machine for Linux, and a Windows 11 machine on
 x86-64 or ARM64 for Windows, each meeting the definition above with nothing else running. On macOS
 and Linux the figures are those of a `scripts/bench-all.sh --reference-host` run that met every
-condition. On Windows they come from the same suites, run on the Windows 11 host.
+condition. On Windows they come from the same suites, run on the Windows 11 host, less the by-name reconnect
+measurement, which is not built there.
 
 The four-processor Linux runners that continuous integration uses meet the definition's count of
 processors, and their figures count as Linux x86-64 figures only where the runner's four processors
-are four physical cores, which the processor recorded beside the figure shows; a runner whose four
-processors are two cores with two hardware threads each records its figures and none of them is a
-release figure. The macOS runner it uses has three processors, below the
-reference host's four, so its figures are recorded and none of them is a release figure.
+are four physical cores. The record does not show that: a hosted runner records a processor model
+name, which does not say how the runner's processors divide into cores. The topology is read from
+the runner itself and stated beside the figure in the release acceptance record, and a runner whose
+four processors are two cores with two hardware threads each records its figures and none of them
+is a release figure. The macOS runner it uses has three processors, below the reference host's
+four, so its figures are recorded and none of them is a release figure.
