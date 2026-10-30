@@ -815,20 +815,35 @@ async fn answering_worker(
     recorded: crate::service::a_close_a_worker_never_answers::Recorded,
     stated: CanonicalSet<kr_protocol::ids::CapabilityId>,
 ) -> crate::service::a_close_a_worker_never_answers::Silent {
+    answering_worker_refusing(
+        answers,
+        recorded,
+        stated,
+        kr_protocol::error::ProtocolError::new(
+            kr_protocol::error::ErrorCode::ResourceUnavailable,
+            "this worker answers only the reads its test gave it",
+        ),
+    )
+    .await
+}
+
+/// As [`answering_worker`], and what it refuses a request with is `refusal`.
+async fn answering_worker_refusing(
+    answers: Answers,
+    recorded: crate::service::a_close_a_worker_never_answers::Recorded,
+    stated: CanonicalSet<kr_protocol::ids::CapabilityId>,
+    refusal: kr_protocol::error::ProtocolError,
+) -> crate::service::a_close_a_worker_never_answers::Silent {
     use std::sync::Arc;
 
     use kr_protocol::envelope::{ControlFrame, Outcome, Response};
-    use kr_protocol::error::{ErrorCode, ProtocolError};
 
     use crate::service::a_close_a_worker_never_answers as fake;
 
-    let refused = |request_id: RequestId| {
+    let refused = move |request_id: RequestId| {
         ControlFrame::Response(Response {
             request_id,
-            outcome: Outcome::Error(ProtocolError::new(
-                ErrorCode::ResourceUnavailable,
-                "this worker answers only the reads its test gave it",
-            )),
+            outcome: Outcome::Error(refusal.clone()),
         })
     };
     fake::fake_world(move |listener, identity, endpoint_text| {
@@ -842,6 +857,7 @@ async fn answering_worker(
                 let answers = Arc::clone(&answers);
                 let recorded = Arc::clone(&recorded);
                 let stated = stated.clone();
+                let refused = refused.clone();
                 tokio::spawn(async move {
                     let (mut reader, mut writer) =
                         kr_ipc::framed::split(connection, kr_protocol::frame::StreamKind::Control);
@@ -5715,5 +5731,167 @@ async fn a_retry_answered_from_the_workers_receipt_is_refused_when_a_fence_lands
         kr_protocol::error::ErrorCode::PermissionDenied
     );
     assert!(refused.message.contains("fence"), "{refused:?}");
+    world.serving.abort();
+}
+
+/// What a worker refuses a device with, and what names the host in it, reaches the device as a
+/// sentence that names none of it; the code travels as the worker gave it.
+///
+/// The refusal is the worker's own text, which this daemon cannot make again, so it is held to the
+/// rule where it is written to the device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_workers_refusal_that_names_the_hosts_files_reaches_a_device_without_them() {
+    use std::sync::Arc;
+
+    use kr_protocol::envelope::ControlFrame;
+    use kr_protocol::error::{ErrorCode, ProtocolError};
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+
+    let said = "the session journal is unavailable: open \
+                /Users/marguerite/.local/state/kr/journal.sqlite3: permission denied";
+    let world = answering_worker_refusing(
+        Arc::new(|_| None),
+        Arc::default(),
+        reads_scopes(),
+        ProtocolError::new(ErrorCode::ResourceUnavailable, said),
+    )
+    .await;
+    fake::acknowledged(&world.controller, world.session_id);
+    let (connection, kept) = viewing_connection(&world.controller, 62);
+
+    let answer = connection
+        .answer_now(ControlFrame::Request(history_page_of(world.session_id, 1)))
+        .await
+        .expect("an answer");
+    assert!(
+        connection.write_answer(answer).await,
+        "the connection stands"
+    );
+    let told = error_of(&kept.frames()[0]).clone();
+    assert_eq!(told.code, ErrorCode::ResourceUnavailable);
+    assert!(
+        told.message
+            .starts_with("the session journal is unavailable;"),
+        "{told:?}"
+    );
+    assert!(
+        !told.message.contains("marguerite") && !told.message.contains('/'),
+        "{told:?}"
+    );
+    world.serving.abort();
+}
+
+/// What the agent of a session refused a device's cancellation with is the agent's own words, and
+/// the device is told the refusal's code and a sentence from it, whatever the words quote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agents_refusal_of_what_a_device_put_to_it_is_not_shown_to_the_device() {
+    use std::sync::Arc;
+
+    use kr_protocol::agent::{AgentCancelParams, AgentMutationTarget, AgentSubject};
+    use kr_protocol::envelope::ControlFrame;
+    use kr_protocol::error::{ErrorCode, ProtocolError};
+    use kr_protocol::rights::ActionRight;
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+
+    let said = "account marguerite cannot run git status";
+    let world = answering_worker_refusing(
+        Arc::new(|_| None),
+        Arc::default(),
+        reads_scopes(),
+        ProtocolError::new(ErrorCode::InvalidArgument, said),
+    )
+    .await;
+    let controller = &world.controller;
+    fake::acknowledged(controller, world.session_id);
+    let connection = super::RemoteConnection::for_test(
+        controller,
+        paired(controller, 15, |grant| {
+            grant.actions = [ActionRight::SessionView, ActionRight::AgentCancel]
+                .into_iter()
+                .collect();
+        }),
+    );
+    let cancel = device_mutation(
+        &world,
+        &connection,
+        Method::AgentTurnCancel,
+        1,
+        ParamsValue::from_typed(&AgentCancelParams {
+            target: AgentMutationTarget {
+                subject: AgentSubject {
+                    session_id: world.session_id,
+                    application_instance_id: kr_protocol::ids::ApplicationInstanceId::new(
+                        Uuid::from_bytes([5; 16]),
+                    ),
+                },
+                binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
+            },
+            turn_id: kr_protocol::ids::AgentTurnId::new("turn-1").expect("a turn"),
+        })
+        .expect("encodes"),
+    );
+    let answer = connection
+        .answer_now(ControlFrame::Mutation(Box::new(cancel)))
+        .await
+        .expect("the cancellation is answered");
+    let told = error_of(answer.frame());
+    assert_eq!(told.code, ErrorCode::InvalidArgument, "{told:?}");
+    assert!(!told.message.contains("marguerite"), "{told:?}");
+    world.serving.abort();
+}
+
+/// What a closure left behind and could not establish, when it names the host, reaches a device as
+/// the kind of thing it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn what_a_closure_left_behind_is_written_to_a_device_without_the_hosts_paths() {
+    use kr_protocol::envelope::{ControlFrame, Notification};
+    use kr_protocol::session::SurvivingResource;
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+
+    let world = fake::fake_worker(None).await;
+    let (connection, kept) = viewing_connection(&world.controller, 63);
+    let record = kr_protocol::session::ClosureRecord {
+        session_id: world.session_id,
+        session_epoch: SessionEpoch::V1,
+        reason: kr_protocol::session::ClosureReason::RootExit,
+        root_exit_code: Nullable::null(),
+        root_signal: Nullable::null(),
+        terminated: Vec::new(),
+        surviving: vec![SurvivingResource {
+            kind: "unestablished".to_owned(),
+            detail: "the control group /sys/fs/cgroup/user.slice/user-1000.slice could not be read"
+                .to_owned(),
+        }],
+        ownership_coverage: kr_protocol::session::OwnershipCoverage::Incomplete,
+        durability: kr_protocol::session::Durability::Durable,
+        closed_at_ms: kr_protocol::scalars::TimestampMs::new(1),
+    };
+    let closed = ControlFrame::Notification(Notification {
+        stream_id: kr_protocol::ids::StreamId::new("session").expect("a stream"),
+        sequence: kr_protocol::ids::EventSequence::new(1),
+        event_type: kr_protocol::ids::EventType::new(kr_protocol::session::SESSION_CLOSED_EVENT)
+            .expect("an event type"),
+        payload: ParamsValue::from_typed(&record).expect("encodes"),
+    });
+    assert!(
+        connection.output.send(&closed).await,
+        "the frame is written"
+    );
+
+    let ControlFrame::Notification(written) = kept.frames()[0].clone() else {
+        panic!("a notification was written");
+    };
+    let written: kr_protocol::session::ClosureRecord =
+        written.payload.to_typed().expect("a closure");
+    assert_eq!(written.surviving[0].kind, "unestablished");
+    assert!(
+        !written.surviving[0].detail.contains("/sys")
+            && !written.surviving[0].detail.contains("1000"),
+        "{:?}",
+        written.surviving
+    );
     world.serving.abort();
 }

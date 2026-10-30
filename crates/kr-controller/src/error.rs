@@ -147,6 +147,12 @@ pub enum ControllerError {
     /// Local IPC failed.
     #[error("{0}")]
     Ipc(#[from] kr_ipc::IpcError),
+    /// The directory a session works in could not be made.
+    ///
+    /// It is reported under the code of what failed, and says which directory it was before it
+    /// says why, so that a message cut at the first path still tells a person what failed.
+    #[error("the host could not make the session's directory: {0}")]
+    SessionDirectory(#[source] kr_ipc::IpcError),
     /// A proof failed.
     #[error("{0}")]
     Verification(#[from] kr_ipc::verify::VerificationError),
@@ -218,7 +224,7 @@ impl ControllerError {
             Self::ClockUntrusted { .. } => ErrorCode::ClockUntrusted,
             Self::Refused { code, .. } => *code,
             Self::ShellIntegrationUnsupported(_) => ErrorCode::ShellIntegrationUnsupported,
-            Self::Ipc(error) => error.code(),
+            Self::Ipc(error) | Self::SessionDirectory(error) => error.code(),
             Self::NotConfigured(_) => ErrorCode::HostNotConfigured,
         }
     }

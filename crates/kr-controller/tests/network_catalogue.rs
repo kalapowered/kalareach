@@ -979,3 +979,94 @@ async fn a_plugin_grant_is_confirmed_by_an_owner_device_and_by_nothing_else() {
     session.close();
     host.stop().await;
 }
+
+/// A catalogue action that fails on a file of this host is answered to a device, and recorded in
+/// its receipt, without the file's place; the owner's own client is told it.
+///
+/// The generation a device asked the host to read is taken away before the read, so the failure is
+/// the one a real host meets when a repository it trusts has gone. The receipt is the catalogue's
+/// own, which a device reads back with `action.read`, and it says that its message was replaced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_catalogue_action_does_not_show_a_device_where_the_generation_was() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let device = net_support::Device::create().await;
+    let record = net_support::pair_with(
+        &host,
+        &device,
+        &owner,
+        net_support::proposal(CATALOGUE_RIGHTS),
+    )
+    .await;
+    let raw = net_support::RawDevice::connect(&host, &device, &record).await;
+    raw.claim();
+    let published = Published::create();
+    let environment_id = host.environment_id;
+    let _: wire::CatalogueAddResult = typed(
+        &raw.mutate(
+            Method::CatalogueAdd,
+            kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(environment_id),
+            &add_params(&host, &owner, &published),
+        )
+        .await
+        .expect("catalogue.add answers a device"),
+    );
+    let place = published
+        ._temp
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("a name")
+        .to_owned();
+    std::fs::remove_dir_all(&published.root).expect("the generation goes away");
+
+    let sync = wire::CatalogueSyncParams {
+        environment_id,
+        catalogue_id: "development".to_owned(),
+    };
+    let action_id = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
+    let told = net_support::refusal(
+        raw.mutate(
+            Method::CatalogueSync,
+            action_id,
+            ActionTarget::environment(environment_id),
+            &sync,
+        )
+        .await,
+    );
+    assert!(!told.message.contains(&place), "{told:?}");
+    let read: kr_protocol::receipt::ActionReadResult = typed(
+        &raw.read(
+            Method::ActionRead,
+            &kr_protocol::receipt::ActionReadParams {
+                action_id,
+                session_id: None,
+            },
+        )
+        .await
+        .expect("action.read answers for a catalogue action"),
+    );
+    assert!(read.receipt.error_withheld, "{:?}", read.receipt);
+    let recorded = read.receipt.error.0.expect("the failure is recorded");
+    assert_eq!(recorded.code, told.code);
+    assert!(!recorded.message.contains(&place), "{recorded:?}");
+
+    // The owner, on the local socket, is told where the generation was.
+    let mut local = host.client().await;
+    let owner_told = net_support::refusal(
+        local
+            .mutate(
+                Method::CatalogueSync,
+                kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(environment_id),
+                &sync,
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert!(owner_told.message.contains(&place), "{owner_told:?}");
+
+    raw.close();
+    host.stop().await;
+}

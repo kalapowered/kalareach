@@ -449,6 +449,35 @@ impl Host {
         self.temp.paths().runtime_root()
     }
 
+    /// Starts a daemon with `owner` as its first owner on a fresh environment whose tree lies
+    /// under `parent`, which is how a suite puts the host's directories under a home directory
+    /// of its own choosing.
+    pub async fn start_under(owner: &DeviceKeys, parent: &Path) -> Self {
+        let mut host = Self::start_on(
+            kr_ipc::testing::TempHost::create_in(parent),
+            room::TestRoom::new(),
+            NetworkSettings {
+                endpoint: loopback(),
+                ..NetworkSettings::default()
+            },
+            AccountAt::Managed,
+            Arc::new(MemoryStore::new()),
+            Clocks::system(),
+            None,
+            Waits::default(),
+        )
+        .await;
+        let (device, record) = bootstrap_owner(&host, owner).await;
+        host.owner = Some(record);
+        host.owner_device = Some(device);
+        host
+    }
+
+    /// The directory the daemon makes each session's working directory in.
+    pub fn workers_dir(&self) -> PathBuf {
+        self.temp.environment().workers_dir()
+    }
+
     /// Starts a daemon on a fresh environment, on the network, with no owner yet.
     pub async fn start_unowned() -> Self {
         Self::start_unowned_on_clocks(Clocks::system()).await
