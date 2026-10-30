@@ -1796,8 +1796,14 @@ async fn a_paired_devices_cursors_count_nothing_before_its_pairing_and_are_sent_
     assert_eq!(shown.from_cursor.get(), cursors[0]);
     assert_eq!(shown.to_cursor.get(), cursors[1] + 1);
 
-    // The log's own cursor, and a number past where the log ends, are not numbers it was given.
-    for foreign in [owner.to_cursor.get(), shown.to_cursor.get() + 1_000] {
+    // The log's own cursor, the number below the first it was shown, and a number past where the
+    // log ends, are not numbers it was given. The second is the one a device would try to find
+    // where the numbers begin.
+    for foreign in [
+        owner.to_cursor.get(),
+        shown.from_cursor.get() - 1,
+        shown.to_cursor.get() + 1_000,
+    ] {
         let refused = device_mutation::<VisitAcknowledgeResult>(
             &device,
             session_target(&host, session_id),

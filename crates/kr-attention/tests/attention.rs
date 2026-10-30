@@ -1930,7 +1930,7 @@ fn a_bounded_viewer_is_not_shown_how_many_changes_came_before_its_history() {
 
 /// KR-REQ-10.49: a viewer with a bound sends back the number it was shown and the store takes the
 /// log's own cursor for it. A number that is not one it was given is none: the log's own cursor,
-/// one below the offset, and one past where the log ends. The owner, and a viewer whose history
+/// one below the first number shown, and one past where the log ends. The owner, and a viewer whose history
 /// reaches every moment, are not numbered.
 #[test]
 fn a_number_a_viewer_is_shown_is_the_one_it_sends_back() {
@@ -1959,6 +1959,11 @@ fn a_number_a_viewer_is_shown_is_the_one_it_sends_back() {
         "no number is shown for a place before the viewer's history"
     );
     assert_eq!(numbering.cursor(4), None, "the log's own cursor");
+    assert_eq!(
+        numbering.cursor(numbering.shown(2) - 1),
+        None,
+        "one below the first number shown: where the answer changes must not be where the offset is"
+    );
     assert_eq!(
         numbering.cursor(numbering.shown(6) + 1),
         None,

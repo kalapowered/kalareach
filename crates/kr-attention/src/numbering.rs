@@ -9,9 +9,10 @@
 //! ([`KeySecret::cursor_offset`]). It is the same whenever it is asked for, with nothing kept
 //! beside the store, and it changes with the store.
 //!
-//! The reader gives these numbers back (`visit.acknowledge`), and a number that is not an offset's
-//! sum with a cursor the log has reached is refused as one this host did not give it. The store
-//! keeps the log's own cursors, and so does every record of an answer.
+//! The reader gives these numbers back (`visit.acknowledge`), and a number that is not the offset's
+//! sum with a cursor from where its history starts to where the log ends is refused as one this
+//! host did not give it. The store keeps the log's own cursors, and so does every record of an
+//! answer.
 //!
 //! What this leaves is the difference between two cursors a reader is shown. A change recorded
 //! after its history began but dated before it is not the reader's, and the place it holds in the
@@ -68,11 +69,17 @@ impl Numbering {
     }
 
     /// Returns the log's own cursor for a number this reader sends back, or none when the number
-    /// is not one this host gives this reader: below the offset, or past where the log ends.
+    /// is not one this host gives this reader: below the first number it is shown, or past where
+    /// the log ends.
+    ///
+    /// The lowest number taken is the first one shown, not the offset. A number between the two
+    /// would be taken and one below the offset would not, and a reader that tried numbers down from
+    /// its first would find the offset where the answer changed, and so how many changes the log
+    /// held before its history.
     #[must_use]
     pub const fn cursor(&self, shown: u64) -> Option<u64> {
         match shown.checked_sub(self.offset) {
-            Some(cursor) if cursor <= self.head => Some(cursor),
+            Some(cursor) if cursor >= self.floor && cursor <= self.head => Some(cursor),
             _ => None,
         }
     }

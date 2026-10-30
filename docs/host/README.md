@@ -5978,8 +5978,12 @@ session and of the moment its history reaches back to, under the attention store
 range from 2^60 up to 2^61. The offset is the same whenever it is asked for and nothing stores it.
 It changes with the store, so the numbers of a replaced store stop being valid by themselves. The
 device sends back in `visit.acknowledge` the number it was shown, and the host takes the offset
-away. A number below the offset or past the end of the log is refused as one the host did not give
-that device, and the log's own cursor is such a number. The store and every record of an answer keep
+away. A number below the first one the device was shown, or past the end of the log, is refused as one
+the host did not give that device, and the log's own cursor is such a number. The line is drawn at
+the first number shown and not at the offset, so that a device cannot find the offset, and with it
+how many changes came before its history, by trying numbers below its first. When retention lets
+go of the changes a device's history started at, its first number moves up, and a number it was
+shown before is refused the same way: it reads its view again. The store and every record of an answer keep
 the log's own cursor, and the answer is numbered as it leaves, for the caller that receives it, so a
 repeat of the action under a later bound is answered in that bound's numbers. The owner and a device
 whose grant starts at the beginning of time are shown the log's own cursors.
