@@ -31,7 +31,7 @@ use kr_client::drafts::{
 };
 use kr_client::services::relay::{ServiceHttp, ServiceSigner};
 use kr_client::services::sync::ManagedSyncService;
-use kr_client::services::{ServiceFuture, SyncBackupService, SyncFetched};
+use kr_client::services::{ServiceFuture, SharedSyncService, SyncBackupService, SyncFetched};
 use kr_client::sync::membership::{
     CollectionRef, Device, DeviceDirectory, Ended, HostAnswers, HostDevice, HostReport,
     KeyRecordService, Refreshed, SyncMembership,
@@ -178,8 +178,12 @@ impl Node {
         store: &str,
     ) -> (SyncClient, Arc<SharedCollectionService>) {
         let shared = Arc::new(
-            SharedCollectionService::new(Arc::clone(&self.service), collection, epoch)
-                .believing_from(floor),
+            SharedCollectionService::new(
+                Arc::clone(&self.service) as Arc<dyn SharedSyncService>,
+                collection,
+                epoch,
+            )
+            .believing_from(floor),
         );
         let sealer = shared.sealer(Arc::new(Self::secrets(&self.root)) as Arc<dyn CollectionKeys>);
         let client = SyncClient::new(
@@ -757,13 +761,17 @@ async fn two_devices_that_change_a_setting_from_one_revision_keep_both_and_neith
     let drafts_two =
         DraftStore::open(two.root.path().join("drafts"), two.device_id).expect("drafts");
     let sealing = |node: &Node| -> Arc<dyn DraftSealer> {
-        let shared = SharedCollectionService::new(Arc::clone(&node.service), collection, epoch);
+        let shared = SharedCollectionService::new(
+            Arc::clone(&node.service) as Arc<dyn SharedSyncService>,
+            collection,
+            epoch,
+        );
         Arc::new(shared.sealer(Arc::new(Node::secrets(&node.root)) as Arc<dyn CollectionKeys>))
             as Arc<dyn DraftSealer>
     };
     let sync_one = DraftSync::new(
         Arc::new(SharedCollectionService::new(
-            Arc::clone(&one.service),
+            Arc::clone(&one.service) as Arc<dyn SharedSyncService>,
             collection,
             epoch,
         )),
@@ -772,7 +780,7 @@ async fn two_devices_that_change_a_setting_from_one_revision_keep_both_and_neith
     );
     let sync_two = DraftSync::new(
         Arc::new(SharedCollectionService::new(
-            Arc::clone(&two.service),
+            Arc::clone(&two.service) as Arc<dyn SharedSyncService>,
             collection,
             epoch,
         )),
