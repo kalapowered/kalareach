@@ -1760,8 +1760,9 @@ impl ProjectService {
     /// location the repository is bound to. A workspace made through no location is reached
     /// through none, whatever the caller holds over the repository it is a copy of, and is
     /// refused. Every Git invocation on the opened repository asks the location again before it
-    /// starts and runs with its reads bounded, so a grant withdrawn while the work runs stops the
-    /// next read.
+    /// starts and runs with its reads bounded, so a location the owner withdraws while the work
+    /// runs stops the next read. That is the location's stop. A revoked grant is held by the
+    /// transactions that need current authority, and an apply whose journal is open finishes.
     ///
     /// **Nothing is written**, as for [`Self::open_workspace_repository`].
     ///
