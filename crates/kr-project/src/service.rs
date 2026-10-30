@@ -1797,6 +1797,30 @@ impl ProjectService {
         self.open_recorded_workspace_recording(&row, &reach)
     }
 
+    /// Opens the repository one workspace's working tree belongs to where the workspace was made,
+    /// like [`Self::open_workspace_repository_recording`], for work this host does for itself on
+    /// what a caller left behind.
+    ///
+    /// A workspace made through a location is reached through that location, admitted as the
+    /// owner's decision about it, which refuses a location that was withdrawn or is dormant. A
+    /// workspace made through none is reached by its recorded path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::PermissionDenied`] when the location no longer admits the use, and
+    /// what [`Self::open_workspace_repository_recording`] returns otherwise.
+    pub fn open_workspace_repository_recording_where_made(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<OpenedRepository> {
+        let row = self.recorded_workspace(workspace_id)?;
+        let reach = match row.located.as_ref() {
+            Some(located) => self.tree_reach(Some(located), Admitting::OwnerDecision)?,
+            None => TreeReach::by_path(),
+        };
+        self.open_recorded_workspace_recording(&row, &reach)
+    }
+
     /// Returns how a workspace's tree is reached for a caller bounded by `grant`, which is the
     /// rule `workspace.remove` holds such a caller to.
     fn reach_of_a_bounded_caller(&self, row: &WorkspaceRow, grant: GrantId) -> Result<TreeReach> {
@@ -3285,28 +3309,12 @@ impl ProjectService {
                 // authority a caller holds over the repository it is a copy of: only the owner
                 // reaches it, by the path it was made at.
                 match (performed.grant(), recorded.as_ref()) {
+                    // A shared workspace is the repository's own tree, which such a caller
+                    // reaches through the source location the repository is bound to, and its
+                    // removal removes the selection and never the tree. Every other workspace
+                    // made through no location is reached through none.
                     (Some(grant), Some(row)) if row.located.is_none() => {
-                        // A shared workspace is the repository's own tree, which such a caller
-                        // reached through the source location the repository is bound to, and
-                        // its removal removes the selection and never the tree. It is reached
-                        // through that location again, with the same bounded reads.
-                        if !matches!(row.kind, WorkspaceKind::SharedExisting) {
-                            return Err(ProjectError::PermissionDenied {
-                                detail: format!(
-                                    "workspace {} was made through no location, so a caller \
-                                     bounded by grant {grant} reaches it through none",
-                                    params.workspace_id
-                                )
-                                .into(),
-                            });
-                        }
-                        let project = self
-                            .locked()?
-                            .project(row.project_repository_id)?
-                            .ok_or_else(|| ProjectError::UnknownProject {
-                                project: row.project_repository_id.to_string().into(),
-                            })?;
-                        self.source_reach(&project, Admitting::Caller(Some(grant)))?
+                        self.reach_of_a_bounded_caller(row, grant)?
                     }
                     // A workspace created through a location is reached through that location,
                     // admitted for this caller, and through nothing else; a location that is

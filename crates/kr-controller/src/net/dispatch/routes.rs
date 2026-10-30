@@ -56,9 +56,9 @@ pub(super) enum DeviceRead {
     /// `diff.read`. A diff of a **recorded version** is answered from this host's own store, with
     /// no Git, for a version inside the device's grant: its environment, its session and the
     /// moment its history reaches back to ([`RemoteConnection::check_version`]). A diff of a
-    /// **working copy** reads the working tree by running the Git program outside the boundary
-    /// that confines what that program reads for a device's repository operations, and is
-    /// refused.
+    /// **working copy** reads the working tree by running the Git program, so it is served only
+    /// on a host that has proved the boundary, through the location the owner authorised for the
+    /// device's grant ([`RemoteConnection::working_copy_diff`]).
     Diff,
     /// A receipt. One of an action this host performed itself is kept by the service that
     /// performed it, and the catalogue's are answered here; any other goes to the session whose
@@ -392,7 +392,7 @@ impl RemoteConnection {
                 // A working copy's diff runs Git on its working tree, so it is held to the rule
                 // the repository operations are, and is read through the location this device's
                 // grant holds.
-                _ => self.working_copy_diff(request).await,
+                _ => self.working_copy_diff(request, &decided.acting).await,
             },
             DeviceRead::Receipt => {
                 // A catalogue action's receipt is decided again under the right its method
@@ -629,6 +629,23 @@ impl RemoteConnection {
         // reaches now.
         if held.is_none() && entry.method == Method::ChangesetMaterialize {
             match self.retained_materialisation(&actor_id, mutation).await {
+                Ok(retained) => held = retained,
+                Err(error) => return failure(mutation.request_id, error),
+            }
+        }
+        // A capture's, an apply's and a revert's record is the change-set service's own as well,
+        // and a repeat of one over a new connection carries a window that is not the new
+        // connection's, so it is answered here, in the form a device is shown.
+        if held.is_none()
+            && matches!(
+                entry.method,
+                Method::ChangesetCapture | Method::DiffApply | Method::DiffRevert
+            )
+        {
+            match self
+                .retained_working_tree_change(&actor_id, mutation, entry.method, &decided.acting)
+                .await
+            {
                 Ok(retained) => held = retained,
                 Err(error) => return failure(mutation.request_id, error),
             }
@@ -999,7 +1016,10 @@ impl RemoteConnection {
             // it the owner. This replaces the refusal these three were given whatever the host
             // and the grant.
             Method::ChangesetCapture | Method::DiffApply | Method::DiffRevert => {
-                if let Err(error) = self.check_working_tree_authority() {
+                if let Err(error) = self
+                    .check_working_tree_request(entry.method, &mutation.params, &decided.acting)
+                    .await
+                {
                     return failure(mutation.request_id, error);
                 }
                 if let Err(refusal) = self.claim_route(mutation, None) {

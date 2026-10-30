@@ -344,20 +344,115 @@ impl RemoteConnection {
     /// Answers a device's `diff.read` of a working copy.
     ///
     /// It runs Git on the working tree, so it is held to the rule a repository operation is
-    /// ([`Self::check_working_tree_authority`]), and the workspace is opened through the location
+    /// ([`Self::check_working_tree_request`]), and the workspace is opened through the location
     /// the owner authorised for this device's grant, with every read bounded to it. What the
-    /// device is told is the diff without this host's own sentences.
-    pub(super) async fn working_copy_diff(&self, request: &Request) -> ControlFrame {
-        if let Err(error) = self.check_working_tree_authority() {
+    /// device is told is the diff without this host's own words in a refusal.
+    pub(super) async fn working_copy_diff(
+        &self,
+        request: &Request,
+        acting: &Acting,
+    ) -> ControlFrame {
+        if let Err(error) = self
+            .check_working_tree_request(Method::DiffRead, &request.params, acting)
+            .await
+        {
             return failure(request.request_id, error);
         }
         let grant = self.device.grant.grant_id;
-        without_host_text(
+        without_service_text(
             self.controller
                 .changesets()
                 .read_frame(request, Some(grant))
                 .await,
         )
+    }
+
+    /// Checks a device's capture, apply, revert or working-copy diff before anything is routed.
+    ///
+    /// The host must have proved the Git boundary ([`Self::check_working_tree_authority`]). The
+    /// request must be decided under the grant the device's locations name: a share lends the
+    /// rights it carries and no location. A version it takes content from, which an apply and a
+    /// revert name and a capture that appends to a change set names, has to be inside the grant by
+    /// the rule every other read of a recorded version is held to ([`Self::check_version`]), so
+    /// that an apply cannot install what a read would refuse. A capture names no workflow run: a
+    /// run names itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal for the first of these that does not hold.
+    pub(super) async fn check_working_tree_request(
+        &self,
+        method: Method,
+        params: &ParamsValue,
+        acting: &Acting,
+    ) -> Result<(), ProtocolError> {
+        self.check_working_tree_authority()?;
+        if acting.grant.grant_id != self.device.grant.grant_id {
+            return Err(ProtocolError::new(
+                ErrorCode::PermissionDenied,
+                "a share lends the rights it carries and no location, so this request is not \
+                 served under it",
+            ));
+        }
+        let unreadable = |error: kr_cbor::CborError| {
+            ProtocolError::new(
+                ErrorCode::InvalidArgument,
+                kr_project::git::redact(&error.to_string()),
+            )
+        };
+        match method {
+            Method::ChangesetCapture => {
+                let params: kr_protocol::changeset::ChangesetCaptureParams =
+                    params.to_typed().map_err(unreadable)?;
+                if params.workflow_run_id.is_present() {
+                    return Err(ProtocolError::new(
+                        ErrorCode::PermissionDenied,
+                        "a capture a paired device asks for names no workflow run",
+                    ));
+                }
+                if let Some(change_set_id) = params.change_set_id.0 {
+                    self.check_version(change_set_id, None).await?;
+                }
+            }
+            Method::DiffApply | Method::DiffRevert => {
+                let params: kr_protocol::changeset::DiffApplyParams =
+                    params.to_typed().map_err(unreadable)?;
+                self.check_version(params.change_set_id, Some(params.version))
+                    .await?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Answers a repeat of a capture, an apply or a revert this device asked for, from the record
+    /// the first attempt left, when there is one.
+    ///
+    /// The answer is given under what the host proves and the grant reaches now, and in the form
+    /// a device is shown. A repeat carries the window its first attempt was admitted under, so it
+    /// is answered before the window is considered, as a materialisation is.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal when the host or the grant no longer reaches what the action did.
+    pub(super) async fn retained_working_tree_change(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        method: Method,
+        acting: &Acting,
+    ) -> Result<Option<ControlFrame>, ProtocolError> {
+        let Some(retained) = self
+            .controller
+            .changesets()
+            .retained(actor_id, mutation, method)
+            .await
+        else {
+            return Ok(None);
+        };
+        self.check_working_tree_request(method, &mutation.params, acting)
+            .await?;
+        Ok(Some(shown_working_tree_change(retained, method)))
     }
 
     /// Checks the version a device asks to have materialised.
@@ -432,6 +527,30 @@ pub(super) fn without_host_text(answer: ControlFrame) -> ControlFrame {
     }
 }
 
+/// Puts a refusal that came out of the change-set service in the form a device is shown, whatever
+/// its code: the code travels, and the text is replaced by its class and length.
+///
+/// The text of a refusal of a working-tree request comes from the project service as well as the
+/// change-set service, and some of it names a directory of this host, so no code is exempt.
+pub(super) fn without_service_text(answer: ControlFrame) -> ControlFrame {
+    match answer {
+        ControlFrame::Response(Response {
+            request_id,
+            outcome: Outcome::Error(error),
+        }) => failure(
+            request_id,
+            ProtocolError::new(
+                error.code,
+                kr_protocol::hostinfo::export::withheld(
+                    kr_protocol::hostinfo::export::ContentClass::Message,
+                    &error.message,
+                ),
+            ),
+        ),
+        other => other,
+    }
+}
+
 /// Puts the answer to a materialisation in the form a device is shown: no host path.
 pub(super) fn shown_materialisation(answer: ControlFrame) -> ControlFrame {
     let ControlFrame::Response(Response {
@@ -473,7 +592,7 @@ pub(super) fn shown_working_tree_change(answer: ControlFrame, method: Method) ->
         outcome: Outcome::Ok(value),
     }) = answer
     else {
-        return without_host_text(answer);
+        return without_service_text(answer);
     };
     if method == Method::ChangesetCapture {
         return ControlFrame::Response(Response {
@@ -490,6 +609,9 @@ pub(super) fn shown_working_tree_change(answer: ControlFrame, method: Method) ->
             }
             result.recovery.detail = withheld(ContentClass::Message, &result.recovery.detail);
             result.detail = withheld(ContentClass::Message, &result.detail);
+            for progress in &mut result.progress {
+                progress.detail = withheld(ContentClass::Message, &progress.detail);
+            }
             for conflict in &mut result.conflicts {
                 conflict.detail = withheld(ContentClass::Message, &conflict.detail);
             }

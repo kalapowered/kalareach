@@ -1675,6 +1675,23 @@ fn run_operations(
         abandoned: None,
     };
     for (path, operation) in operations {
+        // A destination reached through a location is reached only while that location still
+        // admits the caller. Git asks it before each invocation, and this loop installs a path
+        // through the opened tree with no Git of its own, so it asks again before each path and
+        // stops, leaving the rest unattempted, when the location has been withdrawn.
+        if let Some(admission) = repository.admission()
+            && admission.admit().is_err()
+        {
+            run.stopped = Some((
+                ApplyOutcomeClass::InterruptedApply,
+                format!(
+                    "the location this destination is reached through stopped admitting the \
+                     caller, so this apply stopped with {} path(s) already changed",
+                    run.changed.len()
+                ),
+            ));
+            break;
+        }
         let expected = order
             .affected
             .iter()
@@ -3485,7 +3502,7 @@ fn clear_staged(
     let opened = row
         .workspace_id
         .and_then(|workspace_id| service.resolve(workspace_id).ok())
-        .and_then(|resolved| service.open_repository_recording(&resolved, None).ok());
+        .and_then(|resolved| service.open_repository_where_made(&resolved).ok());
     let Some(repository) = opened else {
         cleanup.not_ours = staged.into_iter().map(|entry| entry.path).collect();
         recovery.staged_left += cleanup.not_ours.len() as u64;

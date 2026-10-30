@@ -475,6 +475,29 @@ impl ChangeSetService {
         self.require_first_repository_of(resolved, opened)
     }
 
+    /// Opens one workspace's repository where it was made, for the recovery that runs before the
+    /// daemon serves anything, and has the project service write what the open decides about its
+    /// records.
+    ///
+    /// A workspace made through a location is reached through that location again, admitted as
+    /// the owner's decision about it, so a location that has been withdrawn or has gone dormant
+    /// leaves the workspace unopened and its leftovers reported rather than looked at. A
+    /// workspace made through none is reached by its recorded path, as the owner always has.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::open_repository_recording`] returns, and the project service's
+    /// refusal when the workspace's location no longer admits the use.
+    pub fn open_repository_where_made(
+        &self,
+        resolved: &ResolvedWorkspace,
+    ) -> Result<OpenedRepository> {
+        let opened = self
+            .project
+            .open_workspace_repository_recording_where_made(resolved.summary.workspace_id)?;
+        self.require_first_repository_of(resolved, opened)
+    }
+
     /// Requires what an independent clone's repository must be besides the one the project service
     /// recorded, and returns the repository.
     fn require_first_repository_of(
