@@ -2141,6 +2141,44 @@ fn an_invitation_is_view_only_for_an_hour_and_bounded_at_thirty_days() {
     );
 }
 
+/// KR-REQ-10.49: an invitation's history cannot start after the moment the host issues it. A
+/// bound in the future (a device clock far ahead of the host's makes one) reaches nothing recorded
+/// yet, so a recipient's view of the session would move with every change recorded before the bound,
+/// and tell it how many there were. The host refuses it where it compiles the invitation, and a
+/// bound at the moment of issue or earlier is kept as it is.
+#[test]
+fn an_invitation_refuses_a_history_that_starts_after_the_moment_it_is_issued() {
+    use kr_controller::error::ControllerError;
+    use kr_controller::sharing::roles;
+    use kr_protocol::sharing::{RoleSelection, SessionRole};
+
+    let from = |history_from_ms: u64| RoleSelection {
+        history_from_cursor_ms: Nullable::some(TimestampMs::new(history_from_ms)),
+        ..RoleSelection::plain(SessionRole::Viewer)
+    };
+    let compile =
+        |selection: &RoleSelection| roles::compile(selection, session_id(0xa0), None, 5_000);
+
+    for kept in [0, 4_999, 5_000] {
+        let proposed = compile(&from(kept)).expect("a history that starts by now is kept");
+        assert_eq!(
+            proposed
+                .history
+                .lower_bound_ms
+                .as_ref()
+                .map(|bound| bound.get()),
+            Some(kept)
+        );
+    }
+    for later in [5_001, u64::MAX] {
+        let error = compile(&from(later)).expect_err("a history that starts after now is refused");
+        assert!(
+            matches!(error, ControllerError::InvalidArgument(_)),
+            "unexpected refusal: {error}"
+        );
+    }
+}
+
 #[test]
 fn the_offline_validity_policy_is_optional_and_bounded_when_it_is_chosen() {
     let owner = grant(

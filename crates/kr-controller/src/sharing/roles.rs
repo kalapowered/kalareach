@@ -40,14 +40,17 @@ use crate::error::{ControllerError, Result};
 ///
 /// `lifetime_ms` is the issuer's choice. `None` takes section 10's one-hour default; anything over
 /// [`MAX_INVITATION_LIFETIME_MS`] is refused rather than clamped, because a silently shortened
-/// invitation is an invitation whose issuer believes something untrue about it.
+/// invitation is an invitation whose issuer believes something untrue about it. A history that
+/// starts after `now_ms` is refused for the same reason: it reaches nothing recorded yet, and a
+/// recipient's view of the session would move with each change recorded before it starts.
 ///
 /// An owner-role selection is still an *invitation*: it expires. Section 10 keeps persistent
 /// co-owner access to explicit owner pairing, so nothing here can produce a grant that never ends.
 ///
 /// # Errors
 ///
-/// Returns [`ControllerError::InvalidArgument`] when the lifetime is zero or over the bound.
+/// Returns [`ControllerError::InvalidArgument`] when the lifetime is zero or over the bound, or
+/// when the history is to start after `now_ms`.
 pub fn compile(
     selection: &RoleSelection,
     session_id: SessionId,
@@ -71,8 +74,15 @@ pub fn compile(
     // what it shares, and the cursor is written into the grant: a session share is never stored
     // without one.
     let mut history = selection.history();
-    if history.lower_bound_ms.as_ref().is_none() {
-        history.lower_bound_ms = Nullable::some(TimestampMs::new(now_ms));
+    match history.lower_bound_ms.as_ref() {
+        None => history.lower_bound_ms = Nullable::some(TimestampMs::new(now_ms)),
+        Some(bound) if bound.get() > now_ms => {
+            return Err(ControllerError::InvalidArgument(
+                "a session invitation's history cannot start after the moment it is issued"
+                    .to_owned(),
+            ));
+        }
+        Some(_) => {}
     }
     Ok(ProposedGrant {
         parent_grant_id: Nullable::null(),
