@@ -13,7 +13,7 @@ use kr_protocol::session::SessionListResult;
 
 use super::acting::Acting;
 use super::{RemoteConnection, failure};
-use crate::changeset::{OutOfScope, ScopedEnvironments, VersionScope};
+use crate::changeset::{ScopedEnvironments, VersionScope};
 
 impl RemoteConnection {
     /// Narrows an answer to what this device's grant admits.
@@ -150,14 +150,7 @@ impl RemoteConnection {
                 );
             };
             if read.version.captured_at_ms.get() < bound.get() {
-                return failure(
-                    request_id,
-                    ProtocolError::new(
-                        ErrorCode::PermissionDenied,
-                        "this version was captured before the moment this device's grant reaches \
-                         back to",
-                    ),
-                );
+                return failure(request_id, version_not_reached(read.version.change_set_id));
             }
             let narrowed = kr_protocol::changeset::ChangesetReadResult {
                 versions: read
@@ -289,8 +282,9 @@ impl RemoteConnection {
     /// The version has to be in an environment the grant selects, for a session the grant selects
     /// (a grant that names sessions reaches only a version that records one of them), and captured
     /// at or after the moment the grant's history reaches back to. A grant with no lower bound
-    /// retains none of it. A version this host cannot read is refused the way one outside the
-    /// grant is, so a device learns nothing about which identifiers exist.
+    /// retains none of it. A version outside the grant, one captured before the moment its
+    /// history reaches back to and one this host cannot read are each refused in the same words,
+    /// so a device learns nothing about which identifiers and which numbers exist.
     ///
     /// Returns the number of the version it checked, which is the latest one when none was named:
     /// what is then read has to be that version, and not the one that is latest by then.
@@ -317,14 +311,7 @@ impl RemoteConnection {
         .await;
         match checked {
             Ok(Ok(record)) => Ok(record.version),
-            Ok(Err(OutOfScope::History)) => Err(ProtocolError::new(
-                ErrorCode::PermissionDenied,
-                "this version was captured before the moment this device's grant reaches back to",
-            )),
-            Ok(Err(_)) => Err(ProtocolError::new(
-                ErrorCode::PermissionDenied,
-                format!("this device's grant does not reach change set {change_set_id}"),
-            )),
+            Ok(Err(_)) => Err(version_not_reached(change_set_id)),
             Err(_) => Err(ProtocolError::new(
                 ErrorCode::OutcomeUnknown,
                 "this host could not check the version against this device's grant",
@@ -759,6 +746,15 @@ fn change_set_read(
             ),
         ))),
     }
+}
+
+/// The refusal for a recorded version this device's grant does not reach, which is also the one
+/// for a version this host cannot read: whatever the reason, the device is told the same thing.
+fn version_not_reached(change_set_id: kr_protocol::ids::ChangeSetId) -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::PermissionDenied,
+        format!("this device's grant does not reach change set {change_set_id}"),
+    )
 }
 
 /// Refuses a read of a subject in an environment this device's grant does not reach.
