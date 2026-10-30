@@ -201,6 +201,29 @@ mod macos {
         let _ = unsafe { notify_cancel(token) };
         (read == NOTIFY_STATUS_OK).then_some(state)
     }
+
+    #[cfg(test)]
+    mod tests {
+        use std::ffi::{CStr, c_char};
+
+        use super::PRESSURE_LEVEL;
+
+        unsafe extern "C" {
+            /// The name the SDK declares the thermal pressure level is posted under.
+            static kOSThermalNotificationPressureLevelName: *const c_char;
+        }
+
+        /// The level is read under the name the SDK declares for it. A name nobody posts reads as
+        /// a state of 0, which is the nominal level, so a reader under a wrong name cannot be told
+        /// from a Mac that is cool: the name has to be the system's.
+        #[test]
+        fn the_thermal_pressure_level_is_read_under_the_name_the_sdk_declares() {
+            // SAFETY: the symbol is a pointer to a NUL-terminated string in the system library,
+            // which lives as long as the process.
+            let declared = unsafe { CStr::from_ptr(kOSThermalNotificationPressureLevelName) };
+            assert_eq!(PRESSURE_LEVEL, declared);
+        }
+    }
 }
 
 /// The two places in this crate that call the performance counters and the power status.
