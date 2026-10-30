@@ -9,8 +9,10 @@
 //! * **`recorded` is the label.** The answer lists what the worker had recorded at its last write,
 //!   each identity checked at the moment of the call. It is not a live enumeration: a process that
 //!   started and ended between two of the worker's observations is not in it, nor is one that left
-//!   the boundary the worker watches before it was seen. The record carries no time, so the
-//!   method's documentation states the worker's cadence instead.
+//!   the boundary the worker watches before it was seen, nor one that left for a control daemon's
+//!   own scope. A process the worker has read as ended is dropped at its next write, so its row
+//!   goes away and does not read `ended`; `ended` is a process that ended after the last write. The
+//!   record carries no time, so the method's documentation states the worker's cadence instead.
 //! * **A process is its start, not its number.** A row holds the process identifier together with
 //!   the start the kernel recorded for it, so a number that was reused is another process and the
 //!   recorded one reads as `ended`.
@@ -76,7 +78,8 @@ pub enum ProcessBoot {
     Same,
     /// An earlier boot: no recorded process can still be running.
     Earlier,
-    /// The record names no boot, so its start values cannot be tied to one.
+    /// The record names no boot, so its start values cannot be tied to one, or the worker has
+    /// written no record at all.
     Unrecorded,
     /// The record's boot and this boot cannot be compared.
     Incomparable,
@@ -122,7 +125,8 @@ pub struct SessionProcess {
     /// gives. Null for every other row.
     pub parent: Nullable<ProcessStartIdentity>,
     /// The base name of its executable, for a running row whose executable the platform gives, as
-    /// lossy UTF-8 of at most [`MAX_PROCESS_NAME_BYTES`] bytes. Null for every other row.
+    /// lossy UTF-8 of at most [`MAX_PROCESS_NAME_BYTES`] bytes. Null for every other row. A name
+    /// that was cut cannot be told from one of exactly that length.
     pub name: Nullable<String>,
 }
 
