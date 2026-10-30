@@ -5,10 +5,12 @@
 //! delivered, so these hold the things a deleted or disabled step or a moved file would lose without
 //! any job going red: the check that refuses a run with no screenshot kept, run on real
 //! directories; a job for each class of test on a runner that has its tool, whose step is not
-//! disabled; the evidence check and the strict uploads, neither disabled; and the table of those
-//! jobs in the conformance document. It reads the workflow as text, line by line, which holds its
-//! layout (jobs at two spaces, steps at six): a reformatting fails it loudly, and a step that
-//! swallows its failure in the command (`|| true`) is not looked for.
+//! disabled and runs under the condition the workflow gives it, with the matrix leg that condition
+//! names still in the matrix; the evidence check and the strict uploads, neither disabled, none of
+//! them cut short or kept for less than the repository's default; and the table of those jobs in
+//! the conformance document. It reads the workflow as text, line by line, which holds its layout
+//! (jobs at two spaces, steps at six): a reformatting fails it loudly, and a step that swallows
+//! its failure in the command (`|| true`) is not looked for.
 
 #![cfg(unix)]
 
@@ -170,6 +172,47 @@ fn is_disabled(text: &str) -> bool {
     })
 }
 
+/// A condition without the spaces it is written with, so that how it is spaced does not matter.
+fn compact(condition: &str) -> String {
+    condition.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// The `if` that a job's header or a step carries of its own, at one of the `keys` that start its
+/// line, without the spaces and the trailing comment. A step with none runs whenever its job does.
+fn own_condition(text: &str, keys: &[&str]) -> Option<String> {
+    text.lines().find_map(|line| {
+        let value = keys.iter().find_map(|key| line.strip_prefix(key))?;
+        Some(compact(value.split(" #").next().unwrap_or_default()))
+    })
+}
+
+/// The condition a job's header gives the job, if it has one.
+fn job_condition(header: &str) -> Option<String> {
+    own_condition(header, &["    if:"])
+}
+
+/// The condition a step gives itself, if it has one.
+fn step_condition(step: &str) -> Option<String> {
+    own_condition(step, &["        if:", "      - if:"])
+}
+
+/// The matrix leg a condition names (`matrix.part == 'second'`), if it names one.
+fn leg_named(condition: &str) -> Option<String> {
+    let after = compact(condition)
+        .split_once("matrix.part=='")?
+        .1
+        .to_owned();
+    Some(after.split('\'').next()?.to_owned())
+}
+
+/// The `part` of each leg that the job's matrix includes.
+fn legs(job: &str) -> Vec<String> {
+    job.lines()
+        .filter_map(|line| line.trim().strip_prefix("part:"))
+        .map(|part| part.trim().to_owned())
+        .collect()
+}
+
 /// The jobs a table of the conformance document's classes names, in backticks in its second column.
 fn documented_jobs(document: &str) -> Vec<String> {
     let table: Vec<&str> = document
@@ -203,10 +246,14 @@ struct ClassOfTest {
     job: &'static str,
     /// What the job's runner line holds.
     runner: &'static [&'static str],
+    /// The condition the job runs under, as the workflow writes it. `None` is a job that always
+    /// runs.
+    job_when: Option<&'static str>,
     /// What one step of the job runs.
     tool: &'static str,
-    /// What that step is held to.
-    conditions: &'static [&'static str],
+    /// The condition each step that runs the tool carries, as the workflow writes it. `None` is a
+    /// step that runs whenever its job does.
+    when: Option<&'static str>,
 }
 
 const CLASSES: [ClassOfTest; 10] = [
@@ -214,83 +261,99 @@ const CLASSES: [ClassOfTest; 10] = [
         class: "browser behaviour, on both kinds of runner",
         job: "companion",
         runner: &["ubuntu-24.04", "macos-15"],
+        job_when: None,
         tool: "pnpm -C apps/companion e2e",
-        conditions: &[],
+        when: None,
     },
     ClassOfTest {
         class: "native macOS controls",
         job: "companion",
         runner: &["macos-15"],
+        job_when: None,
         tool: "scripts/desktop-controls-macos.sh",
-        conditions: &["runner.os == 'macOS'"],
+        when: Some(
+            "${{ !cancelled() && runner.os == 'macOS' && steps.desktop-build.outcome == 'success' }}",
+        ),
     },
     ClassOfTest {
         class: "the iOS Simulator, with Xcode",
         job: "ios",
         runner: &["runs-on: macos-15"],
+        job_when: Some("github.event_name != 'workflow_dispatch' || inputs.macos || inputs.ios"),
         tool: "scripts/ios-app-launch.sh",
-        conditions: &[],
+        when: None,
     },
     ClassOfTest {
         class: "an Android emulator",
         job: "android-app",
         runner: &["runs-on: ubuntu-24.04"],
+        job_when: None,
         tool: "scripts/android-app-launch.sh",
-        conditions: &[],
+        when: None,
     },
     ClassOfTest {
         class: "a Windows machine's release build of the desktop application",
         job: "windows",
         runner: &["runs-on: windows-2025"],
+        job_when: None,
         tool: "cargo build --locked -p companion-tauri --release",
-        conditions: &[],
+        when: Some("${{ !cancelled() && matrix.part == 'first' }}"),
     },
     ClassOfTest {
         class: "the Tauri desktop application in a real window, on Windows",
         job: "windows",
         runner: &["runs-on: windows-2025"],
+        job_when: None,
         tool: "cargo test --locked -p companion-tauri --test host_events",
-        conditions: &[],
+        when: Some("${{ !cancelled() && matrix.part == 'second' }}"),
     },
     ClassOfTest {
         class: "the real-worker host tests, on a native Windows machine",
         job: "windows",
         runner: &["runs-on: windows-2025"],
+        job_when: None,
         tool: "cargo test --locked -p kr-worker --test host",
-        conditions: &[],
+        when: Some("${{ !cancelled() && matrix.part == 'second' }}"),
     },
     ClassOfTest {
         class: "the Tauri desktop application's native backend, on both kinds of unix runner",
         job: "companion",
         runner: &["ubuntu-24.04", "macos-15"],
+        job_when: None,
         tool: "cargo test --locked -p companion-tauri -p kr-client",
-        conditions: &[],
+        when: None,
     },
     ClassOfTest {
         class: "a Linux machine",
         job: "rust",
         runner: &["runs-on: ubuntu-24.04"],
+        job_when: None,
         tool: "cargo test --locked --workspace",
-        conditions: &[],
+        when: None,
     },
     ClassOfTest {
         class: "a macOS machine",
         job: "macos",
         runner: &["runs-on: macos-15"],
+        job_when: Some("github.event_name != 'workflow_dispatch' || inputs.macos"),
         tool: "cargo test --locked --workspace",
-        conditions: &[],
+        when: Some("${{ !cancelled() && matrix.part == 'tests' }}"),
     },
 ];
 
 /// KR-REQ-21.01 and KR-REQ-27.02, the part a workflow can hold: each class of test section 21
 /// names has a job in the landing workflow that runs its tool on a runner that has it, by a step
-/// that is not disabled: Playwright for browser behaviour, the operating system's own tooling for
-/// native controls and for the iOS Simulator on macOS, an Android emulator for the Android phone,
-/// the Tauri desktop application's native backend on Linux and macOS, its release build and its
-/// window on Windows, the real-worker host suite on a native Windows machine, and the whole
-/// workspace's tests on a hosted Linux and macOS machine. The Windows job runs many more test
-/// steps than the two this case holds. The conformance document's table names the same jobs.
-/// Physical devices are the person's own and no workflow starts them.
+/// that is not disabled and that runs under the condition the workflow gives it, with the matrix
+/// leg that condition names still in the matrix: Playwright for browser behaviour, the operating
+/// system's own tooling for native controls and for the iOS Simulator on macOS, an Android
+/// emulator for the Android phone, the Tauri desktop application's native backend on Linux and
+/// macOS, its release build and its window on Windows, the real-worker host suite on a native
+/// Windows machine, and the workspace's tests on a hosted Linux and macOS machine (the macOS step
+/// leaves out one package and skips named cases). A step whose condition is never true, or true on
+/// one kind of runner when its class names both, or whose leg is gone from the matrix, runs on no
+/// runner and fails the case. The Windows job runs many more test steps than the two this case
+/// holds. The conformance document's table names the same jobs. Physical devices are the person's
+/// own and no workflow starts them.
 #[test]
 fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
     let workflow = fs::read_to_string(repository().join(".github/workflows/core-ci.yml"))
@@ -299,14 +362,26 @@ fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
         class,
         job: name,
         runner,
+        job_when,
         tool,
-        conditions,
+        when,
     } in CLASSES
     {
         let text = job(&workflow, name);
         assert!(
             !is_disabled(&header(&text)),
             "{class}: the {name} job is disabled or lets its failure pass"
+        );
+        assert_eq!(
+            job_condition(&header(&text)),
+            job_when.map(compact),
+            "{class}: the {name} job runs under a condition other than {job_when:?}"
+        );
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.trim_start().starts_with("exclude:")),
+            "{class}: the {name} job's matrix leaves a leg out"
         );
         for expected in runner {
             assert!(
@@ -319,10 +394,16 @@ fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
                 !is_disabled(&held),
                 "{class}: a step that runs {tool} is disabled"
             );
-            for condition in conditions {
+            assert_eq!(
+                step_condition(&held),
+                when.map(compact),
+                "{class}: a step that runs {tool} runs under a condition other than {when:?}"
+            );
+            if let Some(leg) = when.and_then(leg_named) {
                 assert!(
-                    held.contains(condition),
-                    "{class}: a step that runs {tool} is not held to {condition}"
+                    legs(&text).contains(&leg),
+                    "{class}: the {name} job's matrix has no {leg} leg, so a step that runs {tool} \
+                     never runs"
                 );
             }
         }
@@ -337,6 +418,11 @@ fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
     );
     for guard in steps_running(&companion, "scripts/check-test-evidence.sh") {
         assert!(!is_disabled(&guard), "the evidence check is disabled");
+        assert_eq!(
+            step_condition(&guard),
+            None,
+            "the evidence check does not run on every runner of the matrix"
+        );
     }
     for (job_name, artefact) in [
         ("companion", "companion-evidence-"),
@@ -357,6 +443,17 @@ fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
                 !is_disabled(&upload),
                 "the {job_name} job's upload of {artefact} is disabled or lets its failure pass"
             );
+            assert_eq!(
+                step_condition(&upload),
+                Some(compact("${{ !cancelled() }}")),
+                "the {job_name} job's upload of {artefact} does not run on every runner whether \
+                 the job passed or failed"
+            );
+            assert!(
+                !upload.contains("retention-days"),
+                "the {job_name} job's upload of {artefact} sets a retention of its own, which \
+                 can keep the evidence for less than the repository's default"
+            );
         }
     }
 
@@ -374,17 +471,35 @@ fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
     );
 }
 
-/// KR-REQ-27.02, the WSL2 run: the release's WSL2 acceptance has a workflow of its own that runs
-/// the acceptance script on a hosted Windows machine by a step that is not disabled, because the
-/// landing workflow does not carry it.
+/// KR-REQ-27.02, the WSL2 run: the release's WSL2 acceptance has a workflow of its own, started by
+/// hand and by nothing else, that runs the acceptance script on a hosted Windows machine by a step
+/// that is not disabled, because the landing workflow does not carry it. The Linux set that
+/// acceptance installs is built by a job of its own on a hosted Linux machine, kept, and fetched
+/// by the acceptance, and the conformance document says where the workflow is.
 #[test]
 fn the_wsl2_acceptance_has_a_workflow_that_runs_its_script_on_windows() {
     let workflow = fs::read_to_string(repository().join(".github/workflows/wsl-acceptance.yml"))
         .expect("the WSL2 acceptance workflow");
+    let triggers: Vec<&str> = workflow
+        .lines()
+        .skip_while(|line| *line != "on:")
+        .skip(1)
+        .take_while(|line| line.starts_with(' '))
+        .collect();
+    assert_eq!(
+        triggers,
+        ["  workflow_dispatch:"],
+        "the WSL2 acceptance is started by hand and by nothing else"
+    );
     let text = job(&workflow, "acceptance");
     assert!(
         !is_disabled(&header(&text)),
         "the acceptance job is disabled or lets its failure pass"
+    );
+    assert_eq!(
+        job_condition(&header(&text)),
+        None,
+        "the acceptance job runs under a condition"
     );
     assert!(
         text.contains("runs-on: windows-2025"),
@@ -395,5 +510,58 @@ fn the_wsl2_acceptance_has_a_workflow_that_runs_its_script_on_windows() {
             !is_disabled(&held),
             "the step that runs the WSL2 acceptance is disabled"
         );
+        assert_eq!(
+            step_condition(&held),
+            None,
+            "the step that runs the WSL2 acceptance runs under a condition"
+        );
     }
+
+    // The set the acceptance installs in its distribution: built, kept and fetched.
+    assert!(
+        text.contains("needs: linux-set"),
+        "the acceptance does not wait for the Linux set"
+    );
+    let set = job(&workflow, "linux-set");
+    assert!(
+        !is_disabled(&header(&set)),
+        "the Linux set's job is disabled or lets its failure pass"
+    );
+    assert_eq!(
+        job_condition(&header(&set)),
+        None,
+        "the Linux set's job runs under a condition"
+    );
+    assert!(
+        set.contains("runs-on: ubuntu-24.04"),
+        "the Linux set is not built on a hosted Linux machine"
+    );
+    for kept in steps_holding(&set, "name: wsl-linux-set") {
+        assert!(
+            !is_disabled(&kept),
+            "the step that keeps the set is disabled"
+        );
+        assert_eq!(
+            step_condition(&kept),
+            None,
+            "the step that keeps the set runs under a condition"
+        );
+        assert!(
+            kept.contains("if-no-files-found: error"),
+            "the step that keeps the set does not fail when it kept nothing"
+        );
+    }
+    for fetched in steps_holding(&text, "name: wsl-linux-set") {
+        assert!(
+            !is_disabled(&fetched),
+            "the step that fetches the set is disabled"
+        );
+    }
+
+    let document = fs::read_to_string(repository().join("docs/conformance/README.md"))
+        .expect("the conformance document");
+    assert!(
+        document.contains("`wsl-acceptance`, started by hand"),
+        "the conformance document does not say where the WSL2 acceptance is"
+    );
 }
