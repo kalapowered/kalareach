@@ -105,8 +105,10 @@ fn schema(answer: &EnvironmentCapabilitiesResult) -> Option<String> {
 
 /// KR-REQ-03.26: the owner is told which display server a Linux host is on and which compositor
 /// runs it. A device is told the display server and whether a compositor runs it, with the
-/// compositor's name and the server's protocol name as their class and length. Whichever the host
-/// is on, no screen capture or input injection is reported available because a tool is installed.
+/// compositor's name and the server's protocol name as their class and length. Screen capture and
+/// input injection are never reported available on any of them. Which refusal a machine gives turns
+/// on the tools it has, and this case installs none, so what an installed tool changes is the
+/// platform reader's own unit case.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_is_told_which_display_server_the_host_is_on_and_whether_a_compositor_runs_it() {
     let directory = tempfile::tempdir().expect("a directory of this test's own");
