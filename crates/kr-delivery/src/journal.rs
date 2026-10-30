@@ -2820,8 +2820,9 @@ impl DeliveryJournal {
     ///
     /// Section 24: already-sent notifications and already-delivered external messages are not
     /// retroactively erased. They are shown as retained artifacts, with a separately authorised
-    /// deletion action; `deletable` says whether this host holds a way to ask, not that asking
-    /// will succeed and not that no other copy exists.
+    /// deletion action; `deletable` says whether this host holds a way to ask
+    /// (which `gateway_can_be_asked_about` decides), not that asking will succeed and not that no other
+    /// copy exists.
     ///
     /// Each one carries the notification and destination it is a copy of. That is what a deletion
     /// action addresses: the action is authorised separately from the pass that produced the copy,
@@ -2881,14 +2882,45 @@ impl DeliveryJournal {
                     )
                 },
                 left_at_ms: TimestampMs::new(as_u64(left_at)),
-                // The gateway holds a record of a notification it was given, and a host can ask it
-                // to delete what it still holds. That reaches nothing a provider already accepted,
-                // a device already holds or a mailbox keeps for the device. An external message is
-                // in somebody else's service, which this host has no route to ask.
-                deletable: matches!(kind, DestinationKind::Push),
+                deletable: matches!(kind, DestinationKind::Push)
+                    && self.gateway_can_be_asked_about(&state, &destination)?,
             });
         }
         Ok(exported)
+    }
+
+    /// Returns whether this host can ask the push gateway to delete what it holds for a
+    /// notification in `state` that went to `destination`.
+    ///
+    /// The gateway holds a record of a notification it was given, and a host can ask it to delete
+    /// what it still holds. So the notification must have reached the gateway or may have: the
+    /// gateway took it, answered that it was a duplicate, or its outcome is not known. One still
+    /// waiting to be sent, on the wire, or settled without the gateway having it is not asked
+    /// about, because an answer that the gateway holds nothing would not stop the send that is
+    /// still to come, and would delete nothing of what the notification's detail left in a mailbox.
+    /// The destination must still be a paired device's, since unpairing removes the credential the
+    /// request is made under. That reaches nothing a provider already accepted, a device already
+    /// holds or a mailbox keeps for the device. An external message is in somebody else's service,
+    /// which this host has no route to ask.
+    fn gateway_can_be_asked_about(&self, state: &str, destination: &str) -> Result<bool> {
+        let reached_the_gateway = DeliveryState::from_stored(state).is_some_and(|state| {
+            matches!(
+                state,
+                DeliveryState::Accepted
+                    | DeliveryState::Duplicate
+                    | DeliveryState::DuplicateUncertain
+                    | DeliveryState::OutcomeUnknown
+            )
+        });
+        if !reached_the_gateway {
+            return Ok(false);
+        }
+        Ok(self
+            .destination(&DestinationId::new(destination.to_owned())?)?
+            .is_some_and(|record| {
+                // A removed destination is kept as history with no rule.
+                matches!(record.destination, Destination::Push(_)) && record.rule.is_some()
+            }))
     }
 
     /// Lifts the fence when privacy mode is turned off, at the generation after it.

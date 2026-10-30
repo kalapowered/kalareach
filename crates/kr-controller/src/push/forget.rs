@@ -60,16 +60,40 @@ pub enum ForgetAnswer {
     },
     /// The gateway does not take the credential: it is revoked, expired or not the gateway's.
     CredentialRefused,
-    /// The gateway refused the request in its own words' code, such as a rate limit.
+    /// The gateway refused the request. The code is one of the gateway's published codes, as this
+    /// host's own constant, and none when the gateway named any other: its words are the
+    /// gateway's, and one that repeats what it was sent repeats the bearer credential.
     Refused {
-        /// The code of the refusal.
-        code: String,
+        /// The published code the refusal names, when it names one.
+        code: Option<&'static str>,
     },
     /// No answer this host can read, and the detail of why.
     Unanswered {
         /// Why, never repeating what the answer held.
         detail: String,
     },
+}
+
+/// A request to delete what the gateway holds for one notification, ready to be put.
+///
+/// It holds the credential and the notification and nothing is sent until [`Self::send`], so a
+/// caller can check the authority it acts under once more immediately before the request leaves.
+#[derive(Debug)]
+pub struct PreparedForget {
+    forgetter: GatewayForget,
+    credential: PushDeliveryCredential,
+    notification_id: NotificationId,
+}
+
+impl PreparedForget {
+    /// Puts the request and reads the gateway's answer.
+    ///
+    /// Blocks on the daemon's reactor, so a caller runs it on a blocking thread.
+    #[must_use]
+    pub fn send(self) -> ForgetAnswer {
+        self.forgetter
+            .forget(&self.credential, self.notification_id)
+    }
 }
 
 /// The gateway this host asks to delete what it holds.
@@ -92,11 +116,24 @@ impl GatewayForget {
         }
     }
 
+    /// Readies the request to the gateway `credential` names for `notification_id`.
+    #[must_use]
+    pub fn prepare(
+        &self,
+        credential: PushDeliveryCredential,
+        notification_id: NotificationId,
+    ) -> PreparedForget {
+        PreparedForget {
+            forgetter: self.clone(),
+            credential,
+            notification_id,
+        }
+    }
+
     /// Asks the gateway the credential names to delete what it holds for `notification_id`.
     ///
     /// Blocks on the daemon's reactor, so a caller runs it on a blocking thread.
-    #[must_use]
-    pub fn forget(
+    fn forget(
         &self,
         credential: &PushDeliveryCredential,
         notification_id: NotificationId,
@@ -166,7 +203,7 @@ fn read_answer(answer: &ServiceHttpAnswer, asked: NotificationId) -> ForgetAnswe
             Envelope {
                 ok: true,
                 data: Some(Account { removed }),
-                ..
+                error: None,
             },
         ) => match removed.as_slice() {
             [outcome] if outcome.notification_id == asked => ForgetAnswer::Answered {
@@ -193,7 +230,9 @@ fn read_answer(answer: &ServiceHttpAnswer, asked: NotificationId) -> ForgetAnswe
                 error: Some(Refusal { code }),
                 ..
             },
-        ) => ForgetAnswer::Refused { code },
+        ) => ForgetAnswer::Refused {
+            code: super::sender::known_code(&code),
+        },
         (status, _) => ForgetAnswer::Unanswered {
             detail: format!("the gateway answered {status} without a deletion's account"),
         },
@@ -250,5 +289,118 @@ where
         _ => Err(serde::de::Error::custom(
             "a deletion's account held something this host does not know",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kr_protocol::scalars::Uuid;
+
+    use super::*;
+
+    fn asked() -> NotificationId {
+        NotificationId::new(Uuid::from_bytes([7; 16]))
+    }
+
+    fn answer(status: u16, body: &serde_json::Value) -> ServiceHttpAnswer {
+        ServiceHttpAnswer {
+            status,
+            body: body.to_string().into_bytes(),
+        }
+    }
+
+    fn removed(held: &str, dispatched: bool, id: NotificationId) -> serde_json::Value {
+        serde_json::json!({
+            "ok": true,
+            "data": {
+                "removed": [{ "notification_id": id, "held": held, "dispatched": dispatched }],
+                "note": "Deletion removes what the gateway still holds.",
+            },
+        })
+    }
+
+    /// The gateway's account for each thing it can have held is read as what it says, and a
+    /// success that also names an error, one that names another notification and one that names
+    /// more than were asked about are not an answer to this request.
+    #[test]
+    fn the_gateways_account_is_read_for_the_one_notification_asked_about() {
+        for (word, held) in [
+            ("queued", Held::Queued),
+            ("settled", Held::Settled),
+            ("none", Held::Nothing),
+        ] {
+            assert_eq!(
+                read_answer(&answer(200, &removed(word, true, asked())), asked()),
+                ForgetAnswer::Answered {
+                    held,
+                    dispatched: true
+                },
+                "{word}"
+            );
+        }
+
+        let other = NotificationId::new(Uuid::from_bytes([8; 16]));
+        let mut with_error = removed("settled", false, asked());
+        with_error["error"] = serde_json::json!({ "code": "INTERNAL" });
+        let mut two = removed("settled", false, asked());
+        two["data"]["removed"]
+            .as_array_mut()
+            .expect("a list")
+            .push(serde_json::json!({
+                "notification_id": other, "held": "none", "dispatched": false
+            }));
+        for (why, body) in [
+            ("another notification", removed("settled", false, other)),
+            ("a word it does not know", removed("sent", false, asked())),
+            ("a success naming an error", with_error),
+            ("two outcomes", two),
+        ] {
+            assert!(
+                matches!(
+                    read_answer(&answer(200, &body), asked()),
+                    ForgetAnswer::Unanswered { .. }
+                ),
+                "{why}"
+            );
+        }
+    }
+
+    /// A refusal is told by its published code, as this host's own constant. A code the gateway
+    /// published only by that name is repeated; any other text, which may be what the request
+    /// carried, is not.
+    #[test]
+    fn a_refusal_is_told_by_a_published_code_and_never_by_the_gateways_own_words() {
+        let refused = |status: u16, code: &str| {
+            read_answer(
+                &answer(
+                    status,
+                    &serde_json::json!({
+                        "ok": false,
+                        "error": { "code": code, "message": "a-marker-nobody-should-see" },
+                    }),
+                ),
+                asked(),
+            )
+        };
+        assert_eq!(
+            refused(401, "UNAUTHENTICATED"),
+            ForgetAnswer::CredentialRefused
+        );
+        assert_eq!(
+            refused(429, "RATE_LIMITED"),
+            ForgetAnswer::Refused {
+                code: Some("RATE_LIMITED")
+            }
+        );
+        assert_eq!(
+            refused(400, "a-marker-nobody-should-see"),
+            ForgetAnswer::Refused { code: None }
+        );
+        let ForgetAnswer::Unanswered { detail } =
+            read_answer(&answer(500, &serde_json::json!({})), asked())
+        else {
+            panic!("nothing answered");
+        };
+        assert!(!detail.contains("a-marker-nobody-should-see"), "{detail}");
     }
 }

@@ -943,83 +943,106 @@ fn allow_writes(host: &kr_ipc::testing::TempHost, name: &str) {
 }
 
 /// KR-REQ-24.05: the display number a create is allocated and the reservation that carries the
-/// work it owes are one commit. A reservation the registry cannot write takes no number, so a
-/// create that failed leaves nothing behind for a retry to skip or for a restart to find.
+/// work it owes are one commit, whichever of the two writes the registry cannot make. A create that
+/// failed takes no number and leaves no reservation behind for a retry to skip or for a restart to
+/// find.
 #[test]
 fn an_allocation_is_committed_with_its_reservation_or_not_at_all() {
-    let (host, mut registry) = registry();
-    refuse_writes(
-        &host,
-        "refuse_reservations",
-        "BEFORE INSERT ON reservations",
-    );
-    let token = kr_ipc::new_uuid();
-    registry
-        .reserve(
-            &actor("local:501"),
-            token,
-            digest(1),
-            &intent(),
-            TimestampMs::new(1),
-        )
-        .expect_err("the reservation cannot be written");
-    assert_eq!(registry.occupancy().expect("counts"), 0);
-    assert!(
-        registry
-            .reservation_for_token(&actor("local:501"), token)
-            .expect("reads")
-            .is_none(),
-        "no reservation stands for the token"
-    );
+    for (name, trigger) in [
+        ("refuse_reservations", "BEFORE INSERT ON reservations"),
+        (
+            "refuse_numbers",
+            "BEFORE UPDATE OF next_display ON environment",
+        ),
+    ] {
+        let (host, mut registry) = registry();
+        refuse_writes(&host, name, trigger);
+        let token = kr_ipc::new_uuid();
+        let error = registry
+            .reserve(
+                &actor("local:501"),
+                token,
+                digest(1),
+                &intent(),
+                TimestampMs::new(1),
+            )
+            .expect_err("a write cannot be made");
+        assert!(error.to_string().contains("refused"), "{name}: {error}");
+        assert_eq!(registry.occupancy().expect("counts"), 0, "{name}");
+        assert!(
+            registry
+                .reservation_for_token(&actor("local:501"), token)
+                .expect("reads")
+                .is_none(),
+            "{name}: no reservation stands for the token"
+        );
 
-    allow_writes(&host, "refuse_reservations");
-    let admitted = registry
-        .reserve(
-            &actor("local:501"),
-            token,
-            digest(1),
-            &intent(),
-            TimestampMs::new(2),
-        )
-        .expect("the retry reserves");
-    assert!(!admitted.deduplicated);
-    assert_eq!(
-        admitted.reservation.display_number.get(),
-        1,
-        "the refused attempt took no display number"
-    );
+        allow_writes(&host, name);
+        let admitted = registry
+            .reserve(
+                &actor("local:501"),
+                token,
+                digest(1),
+                &intent(),
+                TimestampMs::new(2),
+            )
+            .expect("the retry reserves");
+        assert!(!admitted.deduplicated, "{name}");
+        assert_eq!(
+            admitted.reservation.display_number.get(),
+            1,
+            "{name}: the refused attempt took no display number"
+        );
+    }
 }
 
-/// KR-REQ-24.05: an authority revision and the fence it owes are one commit, so the registry never
-/// holds a revision it cannot account for, and a restart finds both. The revision only rises: a
-/// floor below the standing revision still moves it up, and settling the fence ends the debt and
+/// KR-REQ-24.05: an authority revision and the fence it owes are one commit, whichever of the two
+/// the registry cannot write, so the registry never holds a revision it cannot account for or a
+/// debt for a revision that was not issued, and a restart finds both. The revision only rises: a
+/// floor below the standing revision lowers nothing, and settling the fence ends the debt and
 /// leaves the revision where it stood.
 #[test]
 fn an_authority_revision_is_committed_with_the_fence_it_owes_or_not_at_all() {
+    for (name, trigger) in [
+        (
+            "refuse_debts",
+            "BEFORE UPDATE OF fence_owed_revision ON environment",
+        ),
+        (
+            "refuse_revisions",
+            "BEFORE UPDATE OF authority_revision ON environment",
+        ),
+    ] {
+        let (host, mut registry) = registry();
+        refuse_writes(&host, name, trigger);
+        for error in [
+            registry
+                .advance_authority_revision()
+                .expect_err("a write cannot be made"),
+            registry
+                .advance_authority_revision_to(AuthorityRevision::new(5))
+                .expect_err("a write cannot be made"),
+        ] {
+            assert!(error.to_string().contains("refused"), "{name}: {error}");
+        }
+        assert_eq!(
+            registry.authority_revision().expect("reads").get(),
+            0,
+            "{name}: no revision stands without the fence it owes"
+        );
+        assert_eq!(
+            registry.fence_owed().expect("reads"),
+            None,
+            "{name}: no debt stands for a revision that was not issued"
+        );
+        allow_writes(&host, name);
+        let first = registry.advance_authority_revision().expect("advances");
+        assert_eq!(first.get(), 1, "{name}");
+        assert_eq!(registry.fence_owed().expect("reads"), Some(first), "{name}");
+    }
+
     let (host, mut registry) = registry();
-    refuse_writes(
-        &host,
-        "refuse_debts",
-        "BEFORE UPDATE OF fence_owed_revision ON environment",
-    );
-    registry
-        .advance_authority_revision()
-        .expect_err("the debt cannot be written");
-    registry
-        .advance_authority_revision_to(AuthorityRevision::new(5))
-        .expect_err("the debt cannot be written");
-    assert_eq!(
-        registry.authority_revision().expect("reads").get(),
-        0,
-        "no revision stands without the fence it owes"
-    );
-    assert_eq!(registry.fence_owed().expect("reads"), None);
-
-    allow_writes(&host, "refuse_debts");
     let first = registry.advance_authority_revision().expect("advances");
-    assert_eq!(first.get(), 1);
-    assert_eq!(registry.fence_owed().expect("reads"), Some(first));
-
     // A daemon that opens the registry again finds the revision and the debt together.
     drop(registry);
     let mut reopened = Registry::open(

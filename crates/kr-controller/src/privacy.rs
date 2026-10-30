@@ -2068,9 +2068,10 @@ impl crate::service::Controller {
     ///
     /// Returns [`ControllerError::InvalidArgument`] when the delivery journal holds no one
     /// notification under the reference, [`ControllerError::PermissionDenied`] for a registration
-    /// that was withdrawn, for a device this host holds no credential for and when no transport
-    /// reaches the gateway, and [`ControllerError::Storage`] when the gateway did not answer or
-    /// refused the request.
+    /// that was withdrawn, for a device this host holds no credential for and when no transport is
+    /// attached yet, [`ControllerError::Refused`] under `RATE_LIMITED` when the gateway takes no
+    /// more deletions from this host for now, and [`ControllerError::Storage`] when the gateway
+    /// did not answer, refused the credential or refused the request.
     async fn privacy_notification_delete(
         self: &Arc<Self>,
         reference: &str,
@@ -2119,22 +2120,25 @@ impl crate::service::Controller {
         .map_err(|_| ControllerError::RegistryUnavailable {
             detail: "the deletion stopped before it could say what it did".to_owned(),
         })??;
-        // The registration the call was admitted under is asked again immediately before the
-        // request leaves. A withdrawal that lands after it does not recall a deletion.
-        self.check_registration(&carried)?;
+        // The registration the call was admitted under is asked again on the thread that puts the
+        // request, after the credential is found and the transport is known, and immediately
+        // before the request is put. A withdrawal that lands after that check does not recall a
+        // request already on its way.
         let controller = Arc::clone(self);
         let answer = tokio::task::spawn_blocking(move || {
-            controller
+            let prepared = controller
                 .delivery_runtime()
-                .forget_notification(sender_record_id, notification_id)
+                .prepare_forget(sender_record_id, notification_id)
+                .map_err(|detail| ControllerError::PermissionDenied {
+                    detail: format!("this host cannot ask for the removal of that copy: {detail}"),
+                })?;
+            controller.check_registration(&carried)?;
+            Ok::<_, ControllerError>(prepared.send())
         })
         .await
         .map_err(|_| ControllerError::RegistryUnavailable {
             detail: "the deletion stopped before it could say what it did".to_owned(),
-        })?
-        .map_err(|detail| ControllerError::PermissionDenied {
-            detail: format!("this host cannot ask for the removal of that copy: {detail}"),
-        })?;
+        })??;
         let unreached = |why: String| ControllerError::Storage {
             operation: "have the gateway delete what it holds for that notification",
             detail: why,
@@ -2143,13 +2147,27 @@ impl crate::service::Controller {
             crate::push::forget::ForgetAnswer::Answered { .. } => {}
             crate::push::forget::ForgetAnswer::CredentialRefused => {
                 return Err(unreached(
-                    "it does not take this host's credential for that device; the credential is \
-                     renewed on its own, so ask again later"
+                    "it does not take this host's credential for that device: a credential that \
+                     ran out is renewed on its own, so ask again later, and one the gateway \
+                     revoked is not, so the device registers again"
                         .to_owned(),
                 ));
             }
+            crate::push::forget::ForgetAnswer::Refused {
+                code: Some("RATE_LIMITED"),
+            } => {
+                return Err(ControllerError::Refused {
+                    code: kr_protocol::error::ErrorCode::RateLimited,
+                    detail: "the gateway takes only so many deletions an hour from this host; \
+                             wait and ask again"
+                        .to_owned(),
+                });
+            }
             crate::push::forget::ForgetAnswer::Refused { code } => {
-                return Err(unreached(format!("it refused the request ({code})")));
+                return Err(unreached(match code {
+                    Some(code) => format!("it refused the request ({code})"),
+                    None => "it refused the request".to_owned(),
+                }));
             }
             crate::push::forget::ForgetAnswer::Unanswered { detail } => {
                 return Err(unreached(detail));

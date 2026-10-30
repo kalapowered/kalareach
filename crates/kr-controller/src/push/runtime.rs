@@ -48,7 +48,7 @@ use kr_delivery::push::DeliveryStatus;
 use super::client::GatewayClient;
 use super::credentials::HeldCredentials;
 use super::external::ExternalSenders;
-use super::forget::{ForgetAnswer, GatewayForget};
+use super::forget::{GatewayForget, PreparedForget};
 use super::mail::MailSubmission;
 use super::sender::GatewaySenders;
 use super::status::{GatewayStatus, StatusAllowance, StatusBudget};
@@ -402,28 +402,30 @@ impl DeliveryRuntime {
         attached
     }
 
-    /// Asks the gateway that gave a credential its authorisation to delete what it still holds for
-    /// one notification this host gave it.
+    /// Readies the request that asks the gateway that gave a credential its authorisation to
+    /// delete what it still holds for one notification this host gave it.
     ///
     /// It is a person's request, so it takes none of the passes' shares and is not stopped by
-    /// privacy mode. It blocks on the daemon's reactor, so a caller runs it on a blocking thread.
+    /// privacy mode. Nothing is sent until [`PreparedForget::send`], which blocks on the daemon's
+    /// reactor, so a caller runs it on a blocking thread.
     ///
     /// # Errors
     ///
-    /// Returns why no request was put: no transport is attached, or this host holds no credential
-    /// for the authorisation, such as a device that was unpaired since. Nothing was sent then.
-    pub fn forget_notification(
+    /// Returns why no request can be put: no transport is attached, or this host holds no
+    /// credential for the authorisation, such as a device that was unpaired since. Nothing was
+    /// sent.
+    pub fn prepare_forget(
         &self,
         sender_record_id: kr_protocol::ids::PushSenderRecordId,
         notification_id: kr_protocol::ids::NotificationId,
-    ) -> Result<ForgetAnswer, String> {
+    ) -> Result<PreparedForget, String> {
         let Some(adapters) = self.adapters.get() else {
             return Err("this host has no transport to the gateway yet".to_owned());
         };
         let Some(credential) = self.credentials.held(sender_record_id) else {
             return Err("this host holds no credential for the device's gateway".to_owned());
         };
-        Ok(adapters.forgetter.forget(&credential, notification_id))
+        Ok(adapters.forgetter.prepare(credential, notification_id))
     }
 
     /// Hands the runtime the environment's attention store, which every pass takes the

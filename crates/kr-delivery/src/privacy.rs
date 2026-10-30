@@ -578,6 +578,56 @@ mod tests {
         );
     }
 
+    /// A notification is offered for deletion only when the gateway has it or may have, and only
+    /// while the device it went to is still paired. One still waiting to be sent, whose detail was
+    /// placed in a mailbox, is listed and not offered: the gateway would answer that it holds
+    /// nothing, which stops no send that is still to come. One of a device since unpaired is kept
+    /// as history and not offered, because the credential it is asked under is gone.
+    #[test]
+    fn a_notification_is_offered_for_deletion_only_when_the_gateway_may_hold_it_for_a_paired_device()
+     {
+        let mut journal = journal_with_work();
+        let waiting = admit_to_the_phone(&mut journal, 5);
+        journal.note_detail_left(waiting).expect("a mark");
+        let accepted = admit_to_the_phone(&mut journal, 6);
+        claim(&mut journal, 6 + 20, 1_500);
+        journal
+            .record_attempt(&Transition {
+                notification_id: accepted,
+                attempt: 1,
+                state: DeliveryState::Accepted,
+                started_at_ms: TimestampMs::new(1_500),
+                settled_at_ms: Some(TimestampMs::new(1_600)),
+                next_attempt_at_ms: None,
+                next: crate::push::NextAction::None,
+                detail: Some("the gateway took it".to_owned()),
+                suppression: None,
+                left_this_host: true,
+                reported_by_destination: false,
+            })
+            .expect("a transition");
+        let deletable = |journal: &mut DeliveryJournal, id: NotificationId| {
+            let outbox = DeliveryOutbox::over(journal, 2_000);
+            let listed = outbox.exported().expect("a list");
+            let copy = listed
+                .iter()
+                .find(|copy| copy.reference.starts_with(&id.to_string()))
+                .unwrap_or_else(|| panic!("{id} is listed: {listed:?}"));
+            copy.deletable
+        };
+
+        assert!(!deletable(&mut journal, waiting), "it has not gone yet");
+        assert!(deletable(&mut journal, accepted), "the gateway took it");
+
+        journal
+            .remove_destination(&DestinationId::new("phone").expect("an identifier"), 3_000)
+            .expect("the device is unpaired");
+        assert!(
+            !deletable(&mut journal, accepted),
+            "the device is no longer paired, so the request has no credential to be made under"
+        );
+    }
+
     #[test]
     fn a_confirmed_duplicate_delivery_is_shown_as_a_retained_artifact() {
         let mut journal = journal_with_work();

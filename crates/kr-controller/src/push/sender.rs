@@ -84,7 +84,7 @@ const GATEWAY_CODES: [&str; 20] = [
 ];
 
 /// The code of [`GATEWAY_CODES`] that `named` is exactly, as this host's own constant.
-fn known_code(named: &str) -> Option<&'static str> {
+pub(super) fn known_code(named: &str) -> Option<&'static str> {
     GATEWAY_CODES.iter().copied().find(|code| *code == named)
 }
 

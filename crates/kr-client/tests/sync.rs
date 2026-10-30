@@ -6939,6 +6939,23 @@ async fn a_settings_object_with_pinned_labels_is_not_published_while_private() {
         1,
         "privacy mode does not clear a pinned label"
     );
+    let SyncBody::Settings(kept) = client
+        .store()
+        .object(object_id)
+        .expect("read")
+        .expect("the object is still held")
+        .body
+    else {
+        panic!("a settings object")
+    };
+    assert_eq!(
+        kept.pinned_labels,
+        ["one", "two"]
+            .iter()
+            .map(|label| (*label).to_owned())
+            .collect(),
+        "the object keeps the labels it holds"
+    );
     assert!(
         service.exchanges().await.is_empty(),
         "removing what is retained sends nothing either"

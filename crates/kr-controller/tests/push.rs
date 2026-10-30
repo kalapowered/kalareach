@@ -4060,6 +4060,8 @@ enum ForgetScript {
     RefusesTheCredential,
     /// Answers about a notification that was not named.
     AnswersAboutAnother(NotificationId),
+    /// Answers that it held the notification as `queued`, `settled` or `none`.
+    Holds(&'static str),
 }
 
 impl DeliveringGateway {
@@ -4188,6 +4190,10 @@ impl kr_client::services::ServiceHttp for DeliveringGateway {
                         Some(ForgetScript::AnswersAboutAnother(another)) => another,
                         _ => named,
                     };
+                    let held = match other {
+                        Some(ForgetScript::Holds(held)) => held,
+                        _ => "settled",
+                    };
                     (
                         200,
                         serde_json::json!({
@@ -4195,7 +4201,7 @@ impl kr_client::services::ServiceHttp for DeliveringGateway {
                             "data": {
                                 "removed": [{
                                     "notification_id": answered,
-                                    "held": "settled",
+                                    "held": held,
                                     "dispatched": true,
                                 }],
                                 "note": "Deletion removes what the gateway still holds.",
@@ -8041,6 +8047,132 @@ async fn a_deletion_the_gateway_did_not_carry_out_is_not_reported_as_one() {
         );
         host.stop().await;
     }
+}
+
+/// KR-REQ-24.29: whatever the gateway says it held, queued, settled or nothing, once it has
+/// answered for the one notification the deletion is done: it holds nothing for it now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gateway_that_answers_for_the_notification_has_nothing_left_to_delete() {
+    for held in ["queued", "settled", "none"] {
+        let gateway = Arc::new(DeliveringGateway::forgetting(ForgetScript::Holds(held)));
+        let (host, copy, _) = a_host_whose_alert_left(&gateway).await;
+
+        let result = delete_retained(&host, &copy.reference)
+            .await
+            .unwrap_or_else(|error| panic!("{held}: {error:?}"));
+
+        assert!(result.deleted, "{held}");
+        assert_eq!(gateway.forgets().len(), 1, "{held}");
+        host.stop().await;
+    }
+}
+
+/// KR-REQ-24.29: the request for each notification is made under the credential of the device the
+/// notification went to and no other. Two paired phones hold credentials of their own, one alert
+/// reaches both, and each deletion carries the bearer that phone's alert was delivered under.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_deletion_is_asked_under_the_credential_of_the_device_its_notification_went_to() {
+    let gateway = Arc::new(DeliveringGateway::default());
+    let host = net_support::Host::start_unowned().await;
+    let controller = host.controller();
+    let now = kr_ipc::now_ms().get();
+    for byte in [10, 11] {
+        let (_, sender, _) = pair_phone(controller, byte, SessionSelector::Any);
+        controller
+            .delivery_runtime()
+            .credentials()
+            .hold(PushDeliveryCredential {
+                sender_record_id: sender,
+                secret: SecretBytes32::from_bytes([byte; 32]),
+                ..current_credential(now)
+            });
+    }
+    assert!(controller.attach_delivery_transport(Arc::new(OneTransport(
+        Arc::clone(&gateway) as Arc<dyn kr_client::services::ServiceHttp>
+    ))));
+    set_privacy(&host, true).await;
+    controller
+        .attention()
+        .observe(&[pending_approval_in(
+            SessionId::new(uuid(90)),
+            1,
+            "req-write-hosts",
+        )])
+        .expect("the store records the approval");
+    until_holds("the alert reaching both phones", || {
+        gateway.delivered().len() == 2
+    })
+    .await;
+    until_holds("both alerts being accepted", || {
+        controller
+            .delivery()
+            .with(|producer| {
+                Ok(producer
+                    .journal()
+                    .deliveries()
+                    .expect("a read")
+                    .iter()
+                    .filter(|record| record.state == DeliveryState::Accepted)
+                    .count()
+                    == 2)
+            })
+            .unwrap_or(false)
+    })
+    .await;
+    let report = privacy_report(&host).await;
+    assert_eq!(report.exported.len(), 2, "{:?}", report.exported);
+    // The bearer each notification was delivered under.
+    let delivered_under = |notification: &NotificationId| {
+        gateway
+            .asked()
+            .into_iter()
+            .filter(|asked| asked.url.ends_with("/api/push/deliver"))
+            .find(|asked| {
+                serde_json::from_slice::<PushDeliveryRequest>(&asked.body)
+                    .is_ok_and(|request| request.notification_id == *notification)
+            })
+            .and_then(|asked| {
+                asked
+                    .headers
+                    .into_iter()
+                    .find(|(name, _)| name == "authorization")
+            })
+            .map(|(_, bearer)| bearer)
+            .expect("the delivery carried a bearer")
+    };
+
+    for copy in &report.exported {
+        delete_retained(&host, &copy.reference)
+            .await
+            .expect("the gateway answered");
+    }
+
+    let forgets = gateway.forgets();
+    assert_eq!(forgets.len(), 2);
+    let mut bearers = BTreeSet::new();
+    for asked in &forgets {
+        let notification = question_about_ids(&asked.body);
+        let bearer = asked
+            .headers
+            .iter()
+            .find(|(name, _)| name == "authorization")
+            .map(|(_, bearer)| bearer.clone())
+            .expect("the request carried a bearer");
+        assert_eq!(
+            bearer,
+            delivered_under(&notification),
+            "the deletion is asked under the credential its notification was delivered under"
+        );
+        bearers.insert(bearer);
+    }
+    assert_eq!(bearers.len(), 2, "the two phones' credentials differ");
+    host.stop().await;
+}
+
+/// The one notification a request to delete names.
+fn question_about_ids(body: &[u8]) -> NotificationId {
+    let asked: serde_json::Value = serde_json::from_slice(body).expect("a JSON request");
+    serde_json::from_value(asked["notification_ids"][0].clone()).expect("an identifier")
 }
 
 /// KR-REQ-24.29: the host asks the gateway about what it listed and nothing else. A reference no
