@@ -5121,16 +5121,22 @@ queued, what a device holds or what a mailbox keeps for the device, and the noti
 listed as one that may have left. A notification waiting to be sent, on the wire, or retrying with
 another send to come is not deletable, since an answer that the gateway holds nothing would stop no
 send still to come; the list shows such a notification only when its detail was placed in a mailbox.
-One that settled without its content ever leaving the host is not listed. Nor is one deletable when
-its device was unpaired since, because this host no longer holds the credential, or when its device
-registered again or its destination was changed since, because the credential this host holds then
-belongs to another authorisation and the gateway answers a credential only for the notifications its
-own authorisation sent. An external message is listed and is not deletable, because this host holds
-no way to ask the service it went to to forget it. Backup does not silently delete unrelated
-collections and does not claim a copy somebody else holds can be recalled. Local deletion is logical
-cleanup of this host's own records rather than a claim of physical secure erase: the files are
-unlinked and the rows are cleared, and nothing here says the bytes are unrecoverable from the device
-they were on.
+One that settled without its content ever leaving the host is not listed. The journal keeps no
+record of which authorisation sent a notification, only a digest of the destination it was admitted
+for, so the host offers a deletion only while the destination is that destination again. A
+registration with the same values keeps the offer, and so does turning previews on or off, and so
+does a rejected token that puts the destination out of service: a notification a gateway answer
+settled for a rejected token, after the content was dispatched, is still offered. A new grant, a new
+stored-envelope key, a new installation or a new authorisation ends the offer. The notification
+stays listed, and it is offered again only if the destination returns to the values it was admitted
+under, which a new authorisation never does. A notification of a device since unpaired is not
+offered, because the destination is kept as history with no rule and this host no longer holds the
+credential, and neither is a row recorded with no digest: it matches no destination. An external
+message is listed and is not deletable, because this host holds no way to ask the service it went to
+to forget it. Backup does not silently delete unrelated collections and does not claim a copy
+somebody else holds can be recalled. Local deletion is logical cleanup of this host's own records
+rather than a claim of physical secure erase: the files are unlinked and the rows are cleared, and
+nothing here says the bytes are unrecoverable from the device they were on.
 
 `privacy.retained.delete` is the separately authorised action that asks the service to delete one of
 those copies. It is its own call, apart from turning privacy mode on. It is served on the owner's
@@ -5144,26 +5150,31 @@ non-deletable as `PERMISSION_DENIED`.
 For a notification the host asks the push gateway, under the credential the gateway gave the
 authorisation the notification was sent under and over the daemon's own transport, to delete what it
 still holds for that one notification, and names no other. The host takes that authorisation from
-the destination, and only while the destination is still the one the notification was admitted for:
-the notification's record keeps a digest of that destination and nothing else of it, so the host
-cannot read the authorisation back from the record. A device that registered again holds another
-authorisation, and the gateway would answer that it holds nothing for a notification it did not
-send, which the host would report as a deletion that did not happen. So such a call is refused as
-`PERMISSION_DENIED` and nothing leaves the host. The registration the call was admitted under is
-asked again on the thread that puts the request, after the credential is found and the transport
-that reaches the gateway is resolved, and immediately before the request is put. The gateway's
-answer says what it held: a notification still queued is not sent now, a recorded decision is gone,
-and nothing at all is also what it answers for a notification it never saw, one of another
-authorisation and one it already removed or swept. This host takes any of those as the gateway
-holding nothing now, and reports the deletion as done. It records nothing of its own, so the list
-goes on showing the notification and a second call asks the gateway again. A gateway that does not
-answer, that refuses the credential, that refuses the request, or whose answer is about another
-notification or also names an error leaves the copy listed as it was and the call fails with
-`STORAGE_UNAVAILABLE`, and the person asks again. Of a refusal the call repeats only a code the
-gateway publishes, never its words. A gateway that takes no more deletions for now fails the call as
-`RATE_LIMITED`; it counts them by this host, by the device's installation and by network, so another
-host's deletions can use up the allowance. A device this host holds no credential for any longer,
-such as one unpaired since, is refused as `PERMISSION_DENIED` and nothing leaves the host.
+the destination, and only while the destination is still the one the notification was admitted for,
+as above: the notification's record keeps a digest of that destination and nothing else of it, so
+the host cannot read the authorisation back from the record. A destination that has changed in a way
+that ends the offer refuses the call as `PERMISSION_DENIED`, and nothing leaves the host. The
+registration the call was admitted under is asked again on the thread that puts the request, after
+the credential is found and the transport that reaches the gateway is resolved, and immediately
+before the request is put. The gateway's answer says what it held: a notification still queued is
+not sent now, a recorded decision is gone, and nothing at all is also what it answers for a
+notification it never saw, one of another authorisation, one it already removed or swept, and one
+asked about under the bearer of another installation. So the host takes `queued` and `settled` as
+the deletion, and takes nothing at all as the deletion only under a bearer the gateway has shown to
+be the authorisation's: one under which it has removed a record since this host started, or one this
+host's own renewal handed over. A device that registers again with the destination's values and
+another bearer puts that bearer in the place of the one the notification was sent under, and a host
+that has just started holds what its secret store kept. Under either, an answer of nothing fails the
+call with `STORAGE_UNAVAILABLE` and the copy stays listed; a record the gateway has already removed
+needs nothing more. The host records nothing of its own, so the list goes on showing the
+notification and a second call asks the gateway again. A gateway that does not answer, that refuses
+the credential, that refuses the request, or whose answer is about another notification or also
+names an error leaves the copy listed as it was and the call fails with `STORAGE_UNAVAILABLE`, and
+the person asks again. Of a refusal the call repeats only a code the gateway publishes, never its
+words. A gateway that takes no more deletions for now fails the call as `RATE_LIMITED`; it counts
+them by this host, by the device's installation and by network, so another host's deletions can use
+up the allowance. A device this host holds no credential for any longer, such as one unpaired since,
+is refused as `PERMISSION_DENIED` and nothing leaves the host.
 
 For a backup generation the host's store decides, in the write that records the request. The
 generation belongs to the archive of this host's setup, and the writer that signed it is still
