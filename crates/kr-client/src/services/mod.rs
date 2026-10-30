@@ -1402,7 +1402,12 @@ impl ServiceClients {
     pub fn availability_of(&self, service: ManagedService) -> Availability {
         let configured = self.holds(service);
         let explanation = if configured {
-            format!("A {} service is configured.", service.as_str())
+            let article = if service.as_str().starts_with(['a', 'e', 'i', 'o', 'u']) {
+                "An"
+            } else {
+                "A"
+            };
+            format!("{article} {} service is configured.", service.as_str())
         } else {
             format!(
                 "No {} service is configured. You can {}.",
