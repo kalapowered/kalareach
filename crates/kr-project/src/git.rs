@@ -3668,8 +3668,8 @@ impl Asked {
 /// its output passes the limit. A child that cannot be waited on is refused and nothing is
 /// signalled by its number, which may be another process's by now. A process that left the group
 /// and kept the pipe is out of reach: the answer is refused after a short wait for the end of its
-/// output, and this host closes its end of the pipe, so it holds nothing of the process. The
-/// process may go on, and a write it makes to the closed pipe fails.
+/// output, and on Unix this host closes its end of the pipe, so it holds nothing of the process.
+/// The process may go on, and a write it makes to the closed pipe fails.
 fn ask(
     program: &Path,
     arguments: &[&str],
@@ -3982,10 +3982,12 @@ fn gather(pipe: &mut impl std::io::Read, seen: &mut Bounded, deadline: Instant) 
 fn without_blocking(pipe: &std::process::ChildStdout) -> std::io::Result<()> {
     #[cfg(test)]
     if let Some(after) = tests::SWITCH_FAILS.with(|fails| fails.borrow().clone()) {
-        // The case that asks for the failure has its stand-in write a file first, so that what is
-        // done to the stand-in afterwards can be told from what is done before it has run.
+        // The case that asks for the failure has its stand-in write its number to a file first, so
+        // that what is done to the stand-in afterwards can be told from what is done before it has
+        // run. The file is made before the number is written to it, so it is the number waited for.
         let guard = Instant::now() + Duration::from_secs(30);
-        while !after.exists() && Instant::now() < guard {
+        let written = || std::fs::metadata(&after).is_ok_and(|file| file.len() > 0);
+        while !written() && Instant::now() < guard {
             std::thread::sleep(Duration::from_millis(5));
         }
         return Err(std::io::Error::other("the pipe cannot be switched"));
@@ -5269,7 +5271,9 @@ mod tests {
         );
         let pid = number_of(&own);
         let alive = running(&pid);
-        end_by_number(&pid);
+        if alive {
+            end_by_number(&pid);
+        }
         assert!(!alive, "the stand-in was ended with the refusal");
     }
 
@@ -5336,6 +5340,58 @@ mod tests {
         let left_alone = running(&pid);
         end_by_number(&pid);
         assert!(left_alone, "the stand-in was signalled by its number");
+    }
+
+    /// A probe that is cut short after its child has ended, and before it is collected, has the
+    /// group that child led ended and is collected, so that the process it left running does not
+    /// outlive the look and the child does not stay a zombie.
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn a_probe_cut_short_after_its_child_ended_has_its_group_ended_and_is_collected() {
+        use std::os::unix::process::CommandExt as _;
+
+        let state = |pid: &str| {
+            let listed = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", pid])
+                .output()
+                .expect("ps lists the process");
+            String::from_utf8_lossy(&listed.stdout).trim().to_owned()
+        };
+        let directory = tempfile::tempdir().expect("a directory for this test");
+        let sleeper = directory.path().join("sleeper");
+        let child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("sleep 120 &\necho $! > '{}'", sleeper.display()))
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the shell starts");
+        let pid = child.id().to_string();
+        // Ended and not collected: a zombie, which is the state the probe finds it in.
+        let guard = Instant::now() + Duration::from_secs(30);
+        while !state(&pid).starts_with('Z') {
+            assert!(Instant::now() < guard, "the shell never ended");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let sleeper = std::fs::read_to_string(&sleeper)
+            .expect("the shell recorded the process it left running")
+            .trim()
+            .to_owned();
+        assert!(running(&sleeper), "the process it left is running");
+
+        end_if_own(child);
+
+        let guard = Instant::now() + Duration::from_secs(30);
+        while running(&sleeper) {
+            assert!(
+                Instant::now() < guard,
+                "the process the child left in its group is still running"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(state(&pid), "", "the child was collected");
     }
 
     #[test]
