@@ -29,18 +29,21 @@ use companion_platform::push::{PendingRegistration, PendingState};
 use companion_tauri::AppState;
 use companion_tauri::device::Device;
 use companion_tauri::push::{
-    AskFuture, ConnectionRegistrar, HostLine, LineFuture, LineStop, Native, PushDesk, PushFuture,
-    PushState, PushView, Reach, Registrar, Wiring,
+    AskFuture, ConnectionRegistrar, GatewayFor, HostLine, LineFuture, LineStop, Native, PushDesk,
+    PushFuture, PushState, PushView, Reach, Registrar, Wiring,
 };
 use futures_util::FutureExt as _;
 use kr_client::pairing::paired::PairedHost;
-use kr_client::services::ServiceFuture;
 use kr_client::services::relay::{ServiceHttp, ServiceHttpAnswer};
+use kr_client::services::{ManagedService, PushService, ServiceFuture, push};
 use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::{MemoryStore, SecretName, SecretStore, load_notification_preview_key};
 use kr_protocol::ids::DeviceKeyRevision;
 use kr_protocol::pairing::KeyPurpose;
-use kr_protocol::push::{DevicePushRegisterParams, DevicePushRegisterResult};
+use kr_protocol::push::{
+    DevicePushRegisterParams, DevicePushRegisterResult, PushRegistrationAnswer,
+    PushRegistrationProposal, PushSenderIssueRequest,
+};
 use kr_protocol::rights::ActionRight;
 use net_support::Host;
 use serde_json::{Value, json};
@@ -763,6 +766,19 @@ fn open_at(
     receiver: &Arc<Receiver>,
     registrar: Arc<dyn Registrar>,
 ) -> Opened {
+    open_replacing(origin, data, device, receiver, registrar, |managed| managed)
+}
+
+/// As [`open_at`], with the client of the gateway the desk asks for made by `replacing` from the
+/// managed one over the scripted gateway.
+fn open_replacing(
+    origin: kr_protocol::service::GatewayOrigin,
+    data: &Path,
+    device: &Arc<Device>,
+    receiver: &Arc<Receiver>,
+    registrar: Arc<dyn Registrar>,
+    replacing: impl FnOnce(Arc<GatewayFor>) -> Arc<GatewayFor>,
+) -> Opened {
     let gateway = Gateway::new();
     let http = Arc::clone(&gateway);
     let clock_ahead_ms = Arc::new(AtomicU64::new(0));
@@ -780,9 +796,9 @@ fn open_at(
         registrar,
         Wiring {
             origin,
-            gateway: companion_tauri::push::gateway_over(Arc::new(move |_| {
+            gateway: replacing(companion_tauri::push::gateway_over(Arc::new(move |_| {
                 Ok(Arc::clone(&http) as Arc<dyn ServiceHttp>)
-            })),
+            }))),
             clock: Arc::new(move || kr_ipc::now_ms().get() + ahead.load(Ordering::SeqCst)),
             keys_within: receiver.state.lock().expect("the receiver").keys_patience,
         },
@@ -967,6 +983,121 @@ async fn a_build_given_its_own_gateway_registers_there_and_its_receivers_answer_
     let theirs = challenge(official_origin().as_str());
     assert_eq!(theirs["verdict"], "refused", "{theirs}");
     assert_eq!(theirs["reason"], "origin");
+}
+
+/// A push service of a fork's own, in the managed gateway client's place. It records each call it
+/// receives and, for the rest, is the managed client over the scripted gateway.
+#[derive(Debug)]
+struct ForkPush {
+    managed: Arc<dyn PushService>,
+    calls: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl PushService for ForkPush {
+    fn propose<'a>(
+        &'a self,
+        proposal: PushRegistrationProposal,
+    ) -> ServiceFuture<'a, push::Registration> {
+        self.calls.lock().expect("the record").push("propose");
+        self.managed.propose(proposal)
+    }
+
+    fn answer<'a>(
+        &'a self,
+        answer: PushRegistrationAnswer,
+    ) -> ServiceFuture<'a, push::Registration> {
+        self.calls.lock().expect("the record").push("answer");
+        self.managed.answer(answer)
+    }
+
+    fn issue<'a>(&'a self, request: PushSenderIssueRequest) -> ServiceFuture<'a, push::Issued> {
+        self.calls.lock().expect("the record").push("issue");
+        self.managed.issue(request)
+    }
+}
+
+/// KR-REQ-17.14: the push desk reaches the gateway through the client its factory makes. A fork's
+/// own client in that place receives the registration calls and the host is handed the credential
+/// that client's issue returned; the client the application's set holds for push is the one the
+/// factory makes, and availability reports it as configured.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_push_desk_talks_to_the_gateway_client_it_was_given() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = phone_paired_with(&host, &owner, &[ActionRight::SessionView]).await;
+    let device = phone.companion.device();
+    let registered = Arc::new(Mutex::new(Registered::default()));
+    let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+    let calls = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+    let opened = open_replacing(
+        official_origin(),
+        phone.data.path(),
+        &device,
+        &Receiver::new(FIRST_TOKEN),
+        Arc::new(HostLink(Arc::clone(&registered))),
+        {
+            let (asked, calls) = (Arc::clone(&asked), Arc::clone(&calls));
+            move |managed| -> Arc<GatewayFor> {
+                Arc::new(move |origin, signer| {
+                    asked
+                        .lock()
+                        .expect("the record")
+                        .push(origin.as_str().to_owned());
+                    Ok(Arc::new(ForkPush {
+                        managed: managed(origin, signer)?,
+                        calls: Arc::clone(&calls),
+                    }) as Arc<dyn PushService>)
+                })
+            }
+        },
+    );
+    let reference = opened.desk.view().hosts[0].reference.clone();
+
+    opened.desk.enable(&reference).expect("the person asks");
+    states_until(&opened.desk, |states| states == [PushState::On]).await;
+
+    let calls = calls.lock().expect("the record").clone();
+    assert_eq!(
+        calls.first(),
+        Some(&"propose"),
+        "{calls:?}: the registration began at the fork's client"
+    );
+    assert!(
+        calls.contains(&"issue"),
+        "{calls:?}: the credential was asked of the fork's client"
+    );
+    assert_eq!(
+        registered
+            .lock()
+            .expect("what was handed")
+            .credentials
+            .len(),
+        1,
+        "the host was handed what the fork's client returned"
+    );
+
+    // The client the set holds for push is made by the same factory, for the same origin.
+    let before = asked.lock().expect("the record").len();
+    let client = opened.desk.client().expect("the desk holds a client");
+    let asked = asked.lock().expect("the record").clone();
+    assert_eq!(
+        asked.len(),
+        before + 1,
+        "the factory made the desk's client"
+    );
+    assert!(
+        asked.iter().all(|origin| *origin == asked[0]),
+        "{asked:?}: one gateway"
+    );
+    let clients = companion_tauri::services::Held {
+        push: Some(client),
+        ..Default::default()
+    }
+    .into_clients();
+    assert!(
+        clients.availability_of(ManagedService::Push).configured,
+        "the set reports the push service as configured"
+    );
 }
 
 /// KR-REQ-16.08: a registration the phone stopped itself, as it does for an account that has left,
