@@ -62,6 +62,26 @@ pub const BOOT_FILE: &str = "boot";
 /// The longest boot record this host reads.
 const BOOT_FILE_LIMIT: u64 = 1_024;
 
+/// How the description process is started: the program found beside the daemon, run in the state
+/// directory with the runtime directory the daemon keeps. The daemon always asks the operating
+/// system to hold the process to its memory ceiling where the platform has such a limit, beside its
+/// own reading of the process.
+fn description_launch(
+    program: PathBuf,
+    environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    runtime_dir: &std::path::Path,
+    state_dir: &std::path::Path,
+) -> kr_describe::supervise::Launch {
+    kr_describe::supervise::Launch {
+        program,
+        arguments: vec!["--runtime-dir".into(), runtime_dir.as_os_str().to_owned()],
+        working_directory: state_dir.to_path_buf(),
+        environment,
+        models: crate::describe::host::models_dir(state_dir),
+        system_memory_limit: true,
+    }
+}
+
 impl Controller {
     /// Starts the description host and the reading of every session's facts, once, at the daemon's
     /// start: the host takes the owner's settings from the configuration document, finds the
@@ -81,17 +101,12 @@ impl Controller {
         let placed = self.description_placement(&state_dir);
         let setup = crate::describe::host::Setup {
             environment_id: self.paths.environment_id(),
-            launch: kr_describe::supervise::Launch {
-                program: placed.program,
-                arguments: vec![
-                    "--runtime-dir".into(),
-                    self.paths.runtime_dir().as_os_str().to_owned(),
-                ],
-                working_directory: state_dir.clone(),
-                environment: placed.environment,
-                models: crate::describe::host::models_dir(&state_dir),
-                system_memory_limit: true,
-            },
+            launch: description_launch(
+                placed.program,
+                placed.environment,
+                self.paths.runtime_dir(),
+                &state_dir,
+            ),
             state_dir,
             build: self.build_id.as_str().to_owned(),
             catalogue: placed.catalogue,
@@ -2522,6 +2537,20 @@ fn open_utc_floor(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// KR-REQ-22.10: a daemon starts the description process under the operating system's own
+    /// memory limit, so that the ceiling is held by the system as well as by the daemon's reading,
+    /// where the platform has such a limit.
+    #[test]
+    fn the_description_process_is_started_under_the_systems_memory_limit() {
+        let launch = description_launch(
+            PathBuf::from("kr-describe-inference"),
+            Vec::new(),
+            std::path::Path::new("runtime"),
+            std::path::Path::new("state"),
+        );
+        assert!(launch.system_memory_limit);
+    }
 
     /// While the record needs nothing of privacy mode's tick, the tick has no period
     /// of its own: it waits for the record to say it changed, however long that is, and begins a
