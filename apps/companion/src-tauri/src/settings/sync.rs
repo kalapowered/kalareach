@@ -74,9 +74,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use kr_client::pairing::owner::Ceremony;
 use kr_client::services::SyncPosition;
-use kr_client::services::{
-    HttpDeadlines, HttpService, ManagedSyncService, SyncBackupService, managed_response_limits,
-};
+use kr_client::services::{SharedSyncService, SyncBackupService};
 use kr_client::sync::membership::{
     CollectionRef, Device, DeviceDirectory, KeyRecordService, SyncMembership,
 };
@@ -111,7 +109,8 @@ pub use requests::Requests;
 
 use super::{ColourMode, Hosts, LocalSettings};
 use crate::error::{CommandError, Result};
-use crate::recovery::{DeviceSigner, now};
+use crate::recovery::now;
+use crate::services::SyncServices;
 use crate::sync_service::{SyncService, SyncServiceView, host_of};
 
 /// Whether the settings kept under `data` hold a membership of a collection.
@@ -259,6 +258,8 @@ pub struct SyncParts {
     pub secrets: Arc<dyn SecretStore>,
     /// The sync service setting.
     pub service: Arc<SyncService>,
+    /// How the client of the service a record names is got.
+    pub clients: Arc<dyn SyncServices>,
 }
 
 /// Where this computer's collection is, and whether its first key record is known to be kept.
@@ -722,7 +723,7 @@ impl SettingsSync {
     async fn settle(
         &self,
         record: &mut Record,
-        service: &Arc<ManagedSyncService>,
+        service: &Arc<dyn SharedSyncService>,
         ask: Ask,
     ) -> Result<Progress> {
         let now_ms = now();
@@ -906,7 +907,7 @@ impl SettingsSync {
 
     /// The client for the collection this computer is in, over the service its record names, with
     /// nothing asked of the service. Called with a step in hand.
-    fn client_of(&self, record: &Record) -> Result<(Arc<ManagedSyncService>, SyncClient)> {
+    fn client_of(&self, record: &Record) -> Result<(Arc<dyn SharedSyncService>, SyncClient)> {
         let service = self.managed(&record.origin()?)?;
         let status = self
             .membership_asking(&service, Ask::Never)?
@@ -1599,22 +1600,8 @@ impl SettingsSync {
     }
 
     /// The service client for `origin`, signing as this installation. No account is presented.
-    fn managed(&self, origin: &GatewayOrigin) -> Result<Arc<ManagedSyncService>> {
-        let http = HttpService::with(
-            origin.clone(),
-            HttpDeadlines::default(),
-            managed_response_limits(),
-        )
-        .map_err(|error| {
-            CommandError::local_failure(format!(
-                "this computer cannot reach the sync service: {error}"
-            ))
-        })?;
-        Ok(Arc::new(ManagedSyncService::new(
-            origin.clone(),
-            Arc::new(http),
-            Arc::new(DeviceSigner::new(self.parts.keys.authorisation.clone())),
-        )))
+    fn managed(&self, origin: &GatewayOrigin) -> Result<Arc<dyn SharedSyncService>> {
+        self.parts.clients.installation(origin)
     }
 
     fn keys(&self) -> StoredCollectionKeys {
@@ -1623,7 +1610,7 @@ impl SettingsSync {
 
     fn membership_with(
         &self,
-        service: &Arc<ManagedSyncService>,
+        service: &Arc<dyn SharedSyncService>,
         directory: Arc<dyn DeviceDirectory>,
     ) -> Result<SyncMembership> {
         SyncMembership::open(
@@ -1641,7 +1628,7 @@ impl SettingsSync {
     /// under.
     fn client(
         &self,
-        service: &Arc<ManagedSyncService>,
+        service: &Arc<dyn SharedSyncService>,
         collection: kr_client::sync::membership::CollectionRef,
         epoch: u64,
         floor: u64,

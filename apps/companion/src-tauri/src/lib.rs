@@ -56,6 +56,7 @@ pub mod recovery;
 pub mod remote;
 pub mod retained;
 pub mod revocation;
+pub mod services;
 pub mod settings;
 pub mod setup;
 pub mod sharing;
@@ -816,6 +817,7 @@ pub fn start_settings_sync<R: tauri::Runtime>(
             keys: identity.keys.clone(),
             secrets: Arc::clone(&identity.secrets),
             service: state.sync_service()?,
+            clients: state.sync_clients(identity),
         },
         state.drafts(),
         hosts,
@@ -887,6 +889,7 @@ pub fn start_recovery<R: tauri::Runtime>(
         Arc::clone(&identity.secrets),
         identity.keys.authorisation.clone(),
         state.sync_service()?,
+        state.sync_clients(identity),
     )?;
     state.recovery_opened(Arc::new(recovery));
     Ok(())
