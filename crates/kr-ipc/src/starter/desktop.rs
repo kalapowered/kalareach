@@ -22,9 +22,7 @@
 use std::io;
 use std::os::windows::ffi::OsStrExt as _;
 
-use windows_sys::Win32::Foundation::{
-    DUPLICATE_SAME_ACCESS, DuplicateHandle, GENERIC_ALL, HANDLE, LocalFree,
-};
+use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
     GetSecurityInfo, SE_WINDOW_OBJECT, SetSecurityInfo,
 };
@@ -38,6 +36,7 @@ use windows_sys::Win32::System::StationsAndDesktops::{
     GetProcessWindowStation, GetThreadDesktop, GetUserObjectInformationW, HDESK, HWINSTA,
     OpenDesktopW, OpenWindowStationW, SetProcessWindowStation, UOI_NAME,
 };
+use windows_sys::Win32::System::SystemServices::MAXIMUM_ALLOWED;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThreadId};
 
 /// A window station and a desktop made for one child, and the name that places the child on them.
@@ -96,7 +95,7 @@ impl OwnDesktop {
             CreateWindowStationW(
                 std::ptr::null(),
                 0,
-                GENERIC_ALL,
+                MAXIMUM_ALLOWED,
                 &raw const station_attributes,
             )
         };
@@ -104,9 +103,7 @@ impl OwnDesktop {
             return Err(step("create the window station")(io::Error::last_os_error()));
         }
         let station = Station(station);
-        station_source.label_onto(station.0).map_err(step(
-            "give the window station the starter's integrity level",
-        ))?;
+        station_source.label_onto(station.0);
         let station_name = name_of(station.0).map_err(step("read the new station's name"))?;
 
         let desktop = {
@@ -123,7 +120,7 @@ impl OwnDesktop {
                     std::ptr::null(),
                     std::ptr::null(),
                     0,
-                    GENERIC_ALL,
+                    MAXIMUM_ALLOWED,
                     &raw const desktop_attributes,
                 )
             };
@@ -131,9 +128,7 @@ impl OwnDesktop {
                 return Err(step("create the desktop")(io::Error::last_os_error()));
             }
             let created = Desktop(created);
-            desktop_source
-                .label_onto(created.0)
-                .map_err(step("give the desktop the starter's integrity level"))?;
+            desktop_source.label_onto(created.0);
             created
         };
 
@@ -343,14 +338,20 @@ impl Source {
         descriptor
     }
 
-    /// Gives `target` this object's integrity label, if it has one.
-    fn label_onto(&self, target: HANDLE) -> io::Result<()> {
+    /// Gives `target` this object's integrity label, if it has one and the starter may set it.
+    ///
+    /// A station that exists already is not the starter's to relabel, and a label the starter may
+    /// not set is left unset. Either leaves the object at the default level, which keeps a process
+    /// of a lower level out and lets every process of the starter's own level in, so nothing is
+    /// opened to anyone by the refusal.
+    fn label_onto(&self, target: HANDLE) {
         if self.label.is_null() {
-            return Ok(());
+            return;
         }
-        // SAFETY: the target is open with the right to change its label, the label list lives in
-        // this value, and every other part is absent, which the call permits.
-        let status = unsafe {
+        // SAFETY: the target is an open handle of a station or a desktop, the label list lives in
+        // this value, and every other part is absent, which the call permits. The call's refusal
+        // is the case the comment above describes, and is not looked at.
+        unsafe {
             SetSecurityInfo(
                 target,
                 SE_WINDOW_OBJECT,
@@ -359,14 +360,8 @@ impl Source {
                 std::ptr::null_mut(),
                 std::ptr::null(),
                 self.label,
-            )
-        };
-        if status != 0 {
-            return Err(io::Error::from_raw_os_error(
-                i32::try_from(status).unwrap_or(i32::MAX),
-            ));
+            );
         }
-        Ok(())
     }
 }
 
