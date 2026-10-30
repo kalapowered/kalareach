@@ -2010,6 +2010,52 @@ fn a_number_a_viewer_is_shown_is_the_one_it_sends_back() {
     );
 }
 
+/// KR-REQ-10.49: where a viewer's own visit stands is part of how far it can have been shown. A
+/// visit stored under a grant that reached further (the same device under a grant that was
+/// replaced) lies past the last change the new bound reaches, and the number the viewer is shown
+/// for that place is one it can send back.
+#[test]
+fn the_number_shown_for_a_visit_stored_under_a_wider_grant_is_taken_back() {
+    let mut attention = engine();
+    // The last turn is recorded last and dated before the later grant's bound.
+    for (sequence, at_ms) in [(1_u64, 1_000_u64), (2, 3_000), (3, 4_000), (4, 500)] {
+        attention
+            .apply(&turn_completed(sequence, at_ms, sequence), reading(0))
+            .expect("the store records the decision");
+    }
+    let admits_one = |candidate: SessionId| candidate == session(1);
+    let phone = actor("device:phone");
+    let stored = attention
+        .acknowledge_visit(
+            &phone,
+            &device_from(&admits_one, 0),
+            session(1),
+            u64::MAX,
+            Vec::new(),
+        )
+        .expect("the store records the visit");
+    assert_eq!(stored.acknowledged_cursor.get(), 8, "the end of the log");
+
+    // The later grant reaches the middle two turns: the log's cursors 2 to 5, and its visit stands
+    // past them, at 8.
+    let later = device_from(&admits_one, NOON + 2_000);
+    let shown = attention
+        .changed(&phone, &later, session(1), 100, 0, Content::Narrowed)
+        .expect("the store is this owner's")
+        .result
+        .from_cursor
+        .get();
+    let numbering = attention
+        .numbering(&phone, &later, session(1))
+        .expect("the store is this owner's")
+        .expect("a viewer with a bound is numbered");
+    assert_eq!(
+        numbering.cursor(shown),
+        Some(8),
+        "the number it was shown for its own visit is taken back"
+    );
+}
+
 /// KR-REQ-10.49: when retention lets go of the changes a viewer's history started at, its first
 /// number moves up with the first change it can still be shown, and a number it was shown before
 /// is not taken: the line is drawn at the first number shown, so it stays out of reach of a viewer
