@@ -334,7 +334,8 @@ pub enum ProcessEnd {
     /// A check of a file ran past its deadline. The daemon ended the process for a check that
     /// took too long, which says nothing of inference.
     CheckOverdue,
-    /// Its resident set passed the ceiling.
+    /// It passed the ceiling: its resident set did, or, on Windows, the system refused it a commit
+    /// past the limit it holds at the ceiling.
     MemoryCeiling,
     /// It stopped reading its requests.
     NotReading,

@@ -795,7 +795,8 @@ impl Driver {
 
     /// Whether the operating system refused the process memory since it was last asked, and
     /// forgets it. A refusal belongs to the next thing the process does: the end it comes to, or
-    /// the answer it gives, and not to a later end that has another cause.
+    /// the answer to a load or a job it gives, and not to a later end that has another cause. The
+    /// answer to a check of a file does not take it.
     fn the_system_refused_memory(&self) -> bool {
         #[cfg(windows)]
         {
@@ -963,7 +964,8 @@ impl Driver {
                     // on. When the system refused it the memory, that is the ceiling, and the
                     // process ends for it: the work is failed and not tried again, and inference
                     // pauses, as it does when the daemon's own reading finds the process over.
-                    // Asked of every answer, so that a refusal the runtime got over is forgotten
+                    // Asked of every answer to a load or a job, so that a refusal the runtime got
+                    // over is forgotten
                     // and is not taken for the cause of a later end.
                     let refused = self.the_system_refused_memory();
                     if refused && the_work_failed(&answer) {
@@ -1021,8 +1023,9 @@ impl Driver {
         let Some(running) = self.process.as_ref() else {
             return Ok(());
         };
-        // A process that closed its end, or whose frames stopped in the middle, while the system
-        // had refused it memory, ended for memory. The ends the daemon decides itself are its own.
+        // A process that closed its end, or whose frames stopped or came wrong, while the system
+        // had refused it memory, ended for memory, whichever part of the daemon saw it end. The
+        // other ends (a bound broken, a build that does not match) are the daemon's own.
         let why = if matches!(why, ProcessEnd::Exited | ProcessEnd::BrokenWire)
             && self.the_system_refused_memory()
         {

@@ -513,10 +513,9 @@ pub mod platform {
     /// The kernel's own class: a mains supply that is online is mains (a USB supply of any kind
     /// counts as one, and an `online` of 2 is a programmable supply that is online); a host with a
     /// battery and no mains online is on the battery; a host with no battery at all is on mains,
-    /// because there is nothing for it to be running from. A battery with the scope `Device` is a
+    /// because there is nothing for it to be running from. A supply with the scope `Device` is a
     /// peripheral's, a mouse or a phone on a cable, and is not the host's power. A supply whose type
-    /// or state the host would not tell is
-    /// not one that can be left out: it may be the battery, so with no mains online the host has
+    /// or state the host would not tell is not one that can be left out: it may be the battery, so with no mains online the host has
     /// not been told it is on mains, and the signal is unqualified, which the policy treats as
     /// battery.
     #[must_use]

@@ -187,10 +187,12 @@ catches the failed allocation answers that its load or job failed and goes on. T
 job when the process closes its end, when its frames stop short, and when it answers that a load
 or a job failed. If the job recorded a refused commit, the process ended for memory: it is ended,
 inference pauses with `memory_pressure` as it does for a reading past the ceiling, and the job is
-not retried. Windows does not promise to deliver the job's message, so a refusal that was not
-recorded reads as an ordinary end or an ordinary failure. The limit is on committed memory and not on the resident set,
-so it does not count the weights a model maps for reading, and the daemon's reading stays the
-measure of the resident set. A host that will not apply the limit says so on its standard error
+not retried. A load or a job that answers without failing clears what the job recorded, so a
+refusal the runtime got over does not count against a later end. Windows does not promise to
+deliver the job's message, so a refusal that was not recorded reads as an ordinary end or an
+ordinary failure. The limit is on committed memory and not on the resident set, so it does not
+count the weights a model maps for reading, and the daemon's reading stays the measure of the
+resident set. A host that will not apply the limit says so on its standard error
 and keeps the daemon's reading as the only ender.
 
 CPU-only is two settings rather than one. Zero GPU layers keeps every layer's weights on the
