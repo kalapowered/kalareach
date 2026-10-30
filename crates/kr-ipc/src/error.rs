@@ -344,6 +344,14 @@ mod tests {
             "{own}"
         );
 
+        // Others who can only enter, or only read, are as much a reason for the command.
+        for mode in [0o711, 0o701, 0o750] {
+            assert!(
+                too_open("/x", 501, mode).mending_command().is_some(),
+                "mode {mode:04o}"
+            );
+        }
+
         // A quote ends the quoting, so the path is cut at it and written again after a quoted one.
         let quoted = too_open("/x/it's $(id)", 501, 0o755);
         assert_eq!(
