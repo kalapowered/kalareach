@@ -70,6 +70,9 @@ pub struct WindowsPlaces {
     pub search_path: Vec<PathBuf>,
     /// The program-files directories PowerShell 7 installs under.
     pub program_files: Vec<PathBuf>,
+    /// The user's local application-data directory, which holds the Store's application
+    /// execution aliases.
+    pub local_app_data: Option<PathBuf>,
     /// The system directory, `%SystemRoot%`.
     pub system_root: Option<PathBuf>,
     /// The command interpreter the system names, `%ComSpec%`.
@@ -89,6 +92,7 @@ impl WindowsPlaces {
                 .into_iter()
                 .filter_map(directory)
                 .collect(),
+            local_app_data: directory("LOCALAPPDATA"),
             system_root: directory("SystemRoot"),
             command_interpreter: std::env::var("ComSpec").ok(),
         }
@@ -159,20 +163,42 @@ mod tests {
         WindowsPlaces {
             search_path: vec![absolute("Tools"), absolute("Other")],
             program_files: vec![absolute("Programs")],
+            local_app_data: Some(absolute("Users").join("someone")),
             system_root: Some(absolute("System")),
             command_interpreter: Some(absolute("System").join("cmd.exe").display().to_string()),
         }
     }
 
-    fn seven_on_the_path() -> PathBuf {
-        absolute("Other").join("pwsh.exe")
-    }
-
-    fn seven_installed() -> PathBuf {
+    fn installed() -> PathBuf {
         absolute("Programs")
             .join("PowerShell")
             .join("7")
             .join("pwsh.exe")
+    }
+
+    /// A PowerShell 7 that is installed under its own version directory but is not the standard
+    /// one, which is how a preview is laid out.
+    fn preview() -> PathBuf {
+        absolute("Programs")
+            .join("PowerShell")
+            .join("7-preview")
+            .join("pwsh.exe")
+    }
+
+    /// The Store's application execution alias for PowerShell 7.
+    fn store_alias() -> PathBuf {
+        absolute("Users")
+            .join("someone")
+            .join("Microsoft")
+            .join("WindowsApps")
+            .join("pwsh.exe")
+    }
+
+    fn on_the_path(places: WindowsPlaces, file: &Path) -> WindowsPlaces {
+        WindowsPlaces {
+            search_path: vec![file.parent().expect("a directory").to_owned()],
+            ..places
+        }
     }
 
     fn five() -> PathBuf {
@@ -183,21 +209,87 @@ mod tests {
             .join("powershell.exe")
     }
 
+    fn system_command_interpreter() -> String {
+        absolute("System")
+            .join("System32")
+            .join("cmd.exe")
+            .display()
+            .to_string()
+    }
+
     /// KR-REQ-03.03: a Windows session that names no shell starts PowerShell 7 when the machine
     /// has it, whichever way it is found, and not the command interpreter the system names.
     #[test]
     fn a_session_that_names_no_shell_gets_powershell_seven_when_the_machine_has_it() {
-        let everything = [seven_on_the_path(), seven_installed(), five()];
         assert_eq!(
-            windows_default(&places(), present(&everything)),
-            seven_installed().to_str().unwrap(),
+            windows_default(
+                &on_the_path(places(), &preview()),
+                present(&[installed(), preview(), five()])
+            ),
+            installed().to_str().unwrap(),
             "the directory its installer uses is read first"
         );
+        for found in [preview(), store_alias()] {
+            assert_eq!(
+                windows_default(
+                    &on_the_path(places(), &found),
+                    present(&[found.clone(), five()])
+                ),
+                found.to_str().unwrap(),
+                "and then the search path where PowerShell 7 has a place of its own"
+            );
+        }
+        let upper = PathBuf::from(
+            preview()
+                .parent()
+                .expect("a directory")
+                .display()
+                .to_string()
+                .to_uppercase(),
+        )
+        .join("pwsh.exe");
         assert_eq!(
-            windows_default(&places(), present(&[seven_on_the_path(), five()])),
-            seven_on_the_path().to_str().unwrap(),
-            "and then the search path, for an installation elsewhere"
+            windows_default(
+                &on_the_path(places(), &upper),
+                present(&[upper.clone(), five()])
+            ),
+            upper.to_str().unwrap(),
+            "a directory is the same directory whatever the case it is written in"
         );
+    }
+
+    /// KR-REQ-03.03: a `pwsh.exe` on the search path is the default shell only where PowerShell 7
+    /// lives. PowerShell 6 has the same file name, and so has a file put in a directory that is
+    /// on the search path for some other reason; neither comes before Windows PowerShell.
+    #[test]
+    fn a_pwsh_on_the_search_path_is_the_default_shell_only_where_powershell_seven_lives() {
+        let six = absolute("Programs")
+            .join("PowerShell")
+            .join("6")
+            .join("pwsh.exe");
+        let elsewhere = absolute("Tools").join("pwsh.exe");
+        let another_stores_alias = absolute("Other")
+            .join("Microsoft")
+            .join("WindowsApps")
+            .join("pwsh.exe");
+        let beside_the_seven = absolute("Programs")
+            .join("PowerShell")
+            .join("7-preview")
+            .join("..")
+            .join("..")
+            .join("Evil")
+            .join("pwsh.exe");
+        for refused in [six, elsewhere, another_stores_alias, beside_the_seven] {
+            assert_eq!(
+                windows_default(
+                    &on_the_path(places(), &refused),
+                    present(&[refused.clone(), five()])
+                ),
+                five().to_str().unwrap(),
+                "{} is not PowerShell 7",
+                refused.display()
+            );
+        }
     }
 
     /// KR-REQ-03.03: without PowerShell 7 the fallback is Windows PowerShell, and the command
@@ -209,36 +301,78 @@ mod tests {
             five().to_str().unwrap()
         );
         let interpreter = places().command_interpreter.expect("the places name one");
-        assert_eq!(windows_default(&places(), present(&[])), interpreter);
         assert_eq!(
-            windows_default(
-                &WindowsPlaces {
-                    command_interpreter: None,
-                    ..places()
-                },
-                present(&[])
-            ),
-            "cmd.exe",
-            "a system that names no interpreter still gets one"
+            windows_default(&places(), present(&[PathBuf::from(&interpreter)])),
+            interpreter,
+            "the interpreter the system names, when it is a file that is there"
+        );
+    }
+
+    /// KR-REQ-03.03: the command interpreter is named by its absolute path, never by a name the
+    /// system searches for. The system's search starts in the worker's own directory, so a bare
+    /// `cmd.exe`, a blank value or a relative one would start whatever is planted there.
+    #[test]
+    fn the_command_interpreter_is_always_an_absolute_path() {
+        let named = |interpreter: Option<String>| WindowsPlaces {
+            command_interpreter: interpreter,
+            ..places()
+        };
+        for refused in [
+            None,
+            Some(String::new()),
+            Some("   ".to_owned()),
+            Some("cmd.exe".to_owned()),
+            Some(r".\planted.exe".to_owned()),
+            Some(absolute("Missing").join("cmd.exe").display().to_string()),
+        ] {
+            let chosen = windows_default(&named(refused.clone()), present(&[]));
+            assert_eq!(
+                chosen,
+                system_command_interpreter(),
+                "the system's own interpreter, not {refused:?}"
+            );
+            assert!(Path::new(&chosen).is_absolute(), "{chosen}");
+        }
+        let nothing_named = WindowsPlaces {
+            system_root: None,
+            command_interpreter: None,
+            ..places()
+        };
+        assert_eq!(
+            windows_default(&nothing_named, present(&[])),
+            r"C:\Windows\System32\cmd.exe",
+            "a system that names no directory of its own still gets the standard one"
         );
     }
 
     /// KR-REQ-03.03: an empty or relative search-path entry is not the directory the worker runs
-    /// in, so a program planted there is not the user's shell.
+    /// in, so a program planted there is not the user's shell, even where the entry would be
+    /// PowerShell 7's own if it were absolute.
     #[test]
     fn a_relative_search_path_entry_is_not_searched() {
         let relative = PathBuf::from("planted");
         let planted = relative.join("pwsh.exe");
+        let relative_seven = PathBuf::from("Programs")
+            .join("PowerShell")
+            .join("7-preview")
+            .join("pwsh.exe");
         let places = WindowsPlaces {
-            search_path: vec![PathBuf::new(), relative, PathBuf::from(".")],
+            search_path: vec![
+                PathBuf::new(),
+                relative,
+                PathBuf::from("."),
+                relative_seven.parent().expect("a directory").to_owned(),
+            ],
+            program_files: vec![PathBuf::from("Programs")],
             ..places()
         };
         let in_the_current_directory = Path::new(".").join("pwsh.exe");
         assert_eq!(
             windows_default(&places, |path| path == planted
+                || path == relative_seven
                 || path == Path::new("pwsh.exe")
                 || path == in_the_current_directory),
-            places.command_interpreter.expect("the places name one")
+            system_command_interpreter()
         );
     }
 
