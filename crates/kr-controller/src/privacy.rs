@@ -2053,16 +2053,15 @@ impl crate::service::Controller {
     /// Asks the gateway to delete what it still holds for one notification this host gave it.
     ///
     /// The person's own action, which privacy mode neither stops nor is stopped by. The copy is
-    /// found again in the delivery journal, which names the notification and the authorisation it
-    /// was sent under, and the request is made under the credential the gateway gave that
-    /// authorisation; the gateway answers for that credential's notifications only. A device that
-    /// has registered again holds another authorisation, and asking under that one would be told
-    /// the gateway holds nothing for a notification it did not send, so the request is refused
-    /// unless the notification's own authorisation is the one the destination holds. The answer
-    /// is that the gateway holds nothing for the notification now, which is what the gateway means
-    /// whether it removed a record, never had one or had already swept it. It says nothing of a
-    /// copy a provider accepted or a device holds, and the list keeps showing the notification as
-    /// one that may have left.
+    /// found again in the delivery journal, which keeps a digest of the destination the
+    /// notification was admitted for. That is all the journal keeps of which authorisation sent
+    /// it, so this host can show the authorisation only while the destination is that one, and
+    /// the request is refused otherwise: it is made under the credential of the authorisation
+    /// the digest holds and under no other. The answer is that the gateway holds nothing for the
+    /// notification now, which is what the gateway means whether it removed a record, never had
+    /// one or had already swept it; it is taken as a deletion only under a bearer the gateway has
+    /// shown to be its authorisation's. It says nothing of a copy a provider accepted or a
+    /// device holds, and the list keeps showing the notification as one that may have left.
     ///
     /// Nothing is recorded here. A gateway that does not answer, or refuses the credential, leaves
     /// the copy listed as it was and the error says why; the person asks again.
@@ -2101,8 +2100,9 @@ impl crate::service::Controller {
                     ));
                 };
                 // The authorisation the notification was sent under, and no other: the destination
-                // is read in the same hold as the notification's own record of what it was
-                // admitted for, so the credential asked under cannot be a later registration's.
+                // is read in the same hold as the notification's own digest, which is all the
+                // journal keeps of what it was admitted for, so the credential asked under is the
+                // one that digest shows.
                 let authorisation =
                     journal
                         .authorisation_of(copy.notification_id)
@@ -2113,8 +2113,9 @@ impl crate::service::Controller {
                 let Some(sender_record_id) = authorisation else {
                     return Err(ControllerError::PermissionDenied {
                         detail: "this host cannot ask for the removal of that copy: its device \
-                                 is no longer paired, or has registered again since, so this \
-                                 host cannot show the authorisation it was sent under"
+                                 is no longer paired, or its destination is no longer the one \
+                                 the copy was sent to, so this host cannot show which \
+                                 authorisation sent it"
                             .to_owned(),
                     });
                 };

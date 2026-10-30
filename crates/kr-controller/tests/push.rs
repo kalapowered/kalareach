@@ -8351,11 +8351,11 @@ async fn the_gateway_is_asked_only_about_a_listed_notification_the_host_holds_a_
     host.stop().await;
 }
 
-/// KR-REQ-24.29: the request is made under the authorisation the notification was sent under. A
-/// device that registers again holds another authorisation, and the gateway answers its credential
-/// that it holds nothing for a notification the first one sent, which this host would report as a
-/// deletion that did not happen. So the notification is listed as one the host holds no way to
-/// ask about, and the call that names it asks the gateway nothing.
+/// KR-REQ-24.29: the request is made under the authorisation the notification was sent under. The
+/// journal keeps only a digest of the destination the notification was admitted for, so a device
+/// that registers under another authorisation leaves the host unable to show which authorisation
+/// sent it. The notification is listed as one the host holds no way to ask about, and the call
+/// that names it asks the gateway nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_notification_sent_under_a_registration_since_replaced_is_not_deleted_under_the_new_one()
 {

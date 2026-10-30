@@ -746,10 +746,10 @@ mod tests {
         );
     }
 
-    /// A notification is asked about under the authorisation it was sent under. A device that
-    /// registers again holds another authorisation, whose credential the gateway would answer
-    /// "nothing held" for a notification it did not send, so the host would report a deletion that
-    /// did not happen. Such a notification is listed and not offered.
+    /// A notification is asked about under the authorisation it was sent under. The journal keeps
+    /// only a digest of the destination the notification was admitted for, so a device that
+    /// registers under another authorisation leaves the host unable to show which authorisation
+    /// sent it. Such a notification is listed and not offered.
     #[test]
     fn a_notification_is_not_offered_once_its_device_has_registered_again() {
         use crate::push::NextAction;

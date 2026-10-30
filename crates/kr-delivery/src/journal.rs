@@ -1729,12 +1729,13 @@ impl DeliveryJournal {
     /// Returns the authorisation a notification was sent under, when the paired device it went to
     /// still holds the registration the notification was admitted for, and nothing otherwise.
     ///
-    /// A notification keeps the digest of the destination as it stood at admission, which names
-    /// the device's authorisation among much else. The destination configured now is that device's
-    /// registration only when its digest is the same: a device that registers again holds another
-    /// authorisation, whose credential is not the one the gateway knows the notification by, and
-    /// a destination removed, edited or disabled since is another recipient than the one the
-    /// notification was admitted for. So a request about a notification is made under the
+    /// The journal keeps no record of which authorisation sent a notification, only the digest of
+    /// the destination as it stood at admission, which holds the device's installation and
+    /// authorisation among much else. So the host can show the authorisation only when the
+    /// destination configured now is that destination again, apart from whether it is in service
+    /// and which choice of previews it holds. A device that registers under another authorisation,
+    /// a rule with another grant, another stored-envelope key, or a destination removed since
+    /// leaves nothing to show it by. A request about a notification is made under the
     /// authorisation this returns and under no other.
     ///
     /// # Errors
