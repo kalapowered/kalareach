@@ -778,22 +778,19 @@ impl Driver {
     /// ceiling says too.
     #[cfg(windows)]
     fn limit_in_the_system(&self, child: &Child) -> Option<kr_ipc::memory_limit::MemoryLimit> {
-        use std::os::windows::io::AsRawHandle as _;
+        use std::os::windows::io::AsHandle as _;
 
         if !self.launch.system_memory_limit {
             return None;
         }
-        kr_ipc::memory_limit::MemoryLimit::around(
-            child.as_raw_handle(),
-            self.service.ceiling_bytes(),
-        )
-        .inspect_err(|why| {
-            eprintln!(
-                "kr-describe: the system's memory limit was not applied to the description \
+        kr_ipc::memory_limit::MemoryLimit::around(child.as_handle(), self.service.ceiling_bytes())
+            .inspect_err(|why| {
+                eprintln!(
+                    "kr-describe: the system's memory limit was not applied to the description \
                      process, so only the daemon's reading ends it past the ceiling: {why}"
-            );
-        })
-        .ok()
+                );
+            })
+            .ok()
     }
 
     /// Whether the operating system refused the process memory since it was last asked, and
