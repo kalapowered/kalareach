@@ -8,9 +8,8 @@
 //!
 //! So the two operations are separate types of work here, not one with a flag. [`Store::list`]
 //! reads the record and the cache and touches no platform at all — it does not take an
-//! [`Observer`], so it could not ask one. [`Store::refresh`] is the only thing that does, and
-//! starting is a separate call on the observer that a refresh makes only when its caller asked
-//! for it.
+//! [`Observer`], so it could not ask one. [`Store::observe`] is the only thing that does, and
+//! starting is a separate call on the observer that it makes only when its caller asked for it.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
