@@ -322,6 +322,17 @@ impl HostAccount {
         self.inner.waiting.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Holds every request for a token at the gate a change of the account raises, until the
+    /// returned guard is dropped, for a test that needs a call to be waiting for its token.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn hold_token_requests(&self) -> TokenRequestsHeld {
+        self.inner.changing.send_replace(true);
+        TokenRequestsHeld {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
     /// Keeps a sign-in the service issued, as a finished browser sign-in would, for a test that
     /// is about what a call does with an account rather than about signing in.
     ///
@@ -607,6 +618,29 @@ impl HostAccount {
             return Listener::open_at(address, &address.to_string());
         }
         Listener::open()
+    }
+}
+
+/// The gate a test raised with [`HostAccount::hold_token_requests`]: requests for a token wait
+/// while this is held.
+#[cfg(feature = "testing")]
+pub struct TokenRequestsHeld {
+    inner: Arc<Inner>,
+}
+
+#[cfg(feature = "testing")]
+impl std::fmt::Debug for TokenRequestsHeld {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TokenRequestsHeld")
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "testing")]
+impl Drop for TokenRequestsHeld {
+    fn drop(&mut self) {
+        self.inner.changing.send_replace(false);
     }
 }
 

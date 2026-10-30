@@ -112,8 +112,8 @@ impl Controller {
     /// Setting up moves no content: the bundle is key material, so privacy mode neither stops it
     /// nor is stopped by it. What the call writes to the service is the sealed bundle, a writer's
     /// enrolment and the account's retention switch. The registration the call was admitted under
-    /// is asked again before each request that changes the service and in the transaction that
-    /// records the setup, after the requests to the service that can outlast it.
+    /// is asked again as each request to the service leaves, once its account token is in hand,
+    /// and in the transaction that records the setup, after the requests that can outlast it.
     ///
     /// # Errors
     ///

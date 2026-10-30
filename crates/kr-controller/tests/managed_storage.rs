@@ -5667,6 +5667,86 @@ async fn a_fence_owed_while_the_storage_state_is_read_stops_the_retention_change
     assert!(rig.controller.backup().setup().expect("a read").is_none());
 }
 
+/// Waits until a request for the account's token waits at the gate a test raised.
+async fn until_a_request_waits_for_its_token(rig: &Rig) {
+    within("a request waiting for its token", async {
+        while rig.controller.host_account().token_requests_waiting() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+}
+
+/// KR-REQ-09.09: a fence this host comes to owe while a request waits for the account token stops
+/// that request. The retention change is the last request that changes the service, and it waits
+/// for its token after the admission was last asked, so the admission is asked again once the token
+/// is in hand: the change does not leave and nothing is recorded. The control: the same call, with
+/// the fence let go, is not refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_owed_while_the_retention_change_waits_for_its_token_stops_it() {
+    let timer = HeldTimer::held();
+    let (rig, _) = a_host_to_set_up(&timer).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+    web.fail(STATUS, 1, Moment::Slow);
+    let call = rig.enable_outcome_in_the_background(&made.params);
+    within(
+        "the read of the storage state",
+        web.requests_reach(STATUS, 2),
+    )
+    .await;
+    // From here a request for a token waits, as it does while the account is being changed.
+    let tokens = rig.controller.host_account().hold_token_requests();
+    web.release_held();
+    until_a_request_waits_for_its_token(&rig).await;
+    rig.controller.hold_fence(true);
+    drop(tokens);
+    let refusal = call
+        .await
+        .expect("the call ends")
+        .expect_err("the change is refused while a fence is owed");
+    assert_eq!(refusal.code, ErrorCode::PermissionDenied);
+    assert!(
+        refusal.message.contains("fence"),
+        "the refusal says why: {}",
+        refusal.message
+    );
+    assert_eq!(web.requests_to(RETENTION), 0, "retention was not changed");
+    assert!(rig.controller.backup().setup().expect("a read").is_none());
+
+    rig.controller.hold_fence(false);
+    assert!(matches!(
+        rig.enable(&made.params).await,
+        BackupEnableResult::Enabled { .. }
+    ));
+    assert_eq!(web.requests_to(RETENTION), 1);
+}
+
+/// KR-REQ-09.09: a fence this host comes to owe while the call waits for its first token stops the
+/// bundle write that follows. Nothing has left for the service yet, so the first request of a call
+/// is held to the admission as much as the last.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_owed_while_the_call_waits_for_its_token_stops_the_bundle_write() {
+    let timer = HeldTimer::held();
+    let (rig, _) = a_host_to_set_up(&timer).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+    let tokens = rig.controller.host_account().hold_token_requests();
+    let call = rig.enable_outcome_in_the_background(&made.params);
+    until_a_request_waits_for_its_token(&rig).await;
+    rig.controller.hold_fence(true);
+    drop(tokens);
+    let refusal = call
+        .await
+        .expect("the call ends")
+        .expect_err("the bundle write is refused while a fence is owed");
+    assert_eq!(refusal.code, ErrorCode::PermissionDenied);
+    assert!(refusal.message.contains("fence"), "{}", refusal.message);
+    assert_eq!(web.requests_to(SYNC), 0, "the bundle was not written");
+    assert_eq!(web.requests_to(MANIFEST), 0, "the writer was not enrolled");
+    assert!(rig.controller.backup().setup().expect("a read").is_none());
+}
+
 /// `backup.status` says why a setup that is recorded cannot make backups: the account signed in is
 /// not the one it belongs to.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

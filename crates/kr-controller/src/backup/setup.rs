@@ -46,11 +46,12 @@ use std::time::Duration;
 
 use kr_client::ClientError;
 use kr_client::recovery::{bundle_collection, kit_fingerprint};
-use kr_client::services::account::{AccountTokenSource, BACKUP_WRITE_SCOPE};
+use kr_client::services::account::{AccountToken, AccountTokenSource, BACKUP_WRITE_SCOPE};
 use kr_client::services::storage::{BackupState, RetentionAnswer, RetentionChange};
 use kr_client::services::{
     BackupManifestService, ManagedBackupManifestService, ManagedStorageService, ManagedSyncService,
-    ServiceHttp, StorageService, SyncBackupService, SyncDispatch, SyncExchanged, SyncFetched,
+    ServiceFuture, ServiceHttp, StorageService, SyncBackupService, SyncDispatch, SyncExchanged,
+    SyncFetched,
 };
 use kr_crypto::keys::{AuthorisationKeyPair, StoredEnvelopeKeyPair};
 use kr_crypto::sign::{SigningTranscript, sign};
@@ -114,7 +115,7 @@ pub fn standing(
 /// The admission a setup call was made under, asked again as the call goes on.
 ///
 /// The call reaches the storage service several times before it records the setup, and each
-/// request can last as long as the service likes, so an authority withdrawn or a fence owed
+/// request can last as long as the host bounds it, so an authority withdrawn or a fence owed
 /// meanwhile has to stop the next request and the record, and not only the call's start. The
 /// implementation also keeps the daemon alive until the commit has ended: a commit that went on
 /// after the environment's lock was let go could land beside the next daemon's start.
@@ -199,15 +200,66 @@ impl std::fmt::Debug for BackupSetup {
 /// How a step of a call ended, when it did not go on.
 type Ended = BackupEnableResult;
 
-/// Why a step of a call did not go on: the call has its answer, or the admission stopped it.
-enum Halt {
-    Answer(Ended),
-    Refused(ControllerError),
+/// The token source a call's requests present, which asks the call's admission once the token is
+/// in hand.
+///
+/// The token is asked for before a request is signed, and the wait for it can last as long as a
+/// renewal or the account's own lock does. That wait is the one place a request can go from
+/// admitted to refused with nothing on its path to notice, and this is the last point before the
+/// request leaves. The client reports the refusal as its own failure to send, so the admission's
+/// refusal is kept here and the call ends with it ([`Self::ended`]).
+struct Admitted {
+    inner: Arc<dyn AccountTokenSource>,
+    admission: Arc<dyn SetupAdmission>,
+    refused: Mutex<Option<ControllerError>>,
 }
 
-impl From<Ended> for Halt {
-    fn from(answer: Ended) -> Self {
-        Self::Answer(answer)
+impl std::fmt::Debug for Admitted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Admitted").finish_non_exhaustive()
+    }
+}
+
+impl Admitted {
+    fn over(inner: Arc<dyn AccountTokenSource>, admission: Arc<dyn SetupAdmission>) -> Self {
+        Self {
+            inner,
+            admission,
+            refused: Mutex::new(None),
+        }
+    }
+
+    /// How the call ends when a step did not go on with `answer`: with the admission's refusal when
+    /// that is what stopped a request, and otherwise with the step's own answer.
+    fn ended(&self, answer: Ended) -> std::result::Result<Step, Ended> {
+        match self
+            .refused
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            Some(refusal) => Ok(Step::Stopped(refusal)),
+            None => Err(answer),
+        }
+    }
+}
+
+impl AccountTokenSource for Admitted {
+    fn token<'a>(&'a self, scope: &'a str) -> ServiceFuture<'a, AccountToken> {
+        Box::pin(async move {
+            let token = self.inner.token(scope).await?;
+            if let Err(refusal) = self.admission.stands() {
+                *self.refused.lock().unwrap_or_else(PoisonError::into_inner) = Some(refusal);
+                return Err(ClientError::refusal(
+                    ErrorCode::PermissionDenied,
+                    kr_client::shown::Shown::said(
+                        "the admission this call was made under no longer stands, so nothing is \
+                         sent",
+                    ),
+                ));
+            }
+            Ok(token)
+        })
     }
 }
 
@@ -218,7 +270,7 @@ enum Step {
     /// The service holds the bundle, the enrolment and the retention switch, and this setup is
     /// what remains to be recorded.
     Record(SetupRecord),
-    /// The admission stopped the call before one of its steps, which did not run.
+    /// The admission stopped the call before one of its requests, which did not leave.
     Stopped(ControllerError),
 }
 
@@ -443,9 +495,16 @@ impl BackupSetup {
         managed_transport(&self.origin, self.proxy.as_ref())
     }
 
-    /// The storage client of one call, presenting tokens fixed to the account it began under.
+    /// The storage client of one read, presenting tokens fixed to the account it began under.
     fn storage(&self, mark: kr_client::services::AccountMark) -> Result<ManagedStorageService> {
-        let tokens = self.account.tokens_fixed_to(self.origin.as_str(), mark);
+        self.storage_presenting(self.account.tokens_fixed_to(self.origin.as_str(), mark))
+    }
+
+    /// The storage client of one call, presenting `tokens`.
+    fn storage_presenting(
+        &self,
+        tokens: Arc<dyn AccountTokenSource>,
+    ) -> Result<ManagedStorageService> {
         Ok(ManagedStorageService::new(
             self.origin.clone(),
             self.transport()?,
@@ -462,8 +521,8 @@ impl BackupSetup {
     /// # Errors
     ///
     /// Returns [`ControllerError::InvalidArgument`] for a call whose fingerprint is not the one its
-    /// recovery public key has, and the admission's refusal when it no longer stands before a request
-    /// that changes the service or where the setup is to be recorded, or when a repeat is answered
+    /// recovery public key has, and the admission's refusal when it no longer stands as a request
+    /// to the service leaves or where the setup is to be recorded, or when a repeat is answered
     /// from a setup already recorded and its registration is gone: nothing is recorded by the call
     /// then, and what the service already holds is harmless, as after any call that ends before
     /// the record. Every other way the call can end is one of its answers.
@@ -525,7 +584,7 @@ impl BackupSetup {
         mark: std::result::Result<kr_client::services::AccountMark, BackupSignIn>,
         admission: Arc<dyn SetupAdmission>,
     ) -> Result<BackupEnableResult> {
-        match self.steps(params, mark, admission.as_ref()).await {
+        match self.steps(params, mark, &admission).await {
             Ok(Step::Answer(done)) | Err(done) => Ok(done),
             Ok(Step::Record(record)) => self.record(record, params, admission).await,
             Ok(Step::Stopped(refusal)) => Err(refusal),
@@ -536,7 +595,7 @@ impl BackupSetup {
         &self,
         params: &BackupEnableParams,
         mark: std::result::Result<kr_client::services::AccountMark, BackupSignIn>,
-        admission: &dyn SetupAdmission,
+        admission: &Arc<dyn SetupAdmission>,
     ) -> std::result::Result<Step, Ended> {
         let origin = self.origin.as_str();
         let backup = Arc::clone(&self.backup);
@@ -578,14 +637,16 @@ impl BackupSetup {
             return Err(self.ended_by(&error, mark, true));
         }
 
-        // The admission is asked before each request that changes the service, and not once at
-        // the call's start: the wait for another call, for a token and for each earlier request
-        // can outlast a fence this host comes to owe or the registration the call was made under.
+        // The admission is asked as each request leaves, and not once at the call's start: the
+        // wait for another call, for a token and for each earlier request can outlast a fence this
+        // host comes to owe or the registration the call was made under. A request that carries a
+        // token asks it once the token is in hand ([`Admitted`]), the last point before the request
+        // leaves; the enrolment carries none and asks it just before.
+        let tokens = Arc::new(Admitted::over(tokens, Arc::clone(admission)));
         // 2. The bundle first.
-        if let Err(refusal) = admission.stands() {
-            return Ok(Step::Stopped(refusal));
+        if let Err(done) = self.write_bundle(params, mark, &tokens).await {
+            return tokens.ended(done);
         }
-        self.write_bundle(params, mark).await?;
         // 3. The writer's enrolment.
         if let Err(refusal) = admission.stands() {
             return Ok(Step::Stopped(refusal));
@@ -593,10 +654,8 @@ impl BackupSetup {
         self.enrol(params, mark).await?;
         // 4. Managed backup storage on, which asks the admission again before each change it
         // makes, after the read of the storage state that precedes it.
-        match self.turn_storage_on(mark, admission).await {
-            Ok(()) => {}
-            Err(Halt::Answer(done)) => return Err(done),
-            Err(Halt::Refused(refusal)) => return Ok(Step::Stopped(refusal)),
+        if let Err(done) = self.turn_storage_on(mark, &tokens).await {
+            return tokens.ended(done);
         }
         // 5. The setup, with the writer's enrolment, in one transaction.
         if self.account.mark_at(origin) != Some(mark) {
@@ -618,7 +677,7 @@ impl BackupSetup {
     /// Records the setup, if the admission the call was made under still stands.
     ///
     /// The admission is asked again in the transaction that records the setup, and not only when
-    /// the call began: the requests before it are the service's to take as long as it likes.
+    /// the call began: the requests before it each take as long as the host bounds a request.
     async fn record(
         &self,
         record: SetupRecord,
@@ -661,9 +720,9 @@ impl BackupSetup {
         &self,
         params: &BackupEnableParams,
         mark: kr_client::services::AccountMark,
+        tokens: &Arc<Admitted>,
     ) -> std::result::Result<(), Ended> {
         self.wait_out_delay()?;
-        let tokens = self.account.tokens_fixed_to(self.origin.as_str(), mark);
         let installation = AuthorisationKeyPair::generate().map_err(|_| unknown(None))?;
         let transport = self.transport().map_err(|_| unknown(None))?;
         let sync = ManagedSyncService::new(
@@ -671,7 +730,7 @@ impl BackupSetup {
             transport,
             Arc::new(InstallationSigner { key: installation }),
         )
-        .presenting(tokens, BACKUP_WRITE_SCOPE)
+        .presenting(Arc::clone(tokens) as _, BACKUP_WRITE_SCOPE)
         .leaving_delays_to_the_caller();
         let collection = bundle_collection(&RecoveryContext {
             service_origin: self.origin.as_str().to_owned(),
@@ -777,14 +836,16 @@ impl BackupSetup {
 
     /// Turns managed backup storage on when it is off, against the revision just read.
     ///
-    /// The read of the storage state can last as long as the service likes, so the admission is
-    /// asked again after it and before each change that follows.
+    /// The read of the storage state can last as long as the host bounds a request, so the
+    /// admission is asked again as the change leaves, once its token is in hand.
     async fn turn_storage_on(
         &self,
         mark: kr_client::services::AccountMark,
-        admission: &dyn SetupAdmission,
-    ) -> std::result::Result<(), Halt> {
-        let storage = self.storage(mark).map_err(|_| unknown(None))?;
+        tokens: &Arc<Admitted>,
+    ) -> std::result::Result<(), Ended> {
+        let storage = self
+            .storage_presenting(Arc::clone(tokens) as _)
+            .map_err(|_| unknown(None))?;
         for _ in 0..RETENTION_TRIES {
             self.wait_out_delay()?;
             let status = storage
@@ -794,7 +855,6 @@ impl BackupSetup {
             if status.backup == BackupState::On {
                 return Ok(());
             }
-            admission.stands().map_err(Halt::Refused)?;
             match storage
                 .set_retention(&RetentionChange {
                     backup: BackupState::On,
@@ -809,7 +869,7 @@ impl BackupSetup {
                 RetentionAnswer::Stale { .. } => {}
             }
         }
-        Err(unknown(None).into())
+        Err(unknown(None))
     }
 
     /// Ends the call, without a request, if the service asked to be left alone.
