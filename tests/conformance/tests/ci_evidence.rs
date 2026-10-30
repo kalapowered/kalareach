@@ -209,7 +209,7 @@ struct ClassOfTest {
     conditions: &'static [&'static str],
 }
 
-const CLASSES: [ClassOfTest; 8] = [
+const CLASSES: [ClassOfTest; 10] = [
     ClassOfTest {
         class: "browser behaviour, on both kinds of runner",
         job: "companion",
@@ -253,6 +253,20 @@ const CLASSES: [ClassOfTest; 8] = [
         conditions: &[],
     },
     ClassOfTest {
+        class: "the real-worker host tests, on a native Windows machine",
+        job: "windows",
+        runner: &["runs-on: windows-2025"],
+        tool: "cargo test --locked -p kr-worker --test host",
+        conditions: &[],
+    },
+    ClassOfTest {
+        class: "the Tauri desktop application's native backend, on both kinds of unix runner",
+        job: "companion",
+        runner: &["ubuntu-24.04", "macos-15"],
+        tool: "cargo test --locked -p companion-tauri -p kr-client",
+        conditions: &[],
+    },
+    ClassOfTest {
         class: "a Linux machine",
         job: "rust",
         runner: &["runs-on: ubuntu-24.04"],
@@ -272,9 +286,10 @@ const CLASSES: [ClassOfTest; 8] = [
 /// names has a job in the landing workflow that runs its tool on a runner that has it, by a step
 /// that is not disabled: Playwright for browser behaviour, the operating system's own tooling for
 /// native controls and for the iOS Simulator on macOS, an Android emulator for the Android phone,
-/// the Tauri desktop application in a real window on Windows, and a hosted Windows, Linux and macOS
-/// machine each for its platform's tests. The conformance document's table names the same jobs.
-/// Physical devices are the person's own and no workflow starts them.
+/// the Tauri desktop application's native backend on Linux and macOS and in a real window on
+/// Windows, the real-worker host suite on a native Windows machine, and a hosted Windows, Linux and
+/// macOS machine each for its platform's tests. The conformance document's table names the same
+/// jobs. Physical devices are the person's own and no workflow starts them.
 #[test]
 fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
     let workflow = fs::read_to_string(repository().join(".github/workflows/core-ci.yml"))
