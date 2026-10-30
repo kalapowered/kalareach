@@ -68,6 +68,7 @@ import {
   nameWords,
   pairingEnd,
   platformWords,
+  sessionIdWords,
   spanWords,
   stateWords,
   visibly,
@@ -75,7 +76,7 @@ import {
   type OfferedRole
 } from '../model/sharing'
 import { deskOf } from '../model/sharing-desk'
-import { handedOver, invited, pendingWorkers, rechecked, tookBack } from '../model/sharing-results'
+import { handedOver, invited, pendingWorkers, rechecked, tookBack, workersHave } from '../model/sharing-results'
 import { Transfer } from './Transfer'
 
 /** How often the list of who has access is read again while the screen is open. */
@@ -744,13 +745,11 @@ function SharingTab({
             tabIndex={-1}
           >
             <span>
-              Revoked {nameWords(line.name)} at {momentWords(line.atMs, now)} (authority revision{' '}
-              {line.revision}).
-              {line.pending > 0
-                ? ` ${String(line.pending)} session worker${line.pending === 1 ? ' has' : 's have'} not confirmed yet.`
-                : ''}
+              {line.waiting.length > 0
+                ? `The revocation for ${nameWords(line.name)} is recorded at ${momentWords(line.atMs, now)} (authority revision ${line.revision}), and not done: ${workersHave(line.waiting.length, line.cut)} not confirmed yet (${line.waiting.map(sessionIdWords).join(', ')}).`
+                : `Revoked ${nameWords(line.name)} at ${momentWords(line.atMs, now)} (authority revision ${line.revision}).`}
             </span>{' '}
-            {line.pending > 0 ? (
+            {line.waiting.length > 0 ? (
               <Button
                 data-testid="check-again"
                 onClick={() => {

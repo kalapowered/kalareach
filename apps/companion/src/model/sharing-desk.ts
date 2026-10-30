@@ -23,7 +23,19 @@ export interface Revoked {
   readonly atMs: number
   /** The authority revision the host issued for the revocation. */
   readonly revision: string
-  readonly pending: number
+  /** The sessions whose workers have not confirmed the revocation, as the host last said. */
+  readonly waiting: readonly string[]
+  /**
+   * Whether the host cut its list of workers: it names the ones that have not confirmed before any
+   * that has, so a cut list is a floor, and more may be waiting than it names.
+   */
+  readonly cut: boolean
+}
+
+/** The workers a revocation still waits for, as one answer of the host says. */
+export interface Waiting {
+  readonly sessions: readonly string[]
+  readonly cut: boolean
 }
 
 /**
@@ -115,14 +127,14 @@ export class SharingDesk {
   }
 
   /**
-   * Keeps the line that says a revocation was made, at which authority revision, and how many
-   * workers have not confirmed it.
+   * Keeps the line that says a revocation was made, at which authority revision, and which
+   * session workers have not confirmed it.
    */
-  keepRevocation(grantId: string, name: string, atMs: number, revision: string, pending: number): void {
+  keepRevocation(grantId: string, name: string, atMs: number, revision: string, waiting: Waiting): void {
     this.#change({
       revoked: [
         ...this.#kept.revoked.filter((line) => line.grantId !== grantId),
-        { grantId, name, atMs, revision, pending }
+        { grantId, name, atMs, revision, waiting: waiting.sessions, cut: waiting.cut }
       ]
     })
   }
@@ -132,10 +144,12 @@ export class SharingDesk {
     return this.#kept.revoked.some((line) => line.grantId === grantId)
   }
 
-  /** Says how many workers still have not confirmed a revocation already kept, as of a check. */
-  checked(grantId: string, pending: number): void {
+  /** Says which workers still have not confirmed a revocation already kept, as of a check. */
+  checked(grantId: string, waiting: Waiting): void {
     this.#change({
-      revoked: this.#kept.revoked.map((line) => (line.grantId === grantId ? { ...line, pending } : line))
+      revoked: this.#kept.revoked.map((line) =>
+        line.grantId === grantId ? { ...line, waiting: waiting.sessions, cut: waiting.cut } : line
+      )
     })
   }
 
