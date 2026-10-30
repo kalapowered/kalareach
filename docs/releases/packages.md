@@ -144,8 +144,9 @@ it, before the release or the build that carries it. A revision number that was 
 cannot be lowered: the next revision has to exceed it, within 18 digits. A Worker rollback is not a
 way to correct a matrix, because hosts keep the newer revision and ignore the older. The cut also
 sets `PRODUCTION_FIRST_REVISION` in `crates/kr-client/src/services/matrix.rs` to the first revision
-that lists the release, since a host with no copy refuses any revision below it and would take a
-rolled-back older one that lists no build of the release.
+that lists the release. A host refuses any revision below that constant, held copy or not. With a
+lower value, a host with no copy would take a rolled-back revision that lists no build of the
+release.
 
 ## A level is one surface
 
