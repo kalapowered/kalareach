@@ -3664,9 +3664,10 @@ impl Asked {
 /// running. A program still under way at the deadline is ended with the processes in its group. One
 /// that has ended has the rest of its group ended with it, and one that answers with more than a
 /// version and a directory is ended where its output passes the limit and refused, whatever it
-/// would have exited with. A process that left the group and kept the pipe is out of reach: the
-/// answer is refused after a short wait for the end of its output, and the pipe is closed, so it
-/// costs this host no more than the descriptor for as long as it runs.
+/// would have exited with. A child that cannot be waited on is refused and nothing is signalled by
+/// its number, which may be another process's by now. A process that left the group and kept the
+/// pipe is out of reach: the answer is refused after a short wait for the end of its output, and
+/// the pipe is closed, so it costs this host no more than the descriptor for as long as it runs.
 fn ask(
     program: &Path,
     arguments: &[&str],
@@ -3745,8 +3746,10 @@ fn ask(
             // Collected where the platform cannot say first, so the number may be anyone's by now
             // and no group is signalled.
             Ended::Collected(status) => break status,
+            // Whether the child is still this process's own is not known: it may be gone already,
+            // collected by something else here, and its number may belong to another process by
+            // now. So nothing is signalled by it, and the child is let go with its pipe.
             Ended::Failed(error) => {
-                end_probe(child);
                 return Err(Asked::Overran(unavailable(format!(
                     "{described} could not be waited on: {error}"
                 ))));
@@ -3981,6 +3984,7 @@ enum Ended {
     Uncollected,
     /// Ended and collected, because the platform could not say first.
     Collected(std::process::ExitStatus),
+    /// The platform could not say, so whether the number is still the child's own is not known.
     Failed(std::io::Error),
 }
 
@@ -4007,7 +4011,8 @@ fn has_ended(child: &mut std::process::Child) -> Ended {
             Ok(None) => return Ended::No,
             Err(rustix::io::Errno::INTR) => return Ended::No,
             // The child is this process's own and was not collected, so the call has no business
-            // failing; if it does, the child is asked after without the group, below.
+            // failing; if it does, the child is asked after below, and if that fails too nothing
+            // is signalled by its number.
             Err(_) => {}
         }
     }
