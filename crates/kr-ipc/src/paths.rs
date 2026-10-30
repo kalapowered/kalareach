@@ -624,17 +624,18 @@ pub fn resolve_here(path: PathBuf) -> Result<PathBuf> {
 /// The file that records which environment owns a directory whose name is only a prefix.
 pub const ENVIRONMENT_MARKER: &str = "environment";
 
-/// Creates a KalaReach directory tree owner-only, under a root this installation owns.
+/// Creates a KalaReach directory tree with mode 0700, under a root this installation owns.
 ///
 /// Only the root and the directories below it are KalaReach's. Their parents are not: `/tmp` is
 /// world-writable by design, and `~/.cache` and `~/.local/state` are ordinarily group-readable.
 /// Demanding 0700 of those would refuse to start on a perfectly normal system, so the boundary is
 /// explicit: a directory above `root` that exists is checked for nothing and left as it is, and
-/// `root` itself and every component below it is created owner-only and verified on every open. A
-/// directory above `root` that is missing is made here, and it is made owner-only like the rest,
-/// whatever the process's umask: a parent that one KalaReach program makes is another one's root
-/// (the store of releases lies inside the state root on macOS), and a directory made wider than
-/// that would be refused on the next open.
+/// `root` itself and every component below it is created with mode 0700 and verified on every open;
+/// on macOS the check also reads the access list, which a new directory takes the inheritable
+/// entries of from the one above it. A directory above `root` that is missing is made here, and it
+/// is made with mode 0700 like the rest, whatever the process's umask: a parent that one KalaReach
+/// program makes is another one's root (the store of releases lies inside the state root on macOS),
+/// and a directory made wider than that would be refused on the next open.
 ///
 /// # Errors
 ///
@@ -665,15 +666,15 @@ pub fn create_private_tree(root: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Creates a directory and the ones above it that are missing, each owner-only on Unix whatever the
-/// process's umask, and leaves one that exists as it is: it is not checked, and a symbolic link to a
-/// directory is followed.
+/// Creates a directory and the ones above it that are missing, each with mode 0700 on Unix whatever
+/// the process's umask, and leaves one that exists as it is: it is not checked, and a symbolic link
+/// to a directory is followed.
 ///
-/// This is `std::fs::create_dir_all` with a mode of its own. [`create_private_tree`] uses it for
-/// the directories above a root that are missing, which it makes owner-only and does not check. A
+/// This is `std::fs::create_dir_all` with a mode of its own. [`create_private_tree`] uses it for the
+/// directories above a root that are missing, which it makes with mode 0700 and does not check. A
 /// caller that makes a directory below a root this installation verifies uses it where the root
-/// keeps others out and what is left to settle is the mode of what the host makes: a directory
-/// that exists there with a wider mode is one an earlier release made with the umask's mode, which
+/// keeps others out and what is left to settle is the mode of what the host makes: a directory that
+/// exists there with a wider mode is one an earlier release made with the umask's mode, which
 /// [`create_private_tree`] would refuse. A directory made on Windows takes the access list of the
 /// one above it, and the check of a root there accepts that list.
 ///
@@ -745,9 +746,9 @@ pub fn create_private_directory(path: &Path) -> Result<()> {
 
 /// `path` without a final separator, to look the name up by.
 ///
-/// The operating system resolves a symbolic link whose name ends in a separator, so the name `link/`
-/// is looked up as the directory the link points to, and the link goes unseen. A root given that
-/// way has to be looked at as the name it is. Only the lookups drop the separator: the path in an
+/// The operating system resolves a symbolic link whose name ends in a separator, so the name
+/// `link/` is looked up as the directory the link points to, and the link goes unseen. A root given
+/// that way has to be looked at as the name it is. Only the lookups drop the separator: the path in an
 /// error stays as it was given, so that a caller that shows the configured root finds it.
 fn without_final_separator(path: &Path) -> &Path {
     path.components().as_path()
@@ -858,19 +859,21 @@ fn others_in_access_list(path: &Path) -> Option<String> {
 }
 
 /// The names an entry of an access list for this user goes by: the short name the system's record
-/// gives, unless it is a number.
+/// gives, unless it is a number or the text of a GUID.
 ///
-/// The list names an account by that short name, and a user number the system has no record of by
-/// the number itself, so a name that is a number is not known to be this user's: an account can be
-/// called "424242" while the user number 424242 has no record, and the two are named alike. An entry
-/// by such a name is taken for another account's, which refuses a list that names this user by
-/// number; the same holds when there is no record of this user. Two accounts with one short name in
-/// different databases of accounts cannot be told apart from what the list gives.
+/// The list names an account by that short name, a user number the system has no record of by the
+/// number itself, and an identity no account has by its GUID's text, with a user's kind in each
+/// case. A name of either form is not known to be this user's: an account can be called "424242"
+/// while the user number 424242 has no record, and the two are named alike. An entry by such a name
+/// is taken for another account's, which refuses a list that names this user by number or GUID; the
+/// same holds when there is no record of this user. Two accounts with one short name in different
+/// databases of accounts cannot be told apart from what the list gives.
 #[cfg(target_os = "macos")]
 fn names_of_this_user(record: Option<PasswdEntry>) -> Vec<String> {
     record
         .map(|account| account.name)
         .filter(|name| !name.bytes().all(|byte| byte.is_ascii_digit()))
+        .filter(|name| uuid::Uuid::try_parse(name).is_err())
         .into_iter()
         .collect()
 }
@@ -893,7 +896,8 @@ fn access_list_verdict(
                     !(entry.kind == exacl::AclEntryKind::User && own.contains(&entry.name))
                 })
                 .then(|| {
-                    "its access list has an allow entry for an account other than yours".to_owned()
+                    "its access list has an allow entry for an account not known to be yours"
+                        .to_owned()
                 })
         }
         // A file system that does not support access lists has none to let anybody in. The error
