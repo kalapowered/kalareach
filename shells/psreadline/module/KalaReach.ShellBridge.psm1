@@ -489,6 +489,16 @@ function Test-KrQualifiedEditor {
             Detail = "PSReadLine $version keeps no reader queue this package can read"
         }
     }
+    if (-not (Test-KrRuntimeReadable)) {
+        # The fence also rests on what the runtime has read from the terminal and not handed to the
+        # editor, and a runtime that keeps that where this package was qualified to find it is the
+        # only one it can prove a queue over.
+        return @{
+            Ok     = $false
+            Reason = 'runtime_reader_unreadable'
+            Detail = 'The .NET runtime keeps no reader of the terminal this package can read'
+        }
+    }
     # This package builds no editor: it binds into the one the person has, and the qualification
     # it publishes names exactly which one that was. A supported range is not that answer, because
     # two installations can be in one range and only one of them was qualified. So a package says
