@@ -543,6 +543,11 @@ mod tests {
             "/configured"
         );
         assert_eq!(choose(None, None, platform), "/platform/shell");
+        assert_eq!(
+            resolve(Some("/requested/shell")),
+            "/requested/shell",
+            "whatever this machine is configured to use, a request's shell is the one started"
+        );
     }
 
     /// KR-REQ-03.03: an empty or relative search-path entry is not the directory the worker runs
