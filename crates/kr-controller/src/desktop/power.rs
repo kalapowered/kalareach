@@ -574,6 +574,9 @@ mod platform {
         /// The files of one supply: each file's name and what it holds.
         type Files<'a> = &'a [(&'a str, &'a str)];
 
+        /// One host to read: what it is, the supplies it shows, and the source it is on.
+        type Host<'a> = (&'a str, &'a [(&'a str, Files<'a>)], PowerSource);
+
         /// The power-supply class a host shows, one directory for each supply with the files the
         /// kernel gives it.
         fn class(supplies: &[(&str, Files)]) -> tempfile::TempDir {
@@ -601,7 +604,7 @@ mod platform {
             let usb_pd: Files = &[("type", "USB_PD\n"), ("online", "1\n")];
             let programmable: Files = &[("type", "USB\n"), ("online", "2\n")];
             let unknown: Files = &[("type", "Unknown\n"), ("online", "1\n")];
-            let cases: [(&str, &[(&str, Files)], PowerSource); 8] = [
+            let cases: [Host; 8] = [
                 (
                     "a desktop with a wireless mouse",
                     &[("hid-mouse", mouse)],
