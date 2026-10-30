@@ -166,9 +166,20 @@ print(", ".join(signed["roles"]["targets"]["keyids"]))
     # shellcheck disable=SC2016
     {
         echo
-        echo "Check an archive after it is downloaded, with the one sum file for all four:"
+        echo "Download an archive and the sum file under the names the sum file lists. A link above writes the + of"
+        echo "the release as %2B, and curl keeps that spelling in a file name unless it is given the name, so name"
+        echo "each file:"
+        echo
+        echo "    curl -L -o kalareach-<target>-$release.tar.gz <the link of that archive above>"
+        echo "    curl -L -o SHA256SUMS <the link of SHA256SUMS above>"
+        echo
+        echo "Check the archive with the one sum file for all four:"
         echo
         echo '    shasum -a 256 --ignore-missing -c SHA256SUMS'
+        echo
+        echo "The check has to print \`kalareach-<target>-$release.tar.gz: OK\`. A line that says FAILED, or that no"
+        echo "file was verified, means the archive is not the one published or is not named as the sums name it:"
+        echo "do not unpack it. On Linux, \`sha256sum --ignore-missing -c SHA256SUMS\` does the same."
         echo
         echo 'Unpack it and put the release in this user'"'"'s store of releases:'
         echo
@@ -294,7 +305,7 @@ for asset in json.load(sys.stdin)["assets"]:
         echo "The KalaReach host $release for macOS and Linux, built from commit $commit."
         echo
         while read -r asset_id asset_name asset_url; do
-            case "$asset_name" in *.tar.gz) echo "- $asset_url" ;; esac
+            case "$asset_name" in *.tar.gz | SHA256SUMS) echo "- $asset_url" ;; esac
         done < "$work/served-assets"
         cat "$work/notes-tail.md"
     } > "$work/notes.md"
@@ -348,6 +359,7 @@ import hashlib
 import json
 import os
 import sys
+import urllib.parse
 
 state_path = os.path.join(os.environ["STUB_STATE"], "state.json")
 state = json.load(open(state_path)) if os.path.exists(state_path) else {"releases": [], "next": 1}
@@ -390,7 +402,9 @@ def release_json(release):
         "published_at": "2026-01-01T00:59:00Z" if release["draft"] else f"2026-01-01T00:{release['published']:02d}:00Z",
         "upload_url": f"upload://{release['id']}{{?name,label}}",
         "assets": [{"id": a["id"], "name": a["name"], "size": a["size"], "digest": a["digest"],
-                    "browser_download_url": f"https://example.invalid/{a['name']}"} for a in release["assets"]],
+                    # As GitHub spells it: the tag keeps its slash and every other reserved character is escaped.
+                    "browser_download_url": f"https://example.invalid/download/{urllib.parse.quote(release['tag_name'], safe='/')}/{urllib.parse.quote(a['name'], safe='')}"}
+                   for a in release["assets"]],
     }
 
 
@@ -459,6 +473,8 @@ elif method == "PATCH":
     release = find(int(path.rsplit("/", 1)[1]))
     if fields.get("draft") == "false":
         release["draft"] = False
+    if fields.get("body", "").startswith("@"):
+        open(os.path.join(os.environ["STUB_STATE"], "notes.md"), "wb").write(open(fields["body"][1:], "rb").read())
     save()
 elif method == "DELETE":
     identifier = int(path.rsplit("/", 1)[1])
@@ -525,6 +541,54 @@ PYTHON
 go() { publish --repo o/r --release "$release" --commit "$commit" --archives "$work/archives" --verified "$work/verified" --root "$work/root.json"; }
 
 case_control() { go && state_has published "host/v$release" && ! state_has draft "host/v$release"; }
+# The commands the notes give, with their placeholders filled in from the notes' own links, download and
+# check an archive; and the check does not pass in a directory that holds no archive under the name the sums
+# list.
+case_notes_download() {
+    go || return 1
+    local notes="$STUB_STATE/notes.md" target="${targets[1]}" served="$STUB_STATE/served" dl="$STUB_STATE/dl"
+    [ -s "$notes" ] || { echo "the notes were never written"; return 1; }
+    mkdir -p "$served" "$dl/named" "$dl/unnamed"
+    python3 -I - "$STUB_STATE/state.json" "$served" << 'PYTHON'
+import json
+import shutil
+import sys
+
+state = json.load(open(sys.argv[1]))
+for release in state["releases"]:
+    for asset in release["assets"]:
+        shutil.copy(asset["path"], f"{sys.argv[2]}/{asset['name']}")
+PYTHON
+    python3 -I - "$notes" "$served" "$target" "$release" > "$STUB_STATE/notes-commands.sh" << 'PYTHON'
+import re
+import sys
+import urllib.parse
+
+notes, served, target, release = sys.argv[1:5]
+text = open(notes, encoding="utf-8").read()
+links = {}
+for url in re.findall(r"^- (\S+)$", text, re.M):
+    name = urllib.parse.unquote(url.rsplit("/", 1)[1])
+    # What the host serves, here the stand-in's files, under the escaped name the link ends in.
+    links[name] = "file://" + served + "/" + url.rsplit("/", 1)[1]
+archive = f"kalareach-{target}-{release}.tar.gz"
+for line in text.splitlines():
+    if line.startswith("    curl ") or line.startswith("    shasum "):
+        line = line.replace("<target>", target)
+        line = line.replace("<the link of that archive above>", links[archive])
+        line = line.replace("<the link of SHA256SUMS above>", links["SHA256SUMS"])
+        print(line.strip())
+PYTHON
+    [ "$(grep -c '' "$STUB_STATE/notes-commands.sh")" -eq 3 ] || { echo "the notes give other than two downloads and a check:"; cat "$STUB_STATE/notes-commands.sh"; return 1; }
+    ( cd "$dl/named" && bash "$STUB_STATE/notes-commands.sh" ) > "$STUB_STATE/named.txt" 2>&1 || { echo "the notes' commands failed:"; cat "$STUB_STATE/named.txt"; return 1; }
+    grep -q -F "kalareach-$target-$release.tar.gz: OK" "$STUB_STATE/named.txt" || { echo "the check did not print OK for the archive:"; cat "$STUB_STATE/named.txt"; return 1; }
+    # The notes' own check line, run where only the sums are and no archive has the name they list, is not a pass.
+    cp "$served/SHA256SUMS" "$dl/unnamed/SHA256SUMS"
+    tail -n 1 "$STUB_STATE/notes-commands.sh" > "$STUB_STATE/notes-check.sh"
+    ( cd "$dl/unnamed" && bash "$STUB_STATE/notes-check.sh" ) > /dev/null 2>&1 && { echo "the notes' check passed with no archive to check"; return 1; }
+    return 0
+}
+
 case_published() { seed_release "host/v$release" false; ( go ) && return 1; [ "$(nothing_created)" = yes ]; }
 case_draft() { seed_release "host/v$release" true; ( go ) && return 1; [ "$(nothing_created)" = yes ]; }
 case_staging_removed() { seed_release "host-staging/v$release" true; go && ! state_has draft "host-staging/v$release"; }
@@ -592,6 +656,7 @@ json.dump({"signed": {"roles": {"targets": {"keyids": ["aa", "bb"]}}}}, open("'"
     }
 
     run "the control: four archives at their recorded digests are published as an immutable pre-release at the commit" pass case_control
+    run "the commands in the release notes download an archive and the sums under their listed names, and the check prints OK" pass case_notes_download
     run "a staging draft of the release is deleted once it is published" pass case_staging_removed
     run "a published release of the tag is refused, and nothing is created beside it" pass case_published
     run "a draft of the tag is refused, and nothing is created beside it" pass case_draft
