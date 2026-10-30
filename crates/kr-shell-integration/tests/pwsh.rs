@@ -39,6 +39,14 @@ fn the_reader_counts_what_the_host_put_into_its_terminal_as_input_it_has_not_tak
     shellpkg::bytes_the_host_put_into_the_terminal_are_input_the_reader_has_not_taken(PWSH);
 }
 
+/// KR-REQ-08.49: the first byte of a character the terminal delivered in two parts is input the
+/// reader has not taken.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn the_reader_counts_half_a_character_the_terminal_delivered_as_input_it_has_not_taken() {
+    shellpkg::half_a_character_the_terminal_delivered_is_input_the_reader_has_not_taken(PWSH);
+}
+
 /// KR-REQ-07.40: the module holds no secret bytes once the handshake is accepted.
 #[test]
 #[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]

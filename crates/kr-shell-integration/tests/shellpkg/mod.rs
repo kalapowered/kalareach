@@ -1686,6 +1686,16 @@ impl Session {
         id
     }
 
+    /// Sends one request to a reader that has been given its step already, without giving it
+    /// another: a case that has put bytes into the terminal behind that step wants nothing typed
+    /// after them.
+    pub fn ask_after_the_step(&mut self, request: WorkerRequest) -> RequestId {
+        self.stepping = false;
+        let id = self.ask(request);
+        self.stepping = true;
+        id
+    }
+
     /// Gives a reader that reaches its own queue only when it steps one step to take.
     ///
     /// The key is one the editor has a binding for, because that is where this package's own
