@@ -1247,9 +1247,13 @@ given. On macOS a desktop-bound worker's job goes into the user's graphical doma
 one's into the background domain, because a headless worker inside the graphical login would have
 that login's access however little of its environment it was given. On Windows the starter of
 the environment's scheduled task creates the worker in the logon session of the user the task logs
-on as. That session has the interactive window station and desktop, so a headless session there
-runs on them: it is given no desktop variables and no capability claim, and nothing keeps it from
-reaching the desktop.
+on as. A desktop-bound worker is on that session's interactive window station and desktop. A
+headless worker is started on a window station and desktop of its own, a desktop named for the
+worker on the window station the system forms for that logon, with the access list of the starter's
+own station and desktop, so neither it nor a program it starts inherits access to the interactive
+desktop. That is not a boundary against a process of the same account, which can still open the
+interactive desktop by name. A worker an earlier release started stays where it was started until
+it ends.
 
 Linux places a job in no login session at all: a user service manager started at boot has no
 display, no compositor socket and no session message bus, because those belong to a graphical login

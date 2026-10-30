@@ -40,7 +40,8 @@
 //!
 //! The profile decides the login context, not only the environment. A desktop-bound worker is
 //! started in the graphical login session, and a headless one is started outside it: on macOS in
-//! the background domain rather than the graphical one. The fallback supervisor has no domains to
+//! the background domain rather than the graphical one, and on Windows on a window station and
+//! desktop of its own rather than the interactive desktop. The fallback supervisor has no domains to
 //! choose between, so a worker it starts is in whatever login context this daemon is in, and a
 //! headless worker there has the environment stripped rather than a login context of its own.
 //!
