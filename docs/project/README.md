@@ -567,10 +567,15 @@ execution profile, and says outright that building an argument vector is not tha
 every invocation this service makes goes through one type, which decides four things a repository
 cannot argue with.
 
-**Which program runs.** The Git binary is resolved once to an absolute path and its own
-`--exec-path` is recorded with it. Both are passed explicitly, so an inherited `GIT_EXEC_PATH` or a
-directory earlier on `PATH` cannot substitute another program. Git 2.32 or later is required,
-because the profile rests on `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM`.
+**Which program runs.** The Git binary is resolved to an absolute path the first time something
+needs it (a request, work the daemon resumes when it starts, or on Linux the proof it makes when it
+starts), and its own `--exec-path` is recorded with it. Both are passed explicitly, so an inherited
+`GIT_EXEC_PATH` or a directory earlier on `PATH` cannot substitute another program. Git 2.32 or
+later is required, because the profile rests on `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM`. A host
+with no usable Git opens the service all the same. A request that runs Git is refused with
+`HOST_NOT_CONFIGURED` before it makes a repository, an operation row, a workspace or a directory,
+and the refusal names the step that installs Git. Windows runs no Git at all and says so, whether or
+not Git is installed. A read of what the journal records still answers.
 
 **What environment it runs in.** The child's environment is built from nothing and then filled in.
 Every variable Git reads that can name a program (`GIT_EXTERNAL_DIFF`, `GIT_SSH`, `GIT_SSH_COMMAND`,
