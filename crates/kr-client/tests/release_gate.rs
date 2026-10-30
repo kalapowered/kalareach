@@ -329,8 +329,7 @@ async fn a_revision_that_lists_the_build_opens_the_gate_again() {
 /// the case shows what the published range decides, not that another released build reads the
 /// document, which needs that release's own reader.
 #[tokio::test]
-async fn this_builds_gate_serves_every_version_the_published_matrix_lists_and_refuses_those_outside()
- {
+async fn this_builds_gate_serves_the_versions_the_matrix_lists_and_refuses_those_outside() {
     const DEPLOYED: &[u8] = include_bytes!("fixtures/release-matrix/deployed-revision-2.json");
     let previous = PackageVersion::new(0, 77, 0);
     let next = PackageVersion::new(0, 79, 99);
