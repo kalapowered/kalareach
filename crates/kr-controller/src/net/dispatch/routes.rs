@@ -374,7 +374,10 @@ impl RemoteConnection {
                 } else {
                     request
                 };
-                let answer = self.controller.read_method(&actor_id, request, false).await;
+                let mut answer = self.controller.read_method(&actor_id, request, false).await;
+                if entry.method == Method::ChangesetRead {
+                    answer = self.within_the_grant(answer).await;
+                }
                 let narrowed = self.narrow(answer, &decided.acting);
                 if entry.method == Method::ChangesetRead {
                     super::narrowing::without_host_text(narrowed)

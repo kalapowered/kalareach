@@ -2362,6 +2362,80 @@ async fn a_read_that_names_no_version_is_held_to_the_latest_one() {
     recorded.stop().await;
 }
 
+/// KR-REQ-23.44: a `changeset.read` of a version a device may read lists the change set's other
+/// versions only where the grant reaches them. A grant that names one session is not told the
+/// number, the content digest or the base revision of a version captured for none. The control is
+/// the grant over any session, which is told of both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
+async fn a_read_of_one_version_lists_no_other_version_the_grant_does_not_reach() {
+    use kr_protocol::grant::SessionSelector;
+
+    let mut recorded = Recorded::start().await;
+    let change_set_id = recorded.for_a_session.change_set_id;
+    // A second version of the change set that holds the one captured for the session, captured
+    // for no session.
+    let later: kr_protocol::changeset::ChangesetCaptureResult = typed(
+        &local_mutation(
+            &mut recorded.control,
+            recorded.host.environment_id,
+            Method::ChangesetCapture,
+            &kr_protocol::changeset::ChangesetCaptureParams {
+                change_set_id: Nullable::some(change_set_id),
+                ..a_capture_of(recorded.workspace)
+            },
+        )
+        .await
+        .expect("the owner captures a later version of the same change set"),
+    );
+    assert_eq!(later.version.version.get(), 2);
+
+    let first = kr_protocol::changeset::ChangesetReadParams {
+        change_set_id,
+        version: Nullable::some(kr_protocol::ids::ChangeSetVersion::new(1)),
+    };
+    let listed = |read: &kr_protocol::changeset::ChangesetReadResult| {
+        let mut numbers: Vec<u64> = read
+            .versions
+            .iter()
+            .map(|summary| summary.version.get())
+            .collect();
+        numbers.sort_unstable();
+        numbers
+    };
+    let session = recorded.session;
+    let (_a, narrow) = recorded
+        .device(|grant| {
+            grant.session_selector = SessionSelector::These {
+                session_ids: [session].into_iter().collect(),
+            };
+        })
+        .await;
+    let read: kr_protocol::changeset::ChangesetReadResult = narrow
+        .read(Method::ChangesetRead, &first)
+        .await
+        .expect("the version captured for the session is read");
+    assert_eq!(read.version.version.get(), 1);
+    assert_eq!(
+        listed(&read),
+        [1],
+        "a version captured for no session is not listed: {:?}",
+        read.versions
+    );
+
+    // The control: the grant over any session is told of both.
+    let (_b, any) = recorded.device(|_| {}).await;
+    let read: kr_protocol::changeset::ChangesetReadResult = any
+        .read(Method::ChangesetRead, &first)
+        .await
+        .expect("a grant over any session reads the version");
+    assert_eq!(listed(&read), [1, 2], "{:?}", read.versions);
+    recorded.stop().await;
+}
+
 /// KR-REQ-23.44: on a host that has not proved it confines what the Git program reads, capture,
 /// apply, revert and the diff of a working copy are refused to a device with the one sentence the
 /// repository operations are refused with, whatever the device holds. The refusal comes before the

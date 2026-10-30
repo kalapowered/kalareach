@@ -221,6 +221,76 @@ impl RemoteConnection {
         }
     }
 
+    /// Returns what a recorded version has to be inside for this device's grant to reach it, or
+    /// nothing when the grant retains no history, which reaches none.
+    fn version_scope(&self) -> Option<VersionScope> {
+        let bound = self.device.grant.history.lower_bound_ms.0?;
+        Some(VersionScope {
+            environments: ScopedEnvironments::Selected(
+                self.device.grant.environment_selector.clone(),
+            ),
+            workspace: None,
+            sessions: Some(self.device.grant.session_selector.clone()),
+            captured_since: Some(bound),
+        })
+    }
+
+    /// Holds the other versions a `changeset.read` lists to this device's grant.
+    ///
+    /// The version asked for was checked before the read, and what is listed about it is its own:
+    /// its materialisations, results and evidence. The summaries of the change set's other
+    /// versions are listed beside it, and a summary names a version's number, its content digest
+    /// and the revision it is based on, so one captured for a session the grant does not reach, or
+    /// before the moment its history reaches back to, is not listed.
+    pub(super) async fn within_the_grant(&self, answer: ControlFrame) -> ControlFrame {
+        let ControlFrame::Response(Response {
+            request_id,
+            outcome: Outcome::Ok(value),
+        }) = &answer
+        else {
+            return answer;
+        };
+        let request_id = *request_id;
+        let Ok(mut read) = value.to_typed::<kr_protocol::changeset::ChangesetReadResult>() else {
+            return answer;
+        };
+        let Some(scope) = self.version_scope() else {
+            // A grant that retains no history is refused further on, with the sentence every
+            // other read of a recorded version gives it.
+            return answer;
+        };
+        let service = std::sync::Arc::clone(self.controller.changesets().service());
+        let summaries = std::mem::take(&mut read.versions);
+        let listed = tokio::task::spawn_blocking(move || {
+            summaries
+                .into_iter()
+                .filter(|summary| {
+                    crate::changeset::version_in_scope(
+                        &service,
+                        summary.change_set_id,
+                        Some(summary.version),
+                        &scope,
+                    )
+                    .is_ok()
+                })
+                .collect::<Vec<_>>()
+        })
+        .await;
+        match listed {
+            Ok(listed) => {
+                read.versions = listed;
+                encoded(request_id, &read)
+            }
+            Err(_) => failure(
+                request_id,
+                ProtocolError::new(
+                    ErrorCode::OutcomeUnknown,
+                    "this host could not check the versions against this device's grant",
+                ),
+            ),
+        }
+    }
+
     /// Checks that the recorded version a device names is one its grant reaches.
     ///
     /// The version has to be in an environment the grant selects, for a session the grant selects
@@ -240,20 +310,12 @@ impl RemoteConnection {
         change_set_id: kr_protocol::ids::ChangeSetId,
         version: Option<kr_protocol::ids::ChangeSetVersion>,
     ) -> Result<kr_protocol::ids::ChangeSetVersion, ProtocolError> {
-        let Some(bound) = self.device.grant.history.lower_bound_ms.0 else {
+        let Some(scope) = self.version_scope() else {
             return Err(ProtocolError::new(
                 ErrorCode::PermissionDenied,
                 "this device's grant retains no history, so it does not read a recorded \
                  change-set version",
             ));
-        };
-        let scope = VersionScope {
-            environments: ScopedEnvironments::Selected(
-                self.device.grant.environment_selector.clone(),
-            ),
-            workspace: None,
-            sessions: Some(self.device.grant.session_selector.clone()),
-            captured_since: Some(bound),
         };
         let service = std::sync::Arc::clone(self.controller.changesets().service());
         let checked = tokio::task::spawn_blocking(move || {
