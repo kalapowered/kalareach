@@ -199,6 +199,18 @@ impl std::fmt::Debug for BackupSetup {
 /// How a step of a call ended, when it did not go on.
 type Ended = BackupEnableResult;
 
+/// Why a step of a call did not go on: the call has its answer, or the admission stopped it.
+enum Halt {
+    Answer(Ended),
+    Refused(ControllerError),
+}
+
+impl From<Ended> for Halt {
+    fn from(answer: Ended) -> Self {
+        Self::Answer(answer)
+    }
+}
+
 /// Where the steps of a call that did not end leave it.
 enum Step {
     /// The call has its answer and records nothing: a repeat of a setup already recorded.
@@ -451,9 +463,10 @@ impl BackupSetup {
     ///
     /// Returns [`ControllerError::InvalidArgument`] for a call whose fingerprint is not the one its
     /// recovery public key has, and the admission's refusal when it no longer stands before a request
-    /// that changes the service or where the setup is to be recorded: nothing is recorded then,
-    /// and what the service already holds is harmless, as after any call that ends before the
-    /// record. Every other way the call can end is one of its answers.
+    /// that changes the service or where the setup is to be recorded, or when a repeat is answered
+    /// from a setup already recorded and its registration is gone: nothing is recorded by the call
+    /// then, and what the service already holds is harmless, as after any call that ends before
+    /// the record. Every other way the call can end is one of its answers.
     pub async fn enable(
         &self,
         params: BackupEnableParams,
@@ -485,8 +498,8 @@ impl BackupSetup {
         let serial = self.serial.lock().await;
         let ended = self.run(&params, mark, admission).await;
         drop(serial);
-        // A call the admission refused at the record ended with no answer of its own, and what
-        // `backup.status` last said about an attempt stays as it was.
+        // A call the admission stopped ended with no answer of its own, and what `backup.status`
+        // last said about an attempt stays as it was.
         if let Ok(answer) = &ended {
             let mut calls = self.calls();
             calls.last = match answer {
@@ -505,8 +518,7 @@ impl BackupSetup {
         ended
     }
 
-    /// Everything a call does, ending as one of its answers, or refused where its setup is to be
-    /// recorded.
+    /// Everything a call does, ending as one of its answers, or stopped by its admission.
     async fn run(
         &self,
         params: &BackupEnableParams,
@@ -579,11 +591,13 @@ impl BackupSetup {
             return Ok(Step::Stopped(refusal));
         }
         self.enrol(params, mark).await?;
-        // 4. Managed backup storage on.
-        if let Err(refusal) = admission.stands() {
-            return Ok(Step::Stopped(refusal));
+        // 4. Managed backup storage on, which asks the admission again before each change it
+        // makes, after the read of the storage state that precedes it.
+        match self.turn_storage_on(mark, admission).await {
+            Ok(()) => {}
+            Err(Halt::Answer(done)) => return Err(done),
+            Err(Halt::Refused(refusal)) => return Ok(Step::Stopped(refusal)),
         }
-        self.turn_storage_on(mark).await?;
         // 5. The setup, with the writer's enrolment, in one transaction.
         if self.account.mark_at(origin) != Some(mark) {
             return Err(declined(BackupEnableCause::AnotherAccount {}));
@@ -762,10 +776,14 @@ impl BackupSetup {
     }
 
     /// Turns managed backup storage on when it is off, against the revision just read.
+    ///
+    /// The read of the storage state can last as long as the service likes, so the admission is
+    /// asked again after it and before each change that follows.
     async fn turn_storage_on(
         &self,
         mark: kr_client::services::AccountMark,
-    ) -> std::result::Result<(), Ended> {
+        admission: &dyn SetupAdmission,
+    ) -> std::result::Result<(), Halt> {
         let storage = self.storage(mark).map_err(|_| unknown(None))?;
         for _ in 0..RETENTION_TRIES {
             self.wait_out_delay()?;
@@ -776,6 +794,7 @@ impl BackupSetup {
             if status.backup == BackupState::On {
                 return Ok(());
             }
+            admission.stands().map_err(Halt::Refused)?;
             match storage
                 .set_retention(&RetentionChange {
                     backup: BackupState::On,
@@ -790,7 +809,7 @@ impl BackupSetup {
                 RetentionAnswer::Stale { .. } => {}
             }
         }
-        Err(unknown(None))
+        Err(unknown(None).into())
     }
 
     /// Ends the call, without a request, if the service asked to be left alone.

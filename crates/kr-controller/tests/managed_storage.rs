@@ -5635,6 +5635,38 @@ async fn a_fence_owed_while_the_bundle_is_written_stops_the_requests_that_follow
     assert!(rig.controller.backup().setup().expect("a read").is_none());
 }
 
+/// KR-REQ-09.09: a fence this host comes to owe while the setup reads the storage state stops the
+/// retention change that follows the read: it is the last request that changes the service, and the
+/// read before it can last as long as the service likes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_owed_while_the_storage_state_is_read_stops_the_retention_change() {
+    let timer = HeldTimer::held();
+    let (rig, _) = a_host_to_set_up(&timer).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+    web.fail(STATUS, 1, Moment::Slow);
+    let call = rig.enable_outcome_in_the_background(&made.params);
+    within(
+        "the read of the storage state",
+        web.requests_reach(STATUS, 2),
+    )
+    .await;
+    rig.controller.hold_fence(true);
+    web.release_held();
+    let refusal = call
+        .await
+        .expect("the call ends")
+        .expect_err("the setup is refused while a fence is owed");
+    assert_eq!(refusal.code, ErrorCode::PermissionDenied);
+    assert_eq!(
+        web.requests_to(MANIFEST),
+        1,
+        "the writer was enrolled before"
+    );
+    assert_eq!(web.requests_to(RETENTION), 0, "retention was not changed");
+    assert!(rig.controller.backup().setup().expect("a read").is_none());
+}
+
 /// `backup.status` says why a setup that is recorded cannot make backups: the account signed in is
 /// not the one it belongs to.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
