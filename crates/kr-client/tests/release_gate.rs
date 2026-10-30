@@ -322,13 +322,15 @@ async fn a_revision_that_lists_the_build_opens_the_gate_again() {
     );
 }
 
-/// KR-REQ-17.46: hosts on the previous, the current and the next supported version read the same
-/// signed matrix, the document the managed service publishes, and are routed alike: each is served
-/// a new lease and a pairing admission, and a build on either side of that range is refused both
-/// with the route error. Each host reads the document as its own build; the matrix does not depend
-/// on which of them read it first.
+/// KR-REQ-17.46: the signed matrix the managed service publishes is accepted under the pin this
+/// build carries, and this build's gate, made for each of the previous, the current and the next
+/// supported version, serves each a new lease and a pairing admission and refuses a build on either
+/// side of that range both with the route error. The readers and gates here are this build's own:
+/// the case shows what the published range decides, not that another released build reads the
+/// document, which needs that release's own reader.
 #[tokio::test]
-async fn hosts_on_every_supported_version_read_one_matrix_and_are_routed_alike() {
+async fn this_builds_gate_serves_every_version_the_published_matrix_lists_and_refuses_those_outside()
+ {
     const DEPLOYED: &[u8] = include_bytes!("fixtures/release-matrix/deployed-revision-2.json");
     let previous = PackageVersion::new(0, 77, 0);
     let next = PackageVersion::new(0, 79, 99);
