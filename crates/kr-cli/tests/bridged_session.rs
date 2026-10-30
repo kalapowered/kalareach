@@ -3320,10 +3320,12 @@ impl Container {
     }
 
     /// Whether the daemon in this container answers `kr list` now. An asking that has not ended
-    /// within the runtime's quick bound is ended and counts as no answer, so that the wait for the
-    /// daemon is bounded by its own deadline and not by one call that never returns.
+    /// within the runtime's quick bound is a stall and not a missing answer: it fails the case
+    /// with the command named, where a retry would hide it. `kr` ends its own connect and hello
+    /// well inside the bound, so a call that outlasts it is the runtime's.
     fn answers(&self) -> bool {
-        self.runtime
+        let asked = self
+            .runtime
             .run(
                 &[
                     "exec",
@@ -3336,7 +3338,8 @@ impl Container {
                 ],
                 self.runtime.quick,
             )
-            .is_ok_and(|output| output.status.success())
+            .unwrap_or_else(|why| panic!("asking the daemon in the container: {why}"));
+        asked.status.success()
     }
 
     /// The environment identity the daemon in this container reports for itself.
@@ -3564,6 +3567,20 @@ fn an_image_build_that_never_ends_fails_the_case_and_names_the_build() {
             .iter()
             .any(|call| call.starts_with("build ")),
         "the build was started"
+    );
+}
+
+/// A probe of the daemon in a container that stalls fails the case with the command named. It is
+/// not counted as one more asking that got no answer, which the next good asking would cover.
+#[test]
+fn a_probe_that_stalls_fails_the_case_and_names_the_command() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let container = held_in(stalling_runtime(directory.path(), &["exec"]));
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| container.answers()));
+    let said = panic_message(failed.expect_err("a stalled probe fails the case"));
+    assert!(
+        said.contains("\"exec\"") && said.contains("\"list\"") && said.contains("\"/kr/kr\""),
+        "the command is named: {said}"
     );
 }
 
