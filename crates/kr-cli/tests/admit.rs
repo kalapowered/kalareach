@@ -587,10 +587,12 @@ fn mode_of(directory: &Path) -> u32 {
 }
 
 /// KR-REQ-24.26: an install into a home that has no KalaReach directory, under the umask a login
-/// starts with, makes every directory from the home down to the store owner-only, the directory
-/// that a macOS host also takes for its state included, so that the host's next command accepts it.
+/// starts with, makes the store, the directories above it that were missing and every directory
+/// of the store outside the installed releases owner-only, the directory that a macOS host also
+/// takes for its state included, so that the host's next command accepts it. The directories of an
+/// installed release are read-only by design, and what the next command makes is not walked.
 #[test]
-fn an_install_into_a_fresh_home_makes_only_owner_only_directories() {
+fn an_install_into_a_fresh_home_makes_the_store_and_the_directories_above_it_owner_only() {
     let home = Home::new();
     let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
     let by_hand = home.prefix("unpacked", &one);
@@ -602,9 +604,9 @@ fn an_install_into_a_fresh_home_makes_only_owner_only_directories() {
     let installed = home.run_as_a_person(&kr(&by_hand), &["host", "install"]);
     assert!(installed.status.success(), "{}", said(&installed));
 
-    // Every directory the install made is owner-only: the store's, the ones above it that were
-    // missing, and nothing else is there but the test's own temporary directory. An installed
-    // release is read-only by design, so the walk stops at the releases themselves.
+    // The walk starts at the store and at each directory above it up to the home, and goes down
+    // from each into every directory it holds, so it covers the store's tree and the parents the
+    // install made. An installed release is read-only by design, so it stops at `versions`.
     let mut pending = vec![home.store.root().to_path_buf()];
     let mut above = home.store.root().parent().map(Path::to_path_buf);
     while let Some(directory) = above.filter(|directory| *directory != home.home) {
