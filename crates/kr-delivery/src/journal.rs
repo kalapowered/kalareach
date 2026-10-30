@@ -1726,6 +1726,42 @@ impl DeliveryJournal {
         record.transpose()
     }
 
+    /// Returns the authorisation a notification was sent under, when the paired device it went to
+    /// still holds the registration the notification was admitted for, and nothing otherwise.
+    ///
+    /// A notification keeps the digest of the destination as it stood at admission, which names
+    /// the device's authorisation among much else. The destination configured now is that device's
+    /// registration only when its digest is the same: a device that registers again holds another
+    /// authorisation, whose credential is not the one the gateway knows the notification by, and
+    /// a destination removed, edited or disabled since is another recipient than the one the
+    /// notification was admitted for. So a request about a notification is made under the
+    /// authorisation this returns and under no other.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::JournalUnavailable`] when the read fails, and
+    /// [`DeliveryError::JournalUnreadable`] when a row cannot be decoded.
+    pub fn authorisation_of(
+        &self,
+        notification_id: NotificationId,
+    ) -> Result<Option<PushSenderRecordId>> {
+        let admitted: Option<(String, String)> = self
+            .connection
+            .query_row(
+                "SELECT destination_id, destination_digest FROM delivery_notifications
+                  WHERE notification_id = ?1",
+                params![notification_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((destination, admitted_for)) = admitted else {
+            return Ok(None);
+        };
+        Ok(self
+            .destination(&DestinationId::new(destination)?)?
+            .and_then(|record| authorisation_sent_under(&record, &admitted_for)))
+    }
+
     /// Returns one enabled destination record, or the refusal that names it.
     ///
     /// # Errors
@@ -2821,8 +2857,8 @@ impl DeliveryJournal {
     /// Section 24: already-sent notifications and already-delivered external messages are not
     /// retroactively erased. They are shown as retained artifacts, with a separately authorised
     /// deletion action; `deletable` says whether this host holds a way to ask (which
-    /// `the_gateway_may_hold` and the destination decide), not that asking will succeed and not
-    /// that no other copy exists.
+    /// `the_gateway_may_hold` and `authorisation_sent_under` decide), not that asking will succeed
+    /// and not that no other copy exists.
     ///
     /// A notification to a paired device is listed when the gateway took it or may have, whatever
     /// its state (a notification the gateway is retrying that this host only reads the decision
@@ -2830,11 +2866,6 @@ impl DeliveryJournal {
     /// detail to be listed by), and otherwise only when its detail may be in the device's mailbox.
     /// An external message is listed when its destination took it, called it a duplicate or left
     /// it unknown.
-    ///
-    /// A listed notification is deletable only while its destination is still a push destination
-    /// with a rule: unpairing removes the credential the request is made under, and a removed
-    /// destination is kept as history with no rule. An external message is in somebody else's
-    /// service, which this host has no route to ask.
     ///
     /// Each one carries the notification and destination it is a copy of. That is what a deletion
     /// action addresses: the action is authorised separately from the pass that produced the copy,
@@ -2850,7 +2881,7 @@ impl DeliveryJournal {
         let mut statement = self.connection.prepare(
             "SELECT n.notification_id, n.destination_id, n.destination_kind, n.state,
                     COALESCE(MAX(a.settled_at_ms), n.admitted_at_ms), n.detail_left,
-                    n.dispatched, o.next_action
+                    n.dispatched, o.next_action, n.destination_digest
                FROM delivery_notifications n
                LEFT JOIN delivery_attempts a ON a.notification_id = n.notification_id
                LEFT JOIN delivery_outbox o ON o.notification_id = n.notification_id
@@ -2870,13 +2901,23 @@ impl DeliveryJournal {
                 row.get::<_, i64>(5)?,
                 row.get::<_, i64>(6)?,
                 row.get::<_, Option<String>>(7)?,
+                row.get::<_, String>(8)?,
             ))
         })?;
         let destinations = self.destinations()?;
         let mut exported = Vec::new();
         for row in rows {
-            let (identifier, destination, kind, state, left_at, detail_left, dispatched, next) =
-                row?;
+            let (
+                identifier,
+                destination,
+                kind,
+                state,
+                left_at,
+                detail_left,
+                dispatched,
+                next,
+                admitted_for,
+            ) = row?;
             let state =
                 DeliveryState::from_stored(&state).ok_or(DeliveryError::JournalUnreadable(
                     "a stored delivery state is not one this build writes",
@@ -2917,10 +2958,8 @@ impl DeliveryJournal {
                     && destinations
                         .iter()
                         .find(|record| record.id.as_str() == destination)
-                        .is_some_and(|record| {
-                            matches!(record.destination, Destination::Push(_))
-                                && record.rule.is_some()
-                        }),
+                        .and_then(|record| authorisation_sent_under(record, &admitted_for))
+                        .is_some(),
             });
         }
         Ok(exported)
@@ -4632,6 +4671,29 @@ fn the_gateway_may_hold(state: DeliveryState, dispatched: bool, next_action: Opt
             dispatched && next_action == Some(crate::push::NextAction::Receipt.as_str())
         }
         DeliveryState::Admitted | DeliveryState::InFlight | DeliveryState::Cancelled => false,
+    }
+}
+
+/// The authorisation of the paired device `destination` is, when it is the registration a
+/// notification admitted under `admitted_for` was sent under.
+///
+/// A request about a notification is made under the credential of that authorisation. It needs a
+/// push destination that is still in service, with a rule: unpairing removes the credential, and a
+/// removed destination is kept as history with no rule. And the destination must be unchanged
+/// since the notification was admitted for it, which is what the digest says; the gateway answers
+/// a credential only for the notifications its own authorisation sent. An external message is in
+/// somebody else's service, which this host has no route to ask.
+fn authorisation_sent_under(
+    destination: &DestinationRecord,
+    admitted_for: &str,
+) -> Option<PushSenderRecordId> {
+    match &destination.destination {
+        Destination::Push(push)
+            if destination.rule.is_some() && destination.binding_digest() == admitted_for =>
+        {
+            Some(push.sender_record_id)
+        }
+        _ => None,
     }
 }
 

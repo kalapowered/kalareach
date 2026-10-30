@@ -2053,10 +2053,13 @@ impl crate::service::Controller {
     /// Asks the gateway to delete what it still holds for one notification this host gave it.
     ///
     /// The person's own action, which privacy mode neither stops nor is stopped by. The copy is
-    /// found again in the delivery journal, which names the notification and the device it went
-    /// to, and the request is made under the credential the gateway gave that device's
-    /// authorisation; the gateway answers for that credential's notifications only. The answer is
-    /// that the gateway holds nothing for the notification now, which is what the gateway means
+    /// found again in the delivery journal, which names the notification and the authorisation it
+    /// was sent under, and the request is made under the credential the gateway gave that
+    /// authorisation; the gateway answers for that credential's notifications only. A device that
+    /// has registered again holds another authorisation, and asking under that one would be told
+    /// the gateway holds nothing for a notification it did not send, so the request is refused
+    /// unless the notification's own authorisation is the one the destination holds. The answer
+    /// is that the gateway holds nothing for the notification now, which is what the gateway means
     /// whether it removed a record, never had one or had already swept it. It says nothing of a
     /// copy a provider accepted or a device holds, and the list keeps showing the notification as
     /// one that may have left.
@@ -2068,8 +2071,9 @@ impl crate::service::Controller {
     ///
     /// Returns [`ControllerError::InvalidArgument`] when the delivery journal holds no one
     /// notification under the reference, [`ControllerError::PermissionDenied`] for a registration
-    /// that was withdrawn, for a device this host holds no credential for and when no transport is
-    /// attached or reaches the gateway, [`ControllerError::Refused`] under `RATE_LIMITED` when the gateway takes no
+    /// that was withdrawn, for a notification whose authorisation the destination no longer holds,
+    /// for a device this host holds no credential for and when no transport is attached or reaches
+    /// the gateway, [`ControllerError::Refused`] under `RATE_LIMITED` when the gateway takes no
     /// more deletions from this host for now, and [`ControllerError::Storage`] when the gateway
     /// did not answer, refused the credential or refused the request.
     async fn privacy_notification_delete(
@@ -2096,24 +2100,25 @@ impl crate::service::Controller {
                             .to_owned(),
                     ));
                 };
-                let destination = journal.destination(&copy.destination_id).map_err(|error| {
-                    ControllerError::Storage {
-                        operation: "read the destination of a notification",
-                        detail: error.to_string(),
-                    }
-                })?;
-                let Some(kr_delivery::destination::DestinationRecord {
-                    destination: kr_delivery::destination::Destination::Push(push),
-                    ..
-                }) = destination
-                else {
+                // The authorisation the notification was sent under, and no other: the destination
+                // is read in the same hold as the notification's own record of what it was
+                // admitted for, so the credential asked under cannot be a later registration's.
+                let authorisation =
+                    journal
+                        .authorisation_of(copy.notification_id)
+                        .map_err(|error| ControllerError::Storage {
+                            operation: "read the authorisation a notification was sent under",
+                            detail: error.to_string(),
+                        })?;
+                let Some(sender_record_id) = authorisation else {
                     return Err(ControllerError::PermissionDenied {
                         detail: "this host cannot ask for the removal of that copy: its device \
-                                 is no longer a destination of this host"
+                                 is no longer paired, or has registered again since, so this \
+                                 host cannot show the authorisation it was sent under"
                             .to_owned(),
                     });
                 };
-                Ok((copy.notification_id, push.sender_record_id))
+                Ok((copy.notification_id, sender_record_id))
             })
         })
         .await

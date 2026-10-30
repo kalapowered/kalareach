@@ -8221,6 +8221,56 @@ async fn the_gateway_is_asked_only_about_a_listed_notification_the_host_holds_a_
     host.stop().await;
 }
 
+/// KR-REQ-24.29: the request is made under the authorisation the notification was sent under. A
+/// device that registers again holds another authorisation, and the gateway answers its credential
+/// that it holds nothing for a notification the first one sent, which this host would report as a
+/// deletion that did not happen. So the notification is listed as one the host holds no way to
+/// ask about, and the call that names it asks the gateway nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_notification_sent_under_a_registration_since_replaced_is_not_deleted_under_the_new_one()
+{
+    let gateway = Arc::new(DeliveringGateway::default());
+    let (host, copy, _) = a_host_whose_alert_left(&gateway).await;
+    assert!(copy.deletable);
+    let controller = host.controller();
+    let phone = DestinationId::new(DeviceId::new(uuid(10)).to_string()).expect("an identifier");
+    let mut record = controller
+        .delivery()
+        .with(|producer| Ok(producer.journal().destination(&phone).expect("a read")))
+        .expect("a read")
+        .expect("the phone is a destination");
+    let registered_again = PushSenderRecordId::new(uuid(99));
+    let Destination::Push(push) = &mut record.destination else {
+        panic!("a paired device is a push destination");
+    };
+    push.sender_record_id = registered_again;
+    controller
+        .delivery()
+        .configure(&record)
+        .expect("the device registers again");
+    controller
+        .delivery_runtime()
+        .credentials()
+        .hold(PushDeliveryCredential {
+            sender_record_id: registered_again,
+            ..current_credential(kr_ipc::now_ms().get())
+        });
+
+    let listed = privacy_report(&host).await.exported;
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0].reference, copy.reference);
+    assert!(
+        !listed[0].deletable,
+        "the credential the host holds now is another authorisation's"
+    );
+    let error = delete_retained(&host, &copy.reference)
+        .await
+        .expect_err("the host cannot say it deleted what it asked nothing about");
+    assert_eq!(error.code, kr_protocol::error::ErrorCode::PermissionDenied);
+    assert!(gateway.forgets().is_empty(), "nothing left the host");
+    host.stop().await;
+}
+
 /// KR-REQ-24.27, KR-REQ-24.28: an alert privacy mode lets through, while it is on the wire, is not
 /// cleanup of content captured before the boundary, so `privacy.status` reports the change complete
 /// rather than waiting on it. The control: the same report names the work still outstanding while a

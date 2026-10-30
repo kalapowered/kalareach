@@ -731,6 +731,46 @@ mod tests {
         );
     }
 
+    /// A notification is asked about under the authorisation it was sent under. A device that
+    /// registers again holds another authorisation, whose credential the gateway would answer
+    /// "nothing held" for a notification it did not send, so the host would report a deletion that
+    /// did not happen. Such a notification is listed and not offered.
+    #[test]
+    fn a_notification_is_not_offered_once_its_device_has_registered_again() {
+        use crate::push::NextAction;
+
+        let mut journal = journal_with_work();
+        let sent = admit_to_the_phone(&mut journal, 5);
+        claim(&mut journal, 5 + 20, 1_500);
+        settle(
+            &mut journal,
+            sent,
+            DeliveryState::Accepted,
+            true,
+            NextAction::None,
+        );
+        let deletable = |journal: &mut DeliveryJournal| {
+            let outbox = DeliveryOutbox::over(journal, 2_000);
+            let listed = outbox.exported().expect("a list");
+            assert_eq!(listed.len(), 1, "{listed:?}");
+            listed[0].deletable
+        };
+        assert!(deletable(&mut journal), "the gateway took it");
+
+        let mut registered_again = phone();
+        if let Destination::Push(push) = &mut registered_again.destination {
+            push.sender_record_id = kr_protocol::ids::PushSenderRecordId::new(uuid(43));
+        }
+        journal
+            .configure_destination(&registered_again)
+            .expect("the device registers again");
+
+        assert!(
+            !deletable(&mut journal),
+            "it was sent under the registration the device replaced"
+        );
+    }
+
     #[test]
     fn a_confirmed_duplicate_delivery_is_shown_as_a_retained_artifact() {
         let mut journal = journal_with_work();
