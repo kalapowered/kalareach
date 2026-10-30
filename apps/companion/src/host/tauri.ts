@@ -13,7 +13,7 @@
 import { Channel, invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 
-import type { AccountView, UsageView } from '../model/account'
+import type { AccountView, ServiceLine, UsageView } from '../model/account'
 import type {
   DeletionConfirmAnswer,
   DeletionSendAnswer,
@@ -425,6 +425,7 @@ export function tauriPort(): HostPort {
     accountSignInCancel: () => call<undefined>('account_sign_in_cancel', {}),
     accountSignOut: () => call<AccountView>('account_sign_out', {}),
     accountUsage: () => call<UsageView>('account_usage', {}),
+    accountServices: () => call<readonly ServiceLine[]>('account_services', {}),
     accountDeletionView: () => call<DeletionViewAnswer>('account_deletion_view', {}),
     accountDeletionSendCode: () => call<DeletionSendAnswer>('account_deletion_send_code', {}),
     accountDeletionConfirm: (code, acknowledged) =>

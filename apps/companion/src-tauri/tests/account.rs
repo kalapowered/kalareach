@@ -174,7 +174,21 @@ impl Carrier for PhoneSession {
 
 /// Builds the application on the mock runtime with the account commands, and invokes `command`.
 fn invoke(account: Arc<Account>, command: &str) -> serde_json::Value {
-    let app = mock_builder()
+    invoke_in(account, None, command)
+}
+
+/// As [`invoke`], over an application that also holds `state`.
+fn invoke_in(
+    account: Arc<Account>,
+    state: Option<companion_tauri::state::AppState>,
+    command: &str,
+) -> serde_json::Value {
+    let builder = mock_builder();
+    let builder = match state {
+        Some(state) => builder.manage(state),
+        None => builder,
+    };
+    let app = builder
         .manage(AccountSlot::ready(account))
         .invoke_handler(tauri::generate_handler![
             companion_tauri::commands::account_status,
@@ -183,6 +197,7 @@ fn invoke(account: Arc<Account>, command: &str) -> serde_json::Value {
             companion_tauri::commands::account_sign_in_cancel,
             companion_tauri::commands::account_sign_out,
             companion_tauri::commands::account_usage,
+            companion_tauri::commands::account_services,
         ])
         .build(mock_context(noop_assets()))
         .expect("an application on the mock runtime");
@@ -460,4 +475,123 @@ fn a_sign_out_the_store_refuses_says_so_beside_the_signed_in_account() {
     assert_eq!(answer["outcome"], "sign_out_failed", "{answer}");
     let status = invoke(account, "account_status");
     assert_eq!(status["outcome"], "sign_out_failed", "{status}");
+}
+
+/// A factory of sync clients that records the origins it is asked for and makes the managed client.
+#[derive(Debug)]
+struct Recording {
+    clients: companion_tauri::services::ManagedSyncServices,
+    asked: Mutex<Vec<String>>,
+}
+
+impl companion_tauri::services::SyncServices for Recording {
+    fn installation(
+        &self,
+        origin: &kr_protocol::service::GatewayOrigin,
+    ) -> companion_tauri::error::Result<Arc<dyn kr_client::services::SharedSyncService>> {
+        self.asked
+            .lock()
+            .expect("the record")
+            .push(origin.as_str().to_owned());
+        self.clients.installation(origin)
+    }
+
+    fn presenting(
+        &self,
+        origin: &kr_protocol::service::GatewayOrigin,
+        tokens: Arc<dyn kr_client::services::AccountTokenSource>,
+        scope: &'static str,
+    ) -> companion_tauri::error::Result<Arc<dyn kr_client::services::SharedSyncService>> {
+        self.clients.presenting(origin, tokens, scope)
+    }
+}
+
+/// The lines a page reads, as (service, configured, explanation).
+fn lines(answer: &serde_json::Value) -> Vec<(String, bool, String)> {
+    answer
+        .as_array()
+        .expect("a list of lines")
+        .iter()
+        .map(|line| {
+            (
+                line["service"].as_str().expect("a name").to_owned(),
+                line["configured"].as_bool().expect("a flag"),
+                line["explanation"].as_str().expect("words").to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// KR-REQ-17.14: the application says which managed services it holds a client of, in the words
+/// the library uses, and for a service it holds none of, what a person does instead. The sync line
+/// is derived from the factory the desks use, asked for the origin the setting names, so replacing
+/// the factory is what changes the line. A phone leaves relay leases out: the host keeps those.
+#[test]
+fn the_application_reports_the_managed_services_it_holds_a_client_of() {
+    use kr_client::services::{ManagedService, ServiceClients};
+
+    let exchanges = Arc::new(Exchanges::default());
+    let views = Arc::new(Mutex::new(Vec::new()));
+    let carrier: Arc<dyn Carrier> = Arc::new(PhoneSession {
+        redirect: Redirect::AppLink,
+        opened: Arc::new(Mutex::new(Vec::new())),
+    });
+    let account = account(Client::Mobile, carrier, &exchanges, &views);
+    let none = ServiceClients::none();
+
+    // An application whose desks are not open holds the account's client and nothing else.
+    let bare = lines(&invoke(Arc::clone(&account), "account_services"));
+    let names: Vec<&str> = bare.iter().map(|(name, _, _)| name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            ManagedService::AccountLogin.as_str(),
+            ManagedService::Push.as_str(),
+            ManagedService::SyncBackup.as_str(),
+            ManagedService::ManagedInference.as_str(),
+        ],
+        "four services, and not the relay lease service"
+    );
+    assert_eq!(
+        bare.iter().map(|(_, held, _)| *held).collect::<Vec<_>>(),
+        [true, false, false, false]
+    );
+    for (name, held, explanation) in &bare {
+        let service = ManagedService::ALL
+            .into_iter()
+            .find(|service| service.as_str() == name)
+            .expect("a service the library names");
+        if !held {
+            assert_eq!(
+                *explanation,
+                none.availability_of(service).explanation,
+                "{name}: what a person does instead is the library's word"
+            );
+        }
+    }
+
+    // With the sync service setting open and a factory of sync clients installed, the sync line is
+    // held, and the factory was asked for the origin the setting names.
+    let directory = tempfile::tempdir().expect("a directory");
+    let state = companion_tauri::state::AppState::new();
+    state.sync_service_opened(Arc::new(companion_tauri::sync_service::SyncService::open(
+        directory.path(),
+    )));
+    let recording = Arc::new(Recording {
+        clients: companion_tauri::services::ManagedSyncServices::new(
+            kr_crypto::keys::AuthorisationKeyPair::generate().expect("a key"),
+        ),
+        asked: Mutex::new(Vec::new()),
+    });
+    state.sync_clients_replaced(Arc::clone(&recording) as _);
+    let held = lines(&invoke_in(account, Some(state), "account_services"));
+    assert_eq!(
+        held.iter().map(|(_, held, _)| *held).collect::<Vec<_>>(),
+        [true, false, true, false]
+    );
+    assert_eq!(
+        *recording.asked.lock().expect("the record"),
+        [ACCOUNT_ORIGIN.to_owned()],
+        "the line is made from the client at the chosen origin"
+    );
 }
