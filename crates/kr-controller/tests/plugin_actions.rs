@@ -725,9 +725,9 @@ async fn kr_req_23_30_a_connection_that_ended_while_the_component_prepared_rejec
     );
 }
 
-/// KR-REQ-23.30: an action is answered within its own deadline whatever its component does. With
-/// the host's replies kept back, a call that is never answered is given up on, and the action is
-/// rejected, while they are still kept back.
+/// KR-REQ-23.30 and KR-REQ-27.05, plugin timeouts: an action is answered within its own deadline
+/// whatever its component does. With the host's replies kept back, a call that is never answered
+/// is given up on, and the action is rejected, while they are still kept back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_23_30_a_component_that_does_not_answer_costs_its_action_and_nothing_else() {
     let Some(acting) = Acting::start().await else {
@@ -738,7 +738,11 @@ async fn kr_req_23_30_a_component_that_does_not_answer_costs_its_action_and_noth
     mutation.requested_ttl_ms = DurationMs::new(1_500);
     let action_id = mutation.action_id;
     acting.gate().hold();
-    let outcome = send(&mut client, mutation).await;
+    // The answer comes from the bound on the call. A silent component that held the action past
+    // it would leave the wait to the harness's patience, so the wait says what did not happen.
+    let outcome = tokio::time::timeout(PATIENCE, send(&mut client, mutation))
+        .await
+        .expect("the action was not answered at its own deadline: the silent component held it");
     let Outcome::Error(refusal) = outcome else {
         panic!("an action whose component is silent was carried: {outcome:?}");
     };
@@ -817,8 +821,9 @@ async fn kr_req_11_31_the_native_terminal_goes_on_while_a_call_to_the_component_
     assert!(frames[1].contains("turn.cancel"), "{frames:?}");
 }
 
-/// KR-REQ-23.30: a plugin runtime that ends while an action's component is being asked costs the
-/// action the code that says asking again can succeed, as one that was gone before the call does.
+/// KR-REQ-23.30 and KR-REQ-27.05, the plugin host kill: a plugin runtime that ends while an
+/// action's component is being asked costs the action the code that says asking again can succeed,
+/// as one that was gone before the call does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_23_30_a_runtime_that_ends_during_the_call_costs_its_action_a_retryable_code() {
     let Some(acting) = Acting::start().await else {

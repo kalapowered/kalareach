@@ -2369,9 +2369,10 @@ impl Drop for ApartWorker {
     }
 }
 
-/// KR-ACC-022: the whole sequence through this daemon's own revocation path - a worker isolated
-/// after its intents were durably accepted, a revocation announced while it cannot answer, the
-/// barrier reported pending in the meantime, and no affected undispatched action executed.
+/// KR-ACC-022 and KR-REQ-27.05, revoked devices: the whole sequence through this daemon's own
+/// revocation path - a worker isolated after its intents were durably accepted, a revocation
+/// announced while it cannot answer, the barrier reported pending in the meantime, and no affected
+/// undispatched action executed.
 /// KR-REQ-02.08, the part that is about current state: an intent accepted under authority that a
 /// revocation then withdrew is rejected as revoked, and never reaches its dispatch marker.
 ///
