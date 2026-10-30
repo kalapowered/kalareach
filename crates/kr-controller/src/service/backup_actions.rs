@@ -7,7 +7,6 @@ use kr_protocol::backup_setup::{BackupEnableParams, BackupEnableResult, BackupSt
 use kr_protocol::envelope::{MutationRequest, ParamsValue};
 
 use crate::backup::setup::SetupAdmission;
-use crate::backup::store::SetupCommit;
 use crate::error::{ControllerError, Result};
 
 use super::{Controller, parse};
@@ -194,35 +193,50 @@ impl Controller {
     }
 }
 
-/// The registration a `backup.enable` call was admitted under, asked again where the setup is
-/// recorded. It holds the daemon until the commit has ended, so a commit that went on after the
-/// call stopped waiting for it cannot outlive the environment's lock.
+/// The registration a `backup.enable` call was admitted under, asked again as the call goes on. It
+/// holds the daemon until the commit has ended, so a commit that went on after the call stopped
+/// waiting for it cannot outlive the environment's lock.
 struct SetupStands {
     controller: std::sync::Arc<Controller>,
     carried: crate::authority::AdmittedMutation,
 }
 
 impl SetupAdmission for SetupStands {
-    fn commit(
-        &self,
-        commit: &mut dyn FnMut() -> Result<SetupCommit>,
-    ) -> Result<Result<SetupCommit>> {
-        self.controller.under_registration(&self.carried, commit)
+    fn stands(&self) -> Result<()> {
+        self.controller.check_registration(&self.carried)
+    }
+
+    fn retained(&self) -> Result<()> {
+        self.controller
+            .check_registration(&crate::authority::AdmittedMutation {
+                deadline: None,
+                ..self.carried
+            })
+    }
+
+    fn admitted(&self, write: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        self.controller.under_registration(&self.carried, write)?
     }
 }
 
-/// An admission that asks nothing at the record, for a suite that drives the setup without a
-/// connection.
+/// An admission that asks nothing, for a suite that drives the setup without a connection. It
+/// keeps the daemon until the commit has ended, as a call's does.
 #[cfg(feature = "testing")]
 struct Unchecked(std::sync::Arc<Controller>);
 
 #[cfg(feature = "testing")]
 impl SetupAdmission for Unchecked {
-    fn commit(
-        &self,
-        commit: &mut dyn FnMut() -> Result<SetupCommit>,
-    ) -> Result<Result<SetupCommit>> {
+    fn stands(&self) -> Result<()> {
         let _daemon = &self.0;
-        Ok(commit())
+        Ok(())
+    }
+
+    fn retained(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn admitted(&self, write: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        let _daemon = &self.0;
+        write()
     }
 }

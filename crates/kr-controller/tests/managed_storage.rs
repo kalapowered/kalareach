@@ -406,7 +406,7 @@ impl Rig {
         };
         self.controller
             .backup()
-            .commit_setup(&record, false, TimestampMs::new(1_000))
+            .commit_setup(&record, false, TimestampMs::new(1_000), &|write| write())
             .expect("the setup is written");
         record
     }
@@ -3532,7 +3532,9 @@ async fn a_request_in_flight_when_a_replacement_commits_is_refused_its_token() {
     replacement.archive_id = other;
     replacement.kit_fingerprint = "QQQQ2345".to_owned();
     backup
-        .commit_setup(&replacement, true, TimestampMs::new(2_000))
+        .commit_setup(&replacement, true, TimestampMs::new(2_000), &|write| {
+            write()
+        })
         .expect("the replacement commits");
     let refused = kr_controller::backup::binding::in_iteration(epoch, source.token(scope)).await;
     assert!(refused.is_err(), "the request began before the commit");
@@ -5606,6 +5608,31 @@ async fn a_fence_owed_while_the_setup_waits_on_the_service_stops_the_record() {
         BackupEnableResult::Enabled { .. }
     ));
     assert!(rig.controller.backup().setup().expect("a read").is_some());
+}
+
+/// KR-REQ-09.09: a fence this host comes to owe while the setup waits on the service stops the
+/// requests that follow as well as the record. The bundle write is the request the call waits on;
+/// once the fence is owed neither the enrolment nor the retention change leaves, and nothing is
+/// recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_owed_while_the_bundle_is_written_stops_the_requests_that_follow() {
+    let timer = HeldTimer::held();
+    let (rig, _) = a_host_to_set_up(&timer).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+    web.fail(SYNC, 1, Moment::Slow);
+    let call = rig.enable_outcome_in_the_background(&made.params);
+    within("the bundle write", web.requests_reach(SYNC, 1)).await;
+    rig.controller.hold_fence(true);
+    web.release_held();
+    let refusal = call
+        .await
+        .expect("the call ends")
+        .expect_err("the setup is refused while a fence is owed");
+    assert_eq!(refusal.code, ErrorCode::PermissionDenied);
+    assert_eq!(web.requests_to(MANIFEST), 0, "the writer was not enrolled");
+    assert_eq!(web.requests_to(RETENTION), 0, "retention was not changed");
+    assert!(rig.controller.backup().setup().expect("a read").is_none());
 }
 
 /// `backup.status` says why a setup that is recorded cannot make backups: the account signed in is

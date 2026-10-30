@@ -448,6 +448,7 @@ impl Rig {
                 },
                 false,
                 TimestampMs::new(1_000),
+                &|write| write(),
             )
             .expect("the setup is written");
         rig.controller

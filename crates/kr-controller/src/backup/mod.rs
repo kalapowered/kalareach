@@ -901,16 +901,22 @@ impl BackupService {
     /// With `replace` over a setup of another archive, the earlier archive's writer is retired and
     /// what it had not finished is cancelled in the same transaction.
     ///
+    /// `admitted` holds the caller's registration standing for the write. It is taken inside the
+    /// hold of the store, the order a privacy change takes the two in, so that neither can wait
+    /// for the other: a caller never holds the registration while it waits for the store.
+    ///
     /// # Errors
     ///
     /// Returns [`ControllerError::InvalidArgument`] when a setup of another archive is there and
     /// `replace` was not asked for, or one of this archive is there with something else recorded,
-    /// and [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    /// `admitted`'s own refusal when the registration does not stand, and
+    /// [`ControllerError::RegistryUnavailable`] when the store refuses the write.
     pub fn commit_setup(
         &self,
         record: &SetupRecord,
         replace: bool,
         now_ms: TimestampMs,
+        admitted: crate::privacy::Admitted<'_>,
     ) -> Result<SetupCommit> {
         #[cfg(feature = "testing")]
         if let Some((arrived, go)) = self
@@ -923,18 +929,26 @@ impl BackupService {
             let _ = go.recv();
         }
         let mut store = self.store();
-        let commit = store.commit_setup(record, replace, now_ms)?;
-        // Inside the hold in which the setup committed, and nowhere else: from here a request the
-        // backup clients make is held to this account.
-        if commit != SetupCommit::Unchanged {
-            self.binding
-                .switch(AccountMark::from_bytes(record.account_mark));
-            *self
-                .kit
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                Some(record.kit_fingerprint.clone());
-        }
+        let mut committed = None;
+        admitted(&mut || {
+            let commit = store.commit_setup(record, replace, now_ms)?;
+            // Inside the hold in which the setup committed, and nowhere else: from here a request
+            // the backup clients make is held to this account.
+            if commit != SetupCommit::Unchanged {
+                self.binding
+                    .switch(AccountMark::from_bytes(record.account_mark));
+                *self
+                    .kit
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(record.kit_fingerprint.clone());
+            }
+            committed = Some(commit);
+            Ok(())
+        })?;
+        let commit = committed.ok_or_else(|| ControllerError::RegistryUnavailable {
+            detail: "the admission returned without writing the setup".to_owned(),
+        })?;
         if matches!(commit, SetupCommit::Replaced { .. }) {
             // What the earlier archive had running is told to stop with the commit.
             self.leases().cancel_all();
