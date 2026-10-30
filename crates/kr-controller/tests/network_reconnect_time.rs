@@ -12,10 +12,24 @@
 //! screen the host projects and the client has painted it. The connection and its handshake, the
 //! attach that comes before the subscription, the host's answer to each, and the projection it
 //! builds and publishes are all inside the figure.
+//!
+//! The two seconds are the row's figure for the reference host, so they are asserted only where the
+//! host meets the reference host's conditions that a run can read: an optimised build, at least
+//! four processors and 8 GiB of memory, and at most one part in a hundred of the time taken by a
+//! hypervisor, where the platform accounts for it. Everywhere else, which includes every debug
+//! build, the figure is recorded with the shortfall named and its time cannot fail the case. Every
+//! run records the figure beside the host it was taken on, before anything is asserted.
 
 #![cfg(unix)]
 
 mod net_support;
+
+#[allow(
+    dead_code,
+    reason = "this case reads the host and records a figure, and the module serves other suites"
+)]
+#[path = "../../kr-transport/tests/support/conditions.rs"]
+mod conditions;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -167,12 +181,15 @@ async fn restored(
 }
 
 /// KR-PERF-006: a paired device that comes back to a real daemon has a painted 120x40 screen of
-/// the session within two seconds of dialling again.
+/// the session within two seconds of dialling again, on a host that meets the reference host's
+/// conditions.
 ///
 /// The device is attached and subscribed once and goes, and the host has recorded that its
 /// connection ended. It then dials again, resuming the cursors the ended session carried, and the
-/// clock starts as it dials. The two seconds are the row's figure, so they are asserted, and the
-/// reading is printed with the conditions it was taken under.
+/// clock starts as it dials. The two seconds are the row's figure for the reference host: they
+/// are asserted where the host meets its conditions, and the reading is recorded with the host it
+/// was taken on in every run. A shared or unoptimised host that is slow is a host that is not the
+/// reference host, so its figure alone fails nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_paired_device_that_comes_back_has_a_painted_screen_inside_the_reconnect_budget() {
     let kept = tempfile::tempdir().expect("a directory for what the application keeps");
@@ -247,6 +264,7 @@ async fn a_paired_device_that_comes_back_has_a_painted_screen_inside_the_reconne
     .await;
 
     // The return: the clock starts as the device dials, and nothing has been asked of the host.
+    let mut stolen = conditions::StolenTime::start();
     let started = Instant::now();
     let transport = dial.dial().await;
     let session = Session::resume(Arc::new(transport), carried.cursors).expect("a resumed session");
@@ -260,24 +278,61 @@ async fn a_paired_device_that_comes_back_has_a_painted_screen_inside_the_reconne
         painted.contains(LAST_LINE),
         "every row of the session's screen is in what a terminal would be sent"
     );
-    eprintln!(
-        "KR-PERF-006 reconnect to a real daemon: {elapsed:?} from the dial to a \
-         painted {COLUMNS}x{ROWS} screen (the first connection took {first:?}); {}/{}, {} logical \
-         processors, {}",
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        std::thread::available_parallelism().map_or(0, std::num::NonZero::get),
-        if cfg!(debug_assertions) {
-            "a debug build"
-        } else {
-            "a release build"
-        },
-    );
-    assert!(
-        elapsed < kr_client::retry::RECONNECT_BUDGET,
-        "a reconnect to a real daemon took {elapsed:?}, over the {:?} budget",
-        kr_client::retry::RECONNECT_BUDGET
-    );
+    let stolen_share = stolen.take();
+    let machine = conditions::Host::read();
+    let shortfalls = machine.shortfalls(stolen_share);
+    let budget = kr_client::retry::RECONNECT_BUDGET;
+    let mut lines = machine.lines();
+    lines.push(format!(
+        "  taken by the host {}, against a {:.2}% cutoff",
+        stolen_share.map_or_else(
+            || "not accounted for here, so unverified".to_owned(),
+            |share| format!("{:.2}%", share * 100.0)
+        ),
+        conditions::MAX_STOLEN_SHARE * 100.0
+    ));
+    lines.push(format!(
+        "  reconnect         {elapsed:?} from the dial to a painted {COLUMNS}x{ROWS} screen, against \
+         a {budget:?} budget (the first connection took {first:?})"
+    ));
+    if shortfalls.is_empty() {
+        lines.push(format!(
+            "  verdict           no measured shortfall, and the budget is {} on this host",
+            if elapsed < budget { "met" } else { "not met" }
+        ));
+        lines.push(
+            "  conditions        no measured shortfall, so the budget is asserted here; what the \
+             lines above call unverified stays unverified"
+                .to_owned(),
+        );
+    } else {
+        lines.push(format!(
+            "  verdict           {} the budget, with a condition missing, so it is recorded and \
+             not asserted here",
+            if elapsed < budget {
+                "inside"
+            } else {
+                "outside"
+            }
+        ));
+        for shortfall in &shortfalls {
+            lines.push(format!("  condition missing {shortfall}"));
+        }
+        lines.push(
+            "  conditions        not met, so the figure above is recorded and the budget is not \
+             asserted here; the budget's evidence is a reference-host run of this case in a \
+             release build"
+                .to_owned(),
+        );
+    }
+    // Before the assertion, so a run the budget failed on keeps the figure and the verdict.
+    conditions::report("KR-PERF-006 reconnect to a real daemon", &lines);
+    if shortfalls.is_empty() {
+        assert!(
+            elapsed < budget,
+            "a reconnect to a real daemon took {elapsed:?}, over the {budget:?} budget"
+        );
+    }
 
     session.close();
     worker
