@@ -16,10 +16,11 @@
 //! the starter does, is admitted to them exactly as it would be to the starter's desktop. A
 //! station that exists already keeps what it has, because creating it again ignores the security
 //! asked for, so the starter reads the access list and label of each object it is about to use
-//! and refuses to start a child on one that admits more than its own does. An object that admits
-//! less is used: a station made before an entry was added to the interactive one, as "Run as
-//! different user" does, has not that entry, and the worker, which runs as the starter does, is
-//! admitted to it all the same. [`super::security`] says what admitting more is.
+//! and refuses to start a child on one that admits more than its own does. An object whose list is
+//! the starter's own with allowing entries left out and denying entries put in is used: a station
+//! made before an entry was added to the interactive one (a "Run as different user" may add one)
+//! has not that entry, and the worker, which runs as the starter does, is admitted to it all the
+//! same. [`super::security`] says exactly what is used and what is refused.
 //!
 //! A desktop on a window station that shows nothing has the heap the system gives such a desktop,
 //! which is much smaller than the interactive one's, and all the processes of one headless session
@@ -391,7 +392,8 @@ impl Source {
     /// Requires `target` to admit no more than this object does, by its access list and by its
     /// integrity label.
     ///
-    /// An object that admits less is used. One that admits more, or whose security cannot be shown
+    /// An object whose security is the starter's own with entries left out that only narrow it, or
+    /// put in that only narrow it, is used. One that admits more, or whose security cannot be shown
     /// to admit no more, is refused, and a child is not started on it.
     ///
     /// # Errors

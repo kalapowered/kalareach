@@ -24,9 +24,9 @@ recent connection apart from the logon time, so a reconnect to a disconnected se
 meant to move the logon time; no run of this host has reconnected a session to show it, and a
 reconnect that did move it would read as another login. This host does not establish that the
 system gives a fresh logon time to every authenticated sign-in to a session, so where it did not,
-the next sign-in would read as the same desktop. Telling those apart needs a per-user agent inside the session
-itself, which this host does not install, so the Windows answer is weaker than the other two and
-the tables below say where that shows. A Windows session bound under an earlier release recorded
+the next sign-in would read as the same desktop. Telling those apart needs a per-user agent inside
+the session itself, which this host does not install, so the Windows answer is weaker than the
+other two and the tables below say where that shows. A Windows session bound under an earlier release recorded
 the logon process's start value as its generation, which the logon time does not equal: it reads
 as another login.
 

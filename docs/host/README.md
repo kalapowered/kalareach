@@ -1258,14 +1258,16 @@ back the security of each station and desktop and refuses to start a worker on o
 than its own: an allowing entry the starter's own has not, a denying entry it lacks, entries in
 another order, a null or absent list where there are entries, or a lower integrity level or a
 weaker policy. It starts the worker on one whose list is the starter's own with allowing entries
-left out and denying entries put in, in the starter's order, and on one with a higher label or a
-stronger policy; a list that differs in any other way is refused, whether or not it admits more.
-That matters when the interactive station gains an entry while a logon lasts, as a person's "Run as
-different user" may make it: the station the headless workers already hold has not that entry,
-and the next headless worker is started on it all the same. The other way round, a station made
-while the interactive one had an entry that it has since lost admits more than the interactive one
-does, and every headless start of that logon is refused until all its headless workers have ended. A worker an earlier release started stays where it was started until it
-ends.
+left out (other than one for the owner's rights) and denying entries put in, in the starter's
+order, and whose label is no lower and refuses no less. The flags that say which children inherit
+an entry, and entries that only children inherit, are not compared. A list that differs in any
+other way is refused, whether or not it admits more. That matters when the interactive station
+gains an entry while a logon lasts, as a person's "Run as different user" may make it: the station
+the headless workers already hold has not that entry, and the next headless worker is started on it
+all the same. The other way round, a station made while the interactive one had an allowing entry
+that it has since lost admits more than the interactive one does, and every headless start of
+that logon is refused until all its headless workers have ended. A worker an earlier release
+started stays where it was started until it ends.
 
 Two limits belong to that placement. All the processes of one headless session share the desktop
 heap the system gives a desktop on a window station that shows nothing (the third value of

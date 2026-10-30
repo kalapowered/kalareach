@@ -7,8 +7,10 @@
 //! More is refused. Less is not: a station made from an earlier reading of the interactive one has
 //! not the entries that were added to that one later (a "Run as different user", for one), and the
 //! worker, which runs as the starter does, is admitted to it all the same. What counts as less is
-//! narrow: the starter's own entries with allowing entries left out and denying entries put in,
-//! still in the starter's order. Any other list is refused, whether or not it admits more.
+//! narrow: the starter's own entries with allowing entries left out, other than one for the
+//! owner's rights, and denying entries put in, still in the starter's order. The flags that say
+//! which children inherit an entry, and entries that only children inherit, are not compared. Any
+//! other list is refused, whether or not it admits more.
 //!
 //! The text is what the system writes for a descriptor, `D:` and its entries for an access list or
 //! `S:` and its label entry for the integrity label. Nothing here calls the system, so it is read
@@ -32,7 +34,8 @@ enum Decision {
     Allow,
     /// It denies.
     Deny,
-    /// A kind this module does not evaluate, which only an equal entry may stand for.
+    /// A kind this module does not evaluate, and an allowing entry for the owner's rights, which
+    /// narrows what the owner has of its own accord: only an equal entry may stand for it.
     Other,
 }
 
@@ -92,14 +95,23 @@ pub(super) fn access_list(text: &str) -> Result<AccessList, String> {
             return Err(format!("the entry ({inner}) has too few fields"));
         }
         let kind = fields[0];
+        // An entry for the owner's rights narrows what the owner has of its own accord, so taking
+        // one away widens that: it can only be matched, never left out. Whether the system counts
+        // one that only children inherit is not something this reads, so such an entry is kept too,
+        // with its flags.
+        if matches!(fields[5], "OW" | "S-1-3-4") && !matches!(kind, "D" | "OD" | "XD") {
+            list.push(Entry {
+                decision: Decision::Other,
+                meaning: fields.join(";"),
+            });
+            continue;
+        }
         // An entry that only children inherit decides nothing about this object.
         if inherit_only(fields[1]) {
             continue;
         }
         let decision = match kind {
-            // An entry for the owner's rights narrows what the owner has of its own accord, so
-            // taking it away widens that: it can only be matched, never left out.
-            "A" | "OA" | "XA" | "ZA" if !matches!(fields[5], "OW" | "S-1-3-4") => Decision::Allow,
+            "A" | "OA" | "XA" | "ZA" => Decision::Allow,
             "D" | "OD" | "XD" => Decision::Deny,
             _ => Decision::Other,
         };
@@ -147,10 +159,10 @@ pub(super) fn label(text: &str) -> Result<Label, String> {
 
 /// Says why `found` admits more than `own`, or nothing when it admits no more.
 ///
-/// Fewer allowing entries admit less, and further denying entries admit less. A missing denying
-/// entry, a further allowing one, a null list where there were entries, and entries in another
-/// order, which the system may evaluate differently, each admit more or cannot be shown to admit no
-/// more, and are refused.
+/// Fewer allowing entries admit less, except an entry for the owner's rights, and further denying
+/// entries admit less. A missing denying entry, a further allowing one, a null list where there
+/// were entries, and entries in another order, which the system may evaluate differently, each
+/// admit more or cannot be shown to admit no more, and are refused.
 pub(super) fn access_list_admits_more(own: &AccessList, found: &AccessList) -> Option<String> {
     match (own, found) {
         (AccessList::Entries(own), AccessList::Entries(found)) => entries_admit_more(own, found),
@@ -206,21 +218,22 @@ fn entries_admit_more(own: &[Entry], found: &[Entry]) -> Option<String> {
     if lined[own.len()][found.len()] {
         return None;
     }
+    let times = |list: &[Entry], entry: &Entry| list.iter().filter(|other| *other == entry).count();
     if let Some(entry) = found
         .iter()
-        .find(|entry| entry.decision != Decision::Deny && !own.contains(entry))
+        .find(|entry| entry.decision != Decision::Deny && times(found, entry) > times(own, entry))
     {
         return Some(format!(
-            "it has an entry ({}) that the starter's own has not",
+            "it has the entry ({}) more often than the starter's own does",
             entry.meaning
         ));
     }
     if let Some(entry) = own
         .iter()
-        .find(|entry| entry.decision != Decision::Allow && !found.contains(entry))
+        .find(|entry| entry.decision != Decision::Allow && times(own, entry) > times(found, entry))
     {
         return Some(format!(
-            "it lacks the entry ({}) that the starter's own has",
+            "it lacks an entry ({}) that the starter's own has",
             entry.meaning
         ));
     }
@@ -405,6 +418,32 @@ mod tests {
                 "D:(A;;0x20000;;;OW)(A;;0x1;;;WD)"
             ),
             None
+        );
+        // One that only children inherit is kept too: whether the system counts it is not read.
+        assert!(more("D:(A;OICIIO;0x20000;;;OW)(A;;0x1;;;WD)", "D:(A;;0x1;;;WD)").is_some());
+        assert!(
+            more(
+                "D:(A;;0x1;;;WD)",
+                "D:(A;OICIIO;0x20000;;;S-1-3-4)(A;;0x1;;;WD)"
+            )
+            .is_some()
+        );
+        // A denying entry for the owner's rights only takes access away.
+        assert_eq!(
+            more("D:(A;;0x1;;;WD)", "D:(D;;0x20000;;;OW)(A;;0x1;;;WD)"),
+            None
+        );
+
+        // The reason names what differs: a count, an entry, or the order.
+        let said = |own: &str, found: &str| more(own, found).expect("refused");
+        assert!(said("D:(D;;0x1;;;WD)(D;;0x1;;;WD)", "D:(D;;0x1;;;WD)").contains("lacks"));
+        assert!(said("D:(A;;0x1;;;WD)", "D:(A;;0x1;;;WD)(A;;0x1;;;WD)").contains("more often"));
+        assert!(
+            said(
+                "D:(A;;0x1;;;SY)(A;;0x1;;;BA)",
+                "D:(A;;0x1;;;BA)(A;;0x1;;;SY)"
+            )
+            .contains("order")
         );
     }
 
