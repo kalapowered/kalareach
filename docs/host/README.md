@@ -2102,20 +2102,22 @@ Under `Fidelity::LegacyVt`, which is every session of a Unix worker and a Window
 pseudo-console did not ask for records, and while the application in the session has negotiated
 `modifyOtherKeys` or the Kitty keyboard protocol, the worker refuses a write of console keys with
 `INPUT_INCOMPATIBLE`, a key coming up and a modifier on its own included, and takes no sequence
-number for the write. The client then asks its console to spell its keys itself and sends the bytes
-the console spells, from the number the refused write was sent under, so the attachment keeps its
-lease and invents no spelling. Its modifier detail is the console's own and it sends no key
-releases. The refused batch is not sent again, and neither are the writes the client had already
-sent as records behind it, whose answers it ignores, or the records it had already read, which it
-drops. After the terminal is the person's again the client says once that its keys went as the
-console spells them, and says that keys typed just before the refusal were lost when a typed key was
-among them: a modifier on its own, a key coming up and a lock key are not typed keys. A console that
-will not spell its keys is given up on: the client hands the lease back with `input.release` and
-goes on watching. The worker does not check a write of bytes against the keyboard state. Under
-`Fidelity::Records` the worker refuses nothing for the keyboard state. The client asks the console
-for no mouse or window-size records. Nothing reports the fidelity at run time: the engine tracks
-which one the backend asked for and the worker spells records accordingly, but no receipt,
-diagnostic or client message carries the answer, so this page is where the limit is stated.
+number for the write. The client then asks its console to spell its keys itself and sends the text
+the console spells as UTF-8 (it reads it with `ReadConsoleW`, so the console's code page has no part
+in it), from the number the refused write was sent under, so the attachment keeps its lease and
+invents no spelling. Its modifier detail is the console's own and it sends no key releases. The
+refused batch is not sent again, and neither are the writes the client had already sent as records
+behind it, whose answers it ignores, or the records it had already read, which it drops. After the
+terminal is the person's again the client says once that its keys went as the console spells them,
+and says that keys typed just before the refusal were lost when a typed key was among them: a
+modifier on its own, a key coming up and a lock key are not typed keys. A console that will not
+spell its keys is given up on: the client hands the lease back with `input.release` and goes on
+watching, and says that the keys typed since were not sent. The worker does not check a write of
+bytes against the keyboard state. Under `Fidelity::Records` the worker refuses nothing for the
+keyboard state. The client asks the console for no mouse or window-size records. Nothing reports the
+fidelity at run time: the engine tracks which one the backend asked for and the worker spells
+records accordingly, but no receipt, diagnostic or client message carries the answer, so this page
+is where the limit is stated.
 
 **The standalone start, and signing out.** The standalone start on Windows is one scheduled task
 per environment, `KalaReach-` and the first eight digits of the environment's identifier, in the

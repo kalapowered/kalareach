@@ -1475,10 +1475,10 @@ const WATCHING_AFTER_A_REFUSAL: &str = "kr: the application in the session uses 
 const TYPED_KEYS_LOST: &str = "Keys typed just before the session refused them were lost: the batch \
      it refused, the writes sent behind that batch and the records this command had already read.";
 
-/// The same, when the console would not spell its keys: no record is read for the session after the
-/// refusal, so the records already read are part of what the attachment stopped sending.
-const TYPED_KEYS_LOST_WATCHING: &str = "Keys typed just before the session refused them were lost: \
-     the batch it refused and the writes sent behind that batch.";
+/// The same, when the console would not spell its keys: nothing is sent after the refusal, so the
+/// keys read since are part of what the attachment did not send.
+const TYPED_KEYS_LOST_WATCHING: &str = "Keys typed from the moment the session refused them were \
+     lost: the batch it refused, the writes sent behind that batch and the keys read since.";
 
 /// What `kr attach --no-probe` does, said to an attachment that can no longer type.
 const WATCHING_WITHOUT_TYPING: &str = "`kr attach --no-probe` watches without typing.";
@@ -1647,7 +1647,7 @@ async fn drive(
         owed,
         typed_during_the_probe,
         attached,
-        input,
+        &mut *input,
         output,
         terminal,
         resized,
@@ -1657,6 +1657,15 @@ async fn drive(
         &mut fallback,
     )
     .await;
+    // The records the reader had read and the loop had not taken when it ended are dropped with the
+    // rest, and a typed one is part of what was lost.
+    if fallback.how.is_some() {
+        while let Ok(read) = input.try_recv() {
+            if let TerminalInput::Keys(keys) = read {
+                fallback.typed_keys_lost |= presses(&keys);
+            }
+        }
+    }
     said_after.extend(fallback.line());
     outcome
 }
@@ -2370,7 +2379,11 @@ async fn drive_loop(
                             window.return_to_live();
                         }
                         let Some(epoch) = epoch else {
-                            // This terminal may not type, and watches.
+                            // This terminal may not type, and watches. After a refusal of its
+                            // console keys that is the loss the line afterwards names.
+                            if fallback.how.is_some() {
+                                fallback.typed_keys_lost |= presses(&keys);
+                            }
                             continue;
                         };
                         let request_id = kr_protocol::ids::RequestId::new(next_request);
@@ -3399,13 +3412,28 @@ mod tests {
         }])
     }
 
-    /// The line after a refusal of console keys says keys were lost only when a typed key was: the
-    /// batch the session refused, a write sent behind it, or a record already read. A modifier on its
-    /// own is none of these, and the session refusing it lost nothing.
+    /// The line after a refusal of console keys says keys were lost only when a typed key was, and
+    /// names where it was lost: the batch the session refused, a write sent behind it, or a record
+    /// already read. A modifier on its own is none of these, and the session refusing it lost
+    /// nothing.
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn the_line_after_a_refusal_says_keys_were_lost_only_when_a_typed_key_was() {
-        for console_will_spell in [true, false] {
+        // What the line names, for a console that spells its keys and for one that will not.
+        for (console_will_spell, batch, behind, read) in [
+            (
+                true,
+                "the batch it refused",
+                "writes sent behind that batch",
+                "records this command had already read",
+            ),
+            (
+                false,
+                "the batch it refused",
+                "writes sent behind that batch",
+                "the keys read since",
+            ),
+        ] {
             // Only a modifier was refused, and nothing else was typed.
             let ran = after_a_refusal(console_will_spell, |mut case| async move {
                 let shift = case.types(shift_down()).await;
@@ -3429,7 +3457,7 @@ mod tests {
             })
             .await;
             assert!(
-                ran.said[0].as_str().contains("were lost"),
+                ran.said[0].as_str().contains("were lost") && ran.said[0].as_str().contains(batch),
                 "the refused batch was typed ({console_will_spell}): {:?}",
                 ran.said[0]
             );
@@ -3438,44 +3466,60 @@ mod tests {
             // records behind a refused one are not read.
             let ran = after_a_refusal(console_will_spell, |mut case| async move {
                 let shift = case.types(shift_down()).await;
-                let behind = case.types(key_down(b'B')).await;
+                let behind_it = case.types(key_down(b'B')).await;
                 case.refuses(&shift, ErrorCode::InputIncompatible);
-                case.refuses(&behind, ErrorCode::InvalidArgument);
+                case.refuses(&behind_it, ErrorCode::InvalidArgument);
                 case.waits_for_the_console_to_be_asked().await;
                 case.hangs_up();
             })
             .await;
             assert!(
-                ran.said[0].as_str().contains("were lost"),
+                ran.said[0].as_str().contains("were lost") && ran.said[0].as_str().contains(behind),
                 "the write behind the refused one was typed ({console_will_spell}): {:?}",
                 ran.said[0]
             );
-        }
 
-        // A letter the reader had already read, and the loop had not yet taken, when the session
-        // refused a modifier. It is dropped and counted, and no write is made of it.
-        let ran = after_a_refusal(true, |mut case| async move {
-            let shift = case.types(shift_down()).await;
-            case.types_without_waiting(key_down(b'D'));
-            case.refuses(&shift, ErrorCode::InputIncompatible);
-            case.waits_for_the_console_to_be_asked().await;
-            let typed = case
-                .types(crate::attach::TerminalInput::Bytes(b"e".to_vec()))
-                .await;
-            case.takes(&typed);
-            case.hangs_up();
-        })
-        .await;
-        assert!(
-            ran.said[0].as_str().contains("were lost"),
-            "the record already read was typed: {:?}",
-            ran.said[0]
-        );
-        assert_eq!(
-            wire::writes_in(&ran.sent).len(),
-            2,
-            "the modifier, then the byte: the record already read is not sent"
-        );
+            // A letter the reader had already read, and the loop had not yet taken, when the session
+            // refused a modifier. It is dropped and counted, and no write is made of it.
+            let ran = after_a_refusal(console_will_spell, |mut case| async move {
+                let shift = case.types(shift_down()).await;
+                case.types_without_waiting(key_down(b'D'));
+                case.refuses(&shift, ErrorCode::InputIncompatible);
+                case.waits_for_the_console_to_be_asked().await;
+                case.hangs_up();
+            })
+            .await;
+            assert!(
+                ran.said[0].as_str().contains("were lost") && ran.said[0].as_str().contains(read),
+                "the record already read was typed ({console_will_spell}): {:?}",
+                ran.said[0]
+            );
+            assert_eq!(
+                wire::writes_in(&ran.sent).len(),
+                1,
+                "only the modifier was written: the record already read is not sent"
+            );
+
+            // The same letter, with the session's closure ready beside the refusal: the attachment
+            // ends before the loop takes the letter, and the line still counts it.
+            let ran = wire::run_switched(true, console_will_spell, |mut case| async move {
+                let shift = case.types(shift_down()).await;
+                case.types_without_waiting(key_down(b'D'));
+                case.refuses(&shift, ErrorCode::InputIncompatible);
+                case.closes();
+            })
+            .await;
+            assert!(
+                matches!(ran.outcome, AttachOutcome::Closed { .. }),
+                "{:?}",
+                ran.outcome
+            );
+            assert!(
+                ran.said.len() == 1 && ran.said[0].as_str().contains("were lost"),
+                "the letter left in the channel was typed ({console_will_spell}): {:?}",
+                ran.said
+            );
+        }
     }
 
     /// A key going down at the console, as the case types it.

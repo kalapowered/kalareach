@@ -339,22 +339,25 @@ negotiated `modifyOtherKeys` or the Kitty keyboard protocol, so it refuses the w
 `Fidelity::Records` the worker carries the records unchanged in any keyboard state, and the keyboard
 state refuses none of them.
 
-When the session refuses the records, the command stops reading records, asks the console to spell
-its keys itself (its own virtual-terminal input), and reads the bytes the console spells from then
-on. It sends them exactly as the console gives them, a NUL included, and the session takes them in
-that encoding. The attachment keeps its input lease and invents no spelling. After the terminal is
+When the session refuses the records, the command asks the console to spell its keys itself (its own
+virtual-terminal input) between two of its reads of the console, and reads the text the console
+spells from then on with `ReadConsoleW`, so that the console's code page has no part in it. It sends
+that text as UTF-8, a NUL included and a held key as many times as the console spells it, and the
+session takes it in that encoding. The command reads nothing from the console while it changes the
+mode, and reads the console's text only when the console holds some, so ending the attachment
+cancels no read. The attachment keeps its input lease and invents no spelling. After the terminal is
 the person's again, the command says once that its keys went as the console spells them, with the
 console's own modifier detail and without key releases. Keys typed just before the session refused
 them are lost, and the command says so only when a typed key was lost: a modifier on its own, a key
 coming up and a lock key are not typed keys. What is lost is the batch the session refused, the
 writes already sent as records behind it, whose answers the command ignores, and the records it had
 already read, which it drops and does not turn into bytes. A console that will not spell its keys
-gives the lease back, goes on watching, and says that and what was lost. The scroll-back keys above
-are taken from the records of Shift and Page Up or Page Down, key by key: the key going down and the
-same key coming up are the window's. The release of a key this attachment did not see go down, the
-Return that started the command among them, is not sent, and every other record is the session's.
-The command does not ask the console for mouse or window-size records, so the console keeps the
-mouse for selecting text.
+gives the lease back and goes on watching, and the command says that and says that every key typed
+since was not sent. The scroll-back keys above are taken from the records of Shift and Page Up or
+Page Down, key by key: the key going down and the same key coming up are the window's. The release
+of a key this attachment did not see go down, the Return that started the command among them, is not
+sent, and every other record is the session's. The command does not ask the console for mouse or
+window-size records, so the console keeps the mouse for selecting text.
 
 Bracketed paste is the one piece of context the command keeps, and it keeps it by watching the
 bytes as they go past rather than by holding any of them: a start delimiter opens a paste and an
