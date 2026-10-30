@@ -479,15 +479,15 @@ impl ChangeSetService {
     /// daemon serves anything, and has the project service write what the open decides about its
     /// records.
     ///
-    /// A workspace made through a location is reached through that location again, admitted as
-    /// the owner's decision about it, so a location that has been withdrawn or has gone dormant
-    /// leaves the workspace unopened and its leftovers reported rather than looked at. A
-    /// workspace made through none is reached by its recorded path, as the owner always has.
+    /// The owner's own work is reached by its recorded path, as the owner always has. A
+    /// workspace made through a location the owner authorised for a device's grant is not opened:
+    /// a recovery runs when no request is running and no location is held, so it has no
+    /// authority to start Git in that tree, and its leftovers are reported rather than looked at.
     ///
     /// # Errors
     ///
     /// Returns what [`Self::open_repository_recording`] returns, and the project service's
-    /// refusal when the workspace's location no longer admits the use.
+    /// refusal for a workspace made through a device's location.
     pub fn open_repository_where_made(
         &self,
         resolved: &ResolvedWorkspace,

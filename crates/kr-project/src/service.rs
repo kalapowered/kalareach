@@ -1801,24 +1801,37 @@ impl ProjectService {
     /// like [`Self::open_workspace_repository_recording`], for work this host does for itself on
     /// what a caller left behind.
     ///
-    /// A workspace made through a location is reached through that location, admitted as the
-    /// owner's decision about it, which refuses a location that was withdrawn or is dormant. A
-    /// workspace made through none is reached by its recorded path.
+    /// The owner's own work is reached by its recorded path, as the owner always reaches it. A
+    /// workspace made through a location the owner authorised for a device's grant is not opened
+    /// at all: that work is reachable only through the location, only for a request of that
+    /// grant, and this host does the work for itself when no request is running and no location
+    /// is held, so nothing here is entitled to start Git in that tree.
     ///
     /// # Errors
     ///
-    /// Returns [`ProjectError::PermissionDenied`] when the location no longer admits the use, and
-    /// what [`Self::open_workspace_repository_recording`] returns otherwise.
+    /// Returns [`ProjectError::PermissionDenied`] for a workspace made through a device's
+    /// location, and what [`Self::open_workspace_repository_recording`] returns otherwise.
     pub fn open_workspace_repository_recording_where_made(
         &self,
         workspace_id: WorkspaceId,
     ) -> Result<OpenedRepository> {
         let row = self.recorded_workspace(workspace_id)?;
-        let reach = match row.located.as_ref() {
-            Some(located) => self.tree_reach(Some(located), Admitting::OwnerDecision)?,
-            None => TreeReach::by_path(),
-        };
-        self.open_recorded_workspace_recording(&row, &reach)
+        if let Some(located) = row.located.as_ref() {
+            let owners =
+                crate::policy::read_location(self.locked()?.connection(), located.location_id)?
+                    .is_some_and(|location| location.grant_id.0.is_none());
+            if !owners {
+                return Err(ProjectError::PermissionDenied {
+                    detail: format!(
+                        "workspace {workspace_id} was made through a location the owner \
+                         authorised for a device's grant, and this host does not open it for \
+                         itself"
+                    )
+                    .into(),
+                });
+            }
+        }
+        self.open_recorded_workspace_recording(&row, &TreeReach::by_path())
     }
 
     /// Returns how a workspace's tree is reached for a caller bounded by `grant`, which is the
