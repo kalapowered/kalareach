@@ -4054,8 +4054,9 @@ mod tests {
                 // needs it.
                 "voice_call_state",
                 "voice_set_muted",
-                // The account's twelve. Each reaches the account service or this device's secure
-                // store, and none reaches a host.
+                // The account's. Each reaches the account service or this device's secure store,
+                // or only says which services the application holds a client of, and none reaches
+                // a host.
                 "account_sign_in",
                 "account_sign_in_cancel",
                 "account_sign_in_for_recovery",
