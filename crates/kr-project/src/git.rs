@@ -3712,7 +3712,7 @@ fn ask(
     })?;
     let mut heard = Heard::of(child.stdout.take());
     let status = loop {
-        heard.take_in();
+        heard.take_in(deadline);
         match has_ended(&mut child) {
             Ended::No => {}
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3752,7 +3752,7 @@ fn ask(
     // the pipe, so the wait for the end is short.
     let drain = deadline.min(Instant::now() + PROBE_DRAIN);
     loop {
-        heard.take_in();
+        heard.take_in(drain);
         if heard.ended() {
             break;
         }
@@ -3827,7 +3827,7 @@ impl Heard {
             if let Some(pipe) = pipe.as_ref() {
                 // A pipe that cannot be read without blocking is not read: it is closed, and the
                 // answer is whatever the program has written when it ends, which is nothing.
-                let _ = rustix::fs::fcntl_setfl(pipe, rustix::fs::OFlags::NONBLOCK);
+                let _ = without_blocking(pipe);
             }
             Self {
                 pipe,
@@ -3843,40 +3843,23 @@ impl Heard {
 
     /// Takes in what has arrived, keeping at most [`PROBE_OUTPUT_LIMIT`] bytes and discarding the
     /// rest, so that a program that writes without end is read and not waited on.
-    fn take_in(&mut self) {
+    fn take_in(&mut self, deadline: Instant) {
         #[cfg(unix)]
         {
-            use std::io::Read as _;
-
             let Some(pipe) = self.pipe.as_mut() else {
                 return;
             };
-            let mut buffer = [0_u8; 4096];
-            loop {
-                match pipe.read(&mut buffer) {
-                    Ok(0) => {
-                        self.pipe = None;
-                        return;
-                    }
-                    Ok(read) => {
-                        let room = PROBE_OUTPUT_LIMIT.saturating_sub(self.seen.bytes.len());
-                        if read > room {
-                            self.seen.bytes.extend_from_slice(&buffer[..room]);
-                            self.seen.truncated = true;
-                        } else {
-                            self.seen.bytes.extend_from_slice(&buffer[..read]);
-                        }
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(error) => {
-                        self.pipe = None;
-                        self.unreadable = Some(error);
-                        return;
-                    }
+            match gather(pipe, &mut self.seen, deadline) {
+                Gathered::Open => {}
+                Gathered::Closed => self.pipe = None,
+                Gathered::Unreadable(error) => {
+                    self.pipe = None;
+                    self.unreadable = Some(error);
                 }
             }
         }
+        #[cfg(not(unix))]
+        let _ = deadline;
     }
 
     /// Whether the end of the output has been reached.
@@ -3908,6 +3891,54 @@ impl Heard {
     }
 }
 
+/// What a pass over a probe's pipe left of it.
+#[cfg(unix)]
+#[derive(Debug)]
+enum Gathered {
+    /// The pipe is still open.
+    Open,
+    /// The end of the output was reached.
+    Closed,
+    /// The pipe could not be read.
+    Unreadable(std::io::Error),
+}
+
+/// Takes in what `pipe` holds without blocking, keeping at most [`PROBE_OUTPUT_LIMIT`] bytes in
+/// `seen`.
+#[cfg(unix)]
+fn gather(pipe: &mut impl std::io::Read, seen: &mut Bounded, _deadline: Instant) -> Gathered {
+    let mut buffer = [0_u8; 4096];
+    loop {
+        match pipe.read(&mut buffer) {
+            Ok(0) => return Gathered::Closed,
+            Ok(read) => {
+                let room = PROBE_OUTPUT_LIMIT.saturating_sub(seen.bytes.len());
+                if read > room {
+                    seen.bytes.extend_from_slice(&buffer[..room]);
+                    seen.truncated = true;
+                } else {
+                    seen.bytes.extend_from_slice(&buffer[..read]);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return Gathered::Open;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Gathered::Unreadable(error),
+        }
+    }
+}
+
+/// Makes reads of a probe's pipe return at once when nothing has arrived.
+#[cfg(unix)]
+fn without_blocking(pipe: &std::process::ChildStdout) -> std::io::Result<()> {
+    #[cfg(test)]
+    if tests::SWITCH_FAILS.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other("the pipe cannot be switched"));
+    }
+    rustix::fs::fcntl_setfl(pipe, rustix::fs::OFlags::NONBLOCK).map_err(std::io::Error::from)
+}
+
 /// Where a child stands, as far as the platform can say without collecting it.
 enum Ended {
     No,
@@ -3924,6 +3955,10 @@ enum Ended {
 /// Where it can, the child is left uncollected, so that the caller can end the group it led while
 /// the number is still the child's own.
 fn has_ended(child: &mut std::process::Child) -> Ended {
+    #[cfg(all(test, unix))]
+    if tests::WAIT_FAILS.with(std::cell::Cell::get) {
+        return Ended::Failed(std::io::Error::from(rustix::io::Errno::CHILD));
+    }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     if let Ok(raw) = i32::try_from(child.id())
         && let Some(pid) = rustix::process::Pid::from_raw(raw)
@@ -4999,6 +5034,198 @@ mod tests {
             !entries.contains_key("half-writ"),
             "and not the one that did not"
         );
+    }
+
+    #[cfg(unix)]
+    thread_local! {
+        /// Set by a case to make the switch to nonblocking reads fail on its own thread.
+        pub(super) static SWITCH_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Set by a case to make the question whether a child has ended fail on its own thread, as
+        /// it does for a child that something else in the process has collected.
+        pub(super) static WAIT_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// A pipe whose writers are faster than its reader: whenever it is asked, it has something to
+    /// give. It runs dry after `lasts` reads, only so that a loop that does not stop ends the case.
+    #[cfg(unix)]
+    struct NeverEmpty {
+        reads: usize,
+        lasts: usize,
+        each: usize,
+    }
+
+    #[cfg(unix)]
+    impl std::io::Read for NeverEmpty {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            if self.reads > self.lasts {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            let given = buffer.len().min(self.each);
+            buffer[..given].fill(b'x');
+            Ok(given)
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_writer_faster_than_the_reader_is_read_only_up_to_the_limit() {
+        let mut pipe = NeverEmpty {
+            reads: 0,
+            lasts: 100_000,
+            each: 4096,
+        };
+        let mut seen = Bounded::default();
+
+        gather(
+            &mut pipe,
+            &mut seen,
+            Instant::now() + Duration::from_secs(60),
+        );
+
+        assert!(seen.truncated, "what passed the limit is reported");
+        assert_eq!(
+            seen.bytes.len(),
+            PROBE_OUTPUT_LIMIT,
+            "the limit is what is kept"
+        );
+        assert!(
+            pipe.reads <= PROBE_OUTPUT_LIMIT / 4096 + 1,
+            "the pass ended at the limit, after {} reads",
+            pipe.reads
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_writer_faster_than_the_reader_is_read_only_until_the_deadline() {
+        let mut pipe = NeverEmpty {
+            reads: 0,
+            lasts: 1_000_000,
+            each: 1,
+        };
+        let mut seen = Bounded::default();
+
+        gather(&mut pipe, &mut seen, Instant::now());
+
+        assert!(
+            pipe.reads <= 1,
+            "a pass that began at the deadline ended with it, after {} reads",
+            pipe.reads
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_that_cannot_be_read_without_blocking_refuses_the_probe() {
+        let directory = tempfile::tempdir().expect("a directory for this test");
+        let (text, program, own) = (
+            directory.path().join("git.text"),
+            directory.path().join("git"),
+            directory.path().join("own"),
+        );
+        std::fs::write(
+            &text,
+            format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 6\n", own.display()),
+        )
+        .expect("the stand-in's text");
+        kr_ipc::testing::place_program(&text, &program);
+
+        SWITCH_FAILS.with(|fails| fails.set(true));
+        let asked = ask(
+            &program,
+            &["--version"],
+            Instant::now() + Duration::from_secs(3),
+        );
+        SWITCH_FAILS.with(|fails| fails.set(false));
+
+        let Err(Asked::Overran(refusal)) = asked else {
+            panic!("a pipe that would block the reads is not read, and the probe is refused");
+        };
+        assert!(
+            refusal.to_string().contains("without blocking"),
+            "it says why: {refusal}"
+        );
+        if let Ok(pid) = std::fs::read_to_string(&own) {
+            let alive = std::process::Command::new("kill")
+                .args(["-0", pid.trim()])
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            assert!(!alive, "the stand-in was ended with the refusal");
+        }
+    }
+
+    /// Whether a process with this identifier is running, which one that has ended and not yet been
+    /// collected is not.
+    #[cfg(unix)]
+    fn running(pid: &str) -> bool {
+        let listed = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+            .expect("ps lists the process");
+        let state = String::from_utf8_lossy(&listed.stdout);
+        !state.trim().is_empty() && !state.trim().starts_with('Z')
+    }
+
+    /// A child that cannot be waited on may be gone already, collected by something else in the
+    /// process, and its number may belong to another process by now. So the look is refused and
+    /// nothing is signalled by that number: the stand-in, which a signal to its number or to its
+    /// group would end, is still running afterwards.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_that_cannot_be_waited_on_is_refused_and_nothing_is_signalled_by_number() {
+        let directory = tempfile::tempdir().expect("a directory for this test");
+        let (text, program, own) = (
+            directory.path().join("git.text"),
+            directory.path().join("git"),
+            directory.path().join("own"),
+        );
+        std::fs::write(
+            &text,
+            format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 120\n", own.display()),
+        )
+        .expect("the stand-in's text");
+        kr_ipc::testing::place_program(&text, &program);
+
+        WAIT_FAILS.with(|fails| fails.set(true));
+        let asked = ask(
+            &program,
+            &["--version"],
+            Instant::now() + Duration::from_secs(60),
+        );
+        WAIT_FAILS.with(|fails| fails.set(false));
+
+        let Err(Asked::Overran(refusal)) = asked else {
+            panic!("a child that cannot be waited on is refused");
+        };
+        assert!(
+            refusal.to_string().contains("could not be waited on"),
+            "it says why: {refusal}"
+        );
+        // The stand-in writes its number when it starts, which may be after the refusal.
+        let guard = Instant::now() + Duration::from_secs(30);
+        let pid = loop {
+            if let Ok(pid) = std::fs::read_to_string(&own)
+                && !pid.trim().is_empty()
+            {
+                break pid.trim().to_owned();
+            }
+            assert!(
+                Instant::now() < guard,
+                "the stand-in never ran: it was ended before it could start"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let left_alone = running(&pid);
+        if left_alone {
+            // Ended here, by the number it wrote.
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid])
+                .stderr(Stdio::null())
+                .status();
+        }
+        assert!(left_alone, "the stand-in was signalled by its number");
     }
 
     #[test]
