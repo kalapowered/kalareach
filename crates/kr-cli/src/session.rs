@@ -2776,10 +2776,19 @@ mod tests {
                     .expect("the loop reads the console");
             }
 
+            /// The next frame the loop sends. A loop that has ended and sent nothing more is a
+            /// failure of the case and not a wait without end.
+            async fn next_frame(&mut self) -> ControlFrame {
+                tokio::time::timeout(std::time::Duration::from_secs(10), self.written.recv())
+                    .await
+                    .expect("the loop sent nothing more in ten seconds")
+                    .expect("the loop is running")
+            }
+
             /// The next `input.write` the loop sends, whatever else it sends first.
             pub async fn next_write(&mut self) -> Written {
                 loop {
-                    let frame = self.written.recv().await.expect("the loop is running");
+                    let frame = self.next_frame().await;
                     let ControlFrame::Request(request) = frame else {
                         continue;
                     };
@@ -2799,7 +2808,7 @@ mod tests {
             /// The next mutation the loop sends with this method, whatever else it sends first.
             pub async fn next_mutation(&mut self, method: Method) -> ParamsValue {
                 loop {
-                    let frame = self.written.recv().await.expect("the loop is running");
+                    let frame = self.next_frame().await;
                     if let ControlFrame::Mutation(mutation) = frame
                         && mutation.method == method.into()
                     {
