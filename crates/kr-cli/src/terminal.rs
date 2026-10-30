@@ -544,9 +544,9 @@ pub fn input_context(terminal: &ControllingTerminal) -> kr_term::probe::InputCon
 /// arrived, which is the only thing that proves nothing else is coming.
 ///
 /// Returns whether the record was written. A host whose runtime directory cannot be written or is
-/// not owner-only, or a terminal with no name to record it under, cannot be recorded; refusing the attach over that
-/// would be refusing it for the wrong reason, so the exchange goes ahead and a failure says that a
-/// retry here is not protected. What the record buys is the *next* attempt, and a person who is
+/// not owner-only, or a terminal with no name to record it under, cannot be recorded; refusing the
+/// attach over that would be refusing it for the wrong reason, so the exchange goes ahead and a
+/// failure says that a retry here is not protected. What the record buys is the *next* attempt, and a person who is
 /// told it is missing can choose a fresh terminal themselves.
 pub fn mark_contaminated(terminal: &ControllingTerminal) -> bool {
     let Some((runtime_root, path)) = contamination_marker(terminal) else {
