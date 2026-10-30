@@ -840,13 +840,16 @@ fn check_owner_only(path: &Path, metadata: &std::fs::Metadata) -> Result<()> {
     Ok(())
 }
 
-/// What the access list of a directory of this user's says about other accounts, when it lets one
-/// in or cannot be read: none when it names nobody else.
+/// What the access list of a directory of this user's says about other accounts, when it has an
+/// allow entry for one or cannot be read: none when it has no allow entry but this user's.
 ///
-/// An entry that denies, and an entry for this user, give nobody else anything. On macOS the list
-/// is separate from the mode and `chmod 700` leaves it as it was. On Linux the mode's group bits
-/// are the mask of a list, so `chmod 700` makes its named entries void, and there is nothing to
-/// read.
+/// An entry that denies, and an entry for this user, give nobody else anything. The rule is
+/// conservative: every allow entry for an account that is not known to be this user's refuses the
+/// directory, whatever it grants and wherever it stands, so an entry of no permissions, an allow
+/// that a deny before it cancels, an entry for a group of one and an entry that only children
+/// inherit all refuse it. On macOS the list is separate from the mode and `chmod 700` leaves it as
+/// it was. On Linux the mode's group bits are the mask of a list, so `chmod 700` makes its named
+/// entries void, and there is nothing to read.
 #[cfg(target_os = "macos")]
 fn others_in_access_list(path: &Path) -> Option<String> {
     access_list_verdict(exacl::getfacl(path, None), || {
@@ -855,13 +858,21 @@ fn others_in_access_list(path: &Path) -> Option<String> {
 }
 
 /// The names an entry of an access list for this user goes by: the short name the system's record
-/// gives. The list names an account by that, or by its number where the system has no record, and
-/// a number is no name of this user's: an account can be called "501". With no record of this user
-/// no entry is taken for this user's, which refuses a list that names one. Two accounts with one
-/// short name in different databases of accounts cannot be told apart from what the list gives.
+/// gives, unless it is a number.
+///
+/// The list names an account by that short name, and a user number the system has no record of by
+/// the number itself, so a name that is a number is not known to be this user's: an account can be
+/// called "424242" while the user number 424242 has no record, and the two are named alike. An entry
+/// by such a name is taken for another account's, which refuses a list that names this user by
+/// number; the same holds when there is no record of this user. Two accounts with one short name in
+/// different databases of accounts cannot be told apart from what the list gives.
 #[cfg(target_os = "macos")]
 fn names_of_this_user(record: Option<PasswdEntry>) -> Vec<String> {
-    record.map(|account| account.name).into_iter().collect()
+    record
+        .map(|account| account.name)
+        .filter(|name| !name.bytes().all(|byte| byte.is_ascii_digit()))
+        .into_iter()
+        .collect()
 }
 
 /// As the platform's list is read for [`others_in_access_list`], with a failure to read it counted
@@ -879,10 +890,11 @@ fn access_list_verdict(
             let own = own();
             allowing
                 .any(|entry| {
-                    !(entry.kind == exacl::AclEntryKind::User
-                        && own.iter().any(|name| *name == entry.name))
+                    !(entry.kind == exacl::AclEntryKind::User && own.contains(&entry.name))
                 })
-                .then(|| "its access list lets another account in".to_owned())
+                .then(|| {
+                    "its access list has an allow entry for an account other than yours".to_owned()
+                })
         }
         // A file system that does not support access lists has none to let anybody in. The error
         // reaches here from the library with the path in its text and without its code, so it is
