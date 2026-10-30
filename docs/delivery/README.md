@@ -752,10 +752,13 @@ and destination it is a copy of so that a separately authorised deletion action 
 artifact a person chose. The `deletable` flag says whether this host holds a way to ask for a
 removal. It is false for a message in another service and for what is on a device or in a mailbox.
 It is true for a notification the push gateway took or may have taken and that this host will not
-present again, while its device is still paired and holds the registration the notification was sent
-under: the host can ask the gateway to delete the record it still holds for it. That reaches nothing
-a provider queued or a device holds, and the host records nothing of it, so the notification stays
-listed. `docs/host/README.md` describes the deletion call.
+present again, while the destination is the one the notification was admitted for: the host can ask
+the gateway to delete the record it still holds for it. The journal keeps only a digest of that
+destination, so a registration with the same values, a change of previews and a rejected token leave
+the flag as it was, while a new grant, stored-envelope key, installation or authorisation clears it,
+and a row recorded with no digest never has it. Deleting reaches nothing a provider queued or a
+device holds, and the host records nothing of it, so the notification stays listed.
+`docs/host/README.md` describes the deletion call.
 
 ## Session text
 
