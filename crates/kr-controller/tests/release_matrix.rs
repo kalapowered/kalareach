@@ -629,9 +629,9 @@ async fn a_skewed_host_is_refused_new_leases_keeps_its_working_route_and_gets_ne
 /// said before the skew, taken right after the read that closed the gate. A device paired under the
 /// closed gate meets the refusal: no lease request for it leaves the host, and the device paired
 /// before is served on the connection it had. The answers are the same again when a revision that
-/// lists the build reopens the gate. The comparison is shown to see a change: a device revoked
-/// makes the device list and the authority revision differ, a grant withdrawn makes the grants
-/// differ, and so does a worker that ends.
+/// lists the build reopens the gate. The comparison is shown to see a change: a grant withdrawn
+/// makes the grants differ, a device revoked makes the device list and the authority revision
+/// differ, and a worker that ends makes the worker's reported state differ.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_skew_leaves_the_hosts_authority_and_its_session_worker_as_they_were() {
     let rig = Rig::start(Some(&supporting("2"))).await;
