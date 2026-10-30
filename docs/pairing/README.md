@@ -141,7 +141,7 @@ selected discovery and relay configuration, a random 256-bit secret and the prop
 grants nothing until the candidate proves possession of that secret over an iroh connection
 authenticated against the pinned endpoint.
 
-A redemption starts with a fresh host challenge and the host's complete purpose-key bundle, so a
+A redemption (`pair.redeem`) starts with a fresh host challenge and the host's complete purpose-key bundle, so a
 proof cannot be prepared before the host agrees to serve one. The challenge is bound to the
 connection it was issued on: it is an offer to that candidate, and answering it from anywhere else
 is another device using a challenge it was not given. It is spent only once a redemption is one it
@@ -193,7 +193,7 @@ the guest afterwards. Persistent co-owner access needs explicit owner pairing.
 A personal owner grant is the other kind: valid until revoked, so independent operation does not
 depend on a cloud lease.
 
-Delegation narrows. `issue_grant` refuses a child that asks for more rights, more resources, more
+Delegation (`grant.create`) narrows. `issue_grant` refuses a child that asks for more rights, more resources, more
 history or a longer life than its parent, that names a parent it was not given, or that omits one it
 was. The candidate cannot enlarge the grant through its bundle either: the host commits the grant
 the invitation proposed.
@@ -234,6 +234,10 @@ a persistent grant, trusting a new repository root, granting executable or nativ
 capabilities, and changing host-management authority. Already-authorised restriction, revocation and
 emergency session stop need none, and `SensitiveAction` lists only the six, so a caller cannot ask
 for a confirmation of something that never needed one.
+
+`owner.confirmation.request` starts a ceremony for one of them, `owner.confirmation.pending` lists the
+challenges an owner can still answer, each with the exact action it approves, and
+`owner.confirmation.complete` answers one with the proof.
 
 The ceremony is platform code. What this crate checks is that the proof answers *that* challenge
 byte for byte, that the channel can carry a confirmation at all, that the challenge has not expired,

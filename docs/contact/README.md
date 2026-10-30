@@ -33,8 +33,8 @@ and every limit.
 
 ## What binds a helper to a session
 
-A tool call reaches the worker that owns the session over its private socket. Before anything is
-created, the worker establishes which session the caller is in, and it asks the operating system
+A tool call reaches the worker that owns the session over its private socket; `ask_user` sends
+`question.create` there. Before anything is created, the worker establishes which session the caller is in, and it asks the operating system
 rather than the caller:
 
 1. **Peer credentials.** The runtime directory is owner-only and the listener refuses any other
@@ -90,7 +90,7 @@ an identity and a caller chooses its own.
 
 Cancellation and expiry are different states, and dismissing a form is neither.
 
-An answer is a tagged union of free text, a selected choice identifier, a boolean decision, or the
+An answer (`question.answer`) is a tagged union of free text, a selected choice identifier, a boolean decision, or the
 free-text `other` option. Every `select` and every `confirm` carries `something_else` with free
 text; the host adds it and an agent cannot remove it. An `other` answer stays `other` everywhere it
 is read: nothing folds it into a listed choice or into yes.
@@ -162,9 +162,9 @@ A question ends as `cancelled` in three ways, and each is a single transition fr
 
 | Who | How |
 | --- | --- |
-| The agent | `cancel_question` with the question's caller token |
+| The agent | `cancel_question` (`question.cancel_own`) with the question's caller token |
 | The agent's client | Cancelling the `ask_user` or `wait_for_answer` call that is asking or waiting on the question |
-| A person | `kr question cancel`, or the companion app, with `question.respond` for the session |
+| A person | `kr question cancel` (`question.cancel`), or the companion app, with `question.respond` for the session |
 
 The second is upstream cancellation. When the client cancels a tool call, because the person
 interrupted the agent or because it gave up on the call, nothing will take the answer that call was
@@ -181,8 +181,8 @@ deadline the installation declared.
 ## The caller token
 
 `ask_user` returns an unpredictable token with the question, over the private channel the question
-was created on. It permits exactly two things: polling and cancelling that one question, from the
-same verified application.
+was created on. It permits exactly two things: polling that one question (`question.read_own`) and cancelling it
+(`question.cancel_own`), from the same verified application.
 
 The worker stores a keyed verification tag and a sealed copy, both bound to the question
 identifier. The key is generated when the ledger opens and lives in the worker's memory alone, so
@@ -200,7 +200,7 @@ authority.
 ## Answering from the terminal
 
 The companion app is the primary answering surface. `kr question` is the same surface on the
-machine the session is on.
+machine the session is on; `list` and `show` read with `question.read`.
 
 | Command | What it does |
 | --- | --- |

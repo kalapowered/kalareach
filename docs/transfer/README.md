@@ -615,7 +615,8 @@ path.
 adapter reads that rather than guessing from a declared media type or a filename, which is how
 unsupported media transfers as a file without being offered as a model image.
 
-A draft is durable and device-owned, with its own revision. Every update and every binding names the
+A draft (`draft.create`) is durable and device-owned, with its own revision. Every update
+(`draft.update`) and every binding names the
 revision it expects, and a mismatch is `DRAFT_CONFLICT` that changes nothing. Losing a connection
 removes an attachment's association, not the draft.
 

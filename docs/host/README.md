@@ -1546,6 +1546,8 @@ qualification may not do.
 
 ## Creating a session
 
+`session.create` takes these steps in this order:
+
 1. The daemon records the reservation durably: the actor, the create token, the immutable payload
    digest, the create request without its environment variables, the allocated session identifier
    and display number, and the launch phase. Display numbers increase and are never reused.
@@ -2306,7 +2308,7 @@ installed.
 
 ### The enrolled environments, and the cached inventory
 
-An enrolment records the identity the platform issued, the operating-system user the helper runs
+An enrolment (`environment.enrol`) records the identity the platform issued, the operating-system user the helper runs
 as, and the absolute path of the helper installed there. The label is what a person types; it
 selects a record and is never compared as an identity, so a container destroyed and recreated under
 the same name does not inherit the old record. The environment identifier selects a record too,
@@ -2495,7 +2497,8 @@ advances, the previous holder's undelivered bytes are dropped, and nothing waits
 agree. What has already reached the application cannot be recalled, so the count of discarded bytes
 is the limit of what a takeover undoes. A write at any other epoch, or from any other attachment, is
 `LEASE_LOST`, and it never takes the lease as a side effect: acquiring is something a controller
-asks for.
+asks for. A holder gives the lease up with `input.release`, which names the attachment and the epoch
+it holds; a release from any other attachment or at any other epoch is `LEASE_LOST`, as a write is.
 
 Whether it may hold the lease is a comparison rather than a label. The canonical grid knows which
 keyboard encoding the application has negotiated (the ordinary one, `modifyOtherKeys` at a level,
@@ -2605,8 +2608,8 @@ conversation view, which is semantic and cannot claim, never competes for it.
 | What happens | What it does to the size |
 | --- | --- |
 | A second terminal attaches | nothing: an existing owner keeps it |
-| An attachment reports its viewport | nothing; it decides only how that attachment is shown the session |
-| The owner resizes at the current epoch | moves the pseudo-terminal and the canonical grid together |
+| An attachment reports its viewport (`attachment.viewport`) | nothing; it decides only how that attachment is shown the session |
+| The owner resizes at the current epoch (`terminal.resize`) | moves the pseudo-terminal and the canonical grid together |
 | The owner detaches or withdraws its claim | the oldest remaining eligible claim succeeds and supplies its own dimensions |
 | A revision withdraws the grant a claim was made under, or the whole host's authority | the claim is withdrawn as above, the claims of other callers first and the owner's last, so the session is resized once; the caller claims again when it may, since a withdrawn claim does not come back by itself |
 | No eligible claim remains | the last geometry is retained, and the next eligible claimant takes it |
@@ -6044,7 +6047,7 @@ authority, because one window suppresses the owner's delivery rather than one ac
 
 ### Acknowledgement
 
-An acknowledgement is one actor's, and it names each item by its key and the revision it was
+An acknowledgement (`attention.acknowledge`) is one actor's, and it names each item by its key and the revision it was
 read at. An item's revision moves when the item is raised and at each new occurrence of its
 condition, so an acknowledgement covers what the actor saw and no more: a later occurrence is
 outstanding for that actor again. A key whose item has gone, moved past the named revision or is
@@ -6067,7 +6070,7 @@ nothing, reopens no completed review and is not a change since anybody's visit. 
 beside that turn is weighed separately, so one arriving at a version the host has not seen is
 recorded, is review work again, and is a change since a visit, whatever the turn beside it said.
 
-A review acknowledgement records that one actor read one version of one subject: a completed turn,
+A review acknowledgement (`review.acknowledge`) records that one actor read one version of one subject: a completed turn,
 or a captured change set. It approves no command, applies no patch and changes no Git state.
 Section 14 makes promotion a separate authorised action, and the engine has no operation that
 performs one, so that holds by construction rather than by policy.
@@ -6090,7 +6093,7 @@ actor than the store admits are all rejections, not outcomes nobody can establis
 
 A visit records how far one actor has read in one session, and never moves backwards. Each session
 has a change log of its own, of the last thousand changes and up to sixty-four ranges it has let
-go of. The view compares the visit's cursor with that log and answers with three separate things:
+go of. The view (`visit.changed`) compares the visit's cursor with that log and answers with three separate things:
 the authoritative changes, the ranges that are missing, and a model summary when one covers the
 interval. The three never merge. A summary names the interval it was written from and cannot stand
 in for an event; a gap is not an absence of changes but a statement that the host cannot say what
@@ -6907,8 +6910,8 @@ grants will be written.
 
 ### Revocation
 
-`Controller::revoke_grant` and `Controller::revoke_device_authority` run in the order a revocation
-cannot be correct without:
+`Controller::revoke_grant` (`grant.revoke`) and `Controller::revoke_device_authority`
+(`device.revoke`) run in the order a revocation cannot be correct without:
 
 1. The grants go first, because a grant still in the store is a grant the next request would be
    decided against.
