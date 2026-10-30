@@ -12,6 +12,8 @@
 //   KR_PUSH_GATEWAY_ORIGIN   the push gateway an independently signed build registers with, as an
 //                            https origin with no path, written https:/$()/host because `//` starts
 //                            a comment here; left out, the official gateway
+//   KR_OFFICIAL_BUILD        1 for an official build, which registers with the official gateway and
+//                            is given no KR_PUSH_GATEWAY_ORIGIN: the build refuses one
 //   AppIdentifierPrefix      the team's prefix with its dot, for a build made with signing off, which
 //                            cannot take it from a provisioning profile as a signed build does
 //   KR_SIGN_STYLE            Manual, to sign with the profiles below; Automatic otherwise

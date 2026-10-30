@@ -123,9 +123,10 @@ dirty=false
 
 ipa=""
 build() {
-    # The Firebase file for the build phase, and the team's prefix, which a build with signing off
-    # cannot take from a provisioning profile (Build.xcconfig says so).
-    kr_store_guard_write_local "$(printf 'KR_GOOGLE_SERVICE_INFO = %s\nAppIdentifierPrefix = %s.' "$firebase" "$team")" \
+    # The Firebase file for the build phase, the team's prefix, which a build with signing off cannot
+    # take from a provisioning profile, and the mark that this build is the official one, which
+    # registers with the official push gateway (Build.xcconfig says why they are written here).
+    kr_store_guard_write_local "$(printf 'KR_GOOGLE_SERVICE_INFO = %s\nAppIdentifierPrefix = %s.\nKR_OFFICIAL_BUILD = 1' "$firebase" "$team")" \
         || { kr_store_say "could not write $apple/Local.xcconfig"; return 2; }
 
     # ---- 1. The archive ------------------------------------------------------------------------
@@ -139,7 +140,7 @@ build() {
     while IFS= read -r name; do
         unset_arguments+=(-u "$name")
     done < <(compgen -e | grep -E '^(APPLE_|IOS_)' || true)
-    ( cd "$companion" && env ${unset_arguments[@]+"${unset_arguments[@]}"} \
+    ( cd "$companion" && kr_store_official_run env ${unset_arguments[@]+"${unset_arguments[@]}"} \
         pnpm tauri ios build --ci --target aarch64 --archive-only --no-sign \
         --config "{\"bundle\":{\"iOS\":{\"bundleVersion\":\"$number\"}}}" ) \
         || { kr_store_say "the archive failed"; return 2; }

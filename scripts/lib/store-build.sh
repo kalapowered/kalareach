@@ -208,6 +208,17 @@ kr_store_clean_tree() {
     fi
 }
 
+# kr_store_official_run <command...>: runs a build as the official one. A store bundle registers
+# with the official push gateway, so a gateway the person running the script has named in the
+# environment, for an independently signed build, is taken out of the build's environment, and the
+# build is marked official. The companion's build step refuses a gateway input under the mark,
+# whichever way the input reached the build; a Cargo configuration file's `[env]` table is one
+# that the removal does not reach. `store-bundle.mjs` then reads the gateway back from the
+# packaged library.
+kr_store_official_run() {
+    env -u KR_PUSH_GATEWAY_ORIGIN KR_OFFICIAL_BUILD=1 "$@"
+}
+
 # kr_store_cargo_target <repository>: the cargo target directory of this worktree, beside the
 # worktrees, so no two worktrees share one.
 kr_store_cargo_target() {

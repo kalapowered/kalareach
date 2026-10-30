@@ -480,12 +480,16 @@ impl Wiring {
     /// Returns a local failure when the build's gateway origin is not one. The build step refuses
     /// such a value, so only a library built around it reaches this.
     pub fn product() -> Result<Self> {
-        // The input is named by `push_origin::BUILD_INPUT`; the macro takes it as a literal.
-        let origin = crate::push_origin::choose(
-            option_env!("KR_PUSH_GATEWAY_ORIGIN"),
-            kr_client::services::account::ACCOUNT_ORIGIN,
-        )
-        .map_err(|error| CommandError::local_failure(format!("the gateway's origin: {error}")))?;
+        let origin = crate::push_origin::given_by(crate::push_origin::the_builds_record!())
+            .and_then(|given| {
+                crate::push_origin::choose(
+                    Some(given),
+                    kr_client::services::account::ACCOUNT_ORIGIN,
+                )
+            })
+            .map_err(|error| {
+                CommandError::local_failure(format!("the gateway's origin: {error}"))
+            })?;
         Ok(Self {
             origin,
             http: Arc::new(|origin| {
@@ -513,7 +517,6 @@ pub struct PushDesk {
     native: Arc<dyn Native>,
     registrar: Arc<dyn Registrar>,
     wiring: Wiring,
-    origin: GatewayOrigin,
     /// Everything the desk changes together, so that a look, the start of a run and the end of one
     /// are each made under one hold: no look finds a host working that no run owns, or on while a
     /// run is still ending it.
@@ -653,7 +656,6 @@ impl PushDesk {
         wiring: Wiring,
         changed: impl Fn(PushView) + Send + Sync + 'static,
     ) -> Arc<Self> {
-        let origin = wiring.origin.clone();
         let file = data.join(DIRECTORY).join(RECORD);
         let now = (wiring.clock)();
         let mut pruned = false;
@@ -715,7 +717,6 @@ impl PushDesk {
             native,
             registrar,
             wiring,
-            origin,
             state: Mutex::new(State {
                 record,
                 running: BTreeMap::new(),
@@ -1866,13 +1867,14 @@ impl PushDesk {
         }
     }
 
-    /// The gateway's origin: the one this build was given, and in a debug build the one a device run named.
+    /// The gateway's origin: the one this build was given, and in a debug build the one a device
+    /// run named.
     fn gateway_origin(&self) -> GatewayOrigin {
         #[cfg(debug_assertions)]
         if let Some(origin) = probe::origin(&self.data) {
             return origin;
         }
-        self.origin.clone()
+        self.wiring.origin.clone()
     }
 
     /// The registration token: the platform's, and in a debug build the one a device run gave.
@@ -2513,17 +2515,21 @@ mod probe {
 mod tests {
     use super::*;
 
-    /// KR-REQ-16.04: the product's wiring names the gateway the build was given, and the managed
-    /// service's, at the text it always had, when the build was given none.
+    /// KR-REQ-16.04: the product's wiring names the gateway the build step recorded for this build,
+    /// and the managed service's, at the text it always had, when the build was given none. A
+    /// build with no input reads the official text here; the build step's own cases give a build an
+    /// origin.
     #[test]
-    fn the_product_wiring_names_the_gateway_the_build_was_given_and_else_the_official_one() {
+    fn the_product_wiring_names_the_gateway_the_build_recorded_and_else_the_official_one() {
         let wiring = Wiring::product().expect("the wiring");
-        match option_env!("KR_PUSH_GATEWAY_ORIGIN") {
-            None | Some("") => assert_eq!(
+        match crate::push_origin::given_by(crate::push_origin::the_builds_record!())
+            .expect("the build's record")
+        {
+            "" => assert_eq!(
                 wiring.origin.as_str(),
                 kr_client::services::account::ACCOUNT_ORIGIN
             ),
-            Some(given) => assert_eq!(wiring.origin.as_str(), given),
+            given => assert_eq!(wiring.origin.as_str(), given),
         }
     }
 

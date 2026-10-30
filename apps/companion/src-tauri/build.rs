@@ -2,49 +2,20 @@
 
 use std::path::Path;
 
-// The library compiles this file too: the origin it checks here is the one the library reads.
-#[allow(dead_code)]
+// The library compiles this file too: the origin the build step checks is the one the library reads.
+#[allow(dead_code, unused_imports, unused_macros)]
 #[path = "src/push_origin.rs"]
 mod push_origin;
 
+// What the build may be given for its push gateway, and the record the library includes.
+#[path = "build_push_gateway.rs"]
+mod build_push_gateway;
+
 fn main() {
-    refuse_a_push_gateway_origin_that_is_not_one();
+    build_push_gateway::run();
     ensure_frontend_placeholder();
     align_the_android_library_for_large_pages();
     tauri_build::try_build(attributes()).expect("the Tauri build step");
-}
-
-/// Stops the build when `KR_PUSH_GATEWAY_ORIGIN`, the push gateway an independently signed build
-/// names, is not an `https://host[:port]` origin, and hands the library the value it accepted.
-///
-/// A build given nothing talks to the managed service's gateway and is told nothing here, so its
-/// requests are the ones it made before the input existed.
-fn refuse_a_push_gateway_origin_that_is_not_one() {
-    println!("cargo:rerun-if-env-changed={}", push_origin::BUILD_INPUT);
-    println!("cargo:rerun-if-changed=src/push_origin.rs");
-    let Ok(given) = std::env::var(push_origin::BUILD_INPUT) else {
-        return;
-    };
-    if given.is_empty() {
-        return;
-    }
-    match push_origin::check(&given) {
-        Ok(origin) => {
-            println!(
-                "cargo:rustc-env={}={}",
-                push_origin::BUILD_INPUT,
-                origin.as_str()
-            );
-            println!(
-                "cargo:warning=this build registers with the push gateway at {}",
-                origin.as_str()
-            );
-        }
-        Err(words) => panic!(
-            "{} is not a push gateway origin: {words}",
-            push_origin::BUILD_INPUT
-        ),
-    }
 }
 
 /// Aligns the Android library's load segments to 16 KB.
