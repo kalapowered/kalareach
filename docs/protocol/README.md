@@ -601,11 +601,10 @@ sets it on the refusal of a link that no longer holds the worker's authority. It
 worker to the control daemon on the same machine, which ends the link and does not pass the member
 on to a device.
 
-A message sent to a paired device does not name a path, the number of an account or command text of
-the host that sent it. The host replaces such a message before it leaves and keeps the code, the
-retry category and the diagnostic identifier, and a receipt whose message was replaced sets
-`error_withheld`. The owner on the local socket is given the whole message. The host document says
-where the rule is applied.
+The host replaces a message that names a path, the number of an account or command text of its own
+before it sends the error to a paired device. It keeps the code, the retry category and the
+diagnostic identifier, and a receipt whose message was replaced sets `error_withheld`. The owner on
+the local socket is given the whole message. The host document says where the rule is applied.
 
 Typed resource states such as `permission_required`, pending revocation and voice
 `creation_unknown` are not error codes. The host reports each in its own result schema:
