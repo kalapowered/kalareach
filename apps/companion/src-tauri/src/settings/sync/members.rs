@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use kr_client::pairing::owner::{CeremonyKind, CeremonyOutcome};
-use kr_client::services::ManagedSyncService;
+use kr_client::services::SharedSyncService;
 use kr_client::sync::membership::{
     CollectionRef, Device, DeviceDirectory, Ended, HostAnswers, HostDevice, HostReport,
     MembershipError, Outcome, Refreshed, SyncMembership,
@@ -463,7 +463,7 @@ impl SettingsSync {
     /// says.
     pub(super) fn membership_asking(
         &self,
-        service: &Arc<ManagedSyncService>,
+        service: &Arc<dyn SharedSyncService>,
         ask: Ask,
     ) -> Result<SyncMembership> {
         self.membership_with(
@@ -478,7 +478,7 @@ impl SettingsSync {
 
     /// How much of the hosts' answer a step needs, given what it was asked for: a collection of one
     /// device with nothing pending has nobody to check, so a background step asks no host.
-    pub(super) fn ask_for(&self, service: &Arc<ManagedSyncService>, wanted: Ask) -> Result<Ask> {
+    pub(super) fn ask_for(&self, service: &Arc<dyn SharedSyncService>, wanted: Ask) -> Result<Ask> {
         let held = self
             .membership_with(
                 service,
@@ -541,7 +541,7 @@ impl SettingsSync {
     }
 
     /// The collections the service says name this installation, kept for the page to offer.
-    async fn look_for_offers(&self, service: &Arc<ManagedSyncService>) -> Result<()> {
+    async fn look_for_offers(&self, service: &Arc<dyn SharedSyncService>) -> Result<()> {
         let listed = service.memberships().await.map_err(CommandError::from)?;
         let held = self.membership_asking(service, Ask::Never)?;
         let current = held.members().map_err(member_failure)?;

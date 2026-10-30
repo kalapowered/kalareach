@@ -61,7 +61,7 @@ use kr_client::drafts::{
 };
 use kr_client::services::sync::KnownRevision;
 use kr_client::services::{
-    ManagedSyncService, ServiceFuture, SyncBackupService, SyncDispatch, SyncExchanged, SyncFetched,
+    ServiceFuture, SharedSyncService, SyncBackupService, SyncDispatch, SyncExchanged, SyncFetched,
     SyncPosition, SyncRequestFence, SyncRequestStatus,
 };
 use kr_client::sync::membership::CollectionRef;
@@ -277,7 +277,7 @@ impl std::fmt::Debug for DraftsSync {
 /// What one pass reads of a collection and writes through.
 pub struct Collection<'a> {
     /// The sync service this device signs for.
-    pub service: &'a Arc<ManagedSyncService>,
+    pub service: &'a Arc<dyn SharedSyncService>,
     /// The collection.
     pub collection: CollectionRef,
     /// The epoch the collection's objects are sealed under now.
