@@ -93,7 +93,7 @@ impl WindowsPlaces {
     /// Reads the places from this process's environment.
     #[must_use]
     pub fn from_environment() -> Self {
-        Self::from_variables(std::env::var_os)
+        Self::from_variables(|name| std::env::var_os(name))
     }
 
     /// Reads the places from environment variables given by `get`.
