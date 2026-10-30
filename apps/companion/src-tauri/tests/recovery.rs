@@ -230,6 +230,15 @@ impl Computer {
 
     /// The application, started over this computer's records, with `account` as its account.
     fn start(&self, account: Arc<Account>) -> Page {
+        self.start_with(account, None)
+    }
+
+    /// As [`Self::start`], with `clients` as the application's clients of the sync service.
+    fn start_with(
+        &self,
+        account: Arc<Account>,
+        clients: Option<Arc<dyn companion_tauri::services::SyncServices>>,
+    ) -> Page {
         let app = mock_builder()
             .manage(AppState::new())
             .manage(AccountSlot::ready(Arc::clone(&account)))
@@ -248,6 +257,9 @@ impl Computer {
             ])
             .build(mock_context(noop_assets()))
             .expect("an application on the mock runtime");
+        if let Some(clients) = clients {
+            app.state::<AppState>().sync_clients_replaced(clients);
+        }
         // The functions the application's start calls, over this computer's records.
         companion_tauri::start_sync_service(app.handle(), self.data.path());
         companion_tauri::start_recovery(app.handle(), self.data.path(), &self.identity())
@@ -271,8 +283,16 @@ impl Computer {
     /// The application, with the sync service chosen to be the one this computer reaches and the
     /// account signed in to it with the right to write backup storage.
     async fn page(&self) -> Page {
+        self.page_with(None).await
+    }
+
+    /// As [`Self::page`], with `clients` as the application's clients of the sync service.
+    async fn page_with(
+        &self,
+        clients: Option<Arc<dyn companion_tauri::services::SyncServices>>,
+    ) -> Page {
         let account = account(&self.origin(), Some(&RECOVERY_BACKUP_SCOPES)).await;
-        let page = self.start(account);
+        let page = self.start_with(account, clients);
         page.call(
             "sync_service_set",
             json!({ "origin": self.served.origin() }),
@@ -720,6 +740,90 @@ async fn turning_recovery_on_puts_the_bundle_at_the_service_and_hands_over_a_kit
     {
         assert!(!told.contains(&secret), "the page was sent part of the kit");
     }
+}
+
+/// A factory of sync clients that records each ask and makes the managed client.
+#[derive(Debug)]
+struct Recording {
+    clients: companion_tauri::services::ManagedSyncServices,
+    asked: Mutex<Vec<(String, bool)>>,
+}
+
+impl companion_tauri::services::SyncServices for Recording {
+    fn installation(
+        &self,
+        origin: &GatewayOrigin,
+    ) -> companion_tauri::error::Result<Arc<dyn kr_client::services::SharedSyncService>> {
+        self.asked
+            .lock()
+            .expect("the record")
+            .push((origin.as_str().to_owned(), false));
+        self.clients.installation(origin)
+    }
+
+    fn presenting(
+        &self,
+        origin: &GatewayOrigin,
+        tokens: Arc<dyn kr_client::services::AccountTokenSource>,
+        scope: &'static str,
+    ) -> companion_tauri::error::Result<Arc<dyn kr_client::services::SharedSyncService>> {
+        self.asked
+            .lock()
+            .expect("the record")
+            .push((origin.as_str().to_owned(), true));
+        self.clients.presenting(origin, tokens, scope)
+    }
+}
+
+/// KR-REQ-17.14: recovery reaches the sync service through the clients the application was given,
+/// and at the origin its record names. A record made while the setting named one service keeps
+/// talking to that service after the setting names another; only a record made now reads the
+/// setting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_asks_its_clients_for_the_service_its_record_names() {
+    let computer = Computer::new().await;
+    let recording = Arc::new(Recording {
+        clients: companion_tauri::services::ManagedSyncServices::new(
+            AuthorisationKeyPair::generate().expect("a key"),
+        ),
+        asked: Mutex::new(Vec::new()),
+    });
+    let page = computer.page_with(Some(Arc::clone(&recording) as _)).await;
+    let ours = computer.served.origin().to_owned();
+
+    page.call("recovery_turn_on", json!({}))
+        .expect("recovery is turned on");
+    let asked = recording.asked.lock().expect("the record").clone();
+    assert!(
+        !asked.is_empty(),
+        "turning recovery on asked the clients it was given"
+    );
+    assert!(
+        asked
+            .iter()
+            .all(|(origin, presenting)| *origin == ours && *presenting),
+        "{asked:?}: the bundle is written at the chosen service, presenting the account"
+    );
+
+    // The setting now names another service. The record still names the first, and every ask that
+    // follows is for the first.
+    page.call(
+        "sync_service_set",
+        json!({ "origin": "https://other.example" }),
+    )
+    .expect("another service is chosen");
+    let before = recording.asked.lock().expect("the record").len();
+    page.call("recovery_view", json!({}))
+        .expect("recovery reads its record");
+    let asked = recording.asked.lock().expect("the record").clone();
+    assert!(
+        asked.len() > before,
+        "reading the record asked for its client"
+    );
+    assert!(
+        asked.iter().all(|(origin, _)| *origin == ours),
+        "{asked:?}: nothing was asked for the service the setting names now"
+    );
 }
 
 /// The kit holds the recovery seed. A file the person chose that already exists, whatever its mode
