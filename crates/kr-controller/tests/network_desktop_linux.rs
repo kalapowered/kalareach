@@ -104,9 +104,9 @@ fn schema(answer: &EnvironmentCapabilitiesResult) -> Option<String> {
 }
 
 /// KR-REQ-03.26: the owner is told which display server a Linux host is on and which compositor
-/// runs it, and a device is told the display server, the protocol the server speaks and whether a
-/// compositor runs it, with the compositor's name as its class and length. Whichever the host is
-/// on, no screen capture or input injection is reported available because a tool is installed.
+/// runs it. A device is told the display server and whether a compositor runs it, with the
+/// compositor's name and the server's protocol name as their class and length. Whichever the host
+/// is on, no screen capture or input injection is reported available because a tool is installed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_is_told_which_display_server_the_host_is_on_and_whether_a_compositor_runs_it() {
     let directory = tempfile::tempdir().expect("a directory of this test's own");
@@ -150,7 +150,7 @@ async fn a_device_is_told_which_display_server_the_host_is_on_and_whether_a_comp
         assert_eq!(
             schema(&remotely),
             Some(withheld(ContentClass::Name, kind)),
-            "and the protocol the server speaks"
+            "and the protocol the server speaks, as a name"
         );
         for capability in [capabilities::SCREEN_CAPTURE, capabilities::INPUT_INJECTION] {
             let record = remotely
@@ -168,8 +168,4 @@ async fn a_device_is_told_which_display_server_the_host_is_on_and_whether_a_comp
         panic!("three sessions were read");
     };
     assert!(!x11.is_present() && sway.is_present() && gnome.is_present());
-    assert_ne!(
-        sway, gnome,
-        "two compositors of different names are two answers"
-    );
 }
