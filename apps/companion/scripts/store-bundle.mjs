@@ -209,6 +209,53 @@ export function problemsInElf(name, bytes) {
   return problems
 }
 
+// -- the push gateway the packaged code registers with ------------------------------------------
+
+/**
+ * What the companion's build step writes into the library, between two unit separators: this name,
+ * then the push gateway the build was given, which is empty for an official build. The library
+ * reads its gateway from that same text, so the record cannot disagree with what the library uses.
+ * The name is `RECORD_NAME` in `src-tauri/build_push_gateway.rs`.
+ */
+export const PUSH_GATEWAY_RECORD_NAME = 'kr-push-gateway-origin'
+
+const RECORD_HEAD = Buffer.from(`\x1f${PUSH_GATEWAY_RECORD_NAME}\x1f`)
+
+/** The longest origin a record can hold: 128 bytes after `https://`, with a margin. */
+const LONGEST_RECORDED_ORIGIN = 256
+
+/** The records of the push gateway in `bytes`: the origin each holds, or null for one that cannot be read. */
+export function pushGatewayRecords(bytes) {
+  const records = []
+  for (let at = bytes.indexOf(RECORD_HEAD); at !== -1; at = bytes.indexOf(RECORD_HEAD, at + 1)) {
+    const start = at + RECORD_HEAD.length
+    const end = bytes.indexOf(0x1f, start)
+    const value = end === -1 ? null : bytes.subarray(start, end)
+    const readable = value !== null && value.length <= LONGEST_RECORDED_ORIGIN && value.every((byte) => byte >= 0x20 && byte <= 0x7e)
+    records.push(readable ? value.toString('latin1') : null)
+  }
+  return records
+}
+
+/**
+ * What is wrong with the push gateway the code in `bytes` registers with. A store bundle is the
+ * official build, which registers with the official gateway and is given none, so its code holds
+ * exactly one record and the record is empty. Anything else is a build made around another gateway,
+ * or by something other than the companion's build step.
+ */
+export function problemsInPushGateway(name, bytes) {
+  const records = pushGatewayRecords(bytes)
+  if (records.length === 0) return [`${name} carries no record of the push gateway it registers with`]
+  if (records.length > 1) return [`${name} carries ${records.length} records of the push gateway it registers with, not one`]
+  const [origin] = records
+  if (origin === null) return [`${name} carries a record of its push gateway that cannot be read`]
+  if (origin !== '') return [`${name} registers with the push gateway ${origin}; an official build is given none and registers with the official one`]
+  return []
+}
+
+/** The library of the companion in an Android bundle: the package's library, `companion_tauri`. */
+const ANDROID_COMPANION_LIBRARY = 'libcompanion_tauri.so'
+
 /** The architectures and libraries a bundle packages, and what is wrong with them. */
 export function problemsInAndroidLibraries(members, read, abis) {
   const problems = []
@@ -226,7 +273,13 @@ export function problemsInAndroidLibraries(members, read, abis) {
   }
   for (const [abi, libraries] of found) {
     for (const library of libraries) {
-      problems.push(...problemsInElf(`${abi}/${library.name.split('/').pop()}`, read(library)))
+      const label = `${abi}/${library.name.split('/').pop()}`
+      const bytes = read(library)
+      problems.push(...problemsInElf(label, bytes))
+      if (library.name.endsWith(`/${ANDROID_COMPANION_LIBRARY}`)) problems.push(...problemsInPushGateway(label, bytes))
+    }
+    if (!libraries.some((library) => library.name.endsWith(`/${ANDROID_COMPANION_LIBRARY}`))) {
+      problems.push(`the bundle packages no ${ANDROID_COMPANION_LIBRARY} for ${abi}`)
     }
   }
   if (!members.some((member) => member.name.startsWith('base/dex/'))) problems.push('the bundle holds no dex file')
@@ -1010,6 +1063,7 @@ export function checkIos(options) {
       const entitlements = images[0] ?? {}
       if (entitlements['get-task-allow'] === true) problems.push(`${bundle.name} lets a debugger attach`)
       if (index === 0) {
+        problems.push(...problemsInPushGateway(`${bundle.name}'s executable`, readFileSync(join(bundle.path, info.CFBundleExecutable))))
         if (entitlements['aps-environment'] !== 'production') {
           problems.push(`${bundle.name}'s push environment is ${JSON.stringify(entitlements['aps-environment'])}, not "production"`)
         }

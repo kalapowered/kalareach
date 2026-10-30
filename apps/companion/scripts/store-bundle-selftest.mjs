@@ -38,6 +38,9 @@ import {
   problemsInAndroidLibraries,
   problemsInAndroidManifest,
   problemsInElf,
+  problemsInPushGateway,
+  pushGatewayRecords,
+  PUSH_GATEWAY_RECORD_NAME,
   problemsInFirebase,
   problemsInProfile,
   problemsInSignature,
@@ -171,13 +174,20 @@ held('a library aligned to 16 KB passes', [], problemsInElf('libapp.so', elf(163
 heldProblems('a library aligned to 4 KB is refused', problemsInElf('libapp.so', elf(4096)), ['aligns a loadable segment to 4096'])
 heldProblems('a file that is no ELF library is refused', problemsInElf('libapp.so', Buffer.from('not a library')), ['not a 64-bit'])
 
-function bundleOf(name, abis, alignment = 16384) {
+/** The record the companion's build step writes into its library: the gateway the build was given, or none. */
+const gatewayRecord = (origin) => Buffer.from(`\x1f${PUSH_GATEWAY_RECORD_NAME}\x1f${origin}\x1f`)
+const OWN_GATEWAY = 'https://push.builder.example'
+
+/** A library with its memory layout and the records of its gateway, among other text as a library has. */
+const libraryOf = (alignment, records) => Buffer.concat([elf(alignment), Buffer.from('some text'), ...records.flatMap((record) => [record, Buffer.from('more text')])])
+
+function bundleOf(name, abis, { alignment = 16384, records = [gatewayRecord('')], library = 'libcompanion_tauri.so' } = {}) {
   const path = join(work, `${name}.aab`)
   writeFileSync(
     path,
     zip([
       { name: 'base/dex/classes.dex', bytes: Buffer.from('dex') },
-      ...abis.map((abi) => ({ name: `base/lib/${abi}/libapp.so`, bytes: elf(alignment) }))
+      ...abis.map((abi) => ({ name: `base/lib/${abi}/${library}`, bytes: libraryOf(alignment, records) }))
     ])
   )
   return path
@@ -187,7 +197,30 @@ held('the requested architectures pass', [], libraries(bundleOf('both', ['arm64-
 heldProblems('an architecture nobody asked for is refused', libraries(bundleOf('three', ['arm64-v8a', 'x86_64', 'armeabi-v7a']), ['arm64-v8a', 'x86_64']), [
   'architectures arm64-v8a, armeabi-v7a, x86_64'
 ])
-heldProblems('a bundle with a 4 KB library is refused', libraries(bundleOf('small', ['arm64-v8a'], 4096), ['arm64-v8a']), ['aligns a loadable segment'])
+heldProblems('a bundle with a 4 KB library is refused', libraries(bundleOf('small', ['arm64-v8a'], { alignment: 4096 }), ['arm64-v8a']), ['aligns a loadable segment'])
+
+// -- the push gateway the library registers with ---------------------------------------------
+
+held('the record is found where the library carries it, once', [''], pushGatewayRecords(libraryOf(16384, [gatewayRecord('')])))
+held('a library given a gateway of its own carries it, and a bundle of it is refused by name', [[OWN_GATEWAY], true], [
+  pushGatewayRecords(libraryOf(16384, [gatewayRecord(OWN_GATEWAY)])),
+  libraries(bundleOf('own-gateway', ['arm64-v8a'], { records: [gatewayRecord(OWN_GATEWAY)] }), ['arm64-v8a']).some((each) => each.includes(`registers with the push gateway ${OWN_GATEWAY}`))
+])
+heldProblems('a library with no record is refused, since a build made around any gateway could not be told from the official one', libraries(bundleOf('no-record', ['arm64-v8a'], { records: [] }), ['arm64-v8a']), [
+  'carries no record of the push gateway'
+])
+heldProblems('a library with two records is refused', libraries(bundleOf('two-records', ['arm64-v8a'], { records: [gatewayRecord(''), gatewayRecord('')] }), ['arm64-v8a']), [
+  'carries 2 records of the push gateway'
+])
+heldProblems(
+  'a record that is not closed, or holds more than an origin, is refused',
+  [Buffer.from(`\x1f${PUSH_GATEWAY_RECORD_NAME}\x1fhttps://push.builder.example`), Buffer.from(`\x1f${PUSH_GATEWAY_RECORD_NAME}\x1f\x01\x1f`)].flatMap((record) => problemsInPushGateway('lib', Buffer.concat([elf(16384), record]))),
+  ['cannot be read']
+)
+heldProblems('a bundle without the companion library for an architecture is refused', libraries(bundleOf('other-library', ['arm64-v8a'], { library: 'libapp.so' }), ['arm64-v8a']), [
+  'packages no libcompanion_tauri.so for arm64-v8a'
+])
+held('the name the checker looks for is the name the build step writes', true, new RegExp(`const RECORD_NAME: &str = "${PUSH_GATEWAY_RECORD_NAME}";`).test(readFileSync(join(import.meta.dirname, '..', 'src-tauri', 'build_push_gateway.rs'), 'utf8')))
 
 // -- the push configuration ------------------------------------------------------------------
 
@@ -775,6 +808,18 @@ if (codesign.error || process.platform !== 'darwin') {
   // problems, and a bundle without it is not.
   const exportCheck = () => checkIos({ path: signed, stage: 'export', versionCode: '1', versionName: '0.1.0', secretFiles: [], skipAppChecks: true }).problems
   held('the export check names embedded code that is signed ad hoc', true, exportCheck().some((each) => each.startsWith('Frameworks/Plain.dylib in the application is signed ad hoc')))
+  // The gateway the application's executable registers with, read from the executable as the
+  // check reads it: none recorded is refused, the official build's empty record passes, and another
+  // gateway is named. The executable is put back as it was.
+  const executable = join(signed, 'KalaReach')
+  const plainExecutable = readFileSync(executable)
+  const gatewayProblems = () => exportCheck().filter((each) => each.includes('push gateway'))
+  held('an application whose executable carries no record of its push gateway is refused', true, gatewayProblems().some((each) => each.includes("the application's executable carries no record")))
+  writeFileSync(executable, Buffer.concat([plainExecutable, gatewayRecord('')]))
+  held('one that carries the empty record of an official build is not', [], gatewayProblems())
+  writeFileSync(executable, Buffer.concat([plainExecutable, gatewayRecord(OWN_GATEWAY)]))
+  held('one that carries another gateway is refused by name', true, gatewayProblems().some((each) => each.includes(`the application's executable registers with the push gateway ${OWN_GATEWAY}`)))
+  writeFileSync(executable, plainExecutable)
   // Code that is not a direct entry of Frameworks: inside a framework, in a framework inside a
   // framework, and outside Frameworks altogether. The outer seal does not make it the team's.
   const deeper = [
@@ -984,6 +1029,16 @@ held('a log bundle outside the temporary directory is kept, and the cleanup fail
     ['status=0', 'status=2', false, 'status=2'],
     [clean.stdout.trim().split('\n').pop(), dirty.stdout.trim().split('\n').pop(), `${dirty.stdout}${dirty.stderr}`.includes('correct-horse-battery-staple'), unreadable.stdout.trim().split('\n').pop()]
   )
+}
+
+// A store build is the official build: a gateway named in the environment of whoever runs the script
+// is not in the build's, and the build is marked official. The iOS script starts its build through a
+// second `env` that takes the Apple variables out, and that call keeps both.
+{
+  const officialEnvironment = (script) => shell(script, { KR_PUSH_GATEWAY_ORIGIN: OWN_GATEWAY, IOS_TEAM: 'ABC', KR_OFFICIAL_BUILD: '' }).stdout.split('\n')
+  const seen = (lines) => [lines.some((line) => line.startsWith('KR_PUSH_GATEWAY_ORIGIN=')), lines.includes('KR_OFFICIAL_BUILD=1'), lines.some((line) => line.startsWith('IOS_TEAM='))]
+  held('a store build is started without the gateway the person named, and marked official', [false, true, true], seen(officialEnvironment('kr_store_official_run env')))
+  held('and the iOS script\'s second env, which takes the Apple variables out, leaves both', [false, true, false], seen(officialEnvironment('kr_store_official_run env -u IOS_TEAM env')))
 }
 
 const racing = join(work, 'racing'); mkdirSync(racing)
