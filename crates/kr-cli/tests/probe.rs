@@ -773,3 +773,24 @@ async fn a_probe_over_a_records_directory_an_earlier_release_left_open_still_rec
         "the question that went unanswered is recorded"
     );
 }
+
+/// KR-REQ-24.26: a runtime root that is open to others is not written into: a probe on a terminal
+/// records nothing in it, since another account could have put a link where the record goes, and
+/// the root is left as it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_probe_writes_no_record_into_a_runtime_root_open_to_others() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let base = kr_ipc::testing::PrivateTempDir::create();
+    let runtime = base.path().join("runtime");
+    std::fs::create_dir(&runtime).expect("a runtime root");
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).expect("opened");
+
+    unanswered_probe(&runtime, &base.path().join("state")).await;
+
+    assert!(
+        !runtime.join("probes").exists(),
+        "nothing was made in a root that others can write to"
+    );
+    assert_eq!(mode_of(&runtime), 0o755, "the root is left as it was");
+}
