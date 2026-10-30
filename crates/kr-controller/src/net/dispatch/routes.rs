@@ -1017,7 +1017,12 @@ impl RemoteConnection {
             // and the grant.
             Method::ChangesetCapture | Method::DiffApply | Method::DiffRevert => {
                 if let Err(error) = self
-                    .check_working_tree_request(entry.method, &mutation.params, &decided.acting)
+                    .check_working_tree_request(
+                        entry.method,
+                        &mutation.params,
+                        &decided.acting,
+                        super::narrowing::Earlier::Nothing,
+                    )
                     .await
                 {
                     return failure(mutation.request_id, error);
