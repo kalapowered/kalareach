@@ -2164,10 +2164,7 @@ async fn a_device_is_refused_a_recorded_version_its_grant_does_not_reach() {
     for refusal in [read.err(), materialised.err()] {
         let refusal = refusal.expect("a version captured before the grant reaches back to");
         assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
-        assert!(
-            said(&refusal).contains("captured before the moment"),
-            "{refusal}"
-        );
+        assert!(said(&refusal).contains(does_not_reach), "{refusal}");
     }
     let (_d, none) = recorded
         .device(|grant| grant.history.lower_bound_ms = Nullable::null())
@@ -2176,10 +2173,7 @@ async fn a_device_is_refused_a_recorded_version_its_grant_does_not_reach() {
     for refusal in [read.err(), materialised.err()] {
         let refusal = refusal.expect("a version captured before the grant's own pairing");
         assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
-        assert!(
-            said(&refusal).contains("captured before the moment"),
-            "{refusal}"
-        );
+        assert!(said(&refusal).contains(does_not_reach), "{refusal}");
     }
 
     // The session: a grant that names sessions reaches a version captured for one of them and no
@@ -2433,6 +2427,36 @@ async fn a_read_of_one_version_lists_no_other_version_the_grant_does_not_reach()
         .await
         .expect("a grant over any session reads the version");
     assert_eq!(listed(&read), [1, 2], "{:?}", read.versions);
+    recorded.stop().await;
+}
+
+/// KR-REQ-23.44: a `changeset.read` of a version captured before the moment the grant's history
+/// reaches back to is refused with the code and the words a number the change set does not have is
+/// refused with, so a device learns nothing about which versions a change set holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_of_a_version_before_the_history_bound_is_refused_as_an_absent_one_is() {
+    let recorded = Recorded::start().await;
+    let beyond = kr_protocol::scalars::TimestampMs::new(recorded.captured_at_ms.get() + 3_600_000);
+    let (_a, later) = recorded
+        .device(|grant| grant.history.lower_bound_ms = Nullable::some(beyond))
+        .await;
+    let change_set_id = recorded.plain.change_set_id;
+    let asked = |version: u64| kr_protocol::changeset::ChangesetReadParams {
+        change_set_id,
+        version: Nullable::some(kr_protocol::ids::ChangeSetVersion::new(version)),
+    };
+    let old = later
+        .read::<_, kr_protocol::changeset::ChangesetReadResult>(Method::ChangesetRead, &asked(1))
+        .await
+        .expect_err("a version captured before the grant reaches back to");
+    let absent = later
+        .read::<_, kr_protocol::changeset::ChangesetReadResult>(Method::ChangesetRead, &asked(99))
+        .await
+        .expect_err("a number the change set does not have");
+    assert_eq!(old.code(), ErrorCode::PermissionDenied);
+    assert_eq!(absent.code(), old.code(), "{old} against {absent}");
+    assert_eq!(said(&absent), said(&old));
+    later.close();
     recorded.stop().await;
 }
 
