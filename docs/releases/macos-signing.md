@@ -225,17 +225,17 @@ these in order and stop at the first that applies:
    `xcrun notarytool log <submission id>` (the notary key options as for `wait`). The submission
    identifiers are in `source`'s summary, under the notary submissions. A status other than `Accepted`
    ends here in the same way: sign again and dispatch again.
-3. Take the sealed archive of the target while it exists, and unpack it:
+3. Download the sealed archive of the target from the `release-host` run while it exists:
 
    ```sh
    gh run download <run id> --repo kalapowered/kalareach --name sealed-<target>
    ```
 
-   That leaves `kalareach-<target>-<release>.tar.gz`. Print the CDHash of a refused file with
-   `codesign -dvvv <file>` (`-dvv` does not print it), on its `CDHash=` line, and look for it among the
-   `ticketContents` of `<work>/<top>.notary-log.json` on the signing machine. If it is not there, the file
-   is not one the service notarised, and its bytes changed after the notarisation. Do not re-run: sign again
-   and dispatch again.
+   That leaves `kalareach-<target>-<release>.tar.gz`; unpack it. Print the CDHash of a file the `check`
+   job refused (its log names them) with `codesign -dvvv <file>` (`-dvv` does not print it), on its
+   `CDHash=` line, and look for it among the `ticketContents` of `<work>/<top>.notary-log.json` on the
+   signing machine. If it is not there, the file is not one the service notarised, and its bytes changed
+   after the notarisation. Do not re-run: sign again and dispatch again.
 4. If it is there, assess the file on a Mac with a network, with
    `/usr/sbin/spctl --assess --type open --context context:primary-signature -vv <file>`. When it
    prints `accepted` with `source=Notarized Developer ID`, the bytes are good and the refusal came from the
