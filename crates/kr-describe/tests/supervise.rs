@@ -2734,6 +2734,12 @@ fn an_end_told_late_of_a_process_that_would_not_run_does_not_stop_the_next_proce
         "{reports:?}"
     );
     assert_eq!(rig.driver.pid(), None, "the process is gone");
+    // The first process's reader tells of its end on a thread of its own. The end is waited for and
+    // not handled, so the second check starts its process with the end still to be handled.
+    assert!(
+        rig.driver.wait(REAL),
+        "the end of the first process was told"
+    );
 
     rig.driver
         .verify(&check(2, files.join("right"), 60_000), at(1))
