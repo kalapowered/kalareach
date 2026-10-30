@@ -178,7 +178,7 @@ pub fn hold_assets(state_dir: &Path, catalogue: &Catalogue, files: &[(&str, &[u8
     let profile = selected(catalogue);
     let models = super::host::models_dir(state_dir);
     let here = super::assets::directory(&models, &profile);
-    std::fs::create_dir_all(&here).expect("the model directory");
+    kr_ipc::paths::create_private_tree(&models, &here).expect("the model directory");
     for (name, contents) in files {
         std::fs::write(here.join(name), contents).expect("a model file");
     }
@@ -195,7 +195,7 @@ pub fn link_assets(state_dir: &Path, catalogue: &Catalogue, files: &[(&str, &Pat
     let profile = selected(catalogue);
     let models = super::host::models_dir(state_dir);
     let here = super::assets::directory(&models, &profile);
-    std::fs::create_dir_all(&here).expect("the model directory");
+    kr_ipc::paths::create_private_tree(&models, &here).expect("the model directory");
     for (name, target) in files {
         #[cfg(unix)]
         std::os::unix::fs::symlink(target, here.join(name)).expect("a link to a model file");
