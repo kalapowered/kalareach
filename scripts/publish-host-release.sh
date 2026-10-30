@@ -188,8 +188,8 @@ print(", ".join(signed["roles"]["targets"]["keyids"]))
         echo "    kalareach-<target>-$release/bin/kr host install"
         echo
         echo 'Project work needs Git. On a Mac that does not have the developer tools yet, run'
-        echo '`xcode-select --install` and wait for it to finish before `kr new`; on Linux, install Git with the'
-        echo 'system'"'"'s package manager.'
+        echo '`xcode-select --install` and wait for it to finish; on Linux, install Git with the system'"'"'s'
+        echo 'package manager.'
         echo
         echo 'A host that has an earlier release takes this one with'
         # shellcheck disable=SC2016
