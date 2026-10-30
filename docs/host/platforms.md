@@ -56,7 +56,7 @@ session ends, the session closes with `desktop_lost` and you create a new one.
 
 | Platform | `desktop_bound` | `headless_user` |
 | --- | --- | --- |
-| macOS | ends with the graphical login. The worker's job is bootstrapped into the user's graphical domain, and a logout tears that domain down | started outside the graphical login, in this user's background domain, so it has no Aqua access to inherit. That domain outlives the graphical login; how long it lasts after the user's last session is the platform's own behaviour, which this host does not read, so it reports the lifetime as not established rather than guessing. Work that must outlive a logout with certainty needs a service in the system's own domain, which is a different execution context and an installation step this host does not take. This host uses launchd only when the user has a graphical domain; a daemon that started without one runs its workers as detached processes (see below) and reports that, not launchd |
+| macOS | ends with the graphical login. The worker's job is bootstrapped into the user's graphical domain, and a logout tears that domain down | started outside the graphical login, in this user's background domain, so it has no Aqua access to inherit. That domain outlives the graphical login; how long it lasts after the user's last session is the platform's own behaviour, which this host does not read, so it reports the lifetime as not established rather than guessing. Work that must outlive a logout with certainty needs a service in the system's own domain, which is a different execution context and an installation step this host does not take. The daemon chooses once, when it starts: launchd if the user has a graphical domain then, otherwise a detached process (described after this table). A daemon that chose a detached process reports that, with the lifetime not established, and does not report launchd |
 | Linux | ends with the graphical login session | survives logout only while lingering is enabled for the user, which keeps the user's service manager running. It is off unless somebody enables it |
 | Windows | ends with the sign-out of the interactive session | ends with the sign-out. A per-user task runs in the user's own session and stops with it; work that must outlive a sign-out needs a service under an account granted the right to log on as a service |
 
@@ -64,17 +64,18 @@ session ends, the session closes with `desktop_lost` and you create a new one.
 the one this table says you probably have. The answer names the service mechanism it is about, and
 a claim that a headless session survives logout also names what makes it survive.
 
-On a Unix host with no per-user service manager the fallback is a detached process: a worker leads
-a session of its own, and the plugin runtime a process group of its own, each reparented when the
-control daemon exits. A worker started that way is in whatever login context the control daemon
-is in, so a headless session there has the desktop's variables stripped
-rather than a login context of its own. `kr doctor` reports that as what it is.
+A Unix daemon that found no per-user service manager when it started (on macOS, no graphical
+domain) falls back to a detached process: a worker leads a session of its own, and the plugin
+runtime a process group of its own, each reparented when the control daemon exits. A worker started
+that way is in whatever login context the control daemon is in, so a headless session there has the
+desktop's variables stripped rather than a login context of its own. `kr doctor` reports that as
+what it is.
 
 Windows has no fallback and needs none: every worker and the plugin runtime are created by the
 starter of the environment's scheduled task, in the logon session of the user the task logs on as,
 so none is a child of the control daemon or in a job the daemon runs in. A headless session there
-is a session with no desktop handles and no promise about the desktop rather than one that cannot
-reach it; its capability records say so.
+runs on the interactive window station and desktop, with no desktop variables and no capability
+claim, so nothing keeps it from reaching the desktop; its capability records say so.
 
 ### The control daemon under the service start
 

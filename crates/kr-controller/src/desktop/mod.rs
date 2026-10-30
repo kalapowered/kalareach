@@ -114,18 +114,21 @@ mod platform {
     /// answer this host has not established would be worse than none, because somebody would plan
     /// around it.
     ///
-    /// A Mac with no graphical domain to put a job in is served by the detached supervisor, and
-    /// the answer says so rather than naming a mechanism this host did not select.
+    /// A daemon that found no graphical domain to put a job in when it started is served by the
+    /// detached supervisor, and the answer says so rather than naming a mechanism this host did not
+    /// select. launchd is still there on such a Mac, so the answer is not that the host has no
+    /// service manager to ask: what a logout does to a detached process is not established either.
     pub(super) fn headless_persistence(
         supervisor: &str,
     ) -> (LogoutPersistence, &'static str, &'static str) {
         if supervisor == crate::supervision::DETACHED_DESCRIPTION {
             return (
-                LogoutPersistence::NoServiceManager,
+                LogoutPersistence::NotEstablished,
                 "a detached process, reparented to the system's first process",
-                "This host starts a session's worker as a detached process, because it has no \
-                 graphical domain to put a launchd job in. What a logout does to it is the \
-                 platform's own behaviour and this host does not claim to know it.",
+                "This daemon started a session's worker as a detached process, because this host \
+                 had no graphical domain to put a launchd job in when the daemon started. What a \
+                 logout does to that process is the platform's own behaviour and this host does \
+                 not claim to know it, so it is not established.",
             );
         }
         (
@@ -150,10 +153,10 @@ mod platform {
     /// The setting is the user's own, it is enabled by an explicit choice, and this host never
     /// enables it as a side effect of installing itself or of creating a session.
     ///
-    /// A host whose daemon selected the detached supervisor has no such setting either. That is
-    /// reported as what it is rather than as a choice the person could make, because on such a
-    /// host a worker is a detached process and what a logout does to it is the platform's own
-    /// behaviour.
+    /// A daemon that selected the detached supervisor has no such setting to report either. That
+    /// is reported as what it is rather than as a choice the person could make, because the
+    /// daemon's workers are detached processes and what a logout does to them is the platform's
+    /// own behaviour.
     pub(super) fn headless_persistence(
         supervisor: &str,
     ) -> (LogoutPersistence, &'static str, &'static str) {
@@ -161,9 +164,10 @@ mod platform {
             return (
                 LogoutPersistence::NoServiceManager,
                 "a detached process, reparented to the system's first process",
-                "This host has no per-user service manager, so a session's worker is a detached \
-                 process rather than a service. What a logout does to it is the platform's own \
-                 behaviour and this host does not claim to know it.",
+                "This daemon found no per-user service manager when it started, so it starts a \
+                 session's worker as a detached process rather than as a service. What a logout \
+                 does to that process is the platform's own behaviour and this host does not claim \
+                 to know it.",
             );
         }
         let (persistence, detail) = if super::agent::lingering(kr_ipc::paths::current_uid()) {
