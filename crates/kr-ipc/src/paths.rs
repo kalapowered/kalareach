@@ -697,6 +697,8 @@ fn create_missing_parents(parent: &Path) -> Result<()> {
 /// Returns an error when the directory cannot be created, or when it exists with the wrong owner
 /// or permissions.
 pub fn create_private_directory(path: &Path) -> Result<()> {
+    let named = without_final_separator(path);
+    let path = named.as_path();
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return Err(IpcError::io(
@@ -726,6 +728,15 @@ pub fn create_private_directory(path: &Path) -> Result<()> {
     let metadata =
         std::fs::symlink_metadata(path).map_err(|error| IpcError::io("inspect", path, error))?;
     check_owner_only(path, &metadata)
+}
+
+/// `path` without a final separator.
+///
+/// The operating system resolves a symbolic link whose name ends in a separator, so the name `link/`
+/// is looked up as the directory the link points to, and the link goes unseen. A root given that
+/// way has to be looked at as the name it is.
+fn without_final_separator(path: &Path) -> PathBuf {
+    path.components().collect()
 }
 
 /// Creates one owner-only directory that was not there, and says whether it did.
