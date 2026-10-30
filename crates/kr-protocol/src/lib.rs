@@ -176,6 +176,7 @@ pub mod schema;
 pub mod semantic;
 pub mod service;
 pub mod session;
+pub mod session_processes;
 pub mod sharing;
 pub mod skill;
 pub mod sync;

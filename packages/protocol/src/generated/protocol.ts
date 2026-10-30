@@ -2060,6 +2060,22 @@ export type PrivacySessionStanding =
       state: 'worker_ended'
     }
 /**
+ * How the boot the record was written in compares with this boot.
+ */
+export type ProcessBoot = 'same' | 'earlier' | 'unrecorded' | 'incomparable'
+/**
+ * What the list is.
+ */
+export type ProcessListing = 'recorded'
+/**
+ * What a listed process is to the session.
+ */
+export type ProcessRole = 'root' | 'backend' | 'descendant'
+/**
+ * What the operating system says of a recorded process now.
+ */
+export type ProcessStanding = 'running' | 'ended' | 'unknown'
+/**
  * One directory the owner authorised for repository work.
  */
 export type ProjectLocationId = string
@@ -3116,6 +3132,10 @@ export interface KalaReachProtocol {
   privacy_set_params?: PrivacySetParams
   privacy_status_params?: PrivacyStatusParams
   privacy_unavailable?: PrivacyUnavailable
+  process_boot?: ProcessBoot
+  process_listing?: ProcessListing
+  process_role?: ProcessRole
+  process_standing?: ProcessStanding
   project_adopt_params?: ProjectAdoptParams
   project_adopt_result?: ProjectAdoptResult
   project_clone_params?: ProjectCloneParams
@@ -3235,6 +3255,9 @@ export interface KalaReachProtocol {
   session_list_result?: SessionListResult
   session_open_params?: SessionOpenParams
   session_open_result?: SessionOpenResult
+  session_process?: SessionProcess
+  session_processes_params?: SessionProcessesParams
+  session_processes_result?: SessionProcessesResult
   session_read_params?: SessionReadParams
   session_read_result?: SessionReadResult
   session_ref?: SessionRef
@@ -19286,6 +19309,7 @@ export interface MethodEntry {
     | 'session.list'
     | 'session.create'
     | 'session.read'
+    | 'session.processes'
     | 'session.open'
     | 'session.close'
     | 'session.describe'
@@ -28396,6 +28420,7 @@ export interface ServiceRequestPayload {
     | 'session.list'
     | 'session.create'
     | 'session.read'
+    | 'session.processes'
     | 'session.open'
     | 'session.close'
     | 'session.describe'
@@ -29201,6 +29226,106 @@ export interface SessionOpenParams {
    * serves the host's own reads and no session's worker.
    */
   session_id: SessionId | null
+}
+/**
+ * One recorded process.
+ */
+export interface SessionProcess {
+  /**
+   * The base name of its executable, for a running row whose executable the platform gives, as
+   * lossy UTF-8 of at most [`MAX_PROCESS_NAME_BYTES`] bytes. Null for every other row.
+   */
+  name: string | null
+  /**
+   * Its parent when it was read, as an identity, for a running row whose parent the platform
+   * gives. Null for every other row.
+   */
+  parent: ProcessStartIdentity4 | null
+  process: ProcessStartIdentity8
+  /**
+   * What it is to the session.
+   */
+  role: 'root' | 'backend' | 'descendant'
+  /**
+   * What the operating system says of it now.
+   */
+  state: 'running' | 'ended' | 'unknown'
+}
+/**
+ * A process and the kernel's record of when it started.
+ *
+ * Every ownership check compares both fields. A process identifier alone can be reused by an
+ * unrelated program within milliseconds of the original exiting, so the host never terminates,
+ * adopts or trusts a process on its identifier alone.
+ */
+export interface ProcessStartIdentity8 {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  pid: string
+  /**
+   * Where the start value came from.
+   */
+  source:
+    | 'linux_proc_stat'
+    | 'macos_proc_bsd_info'
+    | 'windows_process_creation_time'
+    | 'windows_process_start_seconds'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  start_value: string
+}
+/**
+ * Parameters of `session.processes`.
+ */
+export interface SessionProcessesParams {
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * The result of `session.processes`.
+ */
+export interface SessionProcessesResult {
+  /**
+   * How the boot of the record compares with this one.
+   */
+  boot: 'same' | 'earlier' | 'unrecorded' | 'incomparable'
+  /**
+   * What the session's ownership rests on, in the worker's own words, cut at
+   * [`MAX_PROCESS_BOUNDARY_BYTES`] bytes.
+   */
+  boundary: string
+  /**
+   * The control group the worker ran in, on a platform that has them, cut at
+   * [`MAX_PROCESS_CGROUP_BYTES`] bytes.
+   */
+  cgroup: string | null
+  /**
+   * What cannot be established about the session's processes: the host's own sentences first,
+   * then at most [`MAX_PROCESS_LIMITS`] of the worker's, each cut at
+   * [`MAX_PROCESS_LIMIT_BYTES`] bytes, and a last sentence counting the worker's that were left
+   * out.
+   */
+  limits: string[]
+  /**
+   * What the list is.
+   */
+  listing: 'recorded'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  omitted: string
+  /**
+   * The recorded processes: the root, then the servers, then the rest by start.
+   */
+  processes: SessionProcess[]
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
 }
 /**
  * Parameters of `session.read`.
@@ -32429,7 +32554,7 @@ export interface WorkerDescriptor {
    * One installed OS, distribution or container environment and OS user.
    */
   environment_id: string
-  process_start_identity: ProcessStartIdentity8
+  process_start_identity: ProcessStartIdentity9
   protocol_version: ProtocolVersion8
   /**
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
@@ -32476,7 +32601,7 @@ export interface BootIdentity9 {
  * unrelated program within milliseconds of the original exiting, so the host never terminates,
  * adopts or trusts a process on its identifier alone.
  */
-export interface ProcessStartIdentity8 {
+export interface ProcessStartIdentity9 {
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
