@@ -237,6 +237,48 @@ struct Running {
     system_limit: Option<kr_ipc::memory_limit::MemoryLimit>,
 }
 
+/// Ends and collects a process when it is dropped, unless it was kept: what leaves no process
+/// behind when a start fails, or panics, after it created one. A process created held does not run,
+/// so it never reads that its input or its owner has gone, and nothing else would end it.
+struct EndedUnlessKept<'a> {
+    child: &'a mut Child,
+    kept: bool,
+}
+
+impl<'a> EndedUnlessKept<'a> {
+    const fn new(child: &'a mut Child) -> Self {
+        Self { child, kept: false }
+    }
+
+    /// Lets the process live on: it is the driver's now.
+    fn keep(mut self) {
+        self.kept = true;
+    }
+}
+
+impl std::ops::Deref for EndedUnlessKept<'_> {
+    type Target = Child;
+
+    fn deref(&self) -> &Child {
+        self.child
+    }
+}
+
+impl std::ops::DerefMut for EndedUnlessKept<'_> {
+    fn deref_mut(&mut self) -> &mut Child {
+        self.child
+    }
+}
+
+impl Drop for EndedUnlessKept<'_> {
+    fn drop(&mut self) {
+        if !self.kept {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
 /// What kind of work a cancellation is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -737,34 +779,33 @@ impl Driver {
             );
             ProcessEnd::CouldNotStart
         })?;
+        // Until the process is kept, every return below, and a panic, ends and collects it.
+        let mut created = EndedUnlessKept::new(&mut child);
         // The threads end on their own when what they wait for is dropped, which is what happens
         // to both on every return below.
-        let handed = match (child.stdin.take(), child.stdout.take()) {
+        let handed = match (created.stdin.take(), created.stdout.take()) {
             (Some(input), Some(output)) => {
                 give_input.send(input).is_ok() && give_output.send(output).is_ok()
             }
             _ => false,
         };
         if !handed {
-            let _ = child.kill();
-            let _ = child.wait();
             return Err(ProcessEnd::CouldNotStart);
         }
         #[cfg(windows)]
         let system_limit = if hold {
-            self.limit_in_the_system(&child)
+            self.limit_in_the_system(&created)
         } else {
             None
         };
-        if let Err(why) = self.let_run(&child) {
+        if let Err(why) = self.let_run(&created) {
             eprintln!(
                 "kr-describe: {} could not be let run: {why}",
                 self.launch.program.display()
             );
-            let _ = child.kill();
-            let _ = child.wait();
             return Err(ProcessEnd::CouldNotStart);
         }
+        created.keep();
         self.started = self.started.saturating_add(1);
         reports.push(Report::Started { pid: child.id() });
         self.process = Some(Running {
@@ -828,7 +869,7 @@ impl Driver {
         use std::os::windows::io::AsHandle as _;
 
         #[cfg(feature = "testing")]
-        crate::testing::before_the_limit();
+        crate::testing::before_the_limit(child.id());
         kr_ipc::memory_limit::MemoryLimit::around(child.as_handle(), self.service.ceiling_bytes())
             .inspect_err(|why| {
                 eprintln!(

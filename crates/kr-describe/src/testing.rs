@@ -76,6 +76,11 @@ pub(crate) fn thread_start_refused(name: &str) -> bool {
     })
 }
 
+/// What runs before a process is put behind the system's memory limit, given the process's
+/// identifier.
+#[cfg(windows)]
+type LimitHook = Box<dyn FnOnce(u32)>;
+
 thread_local! {
     /// Whether a driver on this thread fails to read its own start identity next.
     static IDENTITY_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -92,27 +97,28 @@ thread_local! {
     /// What runs the next time a driver on this thread is about to put its process behind the
     /// system's memory limit.
     #[cfg(windows)]
-    static BEFORE_LIMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+    static BEFORE_LIMIT: std::cell::RefCell<Option<LimitHook>> =
         const { std::cell::RefCell::new(None) };
 
     /// Whether a driver on this thread is refused when it next lets its process run.
     static LET_RUN_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Runs `hook` the next time a driver on this thread is about to put its process behind the
-/// system's memory limit: the process exists, and if it was created held it has not run. This is
-/// the last point before the limit, so a process that is let run anywhere before it has the time
-/// the hook takes to do what it likes with no limit around it.
+/// Runs `hook`, given the identifier of the process, the next time a driver on this thread is about
+/// to put its process behind the system's memory limit: the process exists, and if it was created
+/// held it has not run. This is the last point before the limit, so a process that is let run
+/// anywhere before it has the time the hook takes to do what it likes with no limit around it, and
+/// a hook that panics is a start that fails after it created the process.
 #[cfg(windows)]
-pub fn before_the_next_limit(hook: impl FnOnce() + 'static) {
+pub fn before_the_next_limit(hook: impl FnOnce(u32) + 'static) {
     BEFORE_LIMIT.with(|held| *held.borrow_mut() = Some(Box::new(hook)));
 }
 
-/// Runs the hook [`before_the_next_limit`] set, once.
+/// Runs the hook [`before_the_next_limit`] set, once, for the process with the identifier `pid`.
 #[cfg(windows)]
-pub(crate) fn before_the_limit() {
+pub(crate) fn before_the_limit(pid: u32) {
     if let Some(hook) = BEFORE_LIMIT.with(|held| held.borrow_mut().take()) {
-        hook();
+        hook(pid);
     }
 }
 

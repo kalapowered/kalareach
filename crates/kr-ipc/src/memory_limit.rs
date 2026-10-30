@@ -25,8 +25,11 @@
 //! committed already. So a process that is to be held to a limit is created held ([`start_held`]),
 //! put behind the limit, and only then let run ([`resume`]): it never runs outside the limit.
 //!
-//! The job does not end the processes in it when its last handle closes: it limits memory and
-//! nothing else, so what ends the process stays with the process's owner.
+//! The job ends the processes in it when its last handle closes. A process that was created held
+//! never runs, so it never reads the end of its input or the end of its owner, and nothing in it
+//! would end it: the job is what does, so an owner that ends, or that loses the limit before it
+//! lets the process run, does not leave a process that never ran. The owner keeps the limit for as
+//! long as the process lives.
 //!
 //! [`around`]: MemoryLimit::around
 
@@ -42,10 +45,10 @@ use std::process::Command;
 use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::IO::{CreateIoCompletionPort, GetQueuedCompletionStatus};
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
-    JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JobObjectAssociateCompletionPortInformation, JobObjectExtendedLimitInformation,
-    QueryInformationJobObject, SetInformationJobObject,
+    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOBOBJECT_ASSOCIATE_COMPLETION_PORT,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectAssociateCompletionPortInformation,
+    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
 };
 use windows_sys::Win32::System::SystemServices::JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT;
 use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
@@ -60,6 +63,10 @@ unsafe extern "system" {
 
 /// Why a limit was not applied.
 pub type Refusal = &'static str;
+
+/// What the job is asked to hold, and what it is read back as holding: the limit on the memory a
+/// process commits, and the end of the process when the job closes.
+const HELD_FLAGS: u32 = JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
 
 /// How far the figure the system holds may be from the one asked for. The system keeps a limit as a
 /// whole number of pages, so a figure that is not one reads back a little different, and the
@@ -95,8 +102,8 @@ pub fn resume(process: BorrowedHandle<'_>) -> std::result::Result<(), Refusal> {
 
 /// A process memory limit the system holds around one process.
 ///
-/// Dropping it closes the job and its port. The process outlives that, and the limit with it for as
-/// long as the process lives.
+/// Dropping it closes the job and its port, and the system ends the process in the job when the
+/// job closes, so it is kept for as long as the process is to live.
 #[derive(Debug)]
 pub struct MemoryLimit {
     /// Kept open for as long as this value lives: the job holds the limit and the process in it.
@@ -108,8 +115,9 @@ pub struct MemoryLimit {
 
 impl MemoryLimit {
     /// Puts the process behind `process` into a job that refuses it more committed memory than
-    /// `limit_bytes`, and reads the limit and the membership back from the system. The limit read
-    /// back is allowed to differ from the one asked for by the rounding the system applies to it.
+    /// `limit_bytes` and ends it when the job closes, and reads the limit and the membership back
+    /// from the system. The limit read back is allowed to differ from the one asked for by the
+    /// rounding the system applies to it.
     ///
     /// The handle must be open on the process with the right to set its quota and to terminate it,
     /// as the one a parent holds of the child it started is, and it stays open for the call. The
@@ -163,7 +171,7 @@ impl MemoryLimit {
         }
 
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+        limits.BasicLimitInformation.LimitFlags = HELD_FLAGS;
         limits.ProcessMemoryLimit = wanted;
         // SAFETY: the call reads one structure of the size given, from a live local.
         let set = unsafe {
@@ -191,7 +199,7 @@ impl MemoryLimit {
             )
         };
         if read == 0
-            || held.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_PROCESS_MEMORY == 0
+            || held.BasicLimitInformation.LimitFlags & HELD_FLAGS != HELD_FLAGS
             || held.ProcessMemoryLimit.abs_diff(wanted) >= ROUNDING
         {
             return Err("this host did not report the memory limit it was given");
@@ -267,12 +275,14 @@ fn size_of<T>(value: &T) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use std::os::windows::io::{AsHandle as _, FromRawHandle as _, OwnedHandle};
+    use std::os::windows::io::{AsHandle as _, AsRawHandle as _, FromRawHandle as _, OwnedHandle};
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
 
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
     use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+        OpenProcess, PROCESS_SET_QUOTA, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
+        WaitForSingleObject,
     };
 
     use super::{MemoryLimit, resume, start_held};
@@ -405,6 +415,79 @@ mod tests {
         let ended = child.wait().expect("the child ends");
         assert_eq!(ended.code(), Some(REFUSED), "the system refused the commit");
         assert!(limit.take_refusal());
+    }
+
+    /// The variable that makes the daemon half below hold a process and end.
+    const DAEMON: &str = "KR_MEMORY_LIMIT_DAEMON";
+
+    /// What the daemon half says before it ends, followed by the identifier of the process it held.
+    const HELD_PROCESS: &str = "held-process-identifier=";
+
+    /// The daemon half of the case below. Run on its own it does nothing and passes. Started by the
+    /// case with the variable set, it starts a process held, puts it behind a limit, names it, and
+    /// ends at once, as a daemon killed from outside does: nothing is dropped and the process is
+    /// never let run.
+    #[test]
+    fn the_daemon_that_ends_with_a_process_held() {
+        if std::env::var_os(DAEMON).is_none() {
+            return;
+        }
+        let child = held_child_asking(512 * MIB);
+        let _limit = MemoryLimit::around(child.as_handle(), 256 * MIB)
+            .expect("the limit is applied to the child");
+        println!("{HELD_PROCESS}{}", child.id());
+        std::io::Write::flush(&mut std::io::stdout()).expect("the name is written");
+        std::process::exit(0);
+    }
+
+    /// A process that was created held and put behind a limit never runs, so it never reads that
+    /// its owner has gone, and without the limit it would stay until the user signs out, holding
+    /// the executable it was made from. The system ends it when the last handle of its job closes,
+    /// which is what happens to the handles of a daemon that ends. The wait is for that fact, with a
+    /// bound for the process that is still there.
+    #[test]
+    fn a_process_held_by_a_daemon_that_ends_is_ended_with_it() {
+        use std::io::BufRead as _;
+
+        let mut daemon = Command::new(std::env::current_exe().expect("this test binary"))
+            .args([
+                "--exact",
+                "memory_limit::tests::the_daemon_that_ends_with_a_process_held",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(DAEMON, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the daemon starts");
+        // A line is read and not the whole output: the held process may have been given the pipe
+        // the daemon writes to, and the pipe is not closed while it lives.
+        let held = std::io::BufReader::new(daemon.stdout.take().expect("a pipe"))
+            .lines()
+            .map_while(Result::ok)
+            .find_map(|line| line.strip_prefix(HELD_PROCESS).map(str::to_owned))
+            .expect("the daemon names the process it held");
+        let held: u32 = held.parse().expect("a process identifier");
+        daemon.wait().expect("the daemon ends");
+
+        // SAFETY: the call takes the identifier of a process and returns a handle or null.
+        let opened = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, held) };
+        if opened.is_null() {
+            // No process has the identifier any more: it is gone.
+            return;
+        }
+        // SAFETY: the handle was just returned by the call above and nothing else owns it.
+        let process = unsafe { OwnedHandle::from_raw_handle(opened.cast()) };
+        let raw: windows_sys::Win32::Foundation::HANDLE = process.as_raw_handle().cast();
+        // SAFETY: the call takes a handle that this function holds open.
+        let waited = unsafe { WaitForSingleObject(raw, 20_000) };
+        if waited != WAIT_OBJECT_0 {
+            // SAFETY: the call takes a handle that this function holds open.
+            unsafe { TerminateProcess(raw, 1) };
+            panic!("the process the daemon held was still there 20 s after the daemon ended");
+        }
     }
 
     /// A handle that may set a process's quota and end it, and may not query it, cannot be asked

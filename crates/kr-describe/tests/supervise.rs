@@ -2156,7 +2156,7 @@ fn a_process_that_commits_memory_as_it_starts_is_refused_by_the_systems_limit() 
     let waiting = runtime.clone();
     // The wait is for a fact about the process, with a bound for the process that cannot say it: a
     // process created held does not run, so it says nothing, and the bound is all that passes.
-    before_the_next_limit(move || {
+    before_the_next_limit(move |_pid| {
         let until = Instant::now() + Duration::from_secs(1);
         while Instant::now() < until
             && !stub::began(&waiting, "committed")
@@ -2177,6 +2177,37 @@ fn a_process_that_commits_memory_as_it_starts_is_refused_by_the_systems_limit() 
         !stub::began(&runtime, "committed"),
         "and the process never held it"
     );
+}
+
+/// KR-REQ-22.10: a start that fails after it created the process leaves no process behind, even
+/// when it fails by a panic, and on Windows the process it created has not run. A process created
+/// held does not run, so it never reads that its owner has gone, and nothing but the start itself
+/// would end it. The start is made to panic at the last point before the limit, and the process
+/// is looked for as soon as the panic has been caught.
+#[cfg(windows)]
+#[test]
+fn a_start_that_panics_after_creating_the_process_leaves_no_held_process() {
+    use kr_describe::testing::before_the_next_limit;
+
+    let mut rig = Rig::limited(&Script::default(), ResourceSettings::default(), None, true);
+    let created = std::rc::Rc::new(std::cell::Cell::new(None));
+    let seen = std::rc::Rc::clone(&created);
+    before_the_next_limit(move |pid| {
+        seen.set(Some(pid));
+        panic!("the start fails after it created the process, as a test asked");
+    });
+    queue(rig.service(), &session(1), Priority::Ordinary, at(0));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rig.driver.turn(&roomy(), at(3_000))
+    }));
+    assert!(outcome.is_err(), "the start panicked");
+    let pid = sysinfo::Pid::from_u32(created.get().expect("the process was created"));
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+    if let Some(left) = system.process(pid) {
+        left.kill();
+        panic!("the process the start created was left behind");
+    }
 }
 
 /// What a process that the system refused memory comes to, whatever the platform: the end is the
