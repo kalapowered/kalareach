@@ -248,7 +248,9 @@ async fn a_headless_session_is_not_on_the_interactive_desktop_and_a_desktop_boun
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_session_that_names_no_profile_is_desktop_bound_where_the_account_has_a_login() {
     let host = WorkerHost::start().await;
-    let created = host.kr_new_as(None, &[]).await;
+    let created = host
+        .kr_new_as(None, &["--shell-mode", "native_compat"])
+        .await;
     assert!(
         created.succeeded(),
         "the session was not created: {}",

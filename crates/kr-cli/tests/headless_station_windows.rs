@@ -23,6 +23,10 @@ mod windows_station;
 use windows_session::WorkerHost;
 use windows_station::{EntryOnInteractive, HeldStation};
 
+/// The arguments of a session that needs no shell package: these cases are about where its worker
+/// starts.
+const NATIVE: &[&str] = &["--shell-mode", "native_compat"];
+
 /// Held by each case for as long as it changes the security of anything.
 static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -36,7 +40,7 @@ async fn a_logon_station_that_admits_more_than_the_starters_own_refuses_the_star
 
     let wider = HeldStation::make(|own| format!("{own}(A;;0x1;;;WD)"))
         .unwrap_or_else(|error| panic!("a station wider than the starter's own: {error}"));
-    let refused = host.kr_new(&[]).await;
+    let refused = host.kr_new(NATIVE).await;
     assert!(
         !refused.succeeded(),
         "a headless session was started on a window station that admits everyone: {}",
@@ -49,7 +53,7 @@ async fn a_logon_station_that_admits_more_than_the_starters_own_refuses_the_star
     );
 
     drop(wider);
-    let after = host.kr_new(&[]).await;
+    let after = host.kr_new(NATIVE).await;
     assert!(
         after.succeeded(),
         "the start after the wider station was gone was refused: {}",
@@ -64,9 +68,9 @@ async fn a_logon_station_that_admits_less_than_the_starters_own_starts_the_worke
     let _alone = ONE_AT_A_TIME.lock().await;
     let host = WorkerHost::start().await;
 
-    let narrower = HeldStation::make(without_system)
+    let narrower = HeldStation::make(without_administrators)
         .unwrap_or_else(|error| panic!("a station narrower than the starter's own: {error}"));
-    let created = host.kr_new(&[]).await;
+    let created = host.kr_new(NATIVE).await;
     assert!(
         created.succeeded(),
         "a headless session was refused a window station that admits less ({}): {}",
@@ -83,7 +87,7 @@ async fn an_entry_added_to_the_interactive_station_does_not_refuse_a_later_headl
     let _alone = ONE_AT_A_TIME.lock().await;
     let host = WorkerHost::start().await;
 
-    let first = host.kr_new(&[]).await;
+    let first = host.kr_new(NATIVE).await;
     assert!(first.succeeded(), "the first session: {}", first.said());
 
     let added = EntryOnInteractive::add()
@@ -95,7 +99,7 @@ async fn an_entry_added_to_the_interactive_station_does_not_refuse_a_later_headl
         list.contains("S-1-5-5-0-4242424"),
         "the entry is not on the interactive station: {list}"
     );
-    let second = host.kr_new(&[]).await;
+    let second = host.kr_new(NATIVE).await;
     assert!(
         second.succeeded(),
         "a headless start was refused after an entry was added to the interactive station: {}",
@@ -103,15 +107,21 @@ async fn an_entry_added_to_the_interactive_station_does_not_refuse_a_later_headl
     );
 }
 
-/// The station's access list without the entry for the local system, which the account does not
-/// need to use the station.
-fn without_system(own: &str) -> String {
-    const TRUSTEE: &str = ";;;SY)";
-    let at = own
-        .find(TRUSTEE)
-        .unwrap_or_else(|| panic!("the interactive station admits the local system: {own}"));
-    let start = own[..at]
-        .rfind('(')
-        .unwrap_or_else(|| panic!("the entry has no start: {own}"));
-    format!("{}{}", &own[..start], &own[at + TRUSTEE.len()..])
+/// The station's access list without the entry for the administrators that applies to the station
+/// itself, which the account does not need to use the station.
+fn without_administrators(own: &str) -> String {
+    const TRUSTEE: &str = ";;;BA)";
+    let mut from = 0;
+    while let Some(found) = own[from..].find(TRUSTEE) {
+        let at = from + found;
+        let start = own[..at]
+            .rfind('(')
+            .unwrap_or_else(|| panic!("the entry has no start: {own}"));
+        let flags = own[start + 1..at].split(';').nth(1).unwrap_or_default();
+        if !flags.contains("IO") {
+            return format!("{}{}", &own[..start], &own[at + TRUSTEE.len()..]);
+        }
+        from = at + TRUSTEE.len();
+    }
+    panic!("the interactive station has no entry for the administrators that applies to it: {own}")
 }
