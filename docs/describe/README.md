@@ -151,8 +151,8 @@ the state is `resource_paused`, the reason is named, and the deterministic title
   as a wireless mouse or a phone on a cable) is not the host's power and is left out.
 - **Thermal or memory pressure** pauses it even on mains. Heat is read from what each platform
   reports: the system's thermal pressure level on macOS, on Intel and on Apple silicon alike
-  (nominal reads as cool, moderate as elevated, and heavy or beyond as critical), the passive limit
-  of each thermal zone on Windows, and each thermal zone's temperature against its own first trip
+  (nominal reads as cool, moderate as elevated, and heavy or beyond as critical; a level that is
+  never posted reads as nominal), the passive limit of each thermal zone on Windows, and each thermal zone's temperature against its own first trip
   point on Linux. A platform that reports nothing leaves heat unread, and an unread signal does not
   pause.
 - When pressure clears, the host resumes on the next evaluation. Nothing is restarted: the queue
@@ -489,7 +489,7 @@ A page of facts is applied under privacy mode's admission at the generation it w
 
 The host reads the memory, power and thermal conditions of the machine every ten seconds, on a thread of its own, because reading the state of the platform can start a program. A reading more than a minute old says nothing: every signal is then unqualified, and the policy pauses rather than trusting the last answer.
 
-Power and heat come from the facility each platform documents. On macOS, power comes from `pmset -g ps` and heat from the processor speed limit that `pmset -g therm` reports; on the Apple silicon Mac this was tried on, the command printed only notes that no warning level had been recorded and no speed limit, and the reader then says nothing about heat. On Linux, power comes from the kernel's power-supply class and heat from each thermal zone against its own first trip point. On Windows, power comes from the system's power-status call, which puts a machine with no battery on mains, and heat from the passive limit of each thermal zone's performance counters, the share of the processors' top speed the platform allows because of heat. The worst zone that was read decides there. A zone that was listed and gave no usable reading keeps the host from reading as nominal, so heat is unqualified unless another zone shows it, and a machine that lists no zone says nothing about heat. A platform with no reader says nothing about either: the policy treats that as battery for power and does not pause for heat.
+Power and heat come from the facility each platform documents. On macOS, power comes from `pmset -g ps` and heat from the system's thermal pressure level, which Intel and Apple silicon Macs both post: nominal reads as cool, moderate as elevated, and heavy or beyond as critical. A level that is never posted reads as nominal, because the system gives the same state for a name nobody posts as for a cool machine, so a Mac that never posts one reads as cool and not as unread. On Linux, power comes from the kernel's power-supply class and heat from each thermal zone against its own first trip point. On Windows, power comes from the system's power-status call, which puts a machine with no battery on mains, and heat from the passive limit of each thermal zone's performance counters, the share of the processors' top speed the platform allows because of heat. The worst zone that was read decides there. A zone that was listed and gave no usable reading keeps the host from reading as nominal, so heat is unqualified unless another zone shows it, and a machine that lists no zone says nothing about heat. A platform with no reader says nothing about either: the policy treats that as battery for power and does not pause for heat.
 
 The description process is a child of the control daemon. It is located next to the executable of the worker. It is started when work is first due.
 
