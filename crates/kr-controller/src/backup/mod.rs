@@ -2396,4 +2396,40 @@ mod tests {
             "the registration is taken while the store is held"
         );
     }
+
+    /// A setup the person makes is admitted inside the hold of the store, in the same order. A
+    /// change of privacy mode that holds the store waits for the registration, so a setup that
+    /// held the registration and waited for the store would wait for the change, and the change
+    /// for the setup.
+    #[test]
+    fn a_setup_is_admitted_inside_the_hold_of_the_store() {
+        let root = tempfile::tempdir().expect("a disposable directory");
+        let service = BackupService::in_memory(&root.path().join("backup")).expect("a service");
+        let device = kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a key");
+        let record = SetupRecord {
+            archive_id: ArchiveId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16])),
+            origin: "https://storage.example".to_owned(),
+            account_mark: [9; 32],
+            recovery_public_key: *device.public(),
+            kit_fingerprint: "ABCD2345".to_owned(),
+            writer_key_id: device.key_id(),
+            producer_key_id: device.key_id(),
+            enabled_at_ms: TimestampMs::new(1),
+        };
+        let admitted_with_the_store_held = Cell::new(None);
+        // The admission is asked for first; its answer here is a refusal, so that nothing is
+        // written.
+        let refused = service.commit_setup(&record, false, TimestampMs::new(1), &|_| {
+            admitted_with_the_store_held.set(Some(service.store.try_lock().is_err()));
+            Err(ControllerError::PermissionDenied {
+                detail: "refused here".to_owned(),
+            })
+        });
+        assert!(refused.is_err(), "the admission's refusal is the answer");
+        assert_eq!(
+            admitted_with_the_store_held.get(),
+            Some(true),
+            "the registration is taken while the store is held"
+        );
+    }
 }
