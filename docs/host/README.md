@@ -2275,11 +2275,11 @@ installed.
 
 ### The enrolled environments, and the cached inventory
 
-An enrolment (`environment.enrol`) records the identity the platform issued, the operating-system user the helper runs
-as, and the absolute path of the helper installed there. The label is what a person types; it
-selects a record and is never compared as an identity, so a container destroyed and recreated under
-the same name does not inherit the old record. The environment identifier selects a record too,
-which is how two records that share a label are told apart.
+An enrolment (`environment.enrol`) records the identity the platform issued, the operating-system
+user the helper runs as, and the absolute path of the helper installed there. The label is what a
+person types; it selects a record and is never compared as an identity, so a container destroyed and
+recreated under the same name does not inherit the old record. The environment identifier selects a
+record too, which is how two records that share a label are told apart.
 
 A container is recorded by the whole identifier its runtime issued. A name is not an identity, and
 neither is a short prefix of an identifier: a runtime resolves either to whichever container
@@ -5918,13 +5918,13 @@ authority, because one window suppresses the owner's delivery rather than one ac
 
 ### Acknowledgement
 
-An acknowledgement (`attention.acknowledge`) is one actor's, and it names each item by its key and the revision it was
-read at. An item's revision moves when the item is raised and at each new occurrence of its
-condition, so an acknowledgement covers what the actor saw and no more: a later occurrence is
-outstanding for that actor again. A key whose item has gone, moved past the named revision or is
-outside what the actor may see records nothing and is answered as stale; a revision beyond the
-item's own refuses the whole request with nothing written. Each actor has one revision for the
-environment, advanced by its acknowledgements of attention, review and visits.
+An acknowledgement (`attention.acknowledge`) is one actor's, and it names each item by its key and
+the revision it was read at. An item's revision moves when the item is raised and at each new
+occurrence of its condition, so an acknowledgement covers what the actor saw and no more: a later
+occurrence is outstanding for that actor again. A key whose item has gone, moved past the named
+revision or is outside what the actor may see records nothing and is answered as stale; a revision
+beyond the item's own refuses the whole request with nothing written. Each actor has one revision
+for the environment, advanced by its acknowledgements of attention, review and visits.
 
 Every change the group makes is the daemon's own action: its record is committed in the same
 transaction as its effect, the admission it carries is checked again inside that transaction
@@ -5941,10 +5941,10 @@ nothing, reopens no completed review and is not a change since anybody's visit. 
 beside that turn is weighed separately, so one arriving at a version the host has not seen is
 recorded, is review work again, and is a change since a visit, whatever the turn beside it said.
 
-A review acknowledgement (`review.acknowledge`) records that one actor read one version of one subject: a completed turn,
-or a captured change set. It approves no command, applies no patch and changes no Git state.
-Section 14 makes promotion a separate authorised action, and the engine has no operation that
-performs one, so that holds by construction rather than by policy.
+A review acknowledgement (`review.acknowledge`) records that one actor read one version of one
+subject: a completed turn, or a captured change set. It approves no command, applies no patch and
+changes no Git state. Section 14 makes promotion a separate authorised action, and the engine has no
+operation that performs one, so that holds by construction rather than by policy.
 
 An acknowledgement binds the version it was made against. When a later version arrives the subject
 is outstanding again, because a new change is new review work and an acknowledgement of an earlier
@@ -5963,12 +5963,12 @@ actor than the store admits are all rejections, not outcomes nobody can establis
 ### Changed since a visit
 
 A visit records how far one actor has read in one session, and never moves backwards. Each session
-has a change log of its own, of the last thousand changes and up to sixty-four ranges it has let
-go of. The view (`visit.changed`) compares the visit's cursor with that log and answers with three separate things:
-the authoritative changes, the ranges that are missing, and a model summary when one covers the
-interval. The three never merge. A summary names the interval it was written from and cannot stand
-in for an event; a gap is not an absence of changes but a statement that the host cannot say what
-was there.
+has a change log of its own, of the last thousand changes and up to sixty-four ranges it has let go
+of. The view (`visit.changed`) compares the visit's cursor with that log and answers with three
+separate things: the authoritative changes, the ranges that are missing, and a model summary when
+one covers the interval. The three never merge. A summary names the interval it was written from and
+cannot stand in for an event; a gap is not an absence of changes but a statement that the host
+cannot say what was there.
 
 A log view's source offset and its filter travel with the visit. They come back after a reconnect,
 each view keeps its own position when a client switches between two, and a view whose range
