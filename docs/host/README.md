@@ -973,7 +973,7 @@ three resources at that moment, and a create finds the first that is short:
 | Resource | A create is refused when | Why |
 | --- | --- | --- |
 | `storage` | the filesystem that holds the state directory has less than 64 MiB free to this account | a session writes its history, its journal and the worker's record from its first moments, and its closure writes the final status there |
-| `terminals` | this host cannot open a pseudo-terminal | the worker opens one for the root shell, and a host out of terminals or of descriptors to open one with says so here and not in a worker that has already started |
+| `terminals` | this host cannot open a pseudo-terminal pair: grant and unlock the master, and open the slave it names, each closed on exec | the worker opens a pair for the root shell, and a host out of terminals or of descriptors to open them with says so here and not in a worker that has already started |
 | `processes` | this account may start fewer than 64 more processes under the daemon's own `RLIMIT_NPROC`, counted over every thread on Linux and every process on macOS | a session starts a worker and a root shell, and the shell's startup files and the person's first commands start more |
 
 The refusal is `RESOURCE_UNAVAILABLE` and names the resource and the figures it found. The three
@@ -4318,9 +4318,14 @@ saying the same, and the worker's service holds, beside the session's group, not
 and processes the session recorded. The account may write a process into its service's own list, or
 make a group of its own below the service and move there, which leaves the session's group and
 everything the session reads; the closure walks the whole service and does not call the session
-covered while one is there. A process the worker runs for itself (a probe, a query of the login
-manager) is one the session did not record, so a close that finds one still running reads
-incomplete rather than complete. A group that is not
+covered while one is there. No reading of the service can close one race while the worker is in it:
+a process that moves between two of its groups while the walk reads them can be in none of the
+lists, and the service's own `populated` line always reads 1 because the worker is in it, so such a
+process can be missed and the closure read complete while it runs; it ends when the worker exits and
+the manager stops the service. The session's group has no such gap, because its `populated` line is
+asked. A process the worker runs for itself (a probe, a query of the login manager) is one the
+session did not record, so a close that finds one still running reads incomplete rather than
+complete. A group that is not
 there holds nothing when its parent is there to say so, as the kernel removes only an empty group; a
 group below it that goes while the listing runs holds nothing and does not void the rest; a group
 that cannot be listed, or that holds more groups than a session makes, is something the host could
@@ -4375,10 +4380,11 @@ user's service manager, the daemon starts in that service, and the end of the se
 the user service manager has answered about that service, the daemon moves into its own transient
 scope `kr-daemon-<id>.scope`, before it starts serving. It doesn't move on macOS, or if there is no
 service manager on a Linux host, or if `systemd-run` cannot be used, or if it was started in a group
-below the service. If the manager takes the request for the scope but refuses it, the start fails
-and `kr new` will say that the daemon didn't answer and name the log of the daemon. If the daemon is
-in the service, i.e. its own control group is the service, `kr doctor` will mention the service,
-otherwise it won't mention anything about it.
+below the service other than the session's group and the groups below that one. If the manager takes
+the request for the scope but refuses it, the start fails and `kr new` will say that the daemon
+didn't answer and name the log of the daemon. If the daemon is in the service, i.e. its own control
+group is the service or the session's group of that service or a group below that one, `kr doctor`
+will mention the service, otherwise it won't mention anything about it.
 
 Until it moves, and if it doesn't move at all, two things can end the daemon together with the
 session. When the service ends, it will end all the processes in the service, whether they are

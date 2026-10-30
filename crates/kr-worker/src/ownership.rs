@@ -2282,6 +2282,28 @@ mod tests {
         assert_eq!(owned.coverage(), OwnershipCoverage::Complete);
     }
 
+    /// KR-REQ-07.60: a forced end of a session whose boundary is a control group writes `1` to the
+    /// group's `cgroup.kill`, which ends everything in the group and in the groups below it at
+    /// once, and not only the processes the record names. The kernel's file is a directory's file
+    /// here, so the write is what the case reads back.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_forced_end_writes_to_the_groups_kill_file() {
+        let (_groups, session) = an_empty_group();
+        let kill = session.join("cgroup.kill");
+        std::fs::write(&kill, "").expect("the kernel's file");
+        let owned = OwnedProcesses::establish(
+            OwnershipBoundary::ControlGroup { path: session },
+            identity(u64::from(u32::MAX) + 1),
+        );
+        force_stop(&owned);
+        assert_eq!(
+            std::fs::read_to_string(&kill).expect("reads the file back"),
+            "1",
+            "the group was ended with one write"
+        );
+    }
+
     /// KR-REQ-07.60: lists are read one group at a time, and a process that moved between two of
     /// them while they were read can be in none; the kernel's `populated` line is the answer for
     /// the whole group, and a group it says is populated is not empty whatever the lists said.

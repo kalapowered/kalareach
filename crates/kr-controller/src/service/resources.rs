@@ -86,8 +86,8 @@ impl HostResources {
             return Some(Shortfall {
                 resource: "storage",
                 detail: format!(
-                    "{} has {free} bytes free and a session needs at least {}",
-                    state_directory.display(),
+                    "the state directory's filesystem has {free} bytes free and a session needs \
+                     at least {}",
                     self.minimum_free_storage
                 ),
             });
@@ -113,15 +113,23 @@ impl HostResources {
     }
 }
 
-/// Opens a pseudo-terminal and closes it again.
+/// Opens a pseudo-terminal pair and closes it again.
 ///
-/// The worker opens one for the root shell. Whether this host can is the reading: a host out of
-/// terminals, or of descriptors to open one with, says so here and not in a worker that has already
-/// been started.
+/// The worker opens a pair for the root shell: the master, then the slave once the master is
+/// granted and unlocked. Whether this host can do all of it is the reading: a host out of
+/// terminals, or of descriptors to open them with, says so here and not in a worker that has
+/// already been started.
 #[cfg(unix)]
 fn measure_terminal() -> std::io::Result<()> {
-    // Closed on exec, as the worker's own are: this daemon starts programs from other threads, and
-    // one that started while this was open would hold the terminal for its whole life.
+    open_pair().map(drop)
+}
+
+/// A pseudo-terminal pair, the master first, with both ends closed on exec.
+///
+/// Closed on exec, as the worker's own are: this daemon starts programs from other threads, and
+/// one that started while a pair was open would hold the terminal for its whole life.
+#[cfg(unix)]
+fn open_pair() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
     #[cfg(target_os = "linux")]
     let master = rustix::pty::openpt(
         rustix::pty::OpenptFlags::RDWR
@@ -135,8 +143,15 @@ fn measure_terminal() -> std::io::Result<()> {
         rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NOCTTY | rustix::fs::OFlags::CLOEXEC,
         rustix::fs::Mode::empty(),
     )?;
-    drop(master);
-    Ok(())
+    rustix::pty::grantpt(&master)?;
+    rustix::pty::unlockpt(&master)?;
+    let name = rustix::pty::ptsname(&master, Vec::new())?;
+    let slave = rustix::fs::open(
+        name.as_c_str(),
+        rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NOCTTY | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?;
+    Ok((master, slave))
 }
 
 /// A Windows worker's console is not measured here.
@@ -199,6 +214,25 @@ mod tests {
         assert!((host.open_terminal)().is_ok());
         assert!((host.process_headroom)().is_ok());
         assert_eq!(host.shortfall(&directory), None);
+    }
+
+    /// The terminal the probe opens is a pair: the master and a slave that is a terminal, both
+    /// closed on exec. The probe is the pair's opening, so a host that can open a master and not
+    /// the slave it grants is short of terminals.
+    #[cfg(unix)]
+    #[test]
+    fn the_terminal_the_probe_opens_is_a_pair_closed_on_exec() {
+        use std::os::fd::AsFd as _;
+
+        let (master, slave) = open_pair().expect("this host opens a terminal pair");
+        for end in [&master, &slave] {
+            let flags = rustix::io::fcntl_getfd(end).expect("reads the descriptor's flags");
+            assert!(flags.contains(rustix::io::FdFlags::CLOEXEC), "{end:?}");
+        }
+        assert!(
+            rustix::termios::isatty(slave.as_fd()),
+            "the slave end is a terminal"
+        );
     }
 
     /// The filesystem's own reading, against a limit no filesystem meets, names storage. The

@@ -249,12 +249,17 @@ async fn reserved(controller: &Controller) {
 /// shows that the create is refused with `RESOURCE_UNAVAILABLE` naming `resource`, before a
 /// reservation is taken and before the supervisor is asked for a worker.
 ///
-/// The control is the same daemon with the readings it makes of its own host: the same create
-/// then reaches the supervisor, so the refusal was the resource's and not the request's.
+/// The control is the same daemon with the readings it makes of its own host: the same request
+/// then reaches the supervisor, under the token the refused one carried and with the first display
+/// number, so the refusal was the resource's and not the request's, and it recorded and allocated
+/// nothing.
+///
+/// Returns the text of the refusal and the state directory of the environment, for a case that has
+/// more to say about either.
 async fn a_create_short_of(
     resource: &str,
     shorten: impl FnOnce(&mut super::resources::HostResources),
-) {
+) -> (String, std::path::PathBuf) {
     let (temp, controller, asked) = daemon().await;
     let environment_id = temp.environment_id();
     let (connection_id, actor_id) = admitted(&controller).await;
@@ -267,13 +272,15 @@ async fn a_create_short_of(
         bound: DeadlineBound::RequestedTtl,
     };
 
+    let request = create_request(environment_id);
+    let token = request.action_id.get();
     let mut resources = super::resources::HostResources::measured();
     shorten(&mut resources);
     controller.use_host_resources(resources);
     let error = controller
         .session_create(
             &actor_id,
-            &create_request(environment_id),
+            &request,
             carried(&controller, connection_id, accepted),
         )
         .await
@@ -287,11 +294,19 @@ async fn a_create_short_of(
         asked.lock().expect("the record is not poisoned").is_empty(),
         "no worker is started for a create the host has no room for"
     );
+    let message = error.to_string();
     let registry = controller.registry.lock().await;
     assert_eq!(
         registry.occupancy().expect("counts"),
         0,
         "and nothing is reserved for it"
+    );
+    assert!(
+        registry
+            .reservation_for_token(&actor_id, token)
+            .expect("reads the token")
+            .is_none(),
+        "and its token is not recorded"
     );
     drop(registry);
 
@@ -299,27 +314,64 @@ async fn a_create_short_of(
     let _ = controller
         .session_create(
             &actor_id,
-            &create_request(environment_id),
+            &request,
             carried(&controller, connection_id, accepted),
         )
         .await;
     assert_eq!(
         asked.lock().expect("the record is not poisoned").len(),
         1,
-        "with the host's own readings the same create reaches the supervisor"
+        "with the host's own readings the same request reaches the supervisor"
     );
+    let registry = controller.registry.lock().await;
+    let reserved = registry
+        .reservation_for_token(&actor_id, token)
+        .expect("reads the token")
+        .expect("the request the host refused is reserved when it is made again");
+    assert_eq!(
+        reserved.display_number.get(),
+        1,
+        "the refused create took no display number"
+    );
+    (message, controller.paths.state_dir().to_path_buf())
 }
 
 /// KR-REQ-07.14: a create is refused with `RESOURCE_UNAVAILABLE` before anything is spawned when
-/// the state directory's filesystem has less free space than a session needs. A filesystem cannot
-/// be filled without harm to the machine the test runs on, so the reading is a stand-in; the
-/// filesystem's own reading is `resources::tests`.
+/// the filesystem that holds the environment's state directory has less free space than a session
+/// needs. A filesystem cannot be filled without harm to the machine the test runs on, so the
+/// reading is a stand-in that notes which directory it was asked about; the filesystem's own
+/// reading is `resources::tests`. The refusal names the resource and the quantities, and no path:
+/// it reaches a paired device as it is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_create_is_refused_before_a_spawn_when_storage_is_short() {
-    a_create_short_of("storage", |resources| {
-        resources.free_storage = |_| Some(1024);
+    static ASKED_ABOUT: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+    let (message, state_dir) = a_create_short_of("storage", |resources| {
+        resources.free_storage = |directory| {
+            *ASKED_ABOUT
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(directory.to_path_buf());
+            Some(1024)
+        };
     })
     .await;
+    let asked = ASKED_ABOUT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .expect("the reading was asked about a directory");
+    assert_eq!(
+        asked, state_dir,
+        "the filesystem asked about is the environment's state directory's"
+    );
+    assert!(
+        !message.contains(&state_dir.display().to_string()),
+        "the refusal names no path: {message}"
+    );
+    assert!(
+        message.contains("1024")
+            && message.contains(&super::resources::MINIMUM_FREE_STORAGE_BYTES.to_string()),
+        "and names the quantities: {message}"
+    );
 }
 
 /// KR-REQ-07.14: a create is refused with `RESOURCE_UNAVAILABLE` before anything is spawned when

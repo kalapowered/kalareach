@@ -535,7 +535,7 @@ impl Controller {
                 .host_resources
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let state_directory = self.paths.state_root().to_path_buf();
+            let state_directory = self.paths.state_dir().to_path_buf();
             // A measurement that did not finish says nothing about the host, as one that cannot be
             // made does, and the create goes on.
             tokio::task::spawn_blocking(move || resources.shortfall(&state_directory))
