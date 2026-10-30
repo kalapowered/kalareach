@@ -57,7 +57,7 @@ serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 # The workspace forbids unsafe code, which a crate that asks the kernel directly cannot honour. This
-# crate denies it instead and allows it in exactly sixteen modules, each of which says why:
+# crate denies it instead and allows it in exactly seventeen modules, each of which says why:
 # `clock::windows` (the interrupt-time counter), `paths::windows` (owner-only access-control lists),
 # `paths::account` (the system's account database, which a directory-service account is only in),
 # `identity::process_times` (a process's creation time, whether it has exited, and ending it),
@@ -71,9 +71,10 @@ tokio = { workspace = true, features = ["rt-multi-thread"] }
 # `inheritance` (marking, in a forked child, the descriptors it would pass on at `exec`),
 # `install::windows` (a store's junction, the image of a process and the access-control list of a
 # sealed release), `conditions::windows` (the power status and the thermal zones' performance
-# counters), `conditions::macos` (the system's thermal pressure level) and `background::platform`
-# (the I/O class of a thread or a process, and a process's priority class). Nothing else in this
-# crate may relax the rule.
+# counters), `conditions::macos` (the system's thermal pressure level), `memory_limit` (a job
+# object that limits a process's committed memory) and `background::platform` (the I/O class of a
+# thread or a process, and a process's priority class). Nothing else in this crate may relax the
+# rule.
 [lints.rust]
 missing_docs = "warn"
 unsafe_code = "deny"

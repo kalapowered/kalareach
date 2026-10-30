@@ -1653,6 +1653,7 @@ pub(crate) mod tests {
                 working_directory: directory.path().to_path_buf(),
                 environment: Vec::new(),
                 models: directory.path().join("models"),
+                system_memory_limit: false,
             },
             "kr-test/0".to_owned(),
         );

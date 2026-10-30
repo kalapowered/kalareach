@@ -1015,6 +1015,7 @@ fn run_daemon(arguments: &[String]) -> i32 {
         working_directory: runtime_dir.clone(),
         environment: vec![(SCRIPT_VARIABLE.into(), child.into())],
         models: runtime_dir,
+        system_memory_limit: false,
     };
     let service = DescriptionService::new(
         HostPlacement {

@@ -105,6 +105,10 @@ pub struct Launch {
     pub environment: Vec<(OsString, OsString)>,
     /// Where the model files are: `<models>/<profile>/<revision>/<file>`.
     pub models: PathBuf,
+    /// Whether the daemon also asks the operating system to refuse the process memory past its
+    /// ceiling, on a platform that has such a limit (Windows). The daemon's own reading of the
+    /// process ends it past the ceiling either way.
+    pub system_memory_limit: bool,
 }
 
 /// Something the driver's channel carries.
@@ -227,6 +231,10 @@ struct Running {
     /// holds no model, and goes when the check is done.
     worked: bool,
     next_sample_ms: u64,
+    /// The memory limit the operating system holds around the process, when the platform has one
+    /// and it was applied.
+    #[cfg(windows)]
+    system_limit: Option<kr_ipc::memory_limit::MemoryLimit>,
 }
 
 /// What kind of work a cancellation is for.
@@ -730,6 +738,8 @@ impl Driver {
             let _ = child.wait();
             return Err(ProcessEnd::CouldNotStart);
         }
+        #[cfg(windows)]
+        let system_limit = self.limit_in_the_system(&child);
         self.tag = tag;
         self.started = self.started.saturating_add(1);
         reports.push(Report::Started { pid: child.id() });
@@ -745,6 +755,8 @@ impl Driver {
             check: None,
             worked: false,
             next_sample_ms: u64::MAX,
+            #[cfg(windows)]
+            system_limit,
         });
         let hello = Request::Hello {
             build: self.build.clone(),
@@ -758,6 +770,46 @@ impl Driver {
             return Err(why);
         }
         Ok(())
+    }
+
+    /// Asks the operating system to refuse the process memory past the ceiling in force, when the
+    /// launch asks for it, and says nothing of the process otherwise. A limit the system would not
+    /// hold leaves the daemon's own reading as the only ender, which the process's report of its
+    /// ceiling says too.
+    #[cfg(windows)]
+    fn limit_in_the_system(&self, child: &Child) -> Option<kr_ipc::memory_limit::MemoryLimit> {
+        use std::os::windows::io::AsRawHandle as _;
+
+        if !self.launch.system_memory_limit {
+            return None;
+        }
+        kr_ipc::memory_limit::MemoryLimit::around(
+            child.as_raw_handle(),
+            self.service.ceiling_bytes(),
+        )
+        .inspect_err(|why| {
+            eprintln!(
+                "kr-describe: the system's memory limit was not applied to the description \
+                     process, so only the daemon's reading ends it past the ceiling: {why}"
+            );
+        })
+        .ok()
+    }
+
+    /// How a process that closed its end ended: one that the system refused memory past its limit
+    /// ended for memory, and the rest ended as they said.
+    fn how_it_ended(&self, why: ProcessEnd) -> ProcessEnd {
+        #[cfg(windows)]
+        if why == ProcessEnd::Exited
+            && self
+                .process
+                .as_ref()
+                .and_then(|running| running.system_limit.as_ref())
+                .is_some_and(kr_ipc::memory_limit::MemoryLimit::reached)
+        {
+            return ProcessEnd::MemoryCeiling;
+        }
+        why
     }
 
     /// Hands one frame to the writer, or says why the process is not taking it.
@@ -813,6 +865,7 @@ impl Driver {
             Event::Wake => {}
             Event::Closed { tag, why } => {
                 if Some(tag) == current {
+                    let why = self.how_it_ended(why);
                     self.kill(why, now, reports)?;
                 }
             }

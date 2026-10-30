@@ -90,6 +90,7 @@ impl Controller {
                 working_directory: state_dir.clone(),
                 environment: placed.environment,
                 models: crate::describe::host::models_dir(&state_dir),
+                system_memory_limit: true,
             },
             state_dir,
             build: self.build_id.as_str().to_owned(),

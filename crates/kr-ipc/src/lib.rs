@@ -13,8 +13,9 @@
 //! | [`identity`] | The host's boot identity, its boot epoch and a process's start identity, read from the kernel |
 //! | [`install`] | The store of installed releases, which release this process runs, and the hold that keeps it on disk |
 //! | [`clock`] | The machine's own continuous clock, which two host processes can compare |
-//! | [`conditions`] | Where the machine's power comes from and how far its platform holds the processors back for heat, on Windows |
+//! | [`conditions`] | Where the machine's power comes from, on Windows, and how far its platform holds the machine back for heat, on Windows and macOS |
 //! | [`background`] | The background CPU and I/O class of a process or thread, set and read back from the system |
+//! | `memory_limit` | On Windows, a limit on the memory a process may commit that the system holds, with the record of its being reached |
 //! | [`floor`] | The host's one reading of UTC in a boot, a word every host process maps |
 //! | [`peer`] | Peer-credential authentication of a local caller |
 //! | [`starter`] | What an environment's starter and the daemon that hands it a launch need from the platform: the launch pipe, a child checked before it runs, the start claim and the recorded login session |
@@ -74,6 +75,8 @@ pub mod identity;
 #[cfg(all(unix, not(any(target_os = "ios", target_os = "android"))))]
 pub mod inheritance;
 pub mod install;
+#[cfg(windows)]
+pub mod memory_limit;
 pub mod paths;
 pub mod peer;
 pub mod starter;

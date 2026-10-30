@@ -181,6 +181,7 @@ fn the_description_process_runs_the_real_model() {
             working_directory: placed.runtime.clone(),
             environment: Vec::new(),
             models: placed.models.clone(),
+            system_memory_limit: false,
         },
         "kr-describe-tests/0".to_owned(),
     );
@@ -365,6 +366,7 @@ fn the_largest_contexts_are_sent_to_the_real_process_and_none_is_refused_for_its
             working_directory: placed.runtime.clone(),
             environment: Vec::new(),
             models: placed.models.clone(),
+            system_memory_limit: false,
         },
         "kr-describe-tests/0".to_owned(),
     );

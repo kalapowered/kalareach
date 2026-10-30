@@ -70,6 +70,17 @@ impl Rig {
     }
 
     fn over(script: &Script, settings: ResourceSettings, signed: Option<&TestCatalogue>) -> Self {
+        Self::limited(script, settings, signed, false)
+    }
+
+    /// A rig whose process the daemon also asks the operating system to refuse memory past the
+    /// ceiling, where the platform has such a limit.
+    fn limited(
+        script: &Script,
+        settings: ResourceSettings,
+        signed: Option<&TestCatalogue>,
+        system_memory_limit: bool,
+    ) -> Self {
         let placed = Placed::stub();
         let runtime = placed.directory("runtime");
         let store = DescriptionStore::open(&placed.directory("state")).expect("a store");
@@ -101,6 +112,7 @@ impl Rig {
             working_directory: runtime,
             environment,
             models: placed.directory("models"),
+            system_memory_limit,
         };
         let driver = Driver::new(service, launch, "kr-describe-tests/0".to_owned());
         Self { placed, driver }
@@ -1908,6 +1920,9 @@ fn a_publication_past_the_ceiling_stands_and_the_pause_follows_through_the_proce
 /// ceiling is the owner's, below section 22's, and the profile still fits under it, so admission
 /// let the job run. The reading is taken at the turn whose time the test chooses, after the process
 /// has said its memory is in place, so what decides is the process's resident set and never a wait.
+/// The bound is one reading period: a turn just short of the first reading leaves the process
+/// alone, and the turn at it ends the process, so a process over the ceiling is ended by the first
+/// reading taken after it passed.
 #[test]
 fn a_job_whose_process_runs_past_the_owners_ceiling_is_ended_by_the_daemons_sampler() {
     const MIB: u64 = 1 << 20;
@@ -1941,10 +1956,91 @@ fn a_job_whose_process_runs_past_the_owners_ceiling_is_ended_by_the_daemons_samp
         "no turn has read the process's memory yet"
     );
 
+    let short = rig
+        .driver
+        .turn(&roomy(), at(3_000 + SAMPLE_MS - 1))
+        .expect("a turn");
+    assert!(
+        !the_process_ended(&short) && rig.driver.pid().is_some(),
+        "no reading is due before a period has passed: {short:?}"
+    );
     let reports = rig.until(
         &roomy(),
         at(3_000 + SAMPLE_MS),
         "the process ended by its resident set",
+        |reports, _| the_process_ended(reports),
+    );
+    assert!(
+        outcomes(&reports).contains(&&Outcome::ProcessEnded {
+            why: ProcessEnd::MemoryCeiling
+        }),
+        "{reports:?}"
+    );
+    assert!(
+        outcomes(&reports)
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Failed { session_id, .. } if *session_id == session(1))),
+        "the job ends failed, not published and not queued again: {reports:?}"
+    );
+    assert_eq!(rig.driver.pid(), None, "the process is gone");
+    assert_eq!(
+        rig.driver.service().resource_state(),
+        ResourceState::ResourcePaused {
+            reason: PauseReason::MemoryPressure,
+            unloaded: true
+        }
+    );
+    assert!(
+        rig.driver
+            .service()
+            .store()
+            .generated(&session(1))
+            .expect("a read")
+            .is_none(),
+        "nothing was published"
+    );
+    assert_eq!(rig.driver.started(), 1);
+}
+
+/// KR-REQ-22.10: on Windows the operating system holds the ceiling beside the daemon's reading. A
+/// process that asks the system for memory past it is refused, ends because it cannot allocate, and
+/// is reported as memory pressure and not as a crash: nothing is published, the job is not queued
+/// again, and inference pauses until the next load may happen. The daemon's own reading is not what
+/// ends it, since the process never holds the memory the reading would find.
+#[cfg(windows)]
+#[test]
+fn a_process_the_system_refuses_memory_past_the_ceiling_ends_as_memory_pressure() {
+    const MIB: u64 = 1 << 20;
+    let (catalogue, _) = tiny();
+    let fits = catalogue
+        .catalogue()
+        .default_profile()
+        .execution()
+        .resident_estimate
+        .total();
+    assert!(fits < Budgets::DEFAULTS.process_memory_ceiling_bytes);
+    let mut rig = Rig::limited(
+        &Script {
+            hold_bytes: fits + 64 * MIB,
+            generate_until_cancelled: true,
+            mark_work: true,
+            ..Script::default()
+        },
+        ResourceSettings {
+            owner_ceiling_bytes: Some(fits),
+            ..ResourceSettings::default()
+        },
+        Some(&catalogue),
+        true,
+    );
+    queue(rig.service(), &session(1), Priority::Ordinary, at(0));
+    rig.job_sent(at(3_000));
+
+    // At a time before the daemon's first reading of the process, so that the end is the system's.
+    let reports = rig.until(
+        &roomy(),
+        at(3_000 + SAMPLE_MS / 2),
+        "the process ended for want of memory",
         |reports, _| the_process_ended(reports),
     );
     assert!(
