@@ -487,6 +487,125 @@ impl Hosted {
         }
     }
 
+    /// A draft for `session_id` holding one uploaded file that the person is to put in the
+    /// terminal themselves, as the daemon's transfer service holds it, and the path the person is
+    /// given for it.
+    fn a_draft_with_a_path(
+        &self,
+        session_id: SessionId,
+    ) -> (
+        kr_protocol::transfer::DraftRecord,
+        kr_protocol::transfer::AttachmentReadGrant,
+    ) {
+        use kr_protocol::scalars::{Bytes, Digest256};
+        use kr_protocol::transfer::{
+            AgentDraftAddAttachmentParams, AttachmentContribution, ChunkDescriptor,
+            DraftCreateParams, InsertionMethod, UploadBeginParams, UploadChunkParams,
+            UploadFinishParams,
+        };
+        let service = self.controller().transfer().service();
+        let actor =
+            kr_protocol::ids::ActorId::new(format!("local:{}", kr_ipc::paths::current_uid()))
+                .expect("a principal");
+        let bytes = vec![13_u8; 64];
+        let digest = Digest256::from_bytes(kr_cbor::sha256(&bytes));
+        let length = U64::new(bytes.len() as u64);
+        let begun = service
+            .upload_begin(
+                &actor,
+                &UploadBeginParams {
+                    environment_id: self.environment_id,
+                    session_id: Nullable::some(session_id),
+                    device_id: Nullable::null(),
+                    declared_byte_len: length,
+                    declared_digest: digest,
+                    declared_media_type: "image/png".to_owned(),
+                    original_file_name: "shot.png".to_owned(),
+                },
+                None,
+            )
+            .expect("reserves the upload");
+        service
+            .upload_chunk(
+                &actor,
+                &UploadChunkParams {
+                    transfer_id: begun.transfer_id,
+                    chunk: ChunkDescriptor {
+                        index: U64::new(0),
+                        byte_len: length,
+                        digest,
+                    },
+                    bytes: Bytes::new(bytes),
+                },
+                None,
+            )
+            .expect("takes the chunk");
+        let handle = service
+            .upload_finish(
+                &actor,
+                &UploadFinishParams {
+                    transfer_id: begun.transfer_id,
+                    declared_byte_len: length,
+                    declared_digest: digest,
+                },
+                None,
+            )
+            .expect("publishes the attachment")
+            .handle;
+        let created = service
+            .draft_create(
+                &actor,
+                &DraftCreateParams {
+                    environment_id: self.environment_id,
+                    device_id: Nullable::null(),
+                    session_id: Nullable::some(session_id),
+                    application_instance_id: Nullable::null(),
+                    text: "have a look at this".to_owned(),
+                },
+                None,
+            )
+            .expect("creates the draft")
+            .draft;
+        let bound = service
+            .draft_add_attachment(
+                &actor,
+                &AgentDraftAddAttachmentParams {
+                    draft_id: created.draft_id,
+                    expected_revision: created.revision,
+                    transfer_id: handle.transfer_id,
+                    contribution: AttachmentContribution {
+                        operation_id: "attach".to_owned(),
+                        accepted_media_types: vec!["image/png".to_owned()],
+                        max_byte_len: U64::new(1024 * 1024),
+                        max_count: U64::new(4),
+                        insertion_method: InsertionMethod::ManualTerminalWorkflow,
+                        external_destination: Nullable::null(),
+                        model_media_capability: false,
+                    },
+                },
+                None,
+            )
+            .expect("binds the attachment");
+        let grant = bound
+            .attachment
+            .read_grant
+            .0
+            .expect("the person is given the path the file can be read at");
+        (bound.draft, grant)
+    }
+
+    /// The draft as the daemon's transfer service holds it now.
+    fn the_draft(&self, draft_id: kr_protocol::ids::DraftId) -> kr_protocol::transfer::DraftRecord {
+        let actor =
+            kr_protocol::ids::ActorId::new(format!("local:{}", kr_ipc::paths::current_uid()))
+                .expect("a principal");
+        self.controller()
+            .transfer()
+            .service()
+            .draft(&actor, draft_id)
+            .expect("reads the draft")
+    }
+
     /// Types `line` into a session's terminal as a person at an attached terminal does: an
     /// attachment that may type, on the session's own worker, the input lease, and the bytes.
     /// Returns the connection, which holds the attachment.
@@ -1305,6 +1424,98 @@ async fn a_program_adopted_with_no_catalogue_change_is_counted_while_it_runs() {
         Nullable::some(U64::new(0)),
         "and once it has exited, none is"
     );
+}
+
+/// KR-REQ-14.03: a path typed in a session's terminal is a terminal operation, and nothing the
+/// daemon does afterwards reads the draft the path came from as an attachment the agent accepted.
+///
+/// The person is given the path of an uploaded file for a manual terminal workflow and types it on
+/// the same line that starts the program the example package recognises, in the session's own
+/// shell. The shell wrote the path where this test reads it, so it reached the terminal; the daemon
+/// then counted the program's binding from the worker's report, so it went on to act on what the
+/// terminal did. The draft is as it was: the binding is recorded, with no evidence and no failure,
+/// the person's path still holds, and the file is still at it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_14_03_a_path_typed_in_the_terminal_is_never_read_as_an_accepted_attachment() {
+    let hosted = Hosted::start().await;
+    let created = hosted.session().await;
+    assert_eq!(
+        hosted.counted_once_known().await,
+        Nullable::some(U64::new(0)),
+        "reconciled with an empty report"
+    );
+    let (draft, grant) = hosted.a_draft_with_a_path(created.session.session_id);
+    let before = hosted.the_draft(draft.draft_id);
+    assert_eq!(before.attachments.len(), 1);
+    assert_eq!(
+        before.attachments[0].state,
+        kr_protocol::transfer::InsertionState::Recorded
+    );
+
+    let program = hosted.tree.root().join("example-agent");
+    kr_ipc::testing::place_and_start_once(
+        &std::env::current_exe().expect("this test's own binary"),
+        &program,
+        &["--exact", "the_stand_in_program", "--test-threads", "1"],
+    );
+    let running = hosted.tree.root().join("stand-in-running");
+    let typed = hosted.tree.root().join("typed-path");
+    let _typing = hosted
+        .type_into(
+            &created,
+            &format!(
+                "printf '%s' '{}' > '{}'; {STAND_IN}=60 {STAND_IN_RUNNING}='{}' '{}' --exact \
+                 the_stand_in_program --test-threads 1\n",
+                grant.host_path,
+                typed.display(),
+                running.display(),
+                program.display()
+            ),
+        )
+        .await;
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    let pid = loop {
+        if let Ok(said) = std::fs::read_to_string(&running)
+            && let Ok(pid) = said.trim().parse::<u32>()
+        {
+            break pid;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the program the line started runs"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(
+        std::fs::read_to_string(&typed).expect("the shell ran the line"),
+        grant.host_path,
+        "the path reached the terminal"
+    );
+    let started = kr_ipc::identity::process_start_identity(pid).expect("the program is identified");
+
+    assert_eq!(
+        hosted.counted_as(1).await,
+        Nullable::some(U64::new(1)),
+        "the daemon has acted on the terminal's program"
+    );
+    let after = hosted.the_draft(draft.draft_id);
+    assert_eq!(
+        after.attachments[0].state,
+        kr_protocol::transfer::InsertionState::Recorded,
+        "a path typed in the terminal is not an accepted attachment"
+    );
+    assert_eq!(after, before, "the draft is as it was");
+    hosted
+        .controller()
+        .transfer()
+        .service()
+        .read_grant(grant.grant_id)
+        .expect("the path the person was given still holds");
+    assert_eq!(
+        std::fs::read(&grant.host_path).expect("the file is at the path"),
+        vec![13_u8; 64]
+    );
+    end(&started).await;
 }
 
 /// KR-REQ-23.29: a `plugin.disable` ends the package's bindings: the host asks again until the
