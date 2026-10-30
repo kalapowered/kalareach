@@ -1537,6 +1537,8 @@ struct SteppedPlatform {
     raises_at: RaisesAt,
     /// Whether the environment answers as running without being started.
     running: bool,
+    /// How far the first look moves the daemon's clock on.
+    takes: Option<(ManualClock, Duration)>,
     started: std::sync::atomic::AtomicBool,
 }
 
@@ -1546,6 +1548,18 @@ impl SteppedPlatform {
             controller: Arc::downgrade(controller),
             raises_at,
             running,
+            takes: None,
+            started: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// A platform whose first look takes `time` on `clock`.
+    fn slow(controller: &Arc<Controller>, clock: &ManualClock, time: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            controller: Arc::downgrade(controller),
+            raises_at: RaisesAt::Never,
+            running: false,
+            takes: Some((clock.clone(), time)),
             started: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -1573,6 +1587,9 @@ impl crate::bridge::store::Observer for SteppedPlatform {
         if self.raises_at == RaisesAt::TheFirstLook {
             self.raise();
         }
+        if let Some((clock, time)) = &self.takes {
+            clock.advance(*time);
+        }
         Ok(EnvironmentPresence::EnvironmentStopped)
     }
 
@@ -1594,7 +1611,7 @@ struct Refreshing {
     carried: crate::authority::AdmittedMutation,
     actor_id: ActorId,
     connection_id: ConnectionId,
-    _clock: ManualClock,
+    clock: ManualClock,
 }
 
 impl Refreshing {
@@ -1615,7 +1632,7 @@ impl Refreshing {
             carried,
             actor_id,
             connection_id,
-            _clock: clock,
+            clock,
         };
         for byte in [1, 2, 3] {
             let mutation = mutation_of(
@@ -1638,13 +1655,21 @@ impl Refreshing {
         method: Method,
         mutation: MutationRequest,
     ) -> impl std::future::Future<Output = crate::error::Result<ParamsValue>> + Send + 'static {
+        self.record_change_under(method, mutation, self.carried)
+    }
+
+    fn record_change_under(
+        &self,
+        method: Method,
+        mutation: MutationRequest,
+        carried: crate::authority::AdmittedMutation,
+    ) -> impl std::future::Future<Output = crate::error::Result<ParamsValue>> + Send + 'static {
         let controller = Arc::clone(&self.controller);
         let actor = super::routes::local_actor(
             self.actor_id.clone(),
             self.connection_id,
             controller.generation,
         );
-        let carried = self.carried;
         async move {
             controller
                 .environment_record(&actor, false, &mutation, method, carried)
@@ -1670,6 +1695,39 @@ impl Refreshing {
                 })
                 .expect("encodes"),
             ),
+        )
+    }
+
+    /// A refresh of the environment `byte` enrolled, accepted under a deadline `within` from now on
+    /// the daemon's clock.
+    fn refresh_within(
+        &self,
+        byte: u8,
+        start: bool,
+        within: Duration,
+    ) -> impl std::future::Future<Output = crate::error::Result<ParamsValue>> + Send + 'static {
+        use kr_protocol::identity::EnvironmentRefreshParams;
+        self.record_change_under(
+            Method::EnvironmentRefresh,
+            mutation_of(
+                &self.temp,
+                Method::EnvironmentRefresh,
+                ParamsValue::from_typed(&EnvironmentRefreshParams {
+                    environment_id: enrolment_of(byte).environment_id,
+                    start,
+                })
+                .expect("encodes"),
+            ),
+            crate::authority::AdmittedMutation {
+                deadline: Some(
+                    self.controller
+                        .clock
+                        .now()
+                        .checked_add(within)
+                        .expect("a deadline"),
+                ),
+                ..self.carried
+            },
         )
     }
 
@@ -1713,6 +1771,34 @@ async fn a_fence_that_lands_while_a_refresh_looks_at_the_environment_stops_the_s
             "start asked for: {start}"
         );
     }
+}
+
+/// KR-REQ-09.09: a refresh whose deadline passes while the platform looks at the environment does
+/// not start it: the refresh is refused as expired, nothing is started and nothing is recorded. The
+/// control: a refresh whose deadline stands starts the environment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refresh_whose_deadline_passes_while_the_platform_looks_does_not_start_the_environment() {
+    use kr_protocol::identity::EnvironmentPresence;
+    let rig = Refreshing::start().await;
+    let slow = SteppedPlatform::slow(&rig.controller, &rig.clock, Duration::from_secs(11));
+    rig.controller.ask_instead(slow.clone());
+    let expired = rig
+        .refresh_within(1, true, Duration::from_secs(10))
+        .await
+        .expect_err("the deadline passed before the start");
+    assert!(
+        matches!(expired, crate::error::ControllerError::WindowExpired { .. }),
+        "{expired}"
+    );
+    assert!(!slow.was_started());
+    assert_eq!(rig.recorded_status(1), EnvironmentPresence::Stale);
+
+    let standing = SteppedPlatform::slow(&rig.controller, &rig.clock, Duration::from_secs(1));
+    rig.controller.ask_instead(standing.clone());
+    rig.refresh_within(2, true, Duration::from_secs(10))
+        .await
+        .expect("a deadline that stands lets the refresh start the environment");
+    assert!(standing.was_started());
 }
 
 /// KR-REQ-09.09: a fence that lands while a refresh starts the environment stops the record, and
