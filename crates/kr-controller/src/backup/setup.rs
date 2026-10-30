@@ -643,7 +643,11 @@ impl BackupSetup {
         // token asks it once the token is in hand ([`Admitted`]), the last point before the request
         // leaves; the enrolment carries none and asks it just before.
         let tokens = Arc::new(Admitted::over(tokens, Arc::clone(admission)));
-        // 2. The bundle first.
+        // 2. The bundle first. The admission is asked before the delay the service named is read,
+        // so that a call that meets both is refused and not told the delay.
+        if let Err(refusal) = admission.stands() {
+            return Ok(Step::Stopped(refusal));
+        }
         if let Err(done) = self.write_bundle(params, mark, &tokens).await {
             return tokens.ended(done);
         }

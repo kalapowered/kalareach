@@ -5808,6 +5808,50 @@ async fn a_fence_owed_while_the_call_waits_for_its_token_stops_the_bundle_write(
     assert!(rig.controller.backup().setup().expect("a read").is_none());
 }
 
+/// KR-REQ-09.09: a call that waits for its first token while the service has asked to be left
+/// alone, and meets a fence meanwhile, is refused for the fence and not told the delay. Nothing
+/// leaves in either case; the answer is what differs. The control: with the fence let go, the same
+/// call is told the delay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_owed_while_the_service_has_asked_to_be_left_alone_refuses_the_call_and_does_not_tell_the_delay()
+ {
+    let timer = HeldTimer::held();
+    let (rig, _) = a_host_to_set_up(&timer).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+    web.fail(
+        SYNC,
+        1,
+        Moment::Refuse {
+            status: 429,
+            code: "RATE_LIMITED",
+            retry_after_seconds: Some(30),
+        },
+    );
+    assert!(matches!(
+        rig.enable(&made.params).await,
+        BackupEnableResult::Unknown { .. }
+    ));
+    let tokens = rig.controller.host_account().hold_token_requests();
+    let call = rig.enable_outcome_in_the_background(&made.params);
+    until_a_request_waits_for_its_token(&rig).await;
+    rig.controller.hold_fence(true);
+    drop(tokens);
+    let refusal = call
+        .await
+        .expect("the call ends")
+        .expect_err("a call is refused while a fence is owed, whatever else it meets");
+    assert_eq!(refusal.code, ErrorCode::PermissionDenied);
+    assert!(refusal.message.contains("fence"), "{}", refusal.message);
+    assert_eq!(web.requests_to(SYNC), 1, "nothing left for the service");
+
+    rig.controller.hold_fence(false);
+    assert!(matches!(
+        rig.enable(&made.params).await,
+        BackupEnableResult::Unknown { retry_after_seconds } if retry_after_seconds.0.is_some()
+    ));
+}
+
 /// KR-REQ-09.09: a fence this host comes to owe while a call waits for another stops it before it
 /// sends anything. The calls reach the service one at a time, so the second is admitted, waits
 /// behind the first and has its turn after a fence it was not admitted under: its bundle is not
