@@ -571,9 +571,12 @@ mod platform {
         use super::{names, power_source_in};
         use kr_protocol::desktop::PowerSource;
 
+        /// The files of one supply: each file's name and what it holds.
+        type Files<'a> = &'a [(&'a str, &'a str)];
+
         /// The power-supply class a host shows, one directory for each supply with the files the
         /// kernel gives it.
-        fn class(supplies: &[(&str, &[(&str, &str)])]) -> tempfile::TempDir {
+        fn class(supplies: &[(&str, Files)]) -> tempfile::TempDir {
             let root = tempfile::tempdir().expect("a power-supply class");
             for (name, files) in supplies {
                 let directory = root.path().join(name);
@@ -592,13 +595,13 @@ mod platform {
         /// unknown, which a `mains_only` setting does not take for mains.
         #[test]
         fn the_power_source_is_the_one_the_descriptions_read_from_the_same_class() {
-            let battery: &[(&str, &str)] = &[("type", "Battery\n")];
-            let mouse: &[(&str, &str)] = &[("type", "Battery\n"), ("scope", "Device\n")];
-            let adapter: &[(&str, &str)] = &[("type", "Mains\n"), ("online", "0\n")];
-            let usb_pd: &[(&str, &str)] = &[("type", "USB_PD\n"), ("online", "1\n")];
-            let programmable: &[(&str, &str)] = &[("type", "USB\n"), ("online", "2\n")];
-            let unknown: &[(&str, &str)] = &[("type", "Unknown\n"), ("online", "1\n")];
-            let cases: [(&str, &[(&str, &[(&str, &str)])], PowerSource); 8] = [
+            let battery: Files = &[("type", "Battery\n")];
+            let mouse: Files = &[("type", "Battery\n"), ("scope", "Device\n")];
+            let adapter: Files = &[("type", "Mains\n"), ("online", "0\n")];
+            let usb_pd: Files = &[("type", "USB_PD\n"), ("online", "1\n")];
+            let programmable: Files = &[("type", "USB\n"), ("online", "2\n")];
+            let unknown: Files = &[("type", "Unknown\n"), ("online", "1\n")];
+            let cases: [(&str, &[(&str, Files)], PowerSource); 8] = [
                 (
                     "a desktop with a wireless mouse",
                     &[("hid-mouse", mouse)],
