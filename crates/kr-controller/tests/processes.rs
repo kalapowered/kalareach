@@ -313,17 +313,23 @@ fn the_answer_is_bounded_and_the_largest_fits_a_frame() {
         .collect();
     processes.sort_by_key(|process| process.start_value.get());
     let mut big = record(Some(this_boot()), processes, Vec::new());
-    // Multi-byte characters, so that a cut at a byte count lands inside one.
-    big.boundary = "é".repeat(MAX_PROCESS_BOUNDARY_BYTES);
-    big.cgroup = Some("é".repeat(MAX_PROCESS_CGROUP_BYTES));
+    // Three-byte characters, so that a cut at a byte count lands inside one: none of these limits is
+    // a multiple of three.
+    big.boundary = "€".repeat(MAX_PROCESS_BOUNDARY_BYTES);
+    big.cgroup = Some("€".repeat(MAX_PROCESS_CGROUP_BYTES));
     big.limits = (0..MAX_PROCESS_LIMITS + 5)
-        .map(|_| "é".repeat(MAX_PROCESS_LIMIT_BYTES))
+        .map(|_| "€".repeat(MAX_PROCESS_LIMIT_BYTES))
         .collect();
     write(&host, &big);
     let view = read(&host);
     assert_eq!(view.processes.len(), MAX_PROCESS_ROWS);
     assert_eq!(view.omitted.get(), 50);
     assert!(view.boundary.len() <= MAX_PROCESS_BOUNDARY_BYTES);
+    assert_eq!(
+        view.boundary.len() % 3,
+        0,
+        "the cut is on a character boundary, not inside a character"
+    );
     assert!(view.cgroup.0.as_ref().expect("a group").len() <= MAX_PROCESS_CGROUP_BYTES);
     assert!(
         view.limits
@@ -339,7 +345,13 @@ fn the_answer_is_bounded_and_the_largest_fits_a_frame() {
     );
 
     // The largest answer there can be: every row running, with a parent and the longest name.
-    let identity = |n: u64| ProcessStartIdentity::new(n, ProcessStartSource::LinuxProcStat, n);
+    let identity = |n: u64| {
+        ProcessStartIdentity::new(
+            u64::MAX - n,
+            ProcessStartSource::WindowsProcessStartSeconds,
+            u64::MAX - n,
+        )
+    };
     let largest = SessionProcessesResult {
         processes: (0..MAX_PROCESS_ROWS as u64)
             .map(|n| SessionProcess {
@@ -347,7 +359,7 @@ fn the_answer_is_bounded_and_the_largest_fits_a_frame() {
                 role: ProcessRole::Descendant,
                 state: ProcessStanding::Running,
                 parent: kr_protocol::scalars::Nullable::some(identity(n + 1)),
-                name: kr_protocol::scalars::Nullable::some("é".repeat(MAX_PROCESS_NAME_BYTES / 2)),
+                name: kr_protocol::scalars::Nullable::some("a".repeat(MAX_PROCESS_NAME_BYTES)),
             })
             .collect(),
         ..view
@@ -358,4 +370,45 @@ fn the_answer_is_bounded_and_the_largest_fits_a_frame() {
         "{} bytes leave room for the envelope",
         encoded.len()
     );
+}
+
+/// KR-REQ-25.06: a record that does not decode, and a journal of another schema version, are
+/// refusals with their cause, and never a successful empty list for a worker that had processes.
+#[test]
+fn a_record_that_does_not_decode_and_a_journal_of_another_schema_are_refusals() {
+    fn change(host: &TempHost, statement: &str, parameters: &[&dyn rusqlite::ToSql]) {
+        let path = host.environment().journal_database(session());
+        let connection = rusqlite::Connection::open(path).expect("opens the journal's file");
+        connection
+            .execute(statement, parameters)
+            .expect("the journal is changed");
+    }
+
+    let host = TempHost::create();
+    let (root, identity) = child();
+    write(
+        &host,
+        &record(Some(this_boot()), vec![identity], Vec::new()),
+    );
+    read(&host);
+    change(&host, "UPDATE owned_processes SET record = x'ff'", &[]);
+    let undecodable = session_processes(&host.environment(), session()).expect_err("no record");
+    assert_eq!(
+        undecodable.code(),
+        ErrorCode::StorageUnavailable,
+        "{undecodable}"
+    );
+
+    change(
+        &host,
+        "UPDATE schema_version SET version = version + 1000",
+        &[],
+    );
+    let other_schema = session_processes(&host.environment(), session()).expect_err("no read");
+    assert_eq!(
+        other_schema.code(),
+        ErrorCode::StorageUnavailable,
+        "{other_schema}"
+    );
+    end(root);
 }

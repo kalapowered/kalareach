@@ -899,8 +899,8 @@ async fn paired_through_an_invitation(
 /// confirming the device, the record the host keeps of the pairing holds the same after, and a
 /// device paired as a guest is refused the sessions of its host until one is shared with it and it
 /// redeems that share. The control is a viewer invitation issued and read the same way, whose view
-/// and record do hold the right, the session and the screen, and whose device is served the same
-/// reads, so the refusals of the guest are the guest's grant and nothing else.
+/// and record do hold the right, the session and the screen, and whose device is served the session
+/// list the guest is refused, so that refusal is the guest's grant and nothing else.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_25_28_a_guest_pairing_shares_no_session_and_no_screen_until_one_is_shared_with_it()
 {
