@@ -5971,6 +5971,28 @@ interval. The three never merge. A summary names the interval it was written fro
 in for an event; a gap is not an absence of changes but a statement that the host cannot say what
 was there.
 
+A device whose grant does not reach every moment is not told how many changes came before its
+history. The cursors it is shown (`from_cursor`, `to_cursor` and each change's `cursor`) are the log's
+own, taken no lower than the first change its history reaches, plus an offset: a keyed digest of the
+session and of the moment its history reaches back to, under the attention store's secret, in the
+range from 2^60 up to 2^61. The offset is the same whenever it is asked for and nothing stores it.
+It changes with the store, so the numbers of a replaced store stop being valid by themselves. The
+device sends back in `visit.acknowledge` the number it was shown, and the host takes the offset
+away. A number below the offset or past the end of the log is refused as one the host did not give
+that device, and the log's own cursor is such a number. The store and every record of an answer keep
+the log's own cursor, and the answer is numbered as it leaves, for the caller that receives it, so a
+repeat of the action under a later bound is answered in that bound's numbers. The owner and a device
+whose grant starts at the beginning of time are shown the log's own cursors.
+
+The numbering has two limits. The first is the step between two cursors a device is shown. A change
+recorded after the bound but dated before it takes a place in the log that the device cannot read,
+so a step of two between neighbours says that something unreadable was recorded, and a device whose
+first view is empty sees its `from_cursor` move when one is. That shows such changes exist after the
+bound, and never how many came before it. The second is what the numbering does not reach: a
+review's versions, an attention item's revision, the `gaps` and `dropped` count of
+`attention.read`, and a log view's output offsets. They stay the host's own numbers, and the bound
+does not cut them.
+
 A log view's source offset and its filter travel with the visit. They come back after a reconnect,
 each view keeps its own position when a client switches between two, and a view whose range
 retention has taken is served from the oldest byte that still exists with the range between stated
