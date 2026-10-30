@@ -70,9 +70,10 @@ mod tests {
         }
     }
 
-    /// What is not an `https://host[:port]` origin refuses the build rather than an application
-    /// that cannot register: another scheme (a loopback one among them), a path, a query, a
-    /// fragment, credentials, a missing or a non-canonical host, and surrounding space.
+    /// What is not an `https://host[:port]` origin refuses the build rather than an application that
+    /// cannot register. The scheme is this module's rule: another scheme, a loopback `http` one
+    /// among them, and none at all. The rest of the grammar is the protocol's origin type, which
+    /// the module defers to; a path stands for it.
     #[test]
     fn a_value_that_is_not_an_https_origin_refuses_the_build() {
         for malformed in [
@@ -80,16 +81,7 @@ mod tests {
             "http://127.0.0.1:8787",
             "ftp://push.builder.example",
             "push.builder.example",
-            "https://",
-            "https://push.builder.example/",
             "https://push.builder.example/api/push",
-            "https://push.builder.example?a=1",
-            "https://push.builder.example#fragment",
-            "https://user@push.builder.example",
-            "https://Push.Builder.Example",
-            "https://push.builder.example:443",
-            " https://push.builder.example",
-            "https://push.builder.example ",
         ] {
             assert!(check(malformed).is_err(), "{malformed:?}");
             assert!(choose(Some(malformed), OFFICIAL).is_err(), "{malformed:?}");

@@ -911,7 +911,9 @@ fn open_push(app: &tauri::AppHandle) {
 ///
 /// # Errors
 ///
-/// Returns a local failure when the pairing records are not open.
+/// Returns a local failure when the pairing records are not open, or when the push gateway origin
+/// this build was given is not one (the build step refuses such a value, so only a library built
+/// around it reaches this).
 pub fn start_push<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     data: &std::path::Path,
@@ -932,7 +934,7 @@ pub fn start_push<R: tauri::Runtime>(
         move |view| {
             let _ = emitter.emit(push::PUSH_EVENT, view);
         },
-    )?;
+    );
     state.push_opened(desk);
     Ok(())
 }

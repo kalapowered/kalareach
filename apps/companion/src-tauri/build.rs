@@ -29,11 +29,17 @@ fn refuse_a_push_gateway_origin_that_is_not_one() {
         return;
     }
     match push_origin::check(&given) {
-        Ok(origin) => println!(
-            "cargo:rustc-env={}={}",
-            push_origin::BUILD_INPUT,
-            origin.as_str()
-        ),
+        Ok(origin) => {
+            println!(
+                "cargo:rustc-env={}={}",
+                push_origin::BUILD_INPUT,
+                origin.as_str()
+            );
+            println!(
+                "cargo:warning=this build registers with the push gateway at {}",
+                origin.as_str()
+            );
+        }
         Err(words) => panic!(
             "{} is not a push gateway origin: {words}",
             push_origin::BUILD_INPUT

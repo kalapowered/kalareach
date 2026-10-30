@@ -644,10 +644,7 @@ const fn this_platform() -> PushPlatform {
 impl PushDesk {
     /// Opens the desk over the record under `data`. `changed` is called, one call at a time and in
     /// the order the views were read, with what the page is shown, when that changes.
-    ///
-    /// # Errors
-    ///
-    /// Returns a local failure when the gateway's origin is not one this build can name.
+    #[must_use]
     pub fn open(
         data: &Path,
         device: Arc<Device>,
@@ -655,7 +652,7 @@ impl PushDesk {
         registrar: Arc<dyn Registrar>,
         wiring: Wiring,
         changed: impl Fn(PushView) + Send + Sync + 'static,
-    ) -> Result<Arc<Self>> {
+    ) -> Arc<Self> {
         let origin = wiring.origin.clone();
         let file = data.join(DIRECTORY).join(RECORD);
         let now = (wiring.clock)();
@@ -743,7 +740,7 @@ impl PushDesk {
             let state = lock(&desk.state);
             desk.keep(&state.record);
         }
-        Ok(desk)
+        desk
     }
 
     /// What the page is shown: each paired host and where its notifications stand.
@@ -1869,7 +1866,7 @@ impl PushDesk {
         }
     }
 
-    /// The gateway's origin: the managed service's, and in a debug build the one a device run named.
+    /// The gateway's origin: the one this build was given, and in a debug build the one a device run named.
     fn gateway_origin(&self) -> GatewayOrigin {
         #[cfg(debug_assertions)]
         if let Some(origin) = probe::origin(&self.data) {
@@ -2487,7 +2484,7 @@ impl HostLine for ConnectionLine {
     }
 }
 
-/// What a device run gives a debug build instead of a provider's token and the managed service's
+/// What a device run gives a debug build instead of a provider's token and the build's gateway
 /// origin: a file in the application's own data directory, `kr-probe/push-request.json`, as the other
 /// device checks have. A release build has none of it.
 #[cfg(debug_assertions)]

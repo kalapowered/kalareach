@@ -407,6 +407,7 @@ impl HostLine for Line {
                     self.host,
                     json!({
                         "sender_record_id": params.credential.sender_record_id.to_string(),
+                        "gateway_origin": params.credential.gateway_origin.as_str(),
                         "previews_enabled": params.previews_enabled,
                     }),
                 ));
@@ -494,10 +495,16 @@ impl ServiceHttp for Gateway {
         let records = vectors()["records"].clone();
         let is_issue = url.ends_with("/api/push/sender/issue");
         let answer = if is_issue {
-            json!({ "ok": true, "data": {
-                "record": records["sender_record"],
-                "credential": records["delivery_credential"],
-            }})
+            // The gateway issues for the origin it was asked at, as a gateway does.
+            let origin = url
+                .strip_suffix("/api/push/sender/issue")
+                .unwrap_or(url)
+                .to_owned();
+            let mut record = records["sender_record"].clone();
+            record["binding"]["gateway_origin"] = json!(origin);
+            let mut credential = records["delivery_credential"].clone();
+            credential["gateway_origin"] = json!(origin);
+            json!({ "ok": true, "data": { "record": record, "credential": credential }})
         } else {
             let proposal = &sent["body"]["installation_register"]["request"]["propose"]["proposal"];
             self.proposed.lock().expect("the proposals").push(
@@ -796,8 +803,7 @@ fn open_at(
             }
             shown.lock().expect("the views").push(view);
         },
-    )
-    .expect("the desk opens");
+    );
     Opened {
         desk,
         gateway,
@@ -879,10 +885,22 @@ async fn a_build_given_its_own_gateway_registers_there_and_its_receivers_answer_
     assert!(!urls.is_empty(), "the phone asked the gateway");
     for url in &urls {
         assert!(
-            url.starts_with(own.as_str()),
-            "{url} is not at the build's gateway"
+            url.strip_prefix(own.as_str())
+                .is_some_and(|route| route.starts_with("/api/push/")),
+            "{url} is not a route of the build's gateway"
         );
     }
+
+    // The credential the host was handed names that gateway, as the gateway issued it.
+    assert_eq!(
+        phone
+            .registered
+            .lock()
+            .expect("what was handed")
+            .credentials[0]
+            .1["gateway_origin"],
+        own.as_str()
+    );
 
     // The registration the receivers wait for names that gateway.
     let pending = phone
