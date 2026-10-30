@@ -2144,7 +2144,7 @@ impl AttentionModule {
         }
         let answer = decode_answer(&record.answer).and_then(|answer| {
             if method == Method::VisitAcknowledge {
-                self.shown_visit(caller, mutation, answer)
+                self.shown_visit(caller, actor, mutation, answer)
             } else {
                 Ok(answer)
             }
@@ -2230,6 +2230,7 @@ impl AttentionModule {
                 cursor_of(
                     &store,
                     caller,
+                    actor,
                     params.session_id,
                     params.acknowledged_cursor.get(),
                 )
@@ -2343,7 +2344,7 @@ impl AttentionModule {
                             // A reader whose history has a bound sends back the number it was
                             // shown, and the store keeps the log's own.
                             let cursor = match store
-                                .numbering(viewer, params.session_id)
+                                .numbering(actor, viewer, params.session_id)
                                 .map_err(Unperformed::Store)?
                             {
                                 None => params.acknowledged_cursor.get(),
@@ -2389,7 +2390,7 @@ impl AttentionModule {
             Performed::Retained(record) => decode_answer(&record.answer),
         }?;
         if method == Method::VisitAcknowledge {
-            return self.shown_visit(caller, mutation, answer);
+            return self.shown_visit(caller, actor, mutation, answer);
         }
         Ok(answer)
     }
@@ -2401,6 +2402,7 @@ impl AttentionModule {
     fn shown_visit(
         &self,
         caller: &Caller,
+        actor: &ActorId,
         mutation: &MutationRequest,
         answer: ParamsValue,
     ) -> Answer<ParamsValue> {
@@ -2408,7 +2410,7 @@ impl AttentionModule {
         let numbering = {
             let store = self.store()?;
             caller
-                .view(|viewer| store.numbering(viewer, params.session_id))
+                .view(|viewer| store.numbering(actor, viewer, params.session_id))
                 .map_err(refusal)?
         };
         let Some(numbering) = numbering else {
@@ -4361,9 +4363,15 @@ fn encode<T: serde::Serialize>(value: &T) -> Answer<ParamsValue> {
 
 /// Returns the log's own cursor for the number a caller sent back, or the refusal when this host
 /// did not give the caller that number.
-fn cursor_of(store: &Attention, caller: &Caller, session_id: SessionId, shown: u64) -> Answer<u64> {
+fn cursor_of(
+    store: &Attention,
+    caller: &Caller,
+    actor: &ActorId,
+    session_id: SessionId,
+    shown: u64,
+) -> Answer<u64> {
     let numbering = caller
-        .view(|viewer| store.numbering(viewer, session_id))
+        .view(|viewer| store.numbering(actor, viewer, session_id))
         .map_err(refusal)?;
     match numbering {
         None => Ok(shown),
@@ -5660,50 +5668,54 @@ pub(crate) mod tests {
         let shown_late = world.changed_for(&reader, &late).await.to_cursor;
         assert_ne!(shown_early, shown_late, "each bound has numbers of its own");
 
-        // The action is performed the way the store performs it: with the log's own cursor.
-        let mutation = MutationRequest {
-            request_id: RequestId::new(9),
-            method: Method::VisitAcknowledge.into(),
-            method_version: MethodVersion::V1,
-            action_id: kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
-            grant_id: Nullable::null(),
-            target: kr_protocol::envelope::ActionTarget::environment(world.temp.environment_id()),
-            expected: ParamsValue::empty(),
-            action_window_id: kr_protocol::ids::ActionWindowId::new("test").expect("a window"),
-            requested_ttl_ms: kr_protocol::scalars::DurationMs::new(60_000),
-            params: ParamsValue::from_typed(&VisitAcknowledgeParams {
-                session_id: world.session_id,
-                acknowledged_cursor: shown_early,
-                views: Vec::new(),
-            })
-            .expect("encodes"),
-        };
-        let key = action_key(&reader, &mutation, Method::VisitAcknowledge).expect("a key");
+        // An action is performed the way the store performs it: with the log's own cursor.
         let reading = world.module.reading();
-        early
-            .view(|viewer| {
-                world.module.store().expect("the store").perform(
-                    &key,
-                    Mutation::Visit {
-                        viewer,
-                        session_id: world.session_id,
-                        cursor: 3,
-                        views: Vec::new(),
-                    },
-                    reading,
-                    || Ok(()),
-                    |answer| encode_answer(answer, reading),
-                )
-            })
-            .expect("the store performs the action");
-
-        let answered = |caller: &Caller| -> u64 {
+        let performed = |request_id: u64, cursor: u64| -> MutationRequest {
+            let mutation = MutationRequest {
+                request_id: RequestId::new(request_id),
+                method: Method::VisitAcknowledge.into(),
+                method_version: MethodVersion::V1,
+                action_id: kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+                grant_id: Nullable::null(),
+                target: kr_protocol::envelope::ActionTarget::environment(
+                    world.temp.environment_id(),
+                ),
+                expected: ParamsValue::empty(),
+                action_window_id: kr_protocol::ids::ActionWindowId::new("test").expect("a window"),
+                requested_ttl_ms: kr_protocol::scalars::DurationMs::new(60_000),
+                params: ParamsValue::from_typed(&VisitAcknowledgeParams {
+                    session_id: world.session_id,
+                    acknowledged_cursor: shown_early,
+                    views: Vec::new(),
+                })
+                .expect("encodes"),
+            };
+            let key = action_key(&reader, &mutation, Method::VisitAcknowledge).expect("a key");
+            early
+                .view(|viewer| {
+                    world.module.store().expect("the store").perform(
+                        &key,
+                        Mutation::Visit {
+                            viewer,
+                            session_id: world.session_id,
+                            cursor,
+                            views: Vec::new(),
+                        },
+                        reading,
+                        || Ok(()),
+                        |answer| encode_answer(answer, reading),
+                    )
+                })
+                .expect("the store performs the action");
+            mutation
+        };
+        let answered = |mutation: &MutationRequest, caller: &Caller| -> u64 {
             let ControlFrame::Response(Response {
                 outcome: Outcome::Ok(value),
                 ..
             }) = world
                 .module
-                .retained(caller, &reader, &mutation, Method::VisitAcknowledge)
+                .retained(caller, &reader, mutation, Method::VisitAcknowledge)
                 .expect("the store holds the action")
             else {
                 panic!("the repeat is answered");
@@ -5714,17 +5726,31 @@ pub(crate) mod tests {
                 .acknowledged_cursor
                 .get()
         };
+
+        let at_the_end = performed(9, 3);
         assert_eq!(
-            answered(&Caller::Owner),
+            answered(&at_the_end, &Caller::Owner),
             3,
             "the owner is answered the log's own"
         );
-        assert_eq!(answered(&early), shown_early.get());
+        assert_eq!(answered(&at_the_end, &early), shown_early.get());
         assert_eq!(
-            answered(&late),
+            answered(&at_the_end, &late),
             shown_late.get(),
             "numbered by the later bound"
         );
+
+        // An action recorded at a place before the history of the caller that repeats it is
+        // answered as the place its history starts at, which is where that caller's first view
+        // starts, and not as a number that says how many changes the place lies after.
+        let at_the_start = performed(10, 0);
+        let newcomer = ActorId::new("test:newcomer").expect("an actor");
+        for caller in [&early, &late] {
+            assert_eq!(
+                answered(&at_the_start, caller),
+                world.changed_for(&newcomer, caller).await.from_cursor.get(),
+            );
+        }
     }
 
     /// KR-REQ-18.02: the callers whose history reaches every moment are the owner and a device

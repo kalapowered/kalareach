@@ -10,9 +10,10 @@
 //! beside the store, and it changes with the store.
 //!
 //! The reader gives these numbers back (`visit.acknowledge`), and a number that is not the offset's
-//! sum with a cursor from where its history starts to where the log ends is refused as one this
-//! host did not give it. The store keeps the log's own cursors, and so does every record of an
-//! answer.
+//! sum with a cursor from where its history starts to the furthest it can have been shown is
+//! refused as one this host did not give it. That is not where the log ends: a reader is not told
+//! where it ends, and a refusal of every number past it would tell it. The store keeps the log's
+//! own cursors, and so does every record of an answer.
 //!
 //! What this leaves is the difference between two cursors a reader is shown. A change recorded
 //! after its history began but dated before it is not the reader's, and the place it holds in the
@@ -31,25 +32,27 @@ pub struct Numbering {
     /// The lowest cursor of a retained change this reader's history reaches, or where the log
     /// ends when it reaches none: no cursor is shown lower.
     floor: u64,
-    /// Where the log ends.
-    head: u64,
+    /// The furthest this reader can have been shown: just past the last change its history
+    /// reaches, or where its visit stands when that is further.
+    ceiling: u64,
 }
 
 impl Numbering {
     /// Numbers `session_id`'s cursors for a reader whose history reaches back to
-    /// `history_from_ms`, with the log starting for it at `floor` and ending at `head`.
+    /// `history_from_ms`, with the log starting for it at `floor` and reaching it as far as
+    /// `ceiling`.
     #[must_use]
     pub fn new(
         secret: &KeySecret,
         session_id: SessionId,
         history_from_ms: u64,
         floor: u64,
-        head: u64,
+        ceiling: u64,
     ) -> Self {
         Self {
             offset: secret.cursor_offset(session_id, history_from_ms),
             floor,
-            head,
+            ceiling,
         }
     }
 
@@ -69,8 +72,8 @@ impl Numbering {
     }
 
     /// Returns the log's own cursor for a number this reader sends back, or none when the number
-    /// is not one this host gives this reader: below the first number it is shown, or past where
-    /// the log ends.
+    /// is not one this host gives this reader: below the first number it is shown, or past the
+    /// furthest it can have been shown.
     ///
     /// The lowest number taken is the first one shown, not the offset. A number between the two
     /// would be taken and one below the offset would not, and a reader that tried numbers down from
@@ -79,7 +82,7 @@ impl Numbering {
     #[must_use]
     pub const fn cursor(&self, shown: u64) -> Option<u64> {
         match shown.checked_sub(self.offset) {
-            Some(cursor) if cursor >= self.floor && cursor <= self.head => Some(cursor),
+            Some(cursor) if cursor >= self.floor && cursor <= self.ceiling => Some(cursor),
             _ => None,
         }
     }

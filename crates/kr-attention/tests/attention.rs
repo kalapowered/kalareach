@@ -1944,9 +1944,10 @@ fn a_number_a_viewer_is_shown_is_the_one_it_sends_back() {
             .expect("the store records the decision");
     }
     let admits_one = |candidate: SessionId| candidate == session(1);
+    let phone = actor("device:phone");
     let viewer = device_from(&admits_one, NOON + 2_000);
     let numbering = attention
-        .numbering(&viewer, session(1))
+        .numbering(&phone, &viewer, session(1))
         .expect("the store is this owner's")
         .expect("a viewer with a bound is numbered");
     // Reaches the last two turns: the log's cursors 2 to 5, and the log ends at 6.
@@ -1971,20 +1972,98 @@ fn a_number_a_viewer_is_shown_is_the_one_it_sends_back() {
     );
     assert_eq!(numbering.cursor(numbering.shown(2) - 1_000_000_000), None);
 
+    // A turn recorded later but dated before the viewer's history is not the viewer's, and the
+    // numbers it takes in the log are not ones the viewer can be told of: the furthest number
+    // taken stays where the last change the viewer reaches ends, and not where the log ends, or a
+    // number refused would say how many changes were recorded beyond.
+    attention
+        .apply(&turn_completed(4, 500, 4), reading(0))
+        .expect("the store records the decision");
+    let numbering = attention
+        .numbering(&phone, &viewer, session(1))
+        .expect("the store is this owner's")
+        .expect("a viewer with a bound is numbered");
+    assert_eq!(
+        numbering.cursor(numbering.shown(6)),
+        Some(6),
+        "the end of what the viewer was shown is still taken"
+    );
+    assert_eq!(
+        numbering.cursor(numbering.shown(7)),
+        None,
+        "and the places the later turn took are not, though the log reaches them"
+    );
+
     assert!(
         attention
-            .numbering(&Viewer::Owner, session(1))
+            .numbering(&phone, &Viewer::Owner, session(1))
             .expect("the store is this owner's")
             .is_none(),
         "the owner is shown the log's own"
     );
     assert!(
         attention
-            .numbering(&device_from(&admits_one, 0), session(1))
+            .numbering(&phone, &device_from(&admits_one, 0), session(1))
             .expect("the store is this owner's")
             .is_none(),
         "so is a viewer whose history reaches every moment"
     );
+}
+
+/// KR-REQ-10.49: when retention lets go of the changes a viewer's history started at, its first
+/// number moves up with the first change it can still be shown, and a number it was shown before
+/// is not taken: the line is drawn at the first number shown, so it stays out of reach of a viewer
+/// that tries numbers below its own.
+#[test]
+fn the_first_number_a_viewer_is_shown_moves_up_when_retention_lets_go_of_what_it_started_at() {
+    let mut attention = engine();
+    attention
+        .apply(&turn_completed(1, 1_000, 1), reading(0))
+        .expect("the store records the decision");
+    let admits_one = |candidate: SessionId| candidate == session(1);
+    let phone = actor("device:phone");
+    let viewer = device_from(&admits_one, NOON + 500);
+    let first = attention
+        .changed(&phone, &viewer, session(1), 100, 0, Content::Narrowed)
+        .expect("the store is this owner's")
+        .result
+        .from_cursor
+        .get();
+    let numbering = attention
+        .numbering(&phone, &viewer, session(1))
+        .expect("the store is this owner's")
+        .expect("a viewer with a bound is numbered");
+    assert_eq!(numbering.cursor(first), Some(0));
+
+    // More changes than the log retains, all inside the viewer's history.
+    for sequence in 2..(2 + 600) {
+        attention
+            .apply(
+                &turn_completed(sequence, 1_000 + sequence, sequence),
+                reading(sequence),
+            )
+            .expect("the store records the decision");
+    }
+    let moved = attention
+        .changed(&phone, &viewer, session(1), 100, 0, Content::Narrowed)
+        .expect("the store is this owner's")
+        .result
+        .from_cursor
+        .get();
+    assert!(
+        moved > first,
+        "the first number moved up: {first} then {moved}"
+    );
+    let numbering = attention
+        .numbering(&phone, &viewer, session(1))
+        .expect("the store is this owner's")
+        .expect("a viewer with a bound is numbered");
+    assert_eq!(
+        numbering.cursor(first),
+        None,
+        "the number it had is not taken"
+    );
+    assert!(numbering.cursor(moved).is_some(), "the number it has is");
 }
 
 /// KR-REQ-10.49: a viewer whose history starts after every change the log holds is told nothing of
@@ -2109,7 +2188,7 @@ fn more_is_true_only_while_a_change_the_viewer_reaches_follows() {
             .expect("the store is this owner's");
         // The number the viewer was shown is the one it sends back, and the store takes the log's.
         let next = attention
-            .numbering(&viewer, session(1))
+            .numbering(&phone, &viewer, session(1))
             .expect("the store is this owner's")
             .expect("a viewer with a bound is numbered")
             .cursor(page.result.to_cursor.get())
@@ -2152,7 +2231,7 @@ fn an_acknowledgement_by_a_viewer_with_a_bound_is_stored_no_further_than_it_was_
         .changed(&phone, &viewer, session(1), 100, 0, Content::Narrowed)
         .expect("the store is this owner's");
     let numbering = attention
-        .numbering(&viewer, session(1))
+        .numbering(&phone, &viewer, session(1))
         .expect("the store is this owner's")
         .expect("a viewer with a bound is numbered");
     assert_eq!(

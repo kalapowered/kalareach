@@ -935,13 +935,15 @@ impl Attention {
     ///
     /// A cursor a viewer sends back (`visit.acknowledge`) is read with [`Numbering::cursor`], and
     /// every cursor [`Attention::changed`] answers a viewer with a bound has been through
-    /// [`Numbering::shown`].
+    /// [`Numbering::shown`]. `actor` is the viewer's own identity: where its visit stands is part of
+    /// how far it can have been shown.
     ///
     /// # Errors
     ///
     /// As [`Attention::engine`].
     pub fn numbering(
         &self,
+        actor: &ActorId,
         viewer: &Viewer<'_>,
         session_id: SessionId,
     ) -> Result<Option<Numbering>> {
@@ -949,15 +951,15 @@ impl Attention {
         if viewer.reaches_every_moment() {
             return Ok(None);
         }
-        let (floor, head) = with_reach_of(viewer, |reach| {
-            self.state.visits.numbering_bounds(session_id, reach)
+        let (floor, ceiling) = with_reach_of(viewer, |reach| {
+            self.state.visits.numbering_bounds(actor, session_id, reach)
         });
         Ok(Some(Numbering::new(
             &self.state.engine.key_secret(),
             session_id,
             viewer.history_from_ms(),
             floor,
-            head,
+            ceiling,
         )))
     }
 
@@ -985,7 +987,7 @@ impl Attention {
         content: Content,
     ) -> Result<ChangedPage> {
         self.live()?;
-        let numbering = self.numbering(viewer, session_id)?;
+        let numbering = self.numbering(actor, viewer, session_id)?;
         let number = |cursor: u64| numbering.map_or(cursor, |numbering| numbering.shown(cursor));
         let changed = with_reach_of(viewer, |reach| {
             self.state.visits.changed_since(

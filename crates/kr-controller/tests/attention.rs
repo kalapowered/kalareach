@@ -1761,8 +1761,15 @@ async fn a_paired_devices_cursors_count_nothing_before_its_pairing_and_are_sent_
         .attention()
         .observe(&before)
         .expect("the store records the turns");
-    let (_phone, device) =
-        net_support::paired_device(&host, &owner_keys, &[ActionRight::SessionView]).await;
+    let phone = net_support::Device::create().await;
+    let record = net_support::pair_with(
+        &host,
+        &phone,
+        &owner_keys,
+        net_support::proposal(&[ActionRight::SessionView]),
+    )
+    .await;
+    let device = net_support::connect(&host, &phone, &record).await;
     let after: Vec<_> = (4..=5).map(|version| turn(session_id, version)).collect();
     host.controller()
         .attention()
@@ -1845,19 +1852,47 @@ async fn a_paired_devices_cursors_count_nothing_before_its_pairing_and_are_sent_
         "the second change is still unread"
     );
 
-    let visited: VisitAcknowledgeResult = device_mutation(
-        &device,
-        session_target(&host, session_id),
-        Method::VisitAcknowledge,
-        &VisitAcknowledgeParams {
-            session_id,
-            acknowledged_cursor: shown.to_cursor,
-            views: Vec::new(),
-        },
-    )
-    .await
-    .expect("the number it was shown is acknowledged");
+    let composed = device
+        .compose(
+            Method::VisitAcknowledge,
+            ActionId::new(kr_ipc::new_uuid()),
+            session_target(&host, session_id),
+            None,
+            &ParamsValue::empty(),
+            &VisitAcknowledgeParams {
+                session_id,
+                acknowledged_cursor: shown.to_cursor,
+                views: Vec::new(),
+            },
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect("the acknowledgement is composed");
+    let answer_of = |settled: kr_client::session::Settled| -> VisitAcknowledgeResult {
+        settled
+            .result()
+            .cloned()
+            .expect("a settled mutation answers with its result")
+            .to_typed()
+            .expect("decodes")
+    };
+    let visited = answer_of(
+        device
+            .send(&composed)
+            .await
+            .expect("the number it was shown is acknowledged"),
+    );
     assert_eq!(visited.acknowledged_cursor, shown.to_cursor);
+    // A repeat of the action from another connection of the same device is answered from the
+    // host's record, in the numbers this device is shown and not in the log's own.
+    let again = net_support::connect(&host, &phone, &record).await;
+    let repeated = answer_of(
+        again
+            .repeat(&composed)
+            .await
+            .expect("the repeat is answered from the record"),
+    );
+    assert_eq!(repeated.acknowledged_cursor, shown.to_cursor);
     let next = device_changes(&device, session_id).await;
     assert!(next.changes.is_empty(), "{next:?}");
     assert_eq!(
