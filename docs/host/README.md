@@ -3201,21 +3201,23 @@ What a device is told of a failure passes one rule, applied where this host's wo
 device: the write boundary of an authorised connection, the refusal of a connection that is not
 admitted, and the pairing surface a candidate reaches before it is paired. An error keeps its code,
 its retry category and its diagnostic identifier. Its message is kept when it names nothing of this
-host. A command quoted in backticks is replaced by `a command` and the rest of the sentence stays.
-A message that names a path of any kind, the number of an account or the program that changes who
-may use a file is not sent: the device is given the clause that comes before the first such name,
-when there is one (`the host could not make the session's directory`), and otherwise a sentence made
-from the code. Two refusals of the project service give their reason in terms of the location the
-grant names and not the place on this host: a filesystem mounted beneath it, and a repository whose
-alternates file names objects outside it. Text that already exists cannot be made again, so the rule holds where an error is
-written, whoever made it: a worker's, one a store kept, one a catalogue receipt holds, and one
-inside a result, such as the presentation error of a create. A receipt whose message was replaced
-says so in `error_withheld`. What a closure records of a resource it left is held to the same rule
-and is replaced by the kind of resource. What the agent of a session says in refusing a prompt, a
-steer, a cancellation or an approval, as `INVALID_ARGUMENT` or `UPSTREAM_UNAVAILABLE`, is the
-agent's own words, so it is replaced by a sentence made from its code whatever it says. A candidate
-that has not paired is never given what the pairing store or the rendezvous service reported. The
-owner at this machine is given the whole text, on the local socket and in the daemon's records.
+host. A command quoted in backticks is replaced by `a command` and the rest of the sentence stays. A
+message that names a path of any kind, the number of an account, a command written without quotes or
+the program that changes who may use a file is not sent: the device is given the clause that comes
+before the first such name, when there is one (`the host could not make the session's directory`),
+and otherwise a sentence made from the code. Two refusals of the project service give their reason
+in terms of the location the grant names and not the place on this host: a filesystem mounted
+beneath it, and a repository whose alternates file names objects outside it. Text that already
+exists cannot be made again, so the rule holds where an error is written, whoever made it: a
+worker's, one a store kept, one a catalogue receipt holds, and one inside a result, such as the
+presentation error of a create. A receipt whose message was replaced says so in `error_withheld`.
+What a closure records of a resource it left is held to the same rule and is replaced by the kind of
+resource. What the agent of a session says in refusing a prompt, a steer, a cancellation, an
+approval or a plugin's action, as `INVALID_ARGUMENT`, `UPSTREAM_UNAVAILABLE` or `OUTCOME_UNKNOWN`,
+is the agent's own words, so it is replaced by a sentence made from its code whatever it says. The
+code and the retry category stay. A candidate that has not paired is never given what the pairing
+store or the rendezvous service reported. The owner at this machine is given the whole text, on the
+local socket and in the daemon's records.
 
 What the grant decides, for every request:
 
