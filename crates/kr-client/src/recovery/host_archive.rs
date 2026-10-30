@@ -44,8 +44,11 @@ use crate::recovery::{BundleStore, RecoveryError, Result, WriterEnabled, kit_fin
 use crate::services::ServiceFuture;
 use crate::session::{Session, Settled};
 
-/// How long an enrolment of the host's backups stays acceptable to the host once sent.
-const ENABLE_TTL: DurationMs = DurationMs::new(60_000);
+/// How long an enrolment of the host's backups stays acceptable to the host once sent: the longest
+/// a mutation may ask for. The host asks its admission again where it records the setup, after
+/// several requests to the storage service that can each last a minute and a half, so a shorter
+/// time would end a setup of a slow service at its last step.
+const ENABLE_TTL: DurationMs = kr_protocol::limits::MAX_MUTATION_TTL;
 
 /// The entries one archive needs in a recovery bundle so that a restore can find it and verify
 /// what the host made of it.
@@ -438,8 +441,8 @@ pub async fn cover_host_archive(
         }) => Err(RecoveryError::HostOutcomeUnknown {
             retry_after_seconds: retry_after_seconds.0.map(|seconds| seconds.get()),
         }),
-        // The host answered with a refusal of its own, which it gives before it does anything, so
-        // nothing was recorded.
+        // The host answered with a refusal of its own, which it gives before it records anything,
+        // so nothing was recorded.
         Err(error) if is_a_definite_refusal(&error) => {
             let _ = entries.withdraw(bundles, seed, now).await;
             Err(RecoveryError::Service(error))

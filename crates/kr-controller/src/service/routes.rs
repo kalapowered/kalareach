@@ -19,9 +19,10 @@ use super::{Controller, encode, error_reply, net, parse, respond};
 /// the environment record, the update handover, the setting up of backups, the person's deletion of
 /// a copy privacy mode lists, the person's confirmation of a policy the host found restored and the
 /// host's own sign-in and sign-out. The deletion asks the registration again in the write that
-/// records it, and the confirmation asks the registration and the deadline again where it removes
-/// the record of the wait, under that record's lock; the others change nothing the revision or the
-/// deadline decides.
+/// records it, the setting up of backups asks it, with the deadline, before each request that
+/// changes the storage service and in the transaction that records the setup, and the confirmation
+/// asks the registration and the deadline again where it removes the record of the wait, under that
+/// record's lock; the others change nothing the revision or the deadline decides.
 ///
 /// The fence check and the registration check run for each of them before it does anything. A
 /// method that takes an admission asks both inside the service that performs it, so this list is

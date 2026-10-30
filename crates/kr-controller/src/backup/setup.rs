@@ -74,7 +74,7 @@ use crate::account::HostAccount;
 use crate::backup::BackupService;
 use crate::backup::relay::InstallationSigner;
 use crate::backup::runtime::{HostKeySigner, TokenState, describe_token, managed_transport};
-use crate::backup::store::{Setup, SetupCommit, SetupRecord};
+use crate::backup::store::{Setup, SetupRecord};
 use crate::backup::uploader::Hold;
 use crate::error::{ControllerError, Result};
 use crate::quiet::Quiet;
@@ -111,23 +111,36 @@ pub fn standing(
     None
 }
 
-/// The admission a setup call was made under, asked again where the setup is recorded.
+/// The admission a setup call was made under, asked again as the call goes on.
 ///
-/// The record is written after several requests to the service, each of which can last as long as
-/// the service likes, so an authority withdrawn or a fence owed meanwhile has to stop the record
-/// and not only the call's start. The implementation also keeps the daemon alive until the commit
-/// has ended: a commit that went on after the environment's lock was let go could land beside the
-/// next daemon's start.
+/// The call reaches the storage service several times before it records the setup, and each
+/// request can last as long as the service likes, so an authority withdrawn or a fence owed
+/// meanwhile has to stop the next request and the record, and not only the call's start. The
+/// implementation also keeps the daemon alive until the commit has ended: a commit that went on
+/// after the environment's lock was let go could land beside the next daemon's start.
 pub trait SetupAdmission: Send + Sync + 'static {
-    /// Runs `commit` while the admission stands.
+    /// Whether the call may still do something to the service or to this host: no fence is owed,
+    /// the registration it was admitted under stands, and its deadline has not passed.
     ///
     /// # Errors
     ///
-    /// Returns the admission's refusal, in which case `commit` did not run.
-    fn commit(
-        &self,
-        commit: &mut dyn FnMut() -> Result<SetupCommit>,
-    ) -> Result<Result<SetupCommit>>;
+    /// Returns the refusal, in which case the caller does nothing more.
+    fn stands(&self) -> Result<()>;
+
+    /// Whether the call may still be answered from what this host already holds: as
+    /// [`Self::stands`], without the deadline, which a receipt outlives.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal, in which case the caller gives no answer.
+    fn retained(&self) -> Result<()>;
+
+    /// Runs `write` while the admission stands, and holds it standing until `write` has ended.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal, in which case `write` did not run.
+    fn admitted(&self, write: &mut dyn FnMut() -> Result<()>) -> Result<()>;
 }
 
 /// The calls that are running, and how the last one that did not set backups up ended.
@@ -193,6 +206,8 @@ enum Step {
     /// The service holds the bundle, the enrolment and the retention switch, and this setup is
     /// what remains to be recorded.
     Record(SetupRecord),
+    /// The admission stopped the call before one of its steps, which did not run.
+    Stopped(ControllerError),
 }
 
 impl BackupSetup {
@@ -435,10 +450,10 @@ impl BackupSetup {
     /// # Errors
     ///
     /// Returns [`ControllerError::InvalidArgument`] for a call whose fingerprint is not the one its
-    /// recovery public key has, and the admission's refusal when it no longer stands where the
-    /// setup is to be recorded: nothing is recorded then, and a repeat under a new admission
-    /// finds what the service already holds. Every other way the call can end is one of its
-    /// answers.
+    /// recovery public key has, and the admission's refusal when it no longer stands before a request
+    /// that changes the service or where the setup is to be recorded: nothing is recorded then,
+    /// and what the service already holds is harmless, as after any call that ends before the
+    /// record. Every other way the call can end is one of its answers.
     pub async fn enable(
         &self,
         params: BackupEnableParams,
@@ -498,9 +513,10 @@ impl BackupSetup {
         mark: std::result::Result<kr_client::services::AccountMark, BackupSignIn>,
         admission: Arc<dyn SetupAdmission>,
     ) -> Result<BackupEnableResult> {
-        match self.steps(params, mark).await {
+        match self.steps(params, mark, admission.as_ref()).await {
             Ok(Step::Answer(done)) | Err(done) => Ok(done),
             Ok(Step::Record(record)) => self.record(record, params, admission).await,
+            Ok(Step::Stopped(refusal)) => Err(refusal),
         }
     }
 
@@ -508,6 +524,7 @@ impl BackupSetup {
         &self,
         params: &BackupEnableParams,
         mark: std::result::Result<kr_client::services::AccountMark, BackupSignIn>,
+        admission: &dyn SetupAdmission,
     ) -> std::result::Result<Step, Ended> {
         let origin = self.origin.as_str();
         let backup = Arc::clone(&self.backup);
@@ -519,9 +536,13 @@ impl BackupSetup {
         // 1. Preconditions.
         if let Some(Setup { record, .. }) = &held {
             if record.archive_id == params.archive_id {
-                // A repeat of a call that finished is answered from what it left.
+                // A repeat of a call that finished is answered from what it left, to a caller
+                // whose registration still stands.
                 return if same_setup(record, params) {
-                    Ok(Step::Answer(enabled(record)))
+                    Ok(match admission.retained() {
+                        Ok(()) => Step::Answer(enabled(record)),
+                        Err(refusal) => Step::Stopped(refusal),
+                    })
                 } else {
                     Err(declined(BackupEnableCause::AlreadySetUp {}))
                 };
@@ -545,11 +566,23 @@ impl BackupSetup {
             return Err(self.ended_by(&error, mark, true));
         }
 
+        // The admission is asked before each request that changes the service, and not once at
+        // the call's start: the wait for another call, for a token and for each earlier request
+        // can outlast a fence this host comes to owe or the registration the call was made under.
         // 2. The bundle first.
+        if let Err(refusal) = admission.stands() {
+            return Ok(Step::Stopped(refusal));
+        }
         self.write_bundle(params, mark).await?;
         // 3. The writer's enrolment.
+        if let Err(refusal) = admission.stands() {
+            return Ok(Step::Stopped(refusal));
+        }
         self.enrol(params, mark).await?;
         // 4. Managed backup storage on.
+        if let Err(refusal) = admission.stands() {
+            return Ok(Step::Stopped(refusal));
+        }
         self.turn_storage_on(mark).await?;
         // 5. The setup, with the writer's enrolment, in one transaction.
         if self.account.mark_at(origin) != Some(mark) {
@@ -583,20 +616,28 @@ impl BackupSetup {
         let at = params.enabled_at_ms;
         // The thread keeps the admission, and with it the daemon, until the commit has ended,
         // though this call stops waiting for it.
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let committed = {
             let record = record.clone();
+            let ran = Arc::clone(&ran);
             tokio::task::spawn_blocking(move || {
-                admission.commit(&mut || backup.commit_setup(&record, replace, at))
+                backup.commit_setup(&record, replace, at, &|write| {
+                    admission.admitted(&mut || {
+                        ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                        write()
+                    })
+                })
             })
             .await
         };
         match committed {
-            Ok(Ok(Ok(_))) => Ok(enabled(&record)),
+            Ok(Ok(_)) => Ok(enabled(&record)),
+            // The admission did not stand where the setup was to be recorded, and nothing was.
+            Ok(Err(refused)) if !ran.load(std::sync::atomic::Ordering::SeqCst) => Err(refused),
             // A store that refuses the setup as it stands: the archive has generations here.
-            Ok(Ok(Err(ControllerError::InvalidArgument(_)))) => {
+            Ok(Err(ControllerError::InvalidArgument(_))) => {
                 Ok(declined(BackupEnableCause::ArchiveInUse {}))
             }
-            Ok(Err(refused)) => Err(refused),
             _ => Ok(unknown(None)),
         }
     }

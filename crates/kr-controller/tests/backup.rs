@@ -9220,7 +9220,7 @@ fn a_replacement_retires_the_earlier_writer_cancels_what_it_had_not_finished_and
     let objects = [stage(1, "a.cbor", b"one")];
     let record = a_setup(archive_id(), &producer, "ABCD2345");
     service
-        .commit_setup(&record, false, TimestampMs::new(1_000))
+        .commit_setup(&record, false, TimestampMs::new(1_000), &|write| write())
         .expect("the setup is written");
     let admitted = service
         .admit(
@@ -9245,7 +9245,8 @@ fn a_replacement_retires_the_earlier_writer_cancels_what_it_had_not_finished_and
     let replacement = a_setup(next, &producer, "QQQQ2345");
     assert_eq!(
         service
-            .commit_setup(&replacement, true, TimestampMs::new(6_000))
+            .commit_setup(&replacement, true, TimestampMs::new(6_000), &|write| write(
+            ))
             .expect("the replacement is written"),
         SetupCommit::Replaced {
             earlier: archive_id(),
@@ -9462,6 +9463,7 @@ impl Host {
                 &a_setup(archive_id(), &self.producer, "ABCD2345"),
                 false,
                 TimestampMs::new(1_000),
+                &|write| write(),
             )
             .expect("the setup is written");
     }
@@ -9676,6 +9678,7 @@ async fn the_store_refuses_a_retention_deletion_for_each_reason_on_its_own() {
             &a_setup(other, &host.producer, "QQQQ2345"),
             true,
             TimestampMs::new(98_000),
+            &|write| write(),
         )
         .expect("a replacement");
     let mut store = BackupStore::open(&host.state).expect("the store");
@@ -9817,12 +9820,12 @@ fn a_repeated_setup_leaves_the_binding_and_a_used_archive_is_not_set_up_again() 
     let producer = Producer::generate();
     let record = a_setup(archive_id(), &producer, "ABCD2345");
     service
-        .commit_setup(&record, false, TimestampMs::new(1_000))
+        .commit_setup(&record, false, TimestampMs::new(1_000), &|write| write())
         .expect("written");
     let epoch = service.binding().read().epoch;
     assert_eq!(
         service
-            .commit_setup(&record, false, TimestampMs::new(1_001))
+            .commit_setup(&record, false, TimestampMs::new(1_001), &|write| write())
             .expect("a repeat"),
         SetupCommit::Unchanged
     );
@@ -9843,11 +9846,12 @@ fn a_repeated_setup_leaves_the_binding_and_a_used_archive_is_not_set_up_again() 
             &a_setup(next, &producer, "QQQQ2345"),
             true,
             TimestampMs::new(6_000),
+            &|write| write(),
         )
         .expect("a replacement");
     assert!(
         matches!(
-            service.commit_setup(&record, true, TimestampMs::new(7_000)),
+            service.commit_setup(&record, true, TimestampMs::new(7_000), &|write| write()),
             Err(ControllerError::InvalidArgument(_))
         ),
         "a late repeat for the archive that was replaced does not bring it back"
@@ -10104,6 +10108,7 @@ async fn the_store_refuses_a_deletion_the_person_asks_for_each_reason_on_its_own
             &a_setup(other, &host.producer, "QQQQ2345"),
             true,
             TimestampMs::new(98_000),
+            &|write| write(),
         )
         .expect("a replacement");
     refused(ask(&host, 1));
@@ -10440,6 +10445,7 @@ fn the_admission_of_a_generation_wakes_the_carrier_once() {
             &a_setup(archive_id(), &producer, "ABCD2345"),
             false,
             TimestampMs::new(1_000),
+            &|write| write(),
         )
         .expect("written");
     let signals = service.signals();
@@ -10515,6 +10521,7 @@ fn a_generation_number_at_or_below_the_count_is_not_admitted() {
             &a_setup(archive_id(), &producer, "ABCD2345"),
             false,
             TimestampMs::new(1_000),
+            &|write| write(),
         )
         .expect("written");
     service
