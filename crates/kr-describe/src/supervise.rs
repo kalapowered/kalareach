@@ -798,17 +798,20 @@ impl Driver {
     /// the answer to a load or a job it gives, and not to a later end that has another cause. The
     /// answer to a check of a file does not take it.
     fn the_system_refused_memory(&self) -> bool {
+        // Asked of the test's record as well as the system's, so that both are forgotten.
+        #[cfg(feature = "testing")]
+        let simulated = crate::testing::memory_refusal_taken();
+        #[cfg(not(feature = "testing"))]
+        let simulated = false;
         #[cfg(windows)]
-        {
-            self.process
-                .as_ref()
-                .and_then(|running| running.system_limit.as_ref())
-                .is_some_and(kr_ipc::memory_limit::MemoryLimit::take_refusal)
-        }
+        let recorded = self
+            .process
+            .as_ref()
+            .and_then(|running| running.system_limit.as_ref())
+            .is_some_and(kr_ipc::memory_limit::MemoryLimit::take_refusal);
         #[cfg(not(windows))]
-        {
-            false
-        }
+        let recorded = false;
+        simulated || recorded
     }
 
     /// Hands one frame to the writer, or says why the process is not taking it.

@@ -81,6 +81,24 @@ thread_local! {
     /// comes to.
     static AT_DECISION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+
+    /// Whether the system has refused the process of a driver on this thread memory since the
+    /// driver last asked.
+    static MEMORY_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Makes the driver on this thread find, the next time it asks, that the system refused its process
+/// memory, as the record of a memory limit does on a platform that holds one. It is found once, and
+/// then forgotten, as the record is. This is how the driver's answer to a refusal is shown on a
+/// platform with no such limit.
+pub fn the_system_refuses_the_process_memory() {
+    MEMORY_REFUSED.with(|refused| refused.set(true));
+}
+
+/// Returns whether the system is to have refused the process memory since this was last asked, and
+/// forgets it.
+pub(crate) fn memory_refusal_taken() -> bool {
+    MEMORY_REFUSED.with(|refused| refused.replace(false))
 }
 
 /// Makes the next reading of its own start identity, by a driver on this thread, fail as a query
@@ -163,6 +181,9 @@ pub struct Script {
     /// Whether a job that is refused the memory it holds answers that it failed, and keeps running,
     /// as a runtime does that catches a failed allocation, instead of ending with the allocation.
     pub fail_when_memory_refused: bool,
+    /// Whether a load ends as failed, as a runtime does that catches an allocation it was refused
+    /// while it reads the weights.
+    pub fail_load: bool,
     /// What a job's answer looks like.
     pub output: Output,
     /// Whether the process ends inside a job, as a crashed model would.
@@ -220,6 +241,9 @@ pub enum Raw {
     PartialFrameThenHang,
     /// Answers each job twice, and once more for work nobody asked for.
     AnswerTwice,
+    /// Answers each job first with a success for work nobody is waiting for, then with its own
+    /// answer, that it failed.
+    StaleSuccessThenFailure,
 }
 
 impl Script {
@@ -267,6 +291,7 @@ impl Script {
         flag("too-large", self.too_large);
         flag("memory-ceiling", self.memory_ceiling);
         flag("fail-when-memory-refused", self.fail_when_memory_refused);
+        flag("fail-load", self.fail_load);
         flag("crash-in-generate", self.crash_in_generate);
         flag("panic-in-generate", self.panic_in_generate);
         flag("mark-start", self.mark_start);
@@ -289,6 +314,9 @@ impl Script {
             Some(Raw::PartialFrameThenExit) => parts.push("raw=partial-frame-then-exit".to_owned()),
             Some(Raw::PartialFrameThenHang) => parts.push("raw=partial-frame-then-hang".to_owned()),
             Some(Raw::AnswerTwice) => parts.push("raw=answer-twice".to_owned()),
+            Some(Raw::StaleSuccessThenFailure) => {
+                parts.push("raw=stale-success-then-failure".to_owned());
+            }
         }
         parts.join(",")
     }
@@ -333,6 +361,7 @@ impl Script {
                 "too-large" => script.too_large = true,
                 "memory-ceiling" => script.memory_ceiling = true,
                 "fail-when-memory-refused" => script.fail_when_memory_refused = true,
+                "fail-load" => script.fail_load = true,
                 "crash-in-generate" => script.crash_in_generate = true,
                 "panic-in-generate" => script.panic_in_generate = true,
                 "mark-start" => script.mark_start = true,
@@ -361,6 +390,7 @@ impl Script {
                         "partial-frame-then-exit" => Raw::PartialFrameThenExit,
                         "partial-frame-then-hang" => Raw::PartialFrameThenHang,
                         "answer-twice" => Raw::AnswerTwice,
+                        "stale-success-then-failure" => Raw::StaleSuccessThenFailure,
                         other => return Err(format!("raw={other} is not a raw mode")),
                     });
                 }
@@ -442,6 +472,12 @@ impl Model for StubModel {
 
     fn load(&mut self, work: &LoadWork<'_>, token: &Cancellation, deadline: Instant) -> Loading {
         self.began("load");
+        if self.script.fail_load {
+            return Loading::Ended {
+                why: crate::wire::LoadEnd::Failed,
+                detail: Some("the runtime could not allocate what the load needs".to_owned()),
+            };
+        }
         if self.script.verify_on_load {
             for placed in work.assets {
                 if let Verifying::Ended { detail, .. } = check_file(&placed.asset, &placed.path) {
@@ -1261,6 +1297,16 @@ fn run_raw(raw: Raw, script: &Script) -> i32 {
                         produced(id),
                         produced(id),
                         produced(U64::new(id.get().saturating_add(1_000))),
+                    ],
+                    Raw::StaleSuccessThenFailure => vec![
+                        produced(U64::new(id.get().saturating_add(1_000))),
+                        Answer::Ended {
+                            id,
+                            why: JobEnd::Failed,
+                            detail: Nullable::some(
+                                "the runtime could not allocate what the job needs".to_owned(),
+                            ),
+                        },
                     ],
                     Raw::Silent => Vec::new(),
                 }
