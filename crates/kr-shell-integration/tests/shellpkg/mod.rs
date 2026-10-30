@@ -1431,7 +1431,16 @@ impl Session {
                         // A routine acknowledgement is not a check's own write, so a bridge that
                         // has gone is recorded here rather than asserted: the check that needs a
                         // working endpoint asks for one and says so itself.
+                        // An idle report asks for nothing, so its acknowledgement gives the reader
+                        // no step: a step makes the reader report idle again, and an
+                        // acknowledgement of that report would then step it for good, with a key
+                        // always on its way to the terminal.
+                        let steps = self.stepping;
+                        if matches!(event, BridgeEvent::ReaderIdle(_)) {
+                            self.stepping = false;
+                        }
                         let _ = self.write_frames_before(&frames, deadline);
+                        self.stepping = steps;
                         if matches!(event, BridgeEvent::CommandResolve(_))
                             && std::mem::take(&mut self.commands.silent_after_resolve)
                         {
@@ -1664,12 +1673,10 @@ impl Session {
 
     /// Answers one event.
     ///
-    /// The reader asked for this and is not waiting on it, so it is not given a step of its own:
-    /// a session that stepped the reader for every acknowledgement would never let it be idle.
+    /// A reader that answers only when it steps is waiting for this and takes it at the step it
+    /// is given here. Its idle reports are acknowledged without one, so that the step is the last.
     pub fn answer_event(&mut self, id: RequestId, result: EventOutcome) {
-        self.stepping = false;
         self.write_frame(&BridgeFrame::EventResult { id, result });
-        self.stepping = true;
     }
 
     /// Sends one request to the reader thread and returns its identifier.
