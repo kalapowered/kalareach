@@ -3419,10 +3419,11 @@ const STAND_IN_BOUND: Duration = Duration::from_secs(5);
 /// fails instead of hanging.
 const STAND_IN_STALL_SECONDS: u32 = 40;
 
-/// A stand-in for the container runtime that answers every call with success and no output, except
-/// the calls whose command it is told to stall (`exec`, `build`, `--version`): those print nothing
-/// and do not end, as `podman exec` did on the build box. It records every call in `calls` in its
-/// directory, one line of arguments each, whether it stalls the call or not.
+/// A stand-in for the container runtime that answers every call with success and no output, and
+/// says no image exists, except the calls whose command it is told to stall (`exec`, `build`,
+/// `--version`): those print nothing and do not end, as `podman exec` did on the build box. It
+/// records every call in `calls` in its directory, one line of arguments each, whether it stalls
+/// the call or not.
 fn stalling_runtime(directory: &Path, stalls: &[&str]) -> Runtime {
     let text = directory.join("runtime.text");
     std::fs::write(
