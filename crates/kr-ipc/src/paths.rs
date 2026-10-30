@@ -788,6 +788,13 @@ fn build_owner_only_directory(path: &Path) -> Result<bool> {
     windows::create_owner_only_directory(path)
 }
 
+/// Checks that a directory belongs to this user, that its mode grants the group and others nothing,
+/// and that its access list lets no other account in.
+///
+/// The list is asked about only for a directory of this user's own: another user's is refused
+/// whatever its list says. A list that lets another account in is refused as such and never as a
+/// mode, since a mode does not remove an entry of a list: the command that mends a mode would leave
+/// the directory open to that account, and the check would then pass it.
 #[cfg(unix)]
 fn check_owner_only(path: &Path, metadata: &std::fs::Metadata) -> Result<()> {
     use std::os::unix::fs::MetadataExt as _;
@@ -795,7 +802,20 @@ fn check_owner_only(path: &Path, metadata: &std::fs::Metadata) -> Result<()> {
     let expected_uid = current_uid();
     let found_uid = metadata.uid();
     let found_mode = metadata.mode() & 0o777;
-    if found_uid != expected_uid || found_mode & 0o077 != 0 {
+    let mode_refused = found_uid != expected_uid || found_mode & 0o077 != 0;
+    if found_uid == expected_uid
+        && let Some(detail) = others_in_access_list(path)
+    {
+        return Err(IpcError::DirectoryAccessRefused {
+            path: path.to_path_buf(),
+            detail: if mode_refused {
+                format!("{detail}, and its mode is {found_mode:04o}")
+            } else {
+                detail
+            },
+        });
+    }
+    if mode_refused {
         return Err(IpcError::DirectoryNotOwnerOnly {
             path: path.to_path_buf(),
             expected_uid,
@@ -804,6 +824,53 @@ fn check_owner_only(path: &Path, metadata: &std::fs::Metadata) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// What the access list of a directory of this user's says about other accounts, when it lets one
+/// in or cannot be read: none when it names nobody else.
+///
+/// An entry that denies, and an entry for this user, give nobody else anything. On macOS the list
+/// is separate from the mode and `chmod 700` leaves it as it was. On Linux the mode's group bits
+/// are the mask of a list, so `chmod 700` makes its named entries void, and there is nothing to
+/// read.
+#[cfg(target_os = "macos")]
+fn others_in_access_list(path: &Path) -> Option<String> {
+    access_list_verdict(exacl::getfacl(path, None), || {
+        let mut own = vec![current_uid().to_string()];
+        own.extend(passwd_entry().map(|account| account.name));
+        own
+    })
+}
+
+/// As the platform's list is read for [`others_in_access_list`], with a failure to read it counted
+/// against the directory: what cannot be established to be closed is not called closed. `own`
+/// gives the names this user's entries go by, and is asked for only when the list allows somebody.
+#[cfg(target_os = "macos")]
+fn access_list_verdict(
+    read: std::io::Result<Vec<exacl::AclEntry>>,
+    own: impl FnOnce() -> Vec<String>,
+) -> Option<String> {
+    match read {
+        Ok(entries) => {
+            let mut allowing = entries.iter().filter(|entry| entry.allow).peekable();
+            allowing.peek()?;
+            let own = own();
+            allowing
+                .any(|entry| {
+                    !(entry.kind == exacl::AclEntryKind::User
+                        && own.iter().any(|name| *name == entry.name))
+                })
+                .then(|| "its access list lets another account in".to_owned())
+        }
+        // A file system that keeps no access lists has none to let anybody in.
+        Err(error) if error.raw_os_error() == Some(libc::ENOTSUP) => None,
+        Err(error) => Some(format!("its access list could not be read: {error}")),
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn others_in_access_list(_path: &Path) -> Option<String> {
+    None
 }
 
 /// Checks that a directory belongs to this user and that its list names nobody else.
@@ -3884,6 +3951,20 @@ mod tests {
             assert!(error.mending_command().is_some(), "{error}");
         }
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// KR-REQ-24.26: a list that cannot be read is not taken to be closed, so the directory is
+    /// refused and no command is named for it; a file system that keeps no lists has none to read.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_list_that_cannot_be_read_is_not_called_closed() {
+        let own = || vec!["501".to_owned(), "someone".to_owned()];
+        let unreadable = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let said = access_list_verdict(Err(unreadable), own).expect("refuses what it cannot read");
+        assert!(said.contains("could not be read"), "{said}");
+
+        let kept_none = std::io::Error::from_raw_os_error(libc::ENOTSUP);
+        assert_eq!(access_list_verdict(Err(kept_none), own), None);
     }
 
     #[test]

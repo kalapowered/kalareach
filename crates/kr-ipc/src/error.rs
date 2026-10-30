@@ -33,8 +33,10 @@ pub enum IpcError {
     },
     /// A directory that must be owner-only was not.
     ///
-    /// A directory that this user owns, that only this user can write and that others can read is
-    /// one `chmod 700` mends, and the text says so, naming the directory.
+    /// A directory that this user owns, that only this user can write and that others can read or
+    /// enter is one `chmod 700` mends, and the text says so, naming the directory. A directory
+    /// whose access list lets another account in is [`Self::DirectoryAccessRefused`], which names
+    /// no command, since a mode leaves the list as it was.
     #[error(
         "{path} must be owned by user {expected_uid} with mode 0700, found owner {found_uid} and mode {found_mode:04o}{}",
         mending_suffix(.path, *.expected_uid, *.found_uid, *.found_mode)
@@ -52,7 +54,9 @@ pub enum IpcError {
     /// A directory that must be owner-only carries an access-control list that says otherwise.
     ///
     /// The Windows answer to the question [`Self::DirectoryNotOwnerOnly`] asks on Unix. There are
-    /// no mode bits to report, so what is carried is what the list said.
+    /// no mode bits to report, so what is carried is what the list said. On macOS it is the
+    /// refusal of a directory of this user's whose access list lets another account in, or cannot
+    /// be read, whatever its mode is.
     #[error("{path} is not owner-only: {detail}")]
     DirectoryAccessRefused {
         /// The directory.
@@ -230,9 +234,9 @@ impl IpcError {
     }
 
     /// The command that mends the directory this failure names, when one command does: a
-    /// directory of this user's own that only this user can write and that others can read. It
-    /// is quoted for a shell, and names the real path, so a caller that shows a path with names
-    /// left out gives it only where nothing was left out.
+    /// directory of this user's own that only this user can write and that others can read or
+    /// enter. It is quoted for a shell, and names the real path, so a caller that shows a path
+    /// with names left out gives it only where nothing was left out.
     #[must_use]
     pub fn mending_command(&self) -> Option<String> {
         match self {
@@ -268,7 +272,8 @@ fn mending_suffix(
 }
 
 /// The command that mends a directory this user owns, that only this user can write and that
-/// others can read, as one argument a shell reads literally. A path that is not text has none.
+/// others can read or enter, as one argument a shell reads literally. A path that is not text has
+/// none.
 fn mending_command(
     path: &std::path::Path,
     expected_uid: u32,
