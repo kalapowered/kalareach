@@ -1170,6 +1170,30 @@ async fn a_stop_the_connection_stopped_waiting_for_is_recorded_and_given_again()
     call.world.serving.abort();
 }
 
+/// KR-REQ-09.09: a voice change that was already recorded is given back to a repeat only while this
+/// host owes no fence it could not raise. The control: the same repeat, with nothing owed, is given
+/// the answer, and is again once the fence is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recorded_voice_stop_is_not_given_back_while_a_fence_is_owed() {
+    let call = Call::start().await;
+    let stop = call.stop_submitted();
+    call.submit_voice(Method::VoiceStop, &stop)
+        .await
+        .expect("the stop is made");
+    call.controller.hold_fence(true);
+    let refused = call
+        .submit_voice(Method::VoiceStop, &stop)
+        .await
+        .expect_err("a recorded answer is not given back while a fence is owed");
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+    assert!(refused.to_string().contains("fence"), "{refused}");
+    call.controller.hold_fence(false);
+    call.submit_voice(Method::VoiceStop, &stop)
+        .await
+        .expect("the answer is given back once nothing is owed");
+    call.world.serving.abort();
+}
+
 /// KR-REQ-15.13 and 09.12: withdrawing a call's grant while a close is on its way raises a barrier
 /// that withdraws no connection. The connection of the device that holds the call stays admitted,
 /// so the answer to the stop and to every request on that link is delivered, and so does every

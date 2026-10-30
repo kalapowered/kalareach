@@ -1048,19 +1048,13 @@ impl Controller {
             crate::grants::ActionClaim::Claimed { hold } => hold,
             crate::grants::ActionClaim::Recorded(record) => {
                 // An earlier attempt recorded this action between the lookup that found nothing
-                // and this claim. What it produced goes back only under authority that has not been
-                // withdrawn, and without the deadline a receipt outlives. The answer is waited for
-                // first: it is the check made with the answer in hand that decides.
-                let answered = self
-                    .recorded_authority_change(actor_id, mutation, record)
+                // and this claim.
+                return self
+                    .retained_under_authority(
+                        &carried,
+                        self.recorded_authority_change(actor_id, mutation, record),
+                    )
                     .await;
-                #[cfg(feature = "testing")]
-                self.after_the_retained_lookup.wait().await;
-                self.check_registration(&crate::authority::AdmittedMutation {
-                    deadline: None,
-                    ..carried
-                })?;
-                return answered;
             }
         };
         let outcome = match (method, intent) {
@@ -1811,7 +1805,10 @@ impl Controller {
             crate::grants::ActionClaim::Claimed { hold } => hold,
             crate::grants::ActionClaim::Recorded(record) => {
                 return self
-                    .recorded_authority_change(actor_id, mutation, record)
+                    .retained_under_authority(
+                        &carried,
+                        self.recorded_authority_change(actor_id, mutation, record),
+                    )
                     .await;
             }
         };
@@ -1845,7 +1842,10 @@ impl Controller {
             crate::grants::ActionClaim::Claimed { hold } => hold,
             crate::grants::ActionClaim::Recorded(record) => {
                 return self
-                    .recorded_authority_change(actor_id, mutation, record)
+                    .retained_under_authority(
+                        &carried,
+                        self.recorded_authority_change(actor_id, mutation, record),
+                    )
                     .await;
             }
         };
@@ -3156,6 +3156,7 @@ mod tests {
         DeliveryRule, Destination, DestinationId, DestinationRecord, PreviewKeys, PushDestination,
     };
     use kr_protocol::envelope::{ActionTarget, MutationRequest, ParamsValue};
+    use kr_protocol::error::ErrorCode;
     use kr_protocol::grant::{
         EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector,
     };
@@ -3507,6 +3508,51 @@ mod tests {
             .await
             .expect("a standing admission registers");
         assert_eq!(host.revisions(), (2, None));
+    }
+
+    /// KR-REQ-09.09: a key registration that was already recorded is given back to a repeat only
+    /// while this host owes no fence. The control: the same repeat, with nothing owed, is given
+    /// the receipt, and is again once the fence is gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_recorded_key_registration_is_not_given_back_while_a_fence_is_owed() {
+        let host = Host::start(GrantExpiry::Never, false).await;
+        let rotated = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a key");
+        let actor = kr_transport::listener::device_principal(&host.device_id);
+        let registration = host.registration(0x74, *rotated.public());
+        host.controller
+            .preview_key_update_action(
+                &actor,
+                &registration,
+                host.admission(Duration::from_secs(10)),
+            )
+            .await
+            .expect("the registration is made");
+        host.controller.hold_fence(true);
+        let refused = host
+            .controller
+            .preview_key_update_action(
+                &actor,
+                &registration,
+                host.admission(Duration::from_secs(10)),
+            )
+            .await
+            .expect_err("a recorded answer is not given back while a fence is owed");
+        assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+        assert!(refused.to_string().contains("fence"), "{refused}");
+        host.controller.hold_fence(false);
+        host.controller
+            .preview_key_update_action(
+                &actor,
+                &registration,
+                host.admission(Duration::from_secs(10)),
+            )
+            .await
+            .expect("the receipt is given back once nothing is owed");
+        assert_eq!(
+            host.revisions(),
+            (2, None),
+            "and the registration was made once"
+        );
     }
 
     /// KR-REQ-09.13: the daemon's entry for a worker replaces the one an answer was given with only
