@@ -713,6 +713,12 @@ fn a_state_directory_whose_access_list_lets_another_account_in_is_refused_withou
 
     let refused = home.run_as_a_person(&program, &["host", "startup", "--set", "standalone"]);
     assert!(!refused.status.success(), "{}", said(&refused));
+    let refusal = format!("{} is not owner-only", state.display());
+    assert!(
+        said(&refused).contains(&refusal),
+        "the refusal names the directory: {}",
+        said(&refused)
+    );
     assert!(
         !said(&refused).contains("chmod"),
         "no command is named for a directory a mode does not mend: {}",
@@ -722,7 +728,7 @@ fn a_state_directory_whose_access_list_lets_another_account_in_is_refused_withou
     std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).expect("closed");
     let again = home.run_as_a_person(&program, &["host", "startup", "--set", "standalone"]);
     assert!(
-        !again.status.success(),
+        said(&again).contains(&refusal),
         "the entry still lets that account in: {}",
         said(&again)
     );
