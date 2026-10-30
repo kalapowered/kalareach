@@ -1661,6 +1661,24 @@ fn settle_one(service: &ChangeSetService, action_id: ActionId, row: &ProgressRow
     service.locked()?.settle_path(action_id, row)
 }
 
+/// Whether the location a destination is reached through has stopped admitting the caller. A
+/// destination reached through none asks nothing, and is the owner's.
+fn location_stopped_admitting(repository: &OpenedRepository) -> bool {
+    repository
+        .admission()
+        .is_some_and(|admission| admission.admit().is_err())
+}
+
+/// What a path comes to when the location stopped admitting the caller before it was published or
+/// removed: nothing was written at it.
+fn withdrawn_before_publishing() -> Installed {
+    Installed::Unresolved(
+        "the location this destination is reached through stopped admitting the caller before \
+         this host published this path, so it published nothing"
+            .to_owned(),
+    )
+}
+
 /// Runs one apply's operations, recording each one's outcome as it goes.
 fn run_operations(
     service: &ChangeSetService,
@@ -1678,10 +1696,9 @@ fn run_operations(
         // A destination reached through a location is reached only while that location still
         // admits the caller. Git asks it before each invocation, and this loop installs a path
         // through the opened tree with no Git of its own, so it asks again before each path and
-        // stops, leaving the rest unattempted, when the location has been withdrawn.
-        if let Some(admission) = repository.admission()
-            && admission.admit().is_err()
-        {
+        // stops, leaving the rest unattempted, when the location has been withdrawn. `install`
+        // asks once more immediately before it publishes or removes the path.
+        if location_stopped_admitting(repository) {
             run.stopped = Some((
                 ApplyOutcomeClass::InterruptedApply,
                 format!(
@@ -2031,6 +2048,9 @@ fn install(
             {
                 return Ok(Installed::Abandoned);
             }
+            if location_stopped_admitting(repository) {
+                return Ok(withdrawn_before_publishing());
+            }
             if let Err(error) = here.remove(&leaf_name) {
                 return Ok(Installed::Unresolved(error.to_string()));
             }
@@ -2261,6 +2281,11 @@ fn install(
                 && !act(path)
             {
                 return ControlFlow::Break(Ok(Installed::Abandoned));
+            }
+            // The location this destination is reached through still admits the caller: the
+            // last thing before the content becomes the destination's.
+            if location_stopped_admitting(repository) {
+                return ControlFlow::Break(Ok(withdrawn_before_publishing()));
             }
             // The content this host is about to publish has to still be the file it wrote. A name
             // replaced between the creation and here is a file this host neither wrote nor
