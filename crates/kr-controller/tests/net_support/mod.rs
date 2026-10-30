@@ -812,6 +812,7 @@ impl Host {
             clocks,
             boot,
             waits,
+            work,
             ..
         } = self;
         clients.abort();
@@ -839,6 +840,7 @@ impl Host {
             clocks,
             boot,
             waits,
+            work,
         }
     }
 
@@ -1125,6 +1127,8 @@ impl Host {
 /// A daemon a suite shut down, and what the next one on its environment tree starts from.
 pub struct Stopped {
     temp: kr_ipc::testing::TempHost,
+    /// The directory the suite built its repositories in, which outlives the daemon.
+    work: kr_ipc::testing::PrivateTempDir,
     room: room::TestRoom,
     owner: Option<DeviceRecord>,
     settings: NetworkSettings,
@@ -1176,6 +1180,7 @@ impl Stopped {
             clocks,
             boot,
             waits,
+            work,
             ..
         } = self;
         let mut host = Host::start_on(
@@ -1183,6 +1188,7 @@ impl Stopped {
         )
         .await;
         host.owner = owner;
+        host.work = work;
         host
     }
 
@@ -1216,6 +1222,7 @@ impl Stopped {
             clocks,
             boot,
             waits,
+            work,
         } = self;
         let mut host = Host::start_on(
             temp,
@@ -1233,6 +1240,7 @@ impl Stopped {
         )
         .await;
         host.owner = owner;
+        host.work = work;
         host
     }
 }
