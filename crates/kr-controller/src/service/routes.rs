@@ -953,7 +953,7 @@ impl Controller {
             Method::BackupEnable => {
                 match accepted.filter(|accepted| self.clock.now() < accepted.deadline) {
                     Some(_) => match self.authorised(connection_id) {
-                        Ok(_) => self.backup_enable(mutation).await,
+                        Ok(_) => self.backup_enable(mutation, carried).await,
                         Err(error) => Err(error),
                     },
                     None => Err(ControllerError::WindowExpired {

@@ -40,7 +40,6 @@
 //! for a token and removed by a guard when the call ends however it ends. `backup.status` reads the
 //! entries without waiting for any call, so a setup that is under way is told so.
 
-use std::any::Any;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -75,7 +74,7 @@ use crate::account::HostAccount;
 use crate::backup::BackupService;
 use crate::backup::relay::InstallationSigner;
 use crate::backup::runtime::{HostKeySigner, TokenState, describe_token, managed_transport};
-use crate::backup::store::{Setup, SetupRecord};
+use crate::backup::store::{Setup, SetupCommit, SetupRecord};
 use crate::backup::uploader::Hold;
 use crate::error::{ControllerError, Result};
 use crate::quiet::Quiet;
@@ -110,6 +109,25 @@ pub fn standing(
         return Some(BackupUnusable::WriterRetired);
     }
     None
+}
+
+/// The admission a setup call was made under, asked again where the setup is recorded.
+///
+/// The record is written after several requests to the service, each of which can last as long as
+/// the service likes, so an authority withdrawn or a fence owed meanwhile has to stop the record
+/// and not only the call's start. The implementation also keeps the daemon alive until the commit
+/// has ended: a commit that went on after the environment's lock was let go could land beside the
+/// next daemon's start.
+pub trait SetupAdmission: Send + Sync + 'static {
+    /// Runs `commit` while the admission stands.
+    ///
+    /// # Errors
+    ///
+    /// Returns the admission's refusal, in which case `commit` did not run.
+    fn commit(
+        &self,
+        commit: &mut dyn FnMut() -> Result<SetupCommit>,
+    ) -> Result<Result<SetupCommit>>;
 }
 
 /// The calls that are running, and how the last one that did not set backups up ended.
@@ -167,6 +185,15 @@ impl std::fmt::Debug for BackupSetup {
 
 /// How a step of a call ended, when it did not go on.
 type Ended = BackupEnableResult;
+
+/// Where the steps of a call that did not end leave it.
+enum Step {
+    /// The call has its answer and records nothing: a repeat of a setup already recorded.
+    Answer(BackupEnableResult),
+    /// The service holds the bundle, the enrolment and the retention switch, and this setup is
+    /// what remains to be recorded.
+    Record(SetupRecord),
+}
 
 impl BackupSetup {
     /// Builds the setup over the service at `origin`, with the host's keys.
@@ -408,11 +435,14 @@ impl BackupSetup {
     /// # Errors
     ///
     /// Returns [`ControllerError::InvalidArgument`] for a call whose fingerprint is not the one its
-    /// recovery public key has. Every other way the call can end is one of its answers.
+    /// recovery public key has, and the admission's refusal when it no longer stands where the
+    /// setup is to be recorded: nothing is recorded then, and a repeat under a new admission
+    /// finds what the service already holds. Every other way the call can end is one of its
+    /// answers.
     pub async fn enable(
         &self,
         params: BackupEnableParams,
-        daemon: Arc<dyn Any + Send + Sync>,
+        admission: Arc<dyn SetupAdmission>,
     ) -> Result<BackupEnableResult> {
         if params.kit_fingerprint != kit_fingerprint(&params.recovery_public_key) {
             return Err(ControllerError::InvalidArgument(
@@ -438,11 +468,13 @@ impl BackupSetup {
             }
         };
         let serial = self.serial.lock().await;
-        let ended = self.run(&params, mark, daemon).await;
+        let ended = self.run(&params, mark, admission).await;
         drop(serial);
-        {
+        // A call the admission refused at the record ended with no answer of its own, and what
+        // `backup.status` last said about an attempt stays as it was.
+        if let Ok(answer) = &ended {
             let mut calls = self.calls();
-            calls.last = match &ended {
+            calls.last = match answer {
                 BackupEnableResult::Enabled { .. } => None,
                 BackupEnableResult::Declined { cause } => Some(BackupLastAttempt {
                     kit_fingerprint: params.kit_fingerprint.clone(),
@@ -455,18 +487,20 @@ impl BackupSetup {
             };
         }
         drop(entry);
-        Ok(ended)
+        ended
     }
 
-    /// Everything a call does, ending as one of its answers.
+    /// Everything a call does, ending as one of its answers, or refused where its setup is to be
+    /// recorded.
     async fn run(
         &self,
         params: &BackupEnableParams,
         mark: std::result::Result<kr_client::services::AccountMark, BackupSignIn>,
-        daemon: Arc<dyn Any + Send + Sync>,
-    ) -> BackupEnableResult {
-        match self.steps(params, mark, daemon).await {
-            Ok(done) | Err(done) => done,
+        admission: Arc<dyn SetupAdmission>,
+    ) -> Result<BackupEnableResult> {
+        match self.steps(params, mark).await {
+            Ok(Step::Answer(done)) | Err(done) => Ok(done),
+            Ok(Step::Record(record)) => self.record(record, params, admission).await,
         }
     }
 
@@ -474,8 +508,7 @@ impl BackupSetup {
         &self,
         params: &BackupEnableParams,
         mark: std::result::Result<kr_client::services::AccountMark, BackupSignIn>,
-        daemon: Arc<dyn Any + Send + Sync>,
-    ) -> std::result::Result<BackupEnableResult, Ended> {
+    ) -> std::result::Result<Step, Ended> {
         let origin = self.origin.as_str();
         let backup = Arc::clone(&self.backup);
         let held = tokio::task::spawn_blocking(move || backup.setup())
@@ -488,7 +521,7 @@ impl BackupSetup {
             if record.archive_id == params.archive_id {
                 // A repeat of a call that finished is answered from what it left.
                 return if same_setup(record, params) {
-                    Ok(enabled(record))
+                    Ok(Step::Answer(enabled(record)))
                 } else {
                     Err(declined(BackupEnableCause::AlreadySetUp {}))
                 };
@@ -532,26 +565,39 @@ impl BackupSetup {
             producer_key_id: params.producer_key_id,
             enabled_at_ms: params.enabled_at_ms,
         };
+        Ok(Step::Record(record))
+    }
+
+    /// Records the setup, if the admission the call was made under still stands.
+    ///
+    /// The admission is asked again in the transaction that records the setup, and not only when
+    /// the call began: the requests before it are the service's to take as long as it likes.
+    async fn record(
+        &self,
+        record: SetupRecord,
+        params: &BackupEnableParams,
+        admission: Arc<dyn SetupAdmission>,
+    ) -> Result<BackupEnableResult> {
         let backup = Arc::clone(&self.backup);
         let replace = params.replace;
         let at = params.enabled_at_ms;
-        // The thread keeps the daemon until the commit has ended, though this call stops waiting
-        // for it.
+        // The thread keeps the admission, and with it the daemon, until the commit has ended,
+        // though this call stops waiting for it.
         let committed = {
             let record = record.clone();
             tokio::task::spawn_blocking(move || {
-                let _daemon = daemon;
-                backup.commit_setup(&record, replace, at)
+                admission.commit(&mut || backup.commit_setup(&record, replace, at))
             })
             .await
         };
         match committed {
-            Ok(Ok(_)) => Ok(enabled(&record)),
+            Ok(Ok(Ok(_))) => Ok(enabled(&record)),
             // A store that refuses the setup as it stands: the archive has generations here.
-            Ok(Err(ControllerError::InvalidArgument(_))) => {
-                Err(declined(BackupEnableCause::ArchiveInUse {}))
+            Ok(Ok(Err(ControllerError::InvalidArgument(_)))) => {
+                Ok(declined(BackupEnableCause::ArchiveInUse {}))
             }
-            _ => Err(unknown(None)),
+            Ok(Err(refused)) => Err(refused),
+            _ => Ok(unknown(None)),
         }
     }
 

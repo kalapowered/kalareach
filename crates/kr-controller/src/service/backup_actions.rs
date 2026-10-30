@@ -6,6 +6,8 @@ use kr_protocol::backup_read::{BackupReadParams, BackupReadResult};
 use kr_protocol::backup_setup::{BackupEnableParams, BackupEnableResult, BackupStatusParams};
 use kr_protocol::envelope::{MutationRequest, ParamsValue};
 
+use crate::backup::setup::SetupAdmission;
+use crate::backup::store::SetupCommit;
 use crate::error::{ControllerError, Result};
 
 use super::{Controller, parse};
@@ -110,38 +112,45 @@ impl Controller {
     ///
     /// Setting up moves no content: the bundle is key material, so privacy mode neither stops it
     /// nor is stopped by it. What the call writes to the service is the sealed bundle, a writer's
-    /// enrolment and the account's retention switch.
+    /// enrolment and the account's retention switch. The registration the call was admitted under
+    /// is asked again in the transaction that records the setup, after the requests to the service
+    /// that can outlast it.
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::NotConfigured`] when the host selects no storage service, and
-    /// [`ControllerError::InvalidArgument`] for a call that is not well formed.
+    /// Returns [`ControllerError::NotConfigured`] when the host selects no storage service,
+    /// [`ControllerError::InvalidArgument`] for a call that is not well formed, and what
+    /// [`Self::under_registration`] refuses with when the fence this host owes, a withdrawn
+    /// registration or the passed deadline stops the record.
     pub(super) async fn backup_enable(
         self: &std::sync::Arc<Self>,
         mutation: &MutationRequest,
+        carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
         #[cfg(any(test, feature = "testing"))]
         crate::testing::note_backup_enable(self.paths.environment_id(), &mutation.params);
         let params: BackupEnableParams = parse(&mutation.params)?;
-        let answer = self.enable_backups(params).await?;
+        let admission = std::sync::Arc::new(SetupStands {
+            controller: std::sync::Arc::clone(self),
+            carried,
+        });
+        let answer = self.enable_backups(params, admission).await?;
         ParamsValue::from_typed(&answer)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
     }
 
     async fn enable_backups(
-        self: &std::sync::Arc<Self>,
+        &self,
         params: BackupEnableParams,
+        admission: std::sync::Arc<dyn SetupAdmission>,
     ) -> Result<BackupEnableResult> {
         let setup = self.backup_setup_of()?;
-        // The setup is committed on a thread that this call can stop waiting for. The thread keeps
-        // the daemon, and with it the environment's lock, until the commit has ended: a commit that
-        // went on after the lock was let go could land beside the next daemon's start.
-        let daemon = std::sync::Arc::clone(self) as std::sync::Arc<dyn std::any::Any + Send + Sync>;
-        setup.enable(params, daemon).await
+        setup.enable(params, admission).await
     }
 
     /// Sets this host's backups up as `backup.enable` does, for a suite that stops waiting for the
-    /// call while its commit is still to be made.
+    /// call while its commit is still to be made. Nothing asks an admission at the record, and the
+    /// daemon is kept until the commit has ended, as a call's is.
     ///
     /// # Errors
     ///
@@ -151,7 +160,11 @@ impl Controller {
         self: &std::sync::Arc<Self>,
         params: BackupEnableParams,
     ) -> Result<BackupEnableResult> {
-        self.enable_backups(params).await
+        self.enable_backups(
+            params,
+            std::sync::Arc::new(Unchecked(std::sync::Arc::clone(self))),
+        )
+        .await
     }
 
     /// Stops the next `backup.status` between its two reads, for a suite that holds a call before
@@ -178,5 +191,38 @@ impl Controller {
                 kr_protocol::hostinfo::configuration::FILE_NAME,
             ))
         })
+    }
+}
+
+/// The registration a `backup.enable` call was admitted under, asked again where the setup is
+/// recorded. It holds the daemon until the commit has ended, so a commit that went on after the
+/// call stopped waiting for it cannot outlive the environment's lock.
+struct SetupStands {
+    controller: std::sync::Arc<Controller>,
+    carried: crate::authority::AdmittedMutation,
+}
+
+impl SetupAdmission for SetupStands {
+    fn commit(
+        &self,
+        commit: &mut dyn FnMut() -> Result<SetupCommit>,
+    ) -> Result<Result<SetupCommit>> {
+        self.controller.under_registration(&self.carried, commit)
+    }
+}
+
+/// An admission that asks nothing at the record, for a suite that drives the setup without a
+/// connection.
+#[cfg(feature = "testing")]
+struct Unchecked(std::sync::Arc<Controller>);
+
+#[cfg(feature = "testing")]
+impl SetupAdmission for Unchecked {
+    fn commit(
+        &self,
+        commit: &mut dyn FnMut() -> Result<SetupCommit>,
+    ) -> Result<Result<SetupCommit>> {
+        let _daemon = &self.0;
+        Ok(commit())
     }
 }
