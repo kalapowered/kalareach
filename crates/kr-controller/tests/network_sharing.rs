@@ -822,3 +822,172 @@ async fn kr_req_25_10_a_pairing_that_runs_out_while_the_share_waits_takes_no_sha
     assert_eq!(listed.grants.len(), 1, "only the first share was written");
     host.stop().await;
 }
+
+/// What a guest pairing is: the grant it commits holds no action, names no session, includes no
+/// live screen and reaches back to no history.
+fn assert_shares_nothing(
+    actions: &kr_protocol::scalars::CanonicalSet<ActionRight>,
+    sessions: &kr_protocol::grant::SessionSelector,
+    history: &kr_protocol::grant::HistoryScope,
+    whose: &str,
+) {
+    assert!(actions.is_empty(), "{whose} holds no action: {actions:?}");
+    assert_eq!(
+        *sessions,
+        kr_protocol::grant::SessionSelector::None,
+        "{whose} names no session"
+    );
+    assert!(!history.include_live_screen, "{whose} shows no live screen");
+    assert!(
+        history.named_questions.is_empty() && history.named_approvals.is_empty(),
+        "{whose} names no question and no approval"
+    );
+}
+
+/// KR-REQ-25.28: an invitation to a guest, issued through `pair.invite`, shares no session and no
+/// screen. The owner is shown a grant that holds none of them before confirming the device, the
+/// record the host keeps of the pairing holds none of them after, and a device paired as a guest
+/// is refused every session of its host until one is shared with it and it redeems that share.
+/// The control is a viewer invitation issued the same way, whose grant does hold a right, so the
+/// reading above can tell the two apart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_25_28_a_guest_pairing_shares_no_session_and_no_screen_until_one_is_shared_with_it()
+{
+    use kr_protocol::grant::SessionSelector;
+    use kr_protocol::invitation::InviteGrantKind;
+    use kr_protocol::session::{SessionListParams, SessionListResult, SessionReadParams};
+    use net_support::pairing::{self as calls, Signer};
+
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let session_id = net_support::an_open_session(&host).0;
+    let signer = Signer::OwnerDevice(&owner);
+    let mut client = host.client().await;
+
+    // The guest's invitation, as `kr pair invite --guest` builds it.
+    let guest = Device::create().await;
+    let proposed = kr_pairing::grants::guest_grant(
+        kr_ipc::now_ms().get(),
+        24 * 60 * 60 * 1000,
+        host.environment_id,
+    )
+    .expect("a guest grant");
+    let invited = calls::invite_direct(
+        host.environment_id,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &proposed,
+        &signer,
+    )
+    .await
+    .expect("the invitation is issued through pair.invite");
+    let (connection, _candidate, _value) = calls::redeem(&guest.candidate(), &invited).await;
+    let shown = calls::owner_status(&mut client, invited.invitation_id)
+        .await
+        .expect("the owner's view")
+        .owner
+        .0
+        .expect("the owner is shown the invitation");
+    assert_shares_nothing(
+        &shown.proposed_grant.actions,
+        &shown.proposed_grant.session_selector,
+        &shown.proposed_grant.history,
+        "the invitation the owner is shown",
+    );
+    let confirmed = calls::confirm_candidate(
+        host.environment_id,
+        &mut client,
+        invited.invitation_id,
+        &signer,
+    )
+    .await
+    .expect("the pairing commits");
+    connection.close(0u32.into(), b"paired");
+    let record = host.record_of(confirmed.device_id);
+    assert_shares_nothing(
+        &record.grant.actions,
+        &record.grant.session_selector,
+        &record.grant.history,
+        "the pairing the host records",
+    );
+
+    // The control: a viewer pairing issued the same way holds a right, and says so in the same
+    // places.
+    let viewer = Device::create().await;
+    let viewer_record = pair_with(
+        &host,
+        &viewer,
+        &owner,
+        proposal(&[ActionRight::SessionView]),
+    )
+    .await;
+    assert!(
+        viewer_record.grant.permits(ActionRight::SessionView)
+            && viewer_record.grant.session_selector == SessionSelector::Any,
+        "a viewer invitation shares a right: {:?}",
+        viewer_record.grant
+    );
+
+    // A guest is refused the sessions of its host, listed or read, however many there are.
+    let session = net_support::connect(&host, &guest, &record).await;
+    let everywhere = SessionListParams {
+        environment_id: Nullable::null(),
+        include_closed: true,
+    };
+    let refused = session
+        .read::<_, SessionListResult>(Method::SessionList, &everywhere)
+        .await
+        .expect_err("a guest lists no session");
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+    let refused = session
+        .read::<_, kr_protocol::session::SessionReadResult>(
+            Method::SessionRead,
+            &SessionReadParams { session_id },
+        )
+        .await
+        .expect_err("a guest reads no session");
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+
+    // Sharing the session is the way in. This file starts no worker, so the session has nothing
+    // running behind it: the host no longer refuses the read for want of a right, and answers that
+    // it serves no such session, where it refuses a session nobody shared. The shared screen itself
+    // is the end-to-end suite's.
+    let issued = shared(&host, session_id, record.device_id).await;
+    let connection = RawDevice::connect(&host, &guest, &record).await;
+    connection
+        .mutate(
+            Method::GrantRedeem,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_the_host(&host),
+            &GrantRedeemParams {
+                invitation_id: issued.preview.invitation_id,
+            },
+        )
+        .await
+        .expect("the share is redeemed");
+    connection.close();
+    let other = net_support::an_open_session(&host).0;
+    let session = net_support::connect(&host, &guest, &record).await;
+    let reading = &session;
+    let read = |session_id| async move {
+        reading
+            .read::<_, kr_protocol::session::SessionReadResult>(
+                Method::SessionRead,
+                &SessionReadParams { session_id },
+            )
+            .await
+    };
+    let shared_one = read(session_id)
+        .await
+        .expect_err("nothing runs behind the open session");
+    assert_eq!(
+        shared_one.code(),
+        ErrorCode::UnknownSession,
+        "the shared session is authorised: {shared_one}"
+    );
+    let unshared = read(other)
+        .await
+        .expect_err("a session nobody shared with the guest");
+    assert_eq!(unshared.code(), ErrorCode::PermissionDenied, "{unshared}");
+    host.stop().await;
+}
