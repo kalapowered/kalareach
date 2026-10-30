@@ -206,6 +206,53 @@ pub struct Script {
     pub mark_start: bool,
 }
 
+/// Memory a job holds that the system is kept from taking back.
+///
+/// A process that holds memory and does nothing with it is what a machine under memory pressure
+/// takes pages back from, and a resident set that has shrunk is not the resident set a ceiling is
+/// held against. A thread touches one byte of each page every so often, so the pages stay in use
+/// for as long as the job holds them, and the process's resident set is the size it was given.
+struct Resident {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Resident {
+    /// How often each page is touched.
+    const EVERY: Duration = Duration::from_millis(50);
+
+    /// The size of the stride at which a byte is touched, which is no more than the smallest page.
+    const STRIDE: usize = 4096;
+
+    /// Holds `memory`, each page of it in use, until this is dropped.
+    fn keep(mut memory: Vec<u8>) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let told = std::sync::Arc::clone(&stop);
+        let thread = std::thread::Builder::new()
+            .name("stub-resident".to_owned())
+            .spawn(move || {
+                while !told.load(std::sync::atomic::Ordering::Relaxed) {
+                    for page in memory.chunks_mut(Self::STRIDE) {
+                        page[0] = page[0].wrapping_add(1);
+                    }
+                    std::hint::black_box(&memory);
+                    std::thread::sleep(Self::EVERY);
+                }
+            })
+            .ok();
+        Self { stop, thread }
+    }
+}
+
+impl Drop for Resident {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// What a job's answer looks like.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Output {
@@ -544,7 +591,8 @@ impl Model for StubModel {
             vec![0xA5_u8; wanted]
         };
         std::hint::black_box(&held);
-        if !held.is_empty() {
+        let kept = (!held.is_empty()).then(|| Resident::keep(held));
+        if kept.is_some() {
             self.began("held");
         }
         let duration = (!self.script.generate_until_cancelled)

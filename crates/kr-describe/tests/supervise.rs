@@ -1915,13 +1915,39 @@ fn a_publication_past_the_ceiling_stands_and_the_pause_follows_through_the_proce
     assert_eq!(rig.driver.started(), 1);
 }
 
+/// Waits until the system says the process's resident set is over `bytes`, which is a fact about
+/// the process and not a length of time.
+fn wait_until_resident_over(pid: u32, bytes: u64) {
+    let pid = sysinfo::Pid::from_u32(pid);
+    let give_up = Instant::now() + REAL;
+    loop {
+        let mut system = sysinfo::System::new();
+        system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+        if system
+            .process(pid)
+            .is_some_and(|process| process.memory() > bytes)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < give_up,
+            "the process's resident set did not pass {bytes} within {REAL:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// KR-REQ-22.10: a job whose process really holds more memory than an owner's ceiling allows is
 /// ended by the daemon's own reading of the process, and the host is told memory pressure paused
 /// inference: nothing is published, the job is not queued again, and the process is gone. The
 /// ceiling is the owner's, below section 22's, and the profile still fits under it, so admission
 /// let the job run. The reading is taken at the turn whose time the test chooses, after the process
-/// has said its memory is in place, so what decides is the process's resident set and never a wait.
-/// The bound is one reading period: a turn just short of the first reading leaves the process
+/// has said its memory is in place and the test has found its resident set over the ceiling, so
+/// what decides is the process's resident set and never a wait. Each turn at one time takes at most
+/// one reading, so the reading must find the process over the ceiling: a machine under memory
+/// pressure takes pages back from a process that holds memory it does not use, which is why the
+/// process keeps its pages in use. Without the daemon's reading nothing here ends the process
+/// before its job's deadline, and the case fails. The bound is one reading period: a turn just short of the first reading leaves the process
 /// alone, and the turn at it ends the process, so a process over the ceiling is ended by the first
 /// reading taken after it passed.
 #[test]
@@ -1952,10 +1978,11 @@ fn a_job_whose_process_runs_past_the_owners_ceiling_is_ended_by_the_daemons_samp
     queue(rig.service(), &session(1), Priority::Ordinary, at(0));
     rig.job_sent(at(3_000));
     stub::wait_until_began(&rig.placed.directory("runtime"), "held");
-    assert!(
-        rig.driver.pid().is_some(),
-        "no turn has read the process's memory yet"
-    );
+    let pid = rig
+        .driver
+        .pid()
+        .expect("no turn has read the process's memory yet");
+    wait_until_resident_over(pid, fits);
 
     let short = rig
         .driver
