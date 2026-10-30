@@ -1595,7 +1595,7 @@ async fn a_revoked_device_is_fenced_before_it_is_served_again() {
             "the device's connection is closed by the host, not left open for its next request",
         );
 
-    // A request after that is refused, not answered.
+    // A request after that fails at the device, which knows its connection is closed.
     let refused = session
         .read::<_, SessionReadResult>(Method::SessionRead, &SessionReadParams { session_id })
         .await

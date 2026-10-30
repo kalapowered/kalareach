@@ -20,10 +20,11 @@
 //! hypervisor, where the platform accounts for them. "Nothing else running" is not among them, so
 //! a figure with no shortfall is a figure with no measured shortfall and not a certified
 //! reference-host run. Where a shortfall is shown, which is every debug build, the figure is
-//! recorded with the shortfall named and its time cannot fail the case. Every run records the
-//! figure beside the host it was taken on, in the form the other performance records take, before
-//! it asserts anything. The timed span is the only part of the case with a figure to meet: the
-//! waits that set the case up and bring it to an end are bounded by a liveness limit of their own.
+//! recorded with the shortfall named and the target cannot fail the case. A run that gets as far as
+//! the timed span's end records the figure beside the host it was taken on, in the form the other
+//! performance records take, before the target is asserted. The case has no other limit on time
+//! than a liveness bound of 120 seconds on each wait, including the wait for the screen inside the
+//! timed span, so a host that never publishes one fails the case whatever it lacks.
 
 #![cfg(unix)]
 
@@ -268,8 +269,8 @@ async fn a_paired_device_that_comes_back_has_a_painted_screen_inside_the_reconne
     .await;
 
     // The host is read before the clock starts and again after it stops, so that neither reading
-    // is inside the figure. The disk is read in the directory the worker's journal lives in, since
-    // the attach inside the figure waits on a durable write.
+    // is inside the figure. The disk is read in the tree that holds the worker's journal, since the
+    // attach inside the figure waits on a durable write.
     let window = record::Window::open_with_disk(host.tree().environment().state_root());
 
     // The return: the clock starts as the device dials, and nothing has been asked of the host.
