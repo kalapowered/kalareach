@@ -105,14 +105,13 @@ fn starts(line: &str, tool: &str) -> bool {
     line.starts_with(tool)
 }
 
-/// The steps of a job that run `tool`, each from its `- ` line to the next step's. There is at
-/// least one.
-fn steps_running(job: &str, tool: &str) -> Vec<String> {
+/// The steps of a job, each from its `- ` line to the next step's, in the order they run.
+fn steps_of(job: &str) -> Vec<String> {
     let lines: Vec<&str> = job.lines().collect();
     let starts_of_steps: Vec<usize> = (0..lines.len())
         .filter(|&index| lines[index].starts_with("      - "))
         .collect();
-    let running: Vec<String> = starts_of_steps
+    starts_of_steps
         .iter()
         .enumerate()
         .map(|(position, &start)| {
@@ -122,6 +121,13 @@ fn steps_running(job: &str, tool: &str) -> Vec<String> {
                 .unwrap_or(lines.len());
             lines[start..end].join("\n")
         })
+        .collect()
+}
+
+/// The steps of a job that run `tool`. There is at least one.
+fn steps_running(job: &str, tool: &str) -> Vec<String> {
+    let running: Vec<String> = steps_of(job)
+        .into_iter()
         .filter(|text| text.lines().any(|line| starts(line, tool)))
         .collect();
     assert!(!running.is_empty(), "no step of the job runs {tool}");
@@ -130,24 +136,47 @@ fn steps_running(job: &str, tool: &str) -> Vec<String> {
 
 /// The steps of a job that hold `needle` anywhere, as a step's name or its inputs.
 fn steps_holding(job: &str, needle: &str) -> Vec<String> {
-    let lines: Vec<&str> = job.lines().collect();
-    let starts_of_steps: Vec<usize> = (0..lines.len())
-        .filter(|&index| lines[index].starts_with("      - "))
-        .collect();
-    let holding: Vec<String> = starts_of_steps
-        .iter()
-        .enumerate()
-        .map(|(position, &start)| {
-            let end = starts_of_steps
-                .get(position + 1)
-                .copied()
-                .unwrap_or(lines.len());
-            lines[start..end].join("\n")
-        })
+    let holding: Vec<String> = steps_of(job)
+        .into_iter()
         .filter(|text| text.contains(needle))
         .collect();
     assert!(!holding.is_empty(), "no step of the job holds {needle}");
     holding
+}
+
+/// Where in the job's steps the step with this exact `id` stands, if one does.
+fn position_of_id(job: &str, id: &str) -> Option<usize> {
+    steps_of(job).iter().position(|step| {
+        step.lines().any(|line| {
+            key_value(line).is_some_and(|(indent, key, value)| {
+                indent == 8
+                    && key == "id"
+                    && value.split(" #").next().unwrap_or_default().trim() == id
+            })
+        })
+    })
+}
+
+/// Where in the job's steps the first step that runs `tool` stands.
+fn position_of_tool(job: &str, tool: &str) -> Option<usize> {
+    steps_of(job)
+        .iter()
+        .position(|step| step.lines().any(|line| starts(line, tool)))
+}
+
+/// The value a key has at `indent` in `text`, without the trailing comment, if it has one.
+fn value_at(text: &str, indent: usize, name: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let (at, key, value) = key_value(line)?;
+        (at == indent && key == name).then(|| {
+            value
+                .split(" #")
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_owned()
+        })
+    })
 }
 
 /// The part of a job that is not its steps: its name, runner, condition and limits, wherever the
@@ -167,16 +196,17 @@ fn header(job: &str) -> String {
 }
 
 /// A step, or a job's header, that a run skips or lets fail without failing the job: the way a step
-/// is kept in the workflow and made to do nothing. A trailing comment and the spaces inside a
-/// condition do not hide it, and any `continue-on-error` that is not the plain `false` counts.
+/// is kept in the workflow and made to do nothing. A trailing comment, the spaces inside a
+/// condition, quotes around the key and spaces before its colon do not hide it, and any
+/// `continue-on-error` that is not the plain `false` counts.
 fn is_disabled(text: &str) -> bool {
     text.lines().any(|line| {
-        let line = line.split(" #").next().unwrap_or_default();
-        let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
-        let compact = compact.trim_start_matches('-');
-        compact == "if:false"
-            || compact == "if:${{false}}"
-            || (compact.starts_with("continue-on-error:") && compact != "continue-on-error:false")
+        let Some((_, key, value)) = key_value(line) else {
+            return false;
+        };
+        let value = compact(value.split(" #").next().unwrap_or_default());
+        (key == "if" && (value == "false" || value == "${{false}}"))
+            || (key == "continue-on-error" && value != "false")
     })
 }
 
@@ -267,6 +297,18 @@ fn legs(job: &str) -> Vec<String> {
         .collect()
 }
 
+/// The lines of a workflow's `on:` block, past blank lines and comments, up to its next top-level
+/// key.
+fn trigger_lines(workflow: &str) -> Vec<&str> {
+    workflow
+        .lines()
+        .skip_while(|line| *line != "on:")
+        .skip(1)
+        .take_while(|line| line.is_empty() || line.starts_with([' ', '#']))
+        .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+        .collect()
+}
+
 /// The jobs a table of the conformance document's classes names, in backticks in its second column.
 fn documented_jobs(document: &str) -> Vec<String> {
     let table: Vec<&str> = document
@@ -298,8 +340,10 @@ fn documented_jobs(document: &str) -> Vec<String> {
 struct ClassOfTest {
     class: &'static str,
     job: &'static str,
-    /// What the job's runner line holds.
+    /// What the job's runner line holds, or its matrix.
     runner: &'static [&'static str],
+    /// The job's `runs-on`, as the workflow writes it.
+    runs_on: &'static str,
     /// The condition the job runs under, as the workflow writes it. `None` is a job that always
     /// runs.
     job_when: Option<&'static str>,
@@ -315,6 +359,7 @@ const CLASSES: [ClassOfTest; 10] = [
         class: "browser behaviour, on both kinds of runner",
         job: "companion",
         runner: &["ubuntu-24.04", "macos-15"],
+        runs_on: "${{ matrix.os }}",
         job_when: None,
         tool: "pnpm -C apps/companion e2e",
         when: None,
@@ -323,6 +368,7 @@ const CLASSES: [ClassOfTest; 10] = [
         class: "native macOS controls",
         job: "companion",
         runner: &["macos-15"],
+        runs_on: "${{ matrix.os }}",
         job_when: None,
         tool: "scripts/desktop-controls-macos.sh",
         when: Some(
@@ -333,6 +379,7 @@ const CLASSES: [ClassOfTest; 10] = [
         class: "the iOS Simulator, with Xcode",
         job: "ios",
         runner: &["runs-on: macos-15"],
+        runs_on: "macos-15",
         job_when: Some("github.event_name != 'workflow_dispatch' || inputs.macos || inputs.ios"),
         tool: "scripts/ios-app-launch.sh",
         when: None,
@@ -341,6 +388,7 @@ const CLASSES: [ClassOfTest; 10] = [
         class: "an Android emulator",
         job: "android-app",
         runner: &["runs-on: ubuntu-24.04"],
+        runs_on: "ubuntu-24.04",
         job_when: None,
         tool: "scripts/android-app-launch.sh",
         when: None,
@@ -349,6 +397,7 @@ const CLASSES: [ClassOfTest; 10] = [
         class: "a Windows machine's release build of the desktop application",
         job: "windows",
         runner: &["runs-on: windows-2025"],
+        runs_on: "windows-2025",
         job_when: None,
         tool: "cargo build --locked -p companion-tauri --release",
         when: Some("${{ !cancelled() && matrix.part == 'first' }}"),
@@ -357,6 +406,7 @@ const CLASSES: [ClassOfTest; 10] = [
         class: "the Tauri desktop application in a real window, on Windows",
         job: "windows",
         runner: &["runs-on: windows-2025"],
+        runs_on: "windows-2025",
         job_when: None,
         tool: "cargo test --locked -p companion-tauri --test host_events",
         when: Some("${{ !cancelled() && matrix.part == 'second' }}"),
@@ -365,6 +415,7 @@ const CLASSES: [ClassOfTest; 10] = [
         class: "the real-worker host tests, on a native Windows machine",
         job: "windows",
         runner: &["runs-on: windows-2025"],
+        runs_on: "windows-2025",
         job_when: None,
         tool: "cargo test --locked -p kr-worker --test host",
         when: Some("${{ !cancelled() && matrix.part == 'second' }}"),
@@ -373,6 +424,7 @@ const CLASSES: [ClassOfTest; 10] = [
         class: "the Tauri desktop application's native backend, on both kinds of unix runner",
         job: "companion",
         runner: &["ubuntu-24.04", "macos-15"],
+        runs_on: "${{ matrix.os }}",
         job_when: None,
         tool: "cargo test --locked -p companion-tauri -p kr-client",
         when: None,
@@ -381,6 +433,7 @@ const CLASSES: [ClassOfTest; 10] = [
         class: "a Linux machine",
         job: "rust",
         runner: &["runs-on: ubuntu-24.04"],
+        runs_on: "ubuntu-24.04",
         job_when: None,
         tool: "cargo test --locked --workspace",
         when: None,
@@ -389,6 +442,7 @@ const CLASSES: [ClassOfTest; 10] = [
         class: "a macOS machine",
         job: "macos",
         runner: &["runs-on: macos-15"],
+        runs_on: "macos-15",
         job_when: Some("github.event_name != 'workflow_dispatch' || inputs.macos"),
         tool: "cargo test --locked --workspace",
         when: Some("${{ !cancelled() && matrix.part == 'tests' }}"),
@@ -416,6 +470,7 @@ fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
         class,
         job: name,
         runner,
+        runs_on,
         job_when,
         tool,
         when,
@@ -431,11 +486,22 @@ fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
             job_when.map(compact),
             "{class}: the {name} job runs under a condition other than {job_when:?}"
         );
+        assert_eq!(
+            value_at(&text, 4, "runs-on").map(|runner| compact(&runner)),
+            Some(compact(runs_on)),
+            "{class}: the {name} job runs on a runner other than {runs_on}"
+        );
         assert!(
-            !text
-                .lines()
-                .any(|line| line.trim_start().starts_with("exclude:")),
+            text.lines()
+                .all(|line| key_value(line).is_none_or(|(_, key, _)| key != "exclude")),
             "{class}: the {name} job's matrix leaves a leg out"
+        );
+        assert!(
+            header(&text)
+                .lines()
+                .all(|line| key_value(line)
+                    .is_none_or(|(indent, key, _)| indent != 4 || key != "needs")),
+            "{class}: the {name} job waits for another, which can leave it skipped"
         );
         for expected in runner {
             assert!(
@@ -462,16 +528,56 @@ fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
             }
             // A step the condition reads the outcome of is a step of the job that runs, and runs.
             for id in when.map(steps_named).unwrap_or_default() {
-                for named in steps_holding(&text, &format!("id: {id}")) {
-                    assert!(
-                        !is_disabled(&named) && step_condition(&named).is_none(),
-                        "{class}: the step {id}, whose outcome decides whether the step that runs \
-                         {tool} runs, is disabled or does not always run"
+                let Some(at) = position_of_id(&text, &id) else {
+                    panic!(
+                        "{class}: no step of the {name} job has the id {id}, whose outcome decides \
+                         whether the step that runs {tool} runs"
                     );
-                }
+                };
+                let named = &steps_of(&text)[at];
+                assert!(
+                    !is_disabled(named) && step_condition(named).is_none(),
+                    "{class}: the step {id}, whose outcome decides whether the step that runs \
+                     {tool} runs, is disabled or does not always run"
+                );
+                assert!(
+                    position_of_tool(&text, tool).is_some_and(|tool_at| at < tool_at),
+                    "{class}: the step {id} comes after the step that runs {tool}, which reads \
+                     its outcome"
+                );
             }
         }
     }
+
+    // The landing workflow runs on every push to main and on every pull request, with no filter
+    // that leaves a change out, and by hand.
+    let triggers = trigger_lines(&workflow);
+    let keys_at = |indent: usize| -> Vec<String> {
+        triggers
+            .iter()
+            .filter_map(|line| key_value(line))
+            .filter(|(at, ..)| *at == indent)
+            .map(|(_, key, _)| key)
+            .collect()
+    };
+    assert_eq!(
+        keys_at(2),
+        ["push", "pull_request", "workflow_dispatch"],
+        "the landing workflow does not run on a push, a pull request and by hand, and only those"
+    );
+    assert_eq!(
+        keys_at(4),
+        ["branches", "inputs"],
+        "a push or a pull request is filtered by something other than the branch of a push"
+    );
+    assert_eq!(
+        triggers
+            .iter()
+            .find_map(|line| key_value(line).filter(|(_, key, _)| key == "branches"))
+            .map(|(_, _, value)| compact(value)),
+        Some(compact("[\"main\"]")),
+        "a push to a branch other than main does not run the landing workflow"
+    );
 
     // KR-REQ-27.03: what each of the jobs that drive a device or a browser keeps, and what refuses
     // a run that kept nothing.
@@ -482,12 +588,8 @@ fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
     );
     // Both runners on every push and pull request: a manual run started with the macOS jobs turned
     // off may leave the macOS leg out, and nothing else may.
-    let runners = companion
-        .lines()
-        .find_map(|line| {
-            let (indent, key, value) = key_value(line)?;
-            (indent == 8 && key == "os").then(|| compact(value))
-        })
+    let runners = value_at(&companion, 8, "os")
+        .map(|runners| compact(&runners))
         .expect("the companion job's matrix names its runners");
     assert_eq!(
         runners,
@@ -505,10 +607,18 @@ fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
             "the evidence check does not run on every runner of the matrix"
         );
     }
-    for (job_name, artefact) in [
-        ("companion", "companion-evidence-"),
-        ("android-app", "test-evidence-android"),
-        ("ios", "test-evidence-ios"),
+    for (job_name, artefact, path) in [
+        ("companion", "companion-evidence-", "/tmp/kr-test-artifacts"),
+        (
+            "android-app",
+            "test-evidence-android",
+            "${{ env.KR_TEST_ARTIFACTS_DIR }}",
+        ),
+        (
+            "ios",
+            "test-evidence-ios",
+            "${{ env.KR_TEST_ARTIFACTS_DIR }}",
+        ),
     ] {
         let text = job(&workflow, job_name);
         assert!(
@@ -534,6 +644,17 @@ fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
                 !upload.contains("retention-days"),
                 "the {job_name} job's upload of {artefact} sets a retention of its own, which \
                  can keep the evidence for less than the repository's default"
+            );
+            // The action that uploads, and the directory it uploads: the one the tests write to.
+            assert!(
+                value_at(&upload, 8, "uses")
+                    .is_some_and(|action| action.starts_with("actions/upload-artifact@")),
+                "the {job_name} job's upload of {artefact} is not made by the upload action"
+            );
+            assert_eq!(
+                value_at(&upload, 10, "path").map(|found| compact(&found)),
+                Some(compact(path)),
+                "the {job_name} job's upload of {artefact} keeps a directory other than {path}"
             );
         }
     }
@@ -561,13 +682,7 @@ fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
 fn the_wsl2_acceptance_has_a_workflow_that_runs_its_script_on_windows() {
     let workflow = fs::read_to_string(repository().join(".github/workflows/wsl-acceptance.yml"))
         .expect("the WSL2 acceptance workflow");
-    let triggers: Vec<&str> = workflow
-        .lines()
-        .skip_while(|line| *line != "on:")
-        .skip(1)
-        .take_while(|line| line.is_empty() || line.starts_with([' ', '#']))
-        .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
-        .collect();
+    let triggers = trigger_lines(&workflow);
     assert_eq!(
         triggers,
         ["  workflow_dispatch:"],
