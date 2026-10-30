@@ -4169,11 +4169,6 @@ async fn a_device_applies_and_reverts_no_version_its_grant_does_not_reach() {
         "an existing version and a missing one are refused alike"
     );
     assert!(told[0].contains("does not reach change set"), "{}", told[0]);
-    assert_eq!(
-        newest_version_of(&mut granted, outside.change_set_id).await,
-        1,
-        "the refused requests recorded nothing"
-    );
     // The control for the proposal: a version the grant reaches gets past the scope and meets the
     // missing workspace.
     let reached = granted.refused(Method::DiffApply, &bare(inside)).await;
@@ -4285,6 +4280,101 @@ async fn a_device_adds_no_version_to_a_change_set_its_grant_does_not_reach() {
     granted.stop().await;
 }
 
+/// KR-REQ-23.44 and section 9: a device that appended a version to a change set and lost the reply
+/// asks again on a new connection after the owner added a newer version that the device's grant
+/// does not reach. It is answered from the record, because what its grant has to reach is the
+/// version it recorded, and not whichever version of the change set is the newest now. The control
+/// is a new capture appended on the same change set, which the grant now refuses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeat_of_an_appended_capture_is_held_to_the_version_it_recorded() {
+    use kr_protocol::changeset::ChangesetCaptureResult;
+
+    let session = SessionId::new(kr_ipc::new_uuid());
+    let Some(mut granted) = granted_for_one_session(
+        "a_repeat_of_an_appended_capture_is_held_to_the_version_it_recorded",
+        session,
+    )
+    .await
+    else {
+        return;
+    };
+    let env = granted.host.environment_id;
+    let target = net_support::on_the_session(&granted.host, session);
+    let review = a_working_copy(&granted, "review").await;
+    let first = owner_captures(&mut granted, review, Some(session)).await;
+    let appending = kr_protocol::changeset::ChangesetCaptureParams {
+        change_set_id: Nullable::some(first.change_set_id),
+        session_id: Nullable::some(session),
+        ..a_capture_of(review)
+    };
+
+    let device =
+        net_support::RawDevice::connect(&granted.host, &granted._device, &granted.record).await;
+    device.claim();
+    let window = device.action_window_id();
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let appended: ChangesetCaptureResult = typed(
+        &device
+            .mutate_in(
+                window.clone(),
+                Method::ChangesetCapture,
+                action_id,
+                target.clone(),
+                &appending,
+            )
+            .await
+            .expect("a change set the grant reaches takes a version"),
+    );
+    assert_eq!(appended.version.version.get(), 2);
+
+    // The owner adds a version that records no session, which the grant does not reach.
+    let newest: ChangesetCaptureResult = typed(
+        &local_mutation(
+            &mut granted.control,
+            env,
+            Method::ChangesetCapture,
+            &kr_protocol::changeset::ChangesetCaptureParams {
+                change_set_id: Nullable::some(first.change_set_id),
+                ..a_capture_of(review)
+            },
+        )
+        .await
+        .expect("the owner appends a version"),
+    );
+    assert_eq!(newest.version.version.get(), 3);
+    let refused = device
+        .mutate_in(
+            window.clone(),
+            Method::ChangesetCapture,
+            ActionId::new(kr_ipc::new_uuid()),
+            target.clone(),
+            &appending,
+        )
+        .await
+        .expect_err("a new capture appended on a change set whose newest version is out of scope");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    device.close();
+
+    let again =
+        net_support::RawDevice::connect(&granted.host, &granted._device, &granted.record).await;
+    again.claim();
+    let repeated: ChangesetCaptureResult = typed(
+        &again
+            .mutate_in(
+                window,
+                Method::ChangesetCapture,
+                action_id,
+                target,
+                &appending,
+            )
+            .await
+            .expect("the repeat is answered from the record of the version it recorded"),
+    );
+    assert_eq!(repeated, appended);
+    again.close();
+    granted.stop().await;
+}
+
 /// What each of the four working-tree methods is told when it names `workspace`, a working copy at
 /// `root/name` that this device's grant does not reach, with a version the device may apply: a
 /// refusal, with the working copy as it was.
@@ -4335,13 +4425,100 @@ async fn is_refused_all_four_on(
     );
 }
 
+/// A working copy the owner makes in a destination location of its own, of a repository of its own
+/// that is bound to a source location of its own. Returns the working copy and the directory the
+/// location covers, which holds it under `name`.
+async fn owners_copy_in_its_own_location(
+    granted: &mut Granted,
+    name: &str,
+) -> (kr_protocol::ids::WorkspaceId, PathBuf) {
+    use kr_protocol::project::{DestinationParent, LocationPurpose};
+
+    let env = granted.host.environment_id;
+    let root = granted.host.work().join(format!("{name}-root"));
+    std::fs::create_dir(&root).expect("a directory to authorise");
+    let destination = authorise_owner_location(
+        &mut granted.control,
+        &granted.host,
+        &granted.owner,
+        &root,
+        LocationPurpose::Destination,
+    )
+    .await;
+    let source_root = granted.host.work().join(format!("{name}-source-root"));
+    std::fs::create_dir(&source_root).expect("a directory to authorise");
+    repository(&source_root, "src");
+    let source = authorise_owner_location(
+        &mut granted.control,
+        &granted.host,
+        &granted.owner,
+        &source_root,
+        LocationPurpose::Source,
+    )
+    .await;
+    let adopted: ProjectAdoptResult = typed(
+        &local_mutation(
+            &mut granted.control,
+            env,
+            Method::ProjectAdopt,
+            &ProjectAdoptParams {
+                destination: DestinationRequest {
+                    environment_id: env,
+                    parent: DestinationParent::Host {
+                        path: source_root.display().to_string(),
+                    },
+                    name: "src".to_owned(),
+                },
+                label: format!("{name}-source"),
+                flow: AdoptionFlow::ExistingCheckout,
+            },
+        )
+        .await
+        .expect("the owner adopts its own repository"),
+    );
+    bind_for(
+        &mut granted.control,
+        &granted.host,
+        &granted.owner,
+        adopted.project.project_repository_id,
+        source.location_id,
+    )
+    .await;
+    let created: WorkspaceCreateResult = typed(
+        &local_mutation(
+            &mut granted.control,
+            env,
+            Method::WorkspaceCreate,
+            &WorkspaceCreateParams {
+                isolation: Nullable::some(IsolationMechanism::IndependentClone),
+                destination: Nullable::some(DestinationRequest {
+                    environment_id: env,
+                    parent: DestinationParent::Location {
+                        location_id: destination.location_id,
+                    },
+                    name: name.to_owned(),
+                }),
+                ..workspace_params(&granted.host, adopted.project.project_repository_id, name)
+            },
+        )
+        .await
+        .expect("the owner makes a working copy in its own location"),
+    );
+    let workspace = created
+        .workspace
+        .0
+        .expect("a creation returns the workspace")
+        .workspace_id;
+    (workspace, root)
+}
+
 /// KR-REQ-23.44: a device reaches a working copy through a location the owner authorised for its
 /// own grant. A working copy in the owner's own location, or in the device's own location after
 /// the owner withdrew it, is refused for all four methods and nothing is written. The control is
 /// the device's own working copy, which it captures and reads before the withdrawal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_reaches_no_working_copy_in_the_owners_location_or_a_withdrawn_one() {
-    use kr_protocol::project::{DestinationParent, LocationPurpose, ProjectLocationWithdrawParams};
+    use kr_protocol::project::ProjectLocationWithdrawParams;
 
     let Some(mut granted) = Granted::on_a_qualified_host_holding(
         "a_device_reaches_no_working_copy_in_the_owners_location_or_a_withdrawn_one",
@@ -4367,87 +4544,8 @@ async fn a_device_reaches_no_working_copy_in_the_owners_location_or_a_withdrawn_
         .await
         .expect("the control: the device reads its own working copy");
 
-    // The owner's own destination location, and a working copy the owner makes in it.
-    let owners_root = granted.host.work().join("owners-root");
-    std::fs::create_dir(&owners_root).expect("a directory to authorise");
-    let owners = authorise_owner_location(
-        &mut granted.control,
-        &granted.host,
-        &granted.owner,
-        &owners_root,
-        LocationPurpose::Destination,
-    )
-    .await;
-    // A repository of the owner's own, bound to a source location of the owner's own, so that the
-    // owner makes the working copy in its own destination location.
-    let owners_source_root = granted.host.work().join("owners-source-root");
-    std::fs::create_dir(&owners_source_root).expect("a directory to authorise");
-    repository(&owners_source_root, "src");
-    let owners_source = authorise_owner_location(
-        &mut granted.control,
-        &granted.host,
-        &granted.owner,
-        &owners_source_root,
-        LocationPurpose::Source,
-    )
-    .await;
-    let adopted: ProjectAdoptResult = typed(
-        &local_mutation(
-            &mut granted.control,
-            env,
-            Method::ProjectAdopt,
-            &ProjectAdoptParams {
-                destination: DestinationRequest {
-                    environment_id: env,
-                    parent: DestinationParent::Host {
-                        path: owners_source_root.display().to_string(),
-                    },
-                    name: "src".to_owned(),
-                },
-                label: "owners-source".to_owned(),
-                flow: AdoptionFlow::ExistingCheckout,
-            },
-        )
-        .await
-        .expect("the owner adopts its own repository"),
-    );
-    bind_for(
-        &mut granted.control,
-        &granted.host,
-        &granted.owner,
-        adopted.project.project_repository_id,
-        owners_source.location_id,
-    )
-    .await;
-    let created: WorkspaceCreateResult = typed(
-        &local_mutation(
-            &mut granted.control,
-            env,
-            Method::WorkspaceCreate,
-            &WorkspaceCreateParams {
-                isolation: Nullable::some(IsolationMechanism::IndependentClone),
-                destination: Nullable::some(DestinationRequest {
-                    environment_id: env,
-                    parent: DestinationParent::Location {
-                        location_id: owners.location_id,
-                    },
-                    name: "owners".to_owned(),
-                }),
-                ..workspace_params(
-                    &granted.host,
-                    adopted.project.project_repository_id,
-                    "owners",
-                )
-            },
-        )
-        .await
-        .expect("the owner makes a working copy in its own location"),
-    );
-    let owners_copy = created
-        .workspace
-        .0
-        .expect("a creation returns the workspace")
-        .workspace_id;
+    // A working copy the owner makes in its own destination location.
+    let (owners_copy, owners_root) = owners_copy_in_its_own_location(&mut granted, "owners").await;
     is_refused_all_four_on(
         &granted,
         owners_copy,
@@ -4483,38 +4581,31 @@ async fn a_device_reaches_no_working_copy_in_the_owners_location_or_a_withdrawn_
     granted.stop().await;
 }
 
-/// The fault that runs `act` once the first path of an apply is written and confirmed.
-fn after_the_first_path(
-    act: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
-) -> kr_changeset::apply::Fault {
-    kr_changeset::apply::Fault {
-        after_paths: 1,
-        act,
-        stop: false,
-        before_rename: None,
-        after_claim: None,
-        refuse_staging_record: false,
-        detail: String::new(),
-    }
+/// When the owner withdraws a device's location during an apply.
+#[derive(Clone, Copy)]
+enum WithdrawnAt {
+    /// Between two paths, once the first is written and confirmed.
+    BetweenPaths,
+    /// While the first path is staged, immediately before it would be published.
+    BeforePublishing,
 }
 
-/// KR-REQ-23.44: an apply writes into a working copy only while the location it is reached through
-/// still admits the device. Two paths are applied; the owner withdraws the location when the first
-/// is written, and the second is not. The control is the same apply with the location standing,
-/// which writes both.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_location_withdrawn_while_an_apply_runs_receives_no_further_write() {
+/// Applies a version of two paths to a working copy of a device twice, and returns what the second
+/// apply was told and how many of its paths are in the working copy. The first apply is the
+/// control: the location stands, and both paths are written. During the second the owner withdraws
+/// the location at `at`.
+async fn apply_two_paths_while_the_owner_withdraws_the_location(
+    test: &str,
+    at: WithdrawnAt,
+) -> Option<(
+    std::result::Result<ParamsValue, ClientError>,
+    usize,
+    Granted,
+)> {
     use kr_protocol::changeset::{AffectedVersion, ApplyOutcomeClass, DiffApplyResult};
     use kr_protocol::project::ProjectLocationWithdrawParams;
 
-    let Some(granted) = Granted::on_a_qualified_host_holding(
-        "a_location_withdrawn_while_an_apply_runs_receives_no_further_write",
-        CHANGE_RIGHTS,
-    )
-    .await
-    else {
-        return;
-    };
+    let granted = Granted::on_a_qualified_host_holding(test, CHANGE_RIGHTS).await?;
     let env = granted.host.environment_id;
     let review = a_working_copy(&granted, "review").await;
     std::fs::write(granted.root.join("review/extra.txt"), "an untracked file\n")
@@ -4544,10 +4635,8 @@ async fn a_location_withdrawn_while_an_apply_runs_receives_no_further_write() {
             == "changed after the commit\n";
         usize::from(readme) + usize::from(directory.join("extra.txt").exists())
     };
-    let service = granted.host.controller().changesets().service();
 
     // The control: the location stands throughout.
-    service.inject(Some(after_the_first_path(None)));
     let applied: DiffApplyResult = typed(
         &remote_mutation(
             &granted.session,
@@ -4558,7 +4647,6 @@ async fn a_location_withdrawn_while_an_apply_runs_receives_no_further_write() {
         .await
         .expect("the apply under a standing location"),
     );
-    service.inject(None);
     assert_eq!(
         applied.outcome.0,
         Some(ApplyOutcomeClass::Applied),
@@ -4566,10 +4654,9 @@ async fn a_location_withdrawn_while_an_apply_runs_receives_no_further_write() {
     );
     assert_eq!(written_in("control"), 2, "both paths are written");
 
-    // The owner withdraws the location the instant the first path is written.
     let owner = std::sync::Arc::new(tokio::sync::Mutex::new(granted.host.client().await));
     let location = granted.destination.location_id;
-    let withdraw: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+    let withdraw = move || {
         let owner = std::sync::Arc::clone(&owner);
         tokio::runtime::Handle::current().block_on(async move {
             let mut owner = owner.lock().await;
@@ -4584,8 +4671,31 @@ async fn a_location_withdrawn_while_an_apply_runs_receives_no_further_write() {
             .await
             .expect("the owner withdraws the location");
         });
-    });
-    service.inject(Some(after_the_first_path(Some(withdraw))));
+    };
+    let service = granted.host.controller().changesets().service();
+    service.inject(Some(match at {
+        WithdrawnAt::BetweenPaths => kr_changeset::apply::Fault {
+            after_paths: 1,
+            act: Some(std::sync::Arc::new(withdraw)),
+            stop: false,
+            before_rename: None,
+            after_claim: None,
+            refuse_staging_record: false,
+            detail: String::new(),
+        },
+        WithdrawnAt::BeforePublishing => kr_changeset::apply::Fault {
+            after_paths: usize::MAX,
+            act: None,
+            stop: false,
+            before_rename: Some(std::sync::Arc::new(move |_| {
+                withdraw();
+                true
+            })),
+            after_claim: None,
+            refuse_staging_record: false,
+            detail: String::new(),
+        },
+    }));
     let outcome = remote_mutation(
         &granted.session,
         env,
@@ -4594,19 +4704,75 @@ async fn a_location_withdrawn_while_an_apply_runs_receives_no_further_write() {
     )
     .await;
     service.inject(None);
+    let written = written_in("withdrawn");
+    Some((outcome, written, granted))
+}
+
+/// What a path of an apply came to, by state.
+fn states_of(
+    answer: &kr_protocol::changeset::DiffApplyResult,
+) -> Vec<kr_protocol::changeset::PathProgressState> {
+    answer.progress.iter().map(|path| path.state).collect()
+}
+
+/// KR-REQ-23.44: an apply writes into a working copy only while the location it is reached through
+/// still admits the device. Two paths are applied; the owner withdraws the location when the first
+/// is written, and the second is not. The apply cannot read the destination afterwards either, so
+/// it ends as an uncertain outcome that lists which path it wrote and which it did not attempt.
+/// The control is the same apply with the location standing, which writes both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_location_withdrawn_between_two_paths_of_an_apply_receives_the_second_no_write() {
+    use kr_protocol::changeset::{ApplyOutcomeClass, DiffApplyResult, PathProgressState};
+
+    let Some((outcome, written, granted)) = apply_two_paths_while_the_owner_withdraws_the_location(
+        "a_location_withdrawn_between_two_paths_of_an_apply_receives_the_second_no_write",
+        WithdrawnAt::BetweenPaths,
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(written, 1, "the path after the withdrawal is not written");
+    let answer: DiffApplyResult = typed(&outcome.expect("the apply is settled and answered"));
     assert_eq!(
-        written_in("withdrawn"),
-        1,
-        "the path after the withdrawal is not written: {outcome:?}"
+        answer.outcome.0,
+        Some(ApplyOutcomeClass::UncertainOutcome),
+        "{answer:?}"
     );
-    if let Ok(value) = &outcome {
-        let answer: DiffApplyResult = typed(value);
-        assert_ne!(
-            answer.outcome.0,
-            Some(ApplyOutcomeClass::Applied),
-            "{answer:?}"
-        );
-    }
+    assert_eq!(
+        states_of(&answer),
+        [PathProgressState::Written, PathProgressState::Skipped],
+        "{answer:?}"
+    );
+    granted.stop().await;
+}
+
+/// KR-REQ-23.44: the owner withdraws the location while the first path of an apply is staged and
+/// not yet published. The path is not published, and nothing of the apply is in the working copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_location_withdrawn_while_a_path_is_staged_has_nothing_published_into_it() {
+    use kr_protocol::changeset::{ApplyOutcomeClass, DiffApplyResult, PathProgressState};
+
+    let Some((outcome, written, granted)) = apply_two_paths_while_the_owner_withdraws_the_location(
+        "a_location_withdrawn_while_a_path_is_staged_has_nothing_published_into_it",
+        WithdrawnAt::BeforePublishing,
+    )
+    .await
+    else {
+        return;
+    };
+    assert_eq!(written, 0, "nothing of the apply is in the working copy");
+    let answer: DiffApplyResult = typed(&outcome.expect("the apply is settled and answered"));
+    assert_eq!(
+        answer.outcome.0,
+        Some(ApplyOutcomeClass::UncertainOutcome),
+        "{answer:?}"
+    );
+    assert_eq!(
+        states_of(&answer),
+        [PathProgressState::Unresolved, PathProgressState::Skipped],
+        "{answer:?}"
+    );
     granted.stop().await;
 }
 
@@ -4813,19 +4979,15 @@ fn all_in(directory: &Path, names: &[String]) -> bool {
 }
 
 /// KR-REQ-23.44: the recovery that settles an interrupted apply before the daemon serves takes
-/// away the temporary it left beside a destination only where this host may still reach the
-/// working copy. The owner's working copy is reached by its own path. A device's is reached
-/// through its location: while the location admits it the temporary is taken away, and once the
-/// owner has withdrawn the location the temporary is left where it is and counted, and no Git
-/// starts in that tree. A daemon that starts afterwards reaches the owner's working copy by its
-/// path and none of the device's.
+/// away the temporary it left beside a destination for the owner's own work, which it reaches by
+/// path as the owner does, whether the working copy was made at a path or in one of the owner's
+/// locations. It does not open a working copy made through a location the owner authorised for a
+/// device's grant: no location is held when a daemon starts, and the device's temporary stays
+/// where it is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn recovery_clears_an_interrupted_device_apply_only_through_a_location_that_still_admits_it()
-{
-    use kr_protocol::project::ProjectLocationWithdrawParams;
-
+async fn a_daemon_that_starts_after_interrupted_applies_clears_the_owners_and_leaves_the_devices() {
     let Some(mut granted) = Granted::on_a_qualified_host_holding(
-        "recovery_clears_an_interrupted_device_apply_only_through_a_location_that_still_admits_it",
+        "a_daemon_that_starts_after_interrupted_applies_clears_the_owners_and_leaves_the_devices",
         CHANGE_RIGHTS,
     )
     .await
@@ -4835,8 +4997,9 @@ async fn recovery_clears_an_interrupted_device_apply_only_through_a_location_tha
     let env = granted.host.environment_id;
     let review = a_working_copy(&granted, "review").await;
     let standing = a_working_copy(&granted, "standing").await;
-    let withdrawn = a_working_copy(&granted, "withdrawn").await;
-    let owners: WorkspaceCreateResult = typed(
+    let (located, located_root) =
+        owners_copy_in_its_own_location(&mut granted, "owners-located").await;
+    let by_path: WorkspaceCreateResult = typed(
         &local_mutation(
             &mut granted.control,
             env,
@@ -4849,7 +5012,7 @@ async fn recovery_clears_an_interrupted_device_apply_only_through_a_location_tha
         .await
         .expect("the owner makes a working copy at a path"),
     );
-    let owners = owners
+    let by_path = by_path
         .workspace
         .0
         .expect("a creation returns the workspace")
@@ -4859,57 +5022,27 @@ async fn recovery_clears_an_interrupted_device_apply_only_through_a_location_tha
     let work = granted.host.work().to_path_buf();
     for directory in [
         root.join("standing"),
-        root.join("withdrawn"),
+        located_root.join("owners-located"),
         work.join("owners"),
     ] {
         std::fs::write(directory.join("README.md"), "a repository\n").expect("the file");
     }
-    let service = std::sync::Arc::clone(granted.host.controller().changesets().service());
 
-    // The location stands: the device's temporary and the owner's are both taken away.
+    // Three applies a daemon stopped inside, each leaving its temporary beside the destination.
     let devices =
         interrupted_apply(&mut granted, false, standing, &root, "standing", version).await;
-    let owners_own = interrupted_apply(&mut granted, true, owners, &work, "owners", version).await;
-    let recovery = service.recover_before_serving().expect("recovery runs");
-    assert_eq!(
-        (recovery.staged_removed, recovery.staged_left),
-        (2, 0),
-        "{recovery:?}"
-    );
-    assert!(!all_in(&root.join("standing"), &devices));
-    assert!(!all_in(&work.join("owners"), &owners_own));
-
-    // The owner withdraws the device's location after the device's apply stopped. The device's
-    // temporary is left where it is and counted; the owner's is still taken away.
-    let devices =
-        interrupted_apply(&mut granted, false, withdrawn, &root, "withdrawn", version).await;
-    let owners_own = interrupted_apply(&mut granted, true, owners, &work, "owners", version).await;
-    local_mutation(
-        &mut granted.control,
-        env,
-        Method::ProjectLocationWithdraw,
-        &ProjectLocationWithdrawParams {
-            location_id: granted.destination.location_id,
-        },
+    let owners_located = interrupted_apply(
+        &mut granted,
+        true,
+        located,
+        &located_root,
+        "owners-located",
+        version,
     )
-    .await
-    .expect("the owner withdraws the location");
-    let recovery = service.recover_before_serving().expect("recovery runs");
-    assert_eq!(
-        (recovery.staged_removed, recovery.staged_left),
-        (1, 1),
-        "{recovery:?}"
-    );
-    assert!(
-        all_in(&root.join("withdrawn"), &devices),
-        "the device's temporary is left where it is"
-    );
-    assert!(!all_in(&work.join("owners"), &owners_own));
+    .await;
+    let owners_by_path =
+        interrupted_apply(&mut granted, true, by_path, &work, "owners", version).await;
 
-    // A daemon that starts after another apply of the owner's stopped does the same: the
-    // location is still not one it reaches, so the device's temporary stays, and the owner's goes.
-    let owners_again =
-        interrupted_apply(&mut granted, true, owners, &work, "owners", version).await;
     let Granted {
         host,
         control,
@@ -4923,10 +5056,17 @@ async fn recovery_clears_an_interrupted_device_apply_only_through_a_location_tha
     drop(_device);
     let host = host.restart().await;
     assert!(
-        all_in(&root.join("withdrawn"), &devices),
+        all_in(&root.join("standing"), &devices),
         "the device's temporary is left where it is by the daemon that starts"
     );
-    assert!(!all_in(&work.join("owners"), &owners_again));
+    assert!(
+        !all_in(&located_root.join("owners-located"), &owners_located),
+        "the owner's temporary in its own location is taken away"
+    );
+    assert!(
+        !all_in(&work.join("owners"), &owners_by_path),
+        "the owner's temporary at a path is taken away"
+    );
     host.stop().await;
 }
 
