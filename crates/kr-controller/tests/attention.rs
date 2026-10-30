@@ -1528,7 +1528,7 @@ async fn a_paired_device_is_served_the_group_under_its_grant() {
         .await
         .expect("a device's review read is served");
     assert!(reviews.reviews.iter().any(|state| state.subject == subject));
-    let _: VisitChangedResult = viewing
+    let seen: VisitChangedResult = viewing
         .read(
             Method::VisitChanged,
             &VisitChangedParams {
@@ -1574,7 +1574,7 @@ async fn a_paired_device_is_served_the_group_under_its_grant() {
         Method::VisitAcknowledge,
         &VisitAcknowledgeParams {
             session_id,
-            acknowledged_cursor: U64::new(0),
+            acknowledged_cursor: seen.to_cursor,
             views: Vec::new(),
         },
     )
