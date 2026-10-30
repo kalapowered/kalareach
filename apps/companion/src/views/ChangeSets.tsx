@@ -3,8 +3,9 @@
  *
  * Both are lists the person reads, and both have the same rule underneath: nothing is removed
  * because it looked stale. A change set is an immutable captured version: this shows exactly what it
- * holds and what it left out, every version of it beside the one read, and marking one reviewed
- * records that this version was reviewed and changes nothing else. What has left the host is shown
+ * holds and what it left out, and which version it is, and marking one reviewed records that this
+ * version was reviewed and changes nothing else. It counts no versions, because a device whose
+ * grant reaches only some of them is listed only those. What has left the host is shown
  * as the host reports it, with whether the host has any way to ask for its removal, and a copy that
  * can be deleted is deleted only through the confirmation native code raises ([`LeftTheHost`]).
  */
@@ -296,7 +297,7 @@ export function ChangeSets(): ReactNode {
                 <h2>{version?.label ?? 'Reading this change set…'}</h2>
                 {version ? (
                   <p className="muted small">
-                    Version {version.version} of {shown?.versions.length ?? 1} · against{' '}
+                    Version {version.version} · against{' '}
                     <span className="mono">
                       {version.base_reference ?? version.base_revision.slice(0, 12)}
                     </span>{' '}
