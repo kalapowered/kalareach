@@ -353,7 +353,7 @@ impl RemoteConnection {
         acting: &Acting,
     ) -> ControlFrame {
         if let Err(error) = self
-            .check_working_tree_request(Method::DiffRead, &request.params, acting)
+            .check_working_tree_request(Method::DiffRead, &request.params, acting, Earlier::Nothing)
             .await
         {
             return failure(request.request_id, error);
@@ -377,6 +377,10 @@ impl RemoteConnection {
     /// that an apply cannot install what a read would refuse. A capture names no workflow run: a
     /// run names itself.
     ///
+    /// A capture that appends to a change set is held to the change set's newest version, unless
+    /// the request repeats one that already recorded a version: then it is held to that version,
+    /// which stays the one the device is told of however many have been added since.
+    ///
     /// # Errors
     ///
     /// Returns the refusal for the first of these that does not hold.
@@ -385,6 +389,7 @@ impl RemoteConnection {
         method: Method,
         params: &ParamsValue,
         acting: &Acting,
+        earlier: Earlier,
     ) -> Result<(), ProtocolError> {
         self.check_working_tree_authority()?;
         if acting.grant.grant_id != self.device.grant.grant_id {
@@ -411,7 +416,18 @@ impl RemoteConnection {
                     ));
                 }
                 if let Some(change_set_id) = params.change_set_id.0 {
-                    self.check_version(change_set_id, None).await?;
+                    match earlier {
+                        Earlier::Nothing => {
+                            self.check_version(change_set_id, None).await?;
+                        }
+                        Earlier::Recorded(version) => {
+                            self.check_version(version.change_set_id, Some(version.version))
+                                .await?;
+                        }
+                        // An attempt that recorded nothing leaves nothing of the change set to
+                        // reach, and its answer is the class and length of a refusal.
+                        Earlier::Refused => {}
+                    }
                 }
             }
             Method::DiffApply | Method::DiffRevert => {
@@ -450,7 +466,12 @@ impl RemoteConnection {
         else {
             return Ok(None);
         };
-        self.check_working_tree_request(method, &mutation.params, acting)
+        let earlier = if method == Method::ChangesetCapture {
+            recorded_by(&retained)
+        } else {
+            Earlier::Nothing
+        };
+        self.check_working_tree_request(method, &mutation.params, acting, earlier)
             .await?;
         Ok(Some(shown_working_tree_change(retained, method)))
     }
@@ -525,6 +546,35 @@ pub(super) fn without_host_text(answer: ControlFrame) -> ControlFrame {
         ),
         other => other,
     }
+}
+
+/// What an earlier attempt of the same capture came to.
+pub(super) enum Earlier {
+    /// This is the first attempt.
+    Nothing,
+    /// An earlier attempt recorded this version.
+    Recorded(kr_protocol::changeset::VersionRef),
+    /// An earlier attempt was refused and recorded nothing.
+    Refused,
+}
+
+/// Reads what the answer a capture was given says it recorded.
+fn recorded_by(retained: &ControlFrame) -> Earlier {
+    let ControlFrame::Response(Response {
+        outcome: Outcome::Ok(value),
+        ..
+    }) = retained
+    else {
+        return Earlier::Refused;
+    };
+    value
+        .to_typed::<kr_protocol::changeset::ChangesetCaptureResult>()
+        .map_or(Earlier::Nothing, |result| {
+            Earlier::Recorded(kr_protocol::changeset::VersionRef {
+                change_set_id: result.version.change_set_id,
+                version: result.version.version,
+            })
+        })
 }
 
 /// Puts a refusal that came out of the change-set service in the form a device is shown, whatever
