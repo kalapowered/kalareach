@@ -781,138 +781,43 @@ impl Group {
     }
 }
 
-/// How many control groups the walk below a unit reads before it says it could not read them all.
-/// Counted as the walk queues them, so a directory with more groups in it than this is refused
-/// before they are all held.
-#[cfg(target_os = "linux")]
-const GROUP_BUDGET: usize = 4096;
-
-/// What reading the process list of one control group came to.
-#[cfg(target_os = "linux")]
-#[derive(Debug, PartialEq, Eq)]
-enum List {
-    /// The group's processes, as numbers.
-    Read(Vec<u32>),
-    /// The group went while the walk was under way, and holds nothing.
-    Gone,
-    /// A threaded group: its processes are listed by the group above it that is its thread root,
-    /// which the walk has read or reads.
-    Threaded,
-}
-
-/// What the kernel's answer to reading a group's `cgroup.procs` says.
-///
-/// A group removed while it is read answers that the file is not there or that the device is gone;
-/// a group of threads answers that the operation is not supported.
-#[cfg(target_os = "linux")]
-fn list_of(read: std::io::Result<String>) -> std::result::Result<List, String> {
-    match read {
-        Ok(text) => {
-            let mut numbers = Vec::new();
-            for line in text.lines() {
-                let number: u32 = line
-                    .trim()
-                    .parse()
-                    .map_err(|_| format!("a line of the list is not a process number: {line:?}"))?;
-                // A process the kernel cannot map into this process's namespace is listed as zero.
-                // It is held by the group and cannot be described, so the list is not whole.
-                if number == 0 {
-                    return Err("the list holds a process this host cannot name (0)".to_owned());
-                }
-                numbers.push(number);
-            }
-            Ok(List::Read(numbers))
-        }
-        Err(error)
-            if error.kind() == std::io::ErrorKind::NotFound
-                || error.raw_os_error() == Some(rustix::io::Errno::NODEV.raw_os_error()) =>
-        {
-            Ok(List::Gone)
-        }
-        Err(error) if error.raw_os_error() == Some(rustix::io::Errno::OPNOTSUPP.raw_os_error()) => {
-            Ok(List::Threaded)
-        }
-        Err(error) => Err(error.to_string()),
-    }
-}
-
 /// Adds the identity of every process in the group at `directory` and in every group below it,
 /// which is what the manager's kill reaches.
+///
+/// The groups are walked by the one reader the session's own control group is read with
+/// (`kr_worker::session_group::members`).
 ///
 /// # Errors
 ///
 /// Returns why the walk could not read all of them: a list or a directory the kernel would not
 /// give, a process it would not describe (asked twice), a process the kernel listed and `/proc`
-/// does not show, or more groups than [`GROUP_BUDGET`]. What was read is in `held` all the same,
-/// but the set is not whole. A process that moves from one group to another while the walk runs
-/// can be read twice or not at all, which only the group's `populated` line, never this list,
-/// answers for.
+/// does not show, or more groups than the walk reads. A process that moves from one group to
+/// another while the walk runs can be read twice or not at all, which only the group's `populated`
+/// line, never this list, answers for.
 #[cfg(target_os = "linux")]
 fn members_below(
     directory: &std::path::Path,
     held: &mut Vec<ProcessStartIdentity>,
 ) -> std::result::Result<(), String> {
-    use std::io::ErrorKind::NotFound;
-
-    let mut pending = vec![directory.to_path_buf()];
-    let mut queued = 1_usize;
-    while let Some(group) = pending.pop() {
-        let procs = match list_of(std::fs::read_to_string(group.join("cgroup.procs"))) {
-            Ok(List::Read(procs)) => procs,
-            Ok(List::Gone) => continue,
-            // The unit's own group has to be listed: its processes are in no group above it for
-            // the walk to read them from.
-            Ok(List::Threaded) if group == directory => {
-                return Err(format!(
-                    "{}: the unit's own group is a group of threads",
-                    group.display()
-                ));
+    for pid in kr_worker::session_group::members(directory)? {
+        // Asked twice: a process that ends while it is described reads as unestablished once,
+        // and as gone the second time.
+        let described = match kr_ipc::identity::query_process(pid) {
+            kr_ipc::identity::ProcessQuery::CannotEstablish(_) => {
+                kr_ipc::identity::query_process(pid)
             }
-            Ok(List::Threaded) => Vec::new(),
-            Err(why) => return Err(format!("{}: {why}", group.display())),
+            answer => answer,
         };
-        for pid in procs {
-            // Asked twice: a process that ends while it is described reads as unestablished once,
-            // and as gone the second time.
-            let described = match kr_ipc::identity::query_process(pid) {
-                kr_ipc::identity::ProcessQuery::CannotEstablish(_) => {
-                    kr_ipc::identity::query_process(pid)
-                }
-                answer => answer,
-            };
-            match described {
-                kr_ipc::identity::ProcessQuery::Present(identity) => {
-                    if !held.contains(&identity) {
-                        held.push(identity);
-                    }
-                }
-                // Listed by the group a moment ago and held by nobody now: it ended.
-                kr_ipc::identity::ProcessQuery::Gone => {}
-                kr_ipc::identity::ProcessQuery::CannotEstablish(error) => {
-                    return Err(format!("process {pid} could not be described: {error}"));
+        match described {
+            kr_ipc::identity::ProcessQuery::Present(identity) => {
+                if !held.contains(&identity) {
+                    held.push(identity);
                 }
             }
-        }
-        let entries = match std::fs::read_dir(&group) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == NotFound => continue,
-            Err(error) => return Err(format!("{}: {error}", group.display())),
-        };
-        for entry in entries {
-            let entry = entry.map_err(|error| format!("{}: {error}", group.display()))?;
-            match entry.file_type() {
-                Ok(kind) if kind.is_dir() => {
-                    queued += 1;
-                    if queued > GROUP_BUDGET {
-                        return Err(format!(
-                            "the service's control group and the groups below it are more than the {GROUP_BUDGET} the walk reads"
-                        ));
-                    }
-                    pending.push(entry.path());
-                }
-                Ok(_) => {}
-                Err(error) if error.kind() == NotFound => {}
-                Err(error) => return Err(format!("{}: {error}", entry.path().display())),
+            // Listed by the group a moment ago and held by nobody now: it ended.
+            kr_ipc::identity::ProcessQuery::Gone => {}
+            kr_ipc::identity::ProcessQuery::CannotEstablish(error) => {
+                return Err(format!("process {pid} could not be described: {error}"));
             }
         }
     }
@@ -989,7 +894,8 @@ fn read_group_under(root: &std::path::Path, path: &str, members: bool) -> Holder
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::{GROUP_BUDGET, Holders, List, list_of, read_group_under};
+    use super::{Holders, read_group_under};
+    use kr_worker::session_group::GROUP_BUDGET;
 
     /// A populated unit at `unit_path` under a directory of its own, with `procs` as its list.
     fn unit_holding(procs: &str) -> (tempfile::TempDir, std::path::PathBuf) {
@@ -1063,25 +969,6 @@ mod tests {
             matches!(read, Holders::Unreadable(ref why) if why.contains("to the end")),
             "{read:?}"
         );
-    }
-
-    /// What the kernel answers when a group's list is read as the group is removed, or when the
-    /// group is one of threads, is told from a failure: the first is a group that holds nothing, the
-    /// second a list some other group gives.
-    #[test]
-    fn a_groups_list_that_cannot_be_read_is_told_from_one_that_is_not_there() {
-        use rustix::io::Errno;
-
-        let raw = |errno: Errno| Err(std::io::Error::from_raw_os_error(errno.raw_os_error()));
-        assert_eq!(list_of(raw(Errno::NODEV)), Ok(List::Gone));
-        assert_eq!(list_of(raw(Errno::NOENT)), Ok(List::Gone));
-        assert_eq!(list_of(raw(Errno::OPNOTSUPP)), Ok(List::Threaded));
-        assert!(list_of(raw(Errno::ACCESS)).is_err());
-        assert_eq!(
-            list_of(Ok("12\n34\n".to_owned())),
-            Ok(List::Read(vec![12, 34]))
-        );
-        assert!(list_of(Ok("12\nx\n".to_owned())).is_err());
     }
 
     /// A unit's control group holds what is directly in it and what is in every group below it, at

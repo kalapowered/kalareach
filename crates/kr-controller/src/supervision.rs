@@ -1196,17 +1196,13 @@ pub(crate) fn kill_unit(
 /// transient unit and the reservation it was started for.
 ///
 /// Read from the process's control group, which names the service the manager runs it in, or the
-/// group a worker made below its service for its session. A process in any other control group, or
-/// on a platform without them, is in none.
+/// group a worker made below its service for its session, or one below that. A process in any other
+/// control group, or on a platform without them, is in none.
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn host_started_service_of(pid: u32) -> Option<HostStartedService> {
     let in_group = kr_ipc::identity::control_group_of(pid)?;
-    // A session's processes are in the group its worker made below the worker's service, and they
-    // are the service's all the same: the manager's end of the service ends them.
-    let path = in_group
-        .strip_suffix(&format!("/{}", kr_worker::session_group::SESSION_GROUP))
-        .map_or(in_group.clone(), str::to_owned);
+    let path = kr_worker::session_group::service_of(&in_group).to_owned();
     let leaf = path.rsplit('/').next()?;
     let label = leaf.strip_suffix(".service")?;
     SERVICE_LABEL_PREFIXES.iter().find_map(|prefix| {

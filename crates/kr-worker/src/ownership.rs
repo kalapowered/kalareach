@@ -1223,33 +1223,39 @@ impl OwnedProcesses {
 
     /// Asks the boundary itself whether it is holding anything.
     ///
-    /// The boundaries this platform has are read through the processes they hold, which
-    /// [`Self::surviving`] has already asked about.
+    /// A process group or a terminal is read through the processes they hold, which
+    /// [`Self::surviving`] has already asked about. A control group is asked directly: it holds
+    /// nothing only when it and every group below it list no process, and nothing the session did
+    /// not record stands in the worker's own service beside it, since the group's account may write
+    /// a process into the service's list and so out of the session's group and its end.
     #[cfg(not(windows))]
     fn ask_the_boundary(&self) -> bool {
         let OwnershipBoundary::ControlGroup { path } = &self.boundary else {
             return true;
         };
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        match crate::session_group::members_or_none_if_gone(path) {
-            Ok(held) if held.is_empty() => true,
-            Ok(held) => {
-                self.note_unestablished(format!(
-                    "the session's control group still held {} process(es) when the closure was \
-                     written",
-                    held.len()
-                ));
-                false
-            }
-            Err(error) => {
-                self.note_unestablished(format!(
-                    "the session's control group at {} would not say what was left in it: {error}",
-                    path.display()
-                ));
-                false
+        #[cfg(target_os = "linux")]
+        {
+            match crate::session_group::members(path) {
+                Ok(held) if held.is_empty() => self.the_service_holds_only_the_workers(path),
+                Ok(held) => {
+                    self.note_unestablished(format!(
+                        "the session's control group still held {} process(es) when the closure \
+                         was written",
+                        held.len()
+                    ));
+                    false
+                }
+                Err(error) => {
+                    self.note_unestablished(format!(
+                        "the session's control group at {} would not say what was left in it: \
+                         {error}",
+                        path.display()
+                    ));
+                    false
+                }
             }
         }
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        #[cfg(not(target_os = "linux"))]
         {
             self.note_unestablished(format!(
                 "the session's control group at {} cannot be read on this platform",
@@ -1257,6 +1263,48 @@ impl OwnedProcesses {
             ));
             false
         }
+    }
+
+    /// Whether the service the session's group is below holds, beside that group, only this worker
+    /// and processes the session recorded.
+    ///
+    /// A process can write its own number into the service's list and leave the session's group,
+    /// and with its session and parent gone it is in nothing the session reads. It is the
+    /// service's, not the session's, and the closure does not call the session covered while one
+    /// runs.
+    #[cfg(target_os = "linux")]
+    fn the_service_holds_only_the_workers(&self, session: &std::path::Path) -> bool {
+        let Some(service) = session.parent() else {
+            return true;
+        };
+        let listed = match crate::session_group::list_of(std::fs::read_to_string(
+            service.join("cgroup.procs"),
+        )) {
+            Ok(crate::session_group::List::Read(listed)) => listed,
+            Ok(crate::session_group::List::Gone) => return true,
+            Ok(crate::session_group::List::Threaded) => Vec::new(),
+            Err(error) => {
+                self.note_unestablished(format!(
+                    "the worker's service at {} would not say what it holds: {error}",
+                    service.display()
+                ));
+                return false;
+            }
+        };
+        let strangers = listed
+            .into_iter()
+            .filter(|pid| *pid != std::process::id())
+            .filter_map(|pid| kr_ipc::identity::process_lineage(pid).ok())
+            .filter(|lineage| !self.seen.contains_key(&key(&lineage.identity)))
+            .count();
+        if strangers == 0 {
+            return true;
+        }
+        self.note_unestablished(format!(
+            "the worker's service holds {strangers} process(es) outside the session's control \
+             group that the session did not record"
+        ));
+        false
     }
 
     /// Returns what this host could not establish, for the closure receipt.
@@ -1357,9 +1405,9 @@ impl OwnedProcesses {
     /// the shell's session or lost its parent is in it still. The tree is read as well, because a
     /// process can move itself out of the group and still be a descendant the session started, and
     /// one that did is outside the boundary and recorded all the same. Each process the group lists
-    /// is recorded from one reading of it that agrees it is still in the group: a number that
-    /// passed to another process after it was listed does not.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    /// is recorded from its identity as read, when the group still names it afterwards: a number
+    /// that passed to another process after it was listed is not in the group.
+    #[cfg(target_os = "linux")]
     fn observe_control_group(&mut self, path: &std::path::Path) {
         let relative = crate::session_group::relative(path);
         let listed = relative
@@ -1367,7 +1415,7 @@ impl OwnedProcesses {
             .ok_or_else(|| {
                 std::io::Error::other("the group is not in the control group file system")
             })
-            .and_then(|_| crate::session_group::members_or_none_if_gone(path));
+            .and_then(|_| crate::session_group::members(path).map_err(std::io::Error::other));
         match (listed, relative) {
             (Ok(pids), Some(relative)) => {
                 let agreeing: Vec<ProcessStartIdentity> = pids
@@ -1399,7 +1447,7 @@ impl OwnedProcesses {
     }
 
     /// A control group is only made on Linux.
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(not(target_os = "linux"))]
     fn observe_control_group(&mut self, path: &std::path::Path) {
         self.note_unestablished(format!(
             "the session's control group at {} cannot be read on this platform",
@@ -1920,11 +1968,11 @@ pub fn boundary_for(group: Option<i32>, root: &ProcessStartIdentity) -> Ownershi
 /// Establishes the boundary after the root shell was started, given the control group it was to be
 /// placed in, if there was one.
 ///
-/// A shell that is in the group, or that has already gone so that nothing can say it was not, gives
-/// a session whose ownership rests on the group: the group holds everything the shell started, and
-/// a process that left the shell's session, group or parent is in it still. A shell that is alive
-/// and outside the group, because the write that places it was refused, gives the boundary a host
-/// without a group has, and the group that nothing entered is removed.
+/// A shell that is shown to be in the group gives a session whose ownership rests on the group: the
+/// group holds everything the shell started, and a process that left the shell's session, group or
+/// parent is in it still. A shell that is not shown to be in it, because the write that places it
+/// was refused or because it has already gone and nothing can say where it was, gives the boundary
+/// a host without a group has, and the group is removed if nothing entered it.
 #[cfg(not(windows))]
 #[must_use]
 pub fn boundary_after_placement(
@@ -1933,8 +1981,7 @@ pub fn boundary_after_placement(
     placed: Option<crate::session_group::SessionGroup>,
 ) -> OwnershipBoundary {
     if let Some(placed) = placed {
-        let pid = u32::try_from(root.pid.get()).unwrap_or_default();
-        if placed.placement(pid) != Some(false) {
+        if placed.holds(u32::try_from(root.pid.get()).unwrap_or_default()) {
             return OwnershipBoundary::ControlGroup {
                 path: placed.path().to_path_buf(),
             };
@@ -1993,7 +2040,7 @@ pub fn force_stop(owned: &OwnedProcesses) {
     // A control group ends everything in it with one write, a process that is starting among
     // them, and not the worker, which is outside the session's group. A kernel with no such file
     // leaves it to the processes the record names, below.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(target_os = "linux")]
     if let OwnershipBoundary::ControlGroup { path } = owned.boundary() {
         match crate::session_group::kill(path) {
             Ok(()) => {}
@@ -2166,18 +2213,64 @@ mod tests {
         );
     }
 
+    /// A control group made of files in a directory, as the kernel's are: the service's list and,
+    /// below it, the session's, both empty. The group is the one boundary this platform reads
+    /// directly and holds nothing; a job object is asked directly too, which needs a real one: that
+    /// is `a_job_this_worker_cannot_ask_is_never_complete_coverage` below and the Windows suite.
+    #[cfg(target_os = "linux")]
+    fn an_empty_group() -> (tempfile::TempDir, std::path::PathBuf) {
+        let root = tempfile::tempdir().expect("a directory");
+        let session = root.path().join("service").join("session");
+        std::fs::create_dir_all(&session).expect("the groups");
+        std::fs::write(root.path().join("service").join("cgroup.procs"), "")
+            .expect("the service's list");
+        std::fs::write(session.join("cgroup.procs"), "").expect("the session's list");
+        (root, session)
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_complete_boundary_with_nothing_left_reports_complete() {
-        // A control group, because every platform reads its emptiness through the processes the
-        // record holds. A job object is asked directly, which needs a real one; that is
-        // `a_job_this_worker_cannot_ask_is_never_complete_coverage` below and the Windows suite.
+        let (_groups, session) = an_empty_group();
         let owned = OwnedProcesses::establish(
-            OwnershipBoundary::ControlGroup {
-                path: std::path::PathBuf::from("/sys/fs/cgroup/kalareach/session"),
-            },
+            OwnershipBoundary::ControlGroup { path: session },
             identity(u64::from(u32::MAX) + 1),
         );
         assert_eq!(owned.coverage(), OwnershipCoverage::Complete);
+    }
+
+    /// KR-REQ-07.60: a process that wrote its own number into the service's list left the session's
+    /// group and everything the session reads, and the group's end does not reach it. It is not the
+    /// session's to end, and the closure does not call the session covered while it runs.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_the_service_holds_beside_the_session_keeps_the_cover_incomplete() {
+        let (groups, session) = an_empty_group();
+        let mut stranger = std::process::Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .expect("starts a process");
+        std::fs::write(
+            groups.path().join("service").join("cgroup.procs"),
+            format!("{}\n{}\n", std::process::id(), stranger.id()),
+        )
+        .expect("the service's list");
+        let owned = OwnedProcesses::establish(
+            OwnershipBoundary::ControlGroup { path: session },
+            identity(u64::from(u32::MAX) + 1),
+        );
+        let coverage = owned.coverage();
+        stranger.kill().expect("ends the process");
+        let _ = stranger.wait();
+        assert_eq!(coverage, OwnershipCoverage::Incomplete);
+        assert!(
+            owned
+                .unestablished()
+                .iter()
+                .any(|note| note.contains("did not record")),
+            "and the receipt says why: {:?}",
+            owned.unestablished()
+        );
     }
 
     #[cfg(windows)]
@@ -2333,12 +2426,12 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_closure_that_could_not_establish_something_never_reports_complete_coverage() {
+        let (_groups, session) = an_empty_group();
         let owned = OwnedProcesses::establish(
-            OwnershipBoundary::ControlGroup {
-                path: std::path::PathBuf::from("/sys/fs/cgroup/kr"),
-            },
+            OwnershipBoundary::ControlGroup { path: session },
             identity(u64::from(u32::MAX) + 1),
         );
         // Nothing survives and the boundary is a complete one, and the answer is still incomplete:

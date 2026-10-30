@@ -311,12 +311,13 @@ async fn a_create_short_of(
 }
 
 /// KR-REQ-07.14: a create is refused with `RESOURCE_UNAVAILABLE` before anything is spawned when
-/// the state directory's filesystem has less free space than a session needs. The reading is the
-/// filesystem's own, against a limit no filesystem meets.
+/// the state directory's filesystem has less free space than a session needs. A filesystem cannot
+/// be filled without harm to the machine the test runs on, so the reading is a stand-in; the
+/// filesystem's own reading is `resources::tests`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_create_is_refused_before_a_spawn_when_storage_is_short() {
     a_create_short_of("storage", |resources| {
-        resources.minimum_free_storage = u64::MAX;
+        resources.free_storage = |_| Some(1024);
     })
     .await;
 }

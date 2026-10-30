@@ -818,20 +818,31 @@ impl Session {
         // Where the worker runs in a service of its own and may make a control group below it, the
         // root shell is placed in one before it runs: the boundary a session has is then the group,
         // which holds what the shell leaves behind.
-        let placed = crate::session_group::SessionGroup::prepare(&mut self.pty);
+        let (placed, group_refused) =
+            match crate::session_group::SessionGroup::prepare(&mut self.pty) {
+                Ok(group) => (group, None),
+                Err(why) => (None, Some(why)),
+            };
         match self.pty.launch(&command, admit) {
             Ok(shell) => {
                 // Ownership is established with the shell, not at closure: a process that started
                 // and ended while the session ran is still one this session owned, and a boundary
                 // created afterwards would never have seen it.
-                self.owned = Some(OwnedProcesses::establish(
+                let owned = OwnedProcesses::establish(
                     crate::ownership::boundary_after_placement(
                         shell.foreground_group(),
                         shell.identity(),
                         placed,
                     ),
                     shell.identity().clone(),
-                ));
+                );
+                if let Some(why) = group_refused {
+                    owned.note_unestablished(format!(
+                        "the worker runs as a service of its own and could not give the session a \
+                         control group, so it rests on its terminal and process group: {why}"
+                    ));
+                }
+                self.owned = Some(owned);
                 self.shell = Some(shell);
                 self.input.lock().set_state(SessionState::Live);
                 self.application_state = Some(ApplicationState::ShellReady);

@@ -16,7 +16,9 @@
 //! a resource that cannot be made scarce without harm to the machine it runs on. The measurements
 //! this host makes itself are [`HostResources::measured`]. A measurement that cannot be made says
 //! nothing about the resource, and the create goes on: only a reading that is short refuses, and
-//! the one exception is the terminal, where the failure to open one is itself the reading.
+//! the one exception is the terminal, where the failure to open one is itself the reading. Storage
+//! is read on every platform; terminals and processes are read where the platform has them to
+//! read, and not on Windows.
 
 use std::path::Path;
 
@@ -49,8 +51,8 @@ pub(crate) struct Shortfall {
 /// How this host reads the resources a create needs.
 #[derive(Clone, Copy)]
 pub(crate) struct HostResources {
-    /// The bytes free to this account on the filesystem that holds a directory.
-    pub(crate) free_storage: fn(&Path) -> std::io::Result<u64>,
+    /// The bytes free to this account on the filesystem that holds a directory, when it can be said.
+    pub(crate) free_storage: fn(&Path) -> Option<u64>,
     /// Opens a pseudo-terminal and closes it again.
     pub(crate) open_terminal: fn() -> std::io::Result<()>,
     /// How many more processes this account may start, or `None` when it has no limit.
@@ -66,7 +68,7 @@ impl HostResources {
     #[must_use]
     pub(crate) const fn measured() -> Self {
         Self {
-            free_storage: measure_free_storage,
+            free_storage: kr_describe::resource::platform::free_space,
             open_terminal: measure_terminal,
             process_headroom: measure_process_headroom,
             minimum_free_storage: MINIMUM_FREE_STORAGE_BYTES,
@@ -78,7 +80,7 @@ impl HostResources {
     ///
     /// This does file-system and process-table work, so it is called on a thread that may block.
     pub(crate) fn shortfall(&self, state_directory: &Path) -> Option<Shortfall> {
-        if let Ok(free) = (self.free_storage)(state_directory)
+        if let Some(free) = (self.free_storage)(state_directory)
             && free < self.minimum_free_storage
         {
             return Some(Shortfall {
@@ -111,19 +113,6 @@ impl HostResources {
     }
 }
 
-/// The bytes free to this account on the filesystem that holds `directory`.
-#[cfg(unix)]
-fn measure_free_storage(directory: &Path) -> std::io::Result<u64> {
-    let stat = rustix::fs::statvfs(directory)?;
-    Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
-}
-
-/// Windows is not measured here: a create goes on, as it does for any measurement that cannot be made.
-#[cfg(not(unix))]
-fn measure_free_storage(_directory: &Path) -> std::io::Result<u64> {
-    Ok(u64::MAX)
-}
-
 /// Opens a pseudo-terminal and closes it again.
 ///
 /// The worker opens one for the root shell. Whether this host can is the reading: a host out of
@@ -131,9 +120,16 @@ fn measure_free_storage(_directory: &Path) -> std::io::Result<u64> {
 /// been started.
 #[cfg(unix)]
 fn measure_terminal() -> std::io::Result<()> {
-    let master =
-        rustix::pty::openpt(rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY)?;
-    drop(master);
+    // Closed on exec, as the worker's own are: this daemon starts programs from other threads, and
+    // one that started while this was open would hold the terminal for its whole life.
+    #[cfg(target_os = "linux")]
+    let flags = rustix::pty::OpenptFlags::RDWR
+        | rustix::pty::OpenptFlags::NOCTTY
+        | rustix::pty::OpenptFlags::CLOEXEC;
+    // `posix_openpt` takes no such flag here; the descriptor is closed within this call.
+    #[cfg(not(target_os = "linux"))]
+    let flags = rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY;
+    drop(rustix::pty::openpt(flags)?);
     Ok(())
 }
 
@@ -145,10 +141,14 @@ fn measure_terminal() -> std::io::Result<()> {
 
 /// How many more processes this account may start under its own limit.
 ///
-/// The limit is the soft `RLIMIT_NPROC`, counted against every task the account holds. An account
-/// with no limit has no headroom to measure, and says so with `None`.
+/// The limit is this daemon's own soft `RLIMIT_NPROC`, counted against every task the account
+/// holds. An account with no limit has no headroom to measure, and says so with `None`; so does the
+/// superuser, whom the kernel does not hold to the limit.
 #[cfg(unix)]
 fn measure_process_headroom() -> std::io::Result<Option<u64>> {
+    if rustix::process::getuid().is_root() {
+        return Ok(None);
+    }
     let Some(limit) = rustix::process::getrlimit(rustix::process::Resource::Nproc).current else {
         return Ok(None);
     };
@@ -187,11 +187,26 @@ mod tests {
         let directory = std::env::temp_dir();
         let host = HostResources::measured();
         assert_eq!(
-            (host.free_storage)(&directory).map(|free| free > 0).ok(),
+            (host.free_storage)(&directory).map(|free| free > 0),
             Some(true)
         );
         assert!((host.open_terminal)().is_ok());
         assert!((host.process_headroom)().is_ok());
         assert_eq!(host.shortfall(&directory), None);
+    }
+
+    /// The filesystem's own reading, against a limit no filesystem meets, names storage; against
+    /// none it names nothing. The create-level case stands a reading in, so that it runs where the
+    /// reading cannot be made; this is the reading itself.
+    #[cfg(unix)]
+    #[test]
+    fn the_filesystems_own_reading_is_short_of_a_limit_no_filesystem_meets() {
+        let directory = std::env::temp_dir();
+        let mut host = HostResources::measured();
+        host.minimum_free_storage = u64::MAX;
+        assert_eq!(
+            host.shortfall(&directory).map(|short| short.resource),
+            Some("storage")
+        );
     }
 }

@@ -369,13 +369,20 @@ fn kr_req_07_60_what_is_recorded_below_a_server_is_below_that_server_only() {
 /// KR-REQ-07.60. A session whose boundary is complete does not read as completely covered once a
 /// server runs outside it, though the server has ended and nothing is left: what it started was
 /// read by parentage, and a process that left between two readings was not seen.
+#[cfg(target_os = "linux")]
 #[test]
 fn kr_req_07_60_a_session_that_had_a_server_never_reads_complete() {
     let mut shell = a_shell();
+    // A control group made of files in a directory, as the kernel's are: the service's list and
+    // the session's below it, both empty.
+    let groups = tempfile::tempdir().expect("a directory");
+    let session = groups.path().join("service").join("session");
+    std::fs::create_dir_all(&session).expect("the groups");
+    std::fs::write(groups.path().join("service").join("cgroup.procs"), "")
+        .expect("the service's list");
+    std::fs::write(session.join("cgroup.procs"), "").expect("the session's list");
     let mut owned = OwnedProcesses::establish(
-        OwnershipBoundary::ControlGroup {
-            path: std::path::PathBuf::from("/sys/fs/cgroup/kalareach/session"),
-        },
+        OwnershipBoundary::ControlGroup { path: session },
         kr_ipc::identity::ended_process_identity(4_000_003),
     );
     assert_eq!(

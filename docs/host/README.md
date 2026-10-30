@@ -974,14 +974,15 @@ three resources at that moment, and a create finds the first that is short:
 | --- | --- | --- |
 | `storage` | the filesystem that holds the state directory has less than 64 MiB free to this account | a session writes its history, its journal and the worker's record from its first moments, and its closure writes the final status there |
 | `terminals` | this host cannot open a pseudo-terminal | the worker opens one for the root shell, and a host out of terminals or of descriptors to open one with says so here and not in a worker that has already started |
-| `processes` | this account may start fewer than 64 more processes under its `RLIMIT_NPROC`, counted over every thread on Linux and every process on macOS | a session starts a worker and a root shell, and the shell's startup files and the person's first commands start more |
+| `processes` | this account may start fewer than 64 more processes under the daemon's own `RLIMIT_NPROC`, counted over every thread on Linux and every process on macOS | a session starts a worker and a root shell, and the shell's startup files and the person's first commands start more |
 
 The refusal is `RESOURCE_UNAVAILABLE` and names the resource and the figures it found. The three
 limits are fixed and are not configuration: a limit the owner could lower would let a create
 through on a host that cannot hold it. They do not narrow `session_limit`, which stays what the
 owner set, and `kr doctor` still reports no resource limit on that number. An account with no
-process limit has no headroom to read, and a reading this host cannot make never refuses a create
-(only a failure to open a terminal does). Windows reads none of the three.
+process limit has no headroom to read, nor has the superuser, whom the kernel does not hold to the
+limit; a reading this host cannot make never refuses a create (only a failure to open a terminal
+does). Windows reads the free space of the volume and does not read terminals or processes.
 
 `grant_rights` is applied where a paired device's request is decided. Every request a device sends
 goes through one decision: its grant, intersected with this host's policy (the organisation lease a
@@ -4308,22 +4309,32 @@ the others.
 control group delegated to it. It makes one group below it, `session`, before the root shell runs and
 has the shell write itself into the group between its fork and its exec, so that everything the shell
 starts is born in the group: a process that gave up the shell's session or process group, or lost its
-parent, is in it still. The session's ownership then rests on that group. While the session runs, the
-worker records the processes the group lists, each from one reading that agrees it is in the group,
-beside the worker's own tree; a closure ends the group with one write to `cgroup.kill` (and then, as
-before, the recorded processes), and its coverage is complete only when the group read empty
-afterwards. A group that is not there holds nothing, as the kernel removes only an empty group; a
-group that cannot be listed, or that holds more groups than a session makes, is something the host
-could not establish, and the closure says so. The worker itself stays in the service's group, outside
-the session's. The group is made only when the worker is the process of a service named for a
+parent, is in it still. The session's ownership then rests on that group, once the shell is shown to
+be in it. While the session runs, the worker records the processes the group lists, each from its
+identity as read when the group still names it afterwards, beside the worker's own tree; a closure
+ends the group with one write to `cgroup.kill` (and then, as before, the recorded processes), and its
+coverage is complete only when the group read empty afterwards and the worker's service holds, beside
+the session's group, nothing but the worker and processes the session recorded. The account may
+write a process into its service's own list, which leaves the session's group and everything the
+session reads; the closure does not call the session covered while one is there. A group that is not
+there holds nothing when its parent is there to say so, as the kernel removes only an empty group; a
+group below it that goes while the listing runs holds nothing and does not void the rest; a group
+that cannot be listed, or that holds more groups than a session makes, is something the host could
+not establish, and the closure says so. The worker itself stays in the service's group, outside the
+session's. The group is made only when the worker is the process of a service named for a
 reservation (`kr-worker-<reservation>.service`), the control groups are the unified hierarchy and the
 worker may make a group below its service. Under any other start, such as a detached process of a
 host with no service manager, a worker in a login session's scope, or a kernel without the unified
 hierarchy, there is no group and the session rests on its terminal and process group as described
-below. A shell that is alive and outside the group because the write that placed it was refused
-leaves the session on those too, and the group is removed. A control daemon a session's command
-starts is in the group and moves out of the service as it does from the service itself; the session's
-group counts as the worker's service for that and for `kr doctor`.
+below. Where a group was owed and could not be made or used, the session rests on those too, and the
+closure says why. A shell that is alive and outside the group because the write that placed it was
+refused, or that has gone before anything could say where it was, leaves the session on those as
+well, and the group is removed. A control daemon a session's command starts is in the group, or in
+a group its commands made below it, and moves out of the service as it does from the service
+itself; the session's group and every group below it count as the worker's service for that and for
+`kr doctor`. Because the worker stays in the service's group, the session's groups carry no
+controllers of their own: a nested runtime that needs a resource controller of the session's group
+(memory or pids for a container) is not given one, and fails by its own error.
 
 **What it cannot reach, and what a survivor means.** On macOS, a process that left the terminal's
 session, a process the worker started outside it and a process that began after the worker's last
