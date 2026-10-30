@@ -325,6 +325,89 @@ async fn the_grant_the_host_writes_carries_the_role_the_person_chose_and_each_op
     scene.stop().await;
 }
 
+/// KR-REQ-18.14: the issuer withdraws an invitation nobody has accepted, from the page. The result
+/// the page is handed states the authority revision and that no session worker owes a fence; the
+/// host lists the grant revoked; the device is no longer offered the invitation, and accepting it
+/// afterwards is answered with the host's sentence that it was withdrawn and gives the device no
+/// share.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_invitation_nobody_accepted_is_withdrawn_and_refused_when_accepted_after() {
+    let scene = Scene::start().await;
+    let made = scene
+        .issuer
+        .call("grant_create", scene.invitation(SessionRole::Viewer))
+        .await
+        .expect("the invitation is issued");
+    let created: GrantCreateResult = typed(&made["value"]);
+    let offered = scene
+        .phone
+        .call("grant_held", json!({}))
+        .await
+        .expect("held");
+    assert_eq!(offered["offers"].as_array().expect("offers").len(), 1);
+
+    let withdrawn = scene
+        .issuer
+        .call(
+            "grant_revoke",
+            json!({ "params": serde_json::to_value(&GrantRevokeParams {
+                grant_id: created.grant.grant_id,
+            }).expect("encodes") }),
+        )
+        .await
+        .expect("the invitation is withdrawn");
+    assert_eq!(withdrawn["attempt"]["outcome"], "happened", "{withdrawn}");
+    let result: RevocationResult = typed(&withdrawn["value"]);
+    assert!(result.barrier.holds(), "no worker owes a fence");
+    assert!(result.revoked_grants.contains(&created.grant.grant_id));
+    assert_eq!(
+        result.authority_revision, created.authority_revision,
+        "an invitation nobody accepted was never in force, so withdrawing it takes no revision"
+    );
+    let listed = scene.listed().await;
+    let held = listed
+        .grants
+        .iter()
+        .find(|summary| summary.grant.grant_id == created.grant.grant_id)
+        .expect("the host lists the withdrawn grant");
+    assert_eq!(held.state, GrantState::Revoked);
+
+    let offered = scene
+        .phone
+        .call("grant_held", json!({}))
+        .await
+        .expect("held");
+    assert_eq!(
+        offered["offers"].as_array().expect("offers").len(),
+        0,
+        "the device is not offered what was withdrawn"
+    );
+    let refused = scene
+        .phone
+        .call(
+            "grant_redeem",
+            json!({ "params": serde_json::to_value(&GrantRedeemParams {
+                invitation_id: created.preview.invitation_id,
+            }).expect("encodes") }),
+        )
+        .await
+        .expect("the device is answered with the attempt");
+    assert_eq!(refused["value"], Value::Null, "{refused}");
+    assert!(
+        refused["attempt"]["refusal"]
+            .as_str()
+            .is_some_and(|said| said.contains("withdrawn")),
+        "the host's own sentence says it was withdrawn: {refused}"
+    );
+    let held = scene
+        .phone
+        .call("grant_held", json!({}))
+        .await
+        .expect("held");
+    assert_eq!(held["shares"].as_array().expect("shares").len(), 0);
+    scene.stop().await;
+}
+
 /// The host's answer to an invitation is lost, and the application, which kept the request before
 /// it sent it, asks the host again with the same request on a connection opened for it. The host
 /// answers from the record it kept, so the invitation exists once, and the page reads the host's

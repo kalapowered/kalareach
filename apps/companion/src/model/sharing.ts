@@ -184,6 +184,11 @@ export function spanWords(ms: number): string {
   return `${String(Math.floor(minutes / 1_440))} days`
 }
 
+/** A session as a person can tell it from another where only its identifier is known. */
+export function sessionIdWords(sessionId: string): string {
+  return `session ${sessionId.slice(0, 8)}`
+}
+
 /**
  * A device's name as the person reads it. A name is whatever its owner typed, so a character that
  * turns text round is made visible, as it is on the screen's preview, and cannot reorder the words

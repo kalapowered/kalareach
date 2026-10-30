@@ -11,14 +11,32 @@
 import type { GrantCreateResult, GrantTransferResult, RevocationResult } from '@kalareach/protocol'
 
 import { nameWords } from './sharing'
-import type { SharingDesk } from './sharing-desk'
+import type { SharingDesk, Waiting } from './sharing-desk'
 
 /** Says something to the person, as the page's toast does. */
 export type Say = (text: string, tone?: 'success' | 'danger' | 'pending') => void
 
+/**
+ * The session workers a revocation still waits for. The host names the workers that have not
+ * confirmed before any that has, and says how many there were in all, so when it cut its list the
+ * names are a floor.
+ */
+export function waitingOn(result: RevocationResult): Waiting {
+  const { workers, workers_total: total } = result.barrier
+  return {
+    sessions: workers.filter((worker) => worker.state === 'pending').map((worker) => worker.session_id),
+    cut: Number(total) > workers.length
+  }
+}
+
 /** How many workers a revocation still waits for. */
 export function pendingWorkers(result: RevocationResult): number {
-  return result.barrier.workers.filter((worker) => worker.state === 'pending').length
+  return waitingOn(result).sessions.length
+}
+
+/** "1 session worker has", "3 session workers have", or "at least 3 session workers have". */
+export function workersHave(count: number, cut: boolean): string {
+  return `${cut ? 'at least ' : ''}${String(count)} session worker${count === 1 ? ' has' : 's have'}`
 }
 
 /**
@@ -57,16 +75,20 @@ export function tookBack(
   withdrawing: boolean,
   nowMs: number
 ): void {
-  const pending = pendingWorkers(result)
-  desk.keepRevocation(grantId, name, nowMs, result.authority_revision, pending)
+  const waiting = waitingOn(result)
+  const done = waiting.sessions.length === 0
+  desk.keepRevocation(grantId, name, nowMs, result.authority_revision, waiting)
   desk.dismissNote(grantId)
+  const owed = `${workersHave(waiting.sessions.length, waiting.cut)} not confirmed yet.`
   say(
-    withdrawing
-      ? `Invitation to ${nameWords(name)} withdrawn.`
-      : pending === 0
-        ? `Revoked ${nameWords(name)}’s access.`
-        : `Revoked ${nameWords(name)}’s access. ${String(pending)} session worker${pending === 1 ? ' has' : 's have'} not confirmed yet.`,
-    withdrawing || pending === 0 ? 'success' : 'pending'
+    done
+      ? withdrawing
+        ? `Invitation to ${nameWords(name)} withdrawn.`
+        : `Revoked ${nameWords(name)}’s access.`
+      : withdrawing
+        ? `The withdrawal of the invitation to ${nameWords(name)} is recorded, and not done: ${owed}`
+        : `The revocation for ${nameWords(name)} is recorded, and not done: ${owed}`,
+    done ? 'success' : 'pending'
   )
 }
 
@@ -76,7 +98,7 @@ export function tookBack(
  * changed by the answer.
  */
 export function rechecked(desk: SharingDesk, result: RevocationResult, grantId: string): void {
-  desk.checked(grantId, pendingWorkers(result))
+  desk.checked(grantId, waitingOn(result))
 }
 
 /**
@@ -93,12 +115,12 @@ export function handedOver(
   words: string,
   nowMs: number
 ): void {
-  const pending = pendingWorkers(done.revoked)
-  desk.keepRevocation(sourceGrantId, givingName, nowMs, done.revoked.authority_revision, pending)
+  const waiting = waitingOn(done.revoked)
+  desk.keepRevocation(sourceGrantId, givingName, nowMs, done.revoked.authority_revision, waiting)
   say(
-    pending === 0
+    waiting.sessions.length === 0
       ? words
-      : `${words} ${String(pending)} session worker${pending === 1 ? ' has' : 's have'} not confirmed that ${nameWords(givingName)} lost access yet.`,
-    pending === 0 ? 'success' : 'pending'
+      : `${words} ${workersHave(waiting.sessions.length, waiting.cut)} not confirmed that ${nameWords(givingName)} lost access yet.`,
+    waiting.sessions.length === 0 ? 'success' : 'pending'
   )
 }

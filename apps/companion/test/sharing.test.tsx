@@ -343,6 +343,44 @@ describe('who has access', () => {
   })
 })
 
+describe('a revocation some session worker has not confirmed', () => {
+  // KR-REQ-18.14: the words do not call it done. The toast and the line say that the revocation is
+  // recorded and not done, state the authority revision, and name each session whose worker has
+  // not confirmed it; once a check finds none left, the line says the access was revoked.
+  it('is said to be recorded and not done, with each session that has not confirmed it', async () => {
+    const { controls, person } = await openSharing()
+    await person.click(screen.getByRole('radio', { name: PHONE }))
+    await person.click(screen.getByTestId('invite'))
+    await waitFor(() => {
+      expect(controls.sharing.grants()).toHaveLength(1)
+    })
+    controls.sharing.deviceAccepts(controls.sharing.grants()[0]?.grant.grant_id ?? '')
+    await reread()
+    const row = await waitFor(() => {
+      const found = screen.getByTestId('access').querySelector('[data-state="active"]')
+      expect(found).not.toBeNull()
+      return found as HTMLElement
+    })
+
+    controls.sharing.holdBarrier(true)
+    await person.click(within(row).getByTestId('revoke'))
+    const line = await screen.findByTestId('recently-revoked')
+    expect(line.textContent).not.toMatch(/^Revoked/)
+    expect(line.textContent).toMatch(/recorded/)
+    expect(line.textContent).toMatch(/not done/)
+    expect(line.textContent).toMatch(/authority revision 6/)
+    expect(line.textContent).toMatch(/1 session worker has not confirmed yet \(session 8a7b6c50\)/)
+    const toast = screen.getByText(/is recorded, and not done: 1 session worker has not confirmed yet/)
+    expect(toast.textContent).not.toMatch(/^Revoked/)
+
+    await person.click(within(line).getByTestId('check-again'))
+    await waitFor(() => {
+      expect(screen.getByTestId('recently-revoked').textContent).toMatch(/^Revoked /)
+    })
+    expect(screen.getByTestId('recently-revoked').textContent).not.toMatch(/not done|session 8a7b6c50/)
+  })
+})
+
 describe('an attempt whose answer was lost', () => {
   it('is listed as unfinished, says until when, and is asked about and never sent again', async () => {
     const { controls, person } = await openSharing()
@@ -1223,7 +1261,7 @@ describe('Check again whose reply was lost', () => {
       controls.sharing.ownerAnswers()
     })
     const line = await screen.findByTestId('recently-revoked', {}, { timeout: 4000 })
-    expect(line.textContent).toMatch(/Revoked Sam.*1 session worker has not confirmed yet/)
+    expect(line.textContent).toMatch(/The revocation for Sam.*1 session worker has not confirmed yet/)
     controls.sharing.loseNextAnswer()
     await person.click(within(line).getByTestId('check-again'))
     await screen.findByTestId('attempt')
