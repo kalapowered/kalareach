@@ -296,6 +296,43 @@ fn a_git_that_answers_without_end_is_ended_where_its_output_passes_the_limit_and
 
 #[cfg(unix)]
 #[test]
+fn a_git_that_passes_the_limit_and_goes_quiet_is_ended_and_refused() {
+    // The output passes the limit and the program then waits without writing, so nothing but the
+    // host ends it: a program that went on writing would end when the pipe closed.
+    let directory = tempfile::tempdir().expect("a directory for this test");
+    let search = directory.path().join("search");
+    std::fs::create_dir(&search).expect("a search path of this test's own");
+    let own = directory.path().join("own");
+    stand_in(
+        &search,
+        &format!(
+            "echo $$ > '{}'\nyes | head -c 200000\nexec sleep 120",
+            own.display()
+        ),
+    );
+    let profile = profile_waiting(directory.path(), &search, Duration::from_secs(20));
+
+    let refusal = profile.git().expect_err("that is not an answer");
+    assert!(
+        matches!(refusal, ProjectError::GitUnavailable { .. }),
+        "{refusal:?}"
+    );
+    assert!(
+        refusal.to_string().contains("more than"),
+        "it says why: {refusal}"
+    );
+    let pid = std::fs::read_to_string(&own)
+        .expect("the stand-in started before its output passed the limit")
+        .trim()
+        .to_owned();
+    until(
+        &format!("the stand-in {pid} still runs after its output passed the limit"),
+        || !exists(&pid),
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn requests_that_arrive_together_start_one_look_between_them() {
     use std::sync::Barrier;
 

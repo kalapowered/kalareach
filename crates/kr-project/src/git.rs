@@ -3982,7 +3982,13 @@ fn gather(pipe: &mut impl std::io::Read, seen: &mut Bounded, deadline: Instant) 
 #[cfg(unix)]
 fn without_blocking(pipe: &std::process::ChildStdout) -> std::io::Result<()> {
     #[cfg(test)]
-    if tests::SWITCH_FAILS.with(std::cell::Cell::get) {
+    if let Some(after) = tests::SWITCH_FAILS.with(|fails| fails.borrow().clone()) {
+        // The case that asks for the failure has its stand-in write a file first, so that what is
+        // done to the stand-in afterwards can be told from what is done before it has run.
+        let guard = Instant::now() + Duration::from_secs(30);
+        while !after.exists() && Instant::now() < guard {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         return Err(std::io::Error::other("the pipe cannot be switched"));
     }
     rustix::fs::fcntl_setfl(pipe, rustix::fs::OFlags::NONBLOCK).map_err(std::io::Error::from)
@@ -5089,8 +5095,9 @@ mod tests {
 
     #[cfg(unix)]
     thread_local! {
-        /// Set by a case to make the switch to nonblocking reads fail on its own thread.
-        pub(super) static SWITCH_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Set by a case to make the switch to nonblocking reads fail on its own thread, once the
+        /// file it names exists.
+        pub(super) static SWITCH_FAILS: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
         /// Set by a case to make the question whether a child has ended fail on its own thread, as
         /// it does for a child that something else in the process has collected.
         pub(super) static WAIT_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -5166,47 +5173,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn a_pipe_that_cannot_be_read_without_blocking_refuses_the_probe() {
-        let directory = tempfile::tempdir().expect("a directory for this test");
-        let (text, program, own) = (
-            directory.path().join("git.text"),
-            directory.path().join("git"),
-            directory.path().join("own"),
-        );
-        std::fs::write(
-            &text,
-            format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 6\n", own.display()),
-        )
-        .expect("the stand-in's text");
-        kr_ipc::testing::place_program(&text, &program);
-
-        SWITCH_FAILS.with(|fails| fails.set(true));
-        let asked = ask(
-            &program,
-            &["--version"],
-            Instant::now() + Duration::from_secs(3),
-        );
-        SWITCH_FAILS.with(|fails| fails.set(false));
-
-        let Err(Asked::Overran(refusal)) = asked else {
-            panic!("a pipe that would block the reads is not read, and the probe is refused");
-        };
-        assert!(
-            refusal.to_string().contains("without blocking"),
-            "it says why: {refusal}"
-        );
-        if let Ok(pid) = std::fs::read_to_string(&own) {
-            let alive = std::process::Command::new("kill")
-                .args(["-0", pid.trim()])
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success());
-            assert!(!alive, "the stand-in was ended with the refusal");
-        }
-    }
-
     /// Whether a process with this identifier is running, which one that has ended and not yet been
     /// collected is not.
     #[cfg(unix)]
@@ -5219,6 +5185,78 @@ mod tests {
         !state.trim().is_empty() && !state.trim().starts_with('Z')
     }
 
+    /// A stand-in that writes its number to `own` and then waits for `seconds`, placed as the
+    /// program a case asks.
+    #[cfg(unix)]
+    fn waiting_stand_in(directory: &Path, own: &Path, seconds: u32) -> PathBuf {
+        let (text, program) = (directory.join("git.text"), directory.join("git"));
+        std::fs::write(
+            &text,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\nexec sleep {seconds}\n",
+                own.display()
+            ),
+        )
+        .expect("the stand-in's text");
+        kr_ipc::testing::place_program(&text, &program);
+        program
+    }
+
+    /// The number a stand-in wrote, which it does when it starts, and so may be after a refusal.
+    #[cfg(unix)]
+    fn number_of(own: &Path) -> String {
+        let guard = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Ok(pid) = std::fs::read_to_string(own)
+                && !pid.trim().is_empty()
+            {
+                return pid.trim().to_owned();
+            }
+            assert!(
+                Instant::now() < guard,
+                "the stand-in never ran: it was ended before it could start"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Ends what a case left running, by the number the stand-in wrote.
+    #[cfg(unix)]
+    fn end_by_number(pid: &str) {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", pid])
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_that_cannot_be_read_without_blocking_refuses_the_probe() {
+        let directory = tempfile::tempdir().expect("a directory for this test");
+        let own = directory.path().join("own");
+        let program = waiting_stand_in(directory.path(), &own, 6);
+
+        SWITCH_FAILS.with(|fails| *fails.borrow_mut() = Some(own.clone()));
+        let asked = ask(
+            &program,
+            &["--version"],
+            Instant::now() + Duration::from_secs(3),
+        );
+        SWITCH_FAILS.with(|fails| *fails.borrow_mut() = None);
+
+        let Err(Asked::Overran(refusal)) = asked else {
+            panic!("a pipe that would block the reads is not read, and the probe is refused");
+        };
+        assert!(
+            refusal.to_string().contains("without blocking"),
+            "it says why: {refusal}"
+        );
+        let pid = number_of(&own);
+        let alive = running(&pid);
+        end_by_number(&pid);
+        assert!(!alive, "the stand-in was ended with the refusal");
+    }
+
     /// A child that cannot be waited on may be gone already, collected by something else in the
     /// process, and its number may belong to another process by now. So the look is refused and
     /// nothing is signalled by that number: the stand-in, which a signal to its number or to its
@@ -5227,17 +5265,8 @@ mod tests {
     #[test]
     fn a_child_that_cannot_be_waited_on_is_refused_and_nothing_is_signalled_by_number() {
         let directory = tempfile::tempdir().expect("a directory for this test");
-        let (text, program, own) = (
-            directory.path().join("git.text"),
-            directory.path().join("git"),
-            directory.path().join("own"),
-        );
-        std::fs::write(
-            &text,
-            format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 120\n", own.display()),
-        )
-        .expect("the stand-in's text");
-        kr_ipc::testing::place_program(&text, &program);
+        let own = directory.path().join("own");
+        let program = waiting_stand_in(directory.path(), &own, 120);
 
         WAIT_FAILS.with(|fails| fails.set(true));
         let asked = ask(
@@ -5254,28 +5283,42 @@ mod tests {
             refusal.to_string().contains("could not be waited on"),
             "it says why: {refusal}"
         );
-        // The stand-in writes its number when it starts, which may be after the refusal.
-        let guard = Instant::now() + Duration::from_secs(30);
-        let pid = loop {
-            if let Ok(pid) = std::fs::read_to_string(&own)
-                && !pid.trim().is_empty()
-            {
-                break pid.trim().to_owned();
-            }
-            assert!(
-                Instant::now() < guard,
-                "the stand-in never ran: it was ended before it could start"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        };
+        let pid = number_of(&own);
         let left_alone = running(&pid);
-        if left_alone {
-            // Ended here, by the number it wrote.
-            let _ = std::process::Command::new("kill")
-                .args(["-9", &pid])
-                .stderr(Stdio::null())
-                .status();
-        }
+        end_by_number(&pid);
+        assert!(left_alone, "the stand-in was signalled by its number");
+    }
+
+    /// The same holds when the probe is ended for another reason than the wait: a pipe that cannot
+    /// be switched is a reason to end the child, but not when the child cannot be waited on, and so
+    /// may not be this process's own any more.
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_ended_for_its_pipe_signals_nothing_by_number_when_its_child_cannot_be_waited_on() {
+        let directory = tempfile::tempdir().expect("a directory for this test");
+        let own = directory.path().join("own");
+        let program = waiting_stand_in(directory.path(), &own, 120);
+
+        SWITCH_FAILS.with(|fails| *fails.borrow_mut() = Some(own.clone()));
+        WAIT_FAILS.with(|fails| fails.set(true));
+        let asked = ask(
+            &program,
+            &["--version"],
+            Instant::now() + Duration::from_secs(60),
+        );
+        WAIT_FAILS.with(|fails| fails.set(false));
+        SWITCH_FAILS.with(|fails| *fails.borrow_mut() = None);
+
+        let Err(Asked::Overran(refusal)) = asked else {
+            panic!("a pipe that would block the reads is not read, and the probe is refused");
+        };
+        assert!(
+            refusal.to_string().contains("without blocking"),
+            "it says why: {refusal}"
+        );
+        let pid = number_of(&own);
+        let left_alone = running(&pid);
+        end_by_number(&pid);
         assert!(left_alone, "the stand-in was signalled by its number");
     }
 
