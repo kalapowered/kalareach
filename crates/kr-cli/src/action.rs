@@ -98,9 +98,10 @@ async fn host_receipt(
 /// The receipt of an action a session performed: from its worker while the session is live, from
 /// the environment's archive once it has closed.
 ///
-/// A session is looked for in every environment of this host unless `--environment` names one, as
-/// `kr close` looks, so a display number two environments use is ambiguous rather than answered
-/// from the first.
+/// A live session is looked for in every environment of this host unless `--environment` names
+/// one, so a display number two environments use is ambiguous rather than answered from the
+/// first. A closed session is looked for only in the environment `--environment` names or this
+/// installation's own, as `kr close` looks.
 async fn session_receipt(
     paths: &HostPaths,
     arguments: &ActionReadArguments,

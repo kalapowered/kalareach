@@ -60,7 +60,8 @@ shell commands nor paths are assembled by interpolating text.
 The commands from `kr project` to `kr organisation` act in this installation's own environment, or in the
 one `--environment <id>` names. Each is a client of one method the control daemon serves, and
 the daemon decides every refusal; `kr action read` of a live session is the exception, which asks
-that session's worker. A command that removes or revokes something names it by its
+that session's worker, and looks for that session in every environment of this host when
+`--environment` names none. A command that removes or revokes something names it by its
 identifier, never by a label or a number.
 
 A session is named by its display number or its identifier. Display numbers increase within an
@@ -1860,9 +1861,11 @@ note go for room after 1,024 reads, has to be asked again. The daemon and the ar
 
 Where the receipt is kept decides what `--session` does. An action a live session performed is kept
 by that session's worker, and the command asks the worker directly. An action a closed session
-performed is kept in the environment's archive, which the control daemon serves. A session is looked
-for in every environment of this host unless `--environment` names one, and a display number that
-two environments use is refused as `AMBIGUOUS_SESSION`. A catalogue or plugin change names no
+performed is kept in the environment's archive, which the control daemon serves. A live session is
+looked for in every environment of this host unless `--environment` names one, and a display number
+that two environments use is refused as `AMBIGUOUS_SESSION`. A closed session is looked for only in
+the environment `--environment` names, or in this installation's own when it names none, as
+`kr close` looks, so a closed session of another environment needs `--environment`. A catalogue or plugin change names no
 session, so leave `--session` out and the daemon answers. Other actions the daemon performs are not
 served by this read yet, and the daemon refuses them. A session whose worker the daemon has not published has no
 receipts to read, and the command says so. An identifier nothing holds is refused by whoever was
