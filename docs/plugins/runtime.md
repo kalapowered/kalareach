@@ -323,7 +323,8 @@ entry is a reason to recompile rather than a reason to refuse the binding.
 
 One process for each environment, `kr-plugin-host`, started by the control daemon
 through the same supervisor trait a worker is started through: a launchd job, a systemd transient
-user service, or a detached process on a Unix host with no service manager, or, on Windows, a
+user service, or a detached process on a Unix host whose daemon found no service manager to use (on a
+Mac, no graphical domain), or, on Windows, a
 process the starter of the environment's scheduled task creates, in each case its own job outside
 the daemon's kill tree.
 

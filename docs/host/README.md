@@ -1265,7 +1265,8 @@ only when it says which session it describes and says the selected one, and a ha
 collected is cleared rather than left to arrive from the other login. A headless worker is given
 none of them.
 
-The fallback supervisor, which a host with no service manager uses, has no domains to choose
+The fallback supervisor, which a daemon uses when it found no service manager to use when it
+started (on a Mac, no graphical domain, although launchd is there), has no domains to choose
 between: a worker it starts is in whatever login context this daemon is in, and a headless worker
 there has the desktop's variables stripped rather than a login context of its own.
 
@@ -1603,9 +1604,15 @@ remains available. It is an explicit choice and never an automatic substitution 
 request that could not be served. A request that names no shell gets the one the host is configured
 to use (`SHELL`), and otherwise the platform's own: `/bin/zsh` on macOS, `/bin/bash` on Linux, and on
 Windows PowerShell 7, then Windows PowerShell 5.1, then the command interpreter. PowerShell 7 is the
-one in its program-files directory or the Store's alias; a `pwsh.exe` elsewhere on the search path is
-not taken, because it may be an older PowerShell. The command interpreter is the one `ComSpec` names
-when that is an absolute path to a file, and otherwise the system directory's `cmd.exe`.
+one in its program-files directory (`PowerShell\7`, or a sibling directory whose name starts with a
+7) or the one the Store's alias names in the user's `WindowsApps` directory; a `pwsh.exe` elsewhere
+on the search path is not taken, because it may be an older PowerShell. The Store's alias is taken by
+its place and not by what it starts, as the directory is the user's own. Each program is found by
+the worker's own environment (`ProgramFiles`, `LOCALAPPDATA`, and `SystemRoot` or `windir` for
+Windows PowerShell 5.1 and `cmd.exe`), and every one is named by an absolute path. The command
+interpreter is the one `ComSpec` names when that is an absolute path to a file, and otherwise
+`cmd.exe` in the system directory (`C:\Windows` when neither variable gives an absolute one),
+named by its path without a check that it is there.
 
 [docs/shell-integration/host.md](../shell-integration/host.md) describes the endpoint, the handshake,
 the phases, the launch transaction and the guarded startup entries `kr shell` writes.

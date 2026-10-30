@@ -127,8 +127,8 @@ mod platform {
             return (
                 LogoutPersistence::NotEstablished,
                 "a detached process, reparented to the system's first process",
-                "This daemon started a session's worker as a detached process, because this host \
-                 had no graphical domain to put a launchd job in when the daemon started. What a \
+                "This daemon starts a session's worker as a detached process: it found no \
+                 graphical domain to put a launchd job in when it selected its supervisor. What a \
                  logout does to that process is the platform's own behaviour and this host does \
                  not claim to know it, so it is not established.",
             );
@@ -166,10 +166,10 @@ mod platform {
             return (
                 LogoutPersistence::NoServiceManager,
                 "a detached process, reparented to the system's first process",
-                "This daemon found no per-user service manager when it started, so it starts a \
-                 session's worker as a detached process rather than as a service. What a logout \
-                 does to that process is the platform's own behaviour and this host does not claim \
-                 to know it.",
+                "This daemon starts a session's worker as a detached process rather than as a \
+                 service: it found no per-user service manager when it selected its supervisor. \
+                 What a logout does to that process is the platform's own behaviour and this host \
+                 does not claim to know it.",
             );
         }
         let (persistence, detail) = if super::agent::lingering(kr_ipc::paths::current_uid()) {
