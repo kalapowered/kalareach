@@ -55,8 +55,8 @@ pub enum AttachOutcome {
     Disconnected,
     /// Input could not be delivered, and whether it arrived is not known.
     DeliveryUncertain(Shown),
-    /// The session refused what was typed here, and none of it was delivered: the application
-    /// asked for a keyboard encoding this terminal cannot send.
+    /// The session refused what was typed here, from one write on, because the application in it
+    /// asked for a keyboard encoding that console keys cannot be sent in.
     InputRefused(Shown),
 }
 
@@ -122,8 +122,9 @@ impl AttachOutcome {
                 shown!("some input may not have reached the session: {}", *detail)
             }
             Self::InputRefused(detail) => shown!(
-                "what was typed here was not delivered, because the application in the session \
-                 asked for a keyboard encoding this terminal cannot send: {}",
+                "the session took no more of what was typed here, because the application in it \
+                 asked for a keyboard encoding that this terminal's keys cannot be sent in; \
+                 `kr attach --no-probe` watches it without typing: {}",
                 *detail
             ),
         }
@@ -2410,8 +2411,11 @@ mod tests {
         Sending, Subscriptions, WindowReports, landed, ownership, presses, resizes_in_flight,
         scroll_keys, scroll_step, scrolled, take_scroll_keys,
     };
+    use crate::error::CliError;
+    use kr_client::error::refusal;
     use kr_client::shown::Shown;
     use kr_protocol::attachment::ViewportPosition;
+    use kr_protocol::error::ErrorCode;
     use kr_protocol::scalars::{Nullable, U64};
     use kr_protocol::session::{ClosureReason, ClosureRecord};
 
@@ -2509,6 +2513,19 @@ mod tests {
             "the session closed: it was closed on request; what was typed while it was closing \
              was not delivered"
         );
+    }
+
+    /// An attachment whose session refused its keys ends as a refusal with the status of one, and
+    /// says how to go on watching.
+    #[test]
+    fn an_attachment_the_session_refused_input_on_ends_with_the_refusals_status() {
+        let outcome = AttachOutcome::InputRefused(Shown::said("INPUT_INCOMPATIBLE"));
+        assert!(outcome.is_failure());
+        assert_eq!(
+            status(&outcome),
+            CliError::Refused(refusal(ErrorCode::InputIncompatible, Shown::said(""))).exit_code()
+        );
+        assert!(outcome.detail().as_str().contains("--no-probe"));
     }
 
     /// A closure this build cannot read ends the attachment as a failure: the session ended, and
