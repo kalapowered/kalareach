@@ -5511,6 +5511,35 @@ the process group the child leads, which holds every helper the clone spawned; o
 job object the child was created inside, which holds them for the same reason and which a process
 cannot leave.
 
+A host without a usable Git starts, and the project service opens on it. Git is looked for the
+first time something needs it, on the `PATH` the daemon was started with, and a Git that is found is
+kept for the life of the daemon. The first use can be a request, work the daemon resumes when it
+starts (a workflow run, or an interrupted apply that left staged paths) or, on Linux, the proof made
+at the start that this host confines Git for a paired device. That proof finds none and is refused
+with its reason in the daemon's own log, and the start goes on. Git counts as missing when none is on
+that `PATH`, when it cannot answer `--exec-path` or `--version`, and when it is older than 2.32. The
+`/usr/bin/git` of a Mac without the Command Line Tools is the second case: it asks to install them
+and exits with status 1 whatever it is asked.
+
+A request that runs Git is then refused with `HOST_NOT_CONFIGURED` before it makes a repository, an
+operation row, a workspace or a directory. Those are `project.init`, `project.clone`,
+`project.adopt`, `workspace.create`, `workspace.remove`, and the change-set methods that read or
+write a working tree: `changeset.capture`, `diff.apply`, `diff.revert` and `diff.read` of a working
+copy. The message ends with the step that installs Git: `xcode-select --install` on macOS and the
+system package manager on Linux. Windows runs no Git at all, so there it gives the platform's own
+refusal before it looks for Git, whether or not Git is installed, and names no install. The project
+methods and `changeset.capture` keep the refusal as the answer to the request's action identifier,
+so a request repeated after Git is installed carries a new identifier. `diff.apply` and
+`diff.revert` refuse before they claim their action and keep nothing. `project.list`,
+`project.read`, `workspace.list` and `workspace.read` read the project journal alone and answer as
+on any host.
+
+A search that finds no usable Git is not kept, so a Git installed while the daemon runs is found by
+the next request that reaches the project service, without a restart. On Linux a paired device
+stays refused the five repository operations until the next `kr doctor` repeats the proof, and the
+owner's requests do not wait for it. On a Mac without the Command Line Tools, each search starts
+the stub that asks to install them.
+
 ### The boundary around a Git invocation
 
 Every Git this host runs is enclosed by the operating system for the length of that one invocation,
