@@ -4888,6 +4888,7 @@ dependencies = [
 name = "kr-ipc"
 version = "0.1.0"
 dependencies = [
+ "exacl",
  "interprocess",
  "kr-cbor",
  "kr-crypto",

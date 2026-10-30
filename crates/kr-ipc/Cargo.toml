@@ -23,6 +23,9 @@ uuid.workspace = true
 libc.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# Reads a directory's access-control list, which the owner check on this platform must see: the mode
+# bits do not describe it.
+exacl.workspace = true
 libproc.workspace = true
 sysctl.workspace = true
 

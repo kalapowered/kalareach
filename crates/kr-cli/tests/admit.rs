@@ -680,3 +680,48 @@ fn a_state_directory_that_is_open_to_others_is_refused_with_the_command_that_men
     let started = home.run_as_a_person(&program, &["host", "startup", "--set", "standalone"]);
     assert!(started.status.success(), "{}", said(&started));
 }
+
+/// KR-REQ-24.26: a host's state directory whose access list lets another account in is refused, and
+/// the refusal names no command, since the mode a command would set leaves the list as it was: the
+/// directory is refused again once the person has changed its mode.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_state_directory_whose_access_list_lets_another_account_in_is_refused_without_a_command() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let home = Home::new();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let by_hand = home.prefix("unpacked", &one);
+    let installed = home.run_as_a_person(&kr(&by_hand), &["host", "install"]);
+    assert!(installed.status.success(), "{}", said(&installed));
+    let program = home.store.stable(Program::Kr);
+
+    let paths = home.run_as_a_person(&program, &["--json", "host", "paths"]);
+    let shown: Value = serde_json::from_slice(&paths.stdout).expect("the roots as JSON");
+    let state = PathBuf::from(shown["state_root"].as_str().expect("the state root"));
+    std::fs::create_dir_all(&state).expect("the state root");
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).expect("opened");
+    let listed = Command::new("/bin/chmod")
+        .arg("+a")
+        .arg("user:root allow write")
+        .arg(&state)
+        .status()
+        .expect("chmod runs");
+    assert!(listed.success(), "an access entry is added");
+
+    let refused = home.run_as_a_person(&program, &["host", "startup", "--set", "standalone"]);
+    assert!(!refused.status.success(), "{}", said(&refused));
+    assert!(
+        !said(&refused).contains("chmod"),
+        "no command is named for a directory a mode does not mend: {}",
+        said(&refused)
+    );
+
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).expect("closed");
+    let again = home.run_as_a_person(&program, &["host", "startup", "--set", "standalone"]);
+    assert!(
+        !again.status.success(),
+        "the entry still lets that account in: {}",
+        said(&again)
+    );
+}

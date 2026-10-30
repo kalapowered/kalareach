@@ -3792,6 +3792,89 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// Gives `directory` an access list of exactly `entries`.
+    #[cfg(target_os = "macos")]
+    fn give_list(directory: &Path, entries: &[exacl::AclEntry]) {
+        exacl::setfacl(&[directory], entries, None).expect("an access list");
+    }
+
+    /// Sets the permission bits of `directory`.
+    #[cfg(target_os = "macos")]
+    fn give_mode(directory: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    }
+
+    /// KR-REQ-24.26: a directory whose access list lets another account in is not owner-only,
+    /// whatever its mode says: one with mode 0700 is refused, and one that is open too is refused
+    /// with no command, since `chmod 700` leaves the list as it was and the check would pass it
+    /// while that account could still write.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_directory_whose_access_list_lets_another_account_in_is_refused_and_names_no_command() {
+        let root = temporary_root("access-list");
+        let another = exacl::AclEntry::allow_user("root", exacl::Perm::WRITE, None);
+
+        let closed = root.join("closed");
+        create_private_tree(&root, &closed).expect("creates");
+        give_list(&closed, std::slice::from_ref(&another));
+        let error = create_private_tree(&root, &closed).expect_err("refuses a list that lets in");
+        assert!(
+            matches!(error, IpcError::DirectoryAccessRefused { .. }),
+            "{error}"
+        );
+
+        let open = root.join("open");
+        create_private_tree(&root, &open).expect("creates");
+        give_mode(&open, 0o755);
+        give_list(&open, &[another]);
+        let error = create_private_tree(&root, &open).expect_err("refuses");
+        assert_eq!(error.mending_command(), None, "{error}");
+        assert!(!error.to_string().contains("chmod"), "{error}");
+
+        // What a person would have done anyway: the mode is mended and the list is still there.
+        give_mode(&open, 0o700);
+        assert!(
+            create_private_tree(&root, &open).is_err(),
+            "a mode does not remove an access entry"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// KR-REQ-24.26: a list that gives nobody else anything does not refuse a directory: the
+    /// denial the system puts on a home folder, and an entry for this user, leave an owner-only
+    /// directory owner-only, and a directory that is open as well keeps its command.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_access_list_that_gives_nobody_else_anything_refuses_nothing() {
+        let root = temporary_root("access-list-kept");
+        let own = passwd_entry().expect("this user's account").name;
+        let lists = [
+            vec![exacl::AclEntry::deny_group(
+                "everyone",
+                exacl::Perm::DELETE,
+                None,
+            )],
+            vec![exacl::AclEntry::allow_user(&own, exacl::Perm::READ, None)],
+        ];
+        for (index, entries) in lists.iter().enumerate() {
+            let directory = root.join(format!("kept-{index}"));
+            create_private_tree(&root, &directory).expect("creates");
+            give_list(&directory, entries);
+            create_private_tree(&root, &directory).expect("still owner-only");
+
+            give_mode(&directory, 0o755);
+            let error = create_private_tree(&root, &directory).expect_err("refuses a mode");
+            assert!(
+                matches!(error, IpcError::DirectoryNotOwnerOnly { .. }),
+                "{error}"
+            );
+            assert!(error.mending_command().is_some(), "{error}");
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn publication_is_atomic_and_owner_only() {
         let root = temporary_root("publish");
@@ -3942,6 +4025,9 @@ mod tests {
     fn a_missing_parent_of_a_root_is_made_owner_only_and_an_existing_one_is_left_alone() {
         use std::os::unix::fs::PermissionsExt as _;
 
+        // Under the mask a login starts with, so that a parent made without a mode of its own comes
+        // out 0755 here whoever runs the suite.
+        let _login = crate::testing::LoginUmask::hold();
         let base = std::env::temp_dir().join(format!("kr-parent-mode-{}", crate::new_uuid()));
         std::fs::create_dir(&base).expect("a directory above");
         std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).expect("opened");
@@ -4001,6 +4087,44 @@ mod tests {
             }
         }
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// KR-REQ-24.26: a root given with a final separator through a symbolic link is checked as the
+    /// link, not as the directory it points to: it is refused as a link and names no command, though
+    /// the directory behind it is one that `chmod 700` would mend, and that directory is left alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_given_with_a_final_separator_is_checked_as_the_link_it_names() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let base = temporary_root("final-separator");
+        let behind = base.join("behind");
+        std::fs::create_dir(&behind).expect("the directory behind the link");
+        std::fs::set_permissions(&behind, std::fs::Permissions::from_mode(0o755)).expect("opened");
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&behind, &link).expect("a link");
+
+        let named = PathBuf::from(format!("{}/", link.display()));
+        let error = create_private_tree(&named, &named).expect_err("a link is refused");
+        assert!(
+            matches!(
+                error,
+                IpcError::Io {
+                    operation: "open",
+                    ..
+                }
+            ),
+            "refused as a link: {error}"
+        );
+        assert_eq!(error.mending_command(), None, "{error}");
+        assert!(!error.to_string().contains("chmod"), "{error}");
+        let mode = std::fs::metadata(&behind)
+            .expect("kept")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755, "the directory behind the link is not touched");
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
