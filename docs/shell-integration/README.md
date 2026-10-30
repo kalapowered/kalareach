@@ -885,12 +885,15 @@ method, and that is exactly what it cannot do:
 - **The queues are the editor's own.** The reader's key queue is read directly, under the version
   range this package was qualified against. Asking the console whether a key is available instead
   would take the lock the editor's own read is holding, and the reader would wait for itself.
-- **The proof here is the editor's own key queue.** The editor decodes the terminal's bytes
-  inside its own key read, where nothing of the module's runs. What the module reports is the
-  editor's own key queue and the operations it is inside; a sequence the editor has begun to
-  decode and not finished is in neither, so the queue proof here is as good as that queue and no
-  better. A fence asked while the reader is blocked on a key is answered at the next point where
-  the module reads its mailbox (the first point above), against the state it has then.
+- **The proof here is the editor's own key queue and the runtime's reader.** The editor decodes
+  the terminal's bytes inside its own key read, where nothing of the module's runs. What the module
+  reports is the editor's own key queue, the operations it is inside, and, outside Windows, what
+  the .NET runtime has read from the terminal and not handed over: the bytes of its buffer, the
+  keys it has made, the bytes its decoder holds for a character not yet whole, and whether the
+  terminal's queue holds anything. A sequence the editor has begun to decode and not finished is in
+  none of these, so the queue proof here is as good as the editor's queue and the runtime's reader
+  and no better. A fence asked while the reader is blocked on a key is answered at the next point
+  where the module reads its mailbox (the first point above), against the state it has then.
 - **The buffer belongs to the read that is in progress.** Between one line being accepted and the
   next read starting, the editor still holds the line that has gone; the module reports the buffer
   it is about to have, which is empty, and counts no change the person did not make.

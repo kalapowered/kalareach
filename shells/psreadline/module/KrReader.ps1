@@ -108,11 +108,13 @@ function Get-KrQueuedKeys {
 #
 # A key the editor has not queued is not necessarily one nobody has read. The runtime reads the
 # terminal in chunks: what a chunk holds beyond the key being returned stays in the runtime's own
-# buffer, and what has not been read at all is still in the terminal's queue. Both are input the
-# editor has not met yet, and neither is in the editor's queue. Asking the console whether a key is
-# available would take the lock the editor's reading thread holds while it waits for one, so the
-# runtime's buffer is read where it lies, and the terminal's queue is asked through the runtime's
-# own lock-free poll of the input it was started with.
+# buffer, the first bytes of a character the chunk ends inside stay in its decoder, and what has
+# not been read at all is still in the terminal's queue. All of it is input the editor has not met
+# yet, and none of it is in the editor's queue. Asking the console whether a key is available
+# would take the lock the editor's reading thread holds while it waits for one, so the runtime's
+# buffer and decoder are read where they lie, and the terminal's queue is asked through the
+# runtime's own poll of the input it was started with, which takes the runtime's console lock for
+# the length of the poll and not the lock a read of the editor's holds.
 $script:RuntimeReader = $null
 
 function Get-KrRuntimeReader {
@@ -134,6 +136,10 @@ function Get-KrRuntimeReader {
             End       = $reader.GetField('_endIndex', $instance)
             Available = $reader.GetField('_availableKeys', $instance)
             Pending   = $reader.GetField('_tmpKeys', $instance)
+            Decoder   = $reader.GetField('_decoder', $instance)
+            # The decoder's count of bytes it holds for a character not yet whole, on the type the
+            # decoder of a UTF-8 terminal has.
+            Leftover  = [System.Text.Encoding]::UTF8.GetDecoder().GetType().GetField('_leftoverByteCount', $instance)
         }
         foreach ($member in $members.Values) { if ($null -eq $member) { return $null } }
         $script:RuntimeReader = $members
@@ -148,9 +154,9 @@ function Get-KrRuntimeReader {
 #
 # The terminal's queue counts as one when it holds anything, since the runtime offers no more than
 # whether there is input. The runtime's buffer is counted by what it holds, and so are the keys it
-# has made of it and not handed over. They are read in the order the input travels, the queue first
-# and the editor's own after, so that input moving from one to the next while they are read is
-# counted at least once and never missed.
+# has made of it and not handed over and the bytes its decoder holds for a character not yet whole.
+# The module reads where the editor's reading thread is idle, between operations, so nothing moves
+# from one of these to the next while they are read.
 #
 # A Windows console is read through its own records, which this does not see: there the editor's
 # queue is the only count.
@@ -163,14 +169,19 @@ function Read-KrRuntimeUnread {
         if ([bool]$members.Ready.Invoke($null, @())) { $unread = [uint64]1 }
         # The runtime makes its reader on the first key it is asked for. Before that there is
         # nothing it has read.
-        $held = $members.Held.GetValue($null)
-        if ($null -eq $held) { return $unread }
-        $inner = $members.Inner.GetValue($held)
+        $reading = $members.Held.GetValue($null)
+        if ($null -eq $reading) { return $unread }
+        $inner = $members.Inner.GetValue($reading)
         if ($null -eq $inner) { return $null }
         $buffered = [int]$members.End.GetValue($inner) - [int]$members.Start.GetValue($inner)
         if ($buffered -gt 0) { $unread += [uint64]$buffered }
         $unread += [uint64]([System.Collections.ICollection]$members.Available.GetValue($inner)).Count
         $unread += [uint64]([System.Collections.ICollection]$members.Pending.GetValue($inner)).Count
+        $decoder = $members.Decoder.GetValue($inner)
+        if ($null -ne $decoder) {
+            $held = [int]$members.Leftover.GetValue($decoder)
+            if ($held -gt 0) { $unread += [uint64]$held }
+        }
         $unread
     } catch {
         $null
