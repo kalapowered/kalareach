@@ -158,11 +158,13 @@ stops, so a limit that a part has is written in that part's own document.
   [descriptions](describe/README.md).
 - **Sharing and control.** Grants scoped to environments and sessions, and a narrower grant that a
   holder can delegate. `kr share invite` offers one session to a paired device for a bounded period
-  of time. The owner is shown the role and rights that will be offered before the invitation exists.
-  A phone accepts the invitation, in the Offers view of the companion application. There is no
-  accept command in `kr share`, and the desktop companion does not have an Offers view.
-  `kr share transfer` hands control of a session to another device. A revocation completes through a
-  barrier per worker. To take control of typing, a controller must explicitly take an input lease:
+  of time. The owner is shown the role and rights that will be offered before the invitation exists,
+  except under `--yes --json` for an invitation that carries no consequence and no live screen,
+  which prints a document naming the role and actions after it creates the invitation. A phone
+  accepts the invitation, in the Offers view of the companion application. There is no accept
+  command in `kr share`, and the desktop companion does not have an Offers view. `kr share transfer`
+  hands control of a session to another device. A revocation completes through a barrier per worker.
+  To take control of typing, a controller must explicitly take an input lease:
   [grants](host/README.md#grants-sharing-and-revocation), [pairing](pairing/README.md),
   [who may type](host/README.md#who-may-type) and [cli](cli/README.md).
 - **Automation.** Versioned workflows that react to verified events, under causal budgets and a
