@@ -1066,37 +1066,37 @@ async fn the_push_desk_talks_to_the_gateway_client_it_was_given() {
         calls.contains(&"issue"),
         "{calls:?}: the credential was asked of the fork's client"
     );
-    assert_eq!(
-        registered
-            .lock()
-            .expect("what was handed")
-            .credentials
-            .len(),
-        1,
-        "the host was handed what the fork's client returned"
-    );
+    {
+        let handed = registered.lock().expect("what was handed");
+        assert_eq!(handed.credentials.len(), 1, "the host was handed one");
+        assert_eq!(
+            handed.credentials[0].1["sender_record_id"],
+            vectors()["records"]["sender_record"]["binding"]["sender_record_id"],
+            "and it is the credential the fork's client returned"
+        );
+    }
 
-    // The client the set holds for push is made by the same factory, for the same origin.
+    // The client the application holds for push is the desk's: the factory makes it, for the same
+    // gateway, and availability reports the service as configured.
+    let state = AppState::new();
+    state.push_opened(Arc::clone(&opened.desk));
     let before = asked.lock().expect("the record").len();
-    let client = opened.desk.client().expect("the desk holds a client");
-    let asked = asked.lock().expect("the record").clone();
-    assert_eq!(
-        asked.len(),
-        before + 1,
-        "the factory made the desk's client"
+    let held = companion_tauri::services::Held::of(
+        Some(&state),
+        None,
+        Arc::new(kr_client::services::NullService),
     );
+    let asked = asked.lock().expect("the record").clone();
+    assert_eq!(asked.len(), before + 1, "the factory made the client held");
     assert!(
         asked.iter().all(|origin| *origin == asked[0]),
         "{asked:?}: one gateway"
     );
-    let clients = companion_tauri::services::Held {
-        push: Some(client),
-        ..Default::default()
-    }
-    .into_clients();
     assert!(
-        clients.availability_of(ManagedService::Push).configured,
-        "the set reports the push service as configured"
+        held.into_clients()
+            .availability_of(ManagedService::Push)
+            .configured,
+        "the application's set reports the push service as configured"
     );
 }
 
