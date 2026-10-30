@@ -170,8 +170,9 @@ impl HeldDeviceAction {
     }
 }
 
-/// KR-ACC-022: a paired device's intent that the worker accepted durably and has not dispatched is
-/// taken back by a revocation committed while it is held, and never executes.
+/// KR-ACC-022 and KR-REQ-27.05, revoked devices: a paired device's intent that the worker accepted
+/// durably and has not dispatched is taken back by a revocation committed while it is held, and
+/// never executes.
 ///
 /// The sequence is section 9's. The device's action is accepted and held: its receipt says
 /// `accepted`, with no dispatch marker, and nothing is written to the upstream. The revocation is
