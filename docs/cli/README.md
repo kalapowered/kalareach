@@ -2316,9 +2316,11 @@ accepted or a device holds stays where it is, the status keeps listing it, and r
 again asks the gateway again. When the gateway does not answer, refuses the credential or refuses
 the request, the command fails with `STORAGE_UNAVAILABLE` and the notification stays listed, so run
 the command again later. When the gateway takes no more deletions from this host for now, it fails
-with `RATE_LIMITED`. A notification whose device was unpaired or registered again since is not
-listed as deletable, and the command refuses it with `PERMISSION_DENIED` without asking the gateway.
-`--json` prints the same document as for a backup generation.
+with `RATE_LIMITED`. The command reads the list itself first, and a copy the list shows as not
+deletable, such as a notification whose device was unpaired, is refused there, without asking the
+host: the command exits with 2 and `INVALID_ARGUMENT`. The host's own `PERMISSION_DENIED` reaches
+you only when the flag changes between the command's read and the host's. `--json` prints the same
+document as for a backup generation.
 
 ## `kr destination`
 
