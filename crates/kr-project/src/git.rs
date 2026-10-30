@@ -755,6 +755,14 @@ impl Installation {
         if let Some(found) = self.found.get() {
             return Ok(found);
         }
+        // Said after the stored program is read and before anything is searched for: a profile
+        // built around a program it was handed has one to give wherever it is, and a profile that
+        // has to look runs no Git on a platform that runs none, installed or not.
+        if let Some(why) = crate::boundary::NO_GIT {
+            return Err(ProjectError::GitFailed {
+                detail: format!("Git is not run on this platform: {why}").into(),
+            });
+        }
         let _one_look_at_a_time = self
             .looking
             .lock()
@@ -1532,13 +1540,9 @@ impl RestrictedProfile {
     ///
     /// Returns [`ProjectError::GitUnavailable`] when there is no usable Git, with the step that
     /// installs it, and the platform's own [`ProjectError::GitFailed`] before any search where the
-    /// platform runs no Git at all. The search is made again at the next call.
+    /// platform runs no Git at all and this profile holds no program it was handed. The search is
+    /// made again at the next call.
     pub fn git(&self) -> Result<&GitProgram> {
-        if let Some(why) = crate::boundary::NO_GIT {
-            return Err(ProjectError::GitFailed {
-                detail: format!("Git is not run on this platform: {why}").into(),
-            });
-        }
         self.git.program()
     }
 
