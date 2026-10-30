@@ -621,7 +621,7 @@ mod tests {
         use crate::push::NextAction;
 
         let mut journal = journal_with_work();
-        let ids: Vec<NotificationId> = (5..=11u8)
+        let ids: Vec<NotificationId> = (5..=12u8)
             .map(|byte| admit_to_the_phone(&mut journal, byte))
             .collect();
         let [
@@ -632,9 +632,10 @@ mod tests {
             refused,
             accepted,
             never_sent,
+            retried_after_dispatch,
         ] = ids[..]
         else {
-            panic!("seven notifications");
+            panic!("eight notifications");
         };
         // Only these three are in a mailbox. The others are listed by what the host does next
         // and nothing else, since a notification the gateway holds has no mailbox detail to show
@@ -688,6 +689,16 @@ mod tests {
             false,
             NextAction::None,
         );
+        // Dispatched once and retrying with another send to come: the gateway may hold it, but
+        // this host will present it again, so it is neither offered nor listed without a detail.
+        claim(&mut journal, 12 + 20, 1_500);
+        settle(
+            &mut journal,
+            retried_after_dispatch,
+            DeliveryState::Retrying,
+            true,
+            NextAction::Send,
+        );
         let listed = |journal: &mut DeliveryJournal, id: NotificationId| {
             let outbox = DeliveryOutbox::over(journal, 2_000);
             outbox
@@ -720,6 +731,10 @@ mod tests {
         assert!(
             listed(&mut journal, never_sent).is_none(),
             "nothing of it left this host"
+        );
+        assert!(
+            listed(&mut journal, retried_after_dispatch).is_none(),
+            "its next send is this host's, and no detail of it is in a mailbox"
         );
 
         journal
@@ -769,6 +784,67 @@ mod tests {
             !deletable(&mut journal),
             "it was sent under the registration the device replaced"
         );
+    }
+
+    /// The row a notification is listed as, when it is.
+    fn listing_of(journal: &mut DeliveryJournal, id: NotificationId) -> Option<Exported> {
+        DeliveryOutbox::over(journal, 2_000)
+            .exported()
+            .expect("a list")
+            .into_iter()
+            .find(|copy| copy.reference.starts_with(&id.to_string()))
+    }
+
+    /// A status read the gateway answers for a notification it is retrying is claimed like any
+    /// attempt, and privacy mode can take it back before it is presented. What was dispatched
+    /// earlier is still out there, so the row records an outcome nobody knows and stays listed:
+    /// it is not a cancellation of something that never left.
+    #[test]
+    fn a_status_read_privacy_mode_takes_back_leaves_what_was_dispatched_listed() {
+        use crate::push::NextAction;
+
+        let mut journal = journal_with_work();
+        let id = admit_to_the_phone(&mut journal, 5);
+        claim(&mut journal, 5 + 20, 1_500);
+        settle(
+            &mut journal,
+            id,
+            DeliveryState::Retrying,
+            true,
+            NextAction::Receipt,
+        );
+        // The read is claimed, and privacy mode begins before it is presented.
+        claim(&mut journal, 5 + 20, 9_500);
+        assert!(
+            journal
+                .record_attempt(&Transition {
+                    notification_id: id,
+                    attempt: 2,
+                    state: DeliveryState::Cancelled,
+                    started_at_ms: TimestampMs::new(9_500),
+                    settled_at_ms: Some(TimestampMs::new(9_600)),
+                    next_attempt_at_ms: None,
+                    next: NextAction::None,
+                    detail: Some("privacy mode took it back before it was presented".to_owned()),
+                    suppression: None,
+                    left_this_host: false,
+                    reported_by_destination: false,
+                })
+                .expect("a transition"),
+            "the claimed read is the one settled"
+        );
+
+        assert_eq!(
+            journal
+                .delivery(id)
+                .expect("a read")
+                .expect("the record")
+                .state,
+            DeliveryState::OutcomeUnknown,
+            "the content left on the first attempt"
+        );
+        let copy = listing_of(&mut journal, id).expect("it is still listed");
+        assert!(copy.deletable, "the gateway may still hold it");
     }
 
     #[test]
