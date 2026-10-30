@@ -2059,9 +2059,11 @@ impl crate::service::Controller {
     /// the request is refused otherwise: it is made under the credential of the authorisation
     /// the digest holds and under no other. The answer is that the gateway holds nothing for the
     /// notification now, which is what the gateway means whether it removed a record, never had
-    /// one or had already swept it; it is taken as a deletion only under a bearer the gateway has
-    /// shown to be its authorisation's. It says nothing of a copy a provider accepted or a
-    /// device holds, and the list keeps showing the notification as one that may have left.
+    /// one or had already swept it, and it is taken as the deletion. It says nothing of a copy a
+    /// provider accepted or a device holds, and the list keeps showing the notification as one
+    /// that may have left. Registration does not bind a bearer to the installation it names, so a
+    /// device with `host.manage` that registers another installation's bearer under its own
+    /// metadata can make this report a deletion while the gateway keeps the record.
     ///
     /// Nothing is recorded here. A gateway that does not answer, or refuses the credential, leaves
     /// the copy listed as it was and the error says why; the person asks again.

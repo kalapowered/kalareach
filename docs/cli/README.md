@@ -2315,15 +2315,13 @@ the gateway holds no record of the notification now and exits with 0; a notifica
 accepted or a device holds stays where it is, the status keeps listing it, and running the command
 again asks the gateway again. When the gateway does not answer, refuses the credential or refuses
 the request, the command fails with `STORAGE_UNAVAILABLE` and the notification stays listed, so run
-the command again later. A deletion the gateway answers by saying it holds nothing fails the same
-way, with `STORAGE_UNAVAILABLE`, unless this host has seen the gateway remove a record under that
-credential since it started, because a credential that cannot see the record gets the same answer; a
-record the gateway removed already needs nothing more. When the gateway takes no more deletions from
-this host for now, it fails with `RATE_LIMITED`. The command reads the list itself first, and a copy
-the list shows as not deletable, such as a notification whose device was unpaired, is refused there,
-without asking the host: the command exits with 2 and `INVALID_ARGUMENT`. The host's own
-`PERMISSION_DENIED` reaches you only when the flag changes between the command's read and the
-host's. `--json` prints the same document as for a backup generation.
+the command again later. When the gateway takes no more deletions from this host for now, it fails
+with `RATE_LIMITED`. The command reads the list itself first, and a copy the list shows as not
+deletable, such as a notification whose device was unpaired, is refused there, without asking the
+host: the command exits with 2 and `INVALID_ARGUMENT`. The host's own `PERMISSION_DENIED` reaches
+you when the flag changes between the command's read and the host's, and when the host holds no
+credential or no transport to ask the gateway under, or the registration the command was admitted
+under is withdrawn. `--json` prints the same document as for a backup generation.
 
 ## `kr destination`
 
