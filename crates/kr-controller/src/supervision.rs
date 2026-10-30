@@ -40,8 +40,9 @@
 //!
 //! The profile decides the login context, not only the environment. A desktop-bound worker is
 //! started in the graphical login session, and a headless one is started outside it: on macOS in
-//! the background domain rather than the graphical one, and on Windows on a window station and
-//! desktop of its own rather than the interactive desktop. The fallback supervisor has no domains to
+//! the background domain rather than the graphical one. On Windows a headless worker is in the same
+//! logon session, on a desktop of its own, made on that logon's window station for processes that
+//! show nothing, rather than on the interactive desktop. The fallback supervisor has no domains to
 //! choose between, so a worker it starts is in whatever login context this daemon is in, and a
 //! headless worker there has the environment stripped rather than a login context of its own.
 //!
@@ -452,7 +453,8 @@ pub fn detect(
     fallback(environment, daemon)
 }
 
-/// What a host with no service manager of its own uses: a detached process.
+/// What a daemon that found no service manager of its own to use falls back to: a detached
+/// process.
 #[cfg(unix)]
 fn fallback(
     _environment: &kr_ipc::paths::EnvironmentPaths,

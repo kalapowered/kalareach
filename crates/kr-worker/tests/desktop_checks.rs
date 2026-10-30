@@ -380,7 +380,7 @@ fn left(path: &std::path::Path) -> Left {
 
 /// What is around one nominated file: the directory as the person left it, which moves its
 /// modification time when a name is added, removed or renamed, and every name in it with its bytes,
-/// its modification time and its permissions.
+/// its modification time and its mode bits (on Windows, its read-only attribute).
 fn directory_state(directory: &std::path::Path) -> (Left, Vec<(String, Vec<u8>, Left)>) {
     let mut names: Vec<_> = std::fs::read_dir(directory)
         .expect("lists the directory")

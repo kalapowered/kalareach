@@ -16,9 +16,8 @@
 //!   the answer for this host rather than assuming one.
 //! * **The desktop a worker is started in.** On macOS and Windows the platform places a per-user
 //!   job in the login session that started it, and on Windows the starter then puts a headless
-//!   worker on a window station and desktop of its own, so that it inherits no access to the
-//!   interactive one. Linux does not place a job in a login session: a user service manager started at
-//!   boot has no display, so the desktop variables a graphical session publishes are collected
+//!   worker on a desktop of its own, so that it inherits no access to the interactive one. Linux
+//!   does not place a job in a login session: a user service manager started at boot has no display, so the desktop variables a graphical session publishes are collected
 //!   here and passed to the worker's own transient unit. That is the desktop-session agent path,
 //!   and [`agent`] owns it.
 //!

@@ -294,19 +294,19 @@ fn context_refusal(capability: &str, desktop: &DesktopContext) -> Option<Answer>
     if !desktop.is_desktop() || !desktop.graphic_access {
         // What a headless context means differs by platform, and the record says which one this
         // is. Where the platform puts every one of a user's processes in that user's own
-        // interactive session, a headless worker is started on a window station and desktop of its
-        // own and inherits no access to the interactive one. That is not a boundary against a
-        // process of the same account, which can still open the interactive desktop by name, so
-        // it would be untrue to say the session cannot reach one.
+        // interactive session, a headless worker is started on a desktop of its own and inherits
+        // no access to the interactive one. That is not a boundary against a process of the same
+        // account, which can still open the interactive desktop by name, so it would be untrue to
+        // say the session cannot reach one.
         #[cfg(windows)]
         return Some(Answer::refused(
             CapabilityState::NotTested,
             CapabilityEvidenceSource::PlatformQuery,
-            "this session is in the headless user profile: its worker is started on a window \
-             station and desktop of its own and inherits no access to the interactive desktop. \
-             This platform runs every one of a user's processes in that user's own interactive \
-             session, and a process of the same account can open the interactive desktop by name, \
-             so nothing here establishes that the desktop cannot be reached",
+            "this session is in the headless user profile: its worker is started on a desktop of \
+             its own and inherits no access to the interactive desktop. This platform runs every \
+             one of a user's processes in that user's own interactive session, and a process of \
+             the same account can open the interactive desktop by name, so nothing here \
+             establishes that the desktop cannot be reached",
         ));
         #[cfg(not(windows))]
         return Some(Answer::refused(

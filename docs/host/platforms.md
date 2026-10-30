@@ -74,9 +74,10 @@ what it is.
 Windows has no fallback and needs none: every worker and the plugin runtime are created by the
 starter of the environment's scheduled task, in the logon session of the user the task logs on as,
 so none is a child of the control daemon or in a job the daemon runs in. A headless session there
-is started on a window station and desktop of its own and inherits no access to the interactive
-one. That is not a boundary against a process of the same account, which can still open the
-interactive desktop by name; its capability records say so.
+is started on a desktop of its own, on the window station for that logon that the headless
+sessions share, and inherits no access to the interactive desktop. That is not a boundary against a
+process of the same account, which can still open the interactive desktop by name; its capability
+records say so.
 
 ### The control daemon under the service start
 
@@ -318,8 +319,8 @@ desktop (the headless profile, an SSH-only host, a host with no graphical login)
 capability answered, and says that rather than reporting a permission problem. Where the platform
 puts every one of a user's processes in that user's own interactive session, as Windows does, the
 record says that nothing establishes that such a session cannot reach a desktop either: on Windows
-a headless worker is started on a window station and desktop of its own and inherits no access to
-the interactive one, which does not stop a process of the same account from opening it by name.
+a headless worker is started on a desktop of its own and inherits no access to the interactive one,
+which does not stop a process of the same account from opening it by name.
 
 There is no general desktop-control interface. Desktop automation here means your own tools running
 in the selected context under the permissions the operating system actually granted them; the

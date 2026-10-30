@@ -95,11 +95,11 @@ pub fn current() -> Reading {
 /// Assembles the execution context of a worker of this profile.
 ///
 /// A `desktop_bound` worker takes the login session it was started in. A `headless_user` worker
-/// takes none of it: it is bound to no desktop, it is given none of a desktop's handles, and it
+/// takes none of it: it is bound to no desktop, it is given none of a desktop's variables, and it
 /// must keep working after a graphical login ends. Where the platform can place such a worker
-/// outside the graphical login it is placed there; where a worker is a child of the control
-/// daemon instead, as on Windows, it runs in that daemon's own login session, so the absence of a
-/// desktop here is the absence of a binding rather than a platform boundary.
+/// outside the graphical login it is placed there. On Windows the task's starter creates it in the
+/// logon session of the user, on a desktop of its own, so it inherits no access to the interactive
+/// one; that is not a boundary against a process of the same account.
 #[must_use]
 pub fn context(profile: WorkerProfile, boot: BootIdentity) -> DesktopContext {
     let login = if profile == WorkerProfile::DesktopBound {

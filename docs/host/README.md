@@ -1248,10 +1248,12 @@ one's into the background domain, because a headless worker inside the graphical
 that login's access however little of its environment it was given. On Windows the starter of
 the environment's scheduled task creates the worker in the logon session of the user the task logs
 on as. A desktop-bound worker is on that session's interactive window station and desktop. A
-headless worker is started on a window station and desktop of its own, a desktop named for the
-worker on the window station the system forms for that logon, with the access list of the starter's
-own station and desktop, so neither it nor a program it starts inherits access to the interactive
-desktop. That is not a boundary against a process of the same account, which can still open the
+headless worker is started on a desktop of its own, named for the worker, on the window station
+the system forms for that logon, so neither it nor a program it starts inherits access to the
+interactive desktop. The station is shared by the headless workers of a logon, and with it their
+clipboard and atoms; it and the desktop have the access list and integrity label of the starter's
+own station and desktop, and a station that has others is refused, so that no worker is started on
+it. That is not a boundary against a process of the same account, which can still open the
 interactive desktop by name. A worker an earlier release started stays where it was started until
 it ends.
 
@@ -1604,15 +1606,16 @@ remains available. It is an explicit choice and never an automatic substitution 
 request that could not be served. A request that names no shell gets the one the host is configured
 to use (`SHELL`), and otherwise the platform's own: `/bin/zsh` on macOS, `/bin/bash` on Linux, and on
 Windows PowerShell 7, then Windows PowerShell 5.1, then the command interpreter. PowerShell 7 is the
-one in its program-files directory (`PowerShell\7`, or a sibling directory whose name starts with a
-7) or the one the Store's alias names in the user's `WindowsApps` directory; a `pwsh.exe` elsewhere
-on the search path is not taken, because it may be an older PowerShell. The Store's alias is taken by
-its place and not by what it starts, as the directory is the user's own. Each program is found by
-the worker's own environment (`ProgramFiles`, `LOCALAPPDATA`, and `SystemRoot` or `windir` for
-Windows PowerShell 5.1 and `cmd.exe`), and every one is named by an absolute path. The command
-interpreter is the one `ComSpec` names when that is an absolute path to a file, and otherwise
-`cmd.exe` in the system directory (`C:\Windows` when neither variable gives an absolute one),
-named by its path without a check that it is there.
+one in `PowerShell\7` under a program-files directory, or, found on the search path, one in a
+sibling directory there whose name starts with a 7 (a preview's) or the one the Store's alias names
+in the user's `WindowsApps` directory; a `pwsh.exe` elsewhere on the search path is not taken,
+because it may be an older PowerShell. The Store's alias is taken by its place and not by what it
+starts, as the directory is the user's own. Each program is found by the worker's own environment
+(`ProgramFiles`, `ProgramW6432` and `ProgramFiles(x86)` for the program-files directories,
+`LOCALAPPDATA`, and `SystemRoot` or `windir` for Windows PowerShell 5.1 and `cmd.exe`), and every
+one is named by an absolute path. The command interpreter is the one `ComSpec` names when that is an
+absolute path to a file, and otherwise `System32\cmd.exe` in the system directory (`C:\Windows` when
+neither variable gives an absolute one), named by its path without a check that it is there.
 
 [docs/shell-integration/host.md](../shell-integration/host.md) describes the endpoint, the handshake,
 the phases, the launch transaction and the guarded startup entries `kr shell` writes.
