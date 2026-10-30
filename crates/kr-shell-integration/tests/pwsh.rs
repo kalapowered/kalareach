@@ -445,6 +445,65 @@ fn the_package_refuses_an_editor_whose_key_queue_it_cannot_read() {
     }
 }
 
+/// KR-REQ-08.49: the package qualifies a runtime only when the reader it counts unread input in
+/// can be read.
+///
+/// A fence counts what the runtime has read from the terminal and not handed to the editor. A
+/// runtime that keeps that reader where the module cannot find it would be read as holding nothing,
+/// and the fence would say the terminal's input was drained because the module saw none. The module
+/// refuses such a runtime, as it refuses an editor whose queue it cannot read. The stand-in is the
+/// module's own lookup of the reader finding none, and the control is the runtime the package was
+/// qualified against.
+#[test]
+#[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_package_refuses_a_runtime_whose_reader_of_the_terminal_it_cannot_read() {
+    let package = shellpkg::Package::built(PWSH);
+    let directory = package.directory();
+    let module = directory
+        .join("modules/KalaReach.ShellBridge/KalaReach.ShellBridge.psd1")
+        .display()
+        .to_string();
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'; Import-Module '{module}'; \
+         $module = Get-Module KalaReach.ShellBridge; \
+         $real = & $module {{ (Test-KrQualifiedEditor).Reason }}; \
+         Write-Output \"kr-runtime[real]=[$real]\"; \
+         $none = [scriptblock]::Create('$null'); \
+         $absent = & $module {{ param($none) \
+             Set-Item function:script:Get-KrRuntimeReader -Value $none; \
+             (Test-KrQualifiedEditor).Reason }} $none; \
+         Write-Output \"kr-runtime[absent]=[$absent]\""
+    );
+    let asked = package
+        .command()
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .env_remove("KR_SHELL_BRIDGE")
+        .env_remove("KR_SHELL_BRIDGE_SECRET")
+        .env_remove("KR_SESSION")
+        .output()
+        .expect("the package's host runs");
+    let said = String::from_utf8_lossy(&asked.stdout).into_owned();
+    let told = String::from_utf8_lossy(&asked.stderr);
+    let reason = |name: &str| -> String {
+        said.lines()
+            .find_map(|line| line.strip_prefix(&format!("kr-runtime[{name}]=[")))
+            .unwrap_or_else(|| panic!("the module said nothing about {name}:\n{said}\n{told}"))
+            .trim_end_matches(']')
+            .to_owned()
+    };
+
+    assert_eq!(
+        reason("real"),
+        "",
+        "the runtime the package was qualified against is accepted"
+    );
+    assert_eq!(
+        reason("absent"),
+        "runtime_reader_unreadable",
+        "a runtime whose reader of the terminal cannot be found is refused by name"
+    );
+}
+
 /// KR-REQ-07.85: what the module takes for the editor's own read-line function is decided against
 /// the editor's own file, never against anything a profile that ran first could have changed.
 ///
