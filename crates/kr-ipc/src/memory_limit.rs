@@ -11,7 +11,10 @@
 //!
 //! The message is the only record of a refusal, and Windows does not promise to deliver it for a
 //! limit of this kind. A refusal that was not recorded reads as an ordinary end of the process, so
-//! an absent message is not proof that no commit was refused.
+//! an absent message is not proof that no commit was refused. On the build this was tried on
+//! (Windows Server 2025, build 26100) the system posts it once for a process: a process refused
+//! several commits, whatever it did between them, has only the first recorded, and every one of
+//! them was refused.
 //!
 //! The limit is on committed memory: the private memory the process asked the system to back,
 //! touched or not. A file mapped for reading is not committed, so the limit does not count the
@@ -239,7 +242,9 @@ impl MemoryLimit {
     ///
     /// It reads what the job has posted, without waiting. The system posts the message inside the
     /// refused call, before that call returns, so a process that has ended has posted everything it
-    /// will. The message is not promised, though: false means none was seen.
+    /// will. The message is not promised, though: false means none was seen. A message posted after
+    /// one that was taken is taken as well; whether the system posts one for a second refusal of
+    /// the same process is the system's.
     #[must_use]
     pub fn take_refusal(&self) -> bool {
         let raw_port: HANDLE = self.port.as_raw_handle().cast();
@@ -527,10 +532,10 @@ mod tests {
         assert!(limit.take_refusal());
     }
 
-    /// The limit reports a refusal each time the system posts one, and keeps no memory of an earlier
-    /// report: a message posted after one that was taken is taken as well. The messages are posted
-    /// to the limit's own port as the system posts them, so this holds on every build of the
-    /// system, whatever it decides to post.
+    /// The limit reports a refusal each time the system posts one, and keeps no memory of an
+    /// earlier report: a message posted after one that was taken is taken as well. The messages
+    /// are posted to the limit's own port as the system posts them, so this holds on every build
+    /// of the system, whatever it decides to post.
     #[test]
     fn a_refusal_posted_after_one_that_was_taken_is_taken_as_well() {
         use windows_sys::Win32::Foundation::HANDLE;
@@ -568,15 +573,14 @@ mod tests {
         );
     }
 
-    /// A process that is refused a commit again, after it gave memory back, is recorded as refused
-    /// again. This is another refused allocation by the same process under the same limit, and not
-    /// another reading of the first: a limit that said so only once for a process would leave every
-    /// refusal after the first reading as an ordinary end. The process asks four times, and the
-    /// limit is asked after each: the first is recorded and said once. The second, with nothing
-    /// done between, and the third, after a commit that succeeded, are asked and not required
-    /// either way. The fourth, after the process gave that commit back, is required.
+    /// The system refuses every commit a process makes past the limit, and records the first. The
+    /// process asks four times: with nothing done between the first and the second, with a small
+    /// commit kept for the third, and with that commit given back for the fourth. The system
+    /// refuses each, and the limit says so after the first and once. What it holds after the
+    /// others is the system's to post and is printed, not required: on the build this was tried on
+    /// (Windows Server 2025, build 26100) it holds nothing for them.
     #[test]
-    fn a_refusal_after_the_process_gave_memory_back_is_recorded_again() {
+    fn a_process_the_system_refuses_four_commits_is_refused_each_time_and_recorded_for_the_first() {
         use std::io::Write as _;
 
         let mut command = Command::new(std::env::current_exe().expect("this test binary"));
@@ -613,11 +617,6 @@ mod tests {
         let status = exit_of(&mut child, "the child that asked four times");
         assert_eq!(status.code(), Some(0), "the child ends when it is done");
         println!("recorded after each of the four requests: {recorded:?}");
-        assert!(
-            recorded[3],
-            "the refusal after the process gave memory back is recorded; recorded after each \
-             request: {recorded:?}"
-        );
     }
 
     /// The variable that makes the daemon half below hold a process and end.

@@ -1062,8 +1062,9 @@ impl Driver {
                     // pauses, as it does when the daemon's own reading finds the process over.
                     // Asked of every answer to the load or the job in hand, so that a refusal the
                     // runtime got over is forgotten and is not taken for the cause of a later end.
-                    // An answer for other work, which a late or a repeated answer is, belongs to
-                    // no refusal that the work in hand is owed.
+                    // The system may post nothing for a later refusal of the same process, which
+                    // then reads as an ordinary failure. An answer for other work, which a late or
+                    // a repeated answer is, belongs to no refusal that the work in hand is owed.
                     if in_hand && self.the_system_refused_memory() && the_work_failed(&answer) {
                         return self.kill(ProcessEnd::MemoryCeiling, now, reports);
                     }
