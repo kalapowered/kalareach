@@ -1761,10 +1761,22 @@ impl ProjectService {
     /// through none, whatever the caller holds over the repository it is a copy of, and is
     /// refused. Every Git invocation on the opened repository asks the location again before it
     /// starts and runs with its reads bounded, so a location the owner withdraws while the work
-    /// runs stops the next Git read, the next request, and the next path an apply publishes or
-    /// removes. It does not stop the file reads a request already has under way. A revoked grant
-    /// is held by the transactions that need current authority, and an apply whose journal is
-    /// open finishes.
+    /// runs stops the next Git read. The next request that opens a workspace through the location
+    /// is refused where the location is looked up. A repeat of a request already answered is
+    /// answered from its record and opens none.
+    ///
+    /// An apply installs a path with no Git of its own and asks the location itself, before the
+    /// first change it makes for a path and again before it publishes or removes the path. A
+    /// withdrawal that lands after one of those checks is not seen until the next: the path in
+    /// progress can still make its directories and its staging, and a rename or a removal already
+    /// under way is finished. The file reads a request has under way are not stopped, and an apply
+    /// reads the next path before its first check stops it. The apply then takes away its own
+    /// staging only while it is still the object the journal recorded; between that comparison
+    /// and the removal by name a local writer can substitute an empty directory, and the staging
+    /// stays where it is when a check of its identity, its permissions or the removal fails.
+    ///
+    /// A revoked grant is held by the transactions that need current authority, and an apply
+    /// whose journal is open finishes.
     ///
     /// **Nothing is written**, as for [`Self::open_workspace_repository`].
     ///
