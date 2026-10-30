@@ -1026,13 +1026,16 @@ sheet says so. A phone shows the setting and offers no recovery.
 service gets. `kr-client` names the clients as traits (account login, relay leases, push, encrypted
 sync and backup, managed inference), and the application works without any of them. A fork replaces
 a client by supplying its implementation of the trait where the desk that uses it is opened; the
-desk's calls then go to that client and to no other.
+calls that desk makes through the seams below then go to that client. Two reads stay outside them:
+recovery's reads of the bundle for the archive list and the offline copy, which go through
+`kr-client`'s `AccountSource` and its own clients, and the voice control socket, which
+`Service::connector` opens. Neither is a slot of `ServiceClients`.
 
 - **Sync and backup.** `SyncServices` gives the client of the sync service at an origin, as a
   `SharedSyncService`. `installation(&origin)` signs as this installation, and
   `presenting(&origin, tokens, scope)` also presents the account's token for `scope`, which
-  recovery's bundle store uses. Settings sync, its drafts and its members, and recovery ask only
-  through it. The origin is an argument because a record keeps the origin it was made at: a record
+  recovery's bundle store uses. Settings sync, its drafts and its members, and recovery's bundle
+  store ask only through it. The origin is an argument because a record keeps the origin it was made at: a record
   made while the setting named one service goes on asking for that service after the setting names
   another, and only a new record reads the setting. `ManagedSyncServices` is the production
   implementation. `AppState::sync_clients_replaced` installs another before the desks open, and the
@@ -1051,13 +1054,13 @@ lease client for each account mark.
 The Account sheet lists, under "Managed services on this device", the services the application can
 hold a client of: account login, push registration, sync and backup, and managed inference. The
 `account_services` command puts the clients the desks hold now into a `ServiceClients`
-(`services::held_by`) and gives `ServiceClients::availability` for each. The sync line is made from
+(`services::Held::of`) and gives `ServiceClients::availability_of` for each. The sync line is made from
 the client the installed `SyncServices` gives for the origin the setting names. A service whose
 client is held reads as configured, which says nothing of whether a call will succeed; one with no
 client, because its desk is not open on this device, reads as the library says, with what a person
 can do instead. The list asks no service, has no control, link or form, and nothing consults it
 before local work. The sheet leaves it out when the command fails. Under it the sheet says these are
-the services the app uses and that a host keeps its own relay leases, so none is listed.
+the managed services an app can use and that a host keeps its own relay leases, so none is listed.
 
 ## What a phone reads once
 
