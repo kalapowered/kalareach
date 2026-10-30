@@ -220,9 +220,9 @@ reason.
   the process and not the thread, because a thread that another thread starts begins at the normal
   priority, and the compute threads of the model runtime are started by the thread that loads it.
   Windows also keeps an I/O priority for each thread, and the thread that loads the model exists
-  before the process's priority is set, so that thread sets its own as well. The process reports the
-  I/O class as applied only when the system reads back very low for that thread and for the
-  process.
+  before the process's priority is set. A thread that was running when the priority was lowered
+  reads the lowered value for itself, and the process reports the I/O class as applied only when
+  the system reads back very low for the process and for the model thread's own value.
   The idle class is served only when nothing else wants the processor, and the process's control
   thread and watchdog are in it too. When other work keeps every core busy for longer than a few
   seconds (Windows lifts a thread that has waited that long), the daemon can wait past its bound
