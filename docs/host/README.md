@@ -5522,12 +5522,16 @@ ten seconds or answers with more than a version and a directory, and when it is 
 `/usr/bin/git` of a Mac without the Command Line Tools is the second case: it asks to install them
 and exits with status 1 whatever it is asked.
 
-A Git that never answers, such as a stand-in that waits for an installer, costs the one look that
-asked it ten seconds and no more. The daemon ends that Git and everything it started, and refuses as
-above. Nothing else waits on it beyond the look: the daemon starts and answers while the look is
-under way, a start that needed Git on Linux or for an interrupted apply goes on once the look has
-ended, requests that arrive during a look wait for it and are refused with it, so the stand-in is
-started once for all of them, and an interrupt ends the daemon when the look under way has ended.
+A Git that never answers, such as a stand-in that waits for an installer, costs the look that asked
+it ten seconds and no more. A program still under way when the ten seconds end is ended with the
+processes in its group, and one that has ended has the rest of its group ended with it. A process
+that leaves the group is out of reach, and is not waited for. The look is refused as above and
+nothing is kept. While a look is under way the daemon answers what needs no Git. A request that
+needs Git waits for that look, and no other, and is refused with it, so the stand-in is started
+once for all of them. The request that comes after the look has ended makes a look of its own. A
+start that needs Git makes one look for each need: on Linux the proof, and each interrupted apply
+that left staged paths. It goes on when each look has ended, so it can take ten seconds for each. An
+interrupt ends the daemon once the look under way has ended.
 
 A request that runs Git is then refused with `HOST_NOT_CONFIGURED` before it makes a repository, an
 operation row, a workspace or a directory. Those are `project.init`, `project.clone`,

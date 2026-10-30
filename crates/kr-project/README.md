@@ -15,10 +15,14 @@ service. Each request that runs Git is refused until a resolution finds one, and
 failed is made again at the next request.
 
 Resolution is bounded, because it is made outside every boundary of a program this host has not yet
-shown to be Git. The questions are given ten seconds in all and an answer of 64 KiB. A program that
-takes longer, or answers with more, is ended with everything it started and refused as unavailable.
-One request at a time resolves, and requests that arrive meanwhile share its result, so a program
-that hangs is started once for all of them.
+shown to be Git. The questions are given ten seconds in all and an answer of 64 KiB. A program still
+under way when the time ends is ended with the processes in its group, one that has ended has the
+rest of its group ended with it, and one that answers with more is refused when it does. A process
+that leaves the group is out of reach, and is not waited for. A look is made by one request at a
+time, and a request that arrives while one is under way waits for that look and shares its result,
+so a program that hangs is started once for all of them. A copy of Git under the helper directory
+that does not answer in time refuses the whole look. One that answers differently, or cannot run,
+leaves the program on the search path as the one that runs.
 
 ## Why there is one
 

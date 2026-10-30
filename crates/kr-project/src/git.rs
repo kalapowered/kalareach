@@ -603,8 +603,8 @@ pub struct GitProgram {
 impl GitProgram {
     /// Resolves installed Git, its own `--exec-path` and its version.
     ///
-    /// The process's own `PATH` is consulted exactly here. Every invocation afterwards runs with
-    /// the `PATH` the profile builds.
+    /// The process's own `PATH` is consulted here, and when a profile is prepared to look for Git
+    /// itself. Every invocation afterwards runs with the `PATH` the profile builds.
     ///
     /// # Errors
     ///
@@ -660,7 +660,11 @@ impl GitProgram {
         }
         // Asked of the resolved binary with an environment of nothing, so the answer is the
         // program's own rather than an inherited `GIT_EXEC_PATH`.
-        let reported = PathBuf::from(ask(&program, &["--exec-path"], deadline)?.trim_end());
+        let reported = PathBuf::from(
+            ask(&program, &["--exec-path"], deadline)
+                .map_err(Asked::into_error)?
+                .trim_end(),
+        );
         if !reported.is_absolute() {
             return Err(ProjectError::GitUnavailable {
                 detail: format!(
@@ -685,7 +689,8 @@ impl GitProgram {
                 )
                 .into(),
             })?;
-        let version = ask(&program, &["--version"], deadline)?
+        let version = ask(&program, &["--version"], deadline)
+            .map_err(Asked::into_error)?
             .trim_end()
             .to_owned();
         let parsed = parse_version(&version).ok_or_else(|| ProjectError::GitUnavailable {
@@ -701,7 +706,7 @@ impl GitProgram {
                 .into(),
             });
         }
-        let executable = handed_off_to(&program, &exec_path, &version, deadline);
+        let executable = handed_off_to(&program, &exec_path, &version, deadline)?;
         Ok(Self {
             program,
             executable,
@@ -747,22 +752,82 @@ impl GitProgram {
 /// Git is looked for the first time an invocation needs it, on the search path the process had
 /// when the profile was prepared, and a program that was found is kept for the life of the
 /// profile. A search that found nothing usable is not kept: a host that installs Git while the
-/// daemon runs serves the next request that needs it without a restart.
+/// daemon runs serves the next request that needs it, one that is not made while a look that began
+/// before the install is still under way, without a restart.
 ///
-/// A look is bounded by `bound`, so a Git that never answers costs a request that long and no
-/// more, and it is made by one request at a time. Requests that arrive while a look is under way
-/// wait for it and share its result, found or refused, so a stand-in that hangs is started once
-/// for all of them and not once for each.
+/// A look is bounded by `bound`, so a Git that never answers costs the look that asked it that
+/// long and no more. One look is under way at a time. A request that arrives while one is under
+/// way waits for that look, and for no other, and is given its result, found or refused, so a
+/// stand-in that hangs is started once for all of them and not once for each. A request that
+/// arrives when none is under way makes its own.
 #[derive(Debug)]
 struct Installation {
     search: Option<OsString>,
     bound: Duration,
     found: OnceLock<GitProgram>,
-    /// How many looks have ended without finding Git. A request reads it before it waits, and a
-    /// look that ended while it waited is the look it shares.
-    refused: AtomicU64,
-    /// Held while Git is looked for. It holds the refusal of the last look that found nothing.
-    looking: Mutex<Option<Diagnostic>>,
+    /// The look under way, if there is one.
+    current: Mutex<Option<Arc<Look>>>,
+}
+
+/// One look for Git, and what it came to.
+#[derive(Debug, Default)]
+struct Look {
+    /// `None` while the look is under way, then `Ok` for a look that found Git, which is kept in
+    /// the installation, or the refusal it ended with.
+    outcome: Mutex<Option<std::result::Result<(), Diagnostic>>>,
+    ended: std::sync::Condvar,
+}
+
+impl Look {
+    /// Ends the look with `outcome` and wakes everything that waited for it.
+    fn end(&self, outcome: std::result::Result<(), Diagnostic>) {
+        let mut held = self
+            .outcome
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if held.is_none() {
+            *held = Some(outcome);
+        }
+        self.ended.notify_all();
+    }
+
+    /// Waits for the look to end, and returns what it came to.
+    fn wait(&self) -> std::result::Result<(), Diagnostic> {
+        let mut held = self
+            .outcome
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if let Some(outcome) = held.as_ref() {
+                return outcome.clone();
+            }
+            held = self
+                .ended
+                .wait(held)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+/// Ends a look when the request that made it stops, however it stops, so that a request waiting
+/// for the look is never left waiting for one that cannot end.
+struct Making<'a> {
+    installation: &'a Installation,
+    look: Arc<Look>,
+}
+
+impl Drop for Making<'_> {
+    fn drop(&mut self) {
+        // Nothing arrives at this look from here on: a request that comes now makes its own.
+        *self
+            .installation
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.look.end(Err(Diagnostic::new(
+            "the look for Git ended without an answer",
+        )));
+    }
 }
 
 impl Installation {
@@ -772,8 +837,7 @@ impl Installation {
             search,
             bound,
             found: OnceLock::new(),
-            refused: AtomicU64::new(0),
-            looking: Mutex::new(None),
+            current: Mutex::new(None),
         }
     }
 
@@ -797,27 +861,47 @@ impl Installation {
                 detail: format!("Git is not run on this platform: {why}").into(),
             });
         }
-        let refused_before = self.refused.load(Ordering::SeqCst);
-        let mut last_refusal = self
-            .looking
+        let mut current = self
+            .current
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A look that ended while this request waited for the lock left Git behind, or nothing.
         if let Some(found) = self.found.get() {
             return Ok(found);
         }
-        if self.refused.load(Ordering::SeqCst) != refused_before
-            && let Some(detail) = last_refusal.clone()
-        {
-            return Err(ProjectError::GitUnavailable { detail });
+        if let Some(under_way) = current.as_ref().map(Arc::clone) {
+            drop(current);
+            return match under_way.wait() {
+                Ok(()) => self
+                    .found
+                    .get()
+                    .ok_or_else(|| ProjectError::GitUnavailable {
+                        detail: Diagnostic::new("the look for Git ended without an answer"),
+                    }),
+                Err(detail) => Err(ProjectError::GitUnavailable { detail }),
+            };
         }
+        let look = Arc::new(Look::default());
+        *current = Some(Arc::clone(&look));
+        drop(current);
+        let making = Making {
+            installation: self,
+            look,
+        };
         match GitProgram::discover_on(self.search.as_deref(), self.bound) {
-            Ok(resolved) => Ok(self.found.get_or_init(|| resolved)),
-            Err(ProjectError::GitUnavailable { detail }) => {
-                *last_refusal = Some(detail.clone());
-                self.refused.fetch_add(1, Ordering::SeqCst);
-                Err(ProjectError::GitUnavailable { detail })
+            Ok(resolved) => {
+                let kept = self.found.get_or_init(|| resolved);
+                making.look.end(Ok(()));
+                Ok(kept)
             }
-            Err(other) => Err(other),
+            Err(error) => {
+                let refusal = match error {
+                    ProjectError::GitUnavailable { detail } => detail,
+                    other => Diagnostic::new(other.to_string()),
+                };
+                making.look.end(Err(refusal.clone()));
+                Err(ProjectError::GitUnavailable { detail: refusal })
+            }
         }
     }
 }
@@ -3083,11 +3167,18 @@ const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(5);
 ///
 /// Git answers these in milliseconds. A program that takes longer is not one this host can run
 /// work through: it is a stand-in waiting on something, such as an installer or a lookup that never
-/// returns. It is ended, with everything it started, and refused as unavailable.
+/// returns. It is ended, with the processes in its group, and refused as unavailable.
 pub const PROBE_BOUND: Duration = Duration::from_secs(10);
 
 /// The most one of those answers may hold. A version and a directory are far shorter.
 const PROBE_OUTPUT_LIMIT: usize = 64 * 1024;
+
+/// How long a probe's output is waited for after the probe has ended and its group has been ended,
+/// which only a process that left the group can still hold open.
+const PROBE_DRAIN: Duration = Duration::from_secs(1);
+
+/// How long a probe that was ended is waited for to be collected.
+const PROBE_REAP: Duration = Duration::from_secs(2);
 
 /// One pipe being read, and the bytes read so far.
 struct Reader {
@@ -3508,26 +3599,58 @@ impl Drop for PrivateTemporary {
 /// version, reporting the same helper directory. It runs when it is. Where there is no such copy,
 /// or it answers differently, the program this host resolved is what runs, and a stand-in that
 /// then cannot hand off is an honest failure rather than a widened list.
-fn handed_off_to(program: &Path, exec_path: &Path, version: &str, deadline: Instant) -> PathBuf {
+fn handed_off_to(
+    program: &Path,
+    exec_path: &Path,
+    version: &str,
+    deadline: Instant,
+) -> Result<PathBuf> {
     let Ok(candidate) = exec_path.join(GIT_FILE_NAME).canonicalize() else {
-        return program.to_owned();
+        return Ok(program.to_owned());
     };
     if candidate == program {
-        return program.to_owned();
+        return Ok(program.to_owned());
     }
-    let same_version = ask(&candidate, &["--version"], deadline)
-        .is_ok_and(|reported| reported.trim_end() == version);
+    // A copy that answers differently, or cannot run, is not the program: the fallback below is for
+    // those. A copy that does not answer in time, or answers without end, is not an answer at all,
+    // and a look that took the stand-in for Git on the strength of it would keep a program that
+    // cannot run, so the whole look is refused and nothing is kept.
+    let same_version = match ask(&candidate, &["--version"], deadline) {
+        Ok(reported) => reported.trim_end() == version,
+        Err(Asked::Declined(_)) => false,
+        Err(overran) => return Err(overran.into_error()),
+    };
     // Compared as the directories the two answers resolve to, because the helper directory is held
     // resolved and either program may report it through a link.
-    let same_helpers = ask(&candidate, &["--exec-path"], deadline).is_ok_and(|reported| {
-        Path::new(reported.trim_end())
+    let same_helpers = match ask(&candidate, &["--exec-path"], deadline) {
+        Ok(reported) => Path::new(reported.trim_end())
             .canonicalize()
-            .is_ok_and(|resolved| resolved == exec_path)
-    });
-    if same_version && same_helpers {
+            .is_ok_and(|resolved| resolved == exec_path),
+        Err(Asked::Declined(_)) => false,
+        Err(overran) => return Err(overran.into_error()),
+    };
+    Ok(if same_version && same_helpers {
         candidate
     } else {
         program.to_owned()
+    })
+}
+
+/// Why a question put to a program was not answered.
+enum Asked {
+    /// The program could not run, or ran and said no. A copy of Git that does this is not the
+    /// program, and the caller goes on without it.
+    Declined(ProjectError),
+    /// The program did not answer in the time it is given, answered with more than a version and a
+    /// directory, or left its output open. It is not a program this host can run work through.
+    Overran(ProjectError),
+}
+
+impl Asked {
+    fn into_error(self) -> ProjectError {
+        match self {
+            Self::Declined(error) | Self::Overran(error) => error,
+        }
     }
 }
 
@@ -3536,22 +3659,27 @@ fn handed_off_to(program: &Path, exec_path: &Path, version: &str, deadline: Inst
 ///
 /// The question is asked outside every boundary, of a program this host has not yet established is
 /// Git, so it is bounded on every side: by time, by what it may answer, and by what it may leave
-/// running. A program that does not answer in time is ended with everything it started, and so is
-/// one that answers with more than a version and a directory. Either way the refusal says Git is
-/// unavailable, and nothing is kept, so the next look asks again.
-fn ask(program: &Path, arguments: &[&str], deadline: Instant) -> Result<String> {
+/// running. A program still under way at the deadline is ended with the processes in its group. One
+/// that has ended has the rest of its group ended with it, and one that answers with more than a
+/// version and a directory is refused when it does. A process that leaves the group is out of
+/// reach, and is not waited for: it holds nothing of this host's once the question is over.
+fn ask(
+    program: &Path,
+    arguments: &[&str],
+    deadline: Instant,
+) -> std::result::Result<String, Asked> {
     let described = format!(
         "{} {}",
         redact(&program.display().to_string()),
         redact(&arguments.join(" "))
     );
+    let unavailable = |detail: String| ProjectError::GitUnavailable {
+        detail: detail.into(),
+    };
     if Instant::now() >= deadline {
-        return Err(ProjectError::GitUnavailable {
-            detail: format!(
-                "{described} was not asked: Git had used the time it is given to answer"
-            )
-            .into(),
-        });
+        return Err(Asked::Overran(unavailable(format!(
+            "{described} was not asked: Git had used the time it is given to answer"
+        ))));
     }
     let mut command = Command::new(program);
     command
@@ -3568,66 +3696,128 @@ fn ask(program: &Path, arguments: &[&str], deadline: Instant) -> Result<String> 
 
         command.process_group(0);
     }
-    let mut child = command
-        .spawn()
-        .map_err(|error| ProjectError::GitUnavailable {
-            detail: format!("{described} could not run: {error}").into(),
-        })?;
+    let mut child = command.spawn().map_err(|error| {
+        Asked::Declined(unavailable(format!("{described} could not run: {error}")))
+    })?;
     let reader = child
         .stdout
         .take()
         .map(|pipe| read_up_to(pipe, PROBE_OUTPUT_LIMIT));
     let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {}
+        match has_ended(&mut child) {
+            Ok(true) => {
+                // The leader is gone and not yet collected, so its group is still its own and
+                // nothing else on this machine can be in it: whatever it left running is ended
+                // before the number can be given to anything else.
+                end_group(&child);
+                match child.wait() {
+                    Ok(status) => break status,
+                    Err(error) => {
+                        return Err(Asked::Overran(unavailable(format!(
+                            "{described} could not be collected: {error}"
+                        ))));
+                    }
+                }
+            }
+            Ok(false) => {}
             Err(error) => {
                 end_probe(&mut child);
-                return Err(ProjectError::GitUnavailable {
-                    detail: format!("{described} could not be waited on: {error}").into(),
-                });
+                return Err(Asked::Overran(unavailable(format!(
+                    "{described} could not be waited on: {error}"
+                ))));
             }
         }
         if Instant::now() >= deadline {
             end_probe(&mut child);
-            return Err(ProjectError::GitUnavailable {
-                detail: format!("{described} did not answer in time and was stopped").into(),
-            });
+            return Err(Asked::Overran(unavailable(format!(
+                "{described} did not answer in time and was stopped"
+            ))));
         }
         std::thread::sleep(Duration::from_millis(5));
     };
-    let answer = join_until(reader, &described, deadline)?;
+    // What the program wrote is read to its end, but a process that left the group may still hold
+    // the pipe, so the wait for the end is short.
+    if let Some(reader) = reader.as_ref() {
+        let drain = deadline.min(Instant::now() + PROBE_DRAIN);
+        while !reader.handle.is_finished() && Instant::now() < drain {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if !reader.handle.is_finished() {
+            return Err(Asked::Overran(unavailable(format!(
+                "{described} left its output open after it ended"
+            ))));
+        }
+    }
+    let answer = join_until(reader, &described, deadline).map_err(|error| {
+        Asked::Overran(unavailable(format!(
+            "{described} produced output this host could not read: {error}"
+        )))
+    })?;
     if !status.success() {
-        return Err(ProjectError::GitUnavailable {
-            detail: format!(
-                "{described} exited {}",
-                status
-                    .code()
-                    .map_or_else(|| "on a signal".to_owned(), |code| code.to_string())
-            )
-            .into(),
-        });
+        return Err(Asked::Declined(unavailable(format!(
+            "{described} exited {}",
+            status
+                .code()
+                .map_or_else(|| "on a signal".to_owned(), |code| code.to_string())
+        ))));
     }
     if answer.truncated {
-        return Err(ProjectError::GitUnavailable {
-            detail: format!("{described} answered with more than a version and a directory").into(),
-        });
+        return Err(Asked::Overran(unavailable(format!(
+            "{described} answered with more than a version and a directory"
+        ))));
     }
     Ok(String::from_utf8_lossy(&answer.bytes).into_owned())
 }
 
-/// Ends a probe that did not finish, with everything it started, and collects it.
-fn end_probe(child: &mut std::process::Child) {
+/// Whether the child has ended, without collecting it where the platform can say so.
+///
+/// Where it can, the child is left uncollected, so that the caller can end the group it led while
+/// the number is still the child's own.
+fn has_ended(child: &mut std::process::Child) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    if let Ok(raw) = i32::try_from(child.id())
+        && let Some(pid) = rustix::process::Pid::from_raw(raw)
+    {
+        use rustix::process::{WaitId, WaitIdOptions, waitid};
+
+        match waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+        ) {
+            Ok(ended) => return Ok(ended.is_some()),
+            Err(rustix::io::Errno::INTR) => return Ok(false),
+            Err(_) => {}
+        }
+    }
+    Ok(child.try_wait()?.is_some())
+}
+
+/// Ends the group the child led, which is every process it started that stayed in it.
+fn end_group(child: &std::process::Child) {
     #[cfg(unix)]
     if let Ok(raw) = i32::try_from(child.id())
         && let Some(group) = rustix::process::Pid::from_raw(raw)
     {
-        // The child leads its own group, so its identifier is the group's and nothing else on this
-        // machine is in it.
         let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
     }
+    #[cfg(not(unix))]
+    let _ = child;
+}
+
+/// Ends a probe that did not finish, with everything it started, and collects it.
+///
+/// Collecting is bounded too: a child that cannot be collected within [`PROBE_REAP`] is left, and
+/// the look goes on without it.
+fn end_probe(child: &mut std::process::Child) {
+    end_group(child);
     let _ = child.kill();
-    let _ = child.wait();
+    let deadline = Instant::now() + PROBE_REAP;
+    while Instant::now() < deadline {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 /// Reads the major and minor version out of `git --version`.
