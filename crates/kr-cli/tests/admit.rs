@@ -602,16 +602,33 @@ fn an_install_into_a_fresh_home_makes_only_owner_only_directories() {
     let installed = home.run_as_a_person(&kr(&by_hand), &["host", "install"]);
     assert!(installed.status.success(), "{}", said(&installed));
 
-    let mut directory = home.store.root().to_path_buf();
-    while directory != home.home {
+    // Every directory the install made is owner-only: the store's, the ones above it that were
+    // missing, and nothing else is there but the test's own temporary directory.
+    let mut pending = vec![home.store.root().to_path_buf()];
+    let mut above = home.store.root().parent().map(Path::to_path_buf);
+    while let Some(directory) = above.filter(|directory| *directory != home.home) {
+        pending.push(directory.clone());
+        above = directory.parent().map(Path::to_path_buf);
+    }
+    let mut made = 0;
+    while let Some(directory) = pending.pop() {
         assert_eq!(
             mode_of(&directory),
             0o700,
             "{} is made by the install",
             directory.display()
         );
-        directory = directory.parent().expect("below the home").to_path_buf();
+        made += 1;
+        for entry in std::fs::read_dir(&directory)
+            .expect("a directory")
+            .flatten()
+        {
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                pending.push(entry.path());
+            }
+        }
     }
+    assert!(made > 5, "the install made the store's directories: {made}");
 
     // What the person runs next, as the store's own copy: on macOS the state root is the directory
     // above the store, and the command refuses one that is open to others.

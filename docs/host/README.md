@@ -30,10 +30,12 @@ Two roots, both owner-only, both checked rather than assumed on every open.
 
 A directory above a root that exists is left as it is and checked for nothing: `/tmp` is
 world-writable by design and `~/.cache` is usually group-readable, and neither is KalaReach's to
-change. One that is missing is created with mode 0700, whatever the umask, as the root and everything
-below it are, and those are verified on every open. A directory that is a symbolic link, or that
-belongs to another user, is refused rather than repaired. One that this user owns and that is too open
-is refused too, with the `chmod 700` that mends it.
+change. One that is missing is created with mode 0700, as the root and everything below it are, and
+the umask can only narrow that mode; the root and what is below it are verified on every open. A root,
+or a directory below it, that is a symbolic link, or that belongs to another user, is refused rather
+than repaired. One that this user owns, that only this user can write and that others can read is
+refused too, with the `chmod 700` command that mends it, its path quoted for a shell. For one that
+others can write to the refusal names no command, since a mode does not remove what they put in it.
 
 On Linux, $XDG_RUNTIME_DIR/kalareach is the default runtime root, unless that directory would end up
 in a location shared between all WSL distros. WSLg sets $XDG_RUNTIME_DIR to /mnt/wslg/runtime-dir,

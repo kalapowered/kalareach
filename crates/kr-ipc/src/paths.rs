@@ -3935,6 +3935,31 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// KR-REQ-24.26: a directory above a root that is missing is made owner-only, and one that is
+    /// there is left as it is, since it is not KalaReach's; a file in the way is an error.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_parent_of_a_root_is_made_owner_only_and_an_existing_one_is_left_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let base = std::env::temp_dir().join(format!("kr-parent-mode-{}", crate::new_uuid()));
+        std::fs::create_dir(&base).expect("a directory above");
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).expect("opened");
+        let root = base.join("one").join("two").join("root");
+        create_private_tree(&root, &root).expect("makes the root and what is above it");
+        for made in [base.join("one"), base.join("one").join("two"), root.clone()] {
+            let mode = std::fs::metadata(&made).expect("made").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{}", made.display());
+        }
+        let mode = std::fs::metadata(&base).expect("kept").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "a directory that was there is not changed");
+
+        std::fs::write(base.join("file"), b"").expect("a file");
+        let blocked = base.join("file").join("two").join("root");
+        assert!(create_private_tree(&blocked, &blocked).is_err());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
     /// Makes `link` a symbolic link to `target`, or says why this machine would not.
     ///
     /// Windows asks for a privilege to create one, held by an elevated account or by a machine in

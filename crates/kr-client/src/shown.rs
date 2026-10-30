@@ -290,26 +290,28 @@ impl Shown {
                 expected_uid,
                 found_uid,
                 found_mode,
-            } if found_uid == expected_uid => crate::shown!(
-                "{} must be owned by user {} with mode 0700, found owner {} and mode {}; make it yours alone with: chmod 700 '{}'",
-                Self::host_path(path),
-                *expected_uid,
-                *found_uid,
-                Self::decided(format!("{found_mode:04o}")),
-                Self::host_path(path)
-            ),
-            IpcError::DirectoryNotOwnerOnly {
-                path,
-                expected_uid,
-                found_uid,
-                found_mode,
-            } => crate::shown!(
-                "{} must be owned by user {} with mode 0700, found owner {} and mode {}",
-                Self::host_path(path),
-                *expected_uid,
-                *found_uid,
-                Self::decided(format!("{found_mode:04o}"))
-            ),
+            } => {
+                let shown = Self::host_path(path);
+                // The command carries the path, so it is given only where the path is said whole:
+                // a name left out of the one shown is not one a command can be written with.
+                match error.mending_command() {
+                    Some(command) if path.to_str() == Some(shown.as_str()) => crate::shown!(
+                        "{} must be owned by user {} with mode 0700, found owner {} and mode {}; make it yours alone with: {}",
+                        shown,
+                        *expected_uid,
+                        *found_uid,
+                        Self::decided(format!("{found_mode:04o}")),
+                        Self::decided(command)
+                    ),
+                    _ => crate::shown!(
+                        "{} must be owned by user {} with mode 0700, found owner {} and mode {}",
+                        shown,
+                        *expected_uid,
+                        *found_uid,
+                        Self::decided(format!("{found_mode:04o}"))
+                    ),
+                }
+            }
             IpcError::DirectoryAccessRefused { path, .. } => {
                 crate::shown!("{} is not owner-only", Self::host_path(path))
             }
@@ -1901,6 +1903,33 @@ mod tests {
             )),
             "{said}"
         );
+    }
+
+    /// KR-REQ-24.26: a directory refused as open to others is said with the command that mends it
+    /// only when its path is said whole; one with a name left out names none.
+    #[test]
+    fn a_too_open_directory_names_its_mending_command_only_where_its_path_is_said_whole() {
+        let refused = |path: &str, uid: u32, mode: u32| {
+            Shown::ipc(&IpcError::DirectoryNotOwnerOnly {
+                path: path.into(),
+                expected_uid: 501,
+                found_uid: uid,
+                found_mode: mode,
+            })
+        };
+        // Every name is one the tree writes.
+        let whole = refused("/state/environments", 501, 0o755);
+        assert!(
+            whole.as_str().ends_with("chmod 700 '/state/environments'"),
+            "{whole}"
+        );
+        // A name a listing could have found is left out of what is said, so no command is.
+        let hidden = refused("/Users/someone/KalaReach", 501, 0o755);
+        assert!(hidden.as_str().contains("[a name]"), "{hidden}");
+        assert!(!hidden.as_str().contains("chmod"), "{hidden}");
+        // Another user's directory is not mended by this user.
+        let other = refused("/state/environments", 502, 0o755);
+        assert!(!other.as_str().contains("chmod"), "{other}");
     }
 
     /// A path prefix outside a configured root says a drive's letter, and never a server's, a

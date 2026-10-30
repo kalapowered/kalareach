@@ -33,11 +33,11 @@ pub enum IpcError {
     },
     /// A directory that must be owner-only was not.
     ///
-    /// A directory that this user owns and that is too open is one `chmod 700` mends, and the text
-    /// says so, naming the directory.
+    /// A directory that this user owns, that only this user can write and that others can read is
+    /// one `chmod 700` mends, and the text says so, naming the directory.
     #[error(
         "{path} must be owned by user {expected_uid} with mode 0700, found owner {found_uid} and mode {found_mode:04o}{}",
-        owner_only_remedy(.path, *.expected_uid, *.found_uid)
+        mending_suffix(.path, *.expected_uid, *.found_uid, *.found_mode)
     )]
     DirectoryNotOwnerOnly {
         /// The directory.
@@ -229,6 +229,23 @@ impl IpcError {
         }
     }
 
+    /// The command that mends the directory this failure names, when one command does: a
+    /// directory of this user's own that only this user can write and that others can read. It
+    /// is quoted for a shell, and names the real path, so a caller that shows a path with names
+    /// left out gives it only where nothing was left out.
+    #[must_use]
+    pub fn mending_command(&self) -> Option<String> {
+        match self {
+            Self::DirectoryNotOwnerOnly {
+                path,
+                expected_uid,
+                found_uid,
+                found_mode,
+            } => mending_command(path, *expected_uid, *found_uid, *found_mode),
+            _ => None,
+        }
+    }
+
     /// Renders the failure as a protocol error a client can be given.
     #[must_use]
     pub fn to_protocol_error(&self) -> ProtocolError {
@@ -236,17 +253,36 @@ impl IpcError {
     }
 }
 
-/// Whether an I/O failure is a connection's refusal of its caller by account, carried inside it.
-/// What follows the refusal of a directory's mode when the directory is this user's own: the one
-/// command that mends it. A directory of another user is not mended by this user, so it names none.
-fn owner_only_remedy(path: &std::path::Path, expected_uid: u32, found_uid: u32) -> String {
-    if found_uid == expected_uid {
-        format!("; make it yours alone with: chmod 700 '{}'", path.display())
-    } else {
-        String::new()
-    }
+/// What follows the refusal of a directory's mode when one command mends it: that command. A
+/// directory that another user owns is not mended by this user. One that others can write to may
+/// hold what they put in it, which a mode does not remove, so for it nothing is named.
+fn mending_suffix(
+    path: &std::path::Path,
+    expected_uid: u32,
+    found_uid: u32,
+    found_mode: u32,
+) -> String {
+    mending_command(path, expected_uid, found_uid, found_mode)
+        .map(|command| format!("; make it yours alone with: {command}"))
+        .unwrap_or_default()
 }
 
+/// The command that mends a directory this user owns, that only this user can write and that
+/// others can read, as one argument a shell reads literally. A path that is not text has none.
+fn mending_command(
+    path: &std::path::Path,
+    expected_uid: u32,
+    found_uid: u32,
+    found_mode: u32,
+) -> Option<String> {
+    if found_uid != expected_uid || found_mode & 0o022 != 0 {
+        return None;
+    }
+    let text = path.to_str()?;
+    Some(format!("chmod 700 '{}'", text.replace('\'', "'\\''")))
+}
+
+/// Whether an I/O failure is a connection's refusal of its caller by account, carried inside it.
 fn carries_account_refusal(source: &std::io::Error) -> bool {
     source
         .get_ref()
@@ -273,6 +309,52 @@ impl From<kr_protocol::retained::CodecError> for IpcError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn too_open(path: &str, found_uid: u32, found_mode: u32) -> IpcError {
+        IpcError::DirectoryNotOwnerOnly {
+            path: path.into(),
+            expected_uid: 501,
+            found_uid,
+            found_mode,
+        }
+    }
+
+    /// KR-REQ-24.26: a directory of this user's own that others can read but not write is refused
+    /// with the one command that mends it, quoted so that a shell reads the path literally; one
+    /// that another user owns, or that others can write to, names no command.
+    #[test]
+    fn a_too_open_directory_of_this_users_names_the_command_that_mends_it() {
+        let own = too_open(
+            "/Users/a b/Library/Application Support/KalaReach",
+            501,
+            0o755,
+        );
+        assert_eq!(
+            own.mending_command().as_deref(),
+            Some("chmod 700 '/Users/a b/Library/Application Support/KalaReach'")
+        );
+        assert!(
+            own.to_string()
+                .ends_with("; make it yours alone with: chmod 700 '/Users/a b/Library/Application Support/KalaReach'"),
+            "{own}"
+        );
+
+        // A quote ends the quoting, so the path is cut at it and written again after a quoted one.
+        let quoted = too_open("/x/it's $(id)", 501, 0o755);
+        assert_eq!(
+            quoted.mending_command().as_deref(),
+            Some("chmod 700 '/x/it'\\''s $(id)'")
+        );
+
+        for refused in [
+            too_open("/x", 502, 0o755),
+            too_open("/x", 501, 0o775),
+            too_open("/x", 501, 0o757),
+        ] {
+            assert_eq!(refused.mending_command(), None, "{refused}");
+            assert!(!refused.to_string().contains("chmod"), "{refused}");
+        }
+    }
 
     /// A caller refused by its account is reported under the permission code, whether it surfaces
     /// directly or inside the socket failure a frame reader wraps it in; any other socket failure,
