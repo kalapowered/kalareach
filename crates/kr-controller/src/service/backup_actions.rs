@@ -112,15 +112,15 @@ impl Controller {
     /// Setting up moves no content: the bundle is key material, so privacy mode neither stops it
     /// nor is stopped by it. What the call writes to the service is the sealed bundle, a writer's
     /// enrolment and the account's retention switch. The registration the call was admitted under
-    /// is asked again in the transaction that records the setup, after the requests to the service
-    /// that can outlast it.
+    /// is asked again before each request that changes the service and in the transaction that
+    /// records the setup, after the requests to the service that can outlast it.
     ///
     /// # Errors
     ///
     /// Returns [`ControllerError::NotConfigured`] when the host selects no storage service,
     /// [`ControllerError::InvalidArgument`] for a call that is not well formed, and what
     /// [`Self::under_registration`] refuses with when the fence this host owes, a withdrawn
-    /// registration or the passed deadline stops the record.
+    /// registration or the passed deadline stops a request or the record.
     pub(super) async fn backup_enable(
         self: &std::sync::Arc<Self>,
         mutation: &MutationRequest,
@@ -148,8 +148,8 @@ impl Controller {
     }
 
     /// Sets this host's backups up as `backup.enable` does, for a suite that stops waiting for the
-    /// call while its commit is still to be made. Nothing asks an admission at the record, and the
-    /// daemon is kept until the commit has ended, as a call's is.
+    /// call while its commit is still to be made. Nothing asks an admission, and the daemon is kept
+    /// until the commit has ended, as a call's is.
     ///
     /// # Errors
     ///
