@@ -69,7 +69,7 @@ use companion_platform::push::{PendingRegistration, PendingState};
 use kr_client::pairing::paired::PairedHost;
 use kr_client::services::push::{InstallationSigner, PushGateway, Registration};
 use kr_client::services::{
-    HttpDeadlines, HttpService, PushService as _, ServiceHttp, managed_response_limits,
+    HttpDeadlines, HttpService, PushService, ServiceHttp, ServiceSigner, managed_response_limits,
 };
 use kr_client::{Said as _, Shown};
 use kr_ipc::paths::{read_owner_only_file, write_owner_only_file};
@@ -457,14 +457,30 @@ pub trait HostLine: Send {
 pub type HttpFor =
     dyn Fn(&GatewayOrigin) -> std::result::Result<Arc<dyn ServiceHttp>, String> + Send + Sync;
 
-/// The seams a test replaces: the gateway this build names, its transport per origin, and the
-/// clock.
+/// The client of the gateway at an origin, signing as this installation: the push service this
+/// phone talks to. It is the implementation of [`PushService`] that stands in the application's
+/// set of service clients, and a suite that wants another implementation supplies another.
+pub type GatewayFor = dyn Fn(&GatewayOrigin, Arc<dyn ServiceSigner>) -> std::result::Result<Arc<dyn PushService>, String>
+    + Send
+    + Sync;
+
+/// The managed gateway client over the transport `http` reaches the gateway by.
+#[must_use]
+pub fn gateway_over(http: Arc<HttpFor>) -> Arc<GatewayFor> {
+    Arc::new(move |origin, signer| {
+        let transport = http(origin)?;
+        Ok(Arc::new(PushGateway::new(origin.clone(), transport, signer)) as Arc<dyn PushService>)
+    })
+}
+
+/// The seams a test replaces: the gateway this build names, the client of the gateway at an origin,
+/// and the clock.
 pub struct Wiring {
     /// The push gateway this phone's requests go to, and the origin the receivers answer a
     /// challenge for.
     pub origin: GatewayOrigin,
-    /// How the gateway at an origin is reached.
-    pub http: Arc<HttpFor>,
+    /// The client of the gateway at an origin.
+    pub gateway: Arc<GatewayFor>,
     /// The time, in UTC milliseconds.
     pub clock: Arc<dyn Fn() -> u64 + Send + Sync>,
     /// How long the receivers are given to take a set of preview keys.
@@ -473,7 +489,7 @@ pub struct Wiring {
 
 impl Wiring {
     /// The product's: the gateway this build was given (the managed service's when it was given
-    /// none), the managed transport, and the system clock.
+    /// none), the managed gateway over the managed transport, and the system clock.
     ///
     /// # Errors
     ///
@@ -492,7 +508,7 @@ impl Wiring {
             })?;
         Ok(Self {
             origin,
-            http: Arc::new(|origin| {
+            gateway: gateway_over(Arc::new(|origin| {
                 HttpService::with(
                     origin.clone(),
                     HttpDeadlines::default(),
@@ -500,7 +516,7 @@ impl Wiring {
                 )
                 .map(|http| Arc::new(http) as Arc<dyn ServiceHttp>)
                 .map_err(|error| error.to_string())
-            }),
+            })),
             clock: Arc::new(|| kr_ipc::now_ms().get()),
             keys_within: KEYS_WITHIN,
         })
@@ -1431,25 +1447,34 @@ impl PushDesk {
         match job {
             Job::Full => {
                 let (gateway, proposed) = self.propose(host, run).await?;
-                self.tell_host(host, run, reach, &gateway, true).await?;
+                self.tell_host(host, run, reach, gateway.as_ref(), true)
+                    .await?;
                 Ok(proposed)
             }
             Job::Delivery(registered) => {
                 let (_, gateway) = self.gateway()?;
-                self.tell_host(host, run, reach, &gateway, false).await?;
+                self.tell_host(host, run, reach, gateway.as_ref(), false)
+                    .await?;
                 Ok(registered)
             }
         }
     }
 
     /// The gateway this phone's requests go to, and the origin it is at.
-    fn gateway(&self) -> std::result::Result<(GatewayOrigin, PushGateway), String> {
+    fn gateway(&self) -> std::result::Result<(GatewayOrigin, Arc<dyn PushService>), String> {
         let origin = self.gateway_origin();
         let signer = Arc::new(InstallationSigner::new(
             self.device.identity().keys.authorisation.clone(),
         ));
-        let http = (self.wiring.http)(&origin).map_err(|_| unreachable_gateway())?;
-        Ok((origin.clone(), PushGateway::new(origin, http, signer)))
+        let gateway = (self.wiring.gateway)(&origin, signer).map_err(|_| unreachable_gateway())?;
+        Ok((origin, gateway))
+    }
+
+    /// The client of the push service this phone talks to now, for the application's set of
+    /// service clients. It is the one a registration is proposed through.
+    #[must_use]
+    pub fn client(&self) -> Option<Arc<dyn PushService>> {
+        self.gateway().ok().map(|(_, gateway)| gateway)
     }
 
     /// The first half of the sequence: the system's permission, the token, and the gateway's
@@ -1462,7 +1487,7 @@ impl PushDesk {
         &self,
         host: &PairedHost,
         run: u64,
-    ) -> std::result::Result<(PushGateway, Digest256), Stop> {
+    ) -> std::result::Result<(Arc<dyn PushService>, Digest256), Stop> {
         let native = &self.native;
         let mut permission = native
             .permission()
@@ -1602,7 +1627,7 @@ impl PushDesk {
         host: &PairedHost,
         run: u64,
         reach: Reach,
-        gateway: &PushGateway,
+        gateway: &dyn PushService,
         full: bool,
     ) -> std::result::Result<(), Stop> {
         // The host is the one the person chose. A phone that was unpaired or forgot the host

@@ -93,11 +93,11 @@ impl Harness {
             .map_err(|error| error.to_string())?;
         let http = HttpService::with(gateway, HttpDeadlines::default(), managed_response_limits())
             .map_err(|error| error.to_string())?;
-        Ok(Service {
-            origin: self.origin.clone(),
-            http: Arc::new(http),
-            connector: ControlConnector::platform().map_err(|error| error.to_string())?,
-        })
+        Ok(Service::new(
+            self.origin.clone(),
+            Arc::new(http),
+            ControlConnector::platform().map_err(|error| error.to_string())?,
+        ))
     }
 }
 

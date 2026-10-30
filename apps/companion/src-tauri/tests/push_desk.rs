@@ -780,7 +780,9 @@ fn open_at(
         registrar,
         Wiring {
             origin,
-            http: Arc::new(move |_| Ok(Arc::clone(&http) as Arc<dyn ServiceHttp>)),
+            gateway: companion_tauri::push::gateway_over(Arc::new(move |_| {
+                Ok(Arc::clone(&http) as Arc<dyn ServiceHttp>)
+            })),
             clock: Arc::new(move || kr_ipc::now_ms().get() + ahead.load(Ordering::SeqCst)),
             keys_within: receiver.state.lock().expect("the receiver").keys_patience,
         },
