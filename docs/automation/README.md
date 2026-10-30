@@ -634,10 +634,15 @@ A test result is what this host observed, and nothing a caller reports.
   A platform that keeps no such record has none, and a result there is indeterminate. The record
   shows that nothing in the copy was written while the suite ran. It does not show what the suite
   read, which can be anything on the machine. Nor does it show a write through a shared mapping that
-  the platform has not yet recorded when the result is recorded (Linux records it at the write and
-  macOS when the mapping is released, so a mapping released before the session ends is shown), a
-  write by a process that outlives the session, or a system clock set back by an account allowed to
-  set it.
+  the platform has not yet recorded when the result is recorded. Linux records a store through a
+  mapping when the store faults: on a filesystem that tracks writes to a mapping (ext4, measured)
+  at the first store to a clean page, and on tmpfs only when that store is the page's first access
+  through the mapping. A page made writable before the record can take later stores with no new
+  fault and no change of time, so a mapping made before the record is not shown. macOS records a
+  store when the mapping is released, so a mapping released before the session ends is shown; a
+  writable mapping released without a store counts as a write there, and the result attests no
+  version. Nor does it show a write by a process that outlives the session, or a system clock set
+  back by an account allowed to set it.
 * **Declared outputs.** A suite may declare paths it intends to write, other than its source, such
   as a build directory. These paths are not compared. Each one that is there is recorded in one
   reference, in path order, found through handles that follow no link and stay on the copy's mount.

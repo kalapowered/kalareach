@@ -46,10 +46,16 @@
 //! It shows that nothing in the copy was written while the command ran, outside the declared
 //! outputs. It does not show what the command read: the copy holds the version, and a command can
 //! read anything else on the machine. It does not show a write through a shared mapping that the
-//! platform has not yet recorded when the result is recorded (Linux records it at the write and
-//! macOS when the mapping is released, so a mapping released before the session ends is shown), a
-//! write by a process that outlives the session after the record is taken, a root account that
-//! sets the system clock back, or a filesystem that does not keep what it reports.
+//! platform has not yet recorded when the result is recorded. Linux records a store through a
+//! mapping when the store faults: on a filesystem that tracks writes to a mapping (ext4, measured)
+//! at the first store to a clean page, and on tmpfs only when that store is the page's first
+//! access through the mapping. A page made writable before the record can take later stores with
+//! no new fault and no change of time, so a mapping made before the record is not shown. macOS
+//! records a store when the mapping is released, so a mapping released before the session ends is
+//! shown; a writable mapping released without a store counts as a write there, and the result
+//! attests no version. It does not show a write by a process that outlives the session after the
+//! record is taken, a root account that sets the system clock back, or a filesystem that does not
+//! keep what it reports.
 
 use kr_protocol::ids::MaterialisationId;
 

@@ -1049,15 +1049,18 @@ fn a_run_that_changed_a_tested_path_and_restored_it_attests_nothing() {
 }
 
 /// The program for the mapping case: python maps the file it is given. Given a second argument it
-/// maps it shared and writable, changes the first byte and puts it back, so that the bytes are as
-/// they were, and ends without asking for the mapping to be flushed; otherwise it maps it read-only
-/// and reads the byte. (A writable mapping that is never written moves the change time on macOS
-/// when it is unmapped, so the control maps read-only.)
+/// reads the first byte from the file handle, maps the file shared and writable, so that the first
+/// access through the mapping is a write, changes the byte and puts it back, so that the bytes are
+/// as they were, and ends without asking for the mapping to be flushed; otherwise it maps the file
+/// read-only and reads the byte. (A read through a writable mapping before the write can leave a
+/// writable page that later stores reach without a fault, on a filesystem that does not track
+/// writes to a mapping, such as tmpfs; and a writable mapping that is never written moves the
+/// change time on macOS when it is unmapped, so the control maps read-only.)
 const MAPPED_WRITE: &str = r#"import mmap, sys
 if len(sys.argv) > 2:
     with open(sys.argv[1], "r+b") as handle:
+        first = handle.read(1)[0]
         view = mmap.mmap(handle.fileno(), 0)
-        first = view[0]
         view[0] = first ^ 1
         view[0] = first
         view.close()
