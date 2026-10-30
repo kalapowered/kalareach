@@ -3408,9 +3408,12 @@ impl Drop for Container {
     fn drop(&mut self) {
         // A cleanup that panics while a failed assertion unwinds aborts the whole test binary and
         // cleans up nothing after it in any case still running. So a removal that fails or stalls
-        // is recorded here and not raised.
+        // is recorded here and not raised. The line goes to standard error directly: the test
+        // harness drops what `eprintln!` prints for a case that passes, and a failed write must
+        // not panic here either.
         if let Err(why) = self.remove() {
-            eprintln!(
+            let _ = writeln!(
+                std::io::stderr(),
                 "the container {} ({}) was not removed and may still be running: {why}",
                 self.name,
                 self.target()
@@ -3488,10 +3491,10 @@ fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
 }
 
 /// A removal that stalls is an error the harness reports, and one that stalls while a failed
-/// assertion unwinds is recorded and aborts nothing: a destructor that panics then ends the whole
-/// test binary and leaves the cleanup of every other case in flight undone.
+/// assertion unwinds aborts nothing: a destructor that panics then ends the whole test binary and
+/// leaves the cleanup of every other case in flight undone.
 #[test]
-fn a_removal_that_stalls_while_an_assertion_fails_is_recorded_and_aborts_nothing() {
+fn a_removal_that_stalls_is_an_error_and_aborts_nothing_while_an_assertion_fails() {
     let directory = tempfile::tempdir().expect("a directory");
     let container = held_in(stalling_runtime(directory.path(), &["rm"]));
     let why = container
