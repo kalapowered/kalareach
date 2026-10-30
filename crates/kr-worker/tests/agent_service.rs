@@ -4347,24 +4347,24 @@ async fn kr_req_10_51_an_answering_action_is_held_to_the_callers_history() {
     };
 
     let absent = kr_protocol::ids::PendingResourceId::new(Uuid::from_bytes([0xab; 16]));
-    let unknown = forward_as_device_within(
-        &mut daemon,
-        &answer(300, absent),
-        &rights,
-        Some(scope(Some(1_000), &[])),
-    )
-    .await
-    .expect_err("the host holds no such approval");
+    let mut refused = Vec::new();
+    let asked = answer(300, absent);
+    refused.push(asked.action_id);
+    let unknown =
+        forward_as_device_within(&mut daemon, &asked, &rights, Some(scope(Some(1_000), &[])))
+            .await
+            .expect_err("the host holds no such approval");
     for (request_id, history) in [
         (301, Some(scope(Some(1_000), &[]))),
         (302, Some(scope(None, &[]))),
         (303, None),
         (304, Some(scope(Some(1_000), &[named]))),
     ] {
-        let withheld =
-            forward_as_device_within(&mut daemon, &answer(request_id, early), &rights, history)
-                .await
-                .expect_err("an approval the caller's history does not reach is not answered");
+        let asked = answer(request_id, early);
+        refused.push(asked.action_id);
+        let withheld = forward_as_device_within(&mut daemon, &asked, &rights, history)
+            .await
+            .expect_err("an approval the caller's history does not reach is not answered");
         assert_eq!(withheld.code, unknown.code, "({request_id}) {withheld:?}");
         assert_eq!(
             shape(&withheld, early),
@@ -4386,6 +4386,16 @@ async fn kr_req_10_51_an_answering_action_is_held_to_the_callers_history() {
         kr_protocol::gateway::PendingState::Pending,
         "the refused answers left the approval as it was"
     );
+    // Each refusal is recorded as a rejection, not left as an action nobody can account for: the
+    // worker accepts the action before it weighs the caller's history and rejects it after.
+    let mut owner = cli(&host).await;
+    for action_id in refused {
+        assert_eq!(
+            receipt(&mut owner, action_id).await.state,
+            ReceiptState::Rejected,
+            "the refused answer has a receipt that says it was refused"
+        );
+    }
 
     forward_as_device_within(
         &mut daemon,
