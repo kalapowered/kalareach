@@ -497,11 +497,33 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use kr_crypto::keys::DeviceKeys;
+    use kr_crypto::secret::SecretVec;
     use kr_crypto::sign::{SigningTranscript, verify};
     use kr_crypto::store::{MemoryStore, store_device_keys};
     use kr_protocol::service::{ServiceRequestSignature, ServiceRequestSigner};
 
     use super::*;
+
+    /// A store that fails the case on any read, for a refusal that must not look for a key.
+    struct NoReads;
+
+    impl SecretStore for NoReads {
+        fn set(&self, _: &SecretName, _: &[u8]) -> kr_crypto::Result<()> {
+            panic!("a refused challenge writes no key");
+        }
+
+        fn get(&self, name: &SecretName) -> kr_crypto::Result<Option<SecretVec>> {
+            panic!("a refused challenge looks for no key, and this one read {name}");
+        }
+
+        fn delete(&self, _: &SecretName) -> kr_crypto::Result<()> {
+            panic!("a refused challenge deletes no key");
+        }
+
+        fn describe(&self) -> String {
+            "a store that fails any read".to_owned()
+        }
+    }
 
     const VECTORS: &str = include_str!("../../../../../fixtures/push/push.json");
 
@@ -680,14 +702,13 @@ mod tests {
 
     /// KR-REQ-16.06: a challenge that does not name the pending registration (another registration,
     /// another token, another gateway, an expired or malformed challenge, none pending) gets no
-    /// answer, and none of the refusals reads the key: a store that holds none answers each of them
-    /// the same way.
+    /// answer, and none of the refusals reads the key: a store that fails any read answers each of
+    /// them the same way.
     #[test]
     fn a_challenge_for_anything_but_the_pending_registration_is_not_answered() {
         let now = now_ms();
         let pending = pending(now + 60_000);
         let data = challenge_data();
-        let empty = OneSecret::new(SecretName::new("nothing/here").expect("a name"), &[]);
         let mut other_registration = data.clone();
         other_registration.insert(
             REGISTRATION_KEY.to_owned(),
@@ -731,8 +752,9 @@ mod tests {
             let decided = verdict(data, record, at);
             assert_eq!(decided["verdict"], "refused", "{reason}: {decided}");
             assert_eq!(decided["reason"], reason);
-            let signed: Value = serde_json::from_str(&sign_with(&input(data, record, at), &empty))
-                .expect("an answer");
+            let signed: Value =
+                serde_json::from_str(&sign_with(&input(data, record, at), &NoReads))
+                    .expect("an answer");
             assert_eq!(signed["ok"], false, "{reason}: {signed}");
             assert_eq!(
                 signed["reason"], reason,
