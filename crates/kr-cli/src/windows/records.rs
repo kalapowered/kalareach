@@ -17,6 +17,10 @@
 //! **Which encoding the keys are sent as is the session's decision, and the worker makes it.** It
 //! knows what its owned backend asked for, and it spells the records as the backend asked for them,
 //! or as legacy VT input, when they reach it. This reader never learns which.
+//!
+//! When the session cannot take the records, the console is asked to spell its keys itself, and
+//! from then on its bytes are read as bytes ([`RecordReader::read_bytes`]), exactly as the console
+//! hands them over: a record is never turned into bytes here.
 
 #![expect(
     unsafe_code,
@@ -25,6 +29,7 @@
 
 use kr_client::shown;
 use kr_client::shown::Shown;
+use std::io::Read as _;
 use std::os::windows::io::AsRawHandle as _;
 
 use kr_term::win32::{KeyRecord, PairHold};
@@ -34,9 +39,10 @@ use windows_sys::Win32::System::Console::{
     ReadConsoleInputW, WINDOW_BUFFER_SIZE_EVENT,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects,
+    CreateEventW, INFINITE, ResetEvent, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
 };
 
+use crate::attach::Woken;
 use crate::error::{CliError, Result};
 
 /// How many records one read asks the console for.
@@ -46,13 +52,13 @@ use crate::error::{CliError, Result};
 const BATCH: usize = 256;
 
 /// An event the thread that reads the console waits on beside the console, so that it can be woken
-/// to end.
+/// to end or to do what it is asked.
 ///
 /// A read of the console cannot be woken by anything else the thread waits on: it is the console
 /// that is waited for, and this is what is waited for with it.
-pub struct StopEvent(std::os::windows::io::OwnedHandle);
+pub struct WakeEvent(std::os::windows::io::OwnedHandle);
 
-impl StopEvent {
+impl WakeEvent {
     /// Makes an event that is not set.
     ///
     /// # Errors
@@ -66,7 +72,7 @@ impl StopEvent {
         let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
         if event.is_null() {
             return Err(CliError::Terminal(shown!(
-                "make an event to stop reading the console with: {}",
+                "make an event to wake the console's reader with: {}",
                 Shown::io(&std::io::Error::last_os_error())
             )));
         }
@@ -78,10 +84,21 @@ impl StopEvent {
 
     /// Sets the event, which ends the wait of a thread that is waiting on it.
     pub fn signal(&self) {
-        use std::os::windows::io::AsRawHandle as _;
-
         // SAFETY: the handle is this event's own and open for the call.
         let _ = unsafe { SetEvent(self.0.as_raw_handle() as HANDLE) };
+    }
+
+    /// Clears the event, so that the next wait on it waits.
+    fn reset(&self) {
+        // SAFETY: the handle is this event's own and open for the call.
+        let _ = unsafe { ResetEvent(self.0.as_raw_handle() as HANDLE) };
+    }
+
+    /// Whether the event is set now, without waiting.
+    #[must_use]
+    pub fn is_set(&self) -> bool {
+        // SAFETY: the handle is this event's own and open for the call.
+        unsafe { WaitForSingleObject(self.0.as_raw_handle() as HANDLE, 0) == WAIT_OBJECT_0 }
     }
 }
 
@@ -105,27 +122,31 @@ impl RecordReader {
         }
     }
 
-    /// Waits until the console has input, or until `stop` is set, and says whether it is input.
+    /// Waits until the console has input, or `stop` is set, or `asked` is set, and says which.
     ///
-    /// A stop that is set is seen first, whatever the console holds.
+    /// A stop that is set is seen first, whatever the console holds. Input the console holds is seen
+    /// before a request, so that a reader asked to do something has read everything the console had
+    /// before it does it. A request seen is cleared.
     ///
     /// # Errors
     ///
     /// Returns an error when the system will not wait.
-    pub fn wait(&self, stop: &StopEvent) -> Result<bool> {
-        use std::os::windows::io::AsRawHandle as _;
-
-        let handles: [HANDLE; 2] = [
+    pub fn wait(&self, stop: &WakeEvent, asked: &WakeEvent) -> Result<Woken> {
+        let handles: [HANDLE; 3] = [
             stop.0.as_raw_handle() as HANDLE,
             self.handle.as_raw_handle() as HANDLE,
+            asked.0.as_raw_handle() as HANDLE,
         ];
-        // SAFETY: both handles are open for the call, the first the event's and the second this
-        // reader's own, and the array holds exactly the two the count names.
-        let woken = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) };
+        // SAFETY: all three handles are open for the call, the first and third the events' and the
+        // second this reader's own, and the array holds exactly the three the count names.
+        let woken = unsafe { WaitForMultipleObjects(3, handles.as_ptr(), 0, INFINITE) };
         if woken == WAIT_OBJECT_0 {
-            Ok(false)
+            Ok(Woken::Stop)
         } else if woken == WAIT_OBJECT_0 + 1 {
-            Ok(true)
+            Ok(Woken::Console)
+        } else if woken == WAIT_OBJECT_0 + 2 {
+            asked.reset();
+            Ok(Woken::Asked)
         } else {
             Err(CliError::Terminal(shown!(
                 "wait for the console's input: {}",
@@ -266,6 +287,19 @@ impl RecordReader {
             out.push(ReadEvent::Keys(ready));
         }
         Ok(out)
+    }
+
+    /// Reads the bytes the console hands over, waiting for at least one.
+    ///
+    /// This is a read of the console as a stream of bytes, for a console that has been asked to
+    /// spell its keys itself. It takes what the console gives and changes none of it, a NUL among
+    /// the bytes included.
+    ///
+    /// # Errors
+    ///
+    /// Returns the console's failure, or the end of its input as `Ok(0)`.
+    pub fn read_bytes(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.handle.read(buffer)
     }
 }
 
