@@ -1168,6 +1168,15 @@ fn stand_in(search: &Path, body: &str) {
         .expect("the stand-in can run");
 }
 
+/// Puts the Git of the machine running this test on `search`, as installing it would.
+#[cfg(unix)]
+fn install_git(search: &Path) {
+    let installed = kr_project::git::GitProgram::discover().expect("this machine has Git");
+    let _ = std::fs::remove_file(search.join("git"));
+    std::os::unix::fs::symlink(installed.program(), search.join("git"))
+        .expect("Git is put on the search path");
+}
+
 /// How many lines a file holds, none when there is no such file yet.
 #[cfg(unix)]
 fn lines_in(path: &Path) -> usize {
@@ -1209,6 +1218,44 @@ async fn listed_projects(
     )
 }
 
+/// `workspace.read`, which needs no Git.
+#[cfg(unix)]
+async fn read_workspace(
+    control: &mut LocalClient,
+    workspace_id: kr_protocol::ids::WorkspaceId,
+) -> kr_protocol::project::WorkspaceSummary {
+    typed::<WorkspaceReadResult>(
+        &control
+            .request(Method::WorkspaceRead, &WorkspaceReadParams { workspace_id })
+            .await
+            .expect("the call reaches the daemon")
+            .expect("workspace.read succeeds without Git"),
+    )
+    .workspace
+}
+
+/// `workspace.remove` of everything that can be removed, under an action of its own.
+#[cfg(unix)]
+async fn remove_workspace(
+    control: &mut LocalClient,
+    environment_id: EnvironmentId,
+    workspace_id: kr_protocol::ids::WorkspaceId,
+) -> std::result::Result<ParamsValue, ProtocolError> {
+    control
+        .mutate(
+            Method::WorkspaceRemove,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(environment_id),
+            &WorkspaceRemoveParams {
+                workspace_id,
+                retention: RetentionPolicy::RemoveRetained,
+                through_location_id: Nullable(None),
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+}
+
 /// A `project.init` in a directory of the person's, under an action of its own.
 #[cfg(unix)]
 fn init_params(environment_id: EnvironmentId, parent: &Path, name: &str) -> ProjectInitParams {
@@ -1226,7 +1273,8 @@ fn init_params(environment_id: EnvironmentId, parent: &Path, name: &str) -> Proj
 }
 
 /// A host without a working Git starts its daemon, answers what needs no Git, and refuses what
-/// runs it with the step that installs it, leaving nothing behind.
+/// runs it with the step that installs it, leaving nothing behind. When Git arrives while the
+/// daemon runs, the next request that needs it is served.
 ///
 /// The daemon is the real `kr-controller` program, started with a search path that holds nothing
 /// but the stand-in this case names, so the installed Git on the machine running the test takes no
@@ -1303,6 +1351,32 @@ async fn a_daemon_on_a_host_without_a_working_git(script: Option<&str>) {
             .projects
             .is_empty(),
         "no repository was recorded for a creation that was refused"
+    );
+
+    // A person follows the step. Git is on the search path now, and the next request that needs it
+    // finds it, with the daemon as it was: no restart. The request carries a new action, because
+    // the daemon keeps a refusal as the answer to the action it refused.
+    install_git(&search);
+    let created: ProjectInitResult = typed(
+        &control
+            .mutate(
+                Method::ProjectInit,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(environment_id),
+                &init_params(environment_id, work.path(), "fresh"),
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("project.init succeeds once Git is installed"),
+    );
+    assert_eq!(created.operation.state, OperationState::Completed);
+    assert!(work.path().join("fresh/.git").is_dir());
+    assert_eq!(
+        listed_projects(&mut control, environment_id)
+            .await
+            .projects
+            .len(),
+        1
     );
 }
 
@@ -1434,6 +1508,163 @@ async fn a_daemon_whose_git_never_answers_answers_refuses_and_ends_when_interrup
     assert!(
         !finished.exists(),
         "the stand-in was ended by the daemon and never finished by itself"
+    );
+}
+
+/// What a daemon on a host without a usable Git still serves, and what it refuses, when the
+/// records are there: a workspace a daemon with Git made is read, listed and read again, and its
+/// removal is refused before it reserves or removes anything.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_workspace_is_read_and_kept_by_a_daemon_that_cannot_run_git() {
+    let host = teardown::Tree::create();
+    let environment = host.environment();
+    let environment_id = host.environment_id();
+    let search = host.root().join("search");
+    std::fs::create_dir(&search).expect("a search path of this test's own");
+    let program = placed_daemon(&host);
+    let endpoint = environment.controller_endpoint().expect("an endpoint");
+    let work = PrivateTempDir::create();
+    let source = repository(work.path(), "source");
+    let log = host.root().join("daemon.log");
+
+    // A daemon with Git adopts the repository and makes a workspace of it.
+    let mut first = start_daemon(&program, &host, None);
+    wait_for_daemon(&endpoint, &log).await;
+    let mut control = connect(&endpoint).await;
+    let destination = |name: &str| DestinationRequest {
+        environment_id,
+        parent: kr_protocol::project::DestinationParent::Host {
+            path: work.path().display().to_string(),
+        },
+        name: name.to_owned(),
+    };
+    let adopted: ProjectAdoptResult = typed(
+        &control
+            .mutate(
+                Method::ProjectAdopt,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(environment_id),
+                &ProjectAdoptParams {
+                    destination: destination("source"),
+                    label: "source".to_owned(),
+                    flow: AdoptionFlow::ExistingCheckout,
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("project.adopt succeeds"),
+    );
+    let project = adopted.project.project_repository_id;
+    let created: WorkspaceCreateResult = typed(
+        &control
+            .mutate(
+                Method::WorkspaceCreate,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(environment_id),
+                &WorkspaceCreateParams {
+                    project_repository_id: project,
+                    label: "review".to_owned(),
+                    kind: WorkspaceKind::Isolated,
+                    isolation: Nullable::some(IsolationMechanism::GitWorktree),
+                    policy: InclusionPolicy::base_only(),
+                    base_revision: Nullable::null(),
+                    base_change_set_id: Nullable::null(),
+                    destination: Nullable::some(destination("review")),
+                    preview_only: false,
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("workspace.create succeeds"),
+    );
+    let workspace = created
+        .workspace
+        .0
+        .expect("a creation returns the workspace")
+        .workspace_id;
+    assert!(work.path().join("review/README.md").is_file());
+    drop(control);
+    first
+        .interrupt()
+        .unwrap_or_else(|error| panic!("the first daemon ends when it is interrupted: {error}"));
+
+    // The same host, with a Git that exits with status 1 where there was one.
+    stand_in(&search, "exit 1");
+    let _second = start_daemon(&program, &host, Some(&search));
+    wait_for_daemon(&endpoint, &log).await;
+    let mut control = connect(&endpoint).await;
+
+    // The records are read: the repository, its workspace, and the workspace by itself.
+    assert_eq!(
+        listed_projects(&mut control, environment_id)
+            .await
+            .projects
+            .len(),
+        1
+    );
+    let read: ProjectReadResult = typed(
+        &control
+            .request(
+                Method::ProjectRead,
+                &ProjectReadParams {
+                    project_repository_id: project,
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("project.read succeeds without Git"),
+    );
+    assert_eq!(read.project.label, "source");
+    assert_eq!(read.workspaces.len(), 1);
+    let listed: WorkspaceListResult = typed(
+        &control
+            .request(
+                Method::WorkspaceList,
+                &WorkspaceListParams {
+                    environment_id,
+                    project_repository_id: Nullable::some(project),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("workspace.list succeeds without Git"),
+    );
+    assert_eq!(listed.workspaces.len(), 1);
+    assert_eq!(
+        read_workspace(&mut control, workspace).await.state,
+        WorkspaceState::Ready
+    );
+
+    // Its removal needs Git to look at what the tree holds, and is refused: the workspace is still
+    // ready, its tree is where it was, and nothing was reserved.
+    let refusal = failure(remove_workspace(&mut control, environment_id, workspace).await);
+    assert_eq!(refusal.code, ErrorCode::HostNotConfigured, "{refusal:?}");
+    assert!(
+        refusal.message.contains(install_step()),
+        "{}",
+        refusal.message
+    );
+    assert_eq!(
+        read_workspace(&mut control, workspace).await.state,
+        WorkspaceState::Ready
+    );
+    assert!(work.path().join("review/README.md").is_file());
+
+    // Git is installed while the daemon runs, and the same removal, under an action of its own,
+    // is served.
+    install_git(&search);
+    let removed: WorkspaceRemoveResult = typed(
+        &remove_workspace(&mut control, environment_id, workspace)
+            .await
+            .expect("workspace.remove succeeds once Git is installed"),
+    );
+    assert_eq!(removed.workspace.state, WorkspaceState::Removed);
+    assert!(removed.working_files_removed);
+    assert_absent(&work.path().join("review"), "the workspace's tree is gone");
+    assert!(
+        source.join("README.md").is_file(),
+        "the source is untouched"
     );
 }
 
