@@ -596,6 +596,12 @@ impl Computer {
     /// Another device's store of the collection, reading and writing under the key of `epoch`:
     /// the collection starts at epoch 0, and each device added or taken out moves it on by one.
     fn elsewhere_at(&self, epoch: u64) -> Elsewhere {
+        self.elsewhere_over(&self.origin(), epoch)
+    }
+
+    /// As [`Self::elsewhere_at`], with the collection read at the sync service at `origin`: for a
+    /// computer whose clients reach a service other than the one its setting names.
+    fn elsewhere_over(&self, origin: &GatewayOrigin, epoch: u64) -> Elsewhere {
         let record: Value = serde_json::from_slice(
             &std::fs::read(self.data.path().join("settings-sync").join("sync.json"))
                 .expect("the record sync keeps"),
@@ -605,7 +611,7 @@ impl Computer {
             serde_json::from_value(record["collection_id"].clone()).expect("a collection");
         let object_id = SyncObjectId::new(collection_id.get());
         let keys = self.identity().keys;
-        let origin = self.origin();
+        let origin = origin.clone();
         let http = HttpService::with(
             origin.clone(),
             HttpDeadlines::default(),
@@ -1331,13 +1337,21 @@ async fn turning_sync_on_starts_a_collection_and_puts_the_settings_in_it_sealed(
 }
 
 /// KR-REQ-17.14: settings sync reaches the sync service through the clients the application was
-/// given, at the origin its record names. A fork's service in that place receives every call and
-/// the service the setting names receives none; a record made while the setting named one service
-/// keeps asking for that service after the setting names another.
+/// given, at the origin its record names, for the settings, the drafts and the members alike. A
+/// fork's service in that place receives every call, a draft's publication, a device shared with
+/// and an offer read among them, and the service the setting names receives none. A record made
+/// while the setting named one service keeps asking for that service after the setting names
+/// another, whether a step settles the settings, shares with a device, takes one out, records a
+/// revocation or lets go of the outcomes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn settings_sync_talks_to_the_service_client_it_was_given_at_the_origin_its_record_names() {
-    let computer = Computer::new().await;
+    let (computer, other) = two_computers().await;
+    let (environment, studio) = host(1, "studio");
+    computer
+        .hosts
+        .say(environment, HostPrivacy::Off { generation: 1 });
     let fork_service = serve().await;
+    let fork_origin = GatewayOrigin::new(fork_service.origin()).expect("an origin");
     let fork = Fork::at(
         &fork_service,
         computer.identity().keys.authorisation.clone(),
@@ -1363,8 +1377,20 @@ async fn settings_sync_talks_to_the_service_client_it_was_given_at_the_origin_it
         fork.asked()
     );
 
+    // The drafts of a host that allows it are published through the same client.
+    let (draft, version) = page.write_draft(Some(&studio), "a prompt to send later");
+    let view = page.drafts_on(true).expect("drafts sync is on");
+    assert!(kept_here(&view).is_empty(), "{view}");
+    let elsewhere = computer.elsewhere_over(&fork_origin, 0);
+    assert_eq!(
+        elsewhere.draft_at(draft).await,
+        Some(1),
+        "the draft was published at the fork's service"
+    );
+
     // The setting now names another service. The record still names the first: the clients are
-    // asked for it, and the fork's service goes on receiving the calls.
+    // asked for it, and the fork's service goes on receiving the calls, a draft's next version
+    // among them.
     page.call(
         "sync_service_set",
         json!({ "origin": "https://other.example" }),
@@ -1376,10 +1402,60 @@ async fn settings_sync_talks_to_the_service_client_it_was_given_at_the_origin_it
         fork_service.web().arrived().len() > before,
         "a step after the setting changed reached the service the record names"
     );
+    page.rewrite_draft(
+        Some(&studio),
+        Some(&studio),
+        draft,
+        &version,
+        "a prompt to send tomorrow",
+    );
+    page.sync_now();
+    assert_eq!(
+        elsewhere.draft_at(draft).await,
+        Some(2),
+        "the draft's next version reached the service the record names"
+    );
+
+    // The members are asked about and changed at the service the record names. A computer that
+    // holds no record reads its offers at the service its own setting names, through its own
+    // clients.
+    let shown = page.devices_refresh();
+    page.share(&reference_of(&shown["candidates"], "the-phone"))
+        .expect("shared with the phone");
+    let phone_fork = Fork::at(&fork_service, other.identity().keys.authorisation.clone());
+    let phone = other.start_with(Some(Arc::clone(&phone_fork) as _));
+    let offers = phone.devices_refresh();
+    assert_eq!(
+        offers["offers"].as_array().expect("offers").len(),
+        1,
+        "the offer was read at the fork's service: {offers}"
+    );
+    let phone_reference = reference_of(&page.devices()["members"], "the-phone");
+    page.unshare(&phone_reference)
+        .expect("the phone is taken out");
+    page.app
+        .state::<AppState>()
+        .settings()
+        .expect("settings are open")
+        .revocations_sent(&[*other.identity().keys.authorisation.public()])
+        .await
+        .expect("the revocation is recorded");
+    page.call("settings_devices_dismiss", json!({}))
+        .expect("the outcomes are let go");
+
     assert!(
         fork.asked().iter().all(|origin| *origin == ours),
         "{:?}: nothing was asked for the service the setting names now",
         fork.asked()
+    );
+    assert!(
+        phone_fork.asked().iter().all(|origin| *origin == ours),
+        "{:?}: the offer was read at the service the phone's setting names",
+        phone_fork.asked()
+    );
+    assert!(
+        computer.served.web().arrived().is_empty(),
+        "the service the setting names received none"
     );
 }
 
