@@ -125,6 +125,19 @@ export type UsageView =
   | { readonly state: 'could_not_read' }
   | { readonly state: 'signed_out' }
 
+/**
+ * One managed service this application can hold a client of, and what a person can do instead of
+ * it when it holds none. It explains availability and nothing else: no control waits on it.
+ */
+export interface ServiceLine {
+  /** The service's name, as the library reports it. */
+  readonly service: string
+  /** Whether this application holds a client of the service. */
+  readonly configured: boolean
+  /** The sentence a person reads. */
+  readonly explanation: string
+}
+
 /** The origin the ceremony runs on, named as text and never as a link. */
 export const ACCOUNT_HOST = 'reach.kala.to'
 

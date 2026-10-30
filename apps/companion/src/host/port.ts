@@ -108,7 +108,7 @@ import type {
   VoiceStopResult
 } from '@kalareach/protocol'
 
-import type { AccountView, UsageView } from '../model/account'
+import type { AccountView, ServiceLine, UsageView } from '../model/account'
 import type {
   DeletionConfirmAnswer,
   DeletionSendAnswer,
@@ -2138,6 +2138,12 @@ export interface HostPort {
 
   /** The account's usage, and nothing about money. */
   accountUsage(): Promise<UsageView>
+
+  /**
+   * Which managed services this application holds a client of, and what a person can do instead
+   * of each it does not. Nothing is asked of any service.
+   */
+  accountServices(): Promise<readonly ServiceLine[]>
 
   /**
    * What deleting the account would do, as the service says it. Nothing is changed. The page

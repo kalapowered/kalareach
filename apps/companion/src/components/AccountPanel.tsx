@@ -33,6 +33,7 @@ import {
   describeUsage,
   usageFraction,
   type AccountView,
+  type ServiceLine,
   type UsageView
 } from '../model/account'
 import { ENTRY_NOTE } from '../model/deletion'
@@ -268,6 +269,8 @@ export function AccountPanel({
           closing={deletion.step.name === 'result'}
         />
 
+        <Services port={port} standing={view.state} />
+
         <p className="account-section-title">Working without an account</p>
         <Card>
           <p className="account-note">
@@ -298,6 +301,64 @@ export function AccountPanel({
 
       {deletion.open ? <DeleteAccount flow={deletion} surface={surface} /> : null}
     </div>
+  )
+}
+
+/** A service's name as a heading: the library's lower-case words, with a capital to start. */
+function serviceTitle(line: ServiceLine): string {
+  return line.service.charAt(0).toUpperCase() + line.service.slice(1)
+}
+
+/**
+ * Which managed services this application holds a client of, and what a person does instead of
+ * each it does not. It explains availability and nothing more: no control here waits on it, no
+ * service is asked, and a read that fails leaves the section out rather than saying a service is
+ * missing. It is read again when the account's standing changes, since signing in and out moves
+ * what the application holds.
+ */
+function Services({
+  port,
+  standing
+}: {
+  readonly port: HostPort
+  readonly standing: AccountView['state']
+}): ReactNode {
+  const [lines, setLines] = useState<readonly ServiceLine[] | null>(null)
+
+  useEffect(() => {
+    let current = true
+    port.accountServices().then(
+      (read) => {
+        if (current) setLines(read)
+      },
+      () => {
+        if (current) setLines(null)
+      }
+    )
+    return () => {
+      current = false
+    }
+  }, [port, standing])
+
+  if (lines === null || lines.length === 0) return null
+  return (
+    <>
+      <p className="account-section-title">Managed services on this device</p>
+      <Card>
+        <ul className="account-services" data-testid="account-services">
+          {lines.map((line) => (
+            <li key={line.service}>
+              <span className="account-service-name">{serviceTitle(line)}</span>
+              <span className="account-note">{line.explanation}</span>
+            </li>
+          ))}
+        </ul>
+        <p className="account-help">
+          These are the services this app uses. A host keeps its own relay leases, so none is
+          listed here.
+        </p>
+      </Card>
+    </>
   )
 }
 

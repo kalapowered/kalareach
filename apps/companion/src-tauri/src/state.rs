@@ -568,6 +568,13 @@ impl AppState {
         let _ = self.sync_clients.set(clients);
     }
 
+    /// The clients of the sync service that were installed with [`Self::sync_clients_replaced`] or
+    /// made by [`Self::sync_clients`], when either has happened.
+    #[must_use]
+    pub fn installed_sync_clients(&self) -> Option<Arc<dyn crate::services::SyncServices>> {
+        self.sync_clients.get().cloned()
+    }
+
     /// The clients of the sync service this computer reaches: the ones installed with
     /// [`Self::sync_clients_replaced`], or the managed ones signing with `identity`'s key.
     #[must_use]

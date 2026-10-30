@@ -13,12 +13,15 @@
 
 use std::sync::Arc;
 
+use kr_client::services::voice::ManagedVoiceService;
 use kr_client::services::{
-    AccountTokenSource, HttpDeadlines, HttpService, ManagedSyncService, ServiceSigner,
-    SharedSyncService, managed_response_limits,
+    AccountService, AccountTokenSource, HttpDeadlines, HttpService, ManagedService,
+    ManagedSyncService, PushService, ServiceClients, ServiceSigner, SharedSyncService,
+    SyncBackupService, managed_response_limits,
 };
 use kr_crypto::keys::AuthorisationKeyPair;
 use kr_protocol::service::GatewayOrigin;
+use serde::Serialize;
 
 use crate::error::{CommandError, Result};
 use crate::recovery::DeviceSigner;
@@ -103,5 +106,104 @@ impl SyncServices for ManagedSyncServices {
         scope: &'static str,
     ) -> Result<Arc<dyn SharedSyncService>> {
         Ok(Arc::new(self.client(origin)?.presenting(tokens, scope)))
+    }
+}
+
+/// The managed services this application can hold a client of. A phone holds no relay lease: the
+/// host keeps the leases of the pairs it serves, so the application's lines leave that service out.
+pub const APPLICABLE: [ManagedService; 4] = [
+    ManagedService::AccountLogin,
+    ManagedService::Push,
+    ManagedService::SyncBackup,
+    ManagedService::ManagedInference,
+];
+
+/// The clients this application holds now, each the one its own desk uses.
+#[derive(Default)]
+pub struct Held {
+    /// The client of the account service.
+    pub account: Option<Arc<dyn AccountService>>,
+    /// The client of the sync service the person chose.
+    pub sync: Option<Arc<dyn SharedSyncService>>,
+    /// The client of the push gateway this phone talks to.
+    pub push: Option<Arc<dyn PushService>>,
+    /// The client of the voice service's broker.
+    pub inference: Option<Arc<dyn ManagedVoiceService>>,
+}
+
+impl Held {
+    /// The set the library reports availability over. A service left out is not configured, and
+    /// nothing here changes what the application does for it.
+    #[must_use]
+    pub fn into_clients(self) -> ServiceClients {
+        let mut clients = ServiceClients::none();
+        clients.account = self.account;
+        clients.sync_backup = self.sync.map(|sync| sync as Arc<dyn SyncBackupService>);
+        clients.push = self.push;
+        clients.managed_inference = self.inference;
+        clients
+    }
+}
+
+/// One service, as the page is told of it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ServiceLine {
+    /// The service's name.
+    pub service: String,
+    /// Whether this application holds a client of it. That is all a client can know without
+    /// asking: whether a call succeeds is what the call says.
+    pub configured: bool,
+    /// What a person is told: the service, and what they can do instead of it.
+    pub explanation: String,
+}
+
+/// What to say of each of the services this application can hold, in one shape. It explains and
+/// nothing more: no code path consults it before doing local work.
+#[must_use]
+pub fn lines(clients: &ServiceClients) -> Vec<ServiceLine> {
+    APPLICABLE
+        .into_iter()
+        .map(|service| {
+            let availability = clients.availability_of(service);
+            ServiceLine {
+                service: service.as_str().to_owned(),
+                configured: availability.configured,
+                explanation: availability.explanation,
+            }
+        })
+        .collect()
+}
+
+/// The clients this application holds now: the account's, and, where the desk that uses one has been
+/// opened, the sync service's at the origin the person chose, the push gateway's, and the voice
+/// broker's. A desk that is not open holds none, and the line for its service says so.
+#[must_use]
+pub fn held_by<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    account: &crate::account::Account,
+) -> Held {
+    use tauri::Manager as _;
+
+    let state = app.try_state::<crate::state::AppState>();
+    let sync = state.as_ref().and_then(|state| {
+        let chosen = state.sync_service().ok()?.origin();
+        let clients = state.installed_sync_clients().or_else(|| {
+            state
+                .device()
+                .ok()
+                .map(|device| state.sync_clients(device.identity()))
+        })?;
+        clients.installation(&chosen).ok()
+    });
+    Held {
+        account: Some(account.service()),
+        sync,
+        push: state
+            .as_ref()
+            .and_then(|state| state.push())
+            .and_then(|desk| desk.client()),
+        inference: app
+            .try_state::<crate::voice::Calls>()
+            .and_then(|calls| calls.broker(account.tokens())),
     }
 }

@@ -47,7 +47,7 @@ import type {
   VoiceStopResult
 } from '@kalareach/protocol'
 
-import type { AccountView, UsageView } from '../model/account'
+import type { AccountView, ServiceLine, UsageView } from '../model/account'
 import type {
   DeletionConfirmAnswer,
   DeletionPreview,
@@ -276,6 +276,8 @@ export interface FakeAccount {
   finishSignIn(view: AccountView): void
   /** Sets what a usage read answers. */
   setUsage(usage: UsageView): void
+  /** Sets the managed services the application reports a client of. */
+  setServices(lines: readonly ServiceLine[]): void
   /** Holds every usage read from now on until the test answers it. */
   holdUsage(): void
   /** Answers the held usage read at `index`, counting from the first one held. */
@@ -1364,6 +1366,7 @@ export function fakeHost(
 
   let accountView: AccountView = { state: 'signed_out', outcome: null }
   let accountUsage: UsageView = { state: 'signed_out' }
+  let accountServices: readonly ServiceLine[] = []
   let usageHeld = false
   const heldUsage: ((usage: UsageView) => void)[] = []
   let signOutFails = false
@@ -2841,6 +2844,7 @@ export function fakeHost(
             heldUsage.push(resolve)
           })
         : Promise.resolve(accountUsage),
+    accountServices: () => Promise.resolve(accountServices),
     accountDeletionView: () => {
       deletionViews += 1
       return Promise.resolve(deletionView)
@@ -3254,6 +3258,9 @@ export function fakeHost(
       },
       set: setAccount,
       finishSignIn: settleSignIn,
+      setServices(lines) {
+        accountServices = lines
+      },
       setUsage(usage) {
         accountUsage = usage
       },

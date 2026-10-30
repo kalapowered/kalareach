@@ -223,6 +223,7 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("account_sign_in_cancel", None),
     ("account_sign_out", None),
     ("account_usage", None),
+    ("account_services", None),
     // Deleting the account: the page reads what it would do, asks for the emailed code, confirms
     // with it, learns how the removal goes, can close the step for a confirmation that has no answer,
     // and says when it has shown the result.
@@ -706,6 +707,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         account_sign_in_cancel,
         account_sign_out,
         account_usage,
+        account_services,
         account_deletion_view,
         account_deletion_send_code,
         account_deletion_confirm,
@@ -3888,6 +3890,7 @@ mod tests {
         "account_sign_in_cancel",
         "account_sign_out",
         "account_usage",
+        "account_services",
         "account_deletion_view",
         "account_deletion_send_code",
         "account_deletion_confirm",
@@ -4051,7 +4054,7 @@ mod tests {
                 // needs it.
                 "voice_call_state",
                 "voice_set_muted",
-                // The account's eleven. Each reaches the account service or this device's secure
+                // The account's twelve. Each reaches the account service or this device's secure
                 // store, and none reaches a host.
                 "account_sign_in",
                 "account_sign_in_cancel",
@@ -4059,6 +4062,7 @@ mod tests {
                 "account_sign_out",
                 "account_status",
                 "account_usage",
+                "account_services",
                 "account_deletion_view",
                 "account_deletion_send_code",
                 "account_deletion_confirm",
@@ -4859,6 +4863,19 @@ pub async fn account_usage(
     account: State<'_, crate::account::AccountSlot>,
 ) -> Result<crate::account::UsageView> {
     Ok(account.get().await?.usage().await)
+}
+
+/// Which managed services this application holds a client of, with what a person can do instead
+/// of each that it does not. It is an explanation: nothing is asked of any service.
+#[tauri::command]
+pub async fn account_services<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    account: State<'_, crate::account::AccountSlot>,
+) -> Result<Vec<crate::services::ServiceLine>> {
+    let account = account.get().await?;
+    Ok(crate::services::lines(
+        &crate::services::held_by(&app, &account).into_clients(),
+    ))
 }
 
 /// What deleting the account would do, as the service says it. Nothing is changed.
