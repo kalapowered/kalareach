@@ -1539,7 +1539,9 @@ async fn a_host_on_every_interface_hints_the_addresses_it_found_there() {
 // silently when that binary was absent would report a pass for something it never ran.
 /// KR-REQ-27.05, revoked devices: a paired device that the owner revokes with `device.revoke`
 /// while its connection is authorised and its subscription is running has the connection ended,
-/// not noticed at its next request, and its record is withdrawn so it cannot come back.
+/// not noticed at its next request, and its record is withdrawn so that it cannot come back. A
+/// record that is not marked fails the case at the reconnect; the barrier of the same revocation
+/// also ends the connection, so the case does not tell the live fence from the barrier.
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_revoked_device_is_fenced_before_it_is_served_again() {
