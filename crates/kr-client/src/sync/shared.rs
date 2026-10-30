@@ -6,7 +6,7 @@
 //! nobody has claimed. Once a key record has claimed a collection, every request about it names
 //! the home it lives in and every write names the epoch its object is sealed under, so the plain
 //! service no longer reaches it. [`SharedCollectionService`] is the one that does: it holds the
-//! collection and the epoch, and asks the `_shared` calls of [`ManagedSyncService`] for what the
+//! collection and the epoch, and asks the `_shared` calls of [`SharedSyncService`] for what the
 //! clients ask.
 //!
 //! # One epoch per value
@@ -48,7 +48,7 @@ use super::membership::CollectionRef;
 use super::{CollectionKeys, CollectionSealer};
 use crate::error::{ClientError, Result};
 use crate::services::{
-    Keyed, ManagedSyncService, ServiceFuture, SyncBackupService, SyncExchanged, SyncFetched,
+    Keyed, ServiceFuture, SharedSyncService, SyncBackupService, SyncExchanged, SyncFetched,
     SyncRequestFence, SyncRequestStatus,
 };
 use crate::shown::Shown;
@@ -56,7 +56,7 @@ use crate::shown::Shown;
 /// A collection two or more devices share, as the single-object service the clients write
 /// through, at one epoch.
 pub struct SharedCollectionService {
-    service: Arc<ManagedSyncService>,
+    service: Arc<dyn SharedSyncService>,
     collection: CollectionRef,
     epoch: u64,
     /// The oldest epoch whose objects are believed.
@@ -83,7 +83,7 @@ impl SharedCollectionService {
     /// more.
     #[must_use]
     pub const fn new(
-        service: Arc<ManagedSyncService>,
+        service: Arc<dyn SharedSyncService>,
         collection: CollectionRef,
         epoch: u64,
     ) -> Self {
