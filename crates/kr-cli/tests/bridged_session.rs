@@ -3133,29 +3133,31 @@ impl Runtime {
             return;
         }
         let context = tempfile::tempdir().expect("an empty build context");
-        let mut build = std::process::Command::new(&self.program)
-            .args(["build", "--quiet", "--pull=never", "--tag", INSTALLED_IMAGE])
-            .args(["--file", "-"])
-            .arg(context.path())
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("the runtime builds");
-        build
-            .stdin
-            .take()
-            .expect("the build reads its file from standard input")
-            .write_all(
-                format!(
-                    "FROM {CONTAINER_IMAGE}\nRUN apt-get update -qq && \\\n    \
-                     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-                     git && rm -rf /var/lib/apt/lists/*\n"
-                )
-                .as_bytes(),
+        let file = context.path().join("Containerfile");
+        std::fs::write(
+            &file,
+            format!(
+                "FROM {CONTAINER_IMAGE}\nRUN apt-get update -qq && \\\n    \
+                 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+                 git && rm -rf /var/lib/apt/lists/*\n"
+            ),
+        )
+        .expect("writes the file");
+        let built = self
+            .run(
+                &[
+                    "build",
+                    "--quiet",
+                    "--pull=never",
+                    "--tag",
+                    INSTALLED_IMAGE,
+                    "--file",
+                    file.to_str().expect("a path of text"),
+                    context.path().to_str().expect("a path of text"),
+                ],
+                self.slow,
             )
-            .expect("writes the file");
-        let built = build.wait_with_output().expect("the build ends");
+            .unwrap_or_else(|why| panic!("{why}"));
         assert!(
             built.status.success(),
             "the image that adds Git is built: {}",
@@ -3546,6 +3548,22 @@ fn a_runtime_that_never_answers_its_version_fails_the_case_and_is_not_skipped() 
     assert!(
         !absent.is_available(),
         "a runtime that is not installed is skipped"
+    );
+}
+
+/// An image build that never ends fails the case with the build named, and does not hold the suite.
+#[test]
+fn an_image_build_that_never_ends_fails_the_case_and_names_the_build() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let runtime = stalling_runtime(directory.path(), &["build"]);
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.ensure_images()));
+    let said = panic_message(failed.expect_err("a build that never ends fails the case"));
+    assert!(said.contains("\"build\""), "the call is named: {said}");
+    assert!(
+        recorded_calls(directory.path())
+            .iter()
+            .any(|call| call.starts_with("build ")),
+        "the build was started"
     );
 }
 
