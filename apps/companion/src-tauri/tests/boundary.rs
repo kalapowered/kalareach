@@ -231,12 +231,12 @@ fn the_page_opens_nothing_itself_and_a_link_goes_through_the_scheme_policy() {
 }
 
 /// KR-REQ-17.19: the account's commands are the application's own, and none of them is a host
-/// method or takes an address from the page. Deleting the account is five of them: what it would
-/// do, the emailed code, the confirmation, how the removal goes, and giving up on a confirmation
-/// that has no answer. The services line is one more: which managed services the application holds
-/// a client of, which asks no service.
+/// method or takes an address from the page. Deleting the account is six of them: what it would
+/// do, the emailed code, the confirmation, how the removal goes, giving up on a confirmation that
+/// has no answer, and the page saying it has shown the result. The services line is one more: which
+/// managed services the application holds a client of, which asks no service.
 #[test]
-fn the_account_is_reached_through_twelve_named_commands() {
+fn the_account_is_reached_through_its_named_commands() {
     let account: Vec<&str> = NAMED_COMMANDS
         .iter()
         .filter(|(command, _)| command.starts_with("account_"))
