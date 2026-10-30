@@ -482,6 +482,7 @@ mod platform {
 #[cfg(target_os = "linux")]
 mod platform {
     use super::{Child, Command, Stdio};
+    use kr_describe::resource::{PowerSource as HostPower, Signal};
     use kr_protocol::desktop::PowerSource;
 
     /// The facility the login manager holds a sleep inhibitor with.
@@ -548,38 +549,20 @@ mod platform {
 
     /// Reads whether this host is running on mains power.
     ///
-    /// The kernel publishes one file per power supply. A supply of type `Mains` that is online is
-    /// the answer; a host with no mains supply at all is a host running on battery. A host with no
-    /// power supplies published is a desktop machine or a virtual one, and neither answers this.
+    /// Through the reader the description host uses, so that `host.info` and the descriptions say
+    /// the same of one machine: the kernel's power-supply class, read by supply type. A host the
+    /// reader cannot qualify (it lists a supply it will not describe, or has a battery and no
+    /// charger online) is unknown, which a `mains_only` setting does not take for mains.
     pub(super) fn power_source() -> PowerSource {
         power_source_in(std::path::Path::new("/sys/class/power_supply"))
     }
 
     /// Reads whether the host is running on mains power from the power-supply class under `root`.
     fn power_source_in(root: &std::path::Path) -> PowerSource {
-        let Ok(entries) = std::fs::read_dir(root) else {
-            return PowerSource::Unknown;
-        };
-        let mut mains = None;
-        let mut battery = false;
-        for entry in entries.flatten() {
-            let kind = std::fs::read_to_string(entry.path().join("type")).unwrap_or_default();
-            match kind.trim() {
-                "Mains" => {
-                    let online =
-                        std::fs::read_to_string(entry.path().join("online")).unwrap_or_default();
-                    mains = Some(mains.unwrap_or(false) || online.trim() == "1");
-                }
-                "Battery" => battery = true,
-                _ => {}
-            }
-        }
-        match (mains, battery) {
-            (Some(true), _) => PowerSource::Mains,
-            (Some(false), true) => PowerSource::Battery,
-            (Some(false), false) => PowerSource::Unknown,
-            (None, true) => PowerSource::Battery,
-            (None, false) => PowerSource::Unknown,
+        match kr_describe::resource::platform::power_of_supplies(root) {
+            Signal::Qualified(HostPower::Mains) => PowerSource::Mains,
+            Signal::Qualified(HostPower::Battery) => PowerSource::Battery,
+            Signal::Unqualified { .. } => PowerSource::Unknown,
         }
     }
 
