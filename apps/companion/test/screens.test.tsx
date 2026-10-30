@@ -985,18 +985,43 @@ describe('packages', () => {
 })
 
 describe('change sets', () => {
-  it('shows what a change set holds and what it left out, and every version beside it', async () => {
+  it('shows what a change set holds, what it left out and which version it is', async () => {
     start({ view: 'changesets' })
     const shown = await screen.findByTestId('change-set')
     await waitFor(() => {
       expect(within(shown).getByRole('heading', { name: 'Wait on the subscription rather than a timer' })).toBeInTheDocument()
     })
-    expect(shown.textContent).toContain('Version 2 of 2')
+    expect(shown.textContent).toContain('Version 2 · against')
     expect(shown.textContent).toContain('Read while the workspace was held still.')
     expect(shown.textContent).toContain('tests/reconnect.rs')
     expect(shown.querySelector('[data-change="deleted"]')?.textContent).toContain('Deleted')
     expect(shown.textContent).toContain('Covered by a secret rule, so never read')
     expect(shown.textContent).toContain('Identical source does not reproduce')
+  })
+
+  it('does not count the versions a bounded device was shown against the version it reads', async () => {
+    // A device whose history starts after version 1 is listed version 2 alone, so the number of
+    // versions it is shown says nothing about which one this is.
+    const { port } = fakeHost()
+    render(
+      <AppProvider
+        port={{
+          ...port,
+          changesetRead: async (params) => {
+            const read = await port.changesetRead(params)
+            return { ...read, versions: read.versions.filter((each) => each.version === '2') }
+          }
+        }}
+        initialPlace={{ view: 'changesets' }}
+      >
+        <App />
+      </AppProvider>
+    )
+    const shown = await screen.findByTestId('change-set')
+    await waitFor(() => {
+      expect(shown.textContent).toContain('Version 2')
+    })
+    expect(shown.textContent).not.toMatch(/Version \d+ of/)
   })
 
   it('reads each change set at the version its review names', async () => {
