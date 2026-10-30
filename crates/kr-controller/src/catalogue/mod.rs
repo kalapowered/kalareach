@@ -660,19 +660,21 @@ impl CatalogueModule {
     /// is no change and is not run so: it is reached in the handler of the connection that asked,
     /// and the connection's end is not seen until the plan's fetch of the manifest is over.
     async fn off_the_executor_async<W: std::future::Future>(&self, work: W) -> W::Output {
+        // Only a build with the testing hooks has anything to say before the work is awaited.
         #[cfg(feature = "testing")]
-        let hook = self.testing_hook();
-        let held = async move {
-            #[cfg(feature = "testing")]
-            if let Some(hook) = hook {
-                (hook.0)(TestingPoint::Held);
+        let work = {
+            let hook = self.testing_hook();
+            async move {
+                if let Some(hook) = hook {
+                    (hook.0)(TestingPoint::Held);
+                }
+                work.await
             }
-            work.await
         };
         if on_a_multi_thread_runtime() {
-            tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(held))
+            tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(work))
         } else {
-            held.await
+            work.await
         }
     }
 
