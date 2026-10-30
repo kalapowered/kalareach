@@ -174,9 +174,34 @@ pub fn lines(clients: &ServiceClients) -> Vec<ServiceLine> {
         .collect()
 }
 
-/// The clients this application holds now: the account's, and, where the desk that uses one has been
-/// opened, the sync service's at the origin the person chose, the push gateway's, and the voice
-/// broker's. A desk that is not open holds none, and the line for its service says so.
+impl Held {
+    /// The clients this application holds now: the account's, and, where the desk that uses one
+    /// has been opened, the sync service's at the origin the person chose, the push gateway's, and
+    /// the voice broker's, which `calls` makes for the tokens it is given. A desk that is not open
+    /// holds none, and the line for its service says so.
+    #[must_use]
+    pub fn of(
+        state: Option<&crate::state::AppState>,
+        calls: Option<(&crate::voice::Calls, Arc<dyn AccountTokenSource>)>,
+        account: Arc<dyn AccountService>,
+    ) -> Self {
+        let sync = state.and_then(|state| {
+            let chosen = state.sync_service().ok()?.origin();
+            state.installed_sync_clients()?.installation(&chosen).ok()
+        });
+        Self {
+            account: Some(account),
+            sync,
+            push: state
+                .and_then(crate::state::AppState::push)
+                .and_then(|desk| desk.client()),
+            inference: calls.and_then(|(calls, tokens)| calls.broker(tokens)),
+        }
+    }
+}
+
+/// The clients this application holds now, as [`Held::of`] reads them from the application's
+/// state and its voice calls.
 #[must_use]
 pub fn held_by<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
@@ -185,25 +210,12 @@ pub fn held_by<R: tauri::Runtime>(
     use tauri::Manager as _;
 
     let state = app.try_state::<crate::state::AppState>();
-    let sync = state.as_ref().and_then(|state| {
-        let chosen = state.sync_service().ok()?.origin();
-        let clients = state.installed_sync_clients().or_else(|| {
-            state
-                .device()
-                .ok()
-                .map(|device| state.sync_clients(device.identity()))
-        })?;
-        clients.installation(&chosen).ok()
-    });
-    Held {
-        account: Some(account.service()),
-        sync,
-        push: state
-            .as_ref()
-            .and_then(|state| state.push())
-            .and_then(|desk| desk.client()),
-        inference: app
-            .try_state::<crate::voice::Calls>()
-            .and_then(|calls| calls.broker(account.tokens())),
-    }
+    let calls = app.try_state::<crate::voice::Calls>();
+    Held::of(
+        state.as_deref(),
+        calls
+            .as_deref()
+            .map(|calls| (calls, account.tokens() as Arc<dyn AccountTokenSource>)),
+        account.service(),
+    )
 }

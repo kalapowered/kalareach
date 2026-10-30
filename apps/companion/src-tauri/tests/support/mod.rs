@@ -637,6 +637,7 @@ impl Companion {
                 true
             })
             .invoke_handler(tauri::generate_handler![
+                companion_tauri::commands::account_services,
                 companion_tauri::commands::question_read,
                 companion_tauri::commands::question_answer,
                 companion_tauri::commands::question_kept,

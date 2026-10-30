@@ -574,9 +574,11 @@ fn the_application_reports_the_managed_services_it_holds_a_client_of() {
     // held, and the factory was asked for the origin the setting names.
     let directory = tempfile::tempdir().expect("a directory");
     let state = companion_tauri::state::AppState::new();
-    state.sync_service_opened(Arc::new(companion_tauri::sync_service::SyncService::open(
-        directory.path(),
-    )));
+    let setting = companion_tauri::sync_service::SyncService::open(directory.path());
+    setting
+        .set("https://sync.example")
+        .expect("another service is chosen");
+    state.sync_service_opened(Arc::new(setting));
     let recording = Arc::new(Recording {
         clients: companion_tauri::services::ManagedSyncServices::new(
             kr_crypto::keys::AuthorisationKeyPair::generate().expect("a key"),
@@ -591,7 +593,7 @@ fn the_application_reports_the_managed_services_it_holds_a_client_of() {
     );
     assert_eq!(
         *recording.asked.lock().expect("the record"),
-        [ACCOUNT_ORIGIN.to_owned()],
-        "the line is made from the client at the chosen origin"
+        ["https://sync.example".to_owned()],
+        "the line is made from the client at the origin the setting names"
     );
 }

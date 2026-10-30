@@ -48,19 +48,22 @@ mod support;
 #[path = "../../../../crates/kr-controller/tests/voice_support/mod.rs"]
 mod voice_support;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use companion_platform::call::{CallEvent, FailureKind};
 use companion_tauri::account::carrier::{Boxed, Carrier, Ending, Plan, Unavailable};
 use companion_tauri::account::{Account, AccountSlot};
-use companion_tauri::voice::{Calls, Kept, Service, Timings};
+use companion_tauri::voice::{Calls, Kept, Service, Timings, managed_brokers};
 use kr_client::services::ServiceFuture;
 use kr_client::services::account::{
     AccountIdentity, AccountService, AccountToken, AccountUsage, AuthorisationGrant, Client,
     Exchanged, IssuedGrant, PendingAuthorisation, RefreshToken, Refreshed, SignedInAccount,
     StoredGrant,
+};
+use kr_client::services::voice::{
+    ManagedVoiceService, VoiceClosure, VoiceMetadata, VoiceSessionRequest, VoiceStart,
 };
 use kr_client::services::voice_control::ControlConnector;
 use kr_client::services::{HttpDeadlines, HttpService, managed_response_limits};
@@ -307,6 +310,55 @@ async fn scene_over(
     account_origin: Option<&str>,
     deadlines: HttpDeadlines,
 ) -> Scene {
+    scene_replacing(timings, signed_in, account_origin, deadlines, |service| {
+        service
+    })
+    .await
+}
+
+/// A voice broker of a fork's own, in the managed broker's place: it records the calls it is asked
+/// to close and is the managed client for the rest.
+#[derive(Debug)]
+struct ForkBroker {
+    managed: Arc<dyn ManagedVoiceService>,
+    closed: Arc<Mutex<Vec<String>>>,
+}
+
+impl ManagedVoiceService for ForkBroker {
+    fn metadata(&self) -> ServiceFuture<'_, Option<VoiceMetadata>> {
+        self.managed.metadata()
+    }
+
+    fn start<'a>(&'a self, request: &'a VoiceSessionRequest) -> ServiceFuture<'a, VoiceStart> {
+        self.managed.start(request)
+    }
+
+    fn close<'a>(&'a self, call_id: &'a str) -> ServiceFuture<'a, VoiceClosure> {
+        self.closed
+            .lock()
+            .expect("the record")
+            .push(call_id.to_owned());
+        self.managed.close(call_id)
+    }
+
+    fn call_is_open<'a>(&'a self, call_id: &'a str) -> ServiceFuture<'a, bool> {
+        self.managed.call_is_open(call_id)
+    }
+
+    fn provider(&self) -> String {
+        self.managed.provider()
+    }
+}
+
+/// As [`scene_over`], with the voice service the phone is given made from the managed one by
+/// `replacing`.
+async fn scene_replacing(
+    timings: Timings,
+    signed_in: Option<IssuedGrant>,
+    account_origin: Option<&str>,
+    deadlines: HttpDeadlines,
+    replacing: impl FnOnce(Service) -> Service,
+) -> Scene {
     let stand_in = StandIn::start().await;
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start_with_document(&owner, &document_naming(stand_in.origin())).await;
@@ -343,10 +395,10 @@ async fn scene_over(
     let data = tempfile::tempdir().expect("a directory");
     let calls = Calls::on_phone(
         Arc::clone(&platform) as Arc<dyn companion_platform::call::CallPlatform>,
-        service_with(
+        replacing(service_with(
             account_origin.unwrap_or_else(|| stand_in.origin()),
             deadlines,
-        ),
+        )),
         timings,
         Kept::at(data.path()),
     );
@@ -1751,14 +1803,32 @@ async fn forgetting_the_host_ends_the_call_and_owes_the_revocation() {
 /// The host created the call, and cannot be told it is over: it is gone before the device finishes
 /// setting the call up. The call is ended all the same, the revocation is owed, and the voice
 /// service is told over its own route, with the account's token, because nothing else can: no
-/// control was opened for the call and the host cannot tell it.
+/// control was opened for the call and the host cannot tell it. KR-REQ-17.14: the close goes
+/// through the client of the voice service the application was given, and the application reports
+/// the managed inference service as one it holds a client of.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_call_the_host_cannot_be_told_about_is_closed_at_the_service_over_its_own_route() {
     let timings = Timings {
         host_within: Duration::from_secs(3),
         ..quick()
     };
-    let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
+    let closed = Arc::new(Mutex::new(Vec::<String>::new()));
+    let recording = Arc::clone(&closed);
+    let mut scene = scene_replacing(
+        timings,
+        Some(phone_grant(PHONE_TOKEN, 3600)),
+        None,
+        HttpDeadlines::default(),
+        move |service| {
+            service.with_brokers(Arc::new(move |origin, http, tokens| {
+                Ok(Arc::new(ForkBroker {
+                    managed: managed_brokers()(origin, http, tokens)?,
+                    closed: Arc::clone(&recording),
+                }) as Arc<dyn ManagedVoiceService>)
+            }))
+        },
+    )
+    .await;
     scene.platform.hold("permit");
     let _holding = scene.platform.release_when_done("permit");
     scene.platform.refuse_the_permit();
@@ -1794,6 +1864,21 @@ async fn a_call_the_host_cannot_be_told_about_is_closed_at_the_service_over_its_
         1,
         "the service was told over its own route"
     );
+    assert_eq!(
+        *closed.lock().expect("the record"),
+        ["call-1".to_owned()],
+        "the close went through the client the application was given"
+    );
+    let services = scene
+        .call("account_services", json!({}))
+        .expect("the services the application holds a client of");
+    let inference = services
+        .as_array()
+        .expect("a list of lines")
+        .iter()
+        .find(|line| line["service"] == "managed inference")
+        .expect("the managed inference line");
+    assert_eq!(inference["configured"], true, "{services}");
 }
 
 /// The person chooses another host to browse while a call runs. The call belongs to the host that
