@@ -3086,15 +3086,20 @@ impl Runtime {
             .unwrap_or_else(|why| panic!("{why}"))
     }
 
-    /// Whether this machine has the runtime. A case skips itself where it has not.
+    /// Whether the program is there to run: a path names a file, and a bare name is on `PATH`.
+    fn installed(&self) -> bool {
+        if self.program.components().count() > 1 {
+            return self.program.is_file();
+        }
+        std::env::var_os("PATH").is_some_and(|path| {
+            std::env::split_paths(&path).any(|directory| directory.join(&self.program).is_file())
+        })
+    }
+
+    /// Whether this machine has the runtime. A case skips itself where it has not. A runtime that
+    /// is there and does not answer `--version` fails the case instead.
     fn is_available(&self) -> bool {
-        let present = std::process::Command::new(&self.program)
-            .arg("--version")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
+        let present = self.installed() && self.call(&["--version"]).status.success();
         if !present {
             eprintln!(
                 "skipped, because {} is not installed on this machine",
@@ -3521,6 +3526,26 @@ fn a_container_start_that_stalls_after_the_runtime_made_the_container_removes_it
             .iter()
             .any(|call| call.starts_with("rm ") && call.ends_with(&format!(" -- {name}"))),
         "the container is removed by the name it was given: {calls:?}"
+    );
+}
+
+/// A runtime that is installed and never answers `--version` fails the case with the call named,
+/// where a runtime that is not installed skips it.
+#[test]
+fn a_runtime_that_never_answers_its_version_fails_the_case_and_is_not_skipped() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let stalled = stalling_runtime(directory.path(), &["--version"]);
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stalled.is_available()));
+    let said = panic_message(failed.expect_err("a runtime that does not answer fails the case"));
+    assert!(said.contains("\"--version\""), "the call is named: {said}");
+
+    let absent = Runtime {
+        program: directory.path().join("no-such-runtime"),
+        ..stalled
+    };
+    assert!(
+        !absent.is_available(),
+        "a runtime that is not installed is skipped"
     );
 }
 
