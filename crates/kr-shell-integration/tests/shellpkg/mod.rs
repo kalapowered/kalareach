@@ -1696,6 +1696,23 @@ impl Session {
         id
     }
 
+    /// Waits for the answer to a request asked after the reader's step, without giving the reader
+    /// another step while it waits.
+    ///
+    /// Every acknowledgement this session writes gives the reader a step, and a step is a key in
+    /// the terminal's queue. A case that is counting what the terminal holds unread would count
+    /// those keys, so it waits for the answer here and not in [`Session::answer`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when the reader does not answer inside [`REPLY`].
+    pub fn answer_after_the_step(&mut self, id: RequestId) -> BridgeAnswer {
+        self.stepping = false;
+        let answer = self.answer(id);
+        self.stepping = true;
+        answer
+    }
+
     /// Gives a reader that reaches its own queue only when it steps one step to take.
     ///
     /// The key is one the editor has a binding for, because that is where this package's own
@@ -1710,16 +1727,21 @@ impl Session {
         self.nudge_before(deadline.0);
     }
 
-    /// Types the step a reader that answers only when it steps will take, without waiting for it.
+    /// Types `bytes` into the terminal, behind the step a reader that answers only when it steps
+    /// will take, in one write, without waiting for the step.
     ///
-    /// A shell that is stopped takes the key in its terminal's queue, ahead of anything typed after
-    /// it, and steps when it is let go. This is how a case puts input behind the reader's step.
-    pub fn type_the_step(&mut self) {
-        if !self.reading || !self.stepping || !dialect(self.package_kind).answers_at_the_next_step {
-            return;
+    /// A shell that is stopped takes the step in its terminal's queue ahead of what follows it, and
+    /// steps when it is let go. One write puts both in the terminal together, so a runtime that
+    /// reads in chunks takes them in one read, which is how input comes to be behind the step in
+    /// the runtime's buffer and not in the terminal's queue.
+    pub fn type_behind_the_step(&mut self, bytes: &[u8]) {
+        let mut typed = Vec::with_capacity(bytes.len() + 1);
+        if self.reading && self.stepping && dialect(self.package_kind).answers_at_the_next_step {
+            typed.push(0x06);
         }
+        typed.extend_from_slice(bytes);
         let deadline = self.deadline_for(REPLY);
-        self.type_bytes_before(&[0x06], deadline.0);
+        self.type_bytes_before(&typed, deadline.0);
     }
 
     /// Gives the reader that step, and is over by `deadline` whatever happens.
