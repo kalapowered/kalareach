@@ -278,6 +278,8 @@ export interface FakeAccount {
   setUsage(usage: UsageView): void
   /** Sets the managed services the application reports a client of. */
   setServices(lines: readonly ServiceLine[]): void
+  /** Makes every read of the managed services fail from now on. */
+  failServices(): void
   /** Holds every usage read from now on until the test answers it. */
   holdUsage(): void
   /** Answers the held usage read at `index`, counting from the first one held. */
@@ -1367,6 +1369,7 @@ export function fakeHost(
   let accountView: AccountView = { state: 'signed_out', outcome: null }
   let accountUsage: UsageView = { state: 'signed_out' }
   let accountServices: readonly ServiceLine[] = []
+  let servicesFail = false
   let usageHeld = false
   const heldUsage: ((usage: UsageView) => void)[] = []
   let signOutFails = false
@@ -2845,7 +2848,10 @@ export function fakeHost(
             heldUsage.push(resolve)
           })
         : Promise.resolve(accountUsage),
-    accountServices: () => Promise.resolve(accountServices),
+    accountServices: () =>
+      servicesFail
+        ? Promise.reject(new Error('the application could not say'))
+        : Promise.resolve(accountServices),
     accountDeletionView: () => {
       deletionViews += 1
       return Promise.resolve(deletionView)
@@ -3261,6 +3267,9 @@ export function fakeHost(
       finishSignIn: settleSignIn,
       setServices(lines) {
         accountServices = lines
+      },
+      failServices() {
+        servicesFail = true
       },
       setUsage(usage) {
         accountUsage = usage
