@@ -2197,6 +2197,185 @@ impl ManagedSyncService {
     }
 }
 
+/// What a device that takes part in a shared collection asks of the sync service besides the
+/// single objects [`SyncBackupService`] writes: the same calls for a collection several
+/// installations share, the listing of the memberships this installation holds, and the key
+/// records of a collection ([`KeyRecordService`]).
+///
+/// It is the whole of what settings sync asks of the service, so that one client can be replaced
+/// by another and every call settings sync makes follows it. A call carries what it did before it
+/// was a method of a trait: the collection it names, the epoch it writes under and the instant it
+/// is signed at, which the caller states.
+pub trait SharedSyncService: SyncBackupService + KeyRecordService {
+    /// Compares what a reader holds of a shared collection with what the service holds, as
+    /// [`ManagedSyncService::compare_shared`] does.
+    fn compare_shared<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        known: &'a [KnownRevision],
+        with_copies: bool,
+        after: Option<u64>,
+    ) -> ServiceFuture<'a, Option<SyncComparison>>;
+
+    /// Writes one object of a shared collection, as [`ManagedSyncService::exchange_shared`] does.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the call as the service takes it"
+    )]
+    fn exchange_shared<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        object: &'a str,
+        epoch: u64,
+        request_id: Uuid,
+        signed_at_ms: u64,
+        expected: Option<SyncPosition>,
+        ciphertext: &'a [u8],
+    ) -> ServiceFuture<'a, Keyed<SyncExchanged>>;
+
+    /// Removes one object of a shared collection, as [`ManagedSyncService::remove_shared`] does.
+    fn remove_shared<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        object: &'a str,
+        epoch: u64,
+        request_id: Uuid,
+        signed_at_ms: u64,
+        expected: Option<SyncPosition>,
+    ) -> ServiceFuture<'a, Keyed<SyncExchanged>>;
+
+    /// What the service recorded about one request on a shared collection, as
+    /// [`ManagedSyncService::status_shared`] does.
+    fn status_shared<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        request_id: Uuid,
+    ) -> ServiceFuture<'a, Keyed<SyncRequestStatus>>;
+
+    /// Ends one request on a shared collection, as [`ManagedSyncService::fence_shared`] does.
+    fn fence_shared<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        request_id: Uuid,
+        first_signed_at_ms: u64,
+        last_signed_at_ms: u64,
+    ) -> ServiceFuture<'a, Keyed<SyncRequestFence>>;
+
+    /// Drops the copy a refusal retained, as [`ManagedSyncService::resolve_shared`] does.
+    fn resolve_shared<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        retained: SyncConflictId,
+    ) -> ServiceFuture<'a, Option<bool>>;
+
+    /// The collections this installation is a member of, as [`ManagedSyncService::memberships`]
+    /// does.
+    fn memberships(&self) -> ServiceFuture<'_, Vec<MembershipListing>>;
+
+    /// The origin of the service this client asks.
+    fn origin(&self) -> &GatewayOrigin;
+}
+
+impl SharedSyncService for ManagedSyncService {
+    fn compare_shared<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        known: &'a [KnownRevision],
+        with_copies: bool,
+        after: Option<u64>,
+    ) -> ServiceFuture<'a, Option<SyncComparison>> {
+        Box::pin(Self::compare_shared(
+            self,
+            collection,
+            known,
+            with_copies,
+            after,
+        ))
+    }
+
+    fn exchange_shared<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        object: &'a str,
+        epoch: u64,
+        request_id: Uuid,
+        signed_at_ms: u64,
+        expected: Option<SyncPosition>,
+        ciphertext: &'a [u8],
+    ) -> ServiceFuture<'a, Keyed<SyncExchanged>> {
+        Box::pin(Self::exchange_shared(
+            self,
+            collection,
+            object,
+            epoch,
+            request_id,
+            signed_at_ms,
+            expected,
+            ciphertext,
+        ))
+    }
+
+    fn remove_shared<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        object: &'a str,
+        epoch: u64,
+        request_id: Uuid,
+        signed_at_ms: u64,
+        expected: Option<SyncPosition>,
+    ) -> ServiceFuture<'a, Keyed<SyncExchanged>> {
+        Box::pin(Self::remove_shared(
+            self,
+            collection,
+            object,
+            epoch,
+            request_id,
+            signed_at_ms,
+            expected,
+        ))
+    }
+
+    fn status_shared<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        request_id: Uuid,
+    ) -> ServiceFuture<'a, Keyed<SyncRequestStatus>> {
+        Box::pin(Self::status_shared(self, collection, request_id))
+    }
+
+    fn fence_shared<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        request_id: Uuid,
+        first_signed_at_ms: u64,
+        last_signed_at_ms: u64,
+    ) -> ServiceFuture<'a, Keyed<SyncRequestFence>> {
+        Box::pin(Self::fence_shared(
+            self,
+            collection,
+            request_id,
+            first_signed_at_ms,
+            last_signed_at_ms,
+        ))
+    }
+
+    fn resolve_shared<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        retained: SyncConflictId,
+    ) -> ServiceFuture<'a, Option<bool>> {
+        Box::pin(Self::resolve_shared(self, collection, retained))
+    }
+
+    fn memberships(&self) -> ServiceFuture<'_, Vec<MembershipListing>> {
+        Box::pin(Self::memberships(self))
+    }
+
+    fn origin(&self) -> &GatewayOrigin {
+        Self::origin(self)
+    }
+}
+
 impl SyncBackupService for ManagedSyncService {
     fn compare_exchange<'a>(
         &'a self,

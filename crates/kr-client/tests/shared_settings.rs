@@ -29,7 +29,8 @@ use kr_client::drafts::{
     draft_collection,
 };
 use kr_client::services::{
-    ManagedSyncService, ServiceHttp, SyncBackupService, SyncExchanged, SyncFetched,
+    ManagedSyncService, ServiceHttp, SharedSyncService, SyncBackupService, SyncExchanged,
+    SyncFetched,
 };
 use kr_client::sync::membership::{CollectionRef, KeyRecordService, RekeyAnswer};
 use kr_client::sync::{
@@ -167,9 +168,12 @@ impl Home {
     /// As [`Self::client`], believing what the epochs from `floor` on sealed as well.
     fn client_believing_from(&self, store: &std::path::Path, floor: u64) -> SyncClient {
         let epoch = self.epoch();
-        let shared =
-            SharedCollectionService::new(Arc::clone(&self.service), self.collection, epoch)
-                .believing_from(floor);
+        let shared = SharedCollectionService::new(
+            Arc::clone(&self.service) as Arc<dyn SharedSyncService>,
+            self.collection,
+            epoch,
+        )
+        .believing_from(floor);
         let sealer = shared.sealer(Arc::clone(&self.secrets) as Arc<dyn CollectionKeys>);
         SyncClient::new(
             Arc::new(shared),
@@ -229,8 +233,11 @@ async fn settings_written_into_a_claimed_collection_are_read_back_sealed_under_i
     assert!(matches!(published, Published::Accepted { .. }));
 
     // The service holds a sealed object: a reader without the key meets ciphertext.
-    let service =
-        SharedCollectionService::new(Arc::clone(&home.service), home.collection, home.epoch());
+    let service = SharedCollectionService::new(
+        Arc::clone(&home.service) as Arc<dyn SharedSyncService>,
+        home.collection,
+        home.epoch(),
+    );
     let SyncFetched::Held { ciphertext, .. } = service
         .fetch(&sync_collection(SyncObjectKind::Settings, object_id))
         .await
@@ -357,8 +364,11 @@ async fn a_write_under_a_retired_epoch_stores_nothing_and_the_work_is_settled_as
     assert_eq!(old.outstanding().expect("a count"), 1);
 
     // Nothing was stored.
-    let service =
-        SharedCollectionService::new(Arc::clone(&home.service), home.collection, home.epoch());
+    let service = SharedCollectionService::new(
+        Arc::clone(&home.service) as Arc<dyn SharedSyncService>,
+        home.collection,
+        home.epoch(),
+    );
     assert!(matches!(
         service
             .fetch(&sync_collection(SyncObjectKind::Settings, object_id))
@@ -473,9 +483,12 @@ async fn a_device_given_only_the_newer_key_is_told_by_name_that_it_cannot_open_a
         SymmetricKey::from_bytes([2; 32]),
     )
     .expect("the key is held");
-    let shared =
-        SharedCollectionService::new(Arc::clone(&home.service), home.collection, home.epoch())
-            .believing_from(0);
+    let shared = SharedCollectionService::new(
+        Arc::clone(&home.service) as Arc<dyn SharedSyncService>,
+        home.collection,
+        home.epoch(),
+    )
+    .believing_from(0);
     let sealer = shared.sealer(late as Arc<dyn CollectionKeys>);
     let client = SyncClient::new(
         Arc::new(shared),
@@ -598,7 +611,11 @@ async fn an_object_sealed_under_a_later_epoch_is_refused_by_name_and_not_as_tamp
 
     // A client built for the epoch before holds both keys and is still not to read what the later
     // epoch sealed: it has not seen the key record that opens that epoch.
-    let shared = SharedCollectionService::new(Arc::clone(&home.service), home.collection, 0);
+    let shared = SharedCollectionService::new(
+        Arc::clone(&home.service) as Arc<dyn SharedSyncService>,
+        home.collection,
+        0,
+    );
     let sealer = shared.sealer(Arc::clone(&home.secrets) as Arc<dyn CollectionKeys>);
     let older = SyncClient::new(
         Arc::new(shared),
@@ -645,8 +662,11 @@ impl Home {
     fn draft_device(&self) -> DraftDevice {
         let directory = tempfile::tempdir().expect("a directory");
         let epoch = self.epoch();
-        let shared =
-            SharedCollectionService::new(Arc::clone(&self.service), self.collection, epoch);
+        let shared = SharedCollectionService::new(
+            Arc::clone(&self.service) as Arc<dyn SharedSyncService>,
+            self.collection,
+            epoch,
+        );
         let sealer: Arc<dyn DraftSealer> =
             Arc::new(shared.sealer(Arc::clone(&self.secrets) as Arc<dyn CollectionKeys>));
         let shared = Arc::new(shared);
@@ -726,8 +746,11 @@ async fn a_removed_draft_leaves_nothing_to_read_and_a_second_removal_finds_it_go
     assert_eq!(held_objects(&home).await, 0, "its place is free");
 
     // A reader finds nothing to open, where it found a sealed draft before.
-    let shared =
-        SharedCollectionService::new(Arc::clone(&home.service), home.collection, home.epoch());
+    let shared = SharedCollectionService::new(
+        Arc::clone(&home.service) as Arc<dyn SharedSyncService>,
+        home.collection,
+        home.epoch(),
+    );
     assert!(matches!(
         shared
             .fetch(&draft_collection(draft))
@@ -814,9 +837,12 @@ async fn a_removal_after_another_device_wrote_removes_nothing_and_keeps_no_copy(
         .replace("this", "that");
     let mut their_draft = device.drafts.load(draft).expect("the draft");
     their_draft.text = theirs;
-    let sealed =
-        SharedCollectionService::new(Arc::clone(&home.service), home.collection, home.epoch())
-            .sealer(Arc::clone(&home.secrets) as Arc<dyn CollectionKeys>);
+    let sealed = SharedCollectionService::new(
+        Arc::clone(&home.service) as Arc<dyn SharedSyncService>,
+        home.collection,
+        home.epoch(),
+    )
+    .sealer(Arc::clone(&home.secrets) as Arc<dyn CollectionKeys>);
     let ciphertext = sealed
         .seal(&DraftStore::encode_payload(&their_draft).expect("canonical bytes"))
         .expect("sealed");

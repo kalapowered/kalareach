@@ -188,7 +188,7 @@ pub use storage::{
 };
 pub use sync::{
     Inventory, InventoryCopy, InventoryObject, ManagedSyncService, MembershipListing,
-    SyncComparison, SyncHeldCopy, SyncHeldObject, SyncUsage,
+    SharedSyncService, SyncComparison, SyncHeldCopy, SyncHeldObject, SyncUsage,
 };
 pub use voice::{
     ManagedVoiceBroker, ManagedVoiceService, VoiceClosure, VoiceCommand, VoiceContextFrame,
