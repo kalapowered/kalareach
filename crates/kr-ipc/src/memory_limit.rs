@@ -307,8 +307,32 @@ mod tests {
         std::process::exit(code);
     }
 
+    /// A child a case started, ended when the case lets go of it, so that a case that fails before
+    /// it lets the child run does not leave a held process behind.
+    struct Started(Child);
+
+    impl std::ops::Deref for Started {
+        type Target = Child;
+        fn deref(&self) -> &Child {
+            &self.0
+        }
+    }
+
+    impl std::ops::DerefMut for Started {
+        fn deref_mut(&mut self) -> &mut Child {
+            &mut self.0
+        }
+    }
+
+    impl Drop for Started {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     /// Starts the child held, so that it has not run, and tells it to ask for `ask` bytes.
-    fn held_child_asking(ask: u64) -> Child {
+    fn held_child_asking(ask: u64) -> Started {
         let mut command = Command::new(std::env::current_exe().expect("this test binary"));
         command
             .args([
@@ -322,7 +346,7 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         start_held(&mut command);
-        command.spawn().expect("the child starts")
+        Started(command.spawn().expect("the child starts"))
     }
 
     /// Starts the child behind a limit and lets it run, and says how it ended and whether the limit
