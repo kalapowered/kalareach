@@ -40,7 +40,7 @@ pub fn random_nonce() -> Result<Nonce192> {
 /// The recipient is a stored-envelope key. A notification-preview key is a different type, so a
 /// mailbox record cannot be sealed to the key the notification extension holds:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0308
 /// use kr_crypto::keys::{NotificationPreviewKeyPair, StoredEnvelopeKeyPair};
 /// use kr_crypto::sealed::seal_stored_envelope;
 ///

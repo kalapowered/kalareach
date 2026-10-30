@@ -94,7 +94,7 @@ pub fn decrypt_object(
 /// The recipient is a stored-envelope key. A notification-preview key is a different type, so an
 /// archive key cannot be wrapped to the key the notification extension holds:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0308
 /// use kr_crypto::archive::wrap_object_key;
 /// use kr_crypto::keys::{NotificationPreviewKeyPair, StoredEnvelopeKeyPair};
 /// use kr_crypto::secret::SymmetricKey;
@@ -347,6 +347,31 @@ pub fn manifest_wrap_for<'a>(
 /// locator it is stored at, so nothing else has to sign it. A restore that has only the kit can
 /// therefore authenticate the bundle; requiring a separate owner signing key would ask the kit for
 /// something it does not carry.
+///
+/// The key is a symmetric key the seed derives. A notification-preview key pair is not one, so a
+/// bundle cannot be encrypted under the key the notification extension holds:
+///
+/// ```compile_fail,E0308
+/// use kr_crypto::archive::encrypt_recovery_bundle;
+/// use kr_crypto::keys::NotificationPreviewKeyPair;
+/// use kr_protocol::archive::RecoveryBundle;
+///
+/// fn encrypt(preview: &NotificationPreviewKeyPair, bundle: &RecoveryBundle) {
+///     let _ = encrypt_recovery_bundle(preview, bundle);
+/// }
+/// ```
+///
+/// The same call under the derived symmetric key is the one that compiles:
+///
+/// ```
+/// use kr_crypto::archive::encrypt_recovery_bundle;
+/// use kr_crypto::secret::SymmetricKey;
+/// use kr_protocol::archive::RecoveryBundle;
+///
+/// fn encrypt(key: &SymmetricKey, bundle: &RecoveryBundle) {
+///     let _ = encrypt_recovery_bundle(key, bundle);
+/// }
+/// ```
 ///
 /// # Errors
 ///
