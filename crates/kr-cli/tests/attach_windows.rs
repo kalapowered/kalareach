@@ -571,7 +571,8 @@ fn spell_probe_in_the_console() {
     stop.stop();
     println!("kr-probe:stopped");
     let mut next = [0_u8; 1];
-    (&*console.handle())
+    let mut input_handle = console.handle();
+    input_handle
         .read_exact(&mut next)
         .expect("the console hands the process the next key");
     println!("kr-probe:next:{}", hex(&next));
