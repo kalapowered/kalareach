@@ -1985,7 +1985,9 @@ fn write_staged(path: &PathBuf, bytes: &[u8]) -> Result<()> {
             "a staged object has no directory",
         ));
     };
-    std::fs::create_dir_all(parent).map_err(ControllerError::registry)?;
+    // The generation's directory is owner-only whatever mask the daemon runs under, as the staging
+    // directory above it is.
+    kr_ipc::paths::create_dir_all_owner_only(parent).map_err(ControllerError::registry)?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
