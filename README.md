@@ -256,7 +256,7 @@ If `kr` refuses `~/Library/Application Support/KalaReach` as open to others, as 
 
 You will need Git to do project work. On macOS, `/usr/bin/git` exits with status 1 on a Mac that does not have the developer tools yet: run `xcode-select --install` and wait for it to finish. On Linux, you need to install it through your package manager. A host of release 0.1.0+8cd1adf5c8bf or of release 0.1.0+955f0efd7def, which is the last release whose host stops without a working Git, needs Git installed before `kr new`: without it `kr new` stops, and `controller.log` holds the line `the environment registry is unavailable: /usr/bin/git --exec-path exited 1`.
 
-A host of a release after 0.1.0+8cd1adf5c8bf still starts without Git. Creating, cloning or adopting a project, creating or removing a workspace, and capturing or applying a change set refuse; on macOS the refusal names the install step, `xcode-select --install`.
+A host of a release after 0.1.0+955f0efd7def still starts without Git. Creating, cloning or adopting a project, creating or removing a workspace, and capturing or applying a change set refuse; on macOS the refusal names the install step, `xcode-select --install`.
 
 The host will not join any network unless instructed to via the configuration document. Run `kr host startup --set standalone`, which writes the configuration document and prints the path to it. If your network requires the use of a proxy, now is the time to set the `network.proxy_url` field of the configuration document, as the following command makes its request through it. See [docs/host/README.md](docs/host/README.md#the-network-and-the-voice-broker) for more details.
 
