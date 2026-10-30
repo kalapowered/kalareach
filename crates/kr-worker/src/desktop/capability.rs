@@ -1006,6 +1006,55 @@ mod tests {
         }
     }
 
+    /// KR-REQ-03.26, the Windows desktop as the report gives it: the report is what reaches a
+    /// caller, so this goes through it rather than through the Windows decision alone, which
+    /// launching an application does not reach. Selecting the desktop reports the display server and
+    /// never capture, injection or the accessibility tree as available, whatever the host has
+    /// installed; launching is the launcher's own answer.
+    #[cfg(windows)]
+    #[test]
+    fn the_report_for_a_windows_desktop_never_shows_capture_or_injection_as_available() {
+        let report = report(
+            environment(),
+            None,
+            desktop(DisplayServer::WindowsDesktop, None),
+            CapabilityRevision::new(1),
+        );
+        for capability in [
+            capabilities::SCREEN_CAPTURE,
+            capabilities::INPUT_INJECTION,
+            capabilities::ACCESSIBILITY,
+        ] {
+            let record = report.record(capability).expect("a record per capability");
+            assert!(
+                !record.state.is_available(),
+                "{capability} was reported available on a desktop selection alone: {record:?}"
+            );
+            assert_eq!(
+                record.state == CapabilityState::NotTested,
+                record.identity.version.is_present(),
+                "{capability}: a facility this host identified leaves the operation unestablished, \
+                 and anything else is a refusal about the facility: {record:?}"
+            );
+            assert!(
+                record.disabled_reason.is_present(),
+                "{capability} says why it is unavailable"
+            );
+        }
+        let server = report
+            .record(capabilities::DISPLAY_SERVER)
+            .expect("the display server is a capability of its own");
+        assert!(server.state.is_available());
+        let launch = report
+            .record(capabilities::APPLICATION_LAUNCH)
+            .expect("a record");
+        assert_eq!(
+            launch.state.is_available(),
+            launch.identity.version.is_present(),
+            "a launcher this host found and identified is the whole of that answer: {launch:?}"
+        );
+    }
+
     /// A path of this test's own, in this host's temporary directory.
     fn temporary(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
