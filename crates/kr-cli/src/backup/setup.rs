@@ -331,7 +331,11 @@ impl Dialogue {
             // A new action identity each time: a claimed action keeps no result for an error that
             // can be tried again, and would answer "outcome unknown" for ever.
             let answer = tokio::select! {
-                answer = daemon.mutate::<_, BackupEnableResult>(Method::BackupEnable, params) => answer,
+                answer = daemon.mutate_within::<_, BackupEnableResult>(
+                    Method::BackupEnable,
+                    params,
+                    kr_client::recovery::ENABLE_TTL,
+                ) => answer,
                 () = self.interrupt.arrived() => return Err(self.stopped()),
             };
             drop(daemon);

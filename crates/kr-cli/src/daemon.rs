@@ -75,6 +75,26 @@ impl Daemon {
         let target = ActionTarget::environment(self.environment_id);
         crate::bind::mutate(&mut self.client, method, target, params).await
     }
+
+    /// Calls a mutation on this environment that asks for a lifetime of `ttl`, for a call whose
+    /// work can outlast the default one.
+    ///
+    /// # Errors
+    ///
+    /// Returns the daemon's refusal, or a transport failure.
+    pub async fn mutate_within<P, T>(
+        &mut self,
+        method: Method,
+        params: &P,
+        ttl: kr_protocol::scalars::DurationMs,
+    ) -> Result<T>
+    where
+        P: serde::Serialize + ?Sized,
+        T: kr_protocol::wire::WireMessage,
+    {
+        let target = ActionTarget::environment(self.environment_id);
+        crate::bind::mutate_within(&mut self.client, method, target, params, ttl).await
+    }
 }
 
 /// Reads an identifier from the command line.

@@ -838,9 +838,36 @@ impl<C: Codec> Client<C> {
         target: kr_protocol::envelope::ActionTarget,
         params: &T,
     ) -> Result<std::result::Result<ParamsValue, ProtocolError>> {
+        self.mutate_within(
+            method,
+            action_id,
+            target,
+            params,
+            kr_protocol::limits::DEFAULT_MUTATION_TTL,
+        )
+        .await
+    }
+
+    /// Calls a mutation that asks the host for a lifetime of `ttl` and not the default one.
+    ///
+    /// A call whose work can outlast the default lifetime asks for the longest the protocol allows;
+    /// the host still caps it by what the connection's window has left.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host's error, or a transport failure.
+    pub async fn mutate_within<T: serde::Serialize + ?Sized>(
+        &mut self,
+        method: Method,
+        action_id: ActionId,
+        target: kr_protocol::envelope::ActionTarget,
+        params: &T,
+        ttl: DurationMs,
+    ) -> Result<std::result::Result<ParamsValue, ProtocolError>> {
         // The window this mutation will quote is taken after everything the host has already
         // pushed has been applied.
-        let mutation = self.compose(method, action_id, target, params).await?;
+        let mut mutation = self.compose(method, action_id, target, params).await?;
+        mutation.requested_ttl_ms = ttl;
         self.send(&ControlFrame::Mutation(Box::new(mutation.clone())))
             .await?;
         self.await_response(mutation.request_id).await

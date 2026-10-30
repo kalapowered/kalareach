@@ -47,8 +47,9 @@ use crate::session::{Session, Settled};
 /// How long an enrolment of the host's backups stays acceptable to the host once sent: the longest
 /// a mutation may ask for. The host asks its admission again where it records the setup, after
 /// several requests to the storage service that can each last a minute and a half, so a shorter
-/// time would end a setup of a slow service at its last step.
-const ENABLE_TTL: DurationMs = kr_protocol::limits::MAX_MUTATION_TTL;
+/// time would end a setup of a slow service at its last step. Every caller of `backup.enable`
+/// asks for it.
+pub const ENABLE_TTL: DurationMs = kr_protocol::limits::MAX_MUTATION_TTL;
 
 /// The entries one archive needs in a recovery bundle so that a restore can find it and verify
 /// what the host made of it.

@@ -127,7 +127,7 @@ impl Controller {
         carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
         #[cfg(any(test, feature = "testing"))]
-        crate::testing::note_backup_enable(self.paths.environment_id(), &mutation.params);
+        crate::testing::note_backup_enable(self.paths.environment_id(), mutation);
         let params: BackupEnableParams = parse(&mutation.params)?;
         let admission = std::sync::Arc::new(SetupStands {
             controller: std::sync::Arc::clone(self),

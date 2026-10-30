@@ -699,6 +699,12 @@ async fn the_kit_that_setup_shows_is_the_one_the_host_records_and_the_daemon_is_
     // What the daemon was given, as it arrived.
     let calls = kr_controller::testing::tapped_backup_enable(rig.temp.environment_id());
     assert_eq!(calls.len(), 1, "one call reached the daemon");
+    // The call asks for the lifetime a setup of a slow service needs, as the companion's does.
+    assert_eq!(
+        kr_controller::testing::tapped_backup_enable_lifetimes(rig.temp.environment_id()),
+        [kr_client::recovery::ENABLE_TTL],
+        "a setup outlasts the default lifetime"
+    );
     let symbols: String = kit.seed_line().chars().filter(|c| *c != '-').collect();
     let hidden: Vec<(&str, Vec<u8>)> = vec![
         ("the seed's bytes", parsed.seed.expose().to_vec()),

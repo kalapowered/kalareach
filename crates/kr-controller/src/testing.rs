@@ -259,10 +259,18 @@ pub(crate) fn supplied_stop(
     Some(answer)
 }
 
-/// The parameters of the `backup.enable` calls a suite asked to read, as the daemon received them
-/// (canonical bytes), by environment. An environment is present once a suite asked.
+/// One `backup.enable` call as the daemon received it.
+struct TappedEnable {
+    /// The parameters, as canonical bytes.
+    params: Vec<u8>,
+    /// The lifetime the call asked for.
+    lifetime: kr_protocol::scalars::DurationMs,
+}
+
+/// The `backup.enable` calls a suite asked to read, by environment. An environment is present once
+/// a suite asked.
 static ENABLE_TAPS: std::sync::Mutex<
-    std::collections::BTreeMap<kr_protocol::ids::EnvironmentId, Vec<Vec<u8>>>,
+    std::collections::BTreeMap<kr_protocol::ids::EnvironmentId, Vec<TappedEnable>>,
 > = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// Has the daemon of `environment` keep the parameters of every `backup.enable` call it receives
@@ -286,21 +294,38 @@ pub fn tapped_backup_enable(environment: kr_protocol::ids::EnvironmentId) -> Vec
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&environment)
-        .cloned()
+        .map(|calls| calls.iter().map(|call| call.params.clone()).collect())
+        .unwrap_or_default()
+}
+
+/// The lifetime each of the `backup.enable` calls the daemon of `environment` has received since
+/// [`tap_backup_enable`] asked for, oldest first.
+#[must_use]
+pub fn tapped_backup_enable_lifetimes(
+    environment: kr_protocol::ids::EnvironmentId,
+) -> Vec<kr_protocol::scalars::DurationMs> {
+    ENABLE_TAPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&environment)
+        .map(|calls| calls.iter().map(|call| call.lifetime).collect())
         .unwrap_or_default()
 }
 
 /// Keeps the parameters of a `backup.enable` call when a suite asked to see them.
 pub(crate) fn note_backup_enable(
     environment: kr_protocol::ids::EnvironmentId,
-    params: &kr_protocol::envelope::ParamsValue,
+    mutation: &kr_protocol::envelope::MutationRequest,
 ) {
     if let Some(kept) = ENABLE_TAPS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get_mut(&environment)
     {
-        kept.push(kr_cbor::encode(params.as_value()));
+        kept.push(TappedEnable {
+            params: kr_cbor::encode(mutation.params.as_value()),
+            lifetime: mutation.requested_ttl_ms,
+        });
     }
 }
 

@@ -74,7 +74,8 @@ pub use crate::recovery::files::{
     RestorePlan, RestoreSource, SignInCause, SourceService, SourceSignIn,
 };
 pub use crate::recovery::host_archive::{
-    ArchiveEntries, HostBackups, HostCover, HostCovered, Left, SessionHost, cover_host_archive,
+    ArchiveEntries, ENABLE_TTL, HostBackups, HostCover, HostCovered, Left, SessionHost,
+    cover_host_archive,
 };
 pub use crate::recovery::kit::{
     MAX_RECOVERY_KIT_BYTES, RECOVERY_KIT_FORMAT, parse_kit, qr_payload, render_kit,

@@ -442,8 +442,36 @@ where
     P: serde::Serialize + ?Sized,
     T: kr_protocol::wire::WireMessage,
 {
+    mutate_within(
+        client,
+        method,
+        target,
+        params,
+        kr_protocol::limits::DEFAULT_MUTATION_TTL,
+    )
+    .await
+}
+
+/// Calls a mutation on this session's worker that asks for a lifetime of `ttl`.
+///
+/// # Errors
+///
+/// Returns the host's refusal, or a transport failure.
+pub async fn mutate_within<P, T>(
+    client: &mut LocalClient,
+    method: Method,
+    target: ActionTarget,
+    params: &P,
+    ttl: kr_protocol::scalars::DurationMs,
+) -> Result<T>
+where
+    P: serde::Serialize + ?Sized,
+    T: kr_protocol::wire::WireMessage,
+{
     let action_id = ActionId::new(kr_ipc::new_uuid());
-    let outcome = client.mutate(method, action_id, target, params).await?;
+    let outcome = client
+        .mutate_within(method, action_id, target, params, ttl)
+        .await?;
     decode(outcome.map_err(CliError::Refused)?)
 }
 
