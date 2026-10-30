@@ -393,6 +393,33 @@ impl Controller {
         })
     }
 
+    /// Gives back what an earlier attempt of an action recorded, found after this mutation was
+    /// admitted: the answer is waited for first, and the registration it arrived under is asked
+    /// with it in hand, without the deadline a receipt outlives.
+    ///
+    /// Section 9 returns a retained receipt to a duplicate only under authority that has not been
+    /// withdrawn, so a fence this host owes, or a registration withdrawn or replaced while the
+    /// answer was read, stops it. Every place that finds a recorded action after admission gives it
+    /// back through here.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::check_registration`] refuses with, and otherwise the answer.
+    pub(super) async fn retained_under_authority(
+        &self,
+        carried: &crate::authority::AdmittedMutation,
+        answer: impl std::future::Future<Output = Result<kr_protocol::envelope::ParamsValue>>,
+    ) -> Result<kr_protocol::envelope::ParamsValue> {
+        let answered = answer.await;
+        #[cfg(feature = "testing")]
+        self.after_the_retained_lookup.wait().await;
+        self.check_registration(&crate::authority::AdmittedMutation {
+            deadline: None,
+            ..*carried
+        })?;
+        answered
+    }
+
     /// The admission a service asks again from inside the work a mutation has begun.
     ///
     /// Every service that performs a mutation's effect after a wait is handed this one check, the

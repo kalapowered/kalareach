@@ -366,7 +366,9 @@ impl Controller {
         // so a retry of a completed change is its own result rather than a conflict, and one whose
         // first attempt is running or ended unrecorded is told so rather than performed.
         if let Some(answered) = self.voice_answered(&actor_id, mutation).await? {
-            return Ok(answered);
+            return self
+                .retained_under_authority(&carried, async { Ok(answered) })
+                .await;
         }
         // A first admission is asked before anything is claimed or created. A start asks the
         // broker for a call before it writes the call's grant, and a call created for a start this
@@ -380,7 +382,12 @@ impl Controller {
         let hold = match self.claim_voice_action(&actor_id, mutation)? {
             crate::grants::ActionClaim::Claimed { hold } => hold,
             crate::grants::ActionClaim::Recorded(record) => {
-                return self.voice_recorded(&actor_id, mutation, record).await;
+                return self
+                    .retained_under_authority(
+                        &carried,
+                        self.voice_recorded(&actor_id, mutation, record),
+                    )
+                    .await;
             }
         };
         let attempt = VoiceAttempt {
