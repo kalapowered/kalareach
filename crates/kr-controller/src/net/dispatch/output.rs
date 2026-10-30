@@ -1,5 +1,6 @@
 //! The write boundary: every frame this connection sends, and the latch a withdrawal sets.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -53,6 +54,9 @@ pub struct RemoteOutput {
         std::sync::Mutex<std::collections::BTreeMap<RequestId, tokio::sync::oneshot::Sender<()>>>,
     /// Where the frames go: the connection's control stream.
     sink: Box<dyn FrameSink>,
+    /// The most bytes of one frame the control stream carries, as the hello negotiated it, when
+    /// it is known.
+    max_payload: Option<usize>,
     /// The authority this connection writes under, read inside the turn.
     ///
     /// The latch above is set by whatever removes the registration, in the same critical section,
@@ -410,6 +414,18 @@ impl RemoteOutput {
             }),
             authority,
         )
+        .limited_to(
+            usize::try_from(session.selection.limits.max_control_frame_len.get())
+                .unwrap_or(usize::MAX)
+                .saturating_sub(kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN),
+        )
+    }
+
+    /// This output with the most bytes one frame may carry named, so that a frame the host's own
+    /// edits made larger is refused here and not by the stream, which would end the connection.
+    pub(super) fn limited_to(mut self, max_payload: usize) -> Self {
+        self.max_payload = Some(max_payload);
+        self
     }
 
     pub(super) fn writing_to(sink: Box<dyn FrameSink>, authority: Arc<Authorisation>) -> Self {
@@ -427,6 +443,7 @@ impl RemoteOutput {
             queued: std::sync::atomic::AtomicUsize::new(0),
             delivery: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             sink,
+            max_payload: None,
             authority,
         }
     }
@@ -496,7 +513,21 @@ impl RemoteOutput {
         // What this host's failures say of the host is not for a device. It is decided here, before
         // the turn is taken, for the one frame every attempt below writes.
         let shown = super::super::device_errors::frame_for_a_device(frame);
-        let frame: &ControlFrame = &shown;
+        let refusal;
+        let frame: &ControlFrame = match (&shown, self.max_payload) {
+            (Cow::Owned(mapped), Some(limit))
+                if !super::super::device_errors::fits(mapped, limit) =>
+            {
+                // The host's edits made the answer larger than the stream carries, and the stream
+                // ends the connection for a frame it cannot carry. A response is refused instead.
+                refusal = super::super::device_errors::too_large_for_the_device(mapped);
+                match &refusal {
+                    Some(refusal) => refusal,
+                    None => return Written::Withdrawn,
+                }
+            }
+            _ => &shown,
+        };
         #[cfg(test)]
         self.queued.fetch_add(1, Ordering::SeqCst);
         let _turn = self.turn.lock().await;
