@@ -270,7 +270,7 @@ enum Step {
     /// The service holds the bundle, the enrolment and the retention switch, and this setup is
     /// what remains to be recorded.
     Record(SetupRecord),
-    /// The admission stopped the call before one of its requests, which did not leave.
+    /// The admission stopped the call: a request did not leave, or a repeat was not answered.
     Stopped(ControllerError),
 }
 

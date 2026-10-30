@@ -5698,7 +5698,7 @@ async fn a_fence_owed_while_the_bundle_is_written_stops_the_requests_that_follow
 
 /// KR-REQ-09.09: a fence this host comes to owe while the setup reads the storage state stops the
 /// retention change that follows the read: it is the last request that changes the service, and the
-/// read before it can last as long as the service likes.
+/// read before it can last as long as the host bounds a request.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fence_owed_while_the_storage_state_is_read_stops_the_retention_change() {
     let timer = HeldTimer::held();
