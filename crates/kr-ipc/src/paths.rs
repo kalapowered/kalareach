@@ -850,16 +850,18 @@ fn check_owner_only(path: &Path, metadata: &std::fs::Metadata) -> Result<()> {
 #[cfg(target_os = "macos")]
 fn others_in_access_list(path: &Path) -> Option<String> {
     access_list_verdict(exacl::getfacl(path, None), || {
-        // The list names an account by its short name, or by its number where the system has no
-        // record of it, so a number is this user's name only when the system has no other: an
-        // account can be called "501". Two accounts with one short name in different databases of
-        // accounts cannot be told apart by what the list gives.
-        vec![
-            passwd_entry()
-                .map(|account| account.name)
-                .unwrap_or_else(|| current_uid().to_string()),
-        ]
+        names_of_this_user(passwd_entry())
     })
+}
+
+/// The names an entry of an access list for this user goes by: the short name the system's record
+/// gives. The list names an account by that, or by its number where the system has no record, and
+/// a number is no name of this user's: an account can be called "501". With no record of this user
+/// no entry is taken for this user's, which refuses a list that names one. Two accounts with one
+/// short name in different databases of accounts cannot be told apart from what the list gives.
+#[cfg(target_os = "macos")]
+fn names_of_this_user(record: Option<PasswdEntry>) -> Vec<String> {
+    record.map(|account| account.name).into_iter().collect()
 }
 
 /// As the platform's list is read for [`others_in_access_list`], with a failure to read it counted
@@ -3963,16 +3965,27 @@ mod tests {
         );
     }
 
-    /// KR-REQ-24.26: an entry the library names by a number is not this user's while the system
-    /// has a name for this user, since an account can be called by a number.
+    /// KR-REQ-24.26: an entry the library names by a number is not this user's, whether or not the
+    /// system has a record of this user, since an account can be called by a number; this user's
+    /// own entry, by the name the system's record gives, is.
     #[cfg(target_os = "macos")]
     #[test]
-    fn an_entry_called_by_a_number_is_not_this_users_when_the_system_names_this_user() {
+    fn an_entry_called_by_a_number_is_not_this_users() {
         let by_number = exacl::AclEntry::allow_user("501", exacl::Perm::READ, None);
         let by_name = exacl::AclEntry::allow_user("someone", exacl::Perm::READ, None);
-        let own = || vec!["someone".to_owned()];
-        assert!(access_list_verdict(Ok(vec![by_number]), own).is_some());
-        assert_eq!(access_list_verdict(Ok(vec![by_name]), own), None);
+        let record = || {
+            Some(PasswdEntry {
+                name: "someone".to_owned(),
+                home: None,
+            })
+        };
+        let known = || names_of_this_user(record());
+        assert!(access_list_verdict(Ok(vec![by_number.clone()]), known).is_some());
+        assert_eq!(access_list_verdict(Ok(vec![by_name.clone()]), known), None);
+
+        let unknown = || names_of_this_user(None);
+        assert!(access_list_verdict(Ok(vec![by_number]), unknown).is_some());
+        assert!(access_list_verdict(Ok(vec![by_name]), unknown).is_some());
     }
 
     #[test]
@@ -4223,7 +4236,13 @@ mod tests {
         // given, which is the one a caller that shows the configured root finds.
         let real = PathBuf::from(format!("{}/", behind.display()));
         match create_private_tree(&real, &real).expect_err("a directory open to others") {
-            IpcError::DirectoryNotOwnerOnly { path, .. } => assert_eq!(path, real),
+            IpcError::DirectoryNotOwnerOnly { path, .. } => {
+                assert_eq!(
+                    path.as_os_str(),
+                    real.as_os_str(),
+                    "the path as it was given"
+                );
+            }
             other => panic!("refused as a mode: {other}"),
         }
         let mode = std::fs::metadata(&behind)

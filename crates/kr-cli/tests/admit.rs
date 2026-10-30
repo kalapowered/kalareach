@@ -727,8 +727,9 @@ fn a_state_directory_whose_access_list_lets_another_account_in_is_refused_withou
 
     std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).expect("closed");
     let again = home.run_as_a_person(&program, &["host", "startup", "--set", "standalone"]);
+    assert!(!again.status.success(), "{}", said(&again));
     assert!(
-        said(&again).contains(&refusal),
+        said(&again).contains(&refusal) && !said(&again).contains("chmod"),
         "the entry still lets that account in: {}",
         said(&again)
     );
