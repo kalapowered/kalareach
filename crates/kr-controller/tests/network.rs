@@ -1537,9 +1537,9 @@ async fn a_host_on_every_interface_hints_the_addresses_it_found_there() {
 // Ignored by default: this suite starts real processes, and the binary it launches is built by
 // `scripts/end-to-end.sh`, which runs it with `--include-ignored`. A suite that skipped itself
 // silently when that binary was absent would report a pass for something it never ran.
-/// KR-REQ-27.05, revoked devices: a paired device that is revoked while its connection is
-/// authorised and its subscription is running has the connection ended, not noticed at its next
-/// request, and its record is withdrawn so it cannot come back.
+/// KR-REQ-27.05, revoked devices: a paired device that the owner revokes with `device.revoke`
+/// while its connection is authorised and its subscription is running has the connection ended,
+/// not noticed at its next request, and its record is withdrawn so it cannot come back.
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_revoked_device_is_fenced_before_it_is_served_again() {
@@ -1555,12 +1555,22 @@ async fn a_revoked_device_is_fenced_before_it_is_served_again() {
     let session = connect(&daemon, &device, &record).await;
     let _attached = attach(&session, host.environment_id, session_id).await;
 
-    // The device is revoked while its connection is authorised and its subscription is running.
-    daemon
-        .network
-        .revoke_device(record.device_id)
+    // The device is revoked while its connection is authorised and its subscription is running,
+    // by the owner at the machine through `device.revoke`: the call a person makes.
+    let _: kr_protocol::sharing::RevocationResult = local
+        .mutate(
+            Method::DeviceRevoke,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &kr_protocol::sharing::DeviceRevokeParams {
+                device_id: record.device_id,
+            },
+        )
         .await
-        .expect("the revocation is recorded");
+        .expect("the call reaches the daemon")
+        .expect("the owner revokes the device")
+        .to_typed()
+        .expect("a revocation result");
 
     // The fence is not a recorded state the next request happens to notice: withdrawing the
     // registration takes the connection's write boundary with it and ends the connection, so there
