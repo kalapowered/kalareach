@@ -273,10 +273,14 @@ fn kr_req_12_02_a_launch_waits_while_another_start_holds_the_window() {
     );
 }
 
-/// KR-REQ-12.02: the desktop reading starts its programs in a launch's window only after the
-/// window is closed. Control: a start with no lock holds the event.
+/// KR-REQ-12.02: the desktop reading starts no program, so while a launch's window is open it holds
+/// nothing a launch made inheritable. Control: a start with no lock holds the event.
+///
+/// The reading asks Terminal Services about the session and runs nothing, so there is no start of
+/// its own for the launch's window to hold back. What the window does to a start that does run a
+/// program is shown by the launch and time-reading cases around this one.
 #[test]
-fn kr_req_12_02_the_desktop_reading_waits_for_a_launchs_window() {
+fn kr_req_12_02_the_desktop_reading_starts_no_program_that_could_hold_a_launchs_handles() {
     let _alone = alone();
     let plain = most_holders_while_a_window_is_open(|| {
         let _ = ping_the_plain_way("2").wait();
@@ -285,7 +289,10 @@ fn kr_req_12_02_the_desktop_reading_waits_for_a_launchs_window() {
     let waiting = most_holders_while_a_window_is_open(|| {
         let _ = kr_worker::desktop::platform::read_login(0);
     });
-    assert_eq!(waiting, 1, "the desktop reading held nothing of the event");
+    assert_eq!(
+        waiting, 1,
+        "the desktop reading started a program that held the event"
+    );
 }
 
 /// KR-REQ-12.02: the time reading starts its program in a launch's window only after the window is
