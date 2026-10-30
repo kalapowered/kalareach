@@ -28,6 +28,8 @@ use serde_json::Value;
 mod support;
 #[path = "../../kr-controller/tests/teardown/mod.rs"]
 mod teardown;
+#[path = "support/user_manager.rs"]
+mod user_manager;
 
 use support::terminal::{self, Answering, Collected, Keys};
 
@@ -160,16 +162,105 @@ exec /usr/bin/env -i PATH=/usr/bin:/bin {home_variable} TMPDIR='{temporary}' \
 
 /// What the stand-in for `ssh` does: skip the options and the host, and run what follows them in
 /// the destination's own environment, as the login on the other side would.
-fn ssh_stand_in(destination: &Path, home: &Path) -> String {
+fn ssh_stand_in(tools: &Path, destination: &Path, home: &Path) -> String {
     let temporary = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_owned());
     format!(
         r##"#!/bin/sh
+# A test that wants the destination unreachable says so with a file, and the connection is refused
+# the way `ssh` refuses one.
+if [ -f '{tools}/unreachable' ]; then
+  echo 'ssh: connect to host build.example port 22: Connection refused' >&2
+  exit 255
+fi
 while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done
 shift
 shift
 exec /usr/bin/env -i PATH=/usr/bin:/bin HOME='{home}' TMPDIR='{temporary}' \
   KR_RUNTIME_DIR='{runtime}' KR_STATE_DIR='{state}' "$@"
 "##,
+        tools = tools.display(),
+        home = home.display(),
+        runtime = destination.join("r").display(),
+        state = destination.join("s").display(),
+    )
+}
+
+/// The identifier the stand-in for `podman` issues for its one container: 64 hexadecimal digits,
+/// which is what a runtime issues and what a record keeps.
+const STAND_IN_CONTAINER_ID: &str =
+    "3f1a9c0d5e7b2468a1c3e5f7092b4d6e8a0c2e4f61738495a6b7c8d9e0f1a2b3";
+
+/// The name the stand-in for `podman` knows its container by.
+const STAND_IN_CONTAINER_NAME: &str = "devbox";
+
+/// What the stand-in for `podman` does: record how it was run, answer the three questions a host
+/// asks a runtime (what identifier a name resolves to, whether the container runs, and to start it),
+/// and run what follows the container in the destination's own environment, as the runtime's exec
+/// does, with what a login there would give it and nothing of the caller's. Where a test says the
+/// helper is unreachable, the runtime still answers and the program cannot be started in the
+/// container.
+fn podman_stand_in(tools: &Path, destination: &Path, home: &Path) -> String {
+    let temporary = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_owned());
+    format!(
+        r##"#!/bin/sh
+case "$1" in
+  --version) echo 'podman version 5.0.0'; exit 0 ;;
+esac
+printf '%s\n' "$*" >>'{tools}/podman-invocations'
+case "$1" in
+  container)
+    # container inspect --format <format> -- <name or identifier>
+    if [ "$6" != '{name}' ] && [ "$6" != '{id}' ]; then
+      echo "Error: no container with name or ID \"$6\" found: no such container" >&2
+      exit 125
+    fi
+    case "$4" in
+      '{{{{.Id}}}}') echo '{id}' ;;
+      '{{{{.State.Running}}}}') cat '{tools}/container-running' 2>/dev/null || echo true ;;
+      *) echo "the stand-in for podman has no answer for: $*" >&2; exit 2 ;;
+    esac
+    exit 0
+    ;;
+  start)
+    # start -- <container>
+    if [ "$3" != '{id}' ]; then
+      echo "Error: no container with name or ID \"$3\" found: no such container" >&2
+      exit 125
+    fi
+    echo true >'{tools}/container-running'
+    echo '{id}'
+    exit 0
+    ;;
+  exec)
+    # exec --interactive --user <user> -- <container> <helper> bridge --stdio
+    printf '%s\n' "$$" >'{tools}/last-bridge.pid'
+    # A test that wants the helper unreachable says so with a file: the container runs, and the
+    # runtime cannot start the program in it.
+    if [ -f '{tools}/unreachable' ]; then
+      echo 'Error: crun: executable file not found in $PATH: No such file or directory' >&2
+      exit 127
+    fi
+    while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done
+    shift
+    if [ "$1" != '{id}' ]; then
+      echo "Error: no container with name or ID \"$1\" found: no such container" >&2
+      exit 125
+    fi
+    if [ "$(cat '{tools}/container-running' 2>/dev/null || echo true)" != true ]; then
+      echo "Error: can only create exec sessions on running containers: container state improper" >&2
+      exit 125
+    fi
+    shift
+    exec /usr/bin/env -i PATH=/usr/bin:/bin HOME='{home}' TMPDIR='{temporary}' \
+      KR_RUNTIME_DIR='{runtime}' KR_STATE_DIR='{state}' "$@"
+    ;;
+esac
+echo "the stand-in for podman has no answer for: $*" >&2
+exit 2
+"##,
+        tools = tools.display(),
+        name = STAND_IN_CONTAINER_NAME,
+        id = STAND_IN_CONTAINER_ID,
         home = home.display(),
         runtime = destination.join("r").display(),
         state = destination.join("s").display(),
@@ -217,7 +308,7 @@ impl World {
             .expect("the stand-in");
         kr_ipc::testing::place_program(&text, &tools.join("wsl.exe"));
         let ssh_text = tools.join("ssh.text");
-        std::fs::write(&ssh_text, ssh_stand_in(destination.root(), &home))
+        std::fs::write(&ssh_text, ssh_stand_in(&tools, destination.root(), &home))
             .expect("the ssh stand-in");
         kr_ipc::testing::place_program(&ssh_text, &tools.join("ssh"));
         // The destination chooses the standalone start, as a person sets a distribution up.
@@ -316,6 +407,20 @@ impl World {
     /// Runs `kr` on the source host to its end.
     fn run(&self, arguments: &[&str]) -> std::process::Output {
         self.kr(arguments).output().expect("runs kr")
+    }
+
+    /// Puts a stand-in for the container runtime first on the path of `kr` and of the daemon, for
+    /// a test that needs a named container where no runtime is installed. Every other test of this
+    /// suite that reaches a container uses the runtime of the machine, which this must not shadow,
+    /// so it is placed by the test that wants it and by no other.
+    fn stand_in_for_the_container_runtime(&self) {
+        let text = self.tools.join("podman.text");
+        std::fs::write(
+            &text,
+            podman_stand_in(&self.tools, self.destination.root(), &self.home),
+        )
+        .expect("the podman stand-in");
+        kr_ipc::testing::place_program(&text, &self.tools.join("podman"));
     }
 
     /// Records the destination in the source host's own inventory, as a WSL distribution.
@@ -1514,6 +1619,185 @@ async fn an_ssh_host_is_enrolled_by_asking_its_helper_and_registers_its_channel(
         "{}",
         String::from_utf8_lossy(&wrong.stderr)
     );
+}
+
+/// The account this test runs as, which the stand-ins run a helper as, as a login of that name would.
+fn own_account() -> String {
+    String::from_utf8(
+        std::process::Command::new("/usr/bin/id")
+            .arg("-un")
+            .output()
+            .expect("id runs")
+            .stdout,
+    )
+    .expect("a name")
+    .trim()
+    .to_owned()
+}
+
+/// The length a person is told of a sentence the host said: "[message withheld, 52 bytes]".
+fn withheld_bytes(shown: &str) -> Option<u64> {
+    shown
+        .strip_prefix("[message withheld, ")?
+        .strip_suffix(" bytes]")?
+        .parse()
+        .ok()
+}
+
+/// How many times the stand-in for `podman` was run, and the lines of how.
+fn podman_invocations(world: &World) -> Vec<String> {
+    std::fs::read_to_string(world.tools.join("podman-invocations"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// KR-REQ-18.11, the part about a named container environment, run on a machine with no container
+/// runtime by standing one in: the container is enrolled by the name the person types and the record
+/// keeps the identifier the runtime issued for it; the probe takes the identity from the helper in
+/// it; a refresh registers the helper's scoped channel and starts nothing; and a container that is
+/// stopped is reported stopped by a refresh, which starts neither it nor a helper in it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_container_is_enrolled_by_name_and_a_refresh_of_it_starts_nothing() {
+    let world = World::start().await;
+    world.stand_in_for_the_container_runtime();
+    // The destination's daemon is started by a create, as for any environment that is running.
+    world.enrol_destination();
+    let _ = world.create_in_destination();
+
+    let helper = support::kr().display().to_string();
+    let enrolled = world.run(&[
+        "--json",
+        "bridge",
+        "enrol",
+        "--access",
+        "container",
+        "--label",
+        "box",
+        "--target",
+        STAND_IN_CONTAINER_NAME,
+        "--user",
+        &own_account(),
+        "--helper",
+        &helper,
+        "--probe",
+    ]);
+    assert!(
+        enrolled.status.success(),
+        "{}; it said {}",
+        String::from_utf8_lossy(&enrolled.stdout),
+        String::from_utf8_lossy(&enrolled.stderr)
+    );
+    let row: Value = serde_json::from_slice(&enrolled.stdout).expect("kr printed JSON");
+    assert_eq!(
+        row["row"]["enrolment"]["target"], STAND_IN_CONTAINER_ID,
+        "the record keeps the identifier the runtime issued, not the name typed: {row}"
+    );
+    assert_eq!(
+        row["row"]["enrolment"]["environment_id"],
+        world.destination.environment_id().to_string(),
+        "the identity is the one the helper in the container reports: {row}"
+    );
+
+    let refreshed = world.refreshed("box");
+    assert_eq!(
+        refreshed["verification"]["environment_id"],
+        world.destination.environment_id().to_string(),
+        "{refreshed}"
+    );
+    assert_eq!(
+        refreshed["row"]["readiness"]["channel_scoped"], true,
+        "{refreshed}"
+    );
+    assert_eq!(refreshed["started"], false, "{refreshed}");
+
+    // The list shows the container under its label and its access class.
+    let listed = world.run(&["bridge", "list"]);
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        listed.contains(&format!("box  container  {STAND_IN_CONTAINER_ID}")),
+        "{listed}"
+    );
+
+    // The container stops. A refresh says so, and neither starts it nor runs anything in it.
+    std::fs::write(world.tools.join("container-running"), "false\n").expect("the state");
+    let before = podman_invocations(&world).len();
+    let stopped = world.refreshed("box");
+    assert_eq!(stopped["row"]["status"], "environment_stopped", "{stopped}");
+    assert_eq!(stopped["started"], false, "{stopped}");
+    assert!(stopped["verification"].is_null(), "{stopped}");
+    let asked = podman_invocations(&world);
+    assert!(
+        asked[before..]
+            .iter()
+            .all(|line| line.starts_with("container inspect ")),
+        "the runtime was asked about the container and nothing was started: {asked:?}"
+    );
+}
+
+/// KR-REQ-18.11, the part about connection diagnostics, for a named SSH host and a named container:
+/// when the connection fails, the refresh still comes back, with no verification and no scoped
+/// channel, in the person's lines it speaks of no protocol it did not hear, and what an earlier
+/// refresh established for the record is taken back rather than left standing beside the failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_that_fails_claims_nothing_for_an_ssh_host_or_a_container() {
+    let world = World::start().await;
+    world.stand_in_for_the_container_runtime();
+    world.enrol_destination();
+    let _ = world.create_in_destination();
+    let helper = support::kr().display().to_string();
+    let account = own_account();
+    // Both name the destination's own identity, so the second enrolment replaces the first record:
+    // each is tried to its end before the other is enrolled.
+    for (label, access, target) in [
+        ("sshdest", "ssh", "build.example"),
+        ("box", "container", STAND_IN_CONTAINER_NAME),
+    ] {
+        let enrolled = world.run(&[
+            "bridge", "enrol", "--access", access, "--label", label, "--target", target, "--user",
+            &account, "--helper", &helper, "--probe",
+        ]);
+        assert!(
+            enrolled.status.success(),
+            "{label}: {}",
+            String::from_utf8_lossy(&enrolled.stderr)
+        );
+        let answered = world.refreshed(label);
+        assert_eq!(
+            answered["row"]["readiness"]["channel_scoped"], true,
+            "{label}: the channel is scoped while the destination answers: {answered}"
+        );
+
+        let switch = world.tools.join("unreachable");
+        std::fs::write(&switch, "").expect("the switch");
+        let failed = world.refreshed(label);
+        assert!(failed["verification"].is_null(), "{label}: {failed}");
+        assert_eq!(
+            failed["row"]["readiness"]["channel_scoped"], false,
+            "{label}: what an earlier answer established is taken back: {failed}"
+        );
+        assert!(
+            failed["connection"]
+                .as_str()
+                .and_then(withheld_bytes)
+                .is_some_and(|bytes| bytes > 0),
+            "{label}: the result says what opening the connection did: {failed}"
+        );
+        // What the person reads: the record's label and where it stands, then the host's sentence
+        // about the connection as its class and length, as every sentence of the host's is shown,
+        // and no line that claims a protocol nothing spoke.
+        let said = world.run(&["bridge", "refresh", label]);
+        let said = String::from_utf8_lossy(&said.stdout);
+        let lines: Vec<&str> = said.lines().collect();
+        assert_eq!(lines.len(), 2, "{label}: {said}");
+        assert!(lines[0].starts_with(&format!("{label} is ")), "{said}");
+        assert!(
+            withheld_bytes(lines[1].trim_start()).is_some_and(|bytes| bytes > 0),
+            "{label}: the connection's sentence is shown as its class and length: {said}"
+        );
+        std::fs::remove_file(&switch).expect("the switch is taken away");
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2774,12 +3058,17 @@ fn runtime_available() -> bool {
     present
 }
 
+/// How long one call to the container runtime may take. A runtime that never answers must fail the
+/// case that called it with the call named, not hold the whole suite.
+const RUNTIME_CALL_BOUND: Duration = Duration::from_secs(300);
+
+/// How long one asking of the daemon in a container is given before it counts as no answer.
+const ASKING_BOUND: Duration = Duration::from_secs(30);
+
 fn podman(arguments: &[&str]) -> std::process::Output {
-    std::process::Command::new(RUNTIME)
-        .args(arguments)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .expect("the runtime runs")
+    let mut command = std::process::Command::new(RUNTIME);
+    command.args(arguments);
+    user_manager::bounded(command, RUNTIME_CALL_BOUND).unwrap_or_else(|why| panic!("{why}"))
 }
 
 /// Puts the images in the runtime's store, once per run of this suite, before any container starts:
@@ -2949,17 +3238,23 @@ impl Container {
             String::from_utf8_lossy(&started.stderr)
         );
         let deadline = Instant::now() + LIVENESS_DEADLINE;
-        while !self
-            .inside(&[&format!("{MOUNTED}/kr"), "list"])
-            .status
-            .success()
-        {
+        while !self.answers() {
             assert!(
                 Instant::now() < deadline,
                 "the daemon in the container did not answer"
             );
             std::thread::sleep(Duration::from_millis(200));
         }
+    }
+
+    /// Whether the daemon in this container answers `kr list` now. An asking that has not ended
+    /// within [`ASKING_BOUND`] is ended and counts as no answer, so that the wait for the daemon
+    /// is bounded by its own deadline and not by one call that never returns.
+    fn answers(&self) -> bool {
+        let mut command = std::process::Command::new(RUNTIME);
+        command.args(["exec", "--user", "root", "--", self.id.as_str()]);
+        command.args([&format!("{MOUNTED}/kr"), "list"]);
+        user_manager::bounded(command, ASKING_BOUND).is_ok_and(|output| output.status.success())
     }
 
     /// The environment identity the daemon in this container reports for itself.
