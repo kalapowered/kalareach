@@ -97,6 +97,24 @@ impl Worker {
         Self::start_as(tree, display, true, script).await
     }
 
+    /// As [`Self::start_running`], for a session of `dimensions`.
+    pub async fn start_running_sized(
+        tree: &kr_ipc::testing::TempHost,
+        display: u64,
+        script: &str,
+        dimensions: Dimensions,
+    ) -> Self {
+        Self::start_with(
+            tree,
+            display,
+            true,
+            script,
+            TimeSources::system(),
+            dimensions,
+        )
+        .await
+    }
+
     /// As [`Self::start`], for a session the registry also holds an open reservation of, as it does
     /// for every session a daemon creates. What a share or an offer of a session tells a device
     /// depends on that: a session with no reservation is not one the host can tell a device about.
@@ -127,7 +145,7 @@ impl Worker {
             adapter: Arc::new(kr_worker::action::adapter::RecordedTimeAdapter::new(kept)),
             ..TimeSources::system()
         };
-        Self::start_with(tree, display, true, script, time).await
+        Self::start_with(tree, display, true, script, time, Dimensions::new(80, 24)).await
     }
 
     async fn start_as(
@@ -136,7 +154,15 @@ impl Worker {
         reserved: bool,
         script: &str,
     ) -> Self {
-        Self::start_with(tree, display, reserved, script, TimeSources::system()).await
+        Self::start_with(
+            tree,
+            display,
+            reserved,
+            script,
+            TimeSources::system(),
+            Dimensions::new(80, 24),
+        )
+        .await
     }
 
     async fn start_with(
@@ -145,6 +171,7 @@ impl Worker {
         reserved: bool,
         script: &str,
         time: TimeSources,
+        dimensions: Dimensions,
     ) -> Self {
         let environment = tree.environment();
         let environment_id = tree.environment_id();
@@ -210,7 +237,7 @@ impl Worker {
             shell_mode: ShellMode::NativeCompat,
             worker_profile: WorkerProfile::HeadlessUser,
             desktop: DesktopBinding::none(),
-            dimensions: Dimensions::new(80, 24),
+            dimensions,
             journal_path: Some(journal_path.clone()),
             spool_directory: Some(environment.session_spool(session_id)),
             worker_endpoint: None,
