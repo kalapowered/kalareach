@@ -231,6 +231,10 @@ use crate::session::{
     SessionCreateResult, SessionListParams, SessionListResult, SessionOpenParams,
     SessionOpenResult, SessionReadParams, SessionReadResult, SessionSummary,
 };
+use crate::session_processes::{
+    ProcessBoot, ProcessListing, ProcessRole, ProcessStanding, SessionProcess,
+    SessionProcessesParams, SessionProcessesResult,
+};
 use crate::sharing::{
     AuthorityFeedStatus, DeviceKeysCompleteParams, DeviceKeysCompleteResult, DeviceKeysDeclaration,
     DeviceListParams, DeviceListResult, DevicePreviewKeyUpdateParams, DevicePreviewKeyUpdateResult,
@@ -725,6 +729,13 @@ pub fn protocol_schema() -> Value {
         "changeset_materialize_result" => ChangesetMaterializeResult,
         "changeset_read_params" => ChangesetReadParams,
         "changeset_read_result" => ChangesetReadResult,
+        "process_boot" => ProcessBoot,
+        "process_listing" => ProcessListing,
+        "process_role" => ProcessRole,
+        "process_standing" => ProcessStanding,
+        "session_process" => SessionProcess,
+        "session_processes_params" => SessionProcessesParams,
+        "session_processes_result" => SessionProcessesResult,
         "test_report" => TestReport,
         "test_reports_params" => TestReportsParams,
         "test_reports_result" => TestReportsResult,

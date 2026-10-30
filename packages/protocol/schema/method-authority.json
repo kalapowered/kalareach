@@ -1,6 +1,6 @@
 {
   "description": "One exhaustive authority entry per method. Anything not listed is denied. Generated from crates/kr-protocol; do not edit by hand.",
-  "method_count": 192,
+  "method_count": 193,
   "methods": [
     {
       "capability": "none",
@@ -2244,6 +2244,35 @@
         "session"
       ],
       "summary": "Read one session's filtered metadata and current state.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "sessions",
+      "history_filter": "not_applicable",
+      "idempotency": "idempotent_read",
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "session.processes",
+      "name": "session.processes",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "session.view"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session"
+      ],
+      "summary": "Read the processes one session's worker had recorded, each checked against the operating system now: the process and its start, its role in the session, whether it is running, ended or unknown, and for a running one its parent as an identity and the base name of its executable. The list is labelled recorded: it is what the worker last wrote, not a live enumeration, and a process that started and ended between two of the worker's observations is not in it. The answer is the local owner's and holds no argument, environment, directory or path.",
       "version": 1
     },
     {

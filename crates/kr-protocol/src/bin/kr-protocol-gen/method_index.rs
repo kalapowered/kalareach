@@ -196,7 +196,9 @@ pub(crate) const fn described_in(method: Method) -> Section {
             at(CONTACT, "Installing the skill")
         }
 
-        Method::SessionList | Method::SessionRead => at(METHOD_REFERENCE, "Reading sessions"),
+        Method::SessionList | Method::SessionRead | Method::SessionProcesses => {
+            at(METHOD_REFERENCE, "Reading sessions")
+        }
         Method::SessionCreate => at(HOST, "Creating a session"),
         Method::SessionClose => at(HOST, "Closure"),
         Method::SessionDescribe | Method::SessionRename => {

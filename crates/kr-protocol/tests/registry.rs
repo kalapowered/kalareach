@@ -1124,9 +1124,9 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         "the launch surface shows what the live screen shows"
     );
 
-    // The one method of the change-set group that section 23's table does not list: the local
-    // owner's read of what the host made of a suite's test reports.
-    let test_reports = ["changeset.test_reports"];
+    // Two methods section 23's table does not list: the local owner's read of what the host made
+    // of a suite's test reports, and of the processes a session's worker recorded.
+    let test_reports = ["changeset.test_reports", "session.processes"];
     for name in test_reports {
         assert!(
             lookup(name).is_some(),
@@ -1745,6 +1745,25 @@ fn the_confirmation_of_a_restored_policy_is_the_person_at_the_machines_alone() {
 #[test]
 fn the_test_reports_of_a_version_are_read_at_the_host_and_nowhere_else() {
     let name = "changeset.test_reports";
+    let entry = lookup(name).expect("the method is in the registry");
+    assert_eq!(entry.effect, EffectClass::Read);
+    assert_eq!(entry.ingress, &[ActorIngress::LocalIpc]);
+    for ingress in [ActorIngress::PairedDevice, ActorIngress::Workflow] {
+        assert!(
+            matches!(
+                decide(name, MethodVersion::V1, ingress),
+                AuthorityDecision::Denied(DenialReason::ForbiddenIngress { .. })
+            ),
+            "{ingress:?} is refused"
+        );
+    }
+}
+
+/// KR-REQ-25.06: the processes a session's worker recorded are the local owner's to read. A paired
+/// device and a workflow are refused the read by the table, so no route of theirs has to narrow it.
+#[test]
+fn the_processes_of_a_session_are_read_at_the_host_and_nowhere_else() {
+    let name = "session.processes";
     let entry = lookup(name).expect("the method is in the registry");
     assert_eq!(entry.effect, EffectClass::Read);
     assert_eq!(entry.ingress, &[ActorIngress::LocalIpc]);
