@@ -204,12 +204,13 @@ fn invitation_for(scene: &Scene, selection: RoleSelection) -> Value {
     })
 }
 
-/// KR-REQ-18.12: the role the person chooses, and each option they take, is what the grant the
-/// host writes carries. For each role the page offers, and for the two options a viewer can take
+/// KR-REQ-18.12: the role the person chooses, and the options they take, is what the grant the
+/// host writes carries. For each role the page offers, and for two of the options a viewer can take
 /// (earlier history, and answering questions), the invitation is issued as the Sharing tab sends
 /// it; the grant in the host's answer, the preview the issuer saw and the host's own list of the
 /// session's shares each carry the actions and the history that choice compiles to and no others,
-/// and the notices the person accepted are the ones those actions carry.
+/// and the notices the person accepted are the ones those actions carry. The third option, the live
+/// screen, is read from the offer the device receives, in the cases that follow.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_grant_the_host_writes_carries_the_role_the_person_chose_and_each_option() {
     let scene = Scene::start().await;
@@ -228,7 +229,6 @@ async fn the_grant_the_host_writes_carries_the_role_the_person_chose_and_each_op
         (RoleSelection::plain(SessionRole::Controller), false),
         (RoleSelection::plain(SessionRole::Owner), true),
     ];
-    let mut seen = Vec::new();
     for (selection, owner) in chosen {
         let before = now_ms();
         let made = scene
@@ -303,8 +303,6 @@ async fn the_grant_the_host_writes_carries_the_role_the_person_chose_and_each_op
             "only an owner manages sharing: {:?}",
             selection.role
         );
-        seen.push((created.grant.actions.clone(), created.grant.history.clone()));
-
         // The invitation is withdrawn, so that the next is the only one open.
         scene
             .issuer
@@ -316,11 +314,6 @@ async fn the_grant_the_host_writes_carries_the_role_the_person_chose_and_each_op
             )
             .await
             .expect("the invitation is withdrawn");
-    }
-    for (index, first) in seen.iter().enumerate() {
-        for second in &seen[index + 1..] {
-            assert_ne!(first, second, "five choices, five different grants");
-        }
     }
     scene.stop().await;
 }

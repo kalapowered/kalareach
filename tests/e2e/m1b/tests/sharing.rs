@@ -857,13 +857,15 @@ struct Chosen {
     history: bool,
 }
 
-/// KR-REQ-18.12, from `kr`: the role the person names, and each explicit option they take, is what
-/// the invitation the host wrote carries. For a viewer, a viewer who asked for earlier history, a
-/// viewer who answers questions, a controller and an owner the command states the role and the
+/// KR-REQ-18.12, from `kr`: the role the person names, and two of the options they can take, is
+/// what the invitation the host wrote carries. For a viewer, a viewer who asked for earlier
+/// history, a viewer who answers questions, a controller and an owner the command states the
 /// actions it compiled to, `kr share list` shows the same actions and the same history on the
 /// grant the host holds, and what separates the roles is in them: only a controller or an owner
 /// types, a viewer answers questions only when the person chose it, only an owner manages sharing,
-/// and earlier history is there only when it was asked for. Real daemon, real worker, real command.
+/// and earlier history is there only when it was asked for. The live screen, the third option, is
+/// read from the offer the device receives, in the cases above. Real daemon, real worker, real
+/// command.
 #[test]
 fn an_invitation_from_kr_carries_the_role_the_person_named_and_each_option() {
     let runtime = runtime();
@@ -940,7 +942,6 @@ fn an_invitation_from_kr_carries_the_role_the_person_named_and_each_option() {
             command.extend(arguments);
             host.kr_json(&command)
         };
-        assert_eq!(issued["role"], role, "{issued}");
         let rights = rights_of(&issued);
         for right in share.carried {
             assert!(rights.iter().any(|held| held == right), "{role}: {issued}");

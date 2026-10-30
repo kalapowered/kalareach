@@ -344,9 +344,10 @@ describe('who has access', () => {
 })
 
 describe('a revocation some session worker has not confirmed', () => {
-  // KR-REQ-18.14: the words do not call it done. The toast and the line say that the revocation is
-  // recorded and not done, state the authority revision, and name each session whose worker has
-  // not confirmed it; once a check finds none left, the line says the access was revoked.
+  // KR-REQ-18.14: the words do not call it done. The toast says that the revocation is recorded and
+  // not done, and how many session workers have not confirmed it. The line says the same, states
+  // the authority revision and names each session whose worker has not confirmed it; once a check
+  // finds none left, the line says the access was revoked.
   it('is said to be recorded and not done, with each session that has not confirmed it', async () => {
     const { controls, person } = await openSharing()
     await person.click(screen.getByRole('radio', { name: PHONE }))

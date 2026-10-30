@@ -84,4 +84,19 @@ describe('the session workers a revocation still waits for', () => {
     expect(workersHave(waiting.sessions.length, waiting.cut)).toBe('at least 1 session worker has')
     expect(workersHave(2, false)).toBe('2 session workers have')
   })
+
+  it('names every worker that has not confirmed, and none that has', () => {
+    const answer = {
+      barrier: {
+        authority_revision: '6',
+        workers: [
+          { session_id: 'session-a', state: 'pending' },
+          { session_id: 'session-b', state: 'acknowledged' },
+          { session_id: 'session-c', state: 'pending' }
+        ],
+        workers_total: '3'
+      }
+    } as unknown as Parameters<typeof waitingOn>[0]
+    expect(waitingOn(answer)).toEqual({ sessions: ['session-a', 'session-c'], cut: false })
+  })
 })
