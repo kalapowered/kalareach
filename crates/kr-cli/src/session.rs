@@ -1451,11 +1451,73 @@ struct Attached {
     owns_geometry: bool,
 }
 
+/// One `input.write` this terminal sent, and what it held.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Write {
+    /// The sequence number it was sent under.
+    sequence: u64,
+    /// Whether it held something the person typed. A key coming up, a modifier on its own and a lock
+    /// key are not typing, so a write of only those is refused without anything being lost.
+    typed: bool,
+    /// Whether it was console key records and not bytes.
+    keys: bool,
+}
+
+impl Write {
+    /// A write of bytes, which are what the person typed.
+    const fn bytes(sequence: u64) -> Self {
+        Self {
+            sequence,
+            typed: true,
+            keys: false,
+        }
+    }
+
+    /// A write of console key records.
+    fn keys(sequence: u64, records: &[kr_term::win32::KeyRecord]) -> Self {
+        Self {
+            sequence,
+            typed: presses(records),
+            keys: true,
+        }
+    }
+}
+
+/// What the host's refusal of one input write means for the attachment.
+#[derive(Debug, PartialEq, Eq)]
+enum Refused {
+    /// Another attachment holds the keys.
+    LeaseLost,
+    /// The session is closing and refuses input. `undelivered` is whether what it refused was typed.
+    Closing { undelivered: bool },
+    /// The host took none of the write, and says it cannot take it in the encoding the session is in.
+    Incompatible(Shown),
+    /// Any other refusal, after which it is not known what the session has.
+    Uncertain(Shown),
+}
+
+/// Reads the refusal of one input write.
+fn refused_write(write: Write, error: &kr_protocol::error::ProtocolError) -> Refused {
+    match error.code {
+        ErrorCode::LeaseLost => Refused::LeaseLost,
+        ErrorCode::SessionClosed => Refused::Closing {
+            undelivered: write.typed,
+        },
+        ErrorCode::InputIncompatible => Refused::Incompatible(Shown::protocol(error)),
+        code => Refused::Uncertain(shown!(
+            "{} at input {}: {}",
+            code,
+            write.sequence,
+            Shown::protocol(error)
+        )),
+    }
+}
+
 /// What one outstanding request was for, so its answer is read as an answer to that.
 #[derive(Clone, Copy, Debug)]
 enum Outstanding {
-    /// Input at this sequence number.
-    Input(u64),
+    /// One input write, with what it held.
+    Input(Write),
     /// A size change this terminal made as the size owner, to this size.
     Resize(Dimensions),
     /// A viewport report, which `WindowReports` holds.
@@ -1576,7 +1638,7 @@ async fn drive(
                 "the connection ended while input was being sent",
             ));
         }
-        outstanding.insert(request_id, Outstanding::Input(sequence));
+        outstanding.insert(request_id, Outstanding::Input(Write::bytes(sequence)));
         sequence += 1;
     }
     loop {
@@ -1645,7 +1707,7 @@ async fn drive(
                             "the connection ended while input was being sent",
                         ));
                     }
-                    outstanding.insert(request_id, Outstanding::Input(sequence));
+                    outstanding.insert(request_id, Outstanding::Input(Write::bytes(sequence)));
                     sequence += 1;
                 }
             }
@@ -1818,8 +1880,19 @@ async fn drive(
                             continue;
                         };
                         // A session that is closing has nothing more to say to this terminal in an
-                        // answer, and nothing an answer would have it send is of use any more.
+                        // answer, and nothing an answer would have it send is of use any more. What
+                        // it refuses of the person's typing it still refused, and that is counted.
                         if closing {
+                            if let (
+                                Outstanding::Input(write),
+                                kr_protocol::envelope::Outcome::Error(error),
+                            ) = (&what, &response.outcome)
+                            {
+                                undelivered |= matches!(
+                                    refused_write(*write, error),
+                                    Refused::Closing { undelivered: true }
+                                );
+                            }
                             continue;
                         }
                         match (what, response.outcome) {
@@ -1937,31 +2010,26 @@ async fn drive(
                                 }
                             }
                             (
-                                Outstanding::Input(sent),
+                                Outstanding::Input(write),
                                 kr_protocol::envelope::Outcome::Error(error),
-                            ) => match error.code {
-                                ErrorCode::LeaseLost => return AttachOutcome::LeaseLost,
+                            ) => match refused_write(write, &error) {
+                                Refused::LeaseLost => return AttachOutcome::LeaseLost,
                                 // The session is closing, and refuses input from the moment it
                                 // began. This terminal stops sending and waits for the closure.
-                                ErrorCode::SessionClosed => {
+                                Refused::Closing { undelivered: typed } => {
                                     closing = true;
                                     window.close();
-                                    undelivered = true;
+                                    undelivered |= typed;
                                 }
                                 // A refusal the session made whole: it took none of what was
                                 // sent, and says why. The terminal is told so and the attachment
                                 // ends, rather than being left typing into a session that refuses
                                 // every key.
-                                ErrorCode::InputIncompatible => {
-                                    return AttachOutcome::InputRefused(Shown::protocol(&error));
+                                Refused::Incompatible(detail) => {
+                                    return AttachOutcome::InputRefused(detail);
                                 }
-                                code => {
-                                    return AttachOutcome::DeliveryUncertain(shown!(
-                                        "{} at input {}: {}",
-                                        code,
-                                        sent,
-                                        Shown::protocol(&error)
-                                    ));
+                                Refused::Uncertain(detail) => {
+                                    return AttachOutcome::DeliveryUncertain(detail);
                                 }
                             },
                             (Outstanding::Input(_), kr_protocol::envelope::Outcome::Ok(_)) => {}
@@ -2121,6 +2189,7 @@ async fn drive(
                         };
                         let request_id = kr_protocol::ids::RequestId::new(next_request);
                         next_request += 1;
+                        let write = Write::keys(sequence, &keys);
                         if !send_keys(
                             client,
                             request_id,
@@ -2136,7 +2205,7 @@ async fn drive(
                                 "the connection ended while input was being sent",
                             ));
                         }
-                        outstanding.insert(request_id, Outstanding::Input(sequence));
+                        outstanding.insert(request_id, Outstanding::Input(write));
                         sequence += 1;
                         continue;
                     }
@@ -2255,7 +2324,7 @@ async fn drive(
                         "the connection ended while input was being sent",
                     ));
                 }
-                outstanding.insert(request_id, Outstanding::Input(sequence));
+                outstanding.insert(request_id, Outstanding::Input(Write::bytes(sequence)));
                 sequence += 1;
             }
         }
@@ -2466,6 +2535,297 @@ mod tests {
     use kr_protocol::error::ErrorCode;
     use kr_protocol::scalars::{Nullable, U64};
     use kr_protocol::session::{ClosureReason, ClosureRecord};
+
+    /// The attach loop run against a connection the case holds both ends of.
+    ///
+    /// Everything the loop sends reaches the case as a frame, and everything the case answers it
+    /// reads as the worker's. The loop's terminal is a device that is no terminal, which it takes
+    /// to be one with no size.
+    #[cfg(unix)]
+    mod wire {
+        use std::sync::Arc;
+
+        use kr_protocol::envelope::{ControlFrame, Notification, Outcome, ParamsValue, Response};
+        use kr_protocol::error::{ErrorCode, ProtocolError};
+        use kr_protocol::ids::{
+            ActionWindowId, AttachmentId, EnvironmentId, EventSequence, EventType, InputLeaseEpoch,
+            RequestId, SessionId, StreamId,
+        };
+        use kr_protocol::input::{InputContent, InputWriteParams};
+        use kr_protocol::method::Method;
+        use kr_protocol::scalars::Uuid;
+        use kr_protocol::session::{
+            ClosureReason, Dimensions, DisplayNumber, SESSION_CLOSED_EVENT,
+        };
+        use tokio::sync::mpsc;
+
+        use super::super::{AttachOutcome, Attached, Attaching, TerminalInput, UndeliveredTyping};
+        use crate::bridge::link::{Answer, Link};
+        use crate::error::{CliError, Result};
+        use crate::terminal::ControllingTerminal;
+
+        /// The loop's end of the connection.
+        struct Wire {
+            sent: mpsc::UnboundedSender<ControlFrame>,
+            heard: mpsc::UnboundedReceiver<ControlFrame>,
+        }
+
+        impl Link for Wire {
+            fn build(&self) -> Option<&kr_protocol::local::LocalBuild> {
+                None
+            }
+
+            fn action_window_id(&self) -> ActionWindowId {
+                ActionWindowId::new("wire").expect("a window")
+            }
+
+            async fn request<T: serde::Serialize + ?Sized>(
+                &mut self,
+                _method: Method,
+                _params: &T,
+            ) -> Result<Answer> {
+                Err(CliError::Other(kr_client::shown::Shown::said(
+                    "the loop asks for nothing by request",
+                )))
+            }
+
+            async fn mutate<T: serde::Serialize + ?Sized>(
+                &mut self,
+                _method: Method,
+                _action_id: kr_protocol::ids::ActionId,
+                _target: kr_protocol::envelope::ActionTarget,
+                _params: &T,
+            ) -> Result<Answer> {
+                Err(CliError::Other(kr_client::shown::Shown::said(
+                    "the loop mutates by frame",
+                )))
+            }
+
+            async fn recv(&mut self) -> Result<ControlFrame> {
+                self.heard.recv().await.ok_or_else(|| {
+                    CliError::Other(kr_client::shown::Shown::said("the case ended the wire"))
+                })
+            }
+
+            async fn send(&mut self, frame: ControlFrame) -> Result<()> {
+                let _ = self.sent.send(frame);
+                Ok(())
+            }
+
+            async fn finish(self) {}
+        }
+
+        /// The case's end: the console it types at, and the frames the loop sends.
+        pub struct Case {
+            console: Option<mpsc::UnboundedSender<TerminalInput>>,
+            written: mpsc::UnboundedReceiver<ControlFrame>,
+            answers: mpsc::UnboundedSender<ControlFrame>,
+        }
+
+        /// One `input.write` the loop sent.
+        pub struct Written {
+            pub request_id: RequestId,
+            pub sequence: u64,
+            pub content: InputContent,
+        }
+
+        impl Case {
+            /// Types `input` at the console and returns the write the loop makes of it.
+            pub async fn types(&mut self, input: TerminalInput) -> Written {
+                self.console
+                    .as_ref()
+                    .expect("the console is open")
+                    .send(input)
+                    .expect("the loop reads the console");
+                self.next_write().await
+            }
+
+            /// The next `input.write` the loop sends, whatever else it sends first.
+            pub async fn next_write(&mut self) -> Written {
+                loop {
+                    let frame = self.written.recv().await.expect("the loop is running");
+                    let ControlFrame::Request(request) = frame else {
+                        continue;
+                    };
+                    if request.method != Method::InputWrite.into() {
+                        continue;
+                    }
+                    let params: InputWriteParams =
+                        request.params.to_typed().expect("write parameters");
+                    return Written {
+                        request_id: request.request_id,
+                        sequence: params.sequence.get(),
+                        content: params.input,
+                    };
+                }
+            }
+
+            /// The next mutation the loop sends with this method, whatever else it sends first.
+            pub async fn next_mutation(&mut self, method: Method) -> ParamsValue {
+                loop {
+                    let frame = self.written.recv().await.expect("the loop is running");
+                    if let ControlFrame::Mutation(mutation) = frame
+                        && mutation.method == method.into()
+                    {
+                        return mutation.params;
+                    }
+                }
+            }
+
+            /// The host took the write.
+            pub fn takes(&self, written: &Written) {
+                self.answer(written, Outcome::Ok(ParamsValue::empty()));
+            }
+
+            /// The host refused the write with `code`.
+            pub fn refuses(&self, written: &Written, code: ErrorCode) {
+                self.answer(
+                    written,
+                    Outcome::Error(ProtocolError::new(code, "refused by the case")),
+                );
+            }
+
+            fn answer(&self, written: &Written, outcome: Outcome) {
+                self.answers
+                    .send(ControlFrame::Response(Response {
+                        request_id: written.request_id,
+                        outcome,
+                    }))
+                    .expect("the loop reads the wire");
+            }
+
+            /// The session closes, as the last thing its stream carries.
+            pub fn closes(&self) {
+                let record = super::closure(ClosureReason::CloseRequested, None, None);
+                self.answers
+                    .send(ControlFrame::Notification(Notification {
+                        stream_id: StreamId::new("session").expect("a stream"),
+                        sequence: EventSequence::new(1),
+                        event_type: EventType::new(SESSION_CLOSED_EVENT).expect("an event type"),
+                        payload: ParamsValue::from_typed(&record).expect("a closure"),
+                    }))
+                    .expect("the loop reads the wire");
+            }
+
+            /// The console's input ends, which ends the attachment.
+            pub fn hangs_up(&mut self) {
+                self.console = None;
+            }
+        }
+
+        /// Runs the loop with `epoch` as the lease it holds, and `case` for what happens, and
+        /// returns how the attachment ended.
+        pub async fn run<F, Fut>(holds_lease: bool, case: F) -> AttachOutcome
+        where
+            F: FnOnce(Case) -> Fut,
+            Fut: std::future::Future<Output = ()>,
+        {
+            let (sent, written) = mpsc::unbounded_channel();
+            let (answers, heard) = mpsc::unbounded_channel();
+            let (console, mut input) = mpsc::unbounded_channel();
+            let mut wire = Wire { sent, heard };
+            let device = std::fs::File::options()
+                .read(true)
+                .write(true)
+                .open("/dev/null")
+                .expect("a device to hold the place of a terminal");
+            let terminal = ControllingTerminal::over(device.try_clone().expect("a duplicate"));
+            let output = Arc::new(device);
+            let attaching = Attaching {
+                session_id: SessionId::new(Uuid::from_bytes([1; 16])),
+                environment_id: EnvironmentId::new(Uuid::from_bytes([2; 16])),
+                display_number: DisplayNumber::new(1),
+            };
+            let attached = Attached {
+                attachment_id: AttachmentId::new(Uuid::from_bytes([3; 16])),
+                dimensions: Dimensions::new(80, 24),
+                lease_epoch: holds_lease.then(|| InputLeaseEpoch::new(5)),
+                geometry_epoch: kr_protocol::ids::GeometryEpoch::new(1),
+                owns_geometry: false,
+            };
+            let mut owed = UndeliveredTyping::new(0);
+            let mut display = crate::render::ProjectedDisplay::new();
+            let case = case(Case {
+                console: Some(console),
+                written,
+                answers,
+            });
+            let (outcome, ()) = tokio::join!(
+                super::super::drive(
+                    &mut wire,
+                    &attaching,
+                    &mut owed,
+                    Vec::new(),
+                    attached,
+                    &mut input,
+                    &output,
+                    &terminal,
+                    None,
+                    &mut display,
+                    false,
+                ),
+                case
+            );
+            outcome
+        }
+    }
+
+    /// An application that typed a key (not a modifier, a lock or a release) before the session
+    /// began to close is refused, and the line that ends the attachment says so. A key coming up is
+    /// not typing: the session refusing it lost nothing the person typed.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn only_typing_the_closing_session_refused_is_said_to_be_undelivered() {
+        use kr_term::win32::KeyRecord;
+
+        let key = |key_down: bool| KeyRecord {
+            virtual_key: u16::from(b'A'),
+            scan_code: 0x1e,
+            unicode: u16::from(b'a'),
+            key_down,
+            control_keys: 0,
+            repeat: 1,
+        };
+        let keys = |down: bool| crate::attach::TerminalInput::Keys(vec![key(down)]);
+
+        // The release is the write the session refuses: the press before it was taken.
+        let outcome = wire::run(true, |mut case| async move {
+            let pressed = case.types(keys(true)).await;
+            case.takes(&pressed);
+            let released = case.types(keys(false)).await;
+            case.refuses(&released, ErrorCode::SessionClosed);
+            case.closes();
+        })
+        .await;
+        assert!(
+            matches!(
+                outcome,
+                AttachOutcome::Closed {
+                    undelivered: false,
+                    ..
+                }
+            ),
+            "a release refused by a closing session lost nothing: {outcome:?}"
+        );
+
+        // The control: the press is the write the session refuses.
+        let outcome = wire::run(true, |mut case| async move {
+            let pressed = case.types(keys(true)).await;
+            case.refuses(&pressed, ErrorCode::SessionClosed);
+            case.closes();
+        })
+        .await;
+        assert!(
+            matches!(
+                outcome,
+                AttachOutcome::Closed {
+                    undelivered: true,
+                    ..
+                }
+            ),
+            "a key pressed and refused by a closing session was typing lost: {outcome:?}"
+        );
+    }
 
     fn closure(reason: ClosureReason, code: Option<u64>, signal: Option<&str>) -> ClosureRecord {
         ClosureRecord {

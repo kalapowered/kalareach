@@ -636,6 +636,12 @@ mod unix {
             Ok(Self { handle })
         }
 
+        /// A terminal over `handle`, for a case that runs the attach loop without a terminal.
+        #[cfg(test)]
+        pub(crate) const fn over(handle: File) -> Self {
+            Self { handle }
+        }
+
         /// Returns the terminal handle, which is the one bytes are read from.
         #[must_use]
         pub const fn handle(&self) -> &File {
