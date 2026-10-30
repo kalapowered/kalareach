@@ -34,8 +34,8 @@ and every limit.
 ## What binds a helper to a session
 
 A tool call reaches the worker that owns the session over its private socket; `ask_user` sends
-`question.create` there. Before anything is created, the worker establishes which session the caller is in, and it asks the operating system
-rather than the caller:
+`question.create` there. Before anything is created, the worker establishes which session the caller
+is in, and it asks the operating system rather than the caller:
 
 1. **Peer credentials.** The runtime directory is owner-only and the listener refuses any other
    user before it reads a frame.
@@ -90,10 +90,10 @@ an identity and a caller chooses its own.
 
 Cancellation and expiry are different states, and dismissing a form is neither.
 
-An answer (`question.answer`) is a tagged union of free text, a selected choice identifier, a boolean decision, or the
-free-text `other` option. Every `select` and every `confirm` carries `something_else` with free
-text; the host adds it and an agent cannot remove it. An `other` answer stays `other` everywhere it
-is read: nothing folds it into a listed choice or into yes.
+An answer (`question.answer`) is a tagged union of free text, a selected choice identifier, a
+boolean decision, or the free-text `other` option. Every `select` and every `confirm` carries
+`something_else` with free text; the host adds it and an agent cannot remove it. An `other` answer
+stays `other` everywhere it is read: nothing folds it into a listed choice or into yes.
 
 The first answer wins. Every resolution is one conditional update against the question's current
 revision, so of two simultaneous answers exactly one changes the question and the other is told
@@ -181,8 +181,8 @@ deadline the installation declared.
 ## The caller token
 
 `ask_user` returns an unpredictable token with the question, over the private channel the question
-was created on. It permits exactly two things: polling that one question (`question.read_own`) and cancelling it
-(`question.cancel_own`), from the same verified application.
+was created on. It permits exactly two things: polling that one question (`question.read_own`) and
+cancelling it (`question.cancel_own`), from the same verified application.
 
 The worker stores a keyed verification tag and a sealed copy, both bound to the question
 identifier. The key is generated when the ledger opens and lives in the worker's memory alone, so
