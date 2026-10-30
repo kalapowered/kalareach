@@ -380,6 +380,68 @@ mod tests {
         }
     }
 
+    /// How long a case waits for a fact about another process before it fails with what it heard.
+    const WAIT: Duration = Duration::from_secs(20);
+
+    /// The lines a child says on its output, read on a thread of their own so that waiting for one
+    /// can be bounded. The thread ends with the child's output.
+    fn lines_of(output: std::process::ChildStdout) -> std::sync::mpsc::Receiver<String> {
+        use std::io::BufRead as _;
+
+        let (say, hear) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(output)
+                .lines()
+                .map_while(Result::ok)
+            {
+                if say.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        hear
+    }
+
+    /// Waits for a line that holds `marker` and returns the text after it, or fails with the lines
+    /// it heard if none comes in time or the output ends. A test harness that does not capture
+    /// output writes the test's name, without a line break, in front of what the test says, so the
+    /// marker is looked for in a line and not at its start.
+    fn text_after(hear: &std::sync::mpsc::Receiver<String>, marker: &str) -> String {
+        use std::sync::mpsc::RecvTimeoutError;
+
+        let give_up = Instant::now() + WAIT;
+        let mut heard = Vec::new();
+        loop {
+            match hear.recv_timeout(give_up.saturating_duration_since(Instant::now())) {
+                Ok(line) => match line.find(marker) {
+                    Some(at) => return line[at + marker.len()..].to_owned(),
+                    None => heard.push(line),
+                },
+                Err(RecvTimeoutError::Timeout) => {
+                    panic!("no line with {marker:?} came within {WAIT:?}; heard {heard:?}")
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    panic!("the output ended without a line with {marker:?}; heard {heard:?}")
+                }
+            }
+        }
+    }
+
+    /// Waits for the child to end, or fails after [`WAIT`] and leaves the child to its guard.
+    fn exit_of(child: &mut Started, what: &str) -> std::process::ExitStatus {
+        let give_up = Instant::now() + WAIT;
+        loop {
+            if let Some(status) = child.try_wait().expect("the child is asked") {
+                return status;
+            }
+            assert!(
+                Instant::now() < give_up,
+                "{what} did not end within {WAIT:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Starts the child held, so that it has not run, and tells it to ask for `ask` bytes.
     fn held_child_asking(ask: u64) -> Started {
         let mut command = Command::new(std::env::current_exe().expect("this test binary"));
@@ -462,7 +524,7 @@ mod tests {
     /// process would leave every refusal after the first reading as an ordinary end.
     #[test]
     fn a_second_commit_the_system_refuses_a_process_is_recorded_as_the_first_was() {
-        use std::io::{BufRead as _, Write as _};
+        use std::io::Write as _;
 
         let mut command = Command::new(std::env::current_exe().expect("this test binary"));
         command
@@ -483,20 +545,16 @@ mod tests {
         resume(child.as_handle()).expect("the child is let run");
 
         let mut input = child.stdin.take().expect("a pipe");
-        let mut lines = std::io::BufReader::new(child.stdout.take().expect("a pipe")).lines();
-        lines
-            .by_ref()
-            .map_while(Result::ok)
-            .find(|line| line == REFUSED_FIRST)
-            .expect("the child says the system refused its first request");
+        let hear = lines_of(child.stdout.take().expect("a pipe"));
+        text_after(&hear, REFUSED_FIRST);
         assert!(limit.take_refusal(), "the first refusal is recorded");
         assert!(!limit.take_refusal(), "and said once");
 
         writeln!(input, "go").expect("the child is told to ask again");
         drop(input);
-        let ended = child.wait().expect("the child ends");
+        let status = exit_of(&mut child, "the child that was told to ask again");
         assert_eq!(
-            ended.code(),
+            status.code(),
             Some(REFUSED),
             "the system refused the second request too"
         );
@@ -513,11 +571,13 @@ mod tests {
     const HELD_PROCESS: &str = "held-process-identifier=";
 
     /// The daemon half of the case below. Run on its own it does nothing and passes. Started by the
-    /// case with the variable set, it starts a process held, puts it behind a limit, names it, and
-    /// ends at once, as a daemon killed from outside does: nothing is dropped and the process is
-    /// never let run.
+    /// case with the variable set, it starts a process held, puts it behind a limit, names it and
+    /// waits until the case holds that process. Then it ends at once, as a daemon killed from
+    /// outside does: nothing is dropped and the process is never let run.
     #[test]
     fn the_daemon_that_ends_with_a_process_held() {
+        use std::io::{BufRead as _, Write as _};
+
         if std::env::var_os(DAEMON).is_none() {
             return;
         }
@@ -525,20 +585,28 @@ mod tests {
         let _limit = MemoryLimit::around(child.as_handle(), 256 * MIB)
             .expect("the limit is applied to the child");
         println!("{HELD_PROCESS}{}", child.id());
-        std::io::Write::flush(&mut std::io::stdout()).expect("the name is written");
+        std::io::stdout().flush().expect("the name is written");
+        let mut line = String::new();
+        std::io::stdin()
+            .lock()
+            .read_line(&mut line)
+            .expect("the go-ahead is read");
         std::process::exit(0);
     }
 
     /// A process that was created held and put behind a limit never runs, so it never reads that
     /// its owner has gone, and without the limit it would stay until the user signs out, holding
     /// the executable it was made from. The system ends it when the last handle of its job closes,
-    /// which is what happens to the handles of a daemon that ends. The wait is for that fact, with a
-    /// bound for the process that is still there.
+    /// which is what happens to the handles of a daemon that ends. The case holds the process
+    /// before the daemon ends, so that it waits on that process and not on an identifier the system
+    /// may give to another. The wait is for that fact, with a bound for the process that is still
+    /// there.
     #[test]
     fn a_process_held_by_a_daemon_that_ends_is_ended_with_it() {
-        use std::io::BufRead as _;
+        use std::io::Write as _;
 
-        let mut daemon = Command::new(std::env::current_exe().expect("this test binary"))
+        let mut command = Command::new(std::env::current_exe().expect("this test binary"));
+        command
             .args([
                 "--exact",
                 "memory_limit::tests::the_daemon_that_ends_with_a_process_held",
@@ -546,29 +614,34 @@ mod tests {
                 "--test-threads=1",
             ])
             .env(DAEMON, "1")
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("the daemon starts");
+            .stderr(Stdio::null());
+        let mut daemon = Started(command.spawn().expect("the daemon starts"));
+        let mut input = daemon.stdin.take().expect("a pipe");
         // A line is read and not the whole output: the held process may have been given the pipe
         // the daemon writes to, and the pipe is not closed while it lives.
-        let held = std::io::BufReader::new(daemon.stdout.take().expect("a pipe"))
-            .lines()
-            .map_while(Result::ok)
-            .find_map(|line| line.strip_prefix(HELD_PROCESS).map(str::to_owned))
-            .expect("the daemon names the process it held");
-        let held: u32 = held.parse().expect("a process identifier");
-        daemon.wait().expect("the daemon ends");
+        let hear = lines_of(daemon.stdout.take().expect("a pipe"));
+        let held: u32 = text_after(&hear, HELD_PROCESS)
+            .trim()
+            .parse()
+            .expect("a process identifier");
 
-        // SAFETY: the call takes the identifier of a process and returns a handle or null.
+        // SAFETY: the call takes the identifier of a process, which the daemon keeps held and not
+        // ended, and returns a handle or null.
         let opened = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, held) };
-        if opened.is_null() {
-            // No process has the identifier any more: it is gone.
-            return;
-        }
+        let refused = std::io::Error::last_os_error();
+        assert!(
+            !opened.is_null(),
+            "the process the daemon held was not opened: {refused}"
+        );
         // SAFETY: the handle was just returned by the call above and nothing else owns it.
         let process = unsafe { OwnedHandle::from_raw_handle(opened.cast()) };
+
+        writeln!(input, "go").expect("the daemon is told to end");
+        drop(input);
+        exit_of(&mut daemon, "the daemon");
+
         let raw: windows_sys::Win32::Foundation::HANDLE = process.as_raw_handle().cast();
         // SAFETY: the call takes a handle that this function holds open.
         let waited = unsafe { WaitForSingleObject(raw, 20_000) };
