@@ -89,24 +89,29 @@ thread_local! {
     /// driver last asked.
     static MEMORY_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
-    /// What runs the next time a driver on this thread has created its process.
-    static AT_SPAWN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+    /// What runs the next time a driver on this thread is about to put its process behind the
+    /// system's memory limit.
+    #[cfg(windows)]
+    static BEFORE_LIMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
 
     /// Whether a driver on this thread is refused when it next lets its process run.
     static LET_RUN_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Runs `hook` the next time a driver on this thread has created its process, before the driver has
-/// done anything else with it: the moment a process that is not held yet is running, and has the
-/// time the hook takes to do what it likes before any limit is put around it.
-pub fn at_next_spawn(hook: impl FnOnce() + 'static) {
-    AT_SPAWN.with(|held| *held.borrow_mut() = Some(Box::new(hook)));
+/// Runs `hook` the next time a driver on this thread is about to put its process behind the
+/// system's memory limit: the process exists, and if it was created held it has not run. This is
+/// the last point before the limit, so a process that is let run anywhere before it has the time
+/// the hook takes to do what it likes with no limit around it.
+#[cfg(windows)]
+pub fn before_the_next_limit(hook: impl FnOnce() + 'static) {
+    BEFORE_LIMIT.with(|held| *held.borrow_mut() = Some(Box::new(hook)));
 }
 
-/// Runs the hook [`at_next_spawn`] set, once.
-pub(crate) fn spawned() {
-    if let Some(hook) = AT_SPAWN.with(|held| held.borrow_mut().take()) {
+/// Runs the hook [`before_the_next_limit`] set, once.
+#[cfg(windows)]
+pub(crate) fn before_the_limit() {
+    if let Some(hook) = BEFORE_LIMIT.with(|held| held.borrow_mut().take()) {
         hook();
     }
 }

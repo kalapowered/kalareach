@@ -2122,14 +2122,15 @@ fn a_runtime_that_answers_a_refused_allocation_as_failed_still_ends_as_memory_pr
 
 /// KR-REQ-22.10: on Windows a process is behind the system's memory limit from its first
 /// instruction. The process commits more than the ceiling as the first thing it does, before it
-/// reads a word of the wire, and the daemon is made to take its time over what it does with the
-/// process after creating it, until the process has done what it does or been refused. A process
-/// that ran in that time would have committed the memory, and none of the limit would be applied
-/// to it afterwards; one that is created held is refused.
+/// reads a word of the wire, and the daemon is made to take its time at the last point before it
+/// puts the process behind the limit, until the process has done what it does or been refused. A
+/// process that was let run anywhere before that point would have committed the memory in that
+/// time, and none of the limit would be applied to it afterwards; one that is held until it is
+/// behind the limit is refused.
 #[cfg(windows)]
 #[test]
 fn a_process_that_commits_memory_as_it_starts_is_refused_by_the_systems_limit() {
-    use kr_describe::testing::at_next_spawn;
+    use kr_describe::testing::before_the_next_limit;
 
     const MIB: u64 = 1 << 20;
     let (catalogue, _) = tiny();
@@ -2155,7 +2156,7 @@ fn a_process_that_commits_memory_as_it_starts_is_refused_by_the_systems_limit() 
     let waiting = runtime.clone();
     // The wait is for a fact about the process, with a bound for the process that cannot say it: a
     // process created held does not run, so it says nothing, and the bound is all that passes.
-    at_next_spawn(move || {
+    before_the_next_limit(move || {
         let until = Instant::now() + Duration::from_secs(1);
         while Instant::now() < until
             && !stub::began(&waiting, "committed")

@@ -737,8 +737,6 @@ impl Driver {
             );
             ProcessEnd::CouldNotStart
         })?;
-        #[cfg(feature = "testing")]
-        crate::testing::spawned();
         // The threads end on their own when what they wait for is dropped, which is what happens
         // to both on every return below.
         let handed = match (child.stdin.take(), child.stdout.take()) {
@@ -829,6 +827,8 @@ impl Driver {
     fn limit_in_the_system(&self, child: &Child) -> Option<kr_ipc::memory_limit::MemoryLimit> {
         use std::os::windows::io::AsHandle as _;
 
+        #[cfg(feature = "testing")]
+        crate::testing::before_the_limit();
         kr_ipc::memory_limit::MemoryLimit::around(child.as_handle(), self.service.ceiling_bytes())
             .inspect_err(|why| {
                 eprintln!(
