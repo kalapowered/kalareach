@@ -57,18 +57,24 @@ const ACCOUNT_WORDS: [&str; 7] = ["user", "owner", "uid", "gid", "group", "accou
 /// The programs whose use on this host a message can tell a person to repeat.
 const COMMAND_WORDS: [&str; 6] = ["chmod", "chown", "sudo", "doas", "systemctl", "launchctl"];
 
-/// Refusals of the project service whose reason a device is told without the place: what the host
-/// says begins to name a directory of its own where `marker` stands, and the device is given the
-/// sentence beside it. The sentences say where in terms of the location the device's grant names,
-/// which is all of the place the device has.
-const KNOWN_REASONS: [(&str, &str); 2] = [
+/// Refusals whose reason a device is told without the place or the account: what the host says
+/// begins to name them where every one of the markers stands, and the device is given the sentence
+/// beside them. The first two are refusals of the project service, in terms of the location the
+/// device's grant names, which is all of the place the device has. The third is the refusal to
+/// start a worker over a scheduled task another account holds, whose text names that account.
+const KNOWN_REASONS: [(&[&str], &str); 3] = [
     (
-        "a filesystem is mounted at ",
+        &["a filesystem is mounted at "],
         "a filesystem is mounted inside the location the grant names",
     ),
     (
-        " its objects/info/alternates names ",
+        &[" its objects/info/alternates names "],
         "the repository names objects outside the location the grant names",
+    ),
+    (
+        &["a task named ", " is registered "],
+        "a task under this environment's name is not this installation's own, so the host left it \
+         as it is",
     ),
 ];
 
@@ -174,7 +180,7 @@ fn told_in_place(text: &str, fixed: impl Fn() -> String) -> Option<String> {
 fn known_reason(text: &str) -> Option<&'static str> {
     KNOWN_REASONS
         .iter()
-        .find(|(marker, _)| text.contains(marker))
+        .find(|(markers, _)| markers.iter().all(|marker| text.contains(marker)))
         .map(|(_, reason)| *reason)
 }
 
@@ -1505,5 +1511,37 @@ mod tests {
             written.instance.application_instance_id,
             event.instance.application_instance_id
         );
+    }
+
+    #[test]
+    fn a_task_the_scheduler_holds_for_another_account_is_told_to_a_device_without_the_account() {
+        use crate::supervision::windows::{Foreign, ForeignReason, task_name};
+        let environment_id = kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid());
+        for user in [
+            "marguerite",
+            "marguerite@example.com",
+            "DESKTOP-4F2\\marguerite",
+        ] {
+            let foreign = Foreign {
+                name: task_name(environment_id),
+                environment_id,
+                reason: ForeignReason::Account {
+                    user: user.to_owned(),
+                    description: "KalaReach environment".to_owned(),
+                },
+            };
+            // The create route's text: the supervisor's refusal, then the command that mends it.
+            let said = format!(
+                "could not start a worker: {foreign}: run kr host startup --set standalone for \
+                 this environment"
+            );
+            let shown =
+                error_for_a_device(&error(ErrorCode::ResourceUnavailable, &said)).into_owned();
+            assert_eq!(shown.code, ErrorCode::ResourceUnavailable);
+            assert!(
+                !shown.message.contains("marguerite") && !shown.message.contains("kr host"),
+                "{user}: {shown:?}"
+            );
+        }
     }
 }
