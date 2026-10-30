@@ -492,9 +492,21 @@ pub mod platform {
 
     #[cfg(target_os = "linux")]
     fn power() -> Signal<PowerSource> {
-        // The kernel's own power-supply class. A mains supply that is online is mains; a host with
-        // no battery at all is mains, because there is nothing for it to be running from.
-        let Ok(entries) = std::fs::read_dir("/sys/class/power_supply") else {
+        power_of_supplies(std::path::Path::new("/sys/class/power_supply"))
+    }
+
+    /// What a Linux power-supply class says of where the host's power comes from, read from the
+    /// directory that holds one entry per supply.
+    ///
+    /// The kernel's own class: a mains supply that is online is mains; a host with a battery and no
+    /// mains online is on the battery; a host with no battery at all is on mains, because there is
+    /// nothing for it to be running from. A supply whose type or state the host would not tell is
+    /// not one that can be left out: it may be the battery, so with no mains online the host has
+    /// not been told it is on mains, and the signal is unqualified, which the policy treats as
+    /// battery.
+    #[must_use]
+    pub fn power_of_supplies(root: &std::path::Path) -> Signal<PowerSource> {
+        let Ok(entries) = std::fs::read_dir(root) else {
             return Signal::Unqualified {
                 why: "this host has no power-supply class",
             };
@@ -502,20 +514,35 @@ pub mod platform {
         let mut saw_battery = false;
         let mut mains_online = false;
         let mut saw_mains = false;
+        let mut unread = false;
         for entry in entries.flatten() {
-            let kind = std::fs::read_to_string(entry.path().join("type")).unwrap_or_default();
-            match kind.trim() {
-                "Battery" => saw_battery = true,
-                "Mains" | "USB" => {
+            let said = |file: &str| {
+                std::fs::read_to_string(entry.path().join(file))
+                    .ok()
+                    .map(|text| text.trim().to_owned())
+                    .filter(|text| !text.is_empty())
+            };
+            match said("type").as_deref() {
+                Some("Battery") => saw_battery = true,
+                Some("Mains" | "USB") => {
                     saw_mains = true;
-                    let online =
-                        std::fs::read_to_string(entry.path().join("online")).unwrap_or_default();
-                    if online.trim() == "1" {
-                        mains_online = true;
+                    match said("online").as_deref() {
+                        Some("1") => mains_online = true,
+                        Some(_) => {}
+                        None => unread = true,
                     }
                 }
-                _ => {}
+                Some(_) => {}
+                None => unread = true,
             }
+        }
+        if mains_online {
+            return Signal::Qualified(PowerSource::Mains);
+        }
+        if unread {
+            return Signal::Unqualified {
+                why: "this host listed a power supply it would not describe",
+            };
         }
         if !saw_battery {
             return Signal::Qualified(PowerSource::Mains);
@@ -525,11 +552,7 @@ pub mod platform {
                 why: "this host reports a battery and no mains supply",
             };
         }
-        Signal::Qualified(if mains_online {
-            PowerSource::Mains
-        } else {
-            PowerSource::Battery
-        })
+        Signal::Qualified(PowerSource::Battery)
     }
 
     #[cfg(windows)]

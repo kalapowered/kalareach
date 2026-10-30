@@ -158,6 +158,91 @@ fn battery_pauses_by_default_and_runs_when_an_owner_enables_it() {
     ));
 }
 
+/// KR-REQ-22.13: what a power-supply class says of the host's power, read from trees laid out as
+/// the kernel lays them out. A supply the host would not describe may be the battery, so with no
+/// mains online it is not taken for a host on mains, which would admit inference on a battery.
+#[test]
+fn a_power_supply_the_host_would_not_describe_is_not_taken_for_mains() {
+    use kr_describe::resource::platform::power_of_supplies;
+
+    /// One supply directory with the files the kernel shows, and a directory where a file is
+    /// `None`: reading a directory as a file fails the way a supply that went away mid-read does.
+    fn supply(root: &std::path::Path, name: &str, files: &[(&str, Option<&str>)]) {
+        let directory = root.join(name);
+        std::fs::create_dir_all(&directory).expect("a supply directory");
+        for (file, content) in files {
+            match content {
+                Some(text) => std::fs::write(directory.join(file), text).expect("a supply file"),
+                None => std::fs::create_dir(directory.join(file)).expect("an unreadable file"),
+            }
+        }
+    }
+    type Files<'a> = &'a [(&'a str, Option<&'a str>)];
+    let tree = |supplies: &[(&str, Files)]| {
+        let root = tempfile::tempdir().expect("a power-supply class");
+        for (name, files) in supplies {
+            supply(root.path(), name, files);
+        }
+        power_of_supplies(root.path())
+    };
+    let battery: Files = &[("type", Some("Battery\n"))];
+    let mains_online: Files = &[("type", Some("Mains\n")), ("online", Some("1\n"))];
+    let mains_offline: Files = &[("type", Some("Mains\n")), ("online", Some("0\n"))];
+
+    // The cases the reader always answered.
+    assert_eq!(
+        tree(&[("BAT0", battery), ("AC", mains_online)]),
+        Signal::Qualified(PowerSource::Mains)
+    );
+    assert_eq!(
+        tree(&[("BAT0", battery), ("AC", mains_offline)]),
+        Signal::Qualified(PowerSource::Battery)
+    );
+    assert_eq!(tree(&[]), Signal::Qualified(PowerSource::Mains));
+    assert_eq!(
+        tree(&[("AC", mains_online)]),
+        Signal::Qualified(PowerSource::Mains)
+    );
+    assert!(matches!(
+        tree(&[("BAT0", battery)]),
+        Signal::Unqualified { .. }
+    ));
+    let absent = tempfile::tempdir().expect("a directory");
+    assert!(matches!(
+        power_of_supplies(&absent.path().join("no-such-class")),
+        Signal::Unqualified { .. }
+    ));
+
+    // A supply whose type the host would not tell, alone or beside a mains supply that is offline,
+    // is a host that has not said it is on mains. Its type file was missing, unreadable or empty.
+    let undescribed_supplies: [Files; 3] = [&[], &[("type", None)], &[("type", Some("\n"))]];
+    for undescribed in undescribed_supplies {
+        assert!(
+            matches!(tree(&[("BAT0", undescribed)]), Signal::Unqualified { .. }),
+            "an undescribed supply alone: {undescribed:?}"
+        );
+        assert!(
+            matches!(
+                tree(&[("BAT0", undescribed), ("AC", mains_offline)]),
+                Signal::Unqualified { .. }
+            ),
+            "an undescribed supply beside a mains supply that is offline: {undescribed:?}"
+        );
+    }
+    // A mains supply that would not say whether it is online is no more known to be plugged in.
+    assert!(matches!(
+        tree(&[("AC", &[("type", Some("Mains\n")), ("online", None)])]),
+        Signal::Unqualified { .. }
+    ));
+
+    // The control: an adapter that says it is online settles it, whatever else the host would not
+    // describe, so a laptop on its charger is not paused for a supply it cannot read.
+    assert_eq!(
+        tree(&[("BAT0", &[("type", None)]), ("AC", mains_online)]),
+        Signal::Qualified(PowerSource::Mains)
+    );
+}
+
 /// KR-REQ-22.13: thermal pressure pauses on mains too, and clearing resumes without a restart.
 #[test]
 fn pressure_that_clears_resumes_without_restarting_a_worker() {
