@@ -262,12 +262,14 @@ fn a_git_that_answers_with_more_than_a_version_and_a_directory_is_refused() {
 
 #[cfg(unix)]
 #[test]
-fn a_git_that_answers_without_end_is_stopped_at_the_bound_and_refused() {
+fn a_git_that_answers_without_end_is_ended_where_its_output_passes_the_limit_and_refused() {
+    // A program that goes on writing is not waited out. Its output passes the limit long before
+    // the bound, and it is refused for that, ended while it still runs.
     let directory = tempfile::tempdir().expect("a directory for this test");
     let search = directory.path().join("search");
     std::fs::create_dir(&search).expect("a search path of this test's own");
     stand_in(&search, "exec yes");
-    let profile = profile_waiting(directory.path(), &search, Duration::from_secs(1));
+    let profile = profile_waiting(directory.path(), &search, Duration::from_secs(5));
 
     let refusal = profile.git().expect_err("that is not an answer either");
     assert!(
@@ -275,7 +277,7 @@ fn a_git_that_answers_without_end_is_stopped_at_the_bound_and_refused() {
         "{refusal:?}"
     );
     assert!(
-        refusal.to_string().contains("did not answer"),
+        refusal.to_string().contains("more than"),
         "it says why: {refusal}"
     );
 }
