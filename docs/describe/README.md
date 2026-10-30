@@ -139,11 +139,16 @@ every job, and that peak has to fit beside the reserve before the next job start
 the state is `resource_paused`, the reason is named, and the deterministic titles are unaffected.
 
 - **Battery** pauses inference by default. A host that cannot read its own power source is treated
-  as being on battery, because it has not been told otherwise. On Linux that includes a host with a
-  power supply it will not describe and no mains supply online: the supply may be the battery, so
-  the source is unknown rather than mains. A battery that belongs to a peripheral (the kernel's
-  scope `Device`, such as a wireless mouse or a phone on a cable) is not the host's power and is
-  left out.
+  as being on battery, because it has not been told otherwise. On Linux the kernel names each
+  supply's type, and the host reads each type one way. A charger is mains when it is online: that
+  is `Mains`, every `USB` kind, `BrickID` (Apple's) and `Wireless`. A `Battery` and a `UPS` are
+  stores of charge, and a `UPS` that says it is online has not said the host is on mains. A host
+  with no store of charge is on mains, and one with a store of charge and no charger online is on
+  its battery. A supply it will not describe, with no charger online, leaves the source unknown
+  rather than mains, because that supply may be the battery: its type is missing, unreadable or
+  empty, is the kernel's `Unknown` (a driver that was not told what its supply is), or is one this
+  build has no name for. A battery that belongs to a peripheral (the kernel's scope `Device`, such
+  as a wireless mouse or a phone on a cable) is not the host's power and is left out.
 - **Thermal or memory pressure** pauses it even on mains. Heat is read from what each platform
   reports: the system's thermal pressure level on macOS, on Intel and on Apple silicon alike
   (nominal reads as cool, moderate as elevated, and heavy or beyond as critical), the passive limit

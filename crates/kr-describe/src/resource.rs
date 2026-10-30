@@ -510,14 +510,21 @@ pub mod platform {
     /// What a Linux power-supply class says of where the host's power comes from, read from the
     /// directory that holds one entry per supply.
     ///
-    /// The kernel's own class: a mains supply that is online is mains (a USB supply of any kind
-    /// counts as one, and an `online` of 2 is a programmable supply that is online); a host with a
-    /// battery and no mains online is on the battery; a host with no battery at all is on mains,
-    /// because there is nothing for it to be running from. A supply with the scope `Device` is a
-    /// peripheral's, a mouse or a phone on a cable, and is not the host's power. A supply whose type
-    /// or state the host would not tell is not one that can be left out: it may be the battery, so with no mains online the host has
-    /// not been told it is on mains, and the signal is unqualified, which the policy treats as
-    /// battery.
+    /// Each type the kernel names (`type`) is read one way. A charger is a supply from outside the
+    /// host: `Mains`, every `USB` kind, `BrickID` (Apple's) and `Wireless`. One that is online (an
+    /// `online` of 1, or 2 for a programmable supply) is mains. A store of charge is the host's own
+    /// energy: `Battery`, and `UPS`, which does not say by being online that the host is on mains.
+    /// A host with no store of charge at all is on mains, because there is nothing for it
+    /// to be running from; a host with one and no charger online is on the battery. A supply with
+    /// the scope `Device` is a peripheral's, a mouse or a phone on a cable, and is not the host's
+    /// power.
+    ///
+    /// A supply whose type or state the host would not tell is not one that can be left out: it
+    /// may be the battery, so with no charger online the host has not been told it is on mains, and
+    /// the signal is unqualified, which the policy treats as battery. That covers a type that is
+    /// missing, unreadable or empty, the kernel's `Unknown` (what a driver reports when it was not
+    /// told what its supply is), and a type this reader has no name for, which a later kernel may
+    /// add.
     #[must_use]
     pub fn power_of_supplies(root: &std::path::Path) -> Signal<PowerSource> {
         let Ok(entries) = std::fs::read_dir(root) else {
@@ -540,8 +547,11 @@ pub mod platform {
                 continue;
             }
             match said("type").as_deref() {
-                Some("Battery") => saw_battery = true,
-                Some(kind) if kind == "Mains" || kind.starts_with("USB") => {
+                Some("Battery" | "UPS") => saw_battery = true,
+                Some(kind)
+                    if matches!(kind, "Mains" | "BrickID" | "Wireless")
+                        || kind.starts_with("USB") =>
+                {
                     saw_mains = true;
                     match said("online").as_deref() {
                         Some("1" | "2") => mains_online = true,
@@ -549,8 +559,7 @@ pub mod platform {
                         None => unread = true,
                     }
                 }
-                Some(_) => {}
-                None => unread = true,
+                Some(_) | None => unread = true,
             }
         }
         if mains_online {
