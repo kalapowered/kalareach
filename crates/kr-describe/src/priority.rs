@@ -20,7 +20,7 @@
 //! | --- | --- | --- |
 //! | Linux | `SCHED_BATCH` with niceness 19, on the calling thread and the threads it starts, which is the scheduler class for non-interactive work | the idle class, on the calling thread and the threads it starts |
 //! | macOS | the lowest ordinary thread priority of the calling thread | the throttled disk policy of the process |
-//! | Windows | the idle priority class of the whole process | very low, for the whole process |
+//! | Windows | the idle priority class of the whole process | very low, for the whole process and for the calling thread |
 //! | the other Unix systems | the lowest ordinary thread priority, where the thread-priority library gives one, and a reported refusal where it does not | none |
 //!
 //! Windows lowers the class of the whole process, because a thread started by another thread there
@@ -44,6 +44,11 @@
 //! The first three end a process the daemon then starts again after its restart delay, so a machine
 //! that is too busy to run the process gets fewer descriptions, and the owner's own work is not the
 //! cost.
+//!
+//! Windows keeps an I/O priority for each thread as well as for the process, and the thread that
+//! loads the model exists before the process's priority is set, so that thread sets its own. The
+//! I/O class counts as applied only when the system reads back very low for the thread and for the
+//! process.
 //!
 //! The class is the idle priority class and the very low IO priority, set on their own. Windows
 //! also has a background mode for a process, which lowers the CPU, IO and memory priority together,

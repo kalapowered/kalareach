@@ -19,7 +19,7 @@
 //! | A job | its execution deadline, plus [`ANSWER_GRACE_MS`] |
 //! | A cancellation | [`CANCEL_MS`] for the process to say it has read it; a load's or a check's own answer is then held to the same bound |
 //! | A check of a file | its deadline, plus [`ANSWER_GRACE_MS`] |
-//! | The ceiling | the process's resident set, read every [`SAMPLE_MS`] while it loads or runs a job |
+//! | The ceiling | the process's resident set, read every [`SAMPLE_MS`] while it loads or runs a job, so a process over it is ended by the first reading after it passed, and on Windows the system's own limit on its committed memory ([`Launch::system_memory_limit`]) |
 //!
 //! Nothing here reads a clock for a decision: every turn takes the host's reading, as the service
 //! does, so a timer is tested by the reading a test passes rather than by waiting for it.

@@ -139,8 +139,15 @@ every job, and that peak has to fit beside the reserve before the next job start
 the state is `resource_paused`, the reason is named, and the deterministic titles are unaffected.
 
 - **Battery** pauses inference by default. A host that cannot read its own power source is treated
-  as being on battery, because it has not been told otherwise.
-- **Thermal or memory pressure** pauses it even on mains.
+  as being on battery, because it has not been told otherwise. On Linux that includes a host with a
+  power supply it will not describe and no mains supply online: the supply may be the battery, so
+  the source is unknown rather than mains.
+- **Thermal or memory pressure** pauses it even on mains. Heat is read from what each platform
+  reports: the system's thermal pressure level on macOS, on Intel and on Apple silicon alike
+  (nominal reads as cool, moderate as elevated, and heavy or beyond as critical), the passive limit
+  of each thermal zone on Windows, and each thermal zone's temperature against its own first trip
+  point on Linux. A platform that reports nothing leaves heat unread, and an unread signal does not
+  pause.
 - When pressure clears, the host resumes on the next evaluation. Nothing is restarted: the queue
   keeps its positions, the sessions keep their titles, and no worker is touched.
 - A host that cannot read a memory signal refuses to load rather than assuming the reserve holds.
@@ -155,11 +162,30 @@ The process is ended after it, and inference pauses with `memory_pressure` until
 happen. A job that held its process past the ceiling without ever finishing is ended by the daemon's
 reading alone, publishes nothing, is not queued again, and pauses inference the same way.
 
+The first reading of a load or a job is due one reading period (one second) after it starts, and
+each later one a period after the last. A process that passes the ceiling is therefore ended by the
+first reading taken after it did, and it can stay over the ceiling for at most one period plus the
+time the daemon takes to run the turn that reads it. That bound is in time: the daemon does not
+bound how much memory a process adds in that period. What keeps the growth small is the process's
+own check between tokens, which looks at its resident set every eight tokens, and the admission of
+a profile only when its itemised cost fits under the ceiling.
+
 The service takes an owner's ceiling below 4 GiB and never one above it, and admits a profile only
 when its itemised cost fits under whichever ceiling is in force. No configuration setting carries
-an owner's ceiling in this build. No operating-system limit backs either figure: the daemon's
-reading and the process's own check are the whole mechanism, and the process says so when it
-starts.
+an owner's ceiling in this build. The process reports `sampler` as the mechanism when it starts,
+on every platform.
+
+On macOS and Linux no operating-system limit backs either figure: the daemon's reading and the
+process's own check are the whole mechanism. On Windows the daemon also puts the process in a job
+object whose per-process limit on committed memory is the ceiling in force when the process starts,
+and counts the limit applied only when the system reads it back and reports the process in the job.
+A commit past the limit is refused by the system, and a runtime that cannot allocate ends. When the
+process closes its end, the daemon asks the job whether it refused a commit, and if it did the
+process ended for memory: inference pauses with `memory_pressure` as it does for a reading past the
+ceiling, and the job is not retried. The limit is on committed memory and not on the resident set,
+so it does not count the weights a model maps for reading, and the daemon's reading stays the
+measure of the resident set. A host that will not apply the limit says so on its standard error
+and keeps the daemon's reading as the only ender.
 
 CPU-only is two settings rather than one. Zero GPU layers keeps every layer's weights on the
 processor; turning the library's *operation* offload off keeps the arithmetic there too, because the
@@ -193,6 +219,10 @@ reason.
 - **Windows:** the whole process takes the idle priority class and the very low I/O priority. It is
   the process and not the thread, because a thread that another thread starts begins at the normal
   priority, and the compute threads of the model runtime are started by the thread that loads it.
+  Windows also keeps an I/O priority for each thread, and the thread that loads the model exists
+  before the process's priority is set, so that thread sets its own as well. The process reports the
+  I/O class as applied only when the system reads back very low for that thread and for the
+  process.
   The idle class is served only when nothing else wants the processor, and the process's control
   thread and watchdog are in it too. When other work keeps every core busy for longer than a few
   seconds (Windows lifts a thread that has waited that long), the daemon can wait past its bound
