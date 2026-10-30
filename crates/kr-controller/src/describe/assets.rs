@@ -242,8 +242,8 @@ async fn fetch_all(
     let models = host.models().to_path_buf();
     let here = directory(&models, profile);
     // Owner-only whatever mask the daemon runs under, which a daemon no service definition started
-    // takes from the login.
-    if let Err(error) = kr_ipc::paths::create_private_tree(&models, &here) {
+    // takes from the login. A directory that is there, a link to a larger disk included, is kept.
+    if let Err(error) = kr_ipc::paths::create_dir_all_owner_only(&here) {
         return Ended::Failed(format!(
             "the folder for the model's files could not be made: {error}"
         ));
