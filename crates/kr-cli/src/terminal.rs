@@ -852,7 +852,8 @@ mod unix {
                 return Err(CliError::TerminalProbeFailed(Shown::said(
                     "this host cannot record that this terminal has been asked, so a handshake \
                      here could not be retried safely; attach with --no-probe, or make the \
-                     runtime directory yours alone and writable",
+                     runtime directory yours alone and writable, with no access list entry for \
+                     another account",
                 )));
             }
             // The clock is monotonic and starts at zero, so the one-second deadline is one second

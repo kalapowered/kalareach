@@ -312,9 +312,12 @@ impl Shown {
                     ),
                 }
             }
-            IpcError::DirectoryAccessRefused { path, .. } => {
-                crate::shown!("{} is not owner-only", Self::host_path(path))
-            }
+            // The detail can name an account, so it is not said; the reason is in fixed words, and
+            // holds for the owner and the access list on every platform that refuses this way.
+            IpcError::DirectoryAccessRefused { path, .. } => crate::shown!(
+                "{} is not owner-only: its owner or its access list does not keep other accounts out",
+                Self::host_path(path)
+            ),
             IpcError::SocketPathTooLong { path, len, limit } => crate::shown!(
                 "socket path {} is {} bytes, over the {}-byte platform limit",
                 Self::host_path(path),
