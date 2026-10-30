@@ -3712,7 +3712,16 @@ fn ask(
             Asked::Declined(detail)
         }
     })?;
-    let mut heard = Heard::of(child.stdout.take());
+    let mut heard = match Heard::of(child.stdout.take()) {
+        Ok(heard) => heard,
+        Err(error) => {
+            // The child was started a moment ago and is this process's own.
+            end_probe(child);
+            return Err(Asked::Overran(unavailable(format!(
+                "{described} was ended because its output could not be read without blocking: {error}"
+            ))));
+        }
+    };
     let too_much = || {
         Asked::Overran(unavailable(format!(
             "{described} answered with more than a version and a directory"
@@ -3837,24 +3846,25 @@ struct Heard {
 }
 
 impl Heard {
-    fn of(pipe: Option<std::process::ChildStdout>) -> Self {
+    /// Takes the pipe, or fails when it cannot be read without blocking.
+    fn of(pipe: Option<std::process::ChildStdout>) -> std::io::Result<Self> {
         #[cfg(unix)]
         {
             if let Some(pipe) = pipe.as_ref() {
-                // A pipe that cannot be read without blocking is not read: it is closed, and the
-                // answer is whatever the program has written when it ends, which is nothing.
-                let _ = without_blocking(pipe);
+                // A read of a pipe that can block could wait for as long as the program lives,
+                // past the deadline that is checked between reads. So such a pipe is not kept.
+                without_blocking(pipe)?;
             }
-            Self {
+            Ok(Self {
                 pipe,
                 seen: Bounded::default(),
                 unreadable: None,
-            }
+            })
         }
         #[cfg(not(unix))]
-        Self {
+        Ok(Self {
             reader: pipe.map(|pipe| read_up_to(pipe, PROBE_OUTPUT_LIMIT)),
-        }
+        })
     }
 
     /// Takes in what has arrived, for no longer than `deadline` and no further than
