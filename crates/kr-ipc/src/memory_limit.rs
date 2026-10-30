@@ -21,6 +21,10 @@
 //! reads the limit back from the job, and asks the system whether the process is in the job, before
 //! it says it applied anything.
 //!
+//! A process runs from the moment it is created, and a limit does not reach back to memory it has
+//! committed already. So a process that is to be held to a limit is created held ([`start_held`]),
+//! put behind the limit, and only then let run ([`resume`]): it never runs outside the limit.
+//!
 //! The job does not end the processes in it when its last handle closes: it limits memory and
 //! nothing else, so what ends the process stays with the process's owner.
 //!
@@ -32,6 +36,8 @@
 )]
 
 use std::os::windows::io::{AsRawHandle as _, BorrowedHandle, FromRawHandle as _, OwnedHandle};
+use std::os::windows::process::CommandExt as _;
+use std::process::Command;
 
 use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::IO::{CreateIoCompletionPort, GetQueuedCompletionStatus};
@@ -42,6 +48,15 @@ use windows_sys::Win32::System::JobObjects::{
     QueryInformationJobObject, SetInformationJobObject,
 };
 use windows_sys::Win32::System::SystemServices::JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT;
+use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    /// `NtResumeProcess`, which the bindings this crate uses do not declare. It lets every thread
+    /// of the process run that a count of suspensions holds, which for a process that was created
+    /// held is its first thread.
+    fn NtResumeProcess(process: HANDLE) -> i32;
+}
 
 /// Why a limit was not applied.
 pub type Refusal = &'static str;
@@ -50,6 +65,33 @@ pub type Refusal = &'static str;
 /// whole number of pages, so a figure that is not one reads back a little different, and the
 /// allocation granularity of 64 KiB is more than a page on every platform it runs on.
 const ROUNDING: usize = 64 * 1024;
+
+/// Makes the process `command` starts begin held: it is created but its first thread does not run
+/// until [`resume`] lets it. This sets the command's creation flags, so it replaces any that were
+/// set.
+pub fn start_held(command: &mut Command) -> &mut Command {
+    command.creation_flags(CREATE_SUSPENDED)
+}
+
+/// Lets run the process that [`start_held`] began held.
+///
+/// The handle must be open on the process with the right to suspend and resume it, as the one a
+/// parent holds of the child it started is.
+///
+/// # Errors
+///
+/// Returns why the process was not let run.
+pub fn resume(process: BorrowedHandle<'_>) -> std::result::Result<(), Refusal> {
+    let process: HANDLE = process.as_raw_handle().cast();
+    // SAFETY: the call takes a handle that the caller holds open and reads no memory of this
+    // process.
+    let status = unsafe { NtResumeProcess(process) };
+    if status < 0 {
+        Err("this host would not let the held process run")
+    } else {
+        Ok(())
+    }
+}
 
 /// A process memory limit the system holds around one process.
 ///
@@ -66,11 +108,13 @@ pub struct MemoryLimit {
 
 impl MemoryLimit {
     /// Puts the process behind `process` into a job that refuses it more committed memory than
-    /// `limit_bytes`, and reads the limit and the membership back from the system. The limit read back is
-    /// allowed to differ from the one asked for by the rounding the system applies to it.
+    /// `limit_bytes`, and reads the limit and the membership back from the system. The limit read
+    /// back is allowed to differ from the one asked for by the rounding the system applies to it.
     ///
     /// The handle must be open on the process with the right to set its quota and to terminate it,
-    /// as the one a parent holds of the child it started is, and it stays open for the call.
+    /// as the one a parent holds of the child it started is, and it stays open for the call. The
+    /// right to query the process is needed to ask the system whether it is in the job; without it
+    /// the assignment's own success stands.
     ///
     /// # Errors
     ///
@@ -161,7 +205,11 @@ impl MemoryLimit {
         let mut inside = 0;
         // SAFETY: the call writes one value through a pointer to a live local of that size.
         let asked = unsafe { IsProcessInJob(process, raw_job, &raw mut inside) };
-        if asked == 0 || inside == 0 {
+        // The assignment was accepted, so the process is in the job. A system that answers that it
+        // is not is believed over that. One that cannot answer (the handle may lack the right to
+        // ask) is not: the job holds the process whatever is done with it here, so dropping it now
+        // would close the port that records a refusal, and the limit would hold unseen.
+        if asked != 0 && inside == 0 {
             return Err("this host did not report the process in the job");
         }
         Ok(Self {
@@ -219,11 +267,15 @@ fn size_of<T>(value: &T) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{BufRead as _, Write as _};
-    use std::os::windows::io::AsHandle as _;
-    use std::process::{Command, Stdio};
+    use std::os::windows::io::{AsHandle as _, FromRawHandle as _, OwnedHandle};
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
 
-    use super::MemoryLimit;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    };
+
+    use super::{MemoryLimit, resume, start_held};
 
     const MIB: u64 = 1 << 20;
 
@@ -234,19 +286,14 @@ mod tests {
     const REFUSED: i32 = 3;
 
     /// The child half of the cases below. Run on its own it asks for nothing and passes. Started by
-    /// them with the variable set, it waits to be told it is in the job, asks the system to commit
-    /// that much, and exits with whether the system let it.
+    /// them with the variable set, it asks the system to commit that much as the first thing it
+    /// does, and exits with whether the system let it.
     #[test]
     fn the_child_that_asks_the_system_for_memory() {
         let Ok(ask) = std::env::var(ASK) else {
             return;
         };
         let ask: usize = ask.parse().expect("a number of bytes");
-        let mut line = String::new();
-        std::io::stdin()
-            .lock()
-            .read_line(&mut line)
-            .expect("the parent says it has put this process in its job");
         let mut held: Vec<u8> = Vec::new();
         let code = match held.try_reserve_exact(ask) {
             Ok(()) => {
@@ -260,10 +307,10 @@ mod tests {
         std::process::exit(code);
     }
 
-    /// Starts the child behind a limit, lets it ask for `ask` bytes, and says how it ended and
-    /// whether the limit recorded being passed.
-    fn child_asking(ask: u64, limit_bytes: u64) -> (Option<i32>, bool) {
-        let mut child = Command::new(std::env::current_exe().expect("this test binary"))
+    /// Starts the child held, so that it has not run, and tells it to ask for `ask` bytes.
+    fn held_child_asking(ask: u64) -> Child {
+        let mut command = Command::new(std::env::current_exe().expect("this test binary"));
+        command
             .args([
                 "--exact",
                 "memory_limit::tests::the_child_that_asks_the_system_for_memory",
@@ -271,39 +318,88 @@ mod tests {
                 "--test-threads=1",
             ])
             .env(ASK, ask.to_string())
-            .stdin(Stdio::piped())
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("the child starts");
+            .stderr(Stdio::null());
+        start_held(&mut command);
+        command.spawn().expect("the child starts")
+    }
+
+    /// Starts the child behind a limit and lets it run, and says how it ended and whether the limit
+    /// recorded being passed, asked twice.
+    fn child_asking(ask: u64, limit_bytes: u64) -> (Option<i32>, bool, bool) {
+        let mut child = held_child_asking(ask);
         let limit = MemoryLimit::around(child.as_handle(), limit_bytes)
             .expect("the limit is applied to the child");
         assert_eq!(limit.limit_bytes(), limit_bytes);
-        assert!(!limit.take_refusal(), "nothing has been asked yet");
-        let mut input = child.stdin.take().expect("the child's input");
-        input.write_all(b"go\n").expect("the child is waiting");
-        drop(input);
+        resume(child.as_handle()).expect("the child is let run");
         let ended = child.wait().expect("the child ends");
-        (ended.code(), limit.take_refusal())
+        (ended.code(), limit.take_refusal(), limit.take_refusal())
     }
 
     /// A process behind the limit that commits more than it allows is refused by the system, and
     /// the limit says so after the process has gone, so that whoever holds it can tell a process
-    /// the system stopped from one that failed some other way. The control is the same request
-    /// under a limit that allows it, which the system grants and does not record.
+    /// the system stopped from one that failed some other way, and forgets it once it has said.
+    /// The child asks as the first thing it does: it was held until it was behind the limit. The
+    /// control is the same request under a limit that allows it, which the system grants and does
+    /// not record.
     #[test]
     fn a_process_refused_a_commit_by_the_system_leaves_the_limit_saying_so() {
         // A limit that is not a whole number of pages, as a profile's itemised cost is not.
-        let (code, reached) = child_asking(512 * MIB, 256 * MIB + 123);
+        let (code, reached, again) = child_asking(512 * MIB, 256 * MIB + 123);
         assert_eq!(code, Some(REFUSED), "the system refused the commit");
         assert!(reached, "and the limit recorded that it had");
+        assert!(!again, "and says it once");
 
-        let (code, reached) = child_asking(512 * MIB, 4096 * MIB + 123);
+        let (code, reached, again) = child_asking(512 * MIB, 4096 * MIB + 123);
         assert_eq!(
             code,
             Some(0),
             "the same request under a limit that allows it"
         );
         assert!(!reached, "is not a limit reached");
+        assert!(!again);
+    }
+
+    /// A held process does not run until it is let: a child that would commit more than the limit
+    /// allows, and is given all the time it would need to do it before the limit is applied, is
+    /// still refused.
+    #[test]
+    fn a_held_process_does_not_run_before_it_is_behind_the_limit() {
+        let mut child = held_child_asking(512 * MIB);
+        let until = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < until {
+            assert!(
+                child.try_wait().expect("the child is asked").is_none(),
+                "the held process ran"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let limit = MemoryLimit::around(child.as_handle(), 256 * MIB)
+            .expect("the limit is applied to the child");
+        resume(child.as_handle()).expect("the child is let run");
+        let ended = child.wait().expect("the child ends");
+        assert_eq!(ended.code(), Some(REFUSED), "the system refused the commit");
+        assert!(limit.take_refusal());
+    }
+
+    /// A handle that may set a process's quota and end it, and may not query it, cannot be asked
+    /// whether the process is in the job. The assignment was accepted, so the process is in the
+    /// job: the limit is held, and it records the refusal as one the system could ask about does.
+    #[test]
+    fn a_limit_whose_membership_the_system_cannot_report_still_holds_and_records() {
+        let mut child = held_child_asking(512 * MIB);
+        // SAFETY: the call takes the identifier of the child, which is held and not yet ended, and
+        // returns a handle or null.
+        let opened = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, child.id()) };
+        assert!(!opened.is_null(), "a handle with two rights is opened");
+        // SAFETY: the handle was just returned by the call above and nothing else owns it.
+        let handle = unsafe { OwnedHandle::from_raw_handle(opened.cast()) };
+        let limit = MemoryLimit::around(handle.as_handle(), 256 * MIB)
+            .expect("a limit that holds is not undone by a question it could not ask");
+        resume(child.as_handle()).expect("the child is let run");
+        let ended = child.wait().expect("the child ends");
+        assert_eq!(ended.code(), Some(REFUSED), "the system refused the commit");
+        assert!(limit.take_refusal(), "and the limit recorded it");
     }
 }

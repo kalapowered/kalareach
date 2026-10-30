@@ -32,7 +32,7 @@ use kr_describe::supervise::{
 };
 use kr_describe::testing::{
     CATALOGUE_VARIABLE, Raw, SCRIPT_VARIABLE, STARTED_PREFIX, Script, TestAsset, TestCatalogue,
-    TestProfile, refuse_identity_lookup, refuse_thread_start,
+    TestProfile, at_next_spawn, refuse_identity_lookup, refuse_thread_start,
     the_system_refuses_the_process_memory,
 };
 use kr_describe::time::Reading;
@@ -2118,6 +2118,62 @@ fn a_process_the_system_refuses_memory_past_the_ceiling_ends_as_memory_pressure(
 #[test]
 fn a_runtime_that_answers_a_refused_allocation_as_failed_still_ends_as_memory_pressure() {
     the_system_refuses_memory_past_the_ceiling(true);
+}
+
+/// KR-REQ-22.10: on Windows a process is behind the system's memory limit from its first
+/// instruction. The process commits more than the ceiling as the first thing it does, before it
+/// reads a word of the wire, and the daemon is made to take its time over what it does with the
+/// process after creating it, until the process has done what it does or been refused. A process
+/// that ran in that time would have committed the memory, and none of the limit would be applied
+/// to it afterwards; one that is created held is refused.
+#[cfg(windows)]
+#[test]
+fn a_process_that_commits_memory_as_it_starts_is_refused_by_the_systems_limit() {
+    const MIB: u64 = 1 << 20;
+    let (catalogue, _) = tiny();
+    let fits = catalogue
+        .catalogue()
+        .default_profile()
+        .execution()
+        .resident_estimate
+        .total();
+    let mut rig = Rig::limited(
+        &Script {
+            commit_at_start_bytes: fits + 64 * MIB,
+            ..Script::default()
+        },
+        ResourceSettings {
+            owner_ceiling_bytes: Some(fits),
+            ..ResourceSettings::default()
+        },
+        Some(&catalogue),
+        true,
+    );
+    let runtime = rig.placed.directory("runtime");
+    let waiting = runtime.clone();
+    // The wait is for a fact about the process, with a bound for the process that cannot say it: a
+    // process created held does not run, so it says nothing, and the bound is all that passes.
+    at_next_spawn(move || {
+        let until = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < until
+            && !stub::began(&waiting, "committed")
+            && !stub::began(&waiting, "refused")
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
+    queue(rig.service(), &session(1), Priority::Ordinary, at(0));
+    rig.until(&roomy(), at(3_000), "the process ended", |reports, _| {
+        the_process_ended(reports)
+    });
+    assert!(
+        stub::began(&runtime, "refused"),
+        "the system refused the process the memory it commits as it starts"
+    );
+    assert!(
+        !stub::began(&runtime, "committed"),
+        "and the process never held it"
+    );
 }
 
 /// What a process that the system refused memory comes to, whatever the platform: the end is the

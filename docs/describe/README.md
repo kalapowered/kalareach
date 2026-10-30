@@ -184,9 +184,13 @@ an owner's ceiling in this build. The process reports `sampler` as the mechanism
 on every platform.
 
 On macOS and Linux no operating-system limit backs either figure: the daemon's reading and the
-process's own check are the whole mechanism. On Windows the daemon also puts the process in a job
-object whose per-process limit on committed memory is the ceiling in force when the process starts,
-and counts the limit applied only when the system reads it back and reports the process in the job.
+process's own check are the whole mechanism. On Windows the daemon also creates the process held,
+puts it in a job object whose per-process limit on committed memory is the ceiling in force when
+the process starts, and lets it run only then, so the process never runs outside the limit and
+memory it commits as it starts is refused. The daemon counts the limit applied only when the system
+reads it back and reports the process in the job; a system that accepted the assignment and cannot
+answer the question of membership leaves the limit in force and recording. A daemon that ends in
+the moment between creating the process and letting it run leaves behind a process that never ran.
 A commit past the limit is refused by the system. A runtime that cannot allocate ends, and one that
 catches the failed allocation answers that its load or job failed and goes on. The daemon asks the
 job when the process closes its end, when its frames stop short, and when it answers that a load
