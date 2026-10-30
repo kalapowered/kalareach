@@ -1933,8 +1933,10 @@ listed as `viewer plus question.respond`. A share that carries no role in full, 
 `session.view`, is listed as `custom:` and its rights.
 `kr share revoke` takes a share back, or withdraws an invitation nobody has accepted. A revocation
 is complete when every affected session's worker has fenced it; until then it is pending, and the
-command names what it waits for and exits with 1. Asking again is a new revocation. What the device
-already saw stays with it.
+command names each session whose worker has not fenced it and exits with 1. Asking again is a new
+revocation. What the device already saw stays with it. With `--json` it returns `grant_id` and the
+revocation result: `authority_revision`, `revoked_grants`, `revoked_grants_total` and the `barrier`,
+which lists each affected worker with its session and state.
 
 `kr share transfer` hands a session's control to another device. The host describes the transfer
 from its own records, an owner device confirms exactly that plan, and the command then sends the
