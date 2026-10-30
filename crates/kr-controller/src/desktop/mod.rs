@@ -71,8 +71,10 @@ pub fn capabilities(
 /// Both profiles are reported, in profile order, whichever one this host creates sessions with:
 /// the answer for the other is what a person needs to choose between them.
 ///
-/// The mechanism a desktop-bound worker's answer names is the supervisor this host actually
-/// selected, because that is what a logout acts on.
+/// The mechanism both answers name is the supervisor this host actually selected, because that is
+/// what a logout acts on. The daemon selects it once, when it starts, so an answer built from what
+/// the platform offers at the moment of the question could name a mechanism this daemon is not
+/// using.
 #[must_use]
 pub fn persistence(supervisor: &'static str) -> Vec<ProfilePersistence> {
     vec![
@@ -84,14 +86,15 @@ pub fn persistence(supervisor: &'static str) -> Vec<ProfilePersistence> {
              attachment and it survives this daemon restarting; it does not survive the login \
              session ending, and it closes with reason desktop_lost when that happens.",
         ),
-        headless_persistence(),
+        headless_persistence(supervisor),
     ]
 }
 
-/// Reports what logout does to a headless worker on this platform.
+/// Reports what logout does to a headless worker on this platform, under the supervisor this host
+/// selected.
 #[must_use]
-pub fn headless_persistence() -> ProfilePersistence {
-    let (persistence, mechanism, detail) = platform::headless_persistence();
+pub fn headless_persistence(supervisor: &'static str) -> ProfilePersistence {
+    let (persistence, mechanism, detail) = platform::headless_persistence(supervisor);
     ProfilePersistence::new(WorkerProfile::HeadlessUser, persistence, mechanism, detail)
 }
 
@@ -111,15 +114,17 @@ mod platform {
     /// answer this host has not established would be worse than none, because somebody would plan
     /// around it.
     ///
-    /// A Mac with no graphical login session has no domain to put a job in, so this host uses a
-    /// detached process there, and says so rather than naming a mechanism it did not select.
-    pub(super) fn headless_persistence() -> (LogoutPersistence, &'static str, &'static str) {
-        if !crate::supervision::LaunchdSupervisor::available() {
+    /// A Mac with no graphical domain to put a job in is served by the detached supervisor, and
+    /// the answer says so rather than naming a mechanism this host did not select.
+    pub(super) fn headless_persistence(
+        supervisor: &str,
+    ) -> (LogoutPersistence, &'static str, &'static str) {
+        if supervisor == crate::supervision::DETACHED_DESCRIPTION {
             return (
                 LogoutPersistence::NoServiceManager,
                 "a detached process, reparented to the system's first process",
-                "This host has no graphical login session to put a job in, so a session's worker \
-                 is a detached process rather than a launchd job. What a logout does to it is the \
+                "This host starts a session's worker as a detached process, because it has no \
+                 graphical domain to put a launchd job in. What a logout does to it is the \
                  platform's own behaviour and this host does not claim to know it.",
             );
         }
@@ -145,11 +150,14 @@ mod platform {
     /// The setting is the user's own, it is enabled by an explicit choice, and this host never
     /// enables it as a side effect of installing itself or of creating a session.
     ///
-    /// A host with no user service manager to ask has no such setting either. That is reported as
-    /// what it is rather than as a choice the person could make, because on such a host a worker
-    /// is a detached process and what a logout does to it is the platform's own behaviour.
-    pub(super) fn headless_persistence() -> (LogoutPersistence, &'static str, &'static str) {
-        if !crate::supervision::SystemdSupervisor::available() {
+    /// A host whose daemon selected the detached supervisor has no such setting either. That is
+    /// reported as what it is rather than as a choice the person could make, because on such a
+    /// host a worker is a detached process and what a logout does to it is the platform's own
+    /// behaviour.
+    pub(super) fn headless_persistence(
+        supervisor: &str,
+    ) -> (LogoutPersistence, &'static str, &'static str) {
+        if supervisor == crate::supervision::DETACHED_DESCRIPTION {
             return (
                 LogoutPersistence::NoServiceManager,
                 "a detached process, reparented to the system's first process",
@@ -186,7 +194,9 @@ mod platform {
     /// user's own logon session, and it is stopped when that session ends. Running work across a
     /// sign-out needs a service under an account with the right to log on as a service, which is
     /// an explicit installation choice and a different execution context from the user's own.
-    pub(super) fn headless_persistence() -> (LogoutPersistence, &'static str, &'static str) {
+    pub(super) fn headless_persistence(
+        _supervisor: &str,
+    ) -> (LogoutPersistence, &'static str, &'static str) {
         (
             LogoutPersistence::EndsAtLogout,
             "a process the environment's scheduled task starts in the user's own logon session",
@@ -204,7 +214,9 @@ mod platform {
     use kr_protocol::desktop::LogoutPersistence;
 
     /// A platform with no per-user service manager this host knows.
-    pub(super) fn headless_persistence() -> (LogoutPersistence, &'static str, &'static str) {
+    pub(super) fn headless_persistence(
+        _supervisor: &str,
+    ) -> (LogoutPersistence, &'static str, &'static str) {
         (
             LogoutPersistence::NoServiceManager,
             "detached process",
@@ -283,6 +295,32 @@ mod tests {
             default_profile(&context(false)),
             WorkerProfile::HeadlessUser,
             "a host with no graphical login has no desktop to bind to"
+        );
+    }
+
+    /// KR-REQ-03.24: the answer for a headless worker is about the supervisor the daemon selected,
+    /// whatever the platform offers at the moment it is asked. A daemon that started a detached
+    /// process says so and claims no service manager; one that selected the platform's own names
+    /// that and not a detached process.
+    #[cfg(unix)]
+    #[test]
+    fn the_headless_answer_follows_the_supervisor_the_daemon_selected() {
+        use crate::supervision::DETACHED_DESCRIPTION;
+
+        let detached = headless_persistence(DETACHED_DESCRIPTION);
+        assert_eq!(detached.persistence, LogoutPersistence::NoServiceManager);
+        assert!(
+            detached.mechanism().as_str().contains("detached"),
+            "{}",
+            detached.mechanism()
+        );
+
+        let own = headless_persistence("the platform's own service manager");
+        assert_ne!(own.persistence, LogoutPersistence::NoServiceManager);
+        assert!(
+            !own.mechanism().as_str().contains("detached"),
+            "{}",
+            own.mechanism()
         );
     }
 

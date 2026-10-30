@@ -1987,7 +1987,7 @@ fn per_user_startup_uses_the_platform_service_mechanism_and_changes_no_sleep_pol
 
     // What logout does to that mechanism is reported rather than assumed, and a claim that a
     // headless session survives logout names the configuration that makes it survive.
-    let persistence = kr_controller::desktop::headless_persistence();
+    let persistence = kr_controller::desktop::headless_persistence(described);
     assert!(!persistence.mechanism().as_str().is_empty());
     assert!(!persistence.detail().as_str().is_empty());
     if persistence.persistence == LogoutPersistence::SurvivesLogout {
@@ -2001,13 +2001,20 @@ fn per_user_startup_uses_the_platform_service_mechanism_and_changes_no_sleep_pol
             persistence.detail()
         );
     }
+    // The report is about the mechanism this host selected: a Mac whose daemon chose launchd says
+    // its background domain outlives the graphical login without establishing how long, and one
+    // that chose a detached process says that, and neither names the other.
     #[cfg(target_os = "macos")]
-    assert_eq!(
-        persistence.persistence,
-        LogoutPersistence::NotEstablished,
-        "this platform's background domain outlives the graphical login and this host does not \
-         read how long it lasts"
-    );
+    if described == kr_controller::supervision::DETACHED_DESCRIPTION {
+        assert_eq!(persistence.persistence, LogoutPersistence::NoServiceManager);
+    } else {
+        assert_eq!(
+            persistence.persistence,
+            LogoutPersistence::NotEstablished,
+            "this platform's background domain outlives the graphical login and this host does \
+             not read how long it lasts"
+        );
+    }
 
     // Starting a host, and asking it anything, never writes a power setting.
     let host = kr_ipc::testing::TempHost::create();
