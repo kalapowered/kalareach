@@ -49,14 +49,21 @@ pub fn random_nonce() -> Result<Nonce192> {
 /// }
 /// ```
 ///
-/// The same call to the recipient's stored-envelope key is the one that compiles:
+/// The same call to the recipient's stored-envelope key is the one that compiles, beside every
+/// name the failing block uses, so a renamed type or method fails this block rather than leaving the
+/// block above to fail for the rename:
 ///
 /// ```
-/// use kr_crypto::keys::StoredEnvelopeKeyPair;
+/// use kr_crypto::keys::{NotificationPreviewKeyPair, StoredEnvelopeKeyPair};
 /// use kr_crypto::sealed::seal_stored_envelope;
 ///
-/// fn seal(sender: &StoredEnvelopeKeyPair, device: &StoredEnvelopeKeyPair) {
+/// fn seal(
+///     sender: &StoredEnvelopeKeyPair,
+///     device: &StoredEnvelopeKeyPair,
+///     preview: &NotificationPreviewKeyPair,
+/// ) {
 ///     let _ = seal_stored_envelope(sender, device.public(), b"a mailbox record");
+///     let _ = preview.public();
 /// }
 /// ```
 ///

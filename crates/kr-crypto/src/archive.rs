@@ -110,21 +110,25 @@ pub fn decrypt_object(
 /// }
 /// ```
 ///
-/// The same call to the recipient's stored-envelope key is the one that compiles:
+/// The same call to the recipient's stored-envelope key is the one that compiles, beside every
+/// name the failing block uses, so a renamed type or method fails this block rather than leaving the
+/// block above to fail for the rename:
 ///
 /// ```
 /// use kr_crypto::archive::wrap_object_key;
-/// use kr_crypto::keys::StoredEnvelopeKeyPair;
+/// use kr_crypto::keys::{NotificationPreviewKeyPair, StoredEnvelopeKeyPair};
 /// use kr_crypto::secret::SymmetricKey;
 /// use kr_protocol::archive::KeyWrapContext;
 ///
 /// fn wrap(
 ///     sender: &StoredEnvelopeKeyPair,
 ///     device: &StoredEnvelopeKeyPair,
+///     preview: &NotificationPreviewKeyPair,
 ///     context: KeyWrapContext,
 ///     key: &SymmetricKey,
 /// ) {
 ///     let _ = wrap_object_key(sender, device.public(), context, key);
+///     let _ = preview.public();
 /// }
 /// ```
 ///
@@ -361,15 +365,19 @@ pub fn manifest_wrap_for<'a>(
 /// }
 /// ```
 ///
-/// The same call under the derived symmetric key is the one that compiles:
+/// The same call under the derived symmetric key is the one that compiles, beside every name the
+/// failing block uses, so a renamed type fails this block rather than leaving the block above to
+/// fail for the rename:
 ///
 /// ```
 /// use kr_crypto::archive::encrypt_recovery_bundle;
+/// use kr_crypto::keys::NotificationPreviewKeyPair;
 /// use kr_crypto::secret::SymmetricKey;
 /// use kr_protocol::archive::RecoveryBundle;
 ///
-/// fn encrypt(key: &SymmetricKey, bundle: &RecoveryBundle) {
+/// fn encrypt(key: &SymmetricKey, preview: &NotificationPreviewKeyPair, bundle: &RecoveryBundle) {
 ///     let _ = encrypt_recovery_bundle(key, bundle);
+///     let _ = preview;
 /// }
 /// ```
 ///
