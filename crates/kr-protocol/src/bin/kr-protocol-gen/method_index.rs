@@ -344,45 +344,52 @@ fn link(section: &Section) -> String {
     )
 }
 
-/// Returns the delimiter and the length of a line that opens or closes a fenced block: three or
-/// more backticks or tildes, after any indentation.
-fn fence(line: &str) -> Option<(u8, usize)> {
-    let bytes = line.trim_start().as_bytes();
-    let mark = *bytes.first()?;
+/// Reads a line as a run of at least three backticks or tildes after at most three spaces, and
+/// returns the delimiter, the length of the run and what follows it. A line indented further is
+/// code, not a fence.
+fn fence(line: &str) -> Option<(u8, usize, &str)> {
+    let indent = line.bytes().take_while(|byte| *byte == b' ').count();
+    if indent > 3 {
+        return None;
+    }
+    let mark = *line.as_bytes().get(indent)?;
     if mark != b'`' && mark != b'~' {
         return None;
     }
-    let length = bytes.iter().take_while(|byte| **byte == mark).count();
-    (length >= 3).then_some((mark, length))
+    let length = line.as_bytes()[indent..]
+        .iter()
+        .take_while(|byte| **byte == mark)
+        .count();
+    (length >= 3).then(|| (mark, length, &line[indent + length..]))
 }
 
 /// Returns the heading lines of a document as (line number, level, text), in order.
 ///
 /// A line is a heading when it is one to six `#`, a space and the text. A line inside a fenced block
-/// is not: a shell comment there starts with `#` and ends no section. A block ends at a line of the
-/// delimiter that opened it, at least as long as the opening and with nothing after it, so a fence
-/// of the other kind, or a shorter one, inside a block is text.
+/// is not: a shell comment there starts with `#` and ends no section. A block opens at a fence whose
+/// text after the run holds no backtick when the run is of backticks, and ends at a fence of the
+/// delimiter that opened it, at least as long as the opening and with nothing after the run, so a
+/// fence of the other kind, a shorter one, or one with text after it, inside a block, is text.
 fn headings(lines: &[&str]) -> Vec<(usize, usize, String)> {
     let mut found = Vec::new();
     let mut open: Option<(u8, usize)> = None;
     for (number, line) in lines.iter().enumerate() {
-        match (open, fence(line)) {
-            (None, Some(start)) => open = Some(start),
-            (Some((mark, length)), Some((closing, run)))
-                if closing == mark
-                    && run >= length
-                    && line.trim().bytes().all(|byte| byte == mark) =>
-            {
+        let fenced = fence(line);
+        if let Some((mark, length)) = open {
+            if fenced.is_some_and(|(closing, run, rest)| {
+                closing == mark && run >= length && rest.trim_matches([' ', '\t']).is_empty()
+            }) {
                 open = None;
             }
-            (Some(_), _) => {}
-            (None, None) => {
-                let level = line.bytes().take_while(|byte| *byte == b'#').count();
-                if let (true, Some(text)) =
-                    ((1..=6).contains(&level), line[level..].strip_prefix(' '))
-                {
-                    found.push((number, level, text.to_owned()));
-                }
+        } else if let Some((mark, length, rest)) = fenced
+            && (mark == b'~' || !rest.contains('`'))
+        {
+            open = Some((mark, length));
+        } else {
+            let level = line.bytes().take_while(|byte| *byte == b'#').count();
+            if let (true, Some(text)) = ((1..=6).contains(&level), line[level..].strip_prefix(' '))
+            {
+                found.push((number, level, text.to_owned()));
             }
         }
     }
@@ -591,8 +598,8 @@ mod tests {
     use kr_protocol::method::REGISTRY;
 
     use super::{
-        INDEX_PATH, broken_links, described_in, has_heading, markdown_documents, names, render,
-        sections, unnamed_methods,
+        INDEX_PATH, broken_links, described_in, has_heading, headings, markdown_documents, names,
+        render, sections, unnamed_methods,
     };
 
     fn docs() -> PathBuf {
@@ -731,6 +738,75 @@ mod tests {
         assert!(!names(&target[0], "three.method"));
         let named_by_its_heading = sections(document, "`three.method`");
         assert!(names(&named_by_its_heading[0], "three.method"));
+    }
+
+    /// KR-REQ-01.24: each rule that makes a fenced block end where a reader sees it end, one case
+    /// for each, so that dropping any one changes a result. In every document `X` is the heading a
+    /// reader does not see and `Y` the one it does; the fence rules decide which are found.
+    #[test]
+    fn a_fenced_block_opens_and_ends_by_its_own_rules() {
+        let found = |document: &str| -> Vec<String> {
+            let lines: Vec<&str> = document.lines().collect();
+            headings(&lines)
+                .into_iter()
+                .map(|(_, _, text)| text)
+                .collect()
+        };
+        let cases: [(&str, &str, &[&str]); 9] = [
+            (
+                "a shorter fence of the same kind does not end it",
+                "~~~~~\n~~~\n## X\n~~~~~\n## Y\n",
+                &["Y"],
+            ),
+            (
+                "a longer fence of the other kind does not end it",
+                "```\n~~~~~\n## X\n```\n## Y\n",
+                &["Y"],
+            ),
+            (
+                "a fence with text after it does not end it",
+                "```\n``` text\n## X\n```\n## Y\n",
+                &["Y"],
+            ),
+            (
+                "a longer fence of its own kind ends it",
+                "```\n## X\n`````\n## Y\n",
+                &["Y"],
+            ),
+            (
+                "a closing fence may be followed by spaces",
+                "```\n## X\n```  \n## Y\n",
+                &["Y"],
+            ),
+            (
+                "backticks in a backtick fence's text make it no fence",
+                "```lang`x\n## X\n## Y\n",
+                &["X", "Y"],
+            ),
+            (
+                "a fence indented four spaces is code, not a fence",
+                "    ```\n## X\n## Y\n",
+                &["X", "Y"],
+            ),
+            (
+                "a closing fence indented four spaces ends nothing",
+                "```\n## X\n    ```\n## X\n```\n## Y\n",
+                &["Y"],
+            ),
+            (
+                "an unclosed fence runs to the end of the document",
+                "## Y\n```\n## X\n",
+                &["Y"],
+            ),
+        ];
+        for (rule, document, expected) in cases {
+            assert_eq!(found(document), expected, "{rule}");
+        }
+        assert_eq!(
+            found("~~~ info with `ticks`\n## X\n~~~\n## Y\n  ```sh\n## X\n  ```\n"),
+            ["Y"],
+            "a tilde fence takes any text, and a fence indented up to three spaces is one"
+        );
     }
 
     #[test]
