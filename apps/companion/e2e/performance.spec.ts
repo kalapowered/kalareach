@@ -135,9 +135,10 @@ async function startTiming(page: Page): Promise<void> {
 
 /**
  * Types the keys and returns the time of each, once the last has been timed, with how far the
- * stream had been drawn when the first key went in, after the composer was emptied.
+ * stream had been drawn when the first key went in, after the composer was emptied, and when the
+ * last key's timing was read, in the same call as the times.
  */
-async function typeKeys(page: Page): Promise<{ times: number[]; drawnBefore: number }> {
+async function typeKeys(page: Page): Promise<{ times: number[]; drawnBefore: number; drawnAfter: number }> {
   const composer = page.getByTestId('composer-input')
   // Emptying the composer presses a key of its own, so it is done, and timed, before the timing
   // is cleared.
@@ -153,7 +154,11 @@ async function typeKeys(page: Page): Promise<{ times: number[]; drawnBefore: num
   const drawnBefore = await page.evaluate(() => window.krKeys?.drawn() ?? -1)
   await page.keyboard.type(KEYS, { delay: PAUSE_MS })
   await page.waitForFunction(() => window.krKeys?.pending === 0 && (window.krKeys?.samples.length ?? 0) > 0)
-  return { times: await page.evaluate(() => [...(window.krKeys?.samples ?? [])]), drawnBefore }
+  const read = await page.evaluate(() => ({
+    times: [...(window.krKeys?.samples ?? [])],
+    drawnAfter: window.krKeys?.drawn() ?? -1
+  }))
+  return { times: read.times, drawnBefore, drawnAfter: read.drawnAfter }
 }
 
 test.describe('KR-PERF-008: input stays responsive while output streams over a large history', () => {
@@ -221,8 +226,7 @@ test.describe('KR-PERF-008: input stays responsive while output streams over a l
     // Typed only once the stream is being drawn, so that the readings are of keys against output
     // that is arriving, not before it has begun.
     await page.waitForFunction(() => (window.krKeys?.drawn() ?? -1) >= 0)
-    const { times: streamed, drawnBefore } = await typeKeys(page)
-    const drawnAfter = await page.evaluate(() => window.krKeys?.drawn() ?? -1)
+    const { times: streamed, drawnBefore, drawnAfter } = await typeKeys(page)
     await page.evaluate(() => window.krKeys?.stop())
 
     const typed = await page.getByTestId('composer-input').inputValue()
@@ -258,7 +262,7 @@ test.describe('KR-PERF-008: input stays responsive while output streams over a l
     )
 
     // Every key reached the composer, in order, and the stream advanced on the screen between the
-    // first key and the end of the last key's timing: a run where the keys finished before any of the stream
+    // moment the first key went in and the moment the last key's timing was read: a run where the keys finished before any of the stream
     // reached the screen would report the same figures and mean something else. The readings above
     // are recorded, and read by a person on a reference host.
     expect(typed).toBe(KEYS)
