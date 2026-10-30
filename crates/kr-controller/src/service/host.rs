@@ -318,8 +318,10 @@ impl Controller {
     /// record's lock and before the effect it guards, because waiting for that lock can outlast a
     /// fence this host owes or the registration the change was admitted under. Enrolling and
     /// forgetting write the record while the registration is held standing; a refresh runs a
-    /// platform command that can take seconds, so it is asked before the command and again before
-    /// it opens a bridge.
+    /// platform command that can take seconds, so it is asked before the command, again before the
+    /// command starts the environment, again where the observation is recorded, which after a
+    /// start is an outcome this host does not know, and once more before it opens a bridge, after
+    /// which a refusal is not a refusal of the refresh that has run.
     pub(super) async fn environment_record(
         self: &Arc<Self>,
         actor: &kr_protocol::actor::ActorEnvelope,
@@ -432,11 +434,12 @@ impl Controller {
                 let asking = Arc::clone(&controller);
                 let platform = self.environment_observer();
                 // The platform command is a blocking one, and it is run on a blocking thread so a
-                // distribution that takes seconds to start does not hold this runtime. It is asked
-                // under the admission before it runs, and what it saw is recorded under the
-                // admission asked again: a fence landing during the command stops the record, and
-                // a refusal after a start is an outcome this host does not know, since the start
-                // is not undone by the record not being made.
+                // distribution that takes seconds to start does not hold this runtime. The
+                // admission is asked before the first look, again before the start, and again
+                // where what it saw is recorded: a fence landing during the first look stops the
+                // start, and one landing during the start stops the record, which after a start is
+                // an outcome this host does not know, since the start is not undone by the record
+                // not being made.
                 let refreshed = tokio::task::spawn_blocking(move || {
                     crate::bridge::store::Store::with_locked(&observing, |store| {
                         #[cfg(feature = "testing")]
@@ -446,6 +449,7 @@ impl Controller {
                             params.environment_id,
                             params.start,
                             platform.as_ref(),
+                            &|| asking.check_registration(&carried),
                         )?;
                         let started = observed.started();
                         asking
@@ -513,7 +517,7 @@ impl Controller {
                             // than assumed, so the record keeps it — against the approved record
                             // the bridge was opened for, which another caller may have replaced
                             // since.
-                            let outcome = self
+                            match self
                                 .record_outcome(
                                     carried,
                                     environment_id,
@@ -521,27 +525,42 @@ impl Controller {
                                     crate::bridge::store::BridgeAnswer::Answered,
                                     now_ms,
                                 )
-                                .await?;
-                            // The record decides, including when it has gone: the readiness that
-                            // comes back is read from it after the result was written.
-                            row.readiness = outcome.readiness;
-                            let detail = if outcome.established {
-                                format!(
-                                    "environment {} answered as {} over its own local channel",
-                                    verification.environment_id, verification.os_user
-                                )
-                            } else {
-                                "this environment's record changed while the bridge was open, so \
-                                 what answered says nothing about what is recorded now"
-                                    .to_owned()
-                            };
-                            (Nullable::some(verification), detail)
+                                .await
+                            {
+                                Ok(outcome) => {
+                                    // The record decides, including when it has gone: the
+                                    // readiness that comes back is read from it after the result
+                                    // was written.
+                                    row.readiness = outcome.readiness;
+                                    let detail = if outcome.established {
+                                        format!(
+                                            "environment {} answered as {} over its own local \
+                                             channel",
+                                            verification.environment_id, verification.os_user
+                                        )
+                                    } else {
+                                        "this environment's record changed while the bridge was \
+                                         open, so what answered says nothing about what is \
+                                         recorded now"
+                                            .to_owned()
+                                    };
+                                    (Nullable::some(verification), detail)
+                                }
+                                // The refresh has run, and a refusal here is not a refusal of it.
+                                Err(refusal) => (
+                                    Nullable::null(),
+                                    format!(
+                                        "the bridge answered, and this host did not record that, \
+                                         because {refusal}"
+                                    ),
+                                ),
+                            }
                         }
                         Err(refusal) => {
                             // Nothing answered. What an earlier bridge established for this record
                             // is not evidence about it any more, so it is taken back rather than
                             // left standing beside a failure.
-                            let outcome = self
+                            match self
                                 .record_outcome(
                                     carried,
                                     environment_id,
@@ -549,9 +568,20 @@ impl Controller {
                                     crate::bridge::store::BridgeAnswer::Refused,
                                     now_ms,
                                 )
-                                .await?;
-                            row.readiness = outcome.readiness;
-                            (Nullable::null(), refusal.to_string())
+                                .await
+                            {
+                                Ok(outcome) => {
+                                    row.readiness = outcome.readiness;
+                                    (Nullable::null(), refusal.to_string())
+                                }
+                                Err(unrecorded) => (
+                                    Nullable::null(),
+                                    format!(
+                                        "{refusal}; and this host did not record that, because \
+                                         {unrecorded}"
+                                    ),
+                                ),
+                            }
                         }
                     }
                 };
