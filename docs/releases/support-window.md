@@ -62,7 +62,7 @@ A build refuses a signed release matrix of a revision below `PRODUCTION_FIRST_RE
 
 1. Find the first revision the managed service has published whose tiers list the new package version. It is live before any release of the level.
 2. Set `PRODUCTION_FIRST_REVISION` to it.
-3. Keep the signed reply of that revision, as the service serves it, as `crates/kr-client/tests/fixtures/release-matrix/deployed-revision-<revision>.json`, and point the cases that read the earlier file at it: the `the_deployed_document` module of `crates/kr-client/tests/release_matrix.rs` and the gate case in `crates/kr-client/tests/release_gate.rs`.
+3. Keep the signed reply of that revision, as the service serves it, as `crates/kr-client/tests/fixtures/release-matrix/deployed-revision-<revision>.json`, and point the cases that read the earlier file at it, moving the revision and the versions they assert to the new range: the `the_deployed_document` module of `crates/kr-client/tests/release_matrix.rs` and the gate case in `crates/kr-client/tests/release_gate.rs`.
 
 `is_read_from_a_revision_that_leaves_out_the_first_publication` reads the file named for the constant and asserts that it verifies under `Pins::production()` and serves `PACKAGE_VERSION`. A cut that raises the constant without keeping the reply fails it, and so does a cut that leaves the constant at a revision whose ranges stop short of the new version. `kr-release-matrix-check`, which the release job runs, refuses a release when the published revision is below the constant or lists no tier for the version.
 
