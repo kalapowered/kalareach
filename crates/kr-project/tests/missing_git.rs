@@ -95,21 +95,15 @@ fn a_profile_is_prepared_where_git_is_not_installed_and_each_invocation_is_refus
 #[cfg(unix)]
 #[test]
 fn a_git_that_exits_with_status_one_is_refused_the_same_way() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     // What `/usr/bin/git` is on a Mac that has no developer tools: a program that asks to install
     // them and ends with status 1, whatever it is asked.
     let directory = tempfile::tempdir().expect("a directory for this test");
     let search = directory.path().join("search");
     std::fs::create_dir(&search).expect("a search path of this test's own");
-    let stand_in = search.join("git");
-    std::fs::write(
-        &stand_in,
-        "#!/bin/sh\necho 'xcode-select: note: No developer tools were found.' >&2\nexit 1\n",
-    )
-    .expect("the stand-in for Git");
-    std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755))
-        .expect("the stand-in can run");
+    stand_in(
+        &search,
+        "echo 'xcode-select: note: No developer tools were found.' >&2\nexit 1",
+    );
     let profile = profile_searching(directory.path(), &search);
 
     assert_refused_for_lack_of_git(&profile.git().expect_err("the stand-in is not Git"));
@@ -142,15 +136,21 @@ fn a_git_installed_after_the_profile_was_prepared_is_found_by_the_next_look() {
     );
 }
 
-/// Puts a `git` that is the script `body` on `search`.
+/// Puts a `git` that is the script `body` on `search`, replacing the one that is there.
+///
+/// The text is written where nothing starts it and a separate process copies it into place, so no
+/// descriptor of this process is ever open on the program for writing. These cases run on threads
+/// of one process beside others that start children, and a child is handed a copy of every
+/// descriptor open at that moment: Linux refuses to start a program that one of them still holds
+/// open for writing, and a refused start would pass for an answer.
 #[cfg(unix)]
 fn stand_in(search: &Path, body: &str) {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let program = search.join("git");
-    std::fs::write(&program, format!("#!/bin/sh\n{body}\n")).expect("the stand-in for Git");
-    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
-        .expect("the stand-in can run");
+    let text = search.join("git.text");
+    std::fs::write(&text, format!("#!/bin/sh\n{body}\n")).expect("the stand-in's text");
+    let _ = std::fs::remove_file(&program);
+    kr_ipc::testing::place_program(&text, &program);
+    std::fs::remove_file(&text).expect("the text goes once the stand-in is in place");
 }
 
 /// Whether a process with this identifier still exists, zombies included.
@@ -274,6 +274,10 @@ fn a_git_that_answers_without_end_is_stopped_at_the_bound_and_refused() {
         matches!(refusal, ProjectError::GitUnavailable { .. }),
         "{refusal:?}"
     );
+    assert!(
+        refusal.to_string().contains("did not answer"),
+        "it says why: {refusal}"
+    );
 }
 
 #[cfg(unix)]
@@ -355,7 +359,7 @@ fn requests_that_arrive_together_share_the_refusal_of_one_look() {
         &search,
         &format!("echo started >> '{}'\nexec sleep 120", started.display()),
     );
-    let profile = profile_waiting(directory.path(), &search, Duration::from_secs(2));
+    let profile = profile_waiting(directory.path(), &search, Duration::from_secs(3));
     let together = Barrier::new(REQUESTS);
 
     std::thread::scope(|scope| {
@@ -380,8 +384,93 @@ fn requests_that_arrive_together_share_the_refusal_of_one_look() {
         .expect("the stand-in was started")
         .lines()
         .count();
-    assert!(
-        starts < REQUESTS,
-        "the stand-in was started {starts} times for {REQUESTS} requests that arrived together"
+    assert_eq!(
+        starts, 1,
+        "the stand-in was started once for {REQUESTS} requests that arrived together"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_git_that_ends_first_leaves_nothing_running_and_costs_no_bound() {
+    // A stand-in that starts a process of its own with the pipe the question is answered on, and
+    // ends. The process it started is in its group, and the group is ended when the stand-in is
+    // seen to end, so the look does not wait out the bound for a pipe that would stay open.
+    let directory = tempfile::tempdir().expect("a directory for this test");
+    let search = directory.path().join("search");
+    std::fs::create_dir(&search).expect("a search path of this test's own");
+    let child = directory.path().join("child");
+    stand_in(
+        &search,
+        &format!("sleep 120 &\necho $! > '{}'\nexit 1", child.display()),
+    );
+    // A bound far longer than this case may take: a look that waited for the pipe would use it.
+    let profile = profile_waiting(directory.path(), &search, Duration::from_secs(60));
+
+    let refusal = profile.git().expect_err("that is not Git");
+    assert!(
+        matches!(refusal, ProjectError::GitUnavailable { .. }),
+        "{refusal:?}"
+    );
+    assert!(
+        refusal.to_string().contains("exited 1"),
+        "it says what happened: {refusal}"
+    );
+    let pid = std::fs::read_to_string(&child)
+        .expect("the stand-in started its process")
+        .trim()
+        .to_owned();
+    until(
+        &format!("process {pid} that the stand-in started still runs after the stand-in ended"),
+        || !exists(&pid),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_copy_of_git_that_does_not_answer_refuses_the_look_and_keeps_nothing() {
+    // The program on the search path answers both questions. The copy of Git under the helper
+    // directory it names does not: it is not a copy that answers differently, which would leave the
+    // program as the one that runs, but no answer, and a look that kept the program on the strength
+    // of it would keep one that cannot run Git.
+    let directory = tempfile::tempdir().expect("a directory for this test");
+    let search = directory.path().join("search");
+    let helpers = directory.path().join("helpers");
+    std::fs::create_dir(&search).expect("a search path of this test's own");
+    std::fs::create_dir(&helpers).expect("a helper directory of this test's own");
+    let helpers = helpers
+        .canonicalize()
+        .expect("the helper directory resolves");
+    stand_in(
+        &search,
+        &format!(
+            "case \"$1\" in\n--exec-path) echo '{}' ;;\n--version) echo 'git version 2.50.1' ;;\nesac",
+            helpers.display()
+        ),
+    );
+    stand_in(&helpers, "exec sleep 120");
+    let profile = profile_waiting(directory.path(), &search, Duration::from_secs(3));
+
+    let refusal = profile
+        .git()
+        .expect_err("a copy that never answers is no answer");
+    assert!(
+        matches!(refusal, ProjectError::GitUnavailable { .. }),
+        "{refusal:?}"
+    );
+    assert!(
+        refusal.to_string().contains("did not answer"),
+        "it says why: {refusal}"
+    );
+
+    // The copy is repaired, and the next look takes it: nothing of the refusal was kept.
+    stand_in(
+        &helpers,
+        &format!(
+            "case \"$1\" in\n--exec-path) echo '{}' ;;\n--version) echo 'git version 2.50.1' ;;\nesac",
+            helpers.display()
+        ),
+    );
+    let found = profile.git().expect("the next look finds Git");
+    assert_eq!(found.executable(), helpers.join("git"));
 }
