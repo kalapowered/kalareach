@@ -241,7 +241,9 @@ async fn fetch_all(
 ) -> Ended {
     let models = host.models().to_path_buf();
     let here = directory(&models, profile);
-    if let Err(error) = tokio::fs::create_dir_all(&here).await {
+    // Owner-only whatever mask the daemon runs under, which a daemon no service definition started
+    // takes from the login.
+    if let Err(error) = kr_ipc::paths::create_private_tree(&models, &here) {
         return Ended::Failed(format!(
             "the folder for the model's files could not be made: {error}"
         ));

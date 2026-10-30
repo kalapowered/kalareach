@@ -699,15 +699,17 @@ pub struct BackupStore {
 }
 
 impl BackupStore {
-    /// Opens the store beside `state_dir`, creating it and its staging directory on first use.
+    /// Opens the store beside `state_dir`, creating it and its staging directory on first use. The
+    /// staging directory is owner-only, whatever mask the daemon runs under.
     ///
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the database cannot be opened or
-    /// migrated, or the staging directory cannot be made.
+    /// migrated, or the staging directory cannot be made or is not owner-only.
     pub fn open(state_dir: &Path) -> Result<Self> {
         let staging_root = state_dir.join("backup");
-        std::fs::create_dir_all(&staging_root).map_err(ControllerError::registry)?;
+        kr_ipc::paths::create_private_tree(&staging_root, &staging_root)
+            .map_err(ControllerError::registry)?;
         let connection =
             Database::open(&state_dir.join("backup.sqlite")).map_err(ControllerError::registry)?;
         Self::opened(connection, staging_root)
