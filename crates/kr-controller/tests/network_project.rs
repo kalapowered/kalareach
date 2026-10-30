@@ -55,6 +55,18 @@ const PROJECT_RIGHTS: &[ActionRight] = &[
     ActionRight::WorkspaceManage,
 ];
 
+/// What a device is paired with when it holds `rights`. A device that may change a working copy
+/// reaches back to the start of time, since the versions it captures and applies are read by the
+/// rule a recorded version is read by, which refuses a grant whose history reaches back to no
+/// moment.
+fn a_proposal_holding(rights: &[ActionRight]) -> kr_protocol::pairing::ProposedGrant {
+    let mut proposal = net_support::proposal(rights);
+    if rights.contains(&ActionRight::ChangesetCreate) {
+        proposal.history.lower_bound_ms = Nullable::some(kr_protocol::scalars::TimestampMs::new(1));
+    }
+    proposal
+}
+
 /// The rights a device needs to capture a working copy, read its diff, and apply or revert a
 /// version in one, beside the rights to make the working copy.
 const CHANGE_RIGHTS: &[ActionRight] = &[
@@ -3370,7 +3382,7 @@ impl Granted {
         let mut control = host.client().await;
         let device = net_support::Device::create().await;
         let record =
-            net_support::pair_with(&host, &device, &owner, net_support::proposal(rights)).await;
+            net_support::pair_with(&host, &device, &owner, a_proposal_holding(rights)).await;
         let session = net_support::connect(&host, &device, &record).await;
         let grant = record.grant.grant_id;
         let root = host.work().join("granted");
