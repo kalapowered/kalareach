@@ -3268,9 +3268,11 @@ async fn a_fork_replaces_every_service_client_and_availability_only_explains_it(
     assert_eq!(before.len(), ManagedService::ALL.len());
     for report in &before {
         assert!(report.configured, "{report:?}");
+        let name = report.service.as_str();
+        let article = if name.starts_with('a') { "An" } else { "A" };
         assert_eq!(
             report.explanation,
-            format!("A {} service is configured.", report.service.as_str())
+            format!("{article} {name} service is configured.")
         );
     }
 
