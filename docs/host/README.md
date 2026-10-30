@@ -32,13 +32,15 @@ A directory above a root that exists is left as it is and checked for nothing: `
 world-writable by design and `~/.cache` is usually group-readable, and neither is KalaReach's to
 change. One that is missing is created with mode 0700 on Unix, and the umask can only narrow that
 mode; on Windows it takes the access list of the directory above it. Each root, and each directory
-below it that the host makes through `create_private_tree`, is made with mode 0700 and verified each
-time the host asks for it that way. The host makes other directories below a root another way,
-among them the terminal probe's record directory, the backup store's staging directory and the
-description model directories. The three are made with mode 0700 as well, and one that exists is
-used as it is, with a wider mode or as a symbolic link to a larger disk, since each lies inside a
-root the host verifies. The directories of an installed release are read-only (mode 0555 on Unix)
-by design.
+below it that the host makes through `create_private_tree`, is made with mode 0700 on Unix and
+verified each time the host asks for it that way. The host makes other directories below a root
+another way, among them the terminal probe's record directory, the backup store's staging directory
+and the description model directories. A missing one of these three is made with mode 0700 on Unix
+as well. One that exists is used as it is, with a wider mode or as a symbolic link to a larger disk,
+since each lies inside a root the host verifies; the target of a link keeps the protection it was
+given. The terminal probe verifies the runtime root before it writes a record, since the probe can
+come before the start that verifies it. The directories of an installed release are read-only
+(mode 0555 on Unix) by design.
 
 A verified directory that is a symbolic link, or that belongs to another user, is refused rather
 than repaired. A root given with a final separator is looked up as the name it ends in, so
@@ -46,12 +48,14 @@ than repaired. A root given with a final separator is looked up as the name it e
 this user owns, that only this user can write and that others can read or enter (mode 0755, 0711 or
 0701, for example) is refused too, and the refusal names the `chmod 700` command that mends it, with
 its path quoted for a shell. `kr` prints the command only where it can say the whole path and the
-path is text: the two roots, and below them the names this installation's tree writes and
-identifiers. For any other directory it prints the owner and the mode. For a directory that others
-can write to the refusal names no command, since a mode does not remove what they put in it. On
-macOS a verified directory whose access list lets another account in is refused with no command,
-since `chmod 700` leaves the list as it is, and so is one whose list cannot be read; either is
-passed again once its list names nobody else and can be read.
+path is text: the two roots, and below them only the names on a fixed list of the host's tree, and
+identifiers. Some verified directories, such as the output times, recoveries and claims
+directories, are not on that list, and for them `kr` prints the owner and the mode. For a directory that others can write to the refusal names no
+command, since a mode does not remove what they put in it. On macOS a verified directory whose
+access list lets another account in is refused with no command, since `chmod 700` leaves the list
+as it is. So is one whose list cannot be read, except on a file system that keeps no lists. Either
+is passed again once its owner and mode are right and its readable list grants no other account
+access.
 
 On Linux, $XDG_RUNTIME_DIR/kalareach is the default runtime root, unless that directory would end up
 in a location shared between all WSL distros. WSLg sets $XDG_RUNTIME_DIR to /mnt/wslg/runtime-dir,
