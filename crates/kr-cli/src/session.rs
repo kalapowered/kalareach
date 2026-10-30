@@ -337,6 +337,10 @@ const VK_CONTROL: u16 = 0x11;
 const VK_MENU: u16 = 0x12;
 /// The keys that toggle a lock. Pressing one types nothing: it changes a state the next key carries.
 const VK_CAPITAL: u16 = 0x14;
+/// The virtual-key code a console gives a character that is no key of the keyboard's, such as one an
+/// input method committed. Every such character has it, so the code says nothing of which key came
+/// up.
+const VK_PACKET: u16 = 0xe7;
 const VK_NUMLOCK: u16 = 0x90;
 const VK_SCROLL: u16 = 0x91;
 
@@ -404,6 +408,35 @@ fn take_scroll_keys(
         }
     }
     (rest, steps)
+}
+
+/// Takes the releases of keys this attachment did not see go down out of a run of key records.
+///
+/// A console reports a key coming up that went down before the attachment began to read, most often
+/// the Return that started the command. Sending that release tells the application a key came up
+/// that was never pressed, and a session that cannot spell records refuses the write for it. `down`
+/// is the keys whose press this attachment has sent, and the order of what is kept is the order it
+/// arrived in. A record with no key of its own (a character an input method committed, or none)
+/// cannot be matched to a press, and is kept.
+fn drop_unseen_releases(
+    keys: Vec<kr_term::win32::KeyRecord>,
+    down: &mut Vec<u16>,
+) -> Vec<kr_term::win32::KeyRecord> {
+    keys.into_iter()
+        .filter(|key| {
+            if matches!(key.virtual_key, 0 | VK_PACKET) {
+                return true;
+            }
+            let place = down.iter().position(|code| *code == key.virtual_key);
+            if key.key_down {
+                if place.is_none() {
+                    down.push(key.virtual_key);
+                }
+                return true;
+            }
+            place.map(|at| down.remove(at)).is_some()
+        })
+        .collect()
 }
 
 /// Whether a run of key records holds a key the person pressed: one going down that is not a
@@ -1479,6 +1512,8 @@ async fn drive(
     let mut paste = PasteWatch::default();
     // The scroll keys that are down now, each with whether this terminal took it.
     let mut scroll_keys_held: Vec<(u16, bool)> = Vec::new();
+    // The keys whose press has been sent to the session and whose release is still to come.
+    let mut keys_down: Vec<u16> = Vec::new();
     // The pointer reports this terminal sends while its window is above the live page, and the
     // moment a report it is part way through stops waiting for the rest of itself.
     let mut pointers = PointerReports::default();
@@ -2057,6 +2092,10 @@ async fn drive(
                             && display.holds_screen()
                             && display.showing_history_buffer();
                         let (keys, steps) = take_scroll_keys(keys, &mut scroll_keys_held, mine);
+                        // A key that came up here after going down before this command read the
+                        // console, the Return that started it among them, is not the session's:
+                        // it never went down there.
+                        let keys = drop_unseen_releases(keys, &mut keys_down);
                         if let (Some(size), true) = (size, steps != 0) {
                             let shown = display
                                 .window_rows()
@@ -2417,8 +2456,8 @@ async fn wait_for_resize(_resized: &mut Option<&mut WindowChanges>) {
 mod tests {
     use super::{
         Answer, AttachOutcome, Heard, Outstanding, Ownership, SCROLL_BACK_KEY, SCROLL_FORWARD_KEY,
-        Sending, Subscriptions, WindowReports, landed, ownership, presses, resizes_in_flight,
-        scroll_keys, scroll_step, scrolled, take_scroll_keys,
+        Sending, Subscriptions, WindowReports, drop_unseen_releases, landed, ownership, presses,
+        resizes_in_flight, scroll_keys, scroll_step, scrolled, take_scroll_keys,
     };
     use crate::error::CliError;
     use kr_client::error::refusal;
@@ -2791,6 +2830,62 @@ mod tests {
             assert!(!presses(&[key(lock, true)]), "{name} types nothing");
             assert!(presses(&[key(lock, true), key(u16::from(b'A'), true)]));
         }
+    }
+
+    /// A key that came up without this attachment seeing it go down is not the session's, however
+    /// the console's records are cut into reads: the Return that started the command is the usual
+    /// one.
+    #[test]
+    fn the_release_of_a_key_this_attachment_did_not_see_go_down_is_not_sent() {
+        use kr_term::win32::KeyRecord;
+
+        let key = |virtual_key: u16, key_down: bool| KeyRecord {
+            virtual_key,
+            scan_code: 0,
+            unicode: 0,
+            key_down,
+            control_keys: 0,
+            repeat: 1,
+        };
+        const RETURN: u16 = 0x0d;
+        const SHIFT: u16 = 0x10;
+        let a = u16::from(b'A');
+        let mut down = Vec::new();
+
+        // The Return that started the command comes up first, and goes nowhere.
+        let kept = drop_unseen_releases(vec![key(RETURN, false)], &mut down);
+        assert!(kept.is_empty(), "{kept:?}");
+        // Shift going down, the letter going down in a read of its own, and both coming up in
+        // another, keep their order, and the release of a key sent going down is sent.
+        let shift_down = key(SHIFT, true);
+        let a_down = key(a, true);
+        assert_eq!(
+            drop_unseen_releases(vec![shift_down], &mut down),
+            vec![shift_down]
+        );
+        assert_eq!(
+            drop_unseen_releases(vec![a_down, a_down], &mut down),
+            vec![a_down, a_down],
+            "a key held down repeats"
+        );
+        let a_up = key(a, false);
+        let shift_up = key(SHIFT, false);
+        assert_eq!(
+            drop_unseen_releases(vec![a_up, shift_up], &mut down),
+            vec![a_up, shift_up]
+        );
+        assert!(down.is_empty());
+        // And the same release again, with nothing down, is not sent a second time.
+        assert!(drop_unseen_releases(vec![a_up], &mut down).is_empty());
+        // A character no key of the keyboard made has no press to match, and is kept whole.
+        let packet = |key_down| key(0xe7, key_down);
+        let run = vec![packet(true), packet(true), packet(false), packet(false)];
+        assert_eq!(drop_unseen_releases(run.clone(), &mut down), run);
+        // One read that holds a release before its own press drops the release and keeps the press.
+        assert_eq!(
+            drop_unseen_releases(vec![a_up, a_down], &mut down),
+            vec![a_down]
+        );
     }
 
     /// Holding the key repeats it, and a read of several is that many pages.
