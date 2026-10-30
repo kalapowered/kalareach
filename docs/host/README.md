@@ -5516,22 +5516,27 @@ first time something needs it, on the `PATH` the daemon was started with, and a 
 kept for the life of the daemon. The first use can be a request, work the daemon resumes when it
 starts (a workflow run, or an interrupted apply that left staged paths) or, on Linux, the proof made
 at the start that this host confines Git for a paired device. That proof finds none and is refused
-with its reason in the daemon's own log, and the start goes on. Git counts as missing when none is on
-that `PATH`, when it cannot answer `--exec-path` or `--version`, when it does not answer both within
-ten seconds or answers with more than a version and a directory, and when it is older than 2.32. The
+with its reason in the daemon's own log, and the start goes on. Git counts as missing when none is on that `PATH`, when it cannot answer `--exec-path` or
+`--version`, when it, or the copy of it under its helper directory, does not answer both within ten
+seconds or answers with more than a version and a directory, and when it is older than 2.32. The
 `/usr/bin/git` of a Mac without the Command Line Tools is the second case: it asks to install them
-and exits with status 1 whatever it is asked.
+and exits with status 1 whatever it is asked. A copy under the helper directory that cannot run, or
+reports another version, is not a reason to refuse: the program on the `PATH` is then the one that
+runs.
 
 A Git that never answers, such as a stand-in that waits for an installer, costs the look that asked
-it ten seconds and no more. A program still under way when the ten seconds end is ended with the
-processes in its group, and one that has ended has the rest of its group ended with it. A process
-that leaves the group is out of reach, and is not waited for. The look is refused as above and
-nothing is kept. While a look is under way the daemon answers what needs no Git. A request that
-needs Git waits for that look, and no other, and is refused with it, so the stand-in is started
-once for all of them. The request that comes after the look has ended makes a look of its own. A
-start that needs Git makes one look for each need: on Linux the proof, and each interrupted apply
-that left staged paths. It goes on when each look has ended, so it can take ten seconds for each. An
-interrupt ends the daemon once the look under way has ended.
+it ten seconds to answer, and a few more to clean up. A program still under way when the ten seconds
+end is ended with the processes in its group, and one that has ended has the rest of its group
+ended with it. A process that has left the group and keeps the pipe is out of reach: the answer is
+refused after one more second and the pipe is closed, so it costs the daemon a descriptor for as
+long as it runs. The look is refused as above and nothing is kept. In a daemon that has started,
+what needs no Git is answered while a look is under way. A request that needs Git waits for that
+look, and no other, and is refused with it, so the stand-in is started once for all of them. A
+request that arrives when no look is under way makes a look of its own. A start that needs Git
+makes one look for each need: on Linux the proof, and each interrupted apply that left staged
+paths. The daemon answers nothing until each has ended, so it can take ten seconds for each. An
+interrupt ends a daemon that has started once the look under way has ended; one interrupted or
+terminated while it is starting ends at once and leaves a stand-in then under way to end by itself.
 
 A request that runs Git is then refused with `HOST_NOT_CONFIGURED` before it makes a repository, an
 operation row, a workspace or a directory. Those are `project.init`, `project.clone`,
@@ -5547,7 +5552,8 @@ so a request repeated after Git is installed carries a new identifier. `diff.app
 on any host.
 
 A search that finds no usable Git is not kept, so a Git installed while the daemon runs is found by
-the next request that reaches the project service, without a restart. On Linux a paired device
+the first request that makes a look after the install, without a restart; a request that joined a
+look under way when Git was installed is refused with it, and its retry finds Git. On Linux a paired device
 stays refused the five repository operations until the next `kr doctor` repeats the proof, and the
 owner's requests do not wait for it. On a Mac without the Command Line Tools, each search starts
 the stub that asks to install them.

@@ -755,8 +755,9 @@ impl GitProgram {
 /// daemon runs serves the next request that needs it, one that is not made while a look that began
 /// before the install is still under way, without a restart.
 ///
-/// A look is bounded by `bound`, so a Git that never answers costs the look that asked it that
-/// long and no more. One look is under way at a time. A request that arrives while one is under
+/// A look is bounded by `bound` to answer, and by [`PROBE_DRAIN`] and [`PROBE_REAP`] to clean up
+/// after, so a Git that never answers costs the look that asked it that long and no more. One look
+/// is under way at a time. A request that arrives while one is under
 /// way waits for that look, and for no other, and is given its result, found or refused, so a
 /// stand-in that hangs is started once for all of them and not once for each. A request that
 /// arrives when none is under way makes its own.
@@ -3167,7 +3168,8 @@ const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(5);
 ///
 /// Git answers these in milliseconds. A program that takes longer is not one this host can run
 /// work through: it is a stand-in waiting on something, such as an installer or a lookup that never
-/// returns. It is ended, with the processes in its group, and refused as unavailable.
+/// returns. It is ended, with the processes in its group, and refused as unavailable. Ending it, and
+/// the wait for its output to close, take [`PROBE_REAP`] and [`PROBE_DRAIN`] more at most.
 pub const PROBE_BOUND: Duration = Duration::from_secs(10);
 
 /// The most one of those answers may hold. A version and a directory are far shorter.
@@ -3661,8 +3663,9 @@ impl Asked {
 /// Git, so it is bounded on every side: by time, by what it may answer, and by what it may leave
 /// running. A program still under way at the deadline is ended with the processes in its group. One
 /// that has ended has the rest of its group ended with it, and one that answers with more than a
-/// version and a directory is refused when it does. A process that leaves the group is out of
-/// reach, and is not waited for: it holds nothing of this host's once the question is over.
+/// version and a directory is refused when it does. A process that left the group and kept the
+/// pipe is out of reach: the answer is refused after a short wait for the end of its output, and
+/// the pipe is closed, so it costs this host no more than the descriptor for as long as it runs.
 fn ask(
     program: &Path,
     arguments: &[&str],
@@ -3688,8 +3691,9 @@ fn ask(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    // The child leads its own group, so ending it ends whatever a wrapper started: a stand-in that
-    // runs a script that runs Git holds the pipe open for as long as any of them lives.
+    // The child leads its own group, so ending the group ends what a wrapper started that stayed in
+    // it: a stand-in that runs a script that runs Git holds the pipe open for as long as any of
+    // them lives.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -3697,15 +3701,22 @@ fn ask(
         command.process_group(0);
     }
     let mut child = command.spawn().map_err(|error| {
-        Asked::Declined(unavailable(format!("{described} could not run: {error}")))
+        let detail = unavailable(format!("{described} could not run: {error}"));
+        // A host that is out of descriptors, processes or memory says nothing about the program,
+        // so the look is refused rather than the program taken for one that cannot run.
+        if short_of_resources(&error) {
+            Asked::Overran(detail)
+        } else {
+            Asked::Declined(detail)
+        }
     })?;
-    let reader = child
-        .stdout
-        .take()
-        .map(|pipe| read_up_to(pipe, PROBE_OUTPUT_LIMIT));
+    let mut heard = Heard::of(child.stdout.take());
     let status = loop {
+        heard.take_in();
         match has_ended(&mut child) {
-            Ok(true) => {
+            Ended::No => {}
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Ended::Uncollected => {
                 // The leader is gone and not yet collected, so its group is still its own and
                 // nothing else on this machine can be in it: whatever it left running is ended
                 // before the number can be given to anything else.
@@ -3719,16 +3730,18 @@ fn ask(
                     }
                 }
             }
-            Ok(false) => {}
-            Err(error) => {
-                end_probe(&mut child);
+            // Collected where the platform cannot say first, so the number may be anyone's by now
+            // and no group is signalled.
+            Ended::Collected(status) => break status,
+            Ended::Failed(error) => {
+                end_probe(child);
                 return Err(Asked::Overran(unavailable(format!(
                     "{described} could not be waited on: {error}"
                 ))));
             }
         }
         if Instant::now() >= deadline {
-            end_probe(&mut child);
+            end_probe(child);
             return Err(Asked::Overran(unavailable(format!(
                 "{described} did not answer in time and was stopped"
             ))));
@@ -3737,22 +3750,31 @@ fn ask(
     };
     // What the program wrote is read to its end, but a process that left the group may still hold
     // the pipe, so the wait for the end is short.
-    if let Some(reader) = reader.as_ref() {
-        let drain = deadline.min(Instant::now() + PROBE_DRAIN);
-        while !reader.handle.is_finished() && Instant::now() < drain {
-            std::thread::sleep(Duration::from_millis(5));
+    let drain = deadline.min(Instant::now() + PROBE_DRAIN);
+    loop {
+        heard.take_in();
+        if heard.ended() {
+            break;
         }
-        if !reader.handle.is_finished() {
+        if Instant::now() >= drain {
             return Err(Asked::Overran(unavailable(format!(
                 "{described} left its output open after it ended"
             ))));
         }
+        std::thread::sleep(Duration::from_millis(5));
     }
-    let answer = join_until(reader, &described, deadline).map_err(|error| {
+    let answer = heard.answer(&described, deadline).map_err(|error| {
         Asked::Overran(unavailable(format!(
             "{described} produced output this host could not read: {error}"
         )))
     })?;
+    // Before the status: what an answer holds beyond the limit is not an answer, whatever the
+    // program then exited with.
+    if answer.truncated {
+        return Err(Asked::Overran(unavailable(format!(
+            "{described} answered with more than a version and a directory"
+        ))));
+    }
     if !status.success() {
         return Err(Asked::Declined(unavailable(format!(
             "{described} exited {}",
@@ -3761,20 +3783,148 @@ fn ask(
                 .map_or_else(|| "on a signal".to_owned(), |code| code.to_string())
         ))));
     }
-    if answer.truncated {
-        return Err(Asked::Overran(unavailable(format!(
-            "{described} answered with more than a version and a directory"
-        ))));
-    }
     Ok(String::from_utf8_lossy(&answer.bytes).into_owned())
+}
+
+/// Whether a failure to start a program says the host, and not the program, is short of something.
+fn short_of_resources(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        use rustix::io::Errno;
+
+        error.raw_os_error().is_some_and(|raw| {
+            [Errno::MFILE, Errno::NFILE, Errno::AGAIN, Errno::NOMEM]
+                .iter()
+                .any(|short| short.raw_os_error() == raw)
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        error.kind() == std::io::ErrorKind::OutOfMemory
+    }
+}
+
+/// A probe's standard output, gathered as it arrives.
+///
+/// On Unix the pipe is read here, without blocking, so no thread holds it: whatever is still
+/// writing to it when the probe is over writes to a pipe that is closed with this. Elsewhere a
+/// thread reads it, as it does for every other Git child.
+struct Heard {
+    #[cfg(unix)]
+    pipe: Option<std::process::ChildStdout>,
+    #[cfg(unix)]
+    seen: Bounded,
+    #[cfg(unix)]
+    unreadable: Option<std::io::Error>,
+    #[cfg(not(unix))]
+    reader: Option<Reader>,
+}
+
+impl Heard {
+    fn of(pipe: Option<std::process::ChildStdout>) -> Self {
+        #[cfg(unix)]
+        {
+            if let Some(pipe) = pipe.as_ref() {
+                // A pipe that cannot be read without blocking is not read: it is closed, and the
+                // answer is whatever the program has written when it ends, which is nothing.
+                let _ = rustix::fs::fcntl_setfl(pipe, rustix::fs::OFlags::NONBLOCK);
+            }
+            Self {
+                pipe,
+                seen: Bounded::default(),
+                unreadable: None,
+            }
+        }
+        #[cfg(not(unix))]
+        Self {
+            reader: pipe.map(|pipe| read_up_to(pipe, PROBE_OUTPUT_LIMIT)),
+        }
+    }
+
+    /// Takes in what has arrived, keeping at most [`PROBE_OUTPUT_LIMIT`] bytes and discarding the
+    /// rest, so that a program that writes without end is read and not waited on.
+    fn take_in(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::io::Read as _;
+
+            let Some(pipe) = self.pipe.as_mut() else {
+                return;
+            };
+            let mut buffer = [0_u8; 4096];
+            loop {
+                match pipe.read(&mut buffer) {
+                    Ok(0) => {
+                        self.pipe = None;
+                        return;
+                    }
+                    Ok(read) => {
+                        let room = PROBE_OUTPUT_LIMIT.saturating_sub(self.seen.bytes.len());
+                        if read > room {
+                            self.seen.bytes.extend_from_slice(&buffer[..room]);
+                            self.seen.truncated = true;
+                        } else {
+                            self.seen.bytes.extend_from_slice(&buffer[..read]);
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => {
+                        self.pipe = None;
+                        self.unreadable = Some(error);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether the end of the output has been reached.
+    fn ended(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.pipe.is_none()
+        }
+        #[cfg(not(unix))]
+        {
+            self.reader
+                .as_ref()
+                .is_none_or(|reader| reader.handle.is_finished())
+        }
+    }
+
+    /// What was written, or why it could not be read.
+    fn answer(self, described: &str, deadline: Instant) -> Result<Bounded> {
+        #[cfg(unix)]
+        {
+            let _ = (described, deadline);
+            match self.unreadable {
+                Some(error) => Err(ProjectError::staging(error)),
+                None => Ok(self.seen),
+            }
+        }
+        #[cfg(not(unix))]
+        join_until(self.reader, described, deadline)
+    }
+}
+
+/// Where a child stands, as far as the platform can say without collecting it.
+enum Ended {
+    No,
+    /// Ended and not yet collected, so its number is still its own.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    Uncollected,
+    /// Ended and collected, because the platform could not say first.
+    Collected(std::process::ExitStatus),
+    Failed(std::io::Error),
 }
 
 /// Whether the child has ended, without collecting it where the platform can say so.
 ///
 /// Where it can, the child is left uncollected, so that the caller can end the group it led while
 /// the number is still the child's own.
-fn has_ended(child: &mut std::process::Child) -> std::io::Result<bool> {
-    #[cfg(unix)]
+fn has_ended(child: &mut std::process::Child) -> Ended {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     if let Ok(raw) = i32::try_from(child.id())
         && let Some(pid) = rustix::process::Pid::from_raw(raw)
     {
@@ -3784,12 +3934,19 @@ fn has_ended(child: &mut std::process::Child) -> std::io::Result<bool> {
             WaitId::Pid(pid),
             WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
         ) {
-            Ok(ended) => return Ok(ended.is_some()),
-            Err(rustix::io::Errno::INTR) => return Ok(false),
+            Ok(Some(_)) => return Ended::Uncollected,
+            Ok(None) => return Ended::No,
+            Err(rustix::io::Errno::INTR) => return Ended::No,
+            // The child is this process's own and was not collected, so the call has no business
+            // failing; if it does, the child is asked after without the group, below.
             Err(_) => {}
         }
     }
-    Ok(child.try_wait()?.is_some())
+    match child.try_wait() {
+        Ok(Some(status)) => Ended::Collected(status),
+        Ok(None) => Ended::No,
+        Err(error) => Ended::Failed(error),
+    }
 }
 
 /// Ends the group the child led, which is every process it started that stayed in it.
@@ -3804,20 +3961,24 @@ fn end_group(child: &std::process::Child) {
     let _ = child;
 }
 
-/// Ends a probe that did not finish, with everything it started, and collects it.
+/// Ends a probe that did not finish, with the processes in its group, and collects it.
 ///
-/// Collecting is bounded too: a child that cannot be collected within [`PROBE_REAP`] is left, and
-/// the look goes on without it.
-fn end_probe(child: &mut std::process::Child) {
-    end_group(child);
+/// Collecting is bounded: a child that cannot be collected within [`PROBE_REAP`], which only one in
+/// an uninterruptible wait cannot, is handed to a thread that collects it when it can, so that it
+/// does not stay a zombie for the life of the daemon, and the look goes on without it.
+fn end_probe(mut child: std::process::Child) {
+    end_group(&child);
     let _ = child.kill();
     let deadline = Instant::now() + PROBE_REAP;
     while Instant::now() < deadline {
-        if !matches!(child.try_wait(), Ok(None)) {
-            return;
+        match child.try_wait() {
+            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+            _ => return,
         }
-        std::thread::sleep(Duration::from_millis(5));
     }
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
 }
 
 /// Reads the major and minor version out of `git --version`.
@@ -4837,6 +4998,30 @@ mod tests {
         assert!(
             !entries.contains_key("half-writ"),
             "and not the one that did not"
+        );
+    }
+
+    #[test]
+    fn a_look_whose_request_stops_is_ended_for_every_request_waiting_for_it() {
+        let installation = Installation::looked_for_on(None, PROBE_BOUND);
+        let look = Arc::new(Look::default());
+        *installation.current.lock().expect("the slot") = Some(Arc::clone(&look));
+        let waiting = {
+            let look = Arc::clone(&look);
+            std::thread::spawn(move || look.wait())
+        };
+
+        // The request that made the look stops without an answer, as one that panics does.
+        drop(Making {
+            installation: &installation,
+            look,
+        });
+
+        let outcome = waiting.join().expect("the waiting request ends");
+        assert!(outcome.is_err(), "it is told the look had no answer");
+        assert!(
+            installation.current.lock().expect("the slot").is_none(),
+            "and the next request makes a look of its own"
         );
     }
 

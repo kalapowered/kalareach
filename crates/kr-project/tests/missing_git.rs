@@ -359,7 +359,7 @@ fn requests_that_arrive_together_share_the_refusal_of_one_look() {
         &search,
         &format!("echo started >> '{}'\nexec sleep 120", started.display()),
     );
-    let profile = profile_waiting(directory.path(), &search, Duration::from_secs(3));
+    let profile = profile_waiting(directory.path(), &search, Duration::from_secs(5));
     let together = Barrier::new(REQUESTS);
 
     std::thread::scope(|scope| {
@@ -407,7 +407,17 @@ fn a_git_that_ends_first_leaves_nothing_running_and_costs_no_bound() {
     // A bound far longer than this case may take: a look that waited for the pipe would use it.
     let profile = profile_waiting(directory.path(), &search, Duration::from_secs(60));
 
-    let refusal = profile.git().expect_err("that is not Git");
+    // The look is made on a thread of its own, so that a look that waits for the pipe is told apart
+    // from one that does not by a guard shorter than the bound, and not by how long this case took.
+    let (done, ended) = std::sync::mpsc::channel();
+    let refusal = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let _ = done.send(profile.git().map(|_| ()).expect_err("that is not Git"));
+        });
+        ended
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the look ended without waiting for the pipe a process it started still held")
+    });
     assert!(
         matches!(refusal, ProjectError::GitUnavailable { .. }),
         "{refusal:?}"
@@ -462,6 +472,12 @@ fn a_copy_of_git_that_does_not_answer_refuses_the_look_and_keeps_nothing() {
         refusal.to_string().contains("did not answer"),
         "it says why: {refusal}"
     );
+    assert!(
+        refusal
+            .to_string()
+            .contains(&helpers.join("git").display().to_string()),
+        "and it names the copy that did not, not the program on the search path: {refusal}"
+    );
 
     // The copy is repaired, and the next look takes it: nothing of the refusal was kept.
     stand_in(
@@ -473,4 +489,82 @@ fn a_copy_of_git_that_does_not_answer_refuses_the_look_and_keeps_nothing() {
     );
     let found = profile.git().expect("the next look finds Git");
     assert_eq!(found.executable(), helpers.join("git"));
+}
+
+/// The program on the search path, which names `helpers` as its helper directory and answers both
+/// questions as a Git of an old enough date does.
+#[cfg(unix)]
+fn answering_program(search: &Path, helpers: &Path) {
+    stand_in(
+        search,
+        &format!(
+            "case \"$1\" in\n--exec-path) echo '{}' ;;\n--version) echo 'git version 2.50.1' ;;\nesac",
+            helpers.display()
+        ),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_copy_of_git_that_cannot_run_or_answers_differently_leaves_the_program_as_the_one_that_runs() {
+    // The copy under the helper directory is asked whether it is the same program. One that cannot
+    // run, or that reports another version, is not: the program on the search path is what runs,
+    // and the look succeeds with it.
+    for (name, copy) in [
+        ("exits-with-status-one", "exit 1"),
+        ("reports-another-version", "echo 'git version 2.49.0'"),
+    ] {
+        let directory = tempfile::tempdir().expect("a directory for this test");
+        let search = directory.path().join("search");
+        let helpers = directory.path().join("helpers");
+        std::fs::create_dir(&search).expect("a search path of this test's own");
+        std::fs::create_dir(&helpers).expect("a helper directory of this test's own");
+        let helpers = helpers
+            .canonicalize()
+            .expect("the helper directory resolves");
+        answering_program(&search, &helpers);
+        stand_in(&helpers, copy);
+        let profile = profile_searching(directory.path(), &search);
+
+        let found = profile
+            .git()
+            .unwrap_or_else(|error| panic!("a copy that {name} does not refuse the look: {error}"));
+        assert_eq!(
+            found.executable(),
+            found.program(),
+            "a copy that {name} is not the program that runs"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_copy_of_git_that_answers_with_too_much_refuses_the_look_whatever_it_exits_with() {
+    for (name, copy) in [
+        ("and exits 0", "head -c 200000 /dev/zero | tr '\\0' x"),
+        (
+            "and exits 1",
+            "head -c 200000 /dev/zero | tr '\\0' x\nexit 1",
+        ),
+    ] {
+        let directory = tempfile::tempdir().expect("a directory for this test");
+        let search = directory.path().join("search");
+        let helpers = directory.path().join("helpers");
+        std::fs::create_dir(&search).expect("a search path of this test's own");
+        std::fs::create_dir(&helpers).expect("a helper directory of this test's own");
+        let helpers = helpers
+            .canonicalize()
+            .expect("the helper directory resolves");
+        answering_program(&search, &helpers);
+        stand_in(&helpers, copy);
+        let profile = profile_searching(directory.path(), &search);
+
+        let refusal = profile
+            .git()
+            .expect_err("a copy that answers with too much is no answer");
+        assert!(
+            refusal.to_string().contains("more than"),
+            "a copy that answers with too much {name}: {refusal}"
+        );
+    }
 }
