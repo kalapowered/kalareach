@@ -19,10 +19,12 @@ even when the platform hands out the same session number. On Windows the logon p
 belongs to the system, and an account without administrative rights, or an administrator whose
 token is not elevated, cannot open it. The generation is the time the system records for the
 session's user to have logged on, which the account reads for its own session whatever its rights.
-A later sign-in to the same session number logs on later, and a session that is disconnected and
-reconnected keeps the time it had. This host does not establish that the system gives a fresh
-logon time to every authenticated sign-in to a session, so where it did not, the next sign-in
-would read as the same desktop. Telling those apart needs a per-user agent inside the session
+A later sign-in to the same session number logs on later. The system records the time of the most
+recent connection apart from the logon time, so a reconnect to a disconnected session is not
+meant to move the logon time; no run of this host has reconnected a session to show it, and a
+reconnect that did move it would read as another login. This host does not establish that the
+system gives a fresh logon time to every authenticated sign-in to a session, so where it did not,
+the next sign-in would read as the same desktop. Telling those apart needs a per-user agent inside the session
 itself, which this host does not install, so the Windows answer is weaker than the other two and
 the tables below say where that shows. A Windows session bound under an earlier release recorded
 the logon process's start value as its generation, which the logon time does not equal: it reads
@@ -47,7 +49,8 @@ A session records that identity when it is created, and `kr status` prints it. O
 worker asks one question afterwards, on every wake of its supervision: is the process that owns my
 login session still running, with the same start value? That is one kernel query, which is what
 lets it be asked that often. On Windows no process answers, so the worker asks the system for the
-session's record again, at most every 30 seconds, and a login that ended is noticed that much later.
+session's record again, no more often than every 30 seconds, and a login that ended is noticed when
+a query next answers after that.
 
 A worker that is already gone cannot be asked, so the host reads the desktop the worker reported
 from the registry's row of the worker, without opening the session's journal, and asks the platform

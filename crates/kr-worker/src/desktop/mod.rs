@@ -16,10 +16,10 @@
 //! The generation is the part that makes the identity survive contact with reality. Linux and
 //! Windows both reuse a login-session number, so the number alone would say a session created in
 //! one login belongs to the next. [`platform`] takes the generation from the process that owns the
-//! login session, and how much that distinguishes is the platform's own business: on macOS and
-//! Linux that process is created with the login and dies with it, and on Windows the logon process
-//! owns the interactive session, which this host reads without establishing that a new one is
-//! started for each sign-in.
+//! login session on macOS and Linux, which is created with the login and dies with it, and from the
+//! time the system records for the session's user to have logged on on Windows, where no process an
+//! account can open owns the session. How much that distinguishes is the platform's own business,
+//! and on Windows this host does not establish that a new logon time is recorded for each sign-in.
 //!
 //! [`DesktopContext::desktop_session_id`] is the derived *name* of that whole context. Equality is
 //! decided by the record's fields, never by the name: a host whose boot identity is too long to
@@ -29,8 +29,10 @@
 //!
 //! [`Watch`] is what one desktop-bound session holds. It is bound at construction to the desktop
 //! recorded in the create request, and every wake of the session's supervision asks it one
-//! question: is that desktop still there? The answer costs one kernel query about a recorded
-//! process identity, which is what lets a live session ask it as often as it wakes.
+//! question: is that desktop still there? On macOS and Linux the answer costs one kernel query
+//! about a recorded process identity, which is what lets a live session ask it as often as it
+//! wakes. Windows has no such process, so a session asks the system for the session's record, no
+//! more often than every [`REREAD_INTERVAL`].
 //!
 //! Three properties of [`Watch`] are deliberate.
 //!

@@ -1,8 +1,9 @@
 //! Reading one login session, on each platform, and asking cheaply whether it is still there.
 //!
-//! Every platform names a graphical login differently, and every platform has one process that
-//! owns it. That process is the anchor of this module: it supplies the login-session generation
-//! and it answers the question a desktop-bound session asks over and over.
+//! Every platform names a graphical login differently, and macOS and Linux each have one process
+//! that owns it. That process is the anchor of this module: it supplies the login-session
+//! generation and it answers the question a desktop-bound session asks over and over. Windows has
+//! none an account can read, and says so below.
 //!
 //! | Platform | The login session | Its owning process |
 //! | --- | --- | --- |
@@ -23,8 +24,8 @@
 //! the system, and an account without administrative rights, or an administrator whose token is
 //! not elevated, cannot open it to read its start time. The Windows reader asks Terminal Services
 //! instead, which answers the account about its own sessions: the generation is the time the
-//! session's user logged on, and a login is rechecked by asking again, on the slower cadence that
-//! a platform conversation gets.
+//! session's user logged on, and a login is rechecked by asking again, no more often than the slower
+//! cadence that a platform conversation gets.
 //!
 //! # Three answers, not two
 //!
@@ -47,7 +48,7 @@ pub struct Login {
     pub kind: DesktopSessionKind,
     /// The platform's own identifier for it.
     pub platform_session: Option<String>,
-    /// The generation, from the owning process's start value.
+    /// The generation: the owning process's start value, or on Windows the session's logon time.
     pub generation: Option<u64>,
     /// What the generation was read from.
     pub generation_source: DesktopGenerationSource,
@@ -194,8 +195,7 @@ pub fn read_login(uid: u32) -> Reading {
 /// be excused because another login exists.
 ///
 /// The recorded generation is compared where the platform gives one, which tells a reused session
-/// number apart from the login that held it before, as far as the process that platform anchors on
-/// allows.
+/// number apart from the login that held it before, as far as that platform's generation allows.
 #[must_use]
 pub fn named_presence(session: &str, generation: Option<u64>, uid: u32) -> Presence {
     implementation::named_presence(session, generation, uid)
@@ -375,7 +375,7 @@ const PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// What this host's own tests asked the deadline to be, in milliseconds, or [`u64::MAX`] when none
 /// did.
-#[cfg(feature = "testing")]
+#[cfg(all(feature = "testing", any(target_os = "macos", target_os = "linux")))]
 static PROBE_DEADLINE_ASKED_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(u64::MAX);
 
@@ -385,7 +385,7 @@ static PROBE_DEADLINE_ASKED_MS: std::sync::atomic::AtomicU64 =
 /// A test that needs a reading to stay outstanding while it works, and to end when it says so,
 /// cannot do that with a deadline the clock runs out. The value is the process's, so such a test
 /// runs in a process of its own.
-#[cfg(feature = "testing")]
+#[cfg(all(feature = "testing", any(target_os = "macos", target_os = "linux")))]
 pub fn set_probe_deadline(deadline: Option<std::time::Duration>) {
     let millis = deadline.map_or(u64::MAX, |deadline| {
         u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX - 1)
@@ -395,7 +395,7 @@ pub fn set_probe_deadline(deadline: Option<std::time::Duration>) {
 
 /// The program this host's own tests asked every platform command to run in place of the one it is
 /// given, or nothing when none did.
-#[cfg(feature = "testing")]
+#[cfg(all(feature = "testing", any(target_os = "macos", target_os = "linux")))]
 static PROBE_PROGRAM: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// Runs `program` in place of the program every platform command is given, with the arguments it
@@ -405,7 +405,7 @@ static PROBE_PROGRAM: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(N
 /// A platform command is named by its absolute path on some platforms (macOS reads its graphical
 /// login through `/bin/launchctl`), so a test cannot put its own on the search path as it can for
 /// the others. The value is the process's, so a test that sets it runs in a process of its own.
-#[cfg(feature = "testing")]
+#[cfg(all(feature = "testing", any(target_os = "macos", target_os = "linux")))]
 pub fn set_probe_program(program: Option<&std::path::Path>) {
     *PROBE_PROGRAM
         .lock()
@@ -782,11 +782,12 @@ mod implementation {
     /// signs in to different sessions over a remote desktop connection and through user
     /// switching, and a worker belongs to exactly one of them. Terminal Services' record of the
     /// session supplies the generation, which is the time its user logged on: a session number
-    /// that a later sign-in reuses has a later logon time, and a session that is reconnected
-    /// keeps the one it had. The record is the account's to read for its own sessions, whatever
-    /// the account's rights.
+    /// that a later sign-in reuses has a later logon time. The record keeps the time of the most
+    /// recent connection apart, so a reconnect is not meant to move it; no run of this host has
+    /// reconnected a session to show that. The record is the account's to read for its own
+    /// sessions, whatever the account's rights.
     pub(super) fn read_login(_uid: u32) -> Reading {
-        let Some(session) = logon::own_session() else {
+        let Ok(session) = kr_ipc::starter::current_session() else {
             return Reading::Unavailable;
         };
         // Session 0 is the service session. It has no desktop, and a worker started there is not
@@ -1149,7 +1150,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_process_in_a_user_session_reads_that_sessions_login_without_opening_any_process() {
-        let session = super::logon::own_session().expect("the process's own session");
+        let session = kr_ipc::starter::current_session().expect("the process's own session");
         let reading = super::read_login(0);
         if session == 0 {
             assert_eq!(reading, Reading::None, "the service session has no desktop");
