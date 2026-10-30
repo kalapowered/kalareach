@@ -5144,19 +5144,20 @@ non-deletable as `PERMISSION_DENIED`.
 For a notification the host asks the push gateway, under the credential the gateway gave the
 authorisation the notification was sent under and over the daemon's own transport, to delete what it
 still holds for that one notification, and names no other. The host takes that authorisation from
-the notification's own record, which keeps the destination as it stood when the notification was
-admitted for it, and asks only while the destination is still that registration. A device that
-registered again holds another authorisation, and the gateway would answer that it holds nothing for
-a notification it did not send, which the host would report as a deletion that did not happen. So
-such a call is refused as `PERMISSION_DENIED` and nothing leaves the host. The registration the call
-was admitted under is asked again on the thread that puts the request, after the credential is found
-and the transport that reaches the gateway is resolved, and immediately before the request is put.
-The gateway's answer says what it held: a notification still queued is not sent now, a recorded
-decision is gone, and nothing at all is also what it answers for a notification it never saw, one of
-another authorisation and one it already removed or swept. This host takes any of those as the
-gateway holding nothing now, and reports the deletion as done. It records nothing of its own, so the
-list goes on showing the notification and a second call asks the gateway again. A gateway that does
-not answer, that refuses the credential, that refuses the request, or whose answer is about another
+the destination, and only while the destination is still the one the notification was admitted for:
+the notification's record keeps a digest of that destination and nothing else of it, so the host
+cannot read the authorisation back from the record. A device that registered again holds another
+authorisation, and the gateway would answer that it holds nothing for a notification it did not
+send, which the host would report as a deletion that did not happen. So such a call is refused as
+`PERMISSION_DENIED` and nothing leaves the host. The registration the call was admitted under is
+asked again on the thread that puts the request, after the credential is found and the transport
+that reaches the gateway is resolved, and immediately before the request is put. The gateway's
+answer says what it held: a notification still queued is not sent now, a recorded decision is gone,
+and nothing at all is also what it answers for a notification it never saw, one of another
+authorisation and one it already removed or swept. This host takes any of those as the gateway
+holding nothing now, and reports the deletion as done. It records nothing of its own, so the list
+goes on showing the notification and a second call asks the gateway again. A gateway that does not
+answer, that refuses the credential, that refuses the request, or whose answer is about another
 notification or also names an error leaves the copy listed as it was and the call fails with
 `STORAGE_UNAVAILABLE`, and the person asks again. Of a refusal the call repeats only a code the
 gateway publishes, never its words. A gateway that takes no more deletions for now fails the call as

@@ -8079,30 +8079,36 @@ async fn a_person_can_have_the_gateway_delete_what_it_holds_for_a_notification_t
 /// the gateway's own words.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_deletion_the_gateway_did_not_carry_out_is_not_reported_as_one() {
-    for (script, code) in [
+    for (script, code, published) in [
         (
             ForgetScript::RefusesTheCredential,
             kr_protocol::error::ErrorCode::StorageUnavailable,
+            None,
         ),
         (
             ForgetScript::AnswersAboutAnother(NotificationId::new(uuid(200))),
             kr_protocol::error::ErrorCode::StorageUnavailable,
+            None,
         ),
         (
             ForgetScript::DoesNotAnswer,
             kr_protocol::error::ErrorCode::StorageUnavailable,
+            None,
         ),
         (
             ForgetScript::Refuses("INTERNAL"),
             kr_protocol::error::ErrorCode::StorageUnavailable,
+            Some("INTERNAL"),
         ),
         (
             ForgetScript::Refuses("A_CODE_THE_GATEWAY_NEVER_PUBLISHED"),
             kr_protocol::error::ErrorCode::StorageUnavailable,
+            None,
         ),
         (
             ForgetScript::RateLimited,
             kr_protocol::error::ErrorCode::RateLimited,
+            None,
         ),
     ] {
         let gateway = Arc::new(DeliveringGateway::forgetting(script));
@@ -8124,6 +8130,13 @@ async fn a_deletion_the_gateway_did_not_carry_out_is_not_reported_as_one() {
             "{script:?}: only a published code is repeated: {}",
             error.message
         );
+        if let Some(published) = published {
+            assert!(
+                error.message.contains(published),
+                "{script:?}: the person is told the published code: {}",
+                error.message
+            );
+        }
         assert_eq!(gateway.forgets().len(), 1, "{script:?}");
         let report = privacy_report(&host).await;
         assert_eq!(
