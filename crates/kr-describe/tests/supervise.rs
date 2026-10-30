@@ -2002,14 +2002,12 @@ fn a_job_whose_process_runs_past_the_owners_ceiling_is_ended_by_the_daemons_samp
     assert_eq!(rig.driver.started(), 1);
 }
 
-/// KR-REQ-22.10: on Windows the operating system holds the ceiling beside the daemon's reading. A
-/// process that asks the system for memory past it is refused, ends because it cannot allocate, and
-/// is reported as memory pressure and not as a crash: nothing is published, the job is not queued
-/// again, and inference pauses until the next load may happen. The daemon's own reading is not what
-/// ends it, since the process never holds the memory the reading would find.
+/// A job whose process the operating system refuses memory past the ceiling, run to its end:
+/// nothing is published, the job is not queued again, the process is gone, and inference pauses
+/// until the next load may happen. The daemon's own reading is not what ends it, since the process
+/// never holds the memory the reading would find.
 #[cfg(windows)]
-#[test]
-fn a_process_the_system_refuses_memory_past_the_ceiling_ends_as_memory_pressure() {
+fn the_system_refuses_memory_past_the_ceiling(fail_when_memory_refused: bool) {
     const MIB: u64 = 1 << 20;
     let (catalogue, _) = tiny();
     let fits = catalogue
@@ -2024,6 +2022,7 @@ fn a_process_the_system_refuses_memory_past_the_ceiling_ends_as_memory_pressure(
             hold_bytes: fits + 64 * MIB,
             generate_until_cancelled: true,
             mark_work: true,
+            fail_when_memory_refused,
             ..Script::default()
         },
         ResourceSettings {
@@ -2073,6 +2072,24 @@ fn a_process_the_system_refuses_memory_past_the_ceiling_ends_as_memory_pressure(
         "nothing was published"
     );
     assert_eq!(rig.driver.started(), 1);
+}
+
+/// KR-REQ-22.10: on Windows the operating system holds the ceiling beside the daemon's reading. A
+/// process that asks the system for memory past it is refused, ends because it cannot allocate, and
+/// is reported as memory pressure and not as a crash.
+#[cfg(windows)]
+#[test]
+fn a_process_the_system_refuses_memory_past_the_ceiling_ends_as_memory_pressure() {
+    the_system_refuses_memory_past_the_ceiling(false);
+}
+
+/// KR-REQ-22.10: a runtime that catches the failed allocation answers that its job failed and goes
+/// on, as the real one does. The refusal is still the ceiling: the answer is not a failure of the
+/// runtime to retry, and the process ends for memory with inference paused.
+#[cfg(windows)]
+#[test]
+fn a_runtime_that_answers_a_refused_allocation_as_failed_still_ends_as_memory_pressure() {
+    the_system_refuses_memory_past_the_ceiling(true);
 }
 
 /// A process that ends inside a job is restarted after the restart delay, and the job is queued

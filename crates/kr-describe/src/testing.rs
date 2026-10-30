@@ -160,6 +160,9 @@ pub struct Script {
     pub too_large: bool,
     /// Whether a job ends because the process passed the memory ceiling.
     pub memory_ceiling: bool,
+    /// Whether a job that is refused the memory it holds answers that it failed, and keeps running,
+    /// as a runtime does that catches a failed allocation, instead of ending with the allocation.
+    pub fail_when_memory_refused: bool,
     /// What a job's answer looks like.
     pub output: Output,
     /// Whether the process ends inside a job, as a crashed model would.
@@ -263,6 +266,7 @@ impl Script {
         flag("produce-when-cancelled", self.produce_when_cancelled);
         flag("too-large", self.too_large);
         flag("memory-ceiling", self.memory_ceiling);
+        flag("fail-when-memory-refused", self.fail_when_memory_refused);
         flag("crash-in-generate", self.crash_in_generate);
         flag("panic-in-generate", self.panic_in_generate);
         flag("mark-start", self.mark_start);
@@ -328,6 +332,7 @@ impl Script {
                 "produce-when-cancelled" => script.produce_when_cancelled = true,
                 "too-large" => script.too_large = true,
                 "memory-ceiling" => script.memory_ceiling = true,
+                "fail-when-memory-refused" => script.fail_when_memory_refused = true,
                 "crash-in-generate" => script.crash_in_generate = true,
                 "panic-in-generate" => script.panic_in_generate = true,
                 "mark-start" => script.mark_start = true,
@@ -488,7 +493,20 @@ impl Model for StubModel {
             std::thread::sleep(Duration::from_millis(self.script.ignore_token_ms));
         }
         // Held to the end of the job, and written so that each page is resident.
-        let held = vec![0xA5_u8; usize::try_from(self.script.hold_bytes).unwrap_or(0)];
+        let wanted = usize::try_from(self.script.hold_bytes).unwrap_or(0);
+        let held = if self.script.fail_when_memory_refused {
+            let mut held: Vec<u8> = Vec::new();
+            if held.try_reserve_exact(wanted).is_err() {
+                return Generating::Ended {
+                    why: JobEnd::Failed,
+                    detail: Some("the runtime could not allocate what the job needs".to_owned()),
+                };
+            }
+            held.resize(wanted, 0xA5_u8);
+            held
+        } else {
+            vec![0xA5_u8; wanted]
+        };
         std::hint::black_box(&held);
         if !held.is_empty() {
             self.began("held");

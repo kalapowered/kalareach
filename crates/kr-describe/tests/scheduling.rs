@@ -235,6 +235,34 @@ fn a_power_supply_the_host_would_not_describe_is_not_taken_for_mains() {
         Signal::Unqualified { .. }
     ));
 
+    // A battery in a peripheral is not the host's power: a desktop with a wireless mouse is on
+    // mains, and a laptop on its battery is on its battery with the mouse beside it.
+    let mouse: Files = &[("type", Some("Battery\n")), ("scope", Some("Device\n"))];
+    assert_eq!(
+        tree(&[("hid-mouse", mouse)]),
+        Signal::Qualified(PowerSource::Mains)
+    );
+    assert_eq!(
+        tree(&[
+            ("BAT0", battery),
+            ("hid-mouse", mouse),
+            ("AC", mains_offline)
+        ]),
+        Signal::Qualified(PowerSource::Battery)
+    );
+    // A charger on a USB-C port, of any of the kinds the kernel names, and a programmable supply
+    // that is online, are mains.
+    let usb_pd: Files = &[("type", Some("USB_PD\n")), ("online", Some("1\n"))];
+    let programmable: Files = &[("type", Some("USB\n")), ("online", Some("2\n"))];
+    assert_eq!(
+        tree(&[("BAT0", battery), ("ucsi", usb_pd)]),
+        Signal::Qualified(PowerSource::Mains)
+    );
+    assert_eq!(
+        tree(&[("BAT0", battery), ("ucsi", programmable)]),
+        Signal::Qualified(PowerSource::Mains)
+    );
+
     // The control: an adapter that says it is online settles it, whatever else the host would not
     // describe, so a laptop on its charger is not paused for a supply it cannot read.
     assert_eq!(
