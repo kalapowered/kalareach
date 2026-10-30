@@ -70,7 +70,8 @@ organisation's team: the key file, its key identifier and its issuer identifier,
 service has the upload, and the script then waits for it. The step goes on only when the status is
 `Accepted`. A status of `In Progress` when the wait times out is not a failure of the submission:
 resume it with `xcrun notarytool wait <submission id>` and the same key options. `notarytool log
-<submission id>` has the service's reasons for a refusal, and the script saves it beside the tree.
+<submission id>` has the service's reasons for a refusal, and the script saves it as
+`<work>/<top>.notary-log.json`, in the folder [named below](#signing-a-release).
 
 A tar archive of executables cannot carry a stapled ticket, because a ticket attaches to an
 application, a package or a disk image. Apple keeps it. The first time a person opens a program that
@@ -113,6 +114,13 @@ leave files for one. It ends by printing the command that starts the sealing, wi
 sums as an input. `--no-stage` stops before the draft. A draft that is already there is a refusal
 that names `scripts/sign-macos-release.sh --remove-staging <release>`; the script removes a draft it
 made itself when one of its later steps fails, and the publish job removes it after publishing.
+
+The script works in a new folder for each run, `<work>`: `$KR_RELEASE_WORK/<stamp>` when `KR_RELEASE_WORK`
+is set, and `~/Library/Caches/kalareach-release/<stamp>` when it is not, where `<stamp>` is the time the run
+started as `YYYYMMDD-HHMMSS`. It keeps the folder. A run that stages prints no path to it, so the newest
+folder is the last run's; `--no-stage` prints the path, and so does a submission the service did not accept.
+For each tree, `<top>` is `kalareach-<target>-<release>`: the notary log is `<work>/<top>.notary-log.json`,
+and the tree taken from the run's artefact is `<work>/<target>/<top>`, so the log is not beside the tree.
 
 The sealing is started by hand:
 
@@ -207,9 +215,10 @@ a job and no safety. The sealed archives are kept for one day after the sealing,
 A second refusal is investigated, not re-run, and so is any other refusal of a notarised tree. Compare
 the digests in `source`'s summary with what the signing script printed. Read the submission's status and
 log with `xcrun notarytool info <submission id>` and `xcrun notarytool log <submission id>` (the notary
-key options as for `wait`), and compare the `CDHash` of a refused file (`codesign -dvv <file>`) with the
-`ticketContents` of the log the signing script saved beside the tree. Assess a file of the run's sealed
-archive, and not only of the tree on the signing machine, with
+key options as for `wait`), and compare the `CDHash` of a refused file with the `ticketContents` of
+`<work>/<top>.notary-log.json`, the log the signing script saved. `codesign -dvvv <file>` prints the CDHash
+on its `CDHash=` line; `codesign -dvv` does not. Assess a file of the run's sealed archive, and not only of
+the tree on the signing machine, with
 `/usr/sbin/spctl --assess --type open --context context:primary-signature -vv <file>`.
 
 ## Keys, and replacing them
