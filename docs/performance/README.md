@@ -10,7 +10,10 @@ host a platform's release figures come from.
 A reference host has:
 
 * at least four processors, counted as the processors the operating system makes available to the
-  measuring process;
+  measuring process. Section 27 says CPU cores, and this count is of logical processors: a host
+  with two cores and two hardware threads each passes it. A figure that is to stand for the
+  reference host is taken on a host with four physical cores, which the processor recorded beside
+  the figure shows;
 * at least 8 GiB of memory, as the operating system reports it (`MemTotal` on Linux, `hw.memsize` on
   macOS);
 * its operating system and architecture recorded beside every figure taken on it;
@@ -60,9 +63,10 @@ host against them, so a record can name a shortfall of its own.
 What the reader bounds is all the processor time the operating system does not charge to the run's
 processes, so the kernel's own work counts as other work, even what the kernel does on the run's
 behalf, which can only make a host read busier. A zero stolen share means the hypervisor reported no
-loss, and a platform that keeps no such count leaves the condition unverified. And memory as the
-operating system reports it is a little less than the memory installed, so a machine with exactly
-8 GiB installed reads as short of the reference host.
+loss, and a platform that keeps no such count leaves the condition unverified. And on Linux memory
+as the operating system reports it (`MemTotal`) is a little less than the memory installed, so a
+machine with exactly 8 GiB installed reads as short of the reference host; `hw.memsize` on macOS
+reports the installed memory.
 
 ### What the reading assumes
 
@@ -84,7 +88,10 @@ in any five seconds.
 
 ## The two configurations
 
-Section 27 measures an idle host and a host under stress.
+Section 27 measures an idle host and a host under stress. KR-PERF-001 and KR-PERF-003 are taken in
+the idle configuration, and the stress run reports the same readings under stress and checks
+KR-PERF-007's slow observer. The other targets are taken on a host in its own state, as the table
+below says.
 
 ### Idle: 20 live shells and 32 attached views
 
@@ -119,9 +126,9 @@ load is waited out, not a host condition.
 | KR-PERF-003 | below 500 MiB and 1% of one core | `crates/kr-worker/tests/performance.rs` (`idle_resources_for_twenty_sessions_and_thirty_two_views`) | The idle configuration's daemon, workers and root shells: processor time over five minutes and resident memory at the end. The processor bound is asserted where the host meets the reference host's conditions, and elsewhere recorded with the shortfall named; the memory bound is asserted on every host. The stress run reports the same readings under stress, which section 27 sets no bound on, and the whole product's memory with the plugin host serving |
 | KR-PERF-004 | a usable 120x40 screen within 500 ms | `performance.rs` (`attach_to_a_usable_screen`) | Five attachments of each presentation, from the connection to a screen a person could look at. The worker makes three journal records durable before it answers an attach, so the 500 ms is asserted unless the disk's durable writes took longer than the reference host admits at either edge, which the record names as a missing condition |
 | KR-PERF-005 | under 25 ms p95 above the path's round trip | `crates/kr-transport/tests/perf.rs` | Remote input over a real connection while a bulk transfer runs, less the path's own round trip. The target is asserted where the host meets the reference host's conditions, and elsewhere recorded with the shortfall named |
-| KR-PERF-006 | usable state within two seconds | `crates/kr-transport/tests/perf.rs`, `crates/kr-client/tests/session.rs` and `crates/kr-controller/tests/network_reconnect_time.rs` | The transport's share is timed: reconnecting, the handshake, a stream and a 120x40 snapshot. The client's share is asserted inside the budget: the subscription through the client library and a painted 120x40 screen, plainly and after one refused read. The whole of it is asserted against a real daemon and worker: a paired device that has been attached and has gone dials again, and the clock runs from the transport's return through the attach, the subscription and the host's projection to a painted 120x40 screen |
+| KR-PERF-006 | usable state within two seconds | `crates/kr-transport/tests/perf.rs`, `crates/kr-client/tests/session.rs` and `crates/kr-controller/tests/network_reconnect_time.rs` | The transport's share is timed: reconnecting, the handshake, a stream and a 120x40 snapshot. The client's share is asserted inside the budget: the subscription through the client library and a painted 120x40 screen, plainly and after one refused read. A reconnect to a real daemon and worker is asserted inside the budget as well: a paired device that has been attached and has gone dials again and resumes the cursors the ended session carried, and the clock runs from the dial through the connection, the attach, the subscription from the carried position and the host's projection to a painted 120x40 screen |
 | KR-PERF-007 | drain 5 MiB/s without unbounded queues; slow observers resynchronise | `crates/kr-term/tests/perf.rs`, and the stress run | The engine's sustained rate on a plain and a scrolling stream, with every bound checked. Two figures against the history behind the screen: what one read costs behind a history at its bound against one behind an emptied history (at most four times as much), and how many rows a session reads over the same reads in each (at most twice as many). In the stress run, the observer that stops reading is told to resynchronise and receives output again once it resubscribes, and no other view goes an interval without output |
-| KR-PERF-008 | one batch per animation frame; input stays responsive | `apps/companion/test/performance.test.tsx` and `apps/companion/e2e/performance.spec.ts` | Events folded into frames, a keystroke's cost against the size of the history while output streams, what a keystroke touches in the document, and how many nodes are drawn for a long history. In a real browser engine, the time from a key's event to the second animation frame after it, typed while twenty nodes a frame stream over a history of four thousand, read in frame periods of the page's own idle frames and against the same keys with a short history and nothing streaming, so that the machine's speed cancels out of both readings |
+| KR-PERF-008 | one batch per animation frame; input stays responsive | `apps/companion/test/performance.test.tsx` and `apps/companion/e2e/performance.spec.ts` | Events folded into frames, a keystroke's cost against the size of the history while output streams, what a keystroke touches in the document, and how many nodes are drawn for a long history. In a real browser engine, the time from a key's event to the second animation frame after it, typed while twenty nodes a frame stream over a history of four thousand, recorded in frame periods of the page's own idle frames and against the same keys with a short history and nothing streaming. The case asserts only that every key arrived in order and was timed and that the stream was drawn meanwhile; the readings carry a verdict against reference bounds for a reference run to read |
 | KR-PERF-009 | 4 GiB, four threads and 30 seconds per description | `scripts/bench-descriptions.sh` | The selected profile against real weights at 1, 5, 20 and 50 sessions, with the resource pause beside it |
 | KR-PERF-010 | first audio and delegation latency recorded | none: the target's method is a paired phone with a connected media path to the voice provider | A host cannot take it. The phones' call classes report the remote audio track where it is added (iOS's `didAdd` receiver, Android's `onAddTrack`), which shows that a track exists, not that its audio has played. The voice service records, for each call, the time from creating it to releasing its answer and to its sideband being ready, which the web repository's voice tests check. Neither is a measurement of delegation latency or of the first audio a person hears |
 
@@ -154,6 +161,16 @@ because a measurement that does not assert its target on a host short of the ref
 records whether the figure met it. With `--reference-host` it waits up to ten minutes before each
 step for other work to stop, still takes and records every figure, and names each condition the
 host did not meet.
+
+### Two measurements taken by name
+
+Two measurements are not steps of `scripts/bench-all.sh`, and neither writes a Markdown section.
+KR-PERF-006's reconnect to a real daemon is
+`cargo test --locked --release -p kr-controller --test network_reconnect_time -- --nocapture`: it
+asserts the two seconds on every host and prints its reading with the host's processors and build.
+KR-PERF-008's responsiveness in a real browser is
+`pnpm -C apps/companion e2e e2e/performance.spec.ts`: it prints each engine's reading with a verdict
+and attaches the figures to the run. The landing workflow runs both with its other tests.
 
 ## The records
 
