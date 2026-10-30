@@ -448,12 +448,16 @@ fn a_console_asked_to_spell_its_keys_hands_the_reader_bytes_where_it_handed_reco
     };
     let started = Instant::now();
     let waits_for = |what: &str, child: &mut Box<dyn portable_pty::Child + Send + Sync>| {
+        let mut ended = false;
         while !output.text().contains(what) {
+            // A probe that has ended can still have its last lines on their way to this side of the
+            // console, so the output is read once more before the end counts against the wait.
             assert!(
-                child.try_wait().expect("the probe's state").is_none(),
+                !ended,
                 "the probe ended before the console showed {what:?}: {:?}",
                 output.text()
             );
+            ended = child.try_wait().expect("the probe's state").is_some();
             assert!(
                 started.elapsed() < LIVENESS_DEADLINE,
                 "waited for the console to show {what:?}: {:?}",
