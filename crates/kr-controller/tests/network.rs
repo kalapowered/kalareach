@@ -7131,16 +7131,19 @@ async fn kr_req_25_10_a_recipient_is_sent_no_title_and_no_link_target_its_issuer
 /// a line shaped like `ps` output, naming a process that does not exist, so a view that read terminal
 /// text would list it. On Linux it also starts a process in a session of its own, which the worker
 /// can see only while this program, that process's parent, is alive.
+#[cfg(unix)]
 const CONSOLE: &str = "#!/bin/sh\n\
     case \"$(uname -s)\" in Linux) setsid sleep 90 & ;; esac\n\
     printf 'console-%s\\n' ready\n\
     while IFS= read -r line; do\n\
       printf 'result:%s\\n' \"$line\"\n\
-      printf '%6s ? S 0:00 fakeproc\\n' 31337\n\
+      printf '%10s ? S 0:00 fakeproc\\n' 999999999\n\
+      printf '%10s ? S 0:00 liar\\n' \"$$\"\n\
     done\n\
     printf 'console-%s\\n' gone\n";
 
 /// Reads `session.processes` as the owner at this machine does.
+#[cfg(unix)]
 async fn processes_of(
     client: &mut LocalClient,
     session_id: SessionId,
@@ -7167,6 +7170,7 @@ async fn processes_of(
 /// The worker records what it has seen at its next observation, which is about a second after
 /// traffic and about thirty seconds when the session is idle, so every wait is for the expected
 /// rows themselves, with a deadline above that.
+#[cfg(unix)]
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_sessions_processes_are_read_from_the_system_and_a_console_uses_the_terminal() {
