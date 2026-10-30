@@ -838,9 +838,6 @@ mod unix {
         ) -> Result<Probe> {
             use kr_term::probe::ProbeSession;
 
-            // The clock is monotonic and starts at zero, so the one-second deadline is one second
-            // of elapsed time whatever the wall clock does while the terminal is being asked.
-            let started = std::time::Instant::now();
             let (mut session, request) = ProbeSession::start(0, context, asked)
                 .map_err(|error| CliError::TerminalProbeFailed(crate::shown::term(&error)))?;
 
@@ -858,6 +855,11 @@ mod unix {
                      runtime directory yours alone and writable",
                 )));
             }
+            // The clock is monotonic and starts at zero, so the one-second deadline is one second
+            // of elapsed time whatever the wall clock does while the terminal is being asked. It
+            // counts the asking, not the record made before it: that verifies a directory, which a
+            // loaded host can take long over, and the terminal has been asked nothing yet.
+            let started = std::time::Instant::now();
             let mut asking = saved.clone();
             asking.make_raw();
             // A read that returns what has arrived and waits for nothing: no line, and not a
