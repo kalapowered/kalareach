@@ -701,6 +701,12 @@ async fn a_skew_leaves_the_hosts_authority_and_its_session_worker_as_they_were()
         0,
         "no lease request left the host"
     );
+    let keeper = rig.check("relay-leases").await;
+    assert_eq!(keeper.status, DoctorStatus::Warning);
+    assert!(
+        keeper.detail().contains("release matrix"),
+        "the keeper holds the device back for the matrix, and not for another reason"
+    );
 
     // The device that was paired before is served on the connection it had.
     let doctor: HostDoctorResult = session
@@ -761,10 +767,15 @@ async fn a_first_publication_below_the_first_revision_a_host_reads_gates_nothing
     let owner = rig.owner_device();
     rig.until("the owner's device holds a lease", || rig.holds(&owner))
         .await;
+    let matrix = rig.check("release-matrix").await;
     assert_eq!(
-        rig.check("release-matrix").await.status,
+        matrix.status,
         DoctorStatus::Warning,
         "a reply that is not accepted is said, and the host asks again by itself"
+    );
+    assert!(
+        matrix.detail().contains("below the first revision"),
+        "the reason is the revision, and not a failed read or a signature"
     );
     assert!(!kept_file(rig.host.tree()).exists(), "nothing was kept");
     let (_device, record) = rig.pairs().await;
