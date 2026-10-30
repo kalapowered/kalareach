@@ -1541,10 +1541,10 @@ async fn a_host_on_every_interface_hints_the_addresses_it_found_there() {
 /// while its connection is authorised and its subscription is running has the connection ended,
 /// not noticed at its next request, and its record is withdrawn so that it cannot come back. The
 /// worker lets go of a connection's attachments when the host lets go of its link, so the
-/// session's attachment count reaching none, before the device sends anything, shows the
-/// connection ended on the revocation alone. A connection that is not fenced keeps its
-/// attachments and fails the case at that wait; a record that is not marked fails it at the
-/// reconnect.
+/// session's attachment count reaching none, and the device's own session reporting the connection
+/// closed, both before the device sends anything, show the connection ended on the revocation
+/// alone. A connection that is not fenced keeps its attachments and fails the case at that wait; a
+/// record that is not marked fails it at the reconnect.
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_revoked_device_is_fenced_before_it_is_served_again() {
@@ -1579,8 +1579,9 @@ async fn a_revoked_device_is_fenced_before_it_is_served_again() {
 
     // The fence is not a recorded state the next request happens to notice: withdrawing the
     // registration takes the connection's write boundary with it and ends the connection. The
-    // device has sent nothing since the revocation, so the owner's view of the session is the
-    // only thing that can show it: both of the device's attachments are let go of.
+    // device has sent nothing since the revocation, so the owner's view of the session shows it
+    // (both of the device's attachments are let go of), and so does the device's own: its session
+    // reports the connection closed.
     waits_for_attachments(
         &mut local,
         session_id,
@@ -1588,8 +1589,13 @@ async fn a_revoked_device_is_fenced_before_it_is_served_again() {
         "the revoked device's connection ends before it asks for anything",
     )
     .await;
+    tokio::time::timeout(PATIENCE, session.closed())
+        .await
+        .expect(
+            "the device's connection is closed by the host, not left open for its next request",
+        );
 
-    // And what it sends after that is refused, not answered.
+    // A request after that is refused, not answered.
     let refused = session
         .read::<_, SessionReadResult>(Method::SessionRead, &SessionReadParams { session_id })
         .await
