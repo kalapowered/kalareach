@@ -301,6 +301,19 @@ impl Controller {
         self.after_the_retained_lookup.arm()
     }
 
+    /// Arms the pause the next key registration of a paired device stops at once its first lookup
+    /// for a retained answer has found none, before it looks again. Returns the end that says the
+    /// registration has arrived, and the end that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_the_second_retained_lookup(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.before_the_second_retained_lookup.arm()
+    }
+
     /// Arms the pause the next automation mutation stops at once the admission it arrived under
     /// has been asked, before the workflow journal's transaction asks it again. Returns the end
     /// that says the mutation has arrived, and the end that lets it go. The pause fires once.

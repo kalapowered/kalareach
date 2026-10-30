@@ -595,6 +595,11 @@ pub struct Controller {
     /// Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     after_the_retained_lookup: ReadPause,
+    /// Where this host's own tests stop a paired device's key registration that found no retained
+    /// answer, before it looks again, so that an earlier attempt can finish in between. Compiled
+    /// away in every shipped build.
+    #[cfg(feature = "testing")]
+    before_the_second_retained_lookup: ReadPause,
     /// Where this host's own tests stop an automation mutation that has passed the admission it
     /// arrived under, before the workflow journal's transaction asks the admission again, so that
     /// a fence can land in between. Compiled away in every shipped build.

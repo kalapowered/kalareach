@@ -1462,11 +1462,24 @@ impl RemoteConnection {
                 // A completed registration is answered from what it produced, before the deadline
                 // is looked at: a device whose answer was lost asks again with the same action and
                 // is told what it was told, after a later rotation or once its window has closed.
+                // The earlier lookup found nothing, and an attempt that finished since is found
+                // here; the answer goes back under the admission asked with it in hand, as the
+                // earlier lookup's does.
+                #[cfg(feature = "testing")]
+                self.controller
+                    .before_the_second_retained_lookup
+                    .wait()
+                    .await;
                 if let Some(answer) = self
                     .controller
                     .retained_authority_change(&actor_id, mutation)
                 {
-                    return answer;
+                    #[cfg(feature = "testing")]
+                    self.controller.after_the_retained_lookup.wait().await;
+                    return match self.admitted_to_answer(validated) {
+                        Ok(()) => answer,
+                        Err(error) => failure(mutation.request_id, error),
+                    };
                 }
                 if self.controller.clock.now() >= accepted.deadline {
                     return failure(

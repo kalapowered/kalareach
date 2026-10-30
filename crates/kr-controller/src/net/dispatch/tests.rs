@@ -5717,3 +5717,108 @@ async fn a_retry_answered_from_the_workers_receipt_is_refused_when_a_fence_lands
     assert!(refused.message.contains("fence"), "{refused:?}");
     world.serving.abort();
 }
+
+/// KR-REQ-09.09: a paired device's key registration whose earlier attempt finishes after the first
+/// lookup for a retained answer has found nothing is found by the second lookup, and goes back only
+/// under the admission asked with it in hand. A fence this host comes to owe while that lookup is
+/// under way stops the answer. The control: the same registration, asked again once nothing is
+/// owed, is given its answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_key_registration_recorded_after_the_first_lookup_is_refused_when_a_fence_lands_during_the_second()
+ {
+    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+
+    let world = fake::fake_worker(None).await;
+    let controller = &world.controller;
+    let device = paired(controller, 41, |_| {});
+    let connection = super::RemoteConnection::for_test(controller, device.clone());
+    let rotated = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a key");
+    let registration = MutationRequest {
+        request_id: RequestId::new(81),
+        method: Method::DevicePreviewKeyUpdate.into(),
+        method_version: MethodVersion::V1,
+        action_id: ActionId::new(kr_ipc::new_uuid()),
+        grant_id: Nullable::null(),
+        target: ActionTarget::environment(world.environment_id),
+        expected: ParamsValue::empty(),
+        action_window_id: connection
+            .windows
+            .issue(connection.connection_id, controller.boot_epoch)
+            .expect("a window")
+            .action_window_id,
+        requested_ttl_ms: kr_protocol::scalars::DurationMs::new(30_000),
+        params: ParamsValue::from_typed(&kr_protocol::sharing::DevicePreviewKeyUpdateParams {
+            device_id: device.device_id,
+            notification_preview: *rotated.public(),
+            revision: kr_protocol::ids::DeviceKeyRevision::new(2),
+        })
+        .expect("encodes"),
+    };
+    let earlier_attempt = crate::authority::AdmittedMutation {
+        connection_id: connection.connection_id,
+        admitted_revision: controller.policy().authority_revision(),
+        deadline: controller
+            .continuous_now()
+            .checked_add(std::time::Duration::from_secs(30)),
+    };
+
+    let (before, look_again) = controller.pause_before_the_second_retained_lookup();
+    let (found, answer) = controller.pause_retained_lookup();
+    let (answered, ()) = tokio::join!(
+        connection.answer_now(ControlFrame::Mutation(Box::new(registration.clone()))),
+        async {
+            tokio::time::timeout(std::time::Duration::from_secs(30), before)
+                .await
+                .expect("the registration reaches the place it is stopped at")
+                .expect("the pause is armed");
+            // An earlier attempt of the same action finishes and records its answer.
+            controller
+                .preview_key_update_action(&device.principal(), &registration, earlier_attempt)
+                .await
+                .expect("the earlier attempt registers the key");
+            look_again.send(()).expect("the registration goes on");
+            tokio::time::timeout(std::time::Duration::from_secs(30), found)
+                .await
+                .expect("the registration reaches its second lookup's answer")
+                .expect("the pause is armed");
+            controller.hold_fence(true);
+            answer.send(()).expect("the registration goes on");
+        }
+    );
+    let answered = answered.expect("the registration is answered");
+    let ControlFrame::Response(Response {
+        outcome: Outcome::Error(refused),
+        ..
+    }) = answered.frame()
+    else {
+        panic!(
+            "a fence owed while the recorded answer was found stops the answer: {:?}",
+            answered.frame()
+        );
+    };
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::PermissionDenied
+    );
+    assert!(refused.message.contains("fence"), "{refused:?}");
+
+    controller.hold_fence(false);
+    let again = connection
+        .answer_now(ControlFrame::Mutation(Box::new(registration)))
+        .await
+        .expect("the registration is answered");
+    assert!(
+        matches!(
+            again.frame(),
+            ControlFrame::Response(Response {
+                outcome: Outcome::Ok(_),
+                ..
+            })
+        ),
+        "with nothing owed the registration is given its answer: {:?}",
+        again.frame()
+    );
+    world.serving.abort();
+}
