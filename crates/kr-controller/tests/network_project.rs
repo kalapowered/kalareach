@@ -2683,6 +2683,10 @@ async fn a_read_of_a_derived_version_names_no_source_the_grant_does_not_reach() 
 /// reaches back to is refused with the code and the words a number the change set does not have is
 /// refused with, so a device learns nothing about which versions a change set holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
 async fn a_read_of_a_version_before_the_history_bound_is_refused_as_an_absent_one_is() {
     let recorded = Recorded::start().await;
     let beyond = kr_protocol::scalars::TimestampMs::new(recorded.captured_at_ms.get() + 3_600_000);
