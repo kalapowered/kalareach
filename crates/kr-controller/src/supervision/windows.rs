@@ -1811,8 +1811,10 @@ mod launching {
             }
         }
 
-        /// KR-REQ-03.24: a headless worker is made on a desktop of its own, named for the worker,
-        /// and a desktop-bound worker is not: it is made on the starter's own.
+        /// KR-REQ-03.24: the mapping from a worker's profile to the desktop it is made on: a
+        /// headless worker's own, named for the worker, and the starter's own for a desktop-bound
+        /// one. That `start` hands this over is shown by the keyed native case, which starts a
+        /// real session of each profile and reads the desktop each one is on.
         #[test]
         fn only_a_headless_worker_is_made_on_a_desktop_of_its_own() {
             let headless = launch(WorkerProfile::HeadlessUser);

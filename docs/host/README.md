@@ -1263,6 +1263,17 @@ the station the headless workers already hold has not that entry, and the next h
 started on it all the same. A worker an earlier release started stays where it was started until it
 ends.
 
+Two limits belong to that placement. All the processes of one headless session share the desktop
+heap the system gives a desktop on a window station that shows nothing (the third value of
+`SharedSection` in `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\SubSystems\Windows`, 768
+KB unless the machine sets another), against the much larger one of the interactive desktop. A
+session that starts very many programs which each make windows, such as a large parallel build or
+test run, can use it up, and the system then fails the next program's start, usually with
+`0xC0000142`, which does not name the desktop. The host does not set a larger heap, and no
+measurement of how many windows fit is made. And a starter that is killed after it has given the
+worker its station and desktop and before it lets the worker run leaves the worker suspended and
+holding them; the daemon, which was told nothing, records the launch as uncertain.
+
 Linux places a job in no login session at all: a user service manager started at boot has no
 display, no compositor socket and no session message bus, because those belong to a graphical login
 that happened later. So a desktop-bound worker's transient unit is given the selected session's own
@@ -2148,9 +2159,11 @@ for that. This platform runs no Git, so a case that needs a repository operation
 that. One test in the worker's service is skipped on this platform for its own stated reason, which
 `cargo test` prints.
 
-What the runner cannot do is the release matrix. It has no interactive logon, no window manager, no
-IME and no physical keyboard, so nothing about Windows Terminal, a real desktop session, IME
-composition at the keyboard or a GUI logout is established there. Those need a machine.
+What the runner cannot do is the release matrix. Its account is an elevated administrator signed in
+at the console, in session 2, so what an account without administrative rights does there is not
+shown, and it has no window manager, no IME and no physical keyboard, so nothing about Windows
+Terminal, IME composition at the keyboard or a GUI logout is established there. Those need a
+machine.
 
 **The Windows test machine.** Prerequisites, all of which the CI runner also has:
 
