@@ -231,7 +231,8 @@ impl Observation {
 }
 
 /// What a worker knows about its session's processes, in the form a later control daemon reads
-/// after the worker has gone.
+/// after the worker has gone, and, read-only, while it runs: the process view lists it and checks
+/// each identity against the operating system.
 ///
 /// A recorded identity is a process identifier and the time the process started, read together, so
 /// it can name only the process that was recorded. The record is a statement about one boot: the
