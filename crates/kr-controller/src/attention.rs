@@ -2352,7 +2352,7 @@ impl AttentionModule {
                                     .cursor(params.acknowledged_cursor.get())
                                     .ok_or_else(|| {
                                         Unperformed::Refused(ControllerError::InvalidArgument(
-                                            NOT_GIVEN_CURSOR.to_owned(),
+                                            CURSOR_NOT_TAKEN.to_owned(),
                                         ))
                                     })?,
                             };
@@ -4377,12 +4377,14 @@ fn cursor_of(
         None => Ok(shown),
         Some(numbering) => numbering
             .cursor(shown)
-            .ok_or_else(|| ProtocolError::new(ErrorCode::InvalidArgument, NOT_GIVEN_CURSOR)),
+            .ok_or_else(|| ProtocolError::new(ErrorCode::InvalidArgument, CURSOR_NOT_TAKEN)),
     }
 }
 
-/// What a caller is told when it sends back a cursor this host did not give it.
-const NOT_GIVEN_CURSOR: &str = "that cursor is not one this host gave this device";
+/// What a caller is told when it sends back a cursor this host does not take from it now: one it
+/// was never given, or one its view has since moved past (retention, or a change it cannot read
+/// recorded while its view was empty).
+const CURSOR_NOT_TAKEN: &str = "that cursor is not one this host takes from this device now; read the view again and send a cursor from it";
 
 fn storable(value: u64, what: &str) -> Answer<()> {
     if value > MAX_STORED_COUNTER {
@@ -5653,6 +5655,59 @@ pub(crate) mod tests {
         assert_eq!((asked[0].from_ms, asked[0].to_ms), (1_000, 2_000));
     }
 
+    /// The acknowledgement of a visit to the world's session that carries `cursor`.
+    fn visit_acknowledgement(world: &Summarised, request_id: u64, cursor: U64) -> MutationRequest {
+        MutationRequest {
+            request_id: RequestId::new(request_id),
+            method: Method::VisitAcknowledge.into(),
+            method_version: MethodVersion::V1,
+            action_id: kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+            grant_id: Nullable::null(),
+            target: kr_protocol::envelope::ActionTarget::environment(world.temp.environment_id()),
+            expected: ParamsValue::empty(),
+            action_window_id: kr_protocol::ids::ActionWindowId::new("test").expect("a window"),
+            requested_ttl_ms: kr_protocol::scalars::DurationMs::new(60_000),
+            params: ParamsValue::from_typed(&VisitAcknowledgeParams {
+                session_id: world.session_id,
+                acknowledged_cursor: cursor,
+                views: Vec::new(),
+            })
+            .expect("encodes"),
+        }
+    }
+
+    /// KR-REQ-10.49: the number shown to a device whose view was empty is refused once a change it
+    /// cannot read has been recorded, because its view starts further on, and the refusal tells it
+    /// to read its view again: it does not say the host never gave it that number.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_number_shown_to_an_empty_view_is_refused_with_a_reason_that_holds_after_a_change_it_cannot_read()
+     {
+        let world = Summarised::start();
+        world.record_commands(&[1_000, 2_000], false);
+        let reader = ActorId::new("test:device").expect("an actor");
+        let device = device_from(5_000);
+        let shown = world.changed_for(&reader, &device).await.from_cursor;
+        let check = || {
+            world.module.check_mutation(
+                &device,
+                &reader,
+                &visit_acknowledgement(&world, 11, shown),
+                Method::VisitAcknowledge,
+            )
+        };
+        check().expect("the number an empty view was shown is taken");
+
+        // One more change, recorded now and dated before the device's history starts.
+        world.record_commands(&[1_000, 2_000, 3_000], false);
+        let refused = check().expect_err("the view now starts further on");
+        assert_eq!(refused.code, ErrorCode::InvalidArgument);
+        assert!(
+            refused.message.contains("view again"),
+            "the refusal says to read the view again: {}",
+            refused.message
+        );
+    }
+
     /// KR-REQ-10.49: an acknowledgement of a visit is kept as the log's own cursor and answered in
     /// the numbers of the caller that asks for it, so a repeat of the action is numbered by the
     /// bound of the caller that repeats it: the owner is answered the log's own cursor, a device the
@@ -5671,25 +5726,7 @@ pub(crate) mod tests {
         // An action is performed the way the store performs it: with the log's own cursor.
         let reading = world.module.reading();
         let performed = |actor: &ActorId, request_id: u64, cursor: u64| -> MutationRequest {
-            let mutation = MutationRequest {
-                request_id: RequestId::new(request_id),
-                method: Method::VisitAcknowledge.into(),
-                method_version: MethodVersion::V1,
-                action_id: kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
-                grant_id: Nullable::null(),
-                target: kr_protocol::envelope::ActionTarget::environment(
-                    world.temp.environment_id(),
-                ),
-                expected: ParamsValue::empty(),
-                action_window_id: kr_protocol::ids::ActionWindowId::new("test").expect("a window"),
-                requested_ttl_ms: kr_protocol::scalars::DurationMs::new(60_000),
-                params: ParamsValue::from_typed(&VisitAcknowledgeParams {
-                    session_id: world.session_id,
-                    acknowledged_cursor: shown_early,
-                    views: Vec::new(),
-                })
-                .expect("encodes"),
-            };
+            let mutation = visit_acknowledgement(&world, request_id, shown_early);
             let key = action_key(actor, &mutation, Method::VisitAcknowledge).expect("a key");
             early
                 .view(|viewer| {
