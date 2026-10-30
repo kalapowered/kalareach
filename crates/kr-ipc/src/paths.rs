@@ -862,8 +862,8 @@ fn access_list_verdict(
                 })
                 .then(|| "its access list lets another account in".to_owned())
         }
-        // A file system that keeps no access lists has none to let anybody in.
-        Err(error) if error.raw_os_error() == Some(libc::ENOTSUP) => None,
+        // A file system that does not support access lists has none to let anybody in.
+        Err(error) if error.raw_os_error() == Some(libc::EOPNOTSUPP) => None,
         Err(error) => Some(format!("its access list could not be read: {error}")),
     }
 }
@@ -3963,7 +3963,7 @@ mod tests {
         let said = access_list_verdict(Err(unreadable), own).expect("refuses what it cannot read");
         assert!(said.contains("could not be read"), "{said}");
 
-        let kept_none = std::io::Error::from_raw_os_error(libc::ENOTSUP);
+        let kept_none = std::io::Error::from_raw_os_error(libc::EOPNOTSUPP);
         assert_eq!(access_list_verdict(Err(kept_none), own), None);
     }
 
