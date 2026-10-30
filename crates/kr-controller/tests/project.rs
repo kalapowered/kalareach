@@ -1473,10 +1473,14 @@ async fn a_daemon_whose_git_never_answers_answers_refuses_and_ends_when_interrup
                 .await
         }
     };
+    // On Linux the start made a look of its own, which left its processes' numbers behind.
+    let _ = std::fs::remove_file(&own);
+    let _ = std::fs::remove_file(&child);
     let before = lines_in(&started);
     let first = tokio::spawn(init("first"));
     wait_until("the stand-in is asked for the request", || {
         lines_in(&started) > before
+            && std::fs::read_to_string(&child).is_ok_and(|text| !text.trim().is_empty())
     })
     .await;
     assert!(
@@ -1486,9 +1490,14 @@ async fn a_daemon_whose_git_never_answers_answers_refuses_and_ends_when_interrup
             .is_empty(),
         "the daemon answers while Git is being waited for"
     );
+    let waiting = std::fs::read_to_string(&child)
+        .expect("the stand-in recorded its process")
+        .trim()
+        .to_owned();
     assert!(
-        !first.is_finished(),
-        "and the request that needs Git was still waiting when it did"
+        exists(&waiting) && !first.is_finished(),
+        "and the stand-in was still under way, and the request that needs Git still waiting, when \
+         it did"
     );
     let refusal = failure(
         tokio::time::timeout(guard, first)
