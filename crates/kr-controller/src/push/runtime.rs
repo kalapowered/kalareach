@@ -411,9 +411,9 @@ impl DeliveryRuntime {
     ///
     /// # Errors
     ///
-    /// Returns why no request can be put: no transport is attached, or this host holds no
-    /// credential for the authorisation, such as a device that was unpaired since. Nothing was
-    /// sent.
+    /// Returns why no request can be put: no transport is attached or reaches the gateway, or this
+    /// host holds no credential for the authorisation, such as a device that was unpaired since.
+    /// Nothing was sent.
     pub fn prepare_forget(
         &self,
         sender_record_id: kr_protocol::ids::PushSenderRecordId,
@@ -425,7 +425,7 @@ impl DeliveryRuntime {
         let Some(credential) = self.credentials.held(sender_record_id) else {
             return Err("this host holds no credential for the device's gateway".to_owned());
         };
-        Ok(adapters.forgetter.prepare(credential, notification_id))
+        adapters.forgetter.prepare(credential, notification_id)
     }
 
     /// Hands the runtime the environment's attention store, which every pass takes the

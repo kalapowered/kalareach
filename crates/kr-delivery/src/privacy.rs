@@ -24,10 +24,12 @@
 //! And the part section 24 is most specific about: *already uploaded archives and notifications
 //! and copies held by authorised viewers are not retroactively erased. Show those retained
 //! artifacts and offer an explicit separately authorised deletion action.* [`DeliveryOutbox::
-//! exported`] is that list. A notification is marked deletable, because the gateway that was given
-//! it holds a record this host can ask it to delete; that reaches nothing a provider queued, which
-//! is on a device. An external message is not, because it is in somebody else's service and this
-//! host has no route to ask that service to forget it.
+//! exported`] is that list. A notification the gateway took, or may have taken, and that this host
+//! will not present again is marked deletable while its device is paired, because the gateway holds
+//! a record this host can ask it to delete; that reaches nothing a provider queued, which is on a
+//! device. One still to be sent is not, since an answer that the gateway holds nothing would stop no
+//! send. An external message is not, because it is in somebody else's service and this host has no
+//! route to ask that service to forget it.
 
 use kr_worker::privacy::{
     Cancelled, Exported, Fenced, KeptExplicitly, PrivacyGeneration, PrivacySubsystem, Removed,
@@ -578,34 +580,100 @@ mod tests {
         );
     }
 
-    /// A notification is offered for deletion only when the gateway has it or may have, and only
-    /// while the device it went to is still paired. One still waiting to be sent, whose detail was
-    /// placed in a mailbox, is listed and not offered: the gateway would answer that it holds
-    /// nothing, which stops no send that is still to come. One of a device since unpaired is kept
-    /// as history and not offered, because the credential it is asked under is gone.
-    #[test]
-    fn a_notification_is_offered_for_deletion_only_when_the_gateway_may_hold_it_for_a_paired_device()
-     {
-        let mut journal = journal_with_work();
-        let waiting = admit_to_the_phone(&mut journal, 5);
-        journal.note_detail_left(waiting).expect("a mark");
-        let accepted = admit_to_the_phone(&mut journal, 6);
-        claim(&mut journal, 6 + 20, 1_500);
+    /// Records one attempt's outcome for a notification admitted to the paired device.
+    fn settle(
+        journal: &mut DeliveryJournal,
+        id: NotificationId,
+        state: DeliveryState,
+        left_this_host: bool,
+        next: crate::push::NextAction,
+    ) {
         journal
             .record_attempt(&Transition {
-                notification_id: accepted,
+                notification_id: id,
                 attempt: 1,
-                state: DeliveryState::Accepted,
+                state,
                 started_at_ms: TimestampMs::new(1_500),
                 settled_at_ms: Some(TimestampMs::new(1_600)),
-                next_attempt_at_ms: None,
-                next: crate::push::NextAction::None,
-                detail: Some("the gateway took it".to_owned()),
+                next_attempt_at_ms: (state == DeliveryState::Retrying)
+                    .then_some(TimestampMs::new(9_000)),
+                next,
+                detail: Some("an outcome".to_owned()),
                 suppression: None,
-                left_this_host: true,
+                left_this_host,
                 reported_by_destination: false,
             })
             .expect("a transition");
+    }
+
+    /// A notification is offered for deletion only when the gateway has it or may have, this host
+    /// will not present it again, and the device it went to is still paired. One still waiting to
+    /// be sent, on the wire, or retrying with another send to come is listed (its detail is in a
+    /// mailbox) and not offered: the gateway would answer that it holds nothing, which stops no
+    /// send that is still to come. One the gateway is retrying that this host only reads the
+    /// decision of is offered, and so is one a gateway answer settled after the content left. One
+    /// of a device since unpaired is kept as history and not offered, because the credential it
+    /// is asked under is gone.
+    #[test]
+    fn a_notification_is_offered_for_deletion_only_when_the_gateway_may_hold_it_for_a_paired_device()
+     {
+        use crate::push::NextAction;
+
+        let mut journal = journal_with_work();
+        let ids: Vec<NotificationId> = (5..=10u8)
+            .map(|byte| admit_to_the_phone(&mut journal, byte))
+            .collect();
+        let [
+            waiting,
+            on_the_wire,
+            to_send_again,
+            read_back,
+            refused,
+            accepted,
+        ] = ids[..]
+        else {
+            panic!("six notifications");
+        };
+        for id in [waiting, on_the_wire, to_send_again, read_back, refused] {
+            journal.note_detail_left(id).expect("a mark");
+        }
+        // Claimed and not answered: an attempt is on the wire.
+        claim(&mut journal, 6 + 20, 1_500);
+        // Retried after an attempt that never reached the gateway: another send is to come.
+        claim(&mut journal, 7 + 20, 1_500);
+        settle(
+            &mut journal,
+            to_send_again,
+            DeliveryState::Retrying,
+            false,
+            NextAction::Send,
+        );
+        // Retried by the gateway after it took the content: this host only reads the decision.
+        claim(&mut journal, 8 + 20, 1_500);
+        settle(
+            &mut journal,
+            read_back,
+            DeliveryState::Retrying,
+            true,
+            NextAction::Receipt,
+        );
+        // Settled by a gateway answer after the content was dispatched.
+        claim(&mut journal, 9 + 20, 1_500);
+        settle(
+            &mut journal,
+            refused,
+            DeliveryState::Refused,
+            true,
+            NextAction::None,
+        );
+        claim(&mut journal, 10 + 20, 1_500);
+        settle(
+            &mut journal,
+            accepted,
+            DeliveryState::Accepted,
+            true,
+            NextAction::None,
+        );
         let deletable = |journal: &mut DeliveryJournal, id: NotificationId| {
             let outbox = DeliveryOutbox::over(journal, 2_000);
             let listed = outbox.exported().expect("a list");
@@ -617,6 +685,19 @@ mod tests {
         };
 
         assert!(!deletable(&mut journal, waiting), "it has not gone yet");
+        assert!(
+            !deletable(&mut journal, on_the_wire),
+            "its answer is coming"
+        );
+        assert!(
+            !deletable(&mut journal, to_send_again),
+            "another send is to come"
+        );
+        assert!(
+            deletable(&mut journal, read_back),
+            "this host only reads the gateway's decision"
+        );
+        assert!(deletable(&mut journal, refused), "the gateway answered");
         assert!(deletable(&mut journal, accepted), "the gateway took it");
 
         journal

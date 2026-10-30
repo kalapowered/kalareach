@@ -2837,9 +2837,11 @@ impl DeliveryJournal {
     pub fn exported(&self) -> Result<Vec<ExportedDelivery>> {
         let mut statement = self.connection.prepare(
             "SELECT n.notification_id, n.destination_id, n.destination_kind, n.state,
-                    COALESCE(MAX(a.settled_at_ms), n.admitted_at_ms), n.detail_left
+                    COALESCE(MAX(a.settled_at_ms), n.admitted_at_ms), n.detail_left,
+                    n.dispatched, o.next_action
                FROM delivery_notifications n
                LEFT JOIN delivery_attempts a ON a.notification_id = n.notification_id
+               LEFT JOIN delivery_outbox o ON o.notification_id = n.notification_id
               WHERE n.state IN ('accepted', 'duplicate', 'duplicate_uncertain', 'outcome_unknown')
                  OR n.detail_left <> 0
               GROUP BY n.notification_id
@@ -2853,11 +2855,20 @@ impl DeliveryJournal {
                 row.get::<_, String>(3)?,
                 row.get::<_, i64>(4)?,
                 row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, Option<String>>(7)?,
             ))
         })?;
+        let destinations = self.destinations()?;
         let mut exported = Vec::new();
         for row in rows {
-            let (identifier, destination, kind, state, left_at, detail_left) = row?;
+            let (identifier, destination, kind, state, left_at, detail_left, dispatched, next) =
+                row?;
+            let state =
+                DeliveryState::from_stored(&state).ok_or(DeliveryError::JournalUnreadable(
+                    "a stored delivery state is not one this build writes",
+                ))?;
+            let state = state.as_str();
             let kind =
                 DestinationKind::from_stored(&kind).ok_or(DeliveryError::JournalUnreadable(
                     "a stored destination kind is not one this build writes",
@@ -2883,44 +2894,17 @@ impl DeliveryJournal {
                 },
                 left_at_ms: TimestampMs::new(as_u64(left_at)),
                 deletable: matches!(kind, DestinationKind::Push)
-                    && self.gateway_can_be_asked_about(&state, &destination)?,
+                    && the_gateway_can_be_asked_about(
+                        state,
+                        dispatched != 0,
+                        next.as_deref(),
+                        destinations
+                            .iter()
+                            .find(|record| record.id.as_str() == destination),
+                    ),
             });
         }
         Ok(exported)
-    }
-
-    /// Returns whether this host can ask the push gateway to delete what it holds for a
-    /// notification in `state` that went to `destination`.
-    ///
-    /// The gateway holds a record of a notification it was given, and a host can ask it to delete
-    /// what it still holds. So the notification must have reached the gateway or may have: the
-    /// gateway took it, answered that it was a duplicate, or its outcome is not known. One still
-    /// waiting to be sent, on the wire, or settled without the gateway having it is not asked
-    /// about, because an answer that the gateway holds nothing would not stop the send that is
-    /// still to come, and would delete nothing of what the notification's detail left in a mailbox.
-    /// The destination must still be a paired device's, since unpairing removes the credential the
-    /// request is made under. That reaches nothing a provider already accepted, a device already
-    /// holds or a mailbox keeps for the device. An external message is in somebody else's service,
-    /// which this host has no route to ask.
-    fn gateway_can_be_asked_about(&self, state: &str, destination: &str) -> Result<bool> {
-        let reached_the_gateway = DeliveryState::from_stored(state).is_some_and(|state| {
-            matches!(
-                state,
-                DeliveryState::Accepted
-                    | DeliveryState::Duplicate
-                    | DeliveryState::DuplicateUncertain
-                    | DeliveryState::OutcomeUnknown
-            )
-        });
-        if !reached_the_gateway {
-            return Ok(false);
-        }
-        Ok(self
-            .destination(&DestinationId::new(destination.to_owned())?)?
-            .is_some_and(|record| {
-                // A removed destination is kept as history with no rule.
-                matches!(record.destination, Destination::Push(_)) && record.rule.is_some()
-            }))
     }
 
     /// Lifts the fence when privacy mode is turned off, at the generation after it.
@@ -4599,6 +4583,54 @@ const SCHEMA: &str = "
     CREATE INDEX IF NOT EXISTS delivery_events_unproduced
         ON delivery_events (produced, taken_seq);
 ";
+
+/// Whether this host can ask the push gateway to delete what it holds for a notification in
+/// `state` whose destination is `destination`, and whether asking would stop it.
+///
+/// The gateway holds a record of a notification it was given, and a host can ask it to delete what
+/// it still holds. So the notification must have reached the gateway or may have, and this host
+/// must not be going to present it again: an answer that the gateway holds nothing would not stop
+/// a send that is still to come. The states of a notification the gateway took, called a duplicate
+/// or left unknown are such, and so is one a gateway answer settled (it collapsed, was refused,
+/// lost its token, ran out or was ended, with the content dispatched earlier), and so is one the
+/// gateway is retrying that this host only reads the decision of. One waiting to be sent, on the
+/// wire, or retrying with another send to come is not. Neither is one that settled without the
+/// gateway having it, which has nothing there to delete, nor the detail a notification left in a
+/// mailbox, which the device removes when it acknowledges it.
+///
+/// The destination must still be a push destination with a rule: unpairing removes the credential
+/// the request is made under, and a removed destination is kept as history with no rule. An
+/// external message is in somebody else's service, which this host has no route to ask.
+fn the_gateway_can_be_asked_about(
+    state: &str,
+    dispatched: bool,
+    next_action: Option<&str>,
+    destination: Option<&DestinationRecord>,
+) -> bool {
+    let Some(state) = DeliveryState::from_stored(state) else {
+        return false;
+    };
+    let reached_the_gateway = match state {
+        DeliveryState::Accepted
+        | DeliveryState::Duplicate
+        | DeliveryState::DuplicateUncertain
+        | DeliveryState::OutcomeUnknown => true,
+        DeliveryState::Collapsed
+        | DeliveryState::TokenDisabled
+        | DeliveryState::Refused
+        | DeliveryState::Revoked
+        | DeliveryState::Abandoned
+        | DeliveryState::Expired => dispatched,
+        DeliveryState::Retrying => {
+            dispatched && next_action == Some(crate::push::NextAction::Receipt.as_str())
+        }
+        DeliveryState::Admitted | DeliveryState::InFlight | DeliveryState::Cancelled => false,
+    };
+    reached_the_gateway
+        && destination.is_some_and(|record| {
+            matches!(record.destination, Destination::Push(_)) && record.rule.is_some()
+        })
+}
 
 #[cfg(test)]
 mod tests {

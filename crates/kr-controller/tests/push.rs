@@ -4062,6 +4062,8 @@ enum ForgetScript {
     AnswersAboutAnother(NotificationId),
     /// Answers that it held the notification as `queued`, `settled` or `none`.
     Holds(&'static str),
+    /// Refuses the request for now, as it does a host that asked too often.
+    RateLimited,
 }
 
 impl DeliveringGateway {
@@ -4182,6 +4184,17 @@ impl kr_client::services::ServiceHttp for DeliveringGateway {
                         "error": {
                             "code": "UNAUTHENTICATED",
                             "message": "That credential does not belong to an active authorisation.",
+                        },
+                    }),
+                ),
+                Some(ForgetScript::RateLimited) => (
+                    429,
+                    serde_json::json!({
+                        "ok": false,
+                        "error": {
+                            "code": "RATE_LIMITED",
+                            "message": "This host has asked to delete too often.",
+                            "retryAfterSeconds": 60,
                         },
                     }),
                 ),
@@ -8022,9 +8035,19 @@ async fn a_person_can_have_the_gateway_delete_what_it_holds_for_a_notification_t
 /// listed as it was and the person is told the gateway did not delete.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_deletion_the_gateway_did_not_carry_out_is_not_reported_as_one() {
-    for script in [
-        ForgetScript::RefusesTheCredential,
-        ForgetScript::AnswersAboutAnother(NotificationId::new(uuid(200))),
+    for (script, code) in [
+        (
+            ForgetScript::RefusesTheCredential,
+            kr_protocol::error::ErrorCode::StorageUnavailable,
+        ),
+        (
+            ForgetScript::AnswersAboutAnother(NotificationId::new(uuid(200))),
+            kr_protocol::error::ErrorCode::StorageUnavailable,
+        ),
+        (
+            ForgetScript::RateLimited,
+            kr_protocol::error::ErrorCode::RateLimited,
+        ),
     ] {
         let gateway = Arc::new(DeliveringGateway::forgetting(script));
         let (host, copy, _) = a_host_whose_alert_left(&gateway).await;
@@ -8033,11 +8056,7 @@ async fn a_deletion_the_gateway_did_not_carry_out_is_not_reported_as_one() {
             .await
             .expect_err("the gateway did not delete");
 
-        assert_eq!(
-            error.code,
-            kr_protocol::error::ErrorCode::StorageUnavailable,
-            "{script:?}: {error:?}"
-        );
+        assert_eq!(error.code, code, "{script:?}: {error:?}");
         assert_eq!(gateway.forgets().len(), 1, "{script:?}");
         let report = privacy_report(&host).await;
         assert_eq!(

@@ -5106,14 +5106,17 @@ archive was ever completed from them. The backup service marks an archive deleta
 person's own deletion of it would be accepted now (below), and not deletable when it would not. The
 ciphertext of a generation whose descriptor was never published is not deletable: its store records
 no deletion of such objects, the entry's kind says so, and a person who wants that copy removed asks
-the service that holds it. A notification the push gateway took, or may have taken, is listed and is
-deletable while its device is still paired, in the one sense the gateway can honour: the host asks
-the gateway to delete what it still holds for it (below). That does not reach what a provider
-queued, what a device holds or what a mailbox keeps for the device, and the notification is still
-listed as one that may have left. A notification still waiting to be sent, on the wire or settled
-without the gateway having it is listed and is not deletable, since an answer that the gateway holds
-nothing would stop no send still to come; the same holds for one of a device since unpaired, whose
-credential this host no longer holds. An external message is listed and is not deletable, because
+the service that holds it. A notification the push gateway took, or may have taken, and that this
+host will not present again is listed and is deletable while its device is still paired, in the one
+sense the gateway can honour: the host asks the gateway to delete what it still holds for it
+(below). That is a notification the gateway took, called a duplicate or left unknown, one a gateway
+answer settled after the content was dispatched, and one the gateway is retrying that this host only
+reads the decision of. It does not reach what a provider queued, what a device holds or what a
+mailbox keeps for the device, and the notification is still listed as one that may have left. A
+notification waiting to be sent, on the wire, or retrying with another send to come is not
+deletable, since an answer that the gateway holds nothing would stop no send still to come; the
+list shows such a notification only when its detail was placed in a mailbox. The same holds for one
+of a device since unpaired, whose credential this host no longer holds. An external message is listed and is not deletable, because
 this host holds no way to ask the service it went to to forget it. Backup does not silently delete unrelated
 collections and does not claim a copy somebody else holds can be recalled. Local deletion is logical
 cleanup of this host's own records rather than a claim of physical secure erase: the files are
@@ -5132,8 +5135,8 @@ non-deletable as `PERMISSION_DENIED`.
 For a notification the host asks the push gateway, under the credential the gateway gave the
 device's authorisation and over the daemon's own transport, to delete what it still holds for that
 one notification, and names no other. The registration the call was admitted under is asked again
-on the thread that puts the request, after the credential is found and immediately before the request
-is put. The gateway's answer says what it held: a notification still
+on the thread that puts the request, after the credential is found and the transport that reaches the
+gateway is resolved, and immediately before the request is put. The gateway's answer says what it held: a notification still
 queued is not sent now, a recorded decision is gone, and nothing at all is also what it answers for a
 notification it never saw, one of another authorisation and one it already removed or swept. This
 host takes any of those as the gateway holding nothing now, and reports the deletion as done. It
@@ -5141,7 +5144,8 @@ records nothing of its own: a gateway that does not answer, that refuses the cre
 the request, or whose answer is about another notification or also names an error leaves the copy
 listed as it was and the call fails with `STORAGE_UNAVAILABLE`, and the person asks again. Of a
 refusal the call repeats only a code the gateway publishes, never its words. A gateway that takes no
-more deletions from this host for now (60 an hour) fails the call as `RATE_LIMITED`. A device this host holds no credential for any
+more deletions for now fails the call as `RATE_LIMITED`; it counts them by this host, by the device's
+installation and by network, so another host's deletions can use up the allowance. A device this host holds no credential for any
 longer, such as one unpaired since, is refused as `PERMISSION_DENIED` and nothing leaves the host.
 
 For a backup generation the host's store decides, in the write that records the request. The

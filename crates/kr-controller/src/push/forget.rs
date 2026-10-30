@@ -76,11 +76,14 @@ pub enum ForgetAnswer {
 
 /// A request to delete what the gateway holds for one notification, ready to be put.
 ///
-/// It holds the credential and the notification and nothing is sent until [`Self::send`], so a
-/// caller can check the authority it acts under once more immediately before the request leaves.
+/// It holds the credential, the notification and the transport that reaches the gateway, and
+/// nothing is sent until [`Self::send`], which only encodes the request and puts it. So a caller
+/// can check the authority it acts under once more immediately before the request leaves, with
+/// nothing between the check and the request that waits.
 #[derive(Debug)]
 pub struct PreparedForget {
-    forgetter: GatewayForget,
+    runtime: tokio::runtime::Handle,
+    transport: Arc<dyn kr_client::services::ServiceHttp>,
     credential: PushDeliveryCredential,
     notification_id: NotificationId,
 }
@@ -91,8 +94,29 @@ impl PreparedForget {
     /// Blocks on the daemon's reactor, so a caller runs it on a blocking thread.
     #[must_use]
     pub fn send(self) -> ForgetAnswer {
-        self.forgetter
-            .forget(&self.credential, self.notification_id)
+        let body = match serde_json::to_vec(&ForgetRequest {
+            notification_ids: [self.notification_id],
+        }) {
+            Ok(body) => body,
+            Err(error) => {
+                return ForgetAnswer::Unanswered {
+                    detail: format!("the request could not be encoded: {error}"),
+                };
+            }
+        };
+        let url = format!("{}{FORGET_ROUTE}", self.credential.gateway_origin.as_str());
+        let header = format!("Bearer {}", bearer(self.credential.secret.expose()));
+        let answered = self.runtime.block_on(async {
+            self.transport
+                .post_json(&url, &body, &[("authorization", header.as_str())])
+                .await
+        });
+        match answered {
+            Ok(answer) => read_answer(&answer, self.notification_id),
+            Err(error) => ForgetAnswer::Unanswered {
+                detail: format!("the gateway did not answer: {error}"),
+            },
+        }
     }
 }
 
@@ -116,59 +140,27 @@ impl GatewayForget {
         }
     }
 
-    /// Readies the request to the gateway `credential` names for `notification_id`.
-    #[must_use]
+    /// Readies the request to the gateway `credential` names for `notification_id`, with the
+    /// transport that reaches it.
+    ///
+    /// # Errors
+    ///
+    /// Returns why no transport reaches the gateway. Nothing has been sent when this fails.
     pub fn prepare(
         &self,
         credential: PushDeliveryCredential,
         notification_id: NotificationId,
-    ) -> PreparedForget {
-        PreparedForget {
-            forgetter: self.clone(),
+    ) -> Result<PreparedForget, String> {
+        let transport = self
+            .transports
+            .to(&credential.gateway_origin)
+            .map_err(|detail| format!("no transport reaches the gateway: {detail}"))?;
+        Ok(PreparedForget {
+            runtime: self.runtime.clone(),
+            transport,
             credential,
             notification_id,
-        }
-    }
-
-    /// Asks the gateway the credential names to delete what it holds for `notification_id`.
-    ///
-    /// Blocks on the daemon's reactor, so a caller runs it on a blocking thread.
-    fn forget(
-        &self,
-        credential: &PushDeliveryCredential,
-        notification_id: NotificationId,
-    ) -> ForgetAnswer {
-        let body = match serde_json::to_vec(&ForgetRequest {
-            notification_ids: [notification_id],
-        }) {
-            Ok(body) => body,
-            Err(error) => {
-                return ForgetAnswer::Unanswered {
-                    detail: format!("the request could not be encoded: {error}"),
-                };
-            }
-        };
-        let transport = match self.transports.to(&credential.gateway_origin) {
-            Ok(transport) => transport,
-            Err(detail) => {
-                return ForgetAnswer::Unanswered {
-                    detail: format!("no transport reaches the gateway: {detail}"),
-                };
-            }
-        };
-        let url = format!("{}{FORGET_ROUTE}", credential.gateway_origin.as_str());
-        let header = format!("Bearer {}", bearer(credential.secret.expose()));
-        let answered = self.runtime.block_on(async {
-            transport
-                .post_json(&url, &body, &[("authorization", header.as_str())])
-                .await
-        });
-        match answered {
-            Ok(answer) => read_answer(&answer, notification_id),
-            Err(error) => ForgetAnswer::Unanswered {
-                detail: format!("the gateway did not answer: {error}"),
-            },
-        }
+        })
     }
 }
 
@@ -396,9 +388,14 @@ mod tests {
             refused(400, "a-marker-nobody-should-see"),
             ForgetAnswer::Refused { code: None }
         );
-        let ForgetAnswer::Unanswered { detail } =
-            read_answer(&answer(500, &serde_json::json!({})), asked())
-        else {
+        // An answer the reader cannot take says where it failed and never what it held.
+        let ForgetAnswer::Unanswered { detail } = read_answer(
+            &answer(
+                500,
+                &serde_json::json!({ "ok": "a-marker-nobody-should-see" }),
+            ),
+            asked(),
+        ) else {
             panic!("nothing answered");
         };
         assert!(!detail.contains("a-marker-nobody-should-see"), "{detail}");

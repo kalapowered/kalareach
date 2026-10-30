@@ -2069,7 +2069,7 @@ impl crate::service::Controller {
     /// Returns [`ControllerError::InvalidArgument`] when the delivery journal holds no one
     /// notification under the reference, [`ControllerError::PermissionDenied`] for a registration
     /// that was withdrawn, for a device this host holds no credential for and when no transport is
-    /// attached yet, [`ControllerError::Refused`] under `RATE_LIMITED` when the gateway takes no
+    /// attached or reaches the gateway, [`ControllerError::Refused`] under `RATE_LIMITED` when the gateway takes no
     /// more deletions from this host for now, and [`ControllerError::Storage`] when the gateway
     /// did not answer, refused the credential or refused the request.
     async fn privacy_notification_delete(
@@ -2158,8 +2158,9 @@ impl crate::service::Controller {
             } => {
                 return Err(ControllerError::Refused {
                     code: kr_protocol::error::ErrorCode::RateLimited,
-                    detail: "the gateway takes only so many deletions an hour from this host; \
-                             wait and ask again"
+                    detail: "the gateway takes only so many deletions an hour from this host, \
+                             this device's installation and this network together; wait and ask \
+                             again"
                         .to_owned(),
                 });
             }
