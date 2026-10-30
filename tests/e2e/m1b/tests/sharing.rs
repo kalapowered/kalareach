@@ -781,3 +781,168 @@ fn hand_over(leg: &str, lose: Option<Method>) {
     run.closing_check()
         .unwrap_or_else(|left| panic!("the leg left processes running: {left}"));
 }
+
+/// The names of the rights a document lists, as the command prints them.
+fn rights_of(document: &serde_json::Value) -> Vec<String> {
+    document["actions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no list of actions: {document}"))
+        .iter()
+        .map(|right| right.as_str().expect("a right's name").to_owned())
+        .collect()
+}
+
+/// The time on this machine's clock, which the host's shares are issued by.
+fn now_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is past 1970")
+            .as_millis(),
+    )
+    .expect("milliseconds fit")
+}
+
+/// A day, in milliseconds, and how far the host's clock and this test's may differ.
+const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+const CLOCK_SLACK_MS: u64 = 5_000;
+
+/// One share the role case issues: the words after `--role`, whether `kr` asks the person at the
+/// terminal before it issues one, the rights the grant has to carry and the ones it must not, and
+/// whether earlier history was asked for.
+struct Chosen {
+    role: &'static str,
+    extra: &'static [&'static str],
+    asks: bool,
+    carried: &'static [&'static str],
+    absent: &'static [&'static str],
+    history: bool,
+}
+
+/// KR-REQ-18.12, from `kr`: the role the person names, and each explicit option they take, is what
+/// the invitation the host wrote carries. For a viewer, a viewer who asked for earlier history, a
+/// viewer who answers questions, a controller and an owner the command states the role and the
+/// actions it compiled to, `kr share list` shows the same actions and the same history on the
+/// grant the host holds, and what separates the roles is in them: only a controller or an owner
+/// types, a viewer answers questions only when the person chose it, only an owner manages sharing,
+/// and earlier history is there only when it was asked for. Real daemon, real worker, real command.
+#[test]
+fn an_invitation_from_kr_carries_the_role_the_person_named_and_each_option() {
+    let runtime = runtime();
+    let run = Run::start("sharing-roles");
+    let host = Host::start(&run, &HostOptions::default());
+    let owner_device = runtime.block_on(Device::create("owner", &run.root().join("o")));
+    let (_, owner) = ceremony::pair_first_owner(&host, &owner_device, &runtime);
+    let (_, display) = new_session(&host);
+    let guest_device = runtime.block_on(Device::create("guest", &run.root().join("g")));
+    let (guest_paired, guest) = ceremony::pair_guest(&host, &owner, &guest_device, &runtime, "60");
+    let device_id = guest_paired.device_id.to_string();
+
+    let chosen = [
+        Chosen {
+            role: "viewer",
+            extra: &[],
+            asks: false,
+            carried: &["session.view"],
+            absent: &["terminal.input", "question.respond", "session.share"],
+            history: false,
+        },
+        Chosen {
+            role: "viewer",
+            extra: &["--history", "1d"],
+            asks: false,
+            carried: &["session.view"],
+            absent: &["terminal.input", "question.respond", "session.share"],
+            history: true,
+        },
+        Chosen {
+            role: "viewer",
+            extra: &["--answer-questions"],
+            asks: true,
+            carried: &["session.view", "question.respond"],
+            absent: &["terminal.input", "session.share"],
+            history: false,
+        },
+        Chosen {
+            role: "controller",
+            extra: &[],
+            asks: true,
+            carried: &["session.view", "terminal.input", "question.respond"],
+            absent: &["session.share", "session.close"],
+            history: false,
+        },
+        Chosen {
+            role: "owner",
+            extra: &[],
+            asks: true,
+            carried: &[
+                "session.view",
+                "terminal.input",
+                "question.respond",
+                "session.share",
+                "session.close",
+            ],
+            absent: &[],
+            history: false,
+        },
+    ];
+    for share in chosen {
+        let role = share.role;
+        let before = now_ms();
+        let mut arguments = vec![display.as_str(), "--to", &device_id, "--role", role];
+        arguments.extend(share.extra);
+        arguments.extend(["--for", "15m"]);
+        let issued = if share.asks {
+            let (_, issued) = ceremony::share_at_terminal(&host, &arguments, b"share");
+            assert_eq!(issued.exit, 0, "the {role} share: {}", issued.document);
+            issued.document
+        } else {
+            arguments.push("--yes");
+            let mut command = vec!["share", "invite"];
+            command.extend(arguments);
+            host.kr_json(&command)
+        };
+        assert_eq!(issued["role"], role, "{issued}");
+        let rights = rights_of(&issued);
+        for right in share.carried {
+            assert!(rights.iter().any(|held| held == right), "{role}: {issued}");
+        }
+        for right in share.absent {
+            assert!(!rights.iter().any(|held| held == right), "{role}: {issued}");
+        }
+
+        let after = now_ms();
+
+        // The host holds the grant with the same actions and the same history.
+        let grant_id = issued["grant_id"].as_str().expect("a grant").to_owned();
+        let listed = host.kr_json(&["share", "list", &display]);
+        let held = listed["grants"]
+            .as_array()
+            .expect("grants")
+            .iter()
+            .find(|listed| listed["grant_id"] == grant_id.as_str())
+            .unwrap_or_else(|| panic!("the host lists the grant: {listed}"));
+        assert_eq!(rights_of(held), rights, "the host's list agrees: {held}");
+        // A share given no earlier history begins when it is issued, and one given a day of it
+        // reaches back a day from then.
+        let reach = if share.history { DAY_MS } else { 0 };
+        let begins = counter(&held["history_from_ms"]);
+        assert!(
+            begins + reach + CLOCK_SLACK_MS >= before && begins + reach <= after + CLOCK_SLACK_MS,
+            "history begins {reach} ms before the share was issued, between {before} and {after}: {held}"
+        );
+
+        // The invitation is withdrawn, so the next one is the only one open.
+        let withdrawn = host.kr(&["share", "revoke", &grant_id, "--json"]);
+        assert!(withdrawn.status.success(), "{role}: the withdrawal");
+    }
+
+    guest.close();
+    owner.close();
+    runtime.block_on(guest_device.close());
+    runtime.block_on(owner_device.close());
+    host.stop()
+        .unwrap_or_else(|problem| panic!("the host did not stop cleanly: {problem}"));
+    run.closing_check()
+        .unwrap_or_else(|left| panic!("the leg left processes running: {left}"));
+}

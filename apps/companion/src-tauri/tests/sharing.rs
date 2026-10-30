@@ -175,6 +175,156 @@ async fn the_typed_result_reaches_the_page_and_a_share_is_accepted_and_taken_bac
     scene.stop().await;
 }
 
+/// The time on this machine's clock, which the host issues shares by.
+fn now_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is past 1970")
+            .as_millis(),
+    )
+    .expect("milliseconds fit")
+}
+
+/// The page's `grant_create` request for `selection`, to the device the scene's host is paired
+/// with, as the Sharing tab sends it once the person has seen what the share carries.
+fn invitation_for(scene: &Scene, selection: RoleSelection) -> Value {
+    let params = GrantCreateParams {
+        session_id: scene.session_id,
+        recipient_device_id: scene.record.device_id,
+        parent_grant_id: Nullable::null(),
+        accepted_notices: AuthorityNotice::for_actions(&selection.actions()),
+        selection,
+        lifetime_ms: Nullable::null(),
+        owner_confirmation: Nullable::null(),
+    };
+    json!({
+        "params": serde_json::to_value(&params).expect("encodes"),
+        "subject": { "sessionId": scene.session_id.to_string(), "sessionEpoch": "1" },
+    })
+}
+
+/// KR-REQ-18.12: the role the person chooses, and each option they take, is what the grant the
+/// host writes carries. For each role the page offers, and for the two options a viewer can take
+/// (earlier history, and answering questions), the invitation is issued as the Sharing tab sends
+/// it; the grant in the host's answer, the preview the issuer saw and the host's own list of the
+/// session's shares each carry the actions and the history that choice compiles to and no others,
+/// and the notices the person accepted are the ones those actions carry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_grant_the_host_writes_carries_the_role_the_person_chose_and_each_option() {
+    let scene = Scene::start().await;
+    let viewer_who_answers = RoleSelection {
+        include_question_respond: true,
+        ..RoleSelection::plain(SessionRole::Viewer)
+    };
+    let viewer_with_history = RoleSelection {
+        history_from_cursor_ms: Nullable::some(kr_protocol::scalars::TimestampMs::new(1_000)),
+        ..RoleSelection::plain(SessionRole::Viewer)
+    };
+    let chosen = [
+        (RoleSelection::plain(SessionRole::Viewer), false),
+        (viewer_with_history, false),
+        (viewer_who_answers, false),
+        (RoleSelection::plain(SessionRole::Controller), false),
+        (RoleSelection::plain(SessionRole::Owner), true),
+    ];
+    let mut seen = Vec::new();
+    for (selection, owner) in chosen {
+        let before = now_ms();
+        let made = scene
+            .issuer
+            .call("grant_create", invitation_for(&scene, selection.clone()))
+            .await
+            .unwrap_or_else(|why| panic!("{:?} is issued: {why}", selection.role));
+        let after = now_ms();
+        assert_eq!(made["attempt"]["outcome"], "happened", "{made}");
+        let created: GrantCreateResult = typed(&made["value"]);
+        let wanted = selection.actions();
+        assert_eq!(created.grant.actions, wanted, "{:?}", selection.role);
+        // A share given no earlier history begins when it is issued; one given a cursor begins there.
+        let begins = created
+            .grant
+            .history
+            .lower_bound_ms
+            .0
+            .expect("the history has a beginning")
+            .get();
+        match selection.history_from_cursor_ms.0 {
+            Some(cursor) => assert_eq!(begins, cursor.get(), "earlier history reaches the cursor"),
+            None => assert!(
+                begins + 5_000 >= before && begins <= after + 5_000,
+                "it begins when it is issued, between {before} and {after}: {begins}"
+            ),
+        }
+        assert_eq!(created.preview.role, selection.role);
+        assert_eq!(created.preview.actions, wanted, "{:?}", selection.role);
+        assert_eq!(
+            created.preview.history, created.grant.history,
+            "the preview shows it"
+        );
+        assert_eq!(
+            created.preview.notices,
+            AuthorityNotice::for_actions(&wanted),
+            "{:?}",
+            selection.role
+        );
+        let listed = scene.listed().await;
+        let held = listed
+            .grants
+            .iter()
+            .find(|summary| summary.grant.grant_id == created.grant.grant_id)
+            .expect("the host lists the grant it wrote");
+        assert_eq!(held.grant.actions, wanted, "the host's list agrees");
+        assert_eq!(
+            held.grant.history, created.grant.history,
+            "and so does the host's list"
+        );
+
+        // The roles are not one set under four names: what separates them is in the grant.
+        let has = |right: ActionRight| created.grant.actions.contains(&right);
+        assert!(has(ActionRight::SessionView), "every role watches");
+        assert_eq!(
+            has(ActionRight::TerminalInput),
+            selection.role == SessionRole::Controller || selection.role == SessionRole::Owner,
+            "only a controller or an owner types: {:?}",
+            selection.role
+        );
+        assert_eq!(
+            has(ActionRight::QuestionRespond),
+            selection.include_question_respond
+                || selection.role == SessionRole::Controller
+                || selection.role == SessionRole::Owner,
+            "a viewer answers questions only when the person chose it: {:?}",
+            selection.role
+        );
+        assert_eq!(
+            has(ActionRight::SessionShare),
+            owner,
+            "only an owner manages sharing: {:?}",
+            selection.role
+        );
+        seen.push((created.grant.actions.clone(), created.grant.history.clone()));
+
+        // The invitation is withdrawn, so that the next is the only one open.
+        scene
+            .issuer
+            .call(
+                "grant_revoke",
+                json!({ "params": serde_json::to_value(&GrantRevokeParams {
+                    grant_id: created.grant.grant_id,
+                }).expect("encodes") }),
+            )
+            .await
+            .expect("the invitation is withdrawn");
+    }
+    for (index, first) in seen.iter().enumerate() {
+        for second in &seen[index + 1..] {
+            assert_ne!(first, second, "five choices, five different grants");
+        }
+    }
+    scene.stop().await;
+}
+
 /// The host's answer to an invitation is lost, and the application, which kept the request before
 /// it sent it, asks the host again with the same request on a connection opened for it. The host
 /// answers from the record it kept, so the invitation exists once, and the page reads the host's
