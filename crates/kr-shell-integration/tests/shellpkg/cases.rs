@@ -464,8 +464,34 @@ fn signal_the_shell(session: &Session, signal: &str) {
 #[cfg(unix)]
 pub fn bytes_the_host_put_into_the_terminal_are_input_the_reader_has_not_taken(kind: ShellKind) {
     // Three answers a terminal gives to a primary device-attributes query.
-    const HOST_REPLY: &[u8] = b"\x1b[?62;22c\x1b[?62;22c\x1b[?62;22c";
+    unread_input_is_not_drained(kind, b"\x1b[?62;22c\x1b[?62;22c\x1b[?62;22c", b"");
+}
 
+/// KR-REQ-08.49: the first byte of a character the terminal delivered in two parts is input the
+/// reader has not taken, although it has read it.
+///
+/// A runtime that reads its terminal in chunks keeps the first byte of a multibyte character in its
+/// decoder until the rest arrives. That byte is no longer in the terminal's queue or in a buffer of
+/// bytes, and the reader that counts only those says its queues are drained with a character half
+/// delivered. The case types the step a reader at a step takes and the first byte of a two-byte
+/// character in one go, asks for the fence, and lets the reader go; it then types the second byte
+/// and expects the queues drained once the reader has the whole character.
+///
+/// # Panics
+///
+/// Panics when the reader says its terminal's typeahead is drained with the first byte unread, or
+/// says it is not after it has the whole character.
+#[cfg(unix)]
+pub fn half_a_character_the_terminal_delivered_is_input_the_reader_has_not_taken(kind: ShellKind) {
+    // The first byte of "\u{e9}" in UTF-8, and its second.
+    unread_input_is_not_drained(kind, b"\xc3", b"\xa9");
+}
+
+/// Types `unread` into the terminal of an idle reader that is stopped, asks it for its queues, and
+/// expects it to say they are not drained. Then types `completion`, which the reader needs to take
+/// what it has, and expects it to say they are.
+#[cfg(unix)]
+fn unread_input_is_not_drained(kind: ShellKind, unread: &[u8], completion: &[u8]) {
     let package = Package::built(kind);
     let mut session = Session::start(&package);
     let first = session.first_prompt();
@@ -488,8 +514,8 @@ pub fn bytes_the_host_put_into_the_terminal_are_input_the_reader_has_not_taken(k
     // A reader that answers only when it steps meets its mailbox at the step a person gives it by
     // typing, so the answers wait behind that step and not ahead of it.
     session.type_the_step();
-    session.type_bytes(HOST_REPLY);
-    let id = session.ask(WorkerRequest::Fence(RootEditorFenceParams {
+    session.type_bytes(unread);
+    let id = session.ask_after_the_step(WorkerRequest::Fence(RootEditorFenceParams {
         session_id: session.session_id,
         fence_id: fence_id(31),
         prompt_generation: first.prompt_generation,
@@ -503,9 +529,10 @@ pub fn bytes_the_host_put_into_the_terminal_are_input_the_reader_has_not_taken(k
     };
     assert!(
         !asked.queues.tty_typeahead_drained,
-        "the reader said its terminal's typeahead was drained with {HOST_REPLY:?} unread: {:?}",
+        "the reader said its terminal's typeahead was drained with {unread:?} unread: {:?}",
         asked.queues
     );
+    session.type_bytes(completion);
 
     // Taken, the answer is no longer typeahead: the reader that reported it unread reports the
     // queues drained once it has read it.
