@@ -847,6 +847,48 @@ mod tests {
         assert!(copy.deletable, "the gateway may still hold it");
     }
 
+    /// Admits one notification to the paired device and settles it as taken by the gateway.
+    fn sent_to_the_phone(journal: &mut DeliveryJournal, byte: u8) -> NotificationId {
+        let id = admit_to_the_phone(journal, byte);
+        claim(journal, byte + 20, 1_500);
+        settle(
+            journal,
+            id,
+            DeliveryState::Accepted,
+            true,
+            crate::push::NextAction::None,
+        );
+        id
+    }
+
+    /// A notification is asked about under the authorisation it was sent under, which this host
+    /// can show only through the destination it was admitted for. Admission uses an enabled
+    /// destination, and the choice of previews is the person's to change afterwards, so neither
+    /// says which authorisation sent a notification and neither takes the offer away.
+    #[test]
+    fn a_notification_stays_offered_when_its_device_only_changes_previews_or_is_disabled() {
+        let mut journal = journal_with_work();
+        let sent = sent_to_the_phone(&mut journal, 5);
+        let offered = |journal: &mut DeliveryJournal| {
+            listing_of(journal, sent).expect("it is listed").deletable
+        };
+        assert!(offered(&mut journal), "the gateway took it");
+
+        let mut previews_off = phone();
+        if let Destination::Push(push) = &mut previews_off.destination {
+            push.previews_enabled = false;
+        }
+        journal
+            .configure_destination(&previews_off)
+            .expect("the device turns previews off");
+        assert!(offered(&mut journal), "previews are off");
+
+        journal
+            .disable_destination(&previews_off.id, &previews_off.binding_digest())
+            .expect("a rejected token disables the destination");
+        assert!(offered(&mut journal), "the destination is out of service");
+    }
+
     #[test]
     fn a_confirmed_duplicate_delivery_is_shown_as_a_retained_artifact() {
         let mut journal = journal_with_work();

@@ -4682,24 +4682,38 @@ fn the_gateway_may_hold(state: DeliveryState, dispatched: bool, next_action: Opt
 /// The authorisation of the paired device `destination` is, when it is the registration a
 /// notification admitted under `admitted_for` was sent under.
 ///
-/// A request about a notification is made under the credential of that authorisation. It needs a
-/// push destination that is still in service, with a rule: unpairing removes the credential, and a
-/// removed destination is kept as history with no rule. And the destination must be unchanged
-/// since the notification was admitted for it, which is what the digest says; the gateway answers
-/// a credential only for the notifications its own authorisation sent. An external message is in
-/// somebody else's service, which this host has no route to ask.
+/// A request about a notification is made under the credential of that authorisation. The journal
+/// keeps no record of which authorisation sent a notification, only the digest of the destination
+/// as it stood when the notification was admitted. So this host can show the authorisation only
+/// when the destination now is that destination again: the same installation, authorisation,
+/// rule and grant, and stored-envelope key. A change of any of them leaves the notification
+/// listed and not offered, and a change back offers it again. Admission uses an enabled
+/// destination, and previews are the person's choice to change afterwards, so a destination put
+/// out of service by a rejected token, or one whose previews were turned on or off, is still the
+/// destination the notification was admitted for.
+///
+/// It needs a push destination with a rule: unpairing removes the credential, and a removed
+/// destination is kept as history with no rule. An external message is in somebody else's
+/// service, which this host has no route to ask.
 fn authorisation_sent_under(
     destination: &DestinationRecord,
     admitted_for: &str,
 ) -> Option<PushSenderRecordId> {
-    match &destination.destination {
-        Destination::Push(push)
-            if destination.rule.is_some() && destination.binding_digest() == admitted_for =>
-        {
-            Some(push.sender_record_id)
+    let Destination::Push(push) = &destination.destination else {
+        return None;
+    };
+    destination.rule.as_ref()?;
+    let mut as_admitted = destination.clone();
+    as_admitted.enabled = true;
+    for previews_enabled in [true, false] {
+        if let Destination::Push(held) = &mut as_admitted.destination {
+            held.previews_enabled = previews_enabled;
         }
-        _ => None,
+        if as_admitted.binding_digest() == admitted_for {
+            return Some(push.sender_record_id);
+        }
     }
+    None
 }
 
 #[cfg(test)]
