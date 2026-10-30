@@ -28,10 +28,14 @@ use kr_controller::service::net::devices::DeviceRecord;
 use kr_controller::testing::HeldTimer;
 use kr_crypto::keys::{AuthorisationKeyPair, DeviceKeys};
 use kr_protocol::hello::{PACKAGE_VERSION, PackageVersion};
-use kr_protocol::hostinfo::{DoctorCheck, DoctorStatus, HostDoctorResult};
+use kr_protocol::hostinfo::{DoctorCheck, DoctorStatus, HostDoctorResult, HostInfoResult};
+use kr_protocol::ids::SessionId;
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
+use kr_protocol::session::{SessionReadParams, SessionReadResult, SessionState};
+use kr_protocol::sharing::{DeviceListParams, DeviceListResult, GrantListParams, GrantListResult};
 use kr_service_stand_in::{Moment, RelayLeaseView, Served, serve, signed_release_matrix};
+use net_support::worker::{Adopted, Worker};
 use net_support::{Device, Host, MovedWall, ReleaseMatrixStage, pair_with, proposal};
 use serde_json::{Value, json};
 use tokio::sync::watch;
@@ -355,6 +359,106 @@ impl Rig {
             .unwrap_or_else(|| panic!("the {id} check"))
     }
 
+    /// Stops the daemon, starts a session worker on its tree, and starts the daemon again, which
+    /// adopts the worker. Waits until the daemon serves the session and has read the matrix.
+    async fn with_a_session_worker(self) -> (Self, Worker) {
+        let Self {
+            host,
+            served,
+            owner,
+            matrix_key,
+            sign_in,
+            wall,
+            matrix_timer,
+            ..
+        } = self;
+        let stopped = host.shut_down().await;
+        let worker = Worker::start_reserved(stopped.tree(), 1).await;
+        let timer = HeldTimer::held();
+        let host = stopped.start_with_timer(Arc::clone(&timer) as _).await;
+        let adopted = Adopted {
+            host,
+            owner,
+            workers: vec![worker],
+        };
+        adopted.until_adopted(&adopted.workers[0]).await;
+        let Adopted {
+            host,
+            owner,
+            mut workers,
+        } = adopted;
+        let rig = Self {
+            host,
+            served,
+            timer,
+            matrix_timer,
+            wall,
+            owner,
+            matrix_key,
+            sign_in,
+        };
+        rig.until_a_matrix_pass(1).await;
+        (rig, workers.remove(0))
+    }
+
+    async fn session_of(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionReadResult, kr_protocol::error::ProtocolError> {
+        let mut local = self.host.client().await;
+        net_support::pairing::read(
+            &mut local,
+            Method::SessionRead,
+            &SessionReadParams { session_id },
+        )
+        .await
+    }
+
+    /// What the host says of its authority and of one session's worker, in the answers of
+    /// `host.info`, `grant.list`, `device.list` and `session.read`. Nothing in it moves with time.
+    async fn standing_of(&self, session_id: SessionId) -> Value {
+        let mut local = self.host.client().await;
+        let info: HostInfoResult = net_support::pairing::read(&mut local, Method::HostInfo, &())
+            .await
+            .expect("host.info");
+        let grants: GrantListResult = net_support::pairing::read(
+            &mut local,
+            Method::GrantList,
+            &GrantListParams {
+                session_id: kr_protocol::scalars::Nullable::null(),
+                include_resolved: true,
+            },
+        )
+        .await
+        .expect("grant.list");
+        let devices: DeviceListResult = net_support::pairing::read(
+            &mut local,
+            Method::DeviceList,
+            &DeviceListParams {
+                include_revoked: true,
+            },
+        )
+        .await
+        .expect("device.list");
+        let worker = match self.session_of(session_id).await {
+            Ok(read) => json!({
+                "epoch": read.session.session_epoch,
+                "state": read.session.state,
+                "root_process": read.session.root_process,
+                "closure": read.session.closure,
+            }),
+            Err(error) => json!({ "refused": format!("{:?}", error.code) }),
+        };
+        json!({
+            "generation": info.generation,
+            "started_at_ms": info.started_at_ms,
+            "live_sessions": info.live_sessions,
+            "grants": grants,
+            "devices": devices,
+            "worker": worker,
+        })
+    }
+
     /// Stops the daemon, lets `change` alter its tree, and starts it again on the tree.
     async fn restarted_after(self, change: impl FnOnce(&kr_ipc::testing::TempHost)) -> Self {
         let Self {
@@ -502,6 +606,87 @@ async fn a_skewed_host_is_refused_new_leases_keeps_its_working_route_and_gets_ne
     rig.pass().await;
     rig.until("the new device holds a lease", || rig.holds(&other))
         .await;
+}
+
+/// KR-REQ-17.46: a skew never resets host authority and never ends a worker. A host runs a real
+/// session worker and has a device paired; the matrix drops its build and the gate closes; what
+/// `host.info`, `grant.list`, `device.list` and `session.read` say of the controller generation, the
+/// grants (a share of the session to the paired device), the authority revision and the worker's epoch, state and root process is what they said
+/// before, and the device's connection is served. The matrix that lists the build gives the same
+/// answers again. The comparison is shown to see a change: a grant withdrawn makes it differ, and so
+/// does a worker that ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_skew_leaves_the_hosts_authority_and_its_session_worker_as_they_were() {
+    let rig = Rig::start(Some(&supporting("2"))).await;
+    let (rig, worker) = rig.with_a_session_worker().await;
+    let (device, record) = rig.pairs().await;
+    let share = net_support::worker::share(
+        &rig.host,
+        worker.session_id,
+        &device,
+        &record,
+        kr_protocol::sharing::RoleSelection::plain(kr_protocol::sharing::SessionRole::Viewer),
+    )
+    .await;
+    let session = net_support::connect(&rig.host, &device, &record).await;
+    let gate = rig
+        .host
+        .controller()
+        .release_matrix()
+        .expect("a reader of the release matrix")
+        .gate();
+    assert!(
+        gate.closed().is_none(),
+        "a build the matrix lists is served"
+    );
+    let before = rig.standing_of(worker.session_id).await;
+    let running = rig
+        .session_of(worker.session_id)
+        .await
+        .expect("the session is served")
+        .session;
+    assert_eq!(running.state, SessionState::Live, "the worker is running");
+    assert!(
+        running.root_process.0.is_some(),
+        "the worker reports the process it runs the shell in, which the comparison holds"
+    );
+
+    // The matrix drops this build, and the host reads it: the gate is closed.
+    rig.publish(&skewing("3"));
+    rig.the_matrix_is_read_again().await;
+    assert!(gate.closed().is_some(), "the build is in no tier");
+    assert_eq!(
+        rig.check("release-matrix").await.status,
+        DoctorStatus::Warning
+    );
+
+    // Nothing the host says of its authority or of the worker has moved, and the device that was
+    // paired before is served on the connection it had.
+    assert_eq!(rig.standing_of(worker.session_id).await, before);
+    let doctor: HostDoctorResult = session
+        .read(Method::HostDoctor, &())
+        .await
+        .expect("the device is still served");
+    assert!(!doctor.checks.is_empty());
+
+    // A revision that lists the build opens the gate, and the answers are the same again.
+    rig.publish(&supporting("4"));
+    rig.the_matrix_is_read_again().await;
+    assert!(gate.closed().is_none());
+    assert_eq!(rig.standing_of(worker.session_id).await, before);
+
+    // The comparison sees what it claims to: a grant withdrawn changes the answers.
+    net_support::worker::revoke(&rig.host, share.grant_id).await;
+    let after_revoking = rig.standing_of(worker.session_id).await;
+    assert_ne!(after_revoking["grants"], before["grants"]);
+
+    // And a worker that ends: the daemon no longer reports the worker it reported.
+    let session_id = worker.session_id;
+    worker.stop().await;
+    assert_ne!(
+        rig.standing_of(session_id).await["worker"],
+        before["worker"]
+    );
 }
 
 /// KR-REQ-17.46: a service rolled back to the publication that listed no build of this product
