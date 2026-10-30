@@ -3168,8 +3168,8 @@ const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(5);
 ///
 /// Git answers these in milliseconds. A program that takes longer is not one this host can run
 /// work through: it is a stand-in waiting on something, such as an installer or a lookup that never
-/// returns. It is ended, with the processes in its group, and refused as unavailable. Ending it, and
-/// the wait for its output to close, take [`PROBE_REAP`] and [`PROBE_DRAIN`] more at most.
+/// returns. It is ended, with the processes in its group, and refused as unavailable. Ending it,
+/// and the wait for its output to close, take a few seconds more at most.
 pub const PROBE_BOUND: Duration = Duration::from_secs(10);
 
 /// The most one of those answers may hold. A version and a directory are far shorter.
