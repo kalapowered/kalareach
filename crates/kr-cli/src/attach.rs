@@ -627,6 +627,66 @@ pub async fn subscribe(
     outcome.map(|_| ()).map_err(CliError::Refused)
 }
 
+/// What makes a console that reports its keys as records spell them itself.
+///
+/// The records of a console go to the session as they are, and the session spells them as its
+/// terminal asked for. A session whose application has negotiated a keyboard encoding that its
+/// spelling of records cannot express refuses them, and the attachment then turns to this: the
+/// console's own virtual-terminal input, which spells the keys as a terminal would and which the
+/// reader hands on as bytes from then on. The command spells nothing in either case.
+pub struct InputSwitch {
+    /// Set once the console spells its keys, when the reader starts to hand on bytes.
+    spelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Asks the console to spell its keys.
+    ask: Box<dyn Fn() -> Result<()> + Send + Sync>,
+}
+
+impl InputSwitch {
+    /// A switch that asks the console with `ask`.
+    #[must_use]
+    pub fn new(ask: impl Fn() -> Result<()> + Send + Sync + 'static) -> Self {
+        Self {
+            spelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ask: Box::new(ask),
+        }
+    }
+
+    /// Asks the console to spell its keys, and from then on the reader hands on bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the console would not, and the reader goes on handing on records.
+    pub fn engage(&self) -> Result<()> {
+        (self.ask)()?;
+        self.spelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Whether the console spells its keys now, as the reader looks at it.
+    #[cfg(not(unix))]
+    fn flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.spelled)
+    }
+}
+
+/// The bytes of a run of records a console spelled itself, in virtual-terminal input mode.
+///
+/// The console puts the characters of its sequences in the records of the keys going down, and a
+/// key coming up has nothing to say. They are UTF-16 in the records and UTF-8 on the wire. A
+/// character left half is dropped rather than guessed, as is a record with no character.
+#[cfg(any(not(unix), test))]
+fn bytes_the_console_spelled(keys: &[kr_term::win32::KeyRecord]) -> Vec<u8> {
+    let units = keys
+        .iter()
+        .filter(|key| key.key_down && key.unicode != 0)
+        .map(|key| key.unicode);
+    char::decode_utf16(units)
+        .filter_map(std::result::Result::ok)
+        .collect::<String>()
+        .into_bytes()
+}
+
 /// One read of the terminal's input.
 ///
 /// A terminal emulator hands this command bytes. A Windows console hands it the keys as the console
@@ -669,6 +729,7 @@ impl std::fmt::Debug for TerminalInput {
 #[cfg(unix)]
 pub fn spawn_input_reader(
     terminal: std::fs::File,
+    _switch: &InputSwitch,
 ) -> Result<(
     tokio::sync::mpsc::UnboundedReceiver<TerminalInput>,
     InputStop,
@@ -771,17 +832,20 @@ pub fn spawn_input_reader(
 #[cfg(not(unix))]
 pub fn spawn_input_reader(
     console: std::fs::File,
+    switch: &InputSwitch,
 ) -> Result<(
     tokio::sync::mpsc::UnboundedReceiver<TerminalInput>,
     InputStop,
 )> {
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     use crate::windows::records::{ReadEvent, RecordReader, StopEvent};
 
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     let stop = Arc::new(StopEvent::new()?);
     let waker = Arc::clone(&stop);
+    let spelled = switch.flag();
     let thread = std::thread::spawn(move || {
         let mut reader = RecordReader::over(console);
         while let Ok(true) = reader.wait(&waker) {
@@ -789,9 +853,21 @@ pub fn spawn_input_reader(
                 break;
             };
             for event in events {
-                if let ReadEvent::Keys(keys) = event
-                    && sender.send(TerminalInput::Keys(keys)).is_err()
-                {
+                let ReadEvent::Keys(keys) = event else {
+                    continue;
+                };
+                // Once the console spells its keys, what it spelled is what the session is given,
+                // as bytes. The records are read the same way either side of the switch.
+                let input = if spelled.load(Ordering::SeqCst) {
+                    let bytes = bytes_the_console_spelled(&keys);
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    TerminalInput::Bytes(bytes)
+                } else {
+                    TerminalInput::Keys(keys)
+                };
+                if sender.send(input).is_err() {
                     return;
                 }
             }
@@ -954,6 +1030,40 @@ async fn call<P: serde::Serialize + ?Sized, T: kr_protocol::wire::WireMessage>(
 mod tests {
     use super::RestorationGuard;
     use crate::terminal::SavedModes;
+
+    /// A console that spells its keys itself puts the characters of its sequences in the records of
+    /// the keys going down: those are the bytes, in UTF-8, and a key coming up, a record with no
+    /// character and half a character have none.
+    #[test]
+    fn the_bytes_a_console_spelled_are_the_characters_of_the_keys_going_down() {
+        use kr_term::win32::KeyRecord;
+
+        let key = |unicode: u16, key_down: bool| KeyRecord {
+            virtual_key: 0,
+            scan_code: 0,
+            unicode,
+            key_down,
+            control_keys: 0,
+            repeat: 1,
+        };
+        // An arrow's sequence, a letter that is two bytes, and a character outside the basic plane.
+        let records = [
+            key(0x1b, true),
+            key(u16::from(b'['), true),
+            key(u16::from(b'A'), true),
+            key(u16::from(b'A'), false),
+            key(0x00e9, true),
+            key(0xd83d, true),
+            key(0xde00, true),
+            key(0, true),
+        ];
+        assert_eq!(
+            super::bytes_the_console_spelled(&records),
+            "\u{1b}[A\u{e9}\u{1f600}".as_bytes()
+        );
+        assert!(super::bytes_the_console_spelled(&[key(0xd83d, true)]).is_empty());
+        assert!(super::bytes_the_console_spelled(&[key(u16::from(b'a'), false)]).is_empty());
+    }
 
     /// A guard that leaves without answering is reported at once, with how it left.
     ///

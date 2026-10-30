@@ -1985,9 +1985,15 @@ session attached from a Windows console is watched and not typed into until `TER
 Under `Fidelity::LegacyVt`, which is every session of a Unix worker and a Windows session whose
 pseudo-console did not ask for records, and while the application in the session has negotiated
 `modifyOtherKeys` or the Kitty keyboard protocol, the worker refuses a write of console keys with
-`INPUT_INCOMPATIBLE`, a key coming up and a modifier on its own included, and the attach ends and
-says so and that `--no-probe` watches without typing. Under `Fidelity::Records` it refuses nothing
-for the keyboard state. The client
+`INPUT_INCOMPATIBLE`, a key coming up and a modifier on its own included, and takes no sequence
+number for the write. The client then asks its console to spell its keys itself and sends the bytes
+the console spells, from the number the refused write was sent under, so the attachment keeps its
+lease and invents no spelling. Its modifier detail is the console's own and it sends no key
+releases. The keys of the refused batch are not sent again, and the client says so once, after the
+terminal is the person's again. A console that will not spell its keys is given up on: the client
+hands the lease back with `input.release` and goes on watching. Bytes refused as incompatible still
+end the attach, which says so and that `--no-probe` watches without typing. Under
+`Fidelity::Records` the worker refuses nothing for the keyboard state. The client
 asks the console for no mouse or window-size records. Nothing reports the fidelity at run time: the
 engine tracks which one the backend asked for and the worker spells records accordingly, but no
 receipt, diagnostic or client message carries the answer, so this page is where the limit is

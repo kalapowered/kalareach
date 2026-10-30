@@ -333,8 +333,16 @@ host reference). Under legacy terminal input (`Fidelity::LegacyVt`: every sessio
 and a Windows session whose pseudo-console did not ask for records) the worker spells console keys
 only as ordinary terminal input, which is a different key while the application has negotiated
 `modifyOtherKeys` or the Kitty keyboard protocol, so it refuses the write. Records the backend asked
-for are carried unchanged in any keyboard state, and nothing is refused then. A refused attachment
-ends and says why and that `--no-probe` watches without typing. The scroll-back keys above are taken
+for are carried unchanged in any keyboard state, and nothing is refused then. When the session
+refuses the records, the command asks the console to spell its keys itself (its own virtual-terminal
+input) and sends what the console spells as bytes from then on, which the session takes in that
+encoding. The attachment keeps its input lease and invents no spelling. After the terminal is the
+person's again it says once that its keys went as the console spells them, with the console's own
+modifier detail and without key releases. The keys of the batch the session refused, and the
+records the command had read before the console began to spell, are not sent again. A console that
+will not spell its keys gives the lease back, goes on watching, and says that. Bytes the session
+refuses as incompatible end the attachment, which says why and that `--no-probe` watches without
+typing. The scroll-back keys above are taken
 from the records of Shift and Page Up or Page Down, key by key: the key going down and the same key
 coming up are the window's, and every other record, a release among them, is the session's. The
 command does not ask the console for mouse or window-size records, so the console keeps the mouse
