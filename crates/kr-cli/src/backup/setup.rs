@@ -44,6 +44,7 @@ use std::time::Duration;
 use kr_client::recovery::{SetupInputs, prepare_setup};
 use kr_client::shown;
 use kr_client::shown::{Said as _, Shown};
+use kr_controller::backup::uploader::SERVICE_CHAIN_LENGTH;
 use kr_ipc::paths::HostPaths;
 use kr_protocol::backup_read::BackupSignIn;
 use kr_protocol::backup_setup::{
@@ -728,16 +729,24 @@ fn show_the_plan(ready: &Ready) {
         "  - It binds the backups to the account signed in now. If this host signs in as another \
          account, backups stop until it signs in as this one again or is set up again with \
          --replace.",
-        "  - It keeps the newest backups the account's retention records, at least two and at \
-         most 16, and deletes the older ones at the service, which charges for deleted storage \
-         for seven more days. A backup that privacy mode drew a line under stays until you \
-         delete it, so the account can hold more than 16.",
-        "  - It shows a recovery kit once. The kit is the only way to read these backups if this \
-         host is lost, and KalaReach keeps no copy of it. Keep the kit and its fingerprint \
-         together: the fingerprint matches a kit to this host only if it is with the kit.",
     ] {
         report::say(&Shown::said(line));
     }
+    // The most the uploader keeps is the figure it holds a host to, so the plan never states
+    // another.
+    report::say(&shown!(
+        "  - It keeps the newest backups the account's retention records, at least two and at \
+         most {}, and deletes the older ones at the service, which charges for deleted storage \
+         for seven more days. A backup that privacy mode drew a line under stays until you \
+         delete it, so the account can hold more than {}.",
+        SERVICE_CHAIN_LENGTH,
+        SERVICE_CHAIN_LENGTH
+    ));
+    report::say(&Shown::said(
+        "  - It shows a recovery kit once. The kit is the only way to read these backups if this \
+         host is lost, and KalaReach keeps no copy of it. Keep the kit and its fingerprint \
+         together: the fingerprint matches a kit to this host only if it is with the kit.",
+    ));
     if ready.privacy_mode {
         report::say(&Shown::said(
             "Privacy mode is on now, so nothing is backed up until it is off.",

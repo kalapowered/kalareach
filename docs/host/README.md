@@ -6104,7 +6104,9 @@ only when its grant selects that session.
 
 ### The rule set
 
-Ten rules, each with a stable identifier that outlives any change to the wording it produces.
+Ten rules, each with a stable identifier that outlives any change to the wording it produces. The
+engine handles all ten, but nothing in the daemon sends the event that raises
+`attention.host_contact_lost`, so no inbox holds that rule today.
 
 | Rule | What raises it | Starts at | While it stands |
 | --- | --- | --- | --- |
@@ -6114,7 +6116,7 @@ Ten rules, each with a stable identifier that outlives any change to the wording
 | `attention.command_failed` | A command exited nonzero | notable | announced once |
 | `attention.review_ready` | A turn finished and is waiting to be reviewed | notable | announced once |
 | `attention.adapter_failed` | An adapter failed | notable | urgent after five minutes, then every five |
-| `attention.host_contact_lost` | Contact with the host was lost | notable | urgent after a minute, then every five |
+| `attention.host_contact_lost` | A host-contact-lost event, which the daemon does not send | notable | urgent after a minute, then every five |
 | `attention.application_notice` | An `OSC 9`, `OSC 99` or `OSC 777` sequence | informational | announced once |
 | `attention.automation_paused` | One of its own limits paused a workflow revision or a causal chain | notable | announced once |
 | `attention.authority_feed_removed` | The authority feed this host reads answered that it was removed from it | urgent | announced once; stands until the host reads another feed or none |
@@ -6356,7 +6358,7 @@ condition would be folded into it rather than announced again. Weighing what is 
 age is what stops a fresh notice displacing an urgent approval.
 
 What the bound never lets go of is a condition somebody or something is still waiting on (an
-unanswered approval, an unanswered request, an adapter still down or a host still out of contact) or
+unanswered approval, an unanswered request or an adapter still down) or
 a decision about one that is still in flight: one no consumer has settled, one quiet hours are
 holding, one nobody has made yet, and one whose sixty-second window is still running, because the
 item is the whole of what the host remembers that window by and letting go of it would announce the

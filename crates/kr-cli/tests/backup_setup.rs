@@ -23,6 +23,7 @@ use kr_client::services::account::{
 };
 use kr_controller::account::{HostAccount, Service};
 use kr_controller::backup::store::{Production, Remote};
+use kr_controller::backup::uploader::SERVICE_CHAIN_LENGTH;
 use kr_controller::quiet::Timer;
 use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
@@ -731,6 +732,29 @@ async fn the_kit_that_setup_shows_is_the_one_the_host_records_and_the_daemon_is_
         .expect("the bundle opens under the kit");
     assert_eq!(bundle.trusted_writers.len(), 1);
     assert_eq!(bundle.trusted_producers.len(), 1);
+}
+
+/// KR-REQ-20.22: the plan a person is asked to confirm states the most backups the host keeps as
+/// the figure the uploader holds a host to, which is the thirty daily snapshots the service keeps.
+/// A person who answers anything but yes at the plan stops there and nothing is set up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_plan_states_the_most_backups_the_host_keeps_as_the_uploader_keeps_them() {
+    let rig = Rig::start().await;
+    let mut window = Window::run(&rig, &["backup", "setup"]);
+    let plan = window.wait_for("Type yes to go on");
+    let most = SERVICE_CHAIN_LENGTH;
+    assert!(
+        plan.contains(&format!("at least two and at most {most},")),
+        "{plan}"
+    );
+    assert!(
+        plan.contains(&format!("the account can hold more than {most}.")),
+        "{plan}"
+    );
+    window.type_line("no");
+    let shown = window.wait_for("kr ended");
+    assert!(!shown.contains("kr ended 0"), "{shown}");
+    assert_eq!(rig.recorded_kit().await, None);
 }
 
 /// Typed at the question about the end of the seed three times wrongly, or with the end right and
