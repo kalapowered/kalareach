@@ -58,6 +58,16 @@ A release retains the compatibility level of the newest release at the highest l
 
 The script takes the newest tag in the form `packages/v<version>+<commit>` in the history of that commit at the highest level below its own, and fails unless that level is the newest the build retains. It then compares the schema, the table of public majors and the plugin host protocol of every release tagged at that level, taken from the tags and not from the history of the commit, with those the level kept. If the level's record refers to an earlier release of the same level, it moves the record to the newest one, and the level's row in the table above with it. It runs the `retained_surface` test against the source tree of that release, to hold the rules and limits the level kept to the release they came from, the `public_majors` tests against the record as it now stands, and `kr-protocol-gen --check`. If the record moved, the script fails after it lists the two files it changed: commit them, run the upgrade suite, which builds the release the record now names, and run the script again on that commit.
 
+### The first revision a build reads
+
+A build refuses a signed release matrix of a revision below `PRODUCTION_FIRST_REVISION` in `crates/kr-client/src/services/matrix.rs`, whether or not it holds a copy, so a managed service rolled back to a publication that lists no build of the release cannot close the lease gate of a host that holds none. Every cut that sets a new package version sets the constant, in the same commit, to the first published revision whose client ranges list that version ([the release matrix](packages.md#the-release-matrix)). Revision 2 lists 0.77.0 to 0.79.99, so the cut of 0.80 is the first that raises it.
+
+1. Find the first revision the managed service has published whose tiers list the new package version. It is live before any release of the level.
+2. Set `PRODUCTION_FIRST_REVISION` to it.
+3. Keep the signed reply of that revision, as the service serves it, as `crates/kr-client/tests/fixtures/release-matrix/deployed-revision-<revision>.json`, and point the cases that read the earlier file at it: the `the_deployed_document` module of `crates/kr-client/tests/release_matrix.rs` and the gate case in `crates/kr-client/tests/release_gate.rs`.
+
+`is_read_from_a_revision_that_leaves_out_the_first_publication` reads the file named for the constant and asserts that it verifies under `Pins::production()` and serves `PACKAGE_VERSION`. A cut that raises the constant without keeping the reply fails it, and so does a cut that leaves the constant at a revision whose ranges stop short of the new version. `kr-release-matrix-check`, which the release job runs, refuses a release when the published revision is below the constant or lists no tier for the version.
+
 ### Retaining a level
 
 A release that raises the compatibility level retains the level of the release before it, and the cut is one commit on the branch that raises it. The release before is the one `kr-protocol-gen --predecessor` prints. Extract its commit with `git archive` into a directory of its own: the steps that read the release read that tree.
