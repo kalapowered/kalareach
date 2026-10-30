@@ -2,6 +2,7 @@
 
 use kr_protocol::changeset::{
     ChangesetMaterializeParams, ChangesetMaterializeResult, DiffApplyResult, DiffReadParams,
+    VersionRef,
 };
 use kr_protocol::envelope::{
     ControlFrame, MutationRequest, Outcome, ParamsValue, Request, Response,
@@ -228,15 +229,21 @@ impl RemoteConnection {
         })
     }
 
-    /// Holds the other versions a `changeset.read` lists to this device's grant.
+    /// Holds what a `changeset.read` says about other versions to this device's grant.
     ///
     /// The version asked for was checked before the read, and what is listed about it is its own:
     /// its materialisations, results and evidence. The summaries of the change set's other
     /// versions are listed beside it, and a summary names a version's number, its content digest
     /// and the revision it is based on, so one captured for a session the grant does not reach, or
     /// before the moment its history reaches back to, is not listed.
+    ///
+    /// A version also names the version it was derived from, in its summary and, for the one that
+    /// was asked for, in its provenance beside a sentence about why. Where the grant does not
+    /// reach that source the reference is left empty and the sentence is not given, because they
+    /// would tell the device that the source exists, which number it has and how the version it
+    /// reads relates to it.
     pub(super) async fn within_the_grant(&self, answer: ControlFrame) -> ControlFrame {
-        let (request_id, mut read) = match change_set_read(answer) {
+        let (request_id, read) = match change_set_read(answer) {
             Ok(read) => read,
             Err(answer) => return *answer,
         };
@@ -246,27 +253,46 @@ impl RemoteConnection {
             return encoded(request_id, &read);
         };
         let service = std::sync::Arc::clone(self.controller.changesets().service());
-        let summaries = std::mem::take(&mut read.versions);
-        let listed = tokio::task::spawn_blocking(move || {
-            summaries
-                .into_iter()
-                .filter(|summary| {
-                    crate::changeset::version_in_scope(
-                        &service,
-                        summary.change_set_id,
-                        Some(summary.version),
-                        &scope,
-                    )
-                    .is_ok()
+        let held = tokio::task::spawn_blocking(move || {
+            let mut read = read;
+            let reaches = |version: VersionRef| {
+                crate::changeset::version_in_scope(
+                    &service,
+                    version.change_set_id,
+                    Some(version.version),
+                    &scope,
+                )
+                .is_ok()
+            };
+            read.versions.retain(|summary| {
+                reaches(VersionRef {
+                    change_set_id: summary.change_set_id,
+                    version: summary.version,
                 })
-                .collect::<Vec<_>>()
+            });
+            for summary in &mut read.versions {
+                if summary
+                    .derived_from
+                    .0
+                    .is_some_and(|source| !reaches(source))
+                {
+                    summary.derived_from = kr_protocol::scalars::Nullable::null();
+                }
+            }
+            let provenance = &mut read.version.provenance;
+            if provenance
+                .derived_from
+                .0
+                .is_some_and(|source| !reaches(source))
+            {
+                provenance.derived_from = kr_protocol::scalars::Nullable::null();
+                provenance.derivation.clear();
+            }
+            read
         })
         .await;
-        match listed {
-            Ok(listed) => {
-                read.versions = listed;
-                encoded(request_id, &read)
-            }
+        match held {
+            Ok(read) => encoded(request_id, &read),
             Err(_) => failure(
                 request_id,
                 ProtocolError::new(

@@ -2430,6 +2430,255 @@ async fn a_read_of_one_version_lists_no_other_version_the_grant_does_not_reach()
     recorded.stop().await;
 }
 
+/// KR-REQ-23.44 and the host's rule for derived content: a `changeset.read` names the version a
+/// version was derived from only where the grant reaches that source. A version captured before
+/// the moment the grant's history reaches back to is not listed, is not named as the source of one
+/// captured after it, and its number, digest and change set appear nowhere in the answer.
+///
+/// Two versions are derived after the grant's bound. One is the result of a test run on a changed
+/// copy of the version, derived within its own change set, which is how a summary names its
+/// source. The other is a proposal of an apply of that version, which is in another change set,
+/// which is how the selected version's provenance names it. The control is a grant that reaches
+/// back far enough: it is told both, and the sentence about why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
+async fn a_read_of_a_derived_version_names_no_source_the_grant_does_not_reach() {
+    use kr_changeset::{binding, materialise};
+    use kr_protocol::changeset::{
+        AffectedVersion, ChangesetReadParams, ChangesetReadResult, DestinationClass,
+        DiffApplyParams, DiffApplyResult, VersionRef,
+    };
+    use kr_protocol::scalars::{TimestampMs, U64};
+
+    let mut recorded = Recorded::start().await;
+    let env = recorded.host.environment_id;
+    let source = recorded.plain;
+    let read_of_version = |reference: VersionRef| ChangesetReadParams {
+        change_set_id: reference.change_set_id,
+        version: Nullable::some(reference.version),
+    };
+
+    // A test run changes its own copy of the version, and the host records what the copy held.
+    let service = recorded.host.controller().changesets().service().clone();
+    let made = materialise::materialise(
+        &service,
+        source,
+        kr_protocol::changeset::MaterialisationPurpose::Test,
+        "the test copy",
+        None,
+    )
+    .expect("the version is materialised");
+    std::fs::write(
+        Path::new(&made.directory_path).join("README.md"),
+        b"what the test run left\n",
+    )
+    .expect("the run edits its copy");
+    let ended = kr_ipc::now_ms();
+    let outputs = materialise::Outputs::none();
+    let bound = binding::bind_run(&service, made.materialisation_id, &outputs);
+    let recorded_result = materialise::record_result(
+        &service,
+        made.materialisation_id,
+        &materialise::RunReport {
+            command: "cargo test".to_owned(),
+            profile: "the project's test profile".to_owned(),
+            tool: kr_protocol::changeset::ToolIdentity {
+                name: "cargo".to_owned(),
+                version: "1.97.1".to_owned(),
+            },
+            receipt: kr_protocol::changeset::ExecutionReceipt {
+                started_at_ms: TimestampMs::new(ended.get().saturating_sub(60_000)),
+                ended_at_ms: ended,
+                exit_status: Nullable::some(U64::new(0)),
+                stopped: false,
+                detail: "every test passed".to_owned(),
+            },
+            outputs: Vec::new(),
+        },
+        &outputs,
+        &bound,
+    )
+    .expect("the result is recorded")
+    .result;
+    let changed = recorded_result
+        .derived_output_version
+        .0
+        .expect("a changed copy records the version it held");
+    assert_eq!(changed.change_set_id, source.change_set_id);
+
+    // A proposal of an apply of the same version: it is derived from what the destination held
+    // before, in its own change set, and names the version that was applied.
+    let applied: DiffApplyResult = typed(
+        &local_mutation(
+            &mut recorded.control,
+            env,
+            Method::DiffApply,
+            &DiffApplyParams {
+                change_set_id: source.change_set_id,
+                version: source.version,
+                destination: DestinationClass::Proposal,
+                workspace_id: Nullable::some(recorded.workspace),
+                expected_reference: Nullable::null(),
+                affected: vec![AffectedVersion {
+                    path: "README.md".to_owned(),
+                    expected_worktree_digest: Nullable::some(kr_changeset::objects::digest_of(
+                        b"changed after the commit\n",
+                    )),
+                    expected_index_object_id: Nullable::null(),
+                    expected_index_mode: Nullable::null(),
+                    check_index: false,
+                }],
+                paths: vec!["README.md".to_owned()],
+                preflight_only: false,
+                acknowledged_limitations: Vec::new(),
+            },
+        )
+        .await
+        .expect("the owner applies the version to a proposal"),
+    );
+    let proposal = applied
+        .proposal_version
+        .0
+        .expect("an apply to a proposal records one");
+    assert_ne!(proposal.change_set_id, source.change_set_id);
+
+    // What the owner reads of each, and the moment each was captured.
+    let of_the_changed: ChangesetReadResult = locally(
+        &mut recorded.control,
+        Method::ChangesetRead,
+        &read_of_version(changed),
+    )
+    .await;
+    let of_the_proposal: ChangesetReadResult = locally(
+        &mut recorded.control,
+        Method::ChangesetRead,
+        &read_of_version(proposal),
+    )
+    .await;
+    assert_eq!(
+        of_the_changed.version.provenance.derived_from,
+        Nullable::some(source)
+    );
+    assert_eq!(
+        of_the_proposal.version.provenance.derived_from,
+        Nullable::some(source)
+    );
+    let first = of_the_changed
+        .versions
+        .iter()
+        .find(|summary| summary.version == source.version)
+        .expect("the owner is listed the source");
+    assert_eq!(
+        of_the_changed
+            .versions
+            .last()
+            .map(|summary| summary.derived_from),
+        Some(Nullable::some(source)),
+        "the owner is told what the changed copy's version was derived from"
+    );
+    // The source was captured before either was derived, which is what the bound below puts
+    // between them.
+    assert!(first.captured_at_ms.get() < of_the_changed.version.captured_at_ms.get());
+    assert!(first.captured_at_ms.get() < of_the_proposal.version.captured_at_ms.get());
+    let numbers = |read: &ChangesetReadResult| {
+        read.versions
+            .iter()
+            .map(|summary| summary.version.get())
+            .collect::<Vec<_>>()
+    };
+
+    // A grant that reaches back only to the moment the changed copy's version was captured.
+    let (_a, narrow) = recorded
+        .device(|grant| {
+            grant.history.lower_bound_ms = Nullable::some(of_the_changed.version.captured_at_ms);
+        })
+        .await;
+    let read: ChangesetReadResult = narrow
+        .read(Method::ChangesetRead, &read_of_version(changed))
+        .await
+        .expect("the version captured after the bound is read");
+    assert_eq!(
+        numbers(&read),
+        [changed.version.get()],
+        "{:?}",
+        read.versions
+    );
+    assert!(
+        read.versions
+            .iter()
+            .all(|summary| summary.derived_from.0.is_none()),
+        "a summary names no source the grant does not reach: {:?}",
+        read.versions
+    );
+    assert!(read.version.provenance.derived_from.0.is_none());
+    assert!(
+        read.version.provenance.derivation.is_empty(),
+        "{}",
+        read.version.provenance.derivation
+    );
+    let answer = serde_json::to_string(&read).expect("the answer is encoded");
+    let source_digest = serde_json::to_string(&first.content_digest).expect("a digest is encoded");
+    assert!(
+        !answer.contains(source_digest.trim_matches('"')),
+        "the source's digest is nowhere in the answer: {answer}"
+    );
+
+    // The same grant, and the proposal, whose source is in another change set.
+    let (_b, narrow) = recorded
+        .device(|grant| {
+            grant.history.lower_bound_ms = Nullable::some(of_the_proposal.version.captured_at_ms);
+        })
+        .await;
+    let read: ChangesetReadResult = narrow
+        .read(Method::ChangesetRead, &read_of_version(proposal))
+        .await
+        .expect("the proposal captured after the bound is read");
+    assert!(read.version.provenance.derived_from.0.is_none());
+    assert!(
+        read.version.provenance.derivation.is_empty(),
+        "{}",
+        read.version.provenance.derivation
+    );
+    let answer = serde_json::to_string(&read).expect("the answer is encoded");
+    let source_change_set = source.change_set_id.to_string();
+    assert!(
+        !answer.contains(&source_change_set),
+        "the source's change set is nowhere in the answer: {answer}"
+    );
+
+    // The control: a grant that reaches back to the start of the host is told what both were
+    // derived from, and why.
+    let (_c, wide) = recorded.device(|_| {}).await;
+    let read: ChangesetReadResult = wide
+        .read(Method::ChangesetRead, &read_of_version(changed))
+        .await
+        .expect("a grant that reaches the source reads the changed copy's version");
+    assert_eq!(read.version.provenance.derived_from, Nullable::some(source));
+    assert!(!read.version.provenance.derivation.is_empty());
+    assert_eq!(
+        read.versions.last().map(|summary| summary.derived_from),
+        Some(Nullable::some(source)),
+        "{:?}",
+        read.versions
+    );
+    let read: ChangesetReadResult = wide
+        .read(Method::ChangesetRead, &read_of_version(proposal))
+        .await
+        .expect("a grant that reaches the source reads the proposal");
+    assert_eq!(read.version.provenance.derived_from, Nullable::some(source));
+    assert!(!read.version.provenance.derivation.is_empty());
+    assert!(
+        serde_json::to_string(&read)
+            .expect("the answer is encoded")
+            .contains(&source_change_set),
+        "the control names the source's change set"
+    );
+    recorded.stop().await;
+}
+
 /// KR-REQ-23.44: a `changeset.read` of a version captured before the moment the grant's history
 /// reaches back to is refused with the code and the words a number the change set does not have is
 /// refused with, so a device learns nothing about which versions a change set holds.
