@@ -821,14 +821,18 @@ fn only_an_invocation_that_reaches_a_repository_may_execute_a_shell() {
     let profile = fixture.service().profile();
     let arguments: [&OsStr; 2] = [OsStr::new("status"), OsStr::new("--porcelain=v2")];
     let read = GitRequest::read(fixture.work(), &arguments);
-    let list = profile.execution_list(&read);
+    let list = profile.execution_list(&read).expect("Git is installed");
     assert_eq!(
         list.len(),
         1,
         "a read executes Git and the helpers under Git's own directory and nothing else: {list:?}"
     );
 
-    let helper = profile.git().exec_path().join("git-credential-cache");
+    let helper = profile
+        .git()
+        .expect("Git is installed")
+        .exec_path()
+        .join("git-credential-cache");
     for transport in [
         RemoteTransport::LocalPath,
         RemoteTransport::Ssh,
@@ -842,7 +846,7 @@ fn only_an_invocation_that_reaches_a_repository_may_execute_a_shell() {
             port: None,
             remote_name: Some("origin"),
         });
-        let list = profile.execution_list(&reaching);
+        let list = profile.execution_list(&reaching).expect("Git is installed");
         assert!(
             list.iter().any(|program| program.ends_with("sh")
                 || program

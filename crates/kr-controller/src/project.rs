@@ -235,10 +235,11 @@ impl ProjectModule {
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::RegistryUnavailable`] when the store, the Git profile or the
-    /// recovery cannot be prepared.
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store, the Git profile's
+    /// directories or the recovery cannot be prepared. Git itself is not looked for here: a host
+    /// without a usable Git opens the module, and each request that runs Git is refused.
     pub async fn open(paths: &kr_ipc::paths::EnvironmentPaths) -> Result<Self> {
-        // Opening the store migrates it, resolving Git reads the installed program, and recovery
+        // Opening the store migrates it, preparing the profile makes its directories, and recovery
         // examines directories. All three are blocking work, so they run on a blocking task rather
         // than on the daemon's reactor.
         let paths = paths.clone();

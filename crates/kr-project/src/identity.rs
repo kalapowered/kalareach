@@ -1268,13 +1268,12 @@ mod tests {
         let checkout = root.path().join("project");
         std::fs::create_dir_all(&checkout).expect("a directory for the checkout");
         let profile_root = root.path().join("profile");
-        let profile = match RestrictedProfile::prepare(&profile_root, environment_id) {
-            Ok(profile) => profile,
-            Err(error) => {
-                println!("not exercised: this host has no Git to prepare a profile with: {error}");
-                return;
-            }
-        };
+        let profile = RestrictedProfile::prepare(&profile_root, environment_id)
+            .expect("the profile is prepared");
+        if let Err(error) = profile.git() {
+            println!("not exercised: this host has no Git to run a profile with: {error}");
+            return;
+        }
         let made = std::process::Command::new("git")
             .arg("-C")
             .arg(&checkout)
@@ -1345,14 +1344,12 @@ mod tests {
         let environment_id = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([10; 16]));
         let checkout = root.path().join("project");
         std::fs::create_dir_all(&checkout).expect("a directory for the checkout");
-        let profile = match RestrictedProfile::prepare(&root.path().join("profile"), environment_id)
-        {
-            Ok(profile) => profile,
-            Err(error) => {
-                println!("not exercised: this host has no Git to prepare a profile with: {error}");
-                return;
-            }
-        };
+        let profile = RestrictedProfile::prepare(&root.path().join("profile"), environment_id)
+            .expect("the profile is prepared");
+        if let Err(error) = profile.git() {
+            println!("not exercised: this host has no Git to run a profile with: {error}");
+            return;
+        }
         let made = std::process::Command::new("git")
             .arg("-C")
             .arg(&checkout)

@@ -1206,11 +1206,12 @@ async fn a_daemon_on_a_host_without_a_working_git(script: Option<&str>) {
 
     // What runs Git is refused with the code a host that is not set up for it answers with, and
     // the message names the step that installs it.
+    let refused = ActionId::new(kr_ipc::new_uuid());
     let refusal = failure(
         control
             .mutate(
                 Method::ProjectInit,
-                ActionId::new(kr_ipc::new_uuid()),
+                refused,
                 ActionTarget::environment(environment_id),
                 &ProjectInitParams {
                     destination: DestinationRequest {
@@ -1233,8 +1234,24 @@ async fn a_daemon_on_a_host_without_a_working_git(script: Option<&str>) {
         "the refusal names the step that installs Git: {}",
         refusal.message
     );
-    // The refusal came before anything was made: no destination and no staging sibling.
+    // The refusal came before anything was made: no destination and no staging sibling, and no
+    // operation row for the action to have been recorded against.
     assert_eq!(names_in(work.path()), Vec::<String>::new());
+    let unrecorded = failure(
+        control
+            .mutate(
+                Method::ProjectOperationCancel,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(environment_id),
+                &ProjectOperationCancelParams {
+                    operation_action_id: refused,
+                    through_location_id: Nullable(None),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(unrecorded.code, ErrorCode::ResourceUnavailable);
     let listed: ProjectListResult = typed(
         &control
             .request(Method::ProjectList, &ProjectListParams { environment_id })

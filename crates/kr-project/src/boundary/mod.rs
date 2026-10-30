@@ -133,6 +133,12 @@ pub use self::windows::{Spawned, start};
 /// What mechanism encloses an invocation on this platform, for a person reading a record.
 pub const MECHANISM: &str = platform::MECHANISM;
 
+/// Why this platform runs no Git, on a platform that runs none.
+///
+/// Said before Git is looked for, so that a host that cannot run Git at all answers the same way
+/// whether or not one is installed.
+pub const NO_GIT: Option<&str> = platform::NO_GIT;
+
 /// The ports an https remote is reached on.
 ///
 /// Both, because a server may answer an https request with a redirection to the same repository
