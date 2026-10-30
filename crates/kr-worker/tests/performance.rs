@@ -1038,6 +1038,13 @@ impl Attached {
 #[test]
 fn a_host_with_a_slow_disk_records_the_attach_figure_without_asserting_it() {
     let slow = record::Conditions::supplied(4, 8 * 1024, Some(0.0)).with_durable_writes(2, 170);
+    assert!(
+        slow.shortfalls()
+            .iter()
+            .any(|shortfall| shortfall.contains("170.0 ms")),
+        "the host's shortfalls, which a measurement asserts only without, name the slow disk: {:?}",
+        slow.shortfalls()
+    );
     let attached = Attached::new(Duration::from_millis(520), &slow);
     assert!(
         attached
