@@ -1414,8 +1414,8 @@ async fn a_daemon_starts_where_there_is_no_git() {
 
 /// A Git that never answers holds nothing else: the daemon starts and answers, a request that
 /// needs Git is refused when Git has had the time it is given, a later request is refused the same
-/// way, and the daemon ends when it is interrupted instead of waiting for Git, with nothing the
-/// stand-in started left running.
+/// way, and the daemon ends when it is interrupted, once the look under way has ended, with
+/// nothing the stand-in started left running.
 ///
 /// The stand-in waits for much longer than a daemon gives Git, starts a process of its own to wait
 /// with, and writes a mark if it is ever allowed to finish.

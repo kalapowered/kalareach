@@ -5354,17 +5354,21 @@ runs.
 
 A Git that never answers, such as a stand-in that waits for an installer, costs the look that asked
 it ten seconds to answer, and a few more to clean up. A program still under way when the ten seconds
-end is ended with the processes in its group, and one that has ended has the rest of its group
-ended with it. A process that has left the group and keeps the pipe is out of reach: the answer is
-refused after one more second and the pipe is closed, so it costs the daemon a descriptor for as
-long as it runs. The look is refused as above and nothing is kept. In a daemon that has started,
-what needs no Git is answered while a look is under way. A request that needs Git waits for that
-look, and no other, and is refused with it, so the stand-in is started once for all of them. A
-request that arrives when no look is under way makes a look of its own. A start that needs Git
-makes one look for each need: on Linux the proof, and each interrupted apply that left staged
-paths. The daemon answers nothing until each has ended, so it can take ten seconds for each. An
-interrupt ends a daemon that has started once the look under way has ended; one interrupted or
-terminated while it is starting ends at once and leaves a stand-in then under way to end by itself.
+end is ended with the processes in its group, and one that has ended has the rest of its group ended
+with it. A program that answers with more than a version and a directory is ended where its output
+passes 64 KiB and refused. A process that has left the group and keeps the pipe is out of reach: the
+answer is refused after one more second and the daemon closes its end of the pipe, so the process
+runs on with its own end and the daemon holds nothing of it. A child the daemon cannot wait on is
+refused, and nothing is signalled by its number. The look is refused as above and nothing is kept.
+In a daemon that has started, what needs no Git is answered on every other connection while a look
+is under way; a connection whose request waits for the look waits with it. A request that needs Git
+waits for that look, and no other, and is refused with it, so the stand-in is started once for all
+of them. A request that arrives when no look is under way makes a look of its own. A start that
+needs Git makes one look for each need: on Linux the proof, and each interrupted apply that left
+staged paths. The daemon answers nothing until each has ended, so it can take ten seconds for each.
+An interrupt ends a daemon that has started once the look under way has ended; a termination signal
+ends it at once, as an interrupt or a termination signal ends one that is still starting, and leaves
+a stand-in then under way to end by itself.
 
 A request that runs Git is then refused with `HOST_NOT_CONFIGURED` before it makes a repository, an
 operation row, a workspace or a directory. Those are `project.init`, `project.clone`,
