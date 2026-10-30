@@ -217,6 +217,14 @@ function Get-KrEditorModes {
     $modes
 }
 
+# Whether the runtime's own reader of the terminal can be read where this package counts what it
+# holds. A Windows console is read through its records, which nothing here counts, so there is
+# nothing to read.
+function Test-KrRuntimeReadable {
+    if ($IsWindows) { return $true }
+    $null -ne (Get-KrRuntimeReader)
+}
+
 # Whether the editor's own key queue can be read, which is what a fence rests on here.
 #
 # It reads the live queue through the function a fence reads it with, so a build whose queue is
@@ -257,9 +265,11 @@ function Get-KrReaderState {
     $queued = if ($null -eq $known) { [uint64]0 } else { $known }
     # Input the runtime has read from the terminal, or has yet to, is input the editor has not met,
     # whoever it came from: a person, or the host answering a question an application asked. A
-    # runtime that cannot say is not read as having none.
+    # runtime that cannot say is not read as having none, and says so for the terminal's typeahead
+    # alone: the editor's macros are counted from the editor's queue.
     $unread = Read-KrRuntimeUnread
-    if ($null -eq $unread) { $known = $null; $unread = [uint64]0 }
+    $terminalKnown = $null -ne $known -and $null -ne $unread
+    if ($null -eq $unread) { $unread = [uint64]0 }
     $typeahead = $queued + $unread
     $modes = Get-KrEditorModes
 
@@ -284,7 +294,7 @@ function Get-KrReaderState {
         keys              = [byte[]]$State.InvokingKeys
         queued_keys       = [uint64]$queued
         pending_bytes     = [uint64]$typeahead
-        tty_typeahead_drained = [bool]($null -ne $known -and $typeahead -eq 0)
+        tty_typeahead_drained = [bool]($terminalKnown -and $typeahead -eq 0)
         macro_input_drained   = [bool]($null -ne $known -and $queued -eq 0 -and $script:Pending.macro_input -eq 0)
         partial_key_drained   = [bool]($script:Pending.multikey_sequence -eq 0)
         cwd_revision      = [uint64]$State.CwdRevision
