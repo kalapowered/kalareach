@@ -3057,8 +3057,8 @@ fn runtime_available() -> bool {
     Runtime::podman().is_available()
 }
 
-/// How long a call that asks about or acts on one container is given: `exec`, `inspect`, `stop`,
-/// `rm`, `image exists`.
+/// How long a call that starts, asks about or acts on one container is given: `run`, `exec`,
+/// `inspect`, `stop`, `rm`, `image exists`, and the `--version` check.
 const QUICK_CALL_BOUND: Duration = Duration::from_secs(60);
 
 /// How long a call that fetches or builds an image is given.
@@ -3331,8 +3331,8 @@ impl Container {
 
     /// Whether the daemon in this container answers `kr list` now. An asking that has not ended
     /// within the runtime's quick bound is a stall and not a missing answer: it fails the case
-    /// with the command named, where a retry would hide it. `kr` ends its own connect and hello
-    /// well inside the bound, so a call that outlasts it is the runtime's.
+    /// with the command named, where a retry would hide it. A probe that gets an error answer
+    /// at once, as `kr` does while the daemon is not up, is asked again.
     fn answers(&self) -> bool {
         let asked = self
             .runtime
@@ -3433,10 +3433,10 @@ const STAND_IN_BOUND: Duration = Duration::from_secs(5);
 const STAND_IN_STALL_SECONDS: u32 = 40;
 
 /// A stand-in for the container runtime that answers every call with success and no output, and
-/// says no image exists, except the calls whose command it is told to stall (`exec`, `build`,
-/// `--version`): those print nothing and do not end, as `podman exec` did on the build box. It
-/// records every call in `calls` in its directory, one line of arguments each, whether it stalls
-/// the call or not.
+/// says no image exists, except the calls whose command it is told to stall (the first argument:
+/// `exec`, `run`, `rm`, `build`, `container`, `--version`): those print nothing and do not end, as
+/// `podman exec` did on the build box. It records every call in `calls` in its directory, one
+/// line of arguments each, whether it stalls the call or not.
 fn stalling_runtime(directory: &Path, stalls: &[&str]) -> Runtime {
     let text = directory.join("runtime.text");
     std::fs::write(
