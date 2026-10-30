@@ -169,8 +169,10 @@ pub enum Answer {
         identity: Nullable<ProcessStartIdentity>,
         /// The background class the process runs its model under.
         background: Background,
-        /// How the process's memory ceiling is enforced: `sampler` when the daemon's own reading
-        /// of the process ends it past the ceiling, and nothing the platform enforces besides.
+        /// How the process's memory ceiling is enforced: `sampler`, the daemon's own reading of the
+        /// process's resident set, which ends it past the ceiling. The process reports it on every
+        /// platform; a limit the daemon also asks the operating system to hold (on Windows) is the
+        /// daemon's doing, and the process does not know of it.
         ceiling: String,
     },
     /// The model is loaded.

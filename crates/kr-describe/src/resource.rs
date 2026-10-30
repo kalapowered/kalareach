@@ -605,8 +605,8 @@ pub mod platform {
     #[cfg(target_os = "macos")]
     fn thermal() -> Signal<ThermalState> {
         // The system's thermal pressure level, which Intel and Apple silicon Macs both post. The
-        // limits `pmset -g therm` prints are an Intel Mac's alone: on Apple silicon it records none,
-        // so a reader of them never sees heat there.
+        // limits `pmset -g therm` prints are an Intel Mac's alone: Apple silicon records none
+        // there, so a reader of them never sees heat.
         kr_ipc::conditions::thermal_pressure_level().map_or(
             Signal::Unqualified {
                 why: "this host did not report a thermal pressure level",
@@ -617,9 +617,11 @@ pub mod platform {
 
     #[cfg(target_os = "linux")]
     fn thermal() -> Signal<ThermalState> {
-        // The kernel's thermal zones, against each zone's own first trip point. Comparing a
-        // temperature with a fixed number would be meaningless across machines; comparing it with
-        // the trip point the platform itself declared is the platform's own judgement.
+        // The kernel's thermal zones, against the lowest trip point each zone declares among its
+        // first eight. Comparing a temperature with a fixed number would be meaningless across
+        // machines; comparing it with the trip point the platform itself declared is the
+        // platform's own judgement. The lowest is the one that matters: on an ACPI zone the first
+        // is often the critical point, well above one the platform acts on earlier.
         let Ok(entries) = std::fs::read_dir("/sys/class/thermal") else {
             return Signal::Unqualified {
                 why: "this host has no thermal class",
