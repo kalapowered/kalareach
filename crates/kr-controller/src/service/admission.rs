@@ -399,8 +399,8 @@ impl Controller {
     ///
     /// Section 9 returns a retained receipt to a duplicate only under authority that has not been
     /// withdrawn, so a fence this host owes, or a registration withdrawn or replaced while the
-    /// answer was read, stops it. Every place that finds a recorded action after admission gives it
-    /// back through here.
+    /// answer was read, stops it. A place that finds a recorded action after its mutation was
+    /// admitted gives it back through here.
     ///
     /// # Errors
     ///

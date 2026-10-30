@@ -1194,6 +1194,40 @@ async fn a_recorded_voice_stop_is_not_given_back_while_a_fence_is_owed() {
     call.world.serving.abort();
 }
 
+/// KR-REQ-09.09: an action identifier a recorded voice change used, asked again with another
+/// payload, is told it conflicts only while this host owes no fence: what the host keeps of an
+/// action, a refusal as much as an answer, goes back under the registration the repeat arrived
+/// under. The control: with nothing owed, the repeat is the conflict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reused_voice_action_identifier_is_not_told_so_while_a_fence_is_owed() {
+    let call = Call::start().await;
+    let stop = call.stop_submitted();
+    call.submit_voice(Method::VoiceStop, &stop)
+        .await
+        .expect("the stop is made");
+    let mut reused = voice_mutation_of(
+        Method::VoiceStop,
+        call.world.environment_id,
+        &VoiceStopParams {
+            voice_session_id: VoiceSessionId::new(call.world.session_id.get()),
+        },
+    );
+    reused.action_id = stop.action_id;
+    let conflict = call
+        .submit_voice(Method::VoiceStop, &reused)
+        .await
+        .expect_err("the identifier was used for another payload");
+    assert_eq!(conflict.code(), ErrorCode::IdConflict, "{conflict}");
+    call.controller.hold_fence(true);
+    let refused = call
+        .submit_voice(Method::VoiceStop, &reused)
+        .await
+        .expect_err("what the host kept of the action is not told while a fence is owed");
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+    assert!(refused.to_string().contains("fence"), "{refused}");
+    call.world.serving.abort();
+}
+
 /// KR-REQ-15.13 and 09.12: withdrawing a call's grant while a close is on its way raises a barrier
 /// that withdraws no connection. The connection of the device that holds the call stays admitted,
 /// so the answer to the stop and to every request on that link is delivered, and so does every

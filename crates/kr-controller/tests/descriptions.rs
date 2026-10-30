@@ -1166,6 +1166,14 @@ impl Environment {
     /// Asks for the fetch at the daemon's local socket and returns what the daemon says in refusing
     /// it.
     async fn download_refused(&self, action: DescriptionDownloadAction) -> String {
+        self.download_refusal(action).await.message
+    }
+
+    /// The refusal the daemon gives a download action.
+    async fn download_refusal(
+        &self,
+        action: DescriptionDownloadAction,
+    ) -> kr_protocol::error::ProtocolError {
         let mut client = self.host.client().await;
         client
             .mutate(
@@ -1177,7 +1185,6 @@ impl Environment {
             .await
             .expect("the call reaches the daemon")
             .expect_err("the daemon refuses the download action")
-            .message
     }
 
     /// What `kr doctor` says of descriptions, as the daemon's diagnostics answer it.
@@ -3425,17 +3432,16 @@ async fn a_fetch_is_not_cancelled_while_a_fence_is_owed() {
 
     environment.controller().hold_fence(true);
     let refused = environment
-        .download_refused(DescriptionDownloadAction::Cancel)
+        .download_refusal(DescriptionDownloadAction::Cancel)
         .await;
     environment.controller().hold_fence(false);
-    assert!(refused.contains("fence"), "{refused}");
     assert_eq!(
-        environment
-            .setup_until("the fetch still runs", |shown| {
-                shown.download == DescriptionDownload::Running
-            })
-            .await
-            .download,
+        refused.code,
+        kr_protocol::error::ErrorCode::PermissionDenied
+    );
+    assert!(refused.message.contains("fence"), "{}", refused.message);
+    assert_eq!(
+        environment.setup().await.download,
         DescriptionDownload::Running,
         "the refused cancellation changed nothing"
     );
