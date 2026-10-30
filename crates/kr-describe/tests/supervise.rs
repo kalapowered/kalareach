@@ -1941,15 +1941,15 @@ fn wait_until_resident_over(pid: u32, bytes: u64) {
 /// ended by the daemon's own reading of the process, and the host is told memory pressure paused
 /// inference: nothing is published, the job is not queued again, and the process is gone. The
 /// ceiling is the owner's, below section 22's, and the profile still fits under it, so admission
-/// let the job run. The reading is taken at the turn whose time the test chooses, after the process
-/// has said its memory is in place and the test has found its resident set over the ceiling, so
-/// what decides is the process's resident set and never a wait. Each turn at one time takes at most
-/// one reading, so the reading must find the process over the ceiling: a machine under memory
-/// pressure takes pages back from a process that holds memory it does not use, which is why the
-/// process keeps its pages in use. Without the daemon's reading nothing here ends the process
-/// before its job's deadline, and the case fails. The bound is one reading period: a turn just short of the first reading leaves the process
-/// alone, and the turn at it ends the process, so a process over the ceiling is ended by the first
-/// reading taken after it passed.
+/// let the job run. The readings are taken at turns whose times the test chooses, a period apart,
+/// and each after the test has found the process's resident set over the ceiling, so what decides
+/// is the process's resident set and never a wait. A turn takes at most one reading, and a
+/// machine under memory pressure takes pages back from a process that holds memory it does not
+/// use. That is why the process keeps its pages in use, and why a reading that still finds the
+/// process under the ceiling leaves it, the next reading is due a period later, and the process is
+/// ended by the first reading that finds it over. Without the daemon's reading nothing here ends
+/// the process before its job's deadline, and the case fails. A turn just short of the first
+/// reading leaves the process alone.
 #[test]
 fn a_job_whose_process_runs_past_the_owners_ceiling_is_ended_by_the_daemons_sampler() {
     const MIB: u64 = 1 << 20;
@@ -1992,12 +1992,23 @@ fn a_job_whose_process_runs_past_the_owners_ceiling_is_ended_by_the_daemons_samp
         !the_process_ended(&short) && rig.driver.pid().is_some(),
         "no reading is due before a period has passed: {short:?}"
     );
-    let reports = rig.until(
-        &roomy(),
-        at(3_000 + SAMPLE_MS),
-        "the process ended by its resident set",
-        |reports, _| the_process_ended(reports),
-    );
+    // A few periods are allowed, well inside the job's deadline: one reading is all it takes when
+    // the process is still over the ceiling at the reading, which it nearly always is.
+    const PERIODS: u64 = 10;
+    let mut reports = Vec::new();
+    for period in 1..=PERIODS {
+        if period > 1 {
+            wait_until_resident_over(pid, fits);
+        }
+        reports.extend(
+            rig.driver
+                .turn(&roomy(), at(3_000 + period * SAMPLE_MS))
+                .expect("a turn"),
+        );
+        if the_process_ended(&reports) {
+            break;
+        }
+    }
     assert!(
         outcomes(&reports).contains(&&Outcome::ProcessEnded {
             why: ProcessEnd::MemoryCeiling

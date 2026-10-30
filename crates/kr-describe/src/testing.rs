@@ -290,8 +290,11 @@ impl Resident {
                     std::thread::sleep(Self::EVERY);
                 }
             })
-            .ok();
-        Self { stop, thread }
+            .expect("the thread that keeps the pages in use starts");
+        Self {
+            stop,
+            thread: Some(thread),
+        }
     }
 }
 
