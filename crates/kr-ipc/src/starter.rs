@@ -329,6 +329,10 @@ pub use self::windows::{
 #[cfg(all(windows, any(test, feature = "testing")))]
 pub use self::windows::{Job, end_process};
 
+/// The desktop a headless worker is made on.
+#[cfg(windows)]
+mod desktop;
+
 /// The calls into the operating system: the launch pipe, the facts of a process, and the child a
 /// starter creates.
 ///
@@ -336,9 +340,6 @@ pub use self::windows::{Job, end_process};
 /// on every wait, a process's image, session and account, and a process created suspended and
 /// checked before it runs are `kernel32` and `advapi32` calls with no safe interface. Every handle
 /// is owned as soon as it exists, so every path closes it.
-#[cfg(windows)]
-mod desktop;
-
 #[cfg(windows)]
 mod windows {
     #![expect(
@@ -1110,6 +1111,10 @@ mod windows {
         pub output: Option<BorrowedHandle<'a>>,
         /// The name of a desktop the child is made on, of its own and apart from the person's
         /// interactive one, or `None` for the starter's own desktop.
+        ///
+        /// Making it switches this process's window station for one call, so a command that names
+        /// one is started only from a process with no other thread that uses a window station.
+        /// The task's starter is such a process: it starts one child and ends.
         pub own_desktop: Option<&'a str>,
     }
 

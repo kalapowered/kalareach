@@ -4,14 +4,21 @@
 //! interactive window station and desktop. A headless worker must not start there, so the starter
 //! makes it a desktop of its own, on the window station this logon session has for processes that
 //! show nothing, and names that desktop in the new process's startup information. The worker, and
-//! every process it starts, then draws nowhere the person looks.
+//! every process it starts, then inherits no access to the interactive desktop. That is not a
+//! boundary against a process of the same account: such a process can open the interactive
+//! desktop by name.
 //!
 //! The window station is the one the system forms from the logon session when it is given no name
-//! (only an administrator may choose one), so every headless worker of a logon shares it and each
-//! has a desktop of its own on it. The station and the desktop are made with the security of the
-//! starter's own, so the worker, which runs as the starter does, is admitted to them exactly as it
-//! would be to the starter's desktop, and a process the person runs for another purpose that
-//! expects those grants finds them.
+//! (only an administrator may choose one), so every headless worker of a logon shares the station
+//! and each has a desktop of its own on it. The clipboard and the atom table belong to the
+//! station, so the headless sessions of one logon share them. The station and the desktop are
+//! given the access list and integrity label of the starter's own, so the worker, which runs as
+//! the starter does, is admitted to them exactly as it would be to the starter's desktop. A
+//! station that exists already keeps what it has, because creating it again ignores the security
+//! asked for, so the starter reads the access list and label of each object it is about to use
+//! and refuses to start a child on one that differs from its own. A desktop on a station that
+//! shows nothing is given a smaller heap than the interactive one, which bounds how many windows
+//! the processes of one headless session can make at once.
 
 #![expect(
     unsafe_code,
@@ -24,7 +31,8 @@ use std::os::windows::ffi::OsStrExt as _;
 
 use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
-    GetSecurityInfo, SE_WINDOW_OBJECT, SetSecurityInfo,
+    ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
+    SE_WINDOW_OBJECT, SetSecurityInfo,
 };
 use windows_sys::Win32::Security::{
     ACL, DACL_SECURITY_INFORMATION, InitializeSecurityDescriptor, LABEL_SECURITY_INFORMATION,
@@ -104,6 +112,9 @@ impl OwnDesktop {
         }
         let station = Station(station);
         station_source.label_onto(station.0);
+        station_source
+            .require_same_on(station.0)
+            .map_err(step("check the window station's security"))?;
         let station_name = name_of(station.0).map_err(step("read the new station's name"))?;
 
         let desktop = {
@@ -129,6 +140,9 @@ impl OwnDesktop {
             }
             let created = Desktop(created);
             desktop_source.label_onto(created.0);
+            desktop_source
+                .require_same_on(created.0)
+                .map_err(step("check the desktop's security"))?;
             created
         };
 
@@ -340,17 +354,15 @@ impl Source {
 
     /// Gives `target` this object's integrity label, if it has one and the starter may set it.
     ///
-    /// A station that exists already is not the starter's to relabel, and a label the starter may
-    /// not set is left unset. Either leaves the object at the default level, which keeps a process
-    /// of a lower level out and lets every process of the starter's own level in, so nothing is
-    /// opened to anyone by the refusal.
+    /// A refusal is not looked at here: a station that exists already is not the starter's to
+    /// relabel. What decides is [`Self::require_same_on`], which reads the label back.
     fn label_onto(&self, target: HANDLE) {
         if self.label.is_null() {
             return;
         }
         // SAFETY: the target is an open handle of a station or a desktop, the label list lives in
         // this value, and every other part is absent, which the call permits. The call's refusal
-        // is the case the comment above describes, and is not looked at.
+        // is not looked at, as the comment above says.
         unsafe {
             SetSecurityInfo(
                 target,
@@ -363,6 +375,95 @@ impl Source {
             );
         }
     }
+
+    /// Requires `target` to have the access list and the integrity label this object has.
+    ///
+    /// The lists are compared by their entries, in order of their text, with the flags that say
+    /// how a list was made left out: two objects whose entries are the same admit the same
+    /// processes. An object that differs is refused, and a child is not started on it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a permission error when the entries differ, or the operating system's error when
+    /// the target's security cannot be read.
+    fn require_same_on(&self, target: HANDLE) -> io::Result<()> {
+        let there = security_of(target)?;
+        for (name, information) in [
+            ("access list", DACL_SECURITY_INFORMATION),
+            ("integrity label", LABEL_SECURITY_INFORMATION),
+        ] {
+            let (own, found) = (self.entries(information)?, there.entries(information)?);
+            if own != found {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "its {name} is not the starter's own: {} here, {} there",
+                        found.join(""),
+                        own.join("")
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The entries of one of this object's lists, as the text security descriptors are written
+    /// in, one string for each and in order.
+    fn entries(&self, information: u32) -> io::Result<Vec<String>> {
+        let mut text: *mut u16 = std::ptr::null_mut();
+        // SAFETY: the descriptor was returned by `GetSecurityInfo` and lives in this value, the
+        // length is not asked for, and `text` is a live out parameter.
+        let converted = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                self.descriptor,
+                SDDL_REVISION_1,
+                information,
+                &raw mut text,
+                std::ptr::null_mut(),
+            )
+        };
+        if converted == 0 || text.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let mut length = 0;
+        // SAFETY: the call above returned a terminated string, which is read up to its end.
+        while unsafe { *text.add(length) } != 0 {
+            length += 1;
+        }
+        // SAFETY: `length` units were just counted in the string that `text` points to.
+        let written = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, length) });
+        // SAFETY: the string was allocated by the conversion, which asks for it to be freed with
+        // this call, and nothing else holds it.
+        unsafe { LocalFree(text.cast()) };
+        Ok(parenthesised(&written))
+    }
+}
+
+/// The parenthesised entries of a security descriptor's text, sorted, without the flags before
+/// the first one.
+fn parenthesised(written: &str) -> Vec<String> {
+    let mut entries = Vec::new();
+    let mut depth = 0_u32;
+    let mut start = 0;
+    for (index, character) in written.char_indices() {
+        match character {
+            '(' => {
+                if depth == 0 {
+                    start = index;
+                }
+                depth += 1;
+            }
+            ')' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    entries.push(written[start..=index].to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+    entries.sort();
+    entries
 }
 
 /// The access list and the integrity label of an object: what decides who may use it and from
@@ -420,4 +521,27 @@ fn wide(text: &str) -> Vec<u16> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parenthesised;
+
+    /// The entries of a list are compared whatever flags and order the text has them in.
+    #[test]
+    fn entries_are_compared_without_their_flags_and_in_any_order() {
+        assert_eq!(
+            parenthesised("D:PAI(A;;GA;;;SY)(A;;GA;;;S-1-5-5-0-1)"),
+            parenthesised("D:(A;;GA;;;S-1-5-5-0-1)(A;;GA;;;SY)")
+        );
+        assert_ne!(
+            parenthesised("D:(A;;GA;;;SY)"),
+            parenthesised("D:(A;;GA;;;SY)(A;;GA;;;WD)")
+        );
+        assert_eq!(parenthesised(""), Vec::<String>::new());
+        assert_eq!(
+            parenthesised("S:(ML;;NW;;;ME)"),
+            vec!["(ML;;NW;;;ME)".to_owned()]
+        );
+    }
 }
