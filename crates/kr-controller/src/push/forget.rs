@@ -13,13 +13,6 @@
 //! notification never left; the person is shown the copy as one that may have left either way.
 //! `none` covers a notification the gateway never saw, one of another authorisation, and one
 //! already removed or swept, and this host does not tell them apart because the gateway does not.
-//! It is also what a bearer of another installation gets for a record it cannot see, and a
-//! registration can put such a bearer in the place of the one a notification was sent under
-//! without changing anything else the host keeps. So `none` is taken as the deletion only under a
-//! bearer the gateway has shown to be its authorisation's: one the gateway accounted for a record
-//! under (`queued` or `settled`), or one this host's own renewal handed over
-//! ([`HeldCredentials::show`]). Under any other it is reported as an answer this host cannot
-//! read, [`ForgetAnswer::Unaccounted`].
 //!
 //! # What an unanswered request means
 //!
@@ -34,7 +27,6 @@ use kr_protocol::ids::NotificationId;
 use kr_protocol::push::PushDeliveryCredential;
 
 use super::client::bearer;
-use super::credentials::HeldCredentials;
 use super::transport::DeliveryTransports;
 
 /// The route a host asks the gateway to delete what it holds for a notification on.
@@ -66,10 +58,6 @@ pub enum ForgetAnswer {
         /// Whether a copy may already have gone to the provider.
         dispatched: bool,
     },
-    /// The gateway holds nothing under the credential, and this host has not seen the gateway
-    /// account for a record under it, so it cannot tell a record the gateway removed from one the
-    /// credential cannot see. Nothing is concluded.
-    Unaccounted,
     /// The gateway does not take the credential: it is revoked, expired or not the gateway's.
     CredentialRefused,
     /// The gateway refused the request. The code is one of the gateway's published codes, as this
@@ -98,9 +86,6 @@ pub struct PreparedForget {
     transport: Arc<dyn kr_client::services::ServiceHttp>,
     credential: PushDeliveryCredential,
     notification_id: NotificationId,
-    credentials: Arc<HeldCredentials>,
-    /// Whether the bearer was shown to be its authorisation's when the request was readied.
-    shown: bool,
 }
 
 impl PreparedForget {
@@ -127,22 +112,7 @@ impl PreparedForget {
                 .await
         });
         match answered {
-            Ok(answer) => {
-                let read = read_answer(&answer, self.notification_id);
-                match &read {
-                    ForgetAnswer::Answered {
-                        held: Held::Nothing,
-                        ..
-                    } if !self.shown => ForgetAnswer::Unaccounted,
-                    // The gateway removed a record under this bearer, so the bearer is the
-                    // authorisation's, and a later `none` under it is a record already gone.
-                    ForgetAnswer::Answered { held, .. } if *held != Held::Nothing => {
-                        self.credentials.show(&self.credential);
-                        read
-                    }
-                    _ => read,
-                }
-            }
+            Ok(answer) => read_answer(&answer, self.notification_id),
             Err(error) => ForgetAnswer::Unanswered {
                 detail: format!("the gateway did not answer: {error}"),
             },
@@ -158,22 +128,15 @@ impl PreparedForget {
 pub struct GatewayForget {
     transports: Arc<dyn DeliveryTransports>,
     runtime: tokio::runtime::Handle,
-    credentials: Arc<HeldCredentials>,
 }
 
 impl GatewayForget {
-    /// Builds a client over the transports this host reaches its gateways through, and the
-    /// credentials it records the bearers the gateway has shown in.
+    /// Builds a client over the transports this host reaches its gateways through.
     #[must_use]
-    pub fn new(
-        transports: Arc<dyn DeliveryTransports>,
-        runtime: tokio::runtime::Handle,
-        credentials: Arc<HeldCredentials>,
-    ) -> Self {
+    pub fn new(transports: Arc<dyn DeliveryTransports>, runtime: tokio::runtime::Handle) -> Self {
         Self {
             transports,
             runtime,
-            credentials,
         }
     }
 
@@ -195,8 +158,6 @@ impl GatewayForget {
         Ok(PreparedForget {
             runtime: self.runtime.clone(),
             transport,
-            shown: self.credentials.is_shown(&credential),
-            credentials: Arc::clone(&self.credentials),
             credential,
             notification_id,
         })

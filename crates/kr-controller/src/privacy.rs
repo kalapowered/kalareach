@@ -2151,15 +2151,6 @@ impl crate::service::Controller {
         };
         match answer {
             crate::push::forget::ForgetAnswer::Answered { .. } => {}
-            crate::push::forget::ForgetAnswer::Unaccounted => {
-                return Err(unreached(
-                    "it holds nothing under this host's credential for that device, and this \
-                     host has not seen it account for a record under that credential, so it \
-                     cannot tell a record it removed from one the credential cannot see; if the \
-                     record is gone, nothing more is needed"
-                        .to_owned(),
-                ));
-            }
             crate::push::forget::ForgetAnswer::CredentialRefused => {
                 return Err(unreached(
                     "it does not take this host's credential for that device: a credential that \
