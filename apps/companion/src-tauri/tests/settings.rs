@@ -40,8 +40,8 @@ use kr_client::drafts::{Draft, DraftSealer, DraftStore, DraftSync, DraftTarget, 
 use kr_client::pairing::BoxFuture;
 use kr_client::pairing::owner::{Ceremony, CeremonyKind, CeremonyOutcome};
 use kr_client::services::{
-    HttpDeadlines, HttpService, ManagedSyncService, ServiceSigner, SyncBackupService,
-    managed_response_limits,
+    HttpDeadlines, HttpService, ManagedSyncService, ServiceSigner, SharedSyncService,
+    SyncBackupService, managed_response_limits,
 };
 use kr_client::sync::{
     CollectionKeys, Published, Restored, SettingValue, SharedCollectionService,
@@ -518,6 +518,14 @@ impl Computer {
     /// The application, started over this computer's records, with the sync service chosen to be
     /// the one this computer can reach.
     fn start(&self) -> Page {
+        self.start_with(None)
+    }
+
+    /// As [`Self::start`], with `clients` as the application's clients of the sync service.
+    fn start_with(
+        &self,
+        clients: Option<Arc<dyn companion_tauri::services::SyncServices>>,
+    ) -> Page {
         let app = mock_builder()
             .manage(AppState::new())
             .invoke_handler(tauri::generate_handler![
@@ -542,6 +550,9 @@ impl Computer {
             .expect("an application on the mock runtime");
         // What the application's start does, over this computer's records.
         app.state::<AppState>().keep_under(self.data.path());
+        if let Some(clients) = clients {
+            app.state::<AppState>().sync_clients_replaced(clients);
+        }
         companion_tauri::start_sync_service(app.handle(), self.data.path());
         companion_tauri::start_settings_sync(
             app.handle(),
@@ -1182,6 +1193,68 @@ fn sync_requests(computer: &Computer) -> usize {
     computer.served.web().requests_to(SYNC_PATH)
 }
 
+/// A sync service of a fork's own, in the place of the one the setting names: the application asks
+/// this for its client at an origin, and it answers with the client of the fork's service whatever
+/// the origin. It records the origins it was asked for.
+#[derive(Debug)]
+struct Fork {
+    client: Arc<ManagedSyncService>,
+    asked: Mutex<Vec<String>>,
+}
+
+impl Fork {
+    fn at(service: &Served, key: AuthorisationKeyPair) -> Arc<Self> {
+        let origin = GatewayOrigin::new(service.origin()).expect("an origin");
+        let http = HttpService::with(
+            origin.clone(),
+            HttpDeadlines::default(),
+            managed_response_limits(),
+        )
+        .expect("a transport");
+        Arc::new(Self {
+            client: Arc::new(ManagedSyncService::new(
+                origin,
+                Arc::new(http),
+                Arc::new(Installation(key)),
+            )),
+            asked: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn asked(&self) -> Vec<String> {
+        self.asked.lock().expect("the record").clone()
+    }
+
+    fn answer(
+        &self,
+        origin: &GatewayOrigin,
+    ) -> companion_tauri::error::Result<Arc<dyn SharedSyncService>> {
+        self.asked
+            .lock()
+            .expect("the record")
+            .push(origin.as_str().to_owned());
+        Ok(Arc::clone(&self.client) as Arc<dyn SharedSyncService>)
+    }
+}
+
+impl companion_tauri::services::SyncServices for Fork {
+    fn installation(
+        &self,
+        origin: &GatewayOrigin,
+    ) -> companion_tauri::error::Result<Arc<dyn SharedSyncService>> {
+        self.answer(origin)
+    }
+
+    fn presenting(
+        &self,
+        origin: &GatewayOrigin,
+        _tokens: Arc<dyn kr_client::services::AccountTokenSource>,
+        _scope: &'static str,
+    ) -> companion_tauri::error::Result<Arc<dyn SharedSyncService>> {
+        self.answer(origin)
+    }
+}
+
 /* -------------------------------------------------------------------------- */
 /* The colour mode, on this computer                                           */
 /* -------------------------------------------------------------------------- */
@@ -1255,6 +1328,59 @@ async fn turning_sync_on_starts_a_collection_and_puts_the_settings_in_it_sealed(
             Some((ServiceRequestSigner::Installation, _))
         ));
     }
+}
+
+/// KR-REQ-17.14: settings sync reaches the sync service through the clients the application was
+/// given, at the origin its record names. A fork's service in that place receives every call and
+/// the service the setting names receives none; a record made while the setting named one service
+/// keeps asking for that service after the setting names another.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settings_sync_talks_to_the_service_client_it_was_given_at_the_origin_its_record_names() {
+    let computer = Computer::new().await;
+    let fork_service = serve().await;
+    let fork = Fork::at(
+        &fork_service,
+        computer.identity().keys.authorisation.clone(),
+    );
+    let page = computer.start_with(Some(Arc::clone(&fork) as _));
+    page.choose("dark");
+
+    let view = page.turn_on();
+    assert_eq!(view["sync"]["state"], "on", "{view}");
+    assert_eq!(view["sync"]["outstanding"], 0, "{view}");
+    assert!(
+        !fork_service.web().arrived().is_empty(),
+        "the fork's service received the calls"
+    );
+    assert!(
+        computer.served.web().arrived().is_empty(),
+        "the service the setting names received none"
+    );
+    let ours = computer.served.origin().to_owned();
+    assert!(
+        !fork.asked().is_empty() && fork.asked().iter().all(|origin| *origin == ours),
+        "{:?}: the client was asked for the service the setting names",
+        fork.asked()
+    );
+
+    // The setting now names another service. The record still names the first: the clients are
+    // asked for it, and the fork's service goes on receiving the calls.
+    page.call(
+        "sync_service_set",
+        json!({ "origin": "https://other.example" }),
+    )
+    .expect("another service is chosen");
+    let before = fork_service.web().arrived().len();
+    page.sync_now();
+    assert!(
+        fork_service.web().arrived().len() > before,
+        "a step after the setting changed reached the service the record names"
+    );
+    assert!(
+        fork.asked().iter().all(|origin| *origin == ours),
+        "{:?}: nothing was asked for the service the setting names now",
+        fork.asked()
+    );
 }
 
 /// A start the service could not take is not lost: the record names the collection, and turning
