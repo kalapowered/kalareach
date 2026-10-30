@@ -187,6 +187,10 @@ print(", ".join(signed["roles"]["targets"]["keyids"]))
         echo "    tar -xzf kalareach-<target>-$release.tar.gz"
         echo "    kalareach-<target>-$release/bin/kr host install"
         echo
+        echo 'Project work needs Git. On a Mac that does not have the developer tools yet, run'
+        echo '`xcode-select --install` and wait for it to finish before `kr new`; on Linux, install Git with the'
+        echo 'system'"'"'s package manager.'
+        echo
         echo 'A host that has an earlier release takes this one with'
         # shellcheck disable=SC2016
         echo '`kr host update --archive <archive>`. `kr host install` checks the release'"'"'s manifest against'
