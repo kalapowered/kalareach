@@ -4708,6 +4708,13 @@ async fn apply_two_paths_while_the_owner_withdraws_the_location(
     Some((outcome, written, granted))
 }
 
+/// Whether no staging directory of an apply is left beside the files of a working copy.
+fn no_staging_left_in(directory: &Path) -> bool {
+    names_in(directory)
+        .iter()
+        .all(|name| !name.starts_with(".kr-apply-"))
+}
+
 /// What a path of an apply came to, by state.
 fn states_of(
     answer: &kr_protocol::changeset::DiffApplyResult,
@@ -4733,6 +4740,10 @@ async fn a_location_withdrawn_between_two_paths_of_an_apply_receives_the_second_
         return;
     };
     assert_eq!(written, 1, "the path after the withdrawal is not written");
+    assert!(
+        no_staging_left_in(&granted.root.join("withdrawn")),
+        "the apply left nothing of its own beside the destination"
+    );
     let answer: DiffApplyResult = typed(&outcome.expect("the apply is settled and answered"));
     assert_eq!(
         answer.outcome.0,
@@ -4762,6 +4773,10 @@ async fn a_location_withdrawn_while_a_path_is_staged_has_nothing_published_into_
         return;
     };
     assert_eq!(written, 0, "nothing of the apply is in the working copy");
+    assert!(
+        no_staging_left_in(&granted.root.join("withdrawn")),
+        "the apply took away the staging directory it made, and left nothing else"
+    );
     let answer: DiffApplyResult = typed(&outcome.expect("the apply is settled and answered"));
     assert_eq!(
         answer.outcome.0,

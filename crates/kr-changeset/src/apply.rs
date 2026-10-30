@@ -1693,22 +1693,6 @@ fn run_operations(
         abandoned: None,
     };
     for (path, operation) in operations {
-        // A destination reached through a location is reached only while that location still
-        // admits the caller. Git asks it before each invocation, and this loop installs a path
-        // through the opened tree with no Git of its own, so it asks again before each path and
-        // stops, leaving the rest unattempted, when the location has been withdrawn. `install`
-        // asks once more immediately before it publishes or removes the path.
-        if location_stopped_admitting(repository) {
-            run.stopped = Some((
-                ApplyOutcomeClass::InterruptedApply,
-                format!(
-                    "the location this destination is reached through stopped admitting the \
-                     caller, so this apply stopped with {} path(s) already changed",
-                    run.changed.len()
-                ),
-            ));
-            break;
-        }
         let expected = order
             .affected
             .iter()
@@ -1746,6 +1730,22 @@ fn run_operations(
             );
             return Ok(run);
         }
+        // A destination reached through a location is reached only while that location still
+        // admits the caller. Git asks it before each invocation, and an install has no Git of its
+        // own, so `install` asks it before the first change it makes for a path and again
+        // immediately before it publishes or removes the path. A path it found withdrawn is
+        // untouched, and the apply stops there and leaves the rest unattempted.
+        if matches!(installed, Installed::Withdrawn) {
+            run.stopped = Some((
+                ApplyOutcomeClass::InterruptedApply,
+                format!(
+                    "the location this destination is reached through stopped admitting the \
+                     caller, so this apply stopped with {} path(s) already changed",
+                    run.changed.len()
+                ),
+            ));
+            break;
+        }
         let row = match &installed {
             Installed::Written(after) => ProgressRow {
                 path: path.clone(),
@@ -1780,6 +1780,7 @@ fn run_operations(
             // Returned above, before anything of this path is settled.
             #[cfg(feature = "fault-injection")]
             Installed::Abandoned => unreachable!("an abandoned path returns before it is settled"),
+            Installed::Withdrawn => unreachable!("a withdrawn path returns before it is settled"),
         };
         service.locked()?.settle_path(order.action_id, &row)?;
         run.progress.push(wire_progress(&row));
@@ -1802,6 +1803,7 @@ fn run_operations(
             Installed::Unresolved(_) => {}
             #[cfg(feature = "fault-injection")]
             Installed::Abandoned => unreachable!("an abandoned path returns before it is settled"),
+            Installed::Withdrawn => unreachable!("a withdrawn path returns before it is settled"),
         }
         #[cfg(feature = "fault-injection")]
         if let Some(fault) = fault
@@ -1979,6 +1981,9 @@ enum Installed {
     Conflicted(Option<Digest256>),
     /// This host could not establish what the destination holds.
     Unresolved(String),
+    /// The location the destination is reached through had stopped admitting the caller before
+    /// this host made any change for the path, so nothing was.
+    Withdrawn,
 }
 
 /// Puts one path's content in the destination, or takes the path away.
@@ -2026,6 +2031,11 @@ fn install(
             .ok_or_else(|| ChangeSetError::StorageUnavailable {
                 detail: "a destination path has no name".into(),
             })?;
+    // The first change this host makes for a path is a directory above it, so the location is
+    // asked immediately before that.
+    if location_stopped_admitting(repository) {
+        return Ok(Installed::Withdrawn);
+    }
     let mut here = clone_handle(repository.work_tree())?;
     for component in parents {
         here = match descend_or_create(&here, &RelativeName::parse(component)?, operation) {
