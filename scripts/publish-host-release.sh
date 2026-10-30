@@ -581,8 +581,14 @@ for line in text.splitlines():
         print(line.strip())
 PYTHON
     [ "$(grep -c '' "$STUB_STATE/notes-commands.sh")" -eq 3 ] || { echo "the notes give other than two downloads and a check:"; cat "$STUB_STATE/notes-commands.sh"; return 1; }
-    # A link of the real host answers with a redirect, which the stand-in's files do not: the downloads follow it.
-    [ "$(grep -c -E '^curl -[A-Za-z]*L[A-Za-z]* ' "$STUB_STATE/notes-commands.sh")" -eq 2 ] || { echo "a download in the notes does not follow redirects:"; cat "$STUB_STATE/notes-commands.sh"; return 1; }
+    # A link of the real host answers with a redirect, and a link to an asset that is gone answers with an
+    # error page. The stand-in's files do neither, so the case holds the downloads to the two flags that
+    # meet them: -L follows the redirect, and -f ends in an error instead of saving the page under the
+    # archive's name.
+    local flag
+    for flag in L f; do
+        [ "$(grep -c -E "^curl -[A-Za-z]*${flag}[A-Za-z]* " "$STUB_STATE/notes-commands.sh")" -eq 2 ] || { echo "a download in the notes lacks curl's -${flag}:"; cat "$STUB_STATE/notes-commands.sh"; return 1; }
+    done
     ( cd "$dl/named" && bash "$STUB_STATE/notes-commands.sh" ) > "$STUB_STATE/named.txt" 2>&1 || { echo "the notes' commands failed:"; cat "$STUB_STATE/named.txt"; return 1; }
     grep -q -F "kalareach-$target-$release.tar.gz: OK" "$STUB_STATE/named.txt" || { echo "the check did not print OK for the archive:"; cat "$STUB_STATE/named.txt"; return 1; }
     # The notes' own check line, run where only the sums are and no archive has the name they list, is not a pass.
