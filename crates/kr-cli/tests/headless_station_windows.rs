@@ -34,18 +34,26 @@ const NATIVE: &[&str] = &["--shell-mode", "native_compat"];
 /// Held by each case for as long as it changes the security of anything.
 static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// What a refused start says when it was refused for a window station that admits more than the
+/// starter's own.
+fn refused_for_the_station(said: &str) -> bool {
+    said.contains("check the window station's security") && said.contains("admits more")
+}
+
 /// Holds a window station of the logon that admits everyone, where the starter's own does not, and
-/// requires the start that meets it to be refused, which shows that the starter and this test are
-/// in one logon.
+/// requires the start that meets it to be refused for that station, which shows that the starter
+/// and this test are in one logon.
 async fn the_starter_meets_the_stations_this_test_makes(host: &WorkerHost) {
     let wider = HeldStation::make(|own| format!("{own}(A;;0x1;;;WD)"))
         .unwrap_or_else(|error| panic!("a station wider than the starter's own: {error}"));
     let refused = host.kr_new(NATIVE).await;
     assert!(
-        !refused.succeeded(),
-        "the starter was not stopped by a station of this test's logon that admits everyone, so \
-         it is in another logon and these cases show nothing: {}",
-        wider.access_list
+        !refused.succeeded() && refused_for_the_station(&refused.said()),
+        "the start was not refused for a window station of this test's logon that admits everyone, \
+         so the starter may be in another logon and these cases would show nothing, or the check \
+         is gone ({}): {}",
+        wider.access_list,
+        refused.said()
     );
 }
 
@@ -67,7 +75,7 @@ async fn a_logon_station_that_admits_more_than_the_starters_own_refuses_the_star
     );
     let said = refused.said();
     assert!(
-        said.contains("check the window station's security") && said.contains("admits more"),
+        refused_for_the_station(&said),
         "the refusal does not say which check refused: {said}"
     );
 

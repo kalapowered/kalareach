@@ -6,7 +6,7 @@
 
 #![expect(
     unsafe_code,
-    reason = "the session queries are kernel32 and wtsapi32 calls with no safe interface"
+    reason = "the session query is a wtsapi32 call with no safe interface"
 )]
 
 use windows_sys::Win32::Foundation::ERROR_CTX_WINSTATION_NOT_FOUND;
