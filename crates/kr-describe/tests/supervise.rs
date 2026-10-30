@@ -33,6 +33,7 @@ use kr_describe::supervise::{
 use kr_describe::testing::{
     CATALOGUE_VARIABLE, Raw, SCRIPT_VARIABLE, STARTED_PREFIX, Script, TestAsset, TestCatalogue,
     TestProfile, refuse_identity_lookup, refuse_thread_start,
+    the_system_refuses_the_process_memory,
 };
 use kr_describe::time::Reading;
 use kr_describe::wire::{LoadEnd, VerifyResult};
@@ -2090,6 +2091,151 @@ fn a_process_the_system_refuses_memory_past_the_ceiling_ends_as_memory_pressure(
 #[test]
 fn a_runtime_that_answers_a_refused_allocation_as_failed_still_ends_as_memory_pressure() {
     the_system_refuses_memory_past_the_ceiling(true);
+}
+
+/// What a process that the system refused memory comes to, whatever the platform: the end is the
+/// ceiling, inference pauses with `memory_pressure`, and no second process is started for the work.
+fn the_process_ended_for_want_of_memory(rig: &Rig, reports: &[Report]) {
+    assert!(
+        outcomes(reports).contains(&&Outcome::ProcessEnded {
+            why: ProcessEnd::MemoryCeiling
+        }),
+        "{reports:?}"
+    );
+    assert_eq!(rig.driver.pid(), None, "the process is gone");
+    assert_eq!(
+        rig.driver.service().resource_state(),
+        ResourceState::ResourcePaused {
+            reason: PauseReason::MemoryPressure,
+            unloaded: true
+        }
+    );
+    assert_eq!(rig.driver.started(), 1, "and no other is started");
+}
+
+/// KR-REQ-22.10: a process whose frame stops short while the system has refused it memory ended for
+/// memory, whichever way the daemon saw it end. The control, a frame cut short with no refusal
+/// before it, is `a_frame_cut_short_ends_the_process`.
+#[test]
+fn a_frame_cut_short_after_the_system_refused_memory_ends_as_memory_pressure() {
+    let mut rig = Rig::new(&Script {
+        raw: Some(Raw::PartialFrameThenExit),
+        ..Script::default()
+    });
+    queue(rig.service(), &session(1), Priority::Ordinary, at(0));
+    rig.job_sent(at(3_000));
+    the_system_refuses_the_process_memory();
+    let reports = rig.until(&roomy(), at(3_000), "the end", |reports, _| {
+        the_process_ended(reports)
+    });
+    the_process_ended_for_want_of_memory(&rig, &reports);
+}
+
+/// KR-REQ-22.10: a runtime that catches the failed allocation while it loads answers that the load
+/// failed. When the system refused it the memory, that is the ceiling: the process ends for it and
+/// the load is not tried again, where a load that fails for another reason is a failure.
+#[test]
+fn a_load_that_fails_after_the_system_refused_memory_ends_as_memory_pressure() {
+    let mut rig = Rig::new(&Script {
+        fail_load: true,
+        ..Script::default()
+    });
+    queue(rig.service(), &session(1), Priority::Ordinary, at(0));
+    rig.until(&roomy(), at(3_000), "the load is sent", |_, driver| {
+        driver.service().is_loading()
+    });
+    the_system_refuses_the_process_memory();
+    let reports = rig.until(&roomy(), at(3_000), "the end", |reports, _| {
+        the_process_ended(reports)
+    });
+    the_process_ended_for_want_of_memory(&rig, &reports);
+}
+
+/// KR-REQ-22.10: an answer that says a job went well clears what the system recorded, so that a
+/// refusal the runtime got over is not taken for the cause of a later end. The process that the
+/// test then ends from outside ends as a process does that nobody refused anything.
+#[test]
+fn a_job_that_goes_well_clears_a_refusal_so_a_later_end_is_not_taken_for_it() {
+    let mut rig = Rig::new(&Script::default());
+    queue(rig.service(), &session(1), Priority::Ordinary, at(0));
+    rig.job_sent(at(3_000));
+    the_system_refuses_the_process_memory();
+    let reports = rig.until(&roomy(), at(3_000), "the description", |reports, _| {
+        a_job_ended(reports)
+    });
+    assert!(
+        outcomes(&reports)
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Published { .. })),
+        "{reports:?}"
+    );
+    end_the_process_from_outside(&rig);
+    let reports = rig.until(&roomy(), at(3_000), "the end", |reports, _| {
+        the_process_ended(reports)
+    });
+    assert!(
+        outcomes(&reports).contains(&&Outcome::ProcessEnded {
+            why: ProcessEnd::Exited
+        }),
+        "{reports:?}"
+    );
+    assert!(
+        !matches!(
+            rig.driver.service().resource_state(),
+            ResourceState::ResourcePaused {
+                reason: PauseReason::MemoryPressure,
+                ..
+            }
+        ),
+        "inference is not paused for memory"
+    );
+}
+
+/// KR-REQ-22.10: an answer for work other than the work in hand does not take the refusal that
+/// belongs to it. A success for a job nobody is waiting for arrives before the failure of the job
+/// in hand, and the failure is still the ceiling. The control is the same two answers with no
+/// refusal, where the failure is an ordinary one and the job is tried again.
+#[test]
+fn an_answer_for_other_work_does_not_take_the_refusal_of_the_work_in_hand() {
+    let mut rig = Rig::new(&Script {
+        raw: Some(Raw::StaleSuccessThenFailure),
+        ..Script::default()
+    });
+    queue(rig.service(), &session(1), Priority::Ordinary, at(0));
+    rig.job_sent(at(3_000));
+    the_system_refuses_the_process_memory();
+    let reports = rig.until(&roomy(), at(3_000), "the end", |reports, _| {
+        the_process_ended(reports)
+    });
+    the_process_ended_for_want_of_memory(&rig, &reports);
+    assert_eq!(rig.driver.service().counts().dropped_answers, 1);
+
+    let mut rig = Rig::new(&Script {
+        raw: Some(Raw::StaleSuccessThenFailure),
+        ..Script::default()
+    });
+    queue(rig.service(), &session(1), Priority::Ordinary, at(0));
+    let reports = rig.until(&roomy(), at(3_000), "the failure", |reports, _| {
+        a_job_ended(reports)
+    });
+    assert!(
+        !outcomes(&reports).contains(&&Outcome::ProcessEnded {
+            why: ProcessEnd::MemoryCeiling
+        }),
+        "{reports:?}"
+    );
+}
+
+/// Ends the process the driver has, from outside it, as the system would end one.
+fn end_the_process_from_outside(rig: &Rig) {
+    let pid = rig.driver.pid().expect("a process to end");
+    let mut system = sysinfo::System::new();
+    let pid = sysinfo::Pid::from_u32(pid);
+    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+    assert!(
+        system.process(pid).expect("the process is there").kill(),
+        "the process is ended"
+    );
 }
 
 /// A process that ends inside a job is restarted after the restart delay, and the job is queued
