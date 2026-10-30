@@ -219,7 +219,7 @@ async fn on_the_starters_desktop(host: &WorkerHost, title: &str) -> Found {
     kr_ipc::starter::end_process(&identity).expect("the probe is ended");
     assert!(
         seen,
-        "the probe's window was not seen on the interactive desktop"
+        "a window a process started on the starter's own desktop made is not on the interactive desktop, so the look for the headless session's window could not have found one"
     );
     found
 }
@@ -281,10 +281,5 @@ async fn a_headless_session_is_not_on_the_interactive_desktop_and_a_desktop_boun
         (bound.winsta0.as_str(), bound.default.as_str()),
         ("opened", "opened"),
         "a process started on the starter's own desktop reaches the interactive desktop: {bound:?}"
-    );
-    assert!(
-        window_here(&bound_title),
-        "a window a process started on the starter's own desktop made is not on the interactive \
-         desktop, so the look for the headless session's window could not have found one"
     );
 }
