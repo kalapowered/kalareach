@@ -195,7 +195,7 @@ describe('the desktop Account sheet', () => {
 describe('the managed services the application holds a client of (KR-REQ-17.14)', () => {
   /** The lines the backend reports for a phone with its account, sync and push clients and no broker. */
   const lines = [
-    { service: 'account login', configured: true, explanation: 'A account login service is configured.' },
+    { service: 'account login', configured: true, explanation: 'An account login service is configured.' },
     { service: 'push registration', configured: true, explanation: 'A push registration service is configured.' },
     { service: 'sync and backup', configured: true, explanation: 'A sync and backup service is configured.' },
     {
@@ -214,7 +214,7 @@ describe('the managed services the application holds a client of (KR-REQ-17.14)'
     const list = await within(sheet).findByTestId('account-services')
     const items = within(list).getAllByRole('listitem')
     expect(items.map((item) => item.textContent)).toEqual([
-      'Account loginA account login service is configured.',
+      'Account loginAn account login service is configured.',
       'Push registrationA push registration service is configured.',
       'Sync and backupA sync and backup service is configured.',
       'Managed inferenceNo managed inference service is configured. You can use your own provider credentials.'
