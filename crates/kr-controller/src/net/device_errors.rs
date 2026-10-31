@@ -24,7 +24,8 @@
 //! rule: a closure's list of what it left behind, and the members of the records in
 //! [`FAILURE_TEXTS`]. The places that hold a place on this host and no failure ([`HOST_PATHS`])
 //! are withheld as a path is, and the reason an agent instance's rich mutations wait is told by
-//! what it says of the wait ([`suspension_for_a_device`]).
+//! what it says of the wait ([`suspension_for_a_device`]), in a result and in the refusal of a
+//! rich mutation.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -66,10 +67,12 @@ const COMMAND_WORDS: [&str; 6] = ["chmod", "chown", "sudo", "doas", "systemctl",
 /// project service, in terms of the location the device's grant names, which is all of the place
 /// the device has. The third is the refusal to start a worker over a scheduled task under the
 /// environment's name that is not this installation's own, whose text can name the account it is
-/// registered for, or quote what the Task Scheduler said. The last four are the Task Scheduler's own
+/// registered for, or quote what the Task Scheduler said. The next four are the Task Scheduler's own
 /// refusals of a command this host gave it, each of which carries what the scheduler printed after
 /// it: that is a program's output, which can hold an account's name in a form the rule cannot find.
-const KNOWN_REASONS: [(&[&str], &str); 7] = [
+/// The last two quote what a task holds, which was written by whoever registered it, where it
+/// differs from the one this installation registers.
+const KNOWN_REASONS: [(&[&str], &str); 9] = [
     (
         &["a filesystem is mounted at "],
         "a filesystem is mounted inside the location the grant names",
@@ -103,6 +106,16 @@ const KNOWN_REASONS: [(&[&str], &str); 7] = [
         "the Task Scheduler did not run the environment's task; what it reported is not sent to a \
          paired device",
     ),
+    (
+        &[" is not the one this installation registers ("],
+        "the environment's task is not the one this installation registers; what it holds is not \
+         sent to a paired device",
+    ),
+    (
+        &[" was changed and reads back differently ("],
+        "the environment's task was changed and reads back differently; what it holds is not sent \
+         to a paired device",
+    ),
 ];
 
 /// The ends of the three refusals that name where in a message a field is, as a JSON pointer.
@@ -126,6 +139,13 @@ const SELECTION_IN_FLIGHT: &str = "the terminal has asked to change its conversa
 const SELECTION_UNKNOWN: &str = "what became of the terminal's last request to change its \
                                  conversation is unknown, so which conversation it is in is \
                                  unknown";
+
+/// What the worker says before why rich mutations wait, in the refusal of one.
+const RICH_MUTATIONS_SUSPENDED: &str = "rich mutations are suspended: ";
+
+/// What a device is told of a reason for the wait that the host does not know, before why it is not
+/// sent.
+const SUSPENDED_BY: &str = "rich mutations are suspended";
 
 /// What the worker says before why it could not take the conversation the terminal selected.
 const CONVERSATION_NOT_BOUND: &str = "the conversation the terminal selected cannot be bound here";
@@ -160,7 +180,7 @@ struct FailureText {
 /// privacy step could not answer, what a workspace or a repository operation records of its own
 /// state, and why an agent instance's bridges are refused. A device reads them in results and in
 /// announcements, so they are held to the rule as an error's message is.
-const FAILURE_TEXTS: [FailureText; 7] = [
+const FAILURE_TEXTS: [FailureText; 8] = [
     FailureText {
         key: "reason",
         beside: &[("subsystem", None)],
@@ -196,32 +216,63 @@ const FAILURE_TEXTS: [FailureText; 7] = [
         beside: &[("download", Some("failed"))],
         of: "why the fetch of the description model failed",
     },
+    FailureText {
+        key: "detail",
+        beside: &[("state", Some("left_out")), ("reason", None)],
+        of: "why the admissions leave the installation out",
+    },
 ];
 
 /// A member of a protocol record that holds a place on this host as plain text, found by its key.
 struct HostPath {
     /// The member's key. Its value is a text, or a list of texts.
     key: &'static str,
-    /// The members beside it that say which record it belongs to.
-    beside: &'static [&'static str],
+    /// The members beside it that say which record it belongs to: each key, and the text it must
+    /// hold when the record is one of several under a tag.
+    beside: &'static [(&'static str, Option<&'static str>)],
 }
 
 /// The members that hold a place on this host and no failure: where a repository or a working copy
-/// is, and the staging paths an operation kept or removed. A path under a home directory names the
-/// account, and a device cannot use one, so a device is given each as the withheld record of a path
-/// (the form the directory of a materialisation has), with the list of paths as long as it was.
-const HOST_PATHS: [HostPath; 3] = [
+/// is, the staging paths an operation kept or removed, the repository a clone was made from, the
+/// socket of a session's worker and the program a question's source runs. A session's own working
+/// directory and shell are not among them: they are part of how the session is described to the
+/// person it is shown to, and a device that may see the session sees its terminal. A path under a
+/// home directory names the account, and a device cannot use one, so a device is given each as the
+/// withheld record of a path (the form the directory of a materialisation has), with the list of
+/// paths as long as it was.
+const HOST_PATHS: [HostPath; 6] = [
     HostPath {
         key: "display_path",
-        beside: &["project_repository_id", "environment_id"],
+        beside: &[("project_repository_id", None), ("environment_id", None)],
     },
     HostPath {
         key: "retained_staging_paths",
-        beside: &["action_id", "destination_state"],
+        beside: &[("action_id", None), ("destination_state", None)],
     },
     HostPath {
         key: "removed_staging_paths",
-        beside: &["action_id", "destination_state"],
+        beside: &[("action_id", None), ("destination_state", None)],
+    },
+    // A clone from a location names the repository it was made from by its place on this host. The
+    // address of a remote on the web is the owner's, and is not held.
+    HostPath {
+        key: "url",
+        beside: &[("remote_name", None), ("transport", Some("local_path"))],
+    },
+    // The path of the socket a session's worker listens on, which a device cannot use and which
+    // names the account on a platform that puts it under the account's runtime directory.
+    HostPath {
+        key: "endpoint",
+        beside: &[("session", None)],
+    },
+    // The program a question's source is running, as the operating system names it.
+    HostPath {
+        key: "executable",
+        beside: &[
+            ("application_instance_id", None),
+            ("process", None),
+            ("connection_id", None),
+        ],
     },
 ];
 
@@ -284,13 +335,27 @@ const OWN_ARGUMENT_REASONS: [(&str, Option<&str>); 13] = [
     ),
 ];
 
+/// The refusal of a call that a component answers for when the component has had its rich
+/// capabilities disabled, by its wording. The worker adds why after the colon, and that is a fault
+/// or a revocation in the component's or the runtime's words.
+const DISABLED_COMPONENT_REASONS: [(&str, Option<&str>); 2] = [
+    (
+        "this binding's rich capabilities are disabled: {..}",
+        Some("this binding's rich capabilities are disabled"),
+    ),
+    (
+        "the component answerable for this operation has had its rich capabilities disabled: {..}",
+        Some("the component answerable for this operation has had its rich capabilities disabled"),
+    ),
+];
+
 /// The refusals of a plugin's action under the codes the plugin runtime's words come under, by
 /// their wording, and the sentence a device is told of each. Most are the host's own and say what
 /// kind of thing stopped the action; the worker writes the runtime's own words, or the component's,
 /// after the colon of several of them, and those are another program's. A `{..}` stands for the
 /// rest of the message, whatever it says. A sentence with no slot at all is the host's own text and
 /// is sent as it is.
-const PLUGIN_ACTION_REASONS: [(&str, Option<&str>); 17] = [
+const PLUGIN_ACTION_REASONS: [(&str, Option<&str>); 18] = [
     ("the plugin runtime is not connected", None),
     (
         "the component is disabled; the runtime's words are withheld for privacy mode",
@@ -351,10 +416,8 @@ const PLUGIN_ACTION_REASONS: [(&str, Option<&str>); 17] = [
         "the component could not be asked to prepare the action: {..}",
         Some("the component could not be asked to prepare the action"),
     ),
-    (
-        "this binding's rich capabilities are disabled: {..}",
-        Some("this binding's rich capabilities are disabled"),
-    ),
+    DISABLED_COMPONENT_REASONS[0],
+    DISABLED_COMPONENT_REASONS[1],
 ];
 
 /// The error `error` is for a device: itself when it names nothing of this host, and otherwise the
@@ -370,6 +433,11 @@ pub(crate) fn error_for_a_device(error: &ProtocolError) -> Cow<'_, ProtocolError
 /// What a device is told in place of `message`, the text of an error of `code`, or `None` when it
 /// is told the message itself.
 fn message_for_a_device(code: ErrorCode, message: &str) -> Option<String> {
+    // The refusal of a rich mutation says why they wait in the words of that reason, which are
+    // told as the reason is.
+    if let Some(reason) = message.strip_prefix(RICH_MUTATIONS_SUSPENDED) {
+        return refusal_while_mutations_wait(reason);
+    }
     told_in_place(message, || sentence_for(code, WHY_NOT_SHOWN))
 }
 
@@ -491,7 +559,8 @@ pub(crate) fn too_large_for_the_device(frame: &ControlFrame) -> Option<ControlFr
 /// other refusal of the argument, of the agent itself, or an end that left the outcome unknown,
 /// is replaced by a sentence composed from its code. A plugin's action also meets the plugin
 /// runtime, whose words come under two more codes and are told the same way
-/// ([`PLUGIN_ACTION_REASONS`]). The code and the retry category stay.
+/// ([`PLUGIN_ACTION_REASONS`]), and the answer to an approval meets a component that was disabled
+/// for a fault ([`DISABLED_COMPONENT_REASONS`]). The code and the retry category stay.
 ///
 /// This is for what a worker answered. The daemon's own refusals of the same call are its own
 /// sentences, made before any worker is asked, and are not given to it.
@@ -540,6 +609,15 @@ fn told_in_place_of_the_upstreams(method: Method, error: &ProtocolError) -> Opti
             if method == Method::PluginActionInvoke =>
         {
             of_the_hosts(&PLUGIN_ACTION_REASONS)
+        }
+        // The component that read an approval can have been disabled for a fault it had, and the
+        // worker says which after the colon.
+        ErrorCode::UnsupportedCapability if method == Method::AgentApprovalRespond => {
+            DISABLED_COMPONENT_REASONS
+                .iter()
+                .find(|(shape, _)| fits_shape(shape, &error.message))
+                .and_then(|(_, kind)| *kind)
+                .map(str::to_owned)
         }
         _ => None,
     }
@@ -756,7 +834,18 @@ fn is_why_mutations_wait(map: &CanonicalMap, key: &str) -> bool {
 fn is_a_host_path(map: &CanonicalMap, key: &str) -> bool {
     HOST_PATHS
         .iter()
-        .any(|path| path.key == key && path.beside.iter().all(|beside| map.get(beside).is_some()))
+        .any(|path| path.key == key && beside_holds(map, path.beside))
+}
+
+/// Whether `map` holds every member of `beside`, with the text it must hold where one is given.
+fn beside_holds(map: &CanonicalMap, beside: &[(&str, Option<&str>)]) -> bool {
+    beside
+        .iter()
+        .all(|(name, value)| match (map.get(name), value) {
+            (Some(CanonicalValue::Text(found)), Some(wanted)) => found == wanted,
+            (Some(_), None) => true,
+            _ => false,
+        })
 }
 
 /// `value`, a text or a list of texts that are places on this host, with each of them withheld as
@@ -788,15 +877,25 @@ fn withheld_paths(value: &CanonicalValue) -> Option<CanonicalValue> {
     }
 }
 
+/// How a device is told why an agent instance's rich mutations wait.
+enum Wait {
+    /// The host's own sentence says it and names nothing, so it is told as it is.
+    AsWritten,
+    /// A sentence for the kind of wait, with none of the words the reason held.
+    Kind(String),
+    /// A reason the host does not know, of which nothing is told.
+    Unknown,
+}
+
 /// Why an agent instance's rich mutations wait, with nothing of this host or of the application's
-/// upstream in it, or `None` when the host's own sentence says it and names nothing.
+/// upstream in it.
 ///
 /// The worker writes the reason from the host's own sentences, and from two things it did not
 /// make: the method of a request that its connector's table does not classify, which is the
 /// upstream's, and what stopped it taking a conversation, which can quote a lock file under a home
 /// directory. A device is told which of those it was and not the words. A reason the host does not
 /// know is not sent.
-fn suspension_for_a_device(reason: &str) -> Option<String> {
+fn why_mutations_wait(reason: &str) -> Wait {
     if [
         kr_worker::broker::THREAD_NOT_READ,
         kr_worker::broker::bridge::UNVERIFIED_THREAD,
@@ -805,41 +904,50 @@ fn suspension_for_a_device(reason: &str) -> Option<String> {
     ]
     .contains(&reason)
     {
-        return None;
+        return Wait::AsWritten;
     }
     if let Some(why) = reason
         .strip_prefix(CONVERSATION_NOT_BOUND)
         .and_then(|rest| rest.strip_prefix(": "))
     {
         // The one reason of those that names nothing is the conversation being held elsewhere.
-        return (why != kr_worker::broker::BrokerError::ConversationHeldElsewhere.to_string())
-            .then(|| format!("{CONVERSATION_NOT_BOUND}; {WHY_NOT_SHOWN}"));
+        return if why == kr_worker::broker::BrokerError::ConversationHeldElsewhere.to_string() {
+            Wait::AsWritten
+        } else {
+            Wait::Kind(format!("{CONVERSATION_NOT_BOUND}; {WHY_NOT_SHOWN}"))
+        };
     }
-    for (end, told) in UNCLASSIFIED_METHODS {
-        if reason.ends_with(end) {
-            return Some((*told).to_owned());
-        }
+    UNCLASSIFIED_METHODS
+        .iter()
+        .find(|(end, _)| reason.ends_with(end))
+        .map_or(Wait::Unknown, |(_, told)| Wait::Kind((*told).to_owned()))
+}
+
+/// What a device is told in place of `reason`, the `suspension_reason` of a binding state, or
+/// `None` when it is told the reason itself.
+fn suspension_for_a_device(reason: &str) -> Option<String> {
+    match why_mutations_wait(reason) {
+        Wait::AsWritten => None,
+        Wait::Kind(told) => Some(told),
+        Wait::Unknown => Some(format!("{SUSPENDED_BY}; {WHY_WHATEVER_IT_SAYS}")),
     }
-    Some(format!(
-        "rich mutations are suspended; {WHY_WHATEVER_IT_SAYS}"
-    ))
+}
+
+/// What a device is told in place of the message of a refusal of a rich mutation, where `reason`
+/// is what follows [`RICH_MUTATIONS_SUSPENDED`], or `None` when it is told the message itself.
+fn refusal_while_mutations_wait(reason: &str) -> Option<String> {
+    match why_mutations_wait(reason) {
+        Wait::AsWritten => None,
+        Wait::Kind(told) => Some(format!("{RICH_MUTATIONS_SUSPENDED}{told}")),
+        Wait::Unknown => Some(format!("{SUSPENDED_BY}; {WHY_WHATEVER_IT_SAYS}")),
+    }
 }
 
 /// What the text under `key` in `map` says, when it is a failure a record holds as plain text.
 fn failure_text_of(map: &CanonicalMap, key: &str) -> Option<&'static str> {
     FAILURE_TEXTS
         .iter()
-        .find(|field| {
-            field.key == key
-                && field
-                    .beside
-                    .iter()
-                    .all(|(name, value)| match (map.get(name), value) {
-                        (Some(CanonicalValue::Text(found)), Some(wanted)) => found == wanted,
-                        (Some(_), None) => true,
-                        _ => false,
-                    })
-        })
+        .find(|field| field.key == key && beside_holds(map, field.beside))
         .map(|field| field.of)
 }
 
@@ -2788,5 +2896,420 @@ mod tests {
         .expect_err("the surface fails");
         assert!(!refused.message.contains("malformed"), "{refused:?}");
         assert_eq!(refused.code, ErrorCode::RendezvousConfigError);
+    }
+
+    #[test]
+    fn the_refusal_of_a_rich_mutation_says_why_they_wait_without_the_words_of_the_reason() {
+        let mut leaked = Vec::new();
+        for method in THE_AGENT_METHODS {
+            for reason in [
+                A_CONVERSATION_LOCK_THAT_FAILED,
+                // The method of a request that the connector's table does not classify is the
+                // upstream's: a bare name, an address, a command.
+                "marguerite is not classified by this connector's table, so what it changed is \
+                 unknown",
+                "marguerite@example.com is not classified by this connector's table, so what the \
+                 terminal asked for is unknown",
+                "net user marguerite is not classified by this connector's table, so what it \
+                 changed is unknown",
+                "marguerite asked for this",
+            ] {
+                let said = format!("rich mutations are suspended: {reason}");
+                let told = told_on(method, ErrorCode::DraftConflict, &said);
+                assert_eq!(told.code, ErrorCode::DraftConflict, "{method:?}");
+                if tells_the_owner_alone(&told.message)
+                    || told.message.contains("example.com")
+                    || told.message.contains("net user")
+                    || !told.message.contains("rich mutations are suspended")
+                {
+                    leaked.push(format!("{method:?}: {told:?}"));
+                }
+            }
+            // The host's own reason is told as it is written.
+            let own = format!(
+                "rich mutations are suspended: {}",
+                kr_worker::broker::THREAD_NOT_READ
+            );
+            assert_eq!(
+                told_on(method, ErrorCode::DraftConflict, &own).message,
+                own,
+                "{method:?}"
+            );
+        }
+        assert!(
+            leaked.is_empty(),
+            "the reason reaches a device in a refusal: {leaked:#?}"
+        );
+    }
+
+    fn remote(
+        transport: kr_protocol::project::RemoteTransport,
+        url: &str,
+    ) -> kr_protocol::project::RemoteSpecification {
+        kr_protocol::project::RemoteSpecification {
+            remote_name: "origin".to_owned(),
+            transport,
+            url: url.to_owned(),
+            provider: String::new(),
+            credential_broker: String::new(),
+        }
+    }
+
+    #[test]
+    fn the_place_of_the_repository_a_clone_was_made_from_is_withheld_from_a_device() {
+        use kr_protocol::project::RemoteTransport;
+        let source = "/Users/marguerite/work/source";
+        let mut cloned = project("a repository");
+        cloned.remote = Nullable::some(remote(RemoteTransport::LocalPath, source));
+        let mut made = operation("it ended");
+        made.remote = Nullable::some(remote(RemoteTransport::LocalPath, source));
+        let owner = project_read(cloned, workspace("it is ready", "nothing held"), made);
+        let device = read_by_a_device(&owner);
+        let withheld_remote = |remote: &Nullable<kr_protocol::project::RemoteSpecification>| {
+            remote.0.as_ref().expect("a remote").url.clone()
+        };
+        assert_eq!(
+            withheld_remote(&device.project.remote),
+            withheld_path(source)
+        );
+        assert_eq!(
+            withheld_remote(&device.operation.0.as_ref().expect("an operation").remote),
+            withheld_path(source)
+        );
+        // The rest of the remote is as it was, and the owner's own copy is.
+        let kept = device.project.remote.0.as_ref().expect("a remote");
+        assert_eq!(kept.transport, RemoteTransport::LocalPath);
+        assert_eq!(kept.remote_name, "origin");
+        assert_eq!(withheld_remote(&owner.project.remote), source);
+
+        // The address of a remote on the web is the owner's to share and is not held.
+        let mut web = project("a repository");
+        web.remote = Nullable::some(remote(
+            RemoteTransport::Https,
+            "https://example.com/org/repo.git",
+        ));
+        let web = project_read(
+            web,
+            workspace("it is ready", "nothing held"),
+            operation("it ended"),
+        );
+        assert_eq!(
+            withheld_remote(&read_by_a_device(&web).project.remote),
+            "https://example.com/org/repo.git"
+        );
+    }
+
+    #[test]
+    fn why_the_admissions_leave_an_installation_out_is_held_to_the_rule_by_its_key() {
+        use kr_protocol::catalogue::{PluginAdmission, PluginLeftOutReason};
+        let left_out = |reason, detail: &str| PluginAdmission::LeftOut {
+            reason,
+            detail: detail.to_owned(),
+        };
+        let told = read_by_a_device(&left_out(
+            PluginLeftOutReason::Incomplete,
+            "/Users/marguerite/.local/share/kr/plugins/9f2c/manifest.json does not parse: \
+             expected value",
+        ));
+        let PluginAdmission::LeftOut { reason, detail } = told else {
+            panic!("a plugin left out");
+        };
+        assert_eq!(reason, PluginLeftOutReason::Incomplete);
+        assert!(!tells_the_owner_alone(&detail), "{detail}");
+        assert_eq!(
+            detail,
+            "why the admissions leave the installation out; the detail names the host and is not \
+             sent to a paired device"
+        );
+        // What names nothing is told as it was.
+        let plain = left_out(PluginLeftOutReason::Revoked, "the package 9f2c was revoked");
+        assert_eq!(read_by_a_device(&plain), plain);
+    }
+
+    #[test]
+    fn a_task_that_differs_from_the_environments_own_is_told_to_a_device_without_what_it_holds() {
+        use crate::supervision::windows::{Difference, ReadBack, TaskError, task_name};
+        let name = task_name(kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid()));
+        let differences = vec![
+            Difference::Arguments {
+                found: "net user marguerite; echo ready".to_owned(),
+                expected: "-NoProfile".to_owned(),
+            },
+            Difference::Program {
+                found: "marguerite.exe".to_owned(),
+                expected: std::path::PathBuf::from("starter.exe"),
+            },
+            Difference::RunLevel("uid: 501".to_owned()),
+        ];
+        let joined = differences
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        for said in [
+            // The launch refusal, then the command that mends it.
+            format!(
+                "the environment's task {name} is not the one this installation registers \
+                 ({joined}): run kr host startup --set standalone to repair it"
+            ),
+            // A change that read back differently.
+            TaskError::ReadBack {
+                name: name.clone(),
+                found: ReadBack::Differs(differences.clone()),
+                undone: true,
+            }
+            .to_string(),
+        ] {
+            assert!(said.contains("net user marguerite"), "{said}");
+            let shown =
+                error_for_a_device(&error(ErrorCode::ResourceUnavailable, &said)).into_owned();
+            assert!(
+                ["marguerite", "net user", "echo", "501", "kr host"]
+                    .iter()
+                    .all(|local| !shown.message.contains(local)),
+                "{said}: {shown:?}"
+            );
+            assert!(
+                shown.message.contains("the environment's task"),
+                "{said}: {shown:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn what_disabled_the_component_of_an_approval_is_withheld_from_a_device() {
+        for said in [
+            "the component answerable for this operation has had its rich capabilities disabled: \
+             marguerite's decoder faulted",
+            "this binding's rich capabilities are disabled: revoked by marguerite@example.com",
+        ] {
+            let told = told_on(
+                Method::AgentApprovalRespond,
+                ErrorCode::UnsupportedCapability,
+                said,
+            );
+            assert_eq!(told.code, ErrorCode::UnsupportedCapability);
+            assert!(
+                told.message.contains("rich capabilities")
+                    && !told.message.contains("marguerite")
+                    && !told.message.contains("example.com"),
+                "{said}: {told:?}"
+            );
+        }
+        // The host's own sentence under that code, which names no component's words, is as it was.
+        let own = "every component bound to 0193abcd has had its rich capabilities disabled";
+        assert_eq!(
+            told_on(
+                Method::AgentApprovalRespond,
+                ErrorCode::UnsupportedCapability,
+                own
+            )
+            .message,
+            own
+        );
+    }
+
+    #[test]
+    fn the_plugin_runtime_rule_holds_for_a_plugins_action_and_for_no_other_method() {
+        let said = "the session journal is busy";
+        let replaced = told_on(
+            Method::PluginActionInvoke,
+            ErrorCode::ResourceUnavailable,
+            said,
+        );
+        assert!(
+            replaced.message.contains("could not complete this request"),
+            "{replaced:?}"
+        );
+        // Elsewhere the host's own words under that code are what they were.
+        for method in [Method::AgentTurnCancel, Method::AgentPromptSubmit] {
+            assert_eq!(
+                told_on(method, ErrorCode::ResourceUnavailable, said).message,
+                said,
+                "{method:?}"
+            );
+        }
+        // A message of no shape the host knows is told by its code, whoever it names.
+        for code in [
+            ErrorCode::ResourceUnavailable,
+            ErrorCode::UnsupportedCapability,
+        ] {
+            let told = told_on(
+                Method::PluginActionInvoke,
+                code,
+                "marguerite is out of reach",
+            );
+            assert_eq!(told.code, code);
+            assert!(
+                !told.message.contains("marguerite")
+                    && told.message.contains("could not complete this request"),
+                "{told:?}"
+            );
+        }
+        // And the row that says an action names no single parameter for its attachment.
+        let told = told_on(
+            Method::PluginActionInvoke,
+            ErrorCode::UnsupportedCapability,
+            "summarise declares no single parameter that names its attachment",
+        );
+        assert!(
+            told.message.contains("declares no single parameter")
+                && !told.message.contains("summarise"),
+            "{told:?}"
+        );
+    }
+
+    #[test]
+    fn a_member_without_the_record_around_it_is_left_alone() {
+        let text = |text: &str| CanonicalValue::Text(text.to_owned());
+        let record = |members: &[(&str, CanonicalValue)]| {
+            rebuilt(
+                members
+                    .iter()
+                    .map(|(key, value)| ((*key).to_owned(), value.clone()))
+                    .collect(),
+            )
+        };
+        let path = "/Users/marguerite/work/x";
+        for (what, carried) in [
+            (
+                "a place with no repository around it",
+                record(&[("display_path", text(path))]),
+            ),
+            (
+                "staging paths with no operation around them",
+                record(&[(
+                    "retained_staging_paths",
+                    CanonicalValue::Array(vec![text(path)]),
+                )]),
+            ),
+            (
+                "an address on the web",
+                record(&[
+                    ("remote_name", text("origin")),
+                    ("transport", text("https")),
+                    ("url", text("https://example.com/x")),
+                ]),
+            ),
+            (
+                "an address with no remote around it",
+                record(&[("transport", text("local_path")), ("url", text(path))]),
+            ),
+            (
+                "a reason with no binding around it",
+                record(&[("suspension_reason", text(A_CONVERSATION_LOCK_THAT_FAILED))]),
+            ),
+            (
+                "a detail of an admission that admits",
+                record(&[
+                    ("state", text("admitted")),
+                    ("reason", text("disabled")),
+                    ("detail", text(path)),
+                ]),
+            ),
+            (
+                "a failure of a fetch that is running",
+                record(&[("download", text("running")), ("failure", text(path))]),
+            ),
+        ] {
+            assert_eq!(shown_value(&carried), None, "{what}");
+        }
+    }
+
+    fn session_summary() -> kr_protocol::session::SessionSummary {
+        use kr_protocol::ids::{EnvironmentId, SessionEpoch};
+        use kr_protocol::scalars::{TimestampMs, Uuid};
+        use kr_protocol::session::{
+            Dimensions, DisplayNumber, SessionState, SessionSummary, ShellMode,
+        };
+        SessionSummary {
+            session_id: SessionId::new(Uuid::from_bytes([7; 16])),
+            session_epoch: SessionEpoch::V1,
+            environment_id: EnvironmentId::new(Uuid::from_bytes([3; 16])),
+            display_number: DisplayNumber::new(1),
+            state: SessionState::Live,
+            shell_mode: ShellMode::NativeCompat,
+            shell_path: "/bin/zsh".to_owned(),
+            cwd: "/Users/marguerite/work".to_owned(),
+            worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+            desktop: kr_protocol::identity::DesktopBinding::none(),
+            created_at_ms: TimestampMs::new(1),
+            dimensions: Dimensions::new(100, 30),
+            attachment_count: U64::ZERO,
+            application_state: Nullable::null(),
+            root_process: Nullable::null(),
+            closure: Nullable::null(),
+            environment_sources: None,
+            root: None,
+            application: None,
+        }
+    }
+
+    #[test]
+    fn the_socket_of_a_sessions_worker_is_withheld_from_a_device() {
+        let socket = "/run/user/1000/kalareach/workers/0193abcd.sock";
+        let read = |endpoint: Option<&str>| kr_protocol::session::SessionReadResult {
+            session: session_summary(),
+            endpoint: Nullable::from(endpoint.map(str::to_owned)),
+            launch_profile: Nullable::null(),
+            last_command_block: Nullable::null(),
+            outstanding_launches: Nullable::null(),
+            metrics: None,
+        };
+        let owner = read(Some(socket));
+        let device = read_by_a_device(&owner);
+        assert_eq!(device.endpoint.0, Some(withheld_path(socket)));
+        // The session is shown as it is, its working directory and its shell with it: they are how
+        // a person is told what the session is.
+        assert_eq!(device.session, owner.session);
+        assert_eq!(owner.endpoint.0.as_deref(), Some(socket));
+        // A session that has closed has none, and none is what a device is told.
+        assert_eq!(read_by_a_device(&read(None)), read(None));
+        // The create's answer carries it the same way.
+        let created = kr_protocol::session::SessionCreateResult {
+            session: session_summary(),
+            endpoint: Nullable::some(socket.to_owned()),
+            deduplicated: false,
+            presentation_error: Nullable::null(),
+        };
+        assert_eq!(
+            read_by_a_device(&created).endpoint.0,
+            Some(withheld_path(socket))
+        );
+    }
+
+    #[test]
+    fn the_program_a_questions_source_runs_is_withheld_from_a_device() {
+        use kr_protocol::ids::{ApplicationInstanceId, ConnectionId};
+        use kr_protocol::question::QuestionSource;
+        use kr_protocol::scalars::Uuid;
+        let program = "/Users/marguerite/.local/bin/release-agent";
+        let source = |executable: Option<&str>| QuestionSource {
+            application_instance_id: ApplicationInstanceId::new(Uuid::from_bytes([3; 16])),
+            process: kr_protocol::identity::ProcessStartIdentity::new(
+                7,
+                kr_protocol::identity::ProcessStartSource::LinuxProcStat,
+                11,
+            ),
+            executable: Nullable::from(executable.map(str::to_owned)),
+            agent_label: Nullable::some("the release agent".to_owned()),
+            connection_id: ConnectionId::new(Uuid::from_bytes([4; 16])),
+            launch_channel: false,
+            session_member: true,
+            ancestry: true,
+            agent_binding_revision: Nullable::null(),
+        };
+        let device = read_by_a_device(&source(Some(program)));
+        assert_eq!(device.executable.0, Some(withheld_path(program)));
+        // The label the caller gave itself, which is shown as unverified, is not a place.
+        assert_eq!(
+            device,
+            QuestionSource {
+                executable: Nullable::some(withheld_path(program)),
+                ..source(Some(program))
+            }
+        );
+        // A source with no program named has none to withhold.
+        assert_eq!(read_by_a_device(&source(None)), source(None));
     }
 }
