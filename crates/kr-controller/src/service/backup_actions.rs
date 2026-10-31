@@ -121,7 +121,8 @@ impl Controller {
     /// Returns [`ControllerError::NotConfigured`] when the host selects no storage service,
     /// [`ControllerError::InvalidArgument`] for a call that is not well formed, and what
     /// [`Self::under_registration`] refuses with when the fence this host owes, a withdrawn
-    /// registration or the passed deadline stops a request or the record.
+    /// registration or the passed deadline stops a request, the record or an answer that tells a
+    /// delay.
     pub(super) async fn backup_enable(
         self: &std::sync::Arc<Self>,
         mutation: &MutationRequest,
