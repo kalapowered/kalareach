@@ -1087,11 +1087,11 @@ fn a_platform_whose_mechanisms_cannot_hold_the_guarantees_runs_no_git() {
 }
 
 /// A kernel without the Landlock interface the boundary needs runs no Git on any route, as a
-/// platform that runs none does not: the profile's own run, whether it found its Git, was handed
-/// one, or has none to find, and a request to the service. Each is refused as a host that is not
-/// set up for the work, which a client does not send again, with what the kernel has and what the
-/// boundary needs, and before the request makes a directory. The kernel is not changed: the answer
-/// to the boundary's own probe is, on this thread only.
+/// platform that runs none does not: the profile's own run, whether the profile has found its Git
+/// already, was handed one, or has none to find, and a request to the service. Each is refused as
+/// a host that is not set up for the work, which a client does not send again, with what the
+/// kernel has and what the boundary needs, and before the request makes a directory. The kernel is
+/// not changed: the answer to the boundary's own probe is, on this thread only.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_kernel_without_the_interface_the_boundary_needs_runs_no_git_on_any_route() {
@@ -1133,6 +1133,20 @@ fn a_kernel_without_the_interface_the_boundary_needs_runs_no_git_on_any_route() 
         Duration::from_secs(60),
     )
     .expect("a profile is prepared without asking anything of Git");
+    // Where there is no repository Git runs and says so, which a refusal for the kernel does not.
+    // This is also what makes the fixture's profile one that has found its Git.
+    fixture
+        .service()
+        .profile()
+        .run(&GitRequest::read(fixture.work(), &arguments))
+        .expect("on the real kernel Git runs");
+    let installed = kr_project::git::GitProgram::discover().expect("this machine has Git");
+    let handed = kr_project::git::RestrictedProfile::prepare_with(
+        &fixture.work().join("handed"),
+        fixture.environment_id(),
+        installed,
+    )
+    .expect("a profile is prepared around the Git it is handed");
 
     kr_project::boundary::with_kernel_interface(2, || {
         let refusal = fixture
@@ -1140,7 +1154,14 @@ fn a_kernel_without_the_interface_the_boundary_needs_runs_no_git_on_any_route() 
             .profile()
             .run(&GitRequest::read(fixture.work(), &arguments))
             .expect_err("no Git runs on this kernel");
-        assert_refused_for_the_kernel(&refusal, "the profile's run");
+        assert_refused_for_the_kernel(&refusal, "the run of a profile that found its Git");
+
+        let refusal = handed
+            .run(&GitRequest::read(fixture.work(), &arguments))
+            .expect_err("no Git runs on this kernel, whichever Git a profile was handed");
+        assert_refused_for_the_kernel(&refusal, "the run of a profile that was handed its Git");
+        let refusal = handed.git().expect_err("nor is it given out");
+        assert_refused_for_the_kernel(&refusal, "the Git a profile was handed");
 
         let refusal = searching
             .git()
@@ -1167,13 +1188,22 @@ fn a_kernel_without_the_interface_the_boundary_needs_runs_no_git_on_any_route() 
     });
 
     assert!(!never_made.exists(), "and the request made no directory");
-    // The control: the same profile runs Git where the kernel is the real one.
-    // Where there is no repository Git runs and says so, which a refusal for the kernel does not.
-    fixture
-        .service()
-        .profile()
-        .run(&GitRequest::read(fixture.work(), &arguments))
-        .expect("on the real kernel Git runs");
+    let staged = std::fs::read_dir(fixture.work())
+        .expect("the directory repositories are made in")
+        .filter_map(std::result::Result::ok)
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(kr_project::operation::STAGING_PREFIX)
+        });
+    assert!(!staged, "nor a staging directory");
+    // The control: the same profiles run Git where the kernel is the real one.
+    for profile in [fixture.service().profile(), &handed] {
+        profile
+            .run(&GitRequest::read(fixture.work(), &arguments))
+            .expect("on the real kernel Git runs");
+    }
 }
 
 #[test]
