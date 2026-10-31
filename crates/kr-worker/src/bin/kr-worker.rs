@@ -124,6 +124,14 @@ fn main() -> ExitCode {
     }
 }
 
+/// How long an idle thread of the blocking pool is kept before it ends.
+///
+/// The host's maintenance pass hands its scheduler thread over to the pool once a minute, so a
+/// pool that lets an idle thread go after ten seconds starts a thread, and later ends it, for each
+/// pass of an idle session. A little over the pass's period lets the next pass find the thread it
+/// used.
+const BLOCKING_THREAD_KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(90);
+
 /// The runtime this worker runs on: one scheduler thread per processor, and at most four.
 ///
 /// A worker serves one session, so a thread per processor of a large host is memory held for no
@@ -136,6 +144,7 @@ fn main() -> ExitCode {
 fn session_runtime(processors: usize) -> std::io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(processors.clamp(1, 4))
+        .thread_keep_alive(BLOCKING_THREAD_KEEP_ALIVE)
         .enable_all()
         .build()
 }
