@@ -19,9 +19,9 @@ pub(crate) fn create_directory_durably(path: &Path) -> Result<bool> {
 }
 
 /// Creates a directory of this host's own and makes the entry that names it durable. What it makes
-/// is owner-only on Unix whatever the process's mask, as the rest of this host's state is; a
-/// directory that exists is used as it is, as an earlier release may have made it with the mask's
-/// mode inside a state directory that was always owner-only.
+/// is owner-only on Unix whatever the process's mask; a directory that exists is used as it is, as
+/// an earlier release may have made it with the mask's mode inside a state directory that was
+/// always owner-only.
 pub(crate) fn create_private_directory_durably(path: &Path) -> Result<()> {
     create_missing_durably(path, kr_ipc::paths::create_dir_all_owner_only).map(|_| ())
 }

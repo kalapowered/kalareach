@@ -364,9 +364,9 @@ impl ProjectError {
             | Self::UnknownOperation { .. }
             | Self::UnknownLocation { .. } => ErrorCode::ResourceUnavailable,
             Self::Unconfirmed { .. } => ErrorCode::OwnerConfirmationRequired,
-            // A destination that is taken, a repository whose identity moved and a configuration
-            // this host will not execute are all the same answer to a caller: change the thing you
-            // named and ask again.
+            // A destination that is taken is the caller's own argument: change the thing you named
+            // and ask again. A repository or a tree whose identity moved is a source that changed,
+            // and a remote or a configuration this host will not execute is untrusted.
             Self::Destination { .. } => ErrorCode::InvalidArgument,
             Self::AdoptionRequired { .. } => ErrorCode::InvalidArgument,
             Self::IdentityChanged { .. } => ErrorCode::SourceChanged,
