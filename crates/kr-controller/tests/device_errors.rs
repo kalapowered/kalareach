@@ -20,6 +20,7 @@ use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::Nullable;
 use kr_protocol::session::{Presentation, SessionCreateParams, ShellMode};
 
+use net_support::environment::{Environment, from};
 use net_support::{Device, Host, RawDevice, on_the_host, pair_with, proposal};
 
 /// The name of an account on the machine the host runs on, and so of the home directory the host's
@@ -227,4 +228,56 @@ async fn a_refusal_that_names_nothing_of_the_host_reaches_a_device_whole() {
 
     world.device.close();
     world.host.stop().await;
+}
+
+/// The socket of a session's worker is told to the owner and withheld from a device.
+///
+/// One real worker adopted by the daemon, read by the owner on the local socket and by a device
+/// over the transport. The owner is given the path as it is; the device is given the withheld
+/// record of a path as long as the owner's, and the session's working directory and shell as they
+/// are.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_socket_of_a_sessions_worker_is_told_to_the_owner_and_withheld_from_a_device() {
+    let environment = Environment::start().await;
+    let params = kr_protocol::session::SessionReadParams {
+        session_id: environment.worker.session_id,
+    };
+    let mut local = environment.host.client().await;
+    let owner: kr_protocol::session::SessionReadResult = local
+        .request(Method::SessionRead, &params)
+        .await
+        .expect("the call reaches the daemon")
+        .expect("session.read answers the owner")
+        .to_typed()
+        .expect("decodes");
+    let socket = owner
+        .endpoint
+        .0
+        .clone()
+        .expect("the owner is told the socket");
+    assert!(socket.starts_with('/'), "{socket}");
+
+    let device = environment
+        .device(from(&[ActionRight::SessionView], 1))
+        .await;
+    let read: kr_protocol::session::SessionReadResult = device
+        .connection
+        .read(Method::SessionRead, &params)
+        .await
+        .expect("a device that may view the session reads it")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(
+        read.endpoint.0,
+        Some(kr_protocol::hostinfo::export::withheld(
+            kr_protocol::hostinfo::export::ContentClass::Path,
+            &socket
+        ))
+    );
+    // The session's working directory and shell are shown to a device as they are shown the owner.
+    assert_eq!(read.session.session_id, owner.session.session_id);
+    assert_eq!(read.session.cwd, owner.session.cwd);
+    assert_eq!(read.session.shell_path, owner.session.shell_path);
+    device.connection.close();
+    environment.stop().await;
 }

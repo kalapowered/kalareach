@@ -142,26 +142,49 @@ fn output_for(
     stream: &Arc<HeldStream>,
     actor_id: ActorId,
 ) -> RemoteOutput {
+    RemoteOutput::writing_to(
+        Box::new(Arc::clone(stream)),
+        authority_for(controller, actor_id),
+    )
+}
+
+/// The write boundary of a connection registered for a test device, writing to `stream`, to a peer
+/// that said in its hello it can receive no more than `receiving`: as an authorised connection's
+/// is built.
+fn output_receiving(
+    controller: &Arc<Controller>,
+    stream: &Arc<HeldStream>,
+    receiving: &kr_protocol::hello::ReceiveLimits,
+) -> RemoteOutput {
+    RemoteOutput::for_a_peer_receiving(
+        Box::new(Arc::clone(stream)),
+        authority_for(
+            controller,
+            ActorId::new("device:test").expect("a principal"),
+        ),
+        receiving,
+    )
+}
+
+/// The authority of a connection registered for `actor_id`.
+fn authority_for(controller: &Arc<Controller>, actor_id: ActorId) -> Arc<Authorisation> {
     let connection_id = ConnectionId::new(kr_ipc::new_uuid());
     controller.admitted_write().insert(
         connection_id,
         crate::service::AdmittedConnection::new(actor_id, controller.policy().authority_revision()),
     );
-    RemoteOutput::writing_to(
-        Box::new(Arc::clone(stream)),
-        Arc::new(Authorisation {
-            controller: Arc::clone(controller),
-            devices: Arc::clone(controller.devices()),
-            pending: Arc::new(crate::service::net::devices::PendingExpiry::default()),
-            clock: Arc::clone(controller.lifetimes().clock_trust()),
-            device_id: DeviceId::new(kr_ipc::new_uuid()),
-            connection_id,
-            grant_deadline: None,
-            grant_expires_at_ms: None,
-            expired: AtomicBool::new(false),
-            recorded: AtomicBool::new(false),
-        }),
-    )
+    Arc::new(Authorisation {
+        controller: Arc::clone(controller),
+        devices: Arc::clone(controller.devices()),
+        pending: Arc::new(crate::service::net::devices::PendingExpiry::default()),
+        clock: Arc::clone(controller.lifetimes().clock_trust()),
+        device_id: DeviceId::new(kr_ipc::new_uuid()),
+        connection_id,
+        grant_deadline: None,
+        grant_expires_at_ms: None,
+        expired: AtomicBool::new(false),
+        recorded: AtomicBool::new(false),
+    })
 }
 
 /// The decision a batch was written under, taken now and bounded by nothing but events.
@@ -2983,10 +3006,18 @@ async fn an_answer_the_hosts_edits_make_too_large_for_the_device_is_not_written(
     let temp = kr_ipc::testing::TempHost::create();
     let controller = super::super::tests::daemon(&temp).await;
 
+    // What a peer says it can receive is the whole frame, its length prefix included.
+    let receiving = |payload: usize| kr_protocol::hello::ReceiveLimits {
+        max_control_frame_len: kr_protocol::scalars::U64::new(
+            (payload + kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN) as u64,
+        ),
+        ..kr_protocol::hello::ReceiveLimits::default()
+    };
+
     // The limit the original fits and the edited answer does not: the answer is refused.
     let stream = HeldStream::new(false);
     stream.writer.add_permits(2);
-    let limited = output(&controller, &stream).limited_to(answer_before);
+    let limited = output_receiving(&controller, &stream, &receiving(answer_before));
     assert!(limited.send(&answer).await, "the refusal is written");
     let ControlFrame::Response(Response {
         request_id,
@@ -2998,14 +3029,14 @@ async fn an_answer_the_hosts_edits_make_too_large_for_the_device_is_not_written(
     assert_eq!(request_id, RequestId::new(9));
     assert_eq!(refused.code, kr_protocol::error::ErrorCode::InvalidArgument);
     // A notification has no request to refuse, so the connection ends with nothing written.
-    let limited = output(&controller, &stream).limited_to(notice_before);
+    let limited = output_receiving(&controller, &stream, &receiving(notice_before));
     assert!(!limited.send(&notice).await);
     assert_eq!(stream.frames().len(), 1, "nothing of the notification went");
 
     // The limit the edited answer fits: it is written as edited.
     let stream = HeldStream::new(false);
     stream.writer.add_permits(1);
-    let roomy = output(&controller, &stream).limited_to(answer_after);
+    let roomy = output_receiving(&controller, &stream, &receiving(answer_after));
     assert!(roomy.send(&answer).await);
     assert_eq!(stream.frames(), vec![shown(&answer)]);
     drop(controller);
