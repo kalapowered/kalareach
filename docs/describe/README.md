@@ -209,24 +209,25 @@ load or a job failed. If the job recorded a refused commit, the daemon takes it 
 ended for memory: the process is ended, inference pauses with `memory_pressure` as it does for a
 reading past the ceiling, and the job is not retried. The answer of the load or the job in hand,
 when it does not say that the load or the job failed, clears what the job recorded, so a refusal the
-runtime got over does not count against a later end. The job's message and the process's frames
-reach the daemon by different routes, with no order between them, so the daemon cannot tell a
-refusal the runtime got over from one the system posted just after the runtime wrote that answer.
-Both are cleared when the daemon handles the answer, and the end that follows the second reads as an
-ordinary end; a refusal posted after that stays recorded for the end it leads to. An answer for
-other work, a late or a repeated one, neither clears nor uses it. Windows does not promise to
-deliver the job's message, so a refusal that was not recorded reads as an ordinary end or an
-ordinary failure. On the build this was tried on (Windows Server 2025, build 26100), a process that
-asked the system for memory four times, with nothing done between the first two requests, a small
-commit kept for the third and given back for the fourth, was refused all four and had only the first
-recorded. A later refusal may therefore leave no record, and it reads as an ordinary failure. A
-failed job unloads the process and restarts inference, and the next process may record a first
-refusal of its own. A failed load leaves the process in place with no model, and the next load,
-after the restart delay, goes to it, so failures in a row can pause inference as `inference_failed`
-and not as `memory_pressure`. The limit is on committed memory and not on the resident set, so it
-does not count the weights a model maps for reading, and the daemon's reading stays the measure of
-the resident set. A host that will not apply the limit says so on its standard error and keeps the
-daemon's reading as the only ender.
+runtime got over does not count against a later end. The system posts the job's message inside the
+refused call, so an answer written after that call finds it. But the message and the process's
+frames reach the daemon by different routes, and nothing orders a refusal posted after the runtime
+wrote an answer against the daemon's handling of that answer, so the daemon cannot tell it from a
+refusal the runtime got over. Both are cleared when the daemon handles the answer, and the end that
+follows the second reads as an ordinary end; a refusal posted after that stays recorded for the end
+it leads to. An answer for other work, a late or a repeated one, neither clears nor uses it. Windows
+does not promise to deliver the job's message, so a refusal that was not recorded reads as an
+ordinary end or an ordinary failure. On the build this was tried on (Windows Server 2025, build
+26100), a process that asked the system for memory four times, with nothing done between the first
+two requests, a small commit kept for the third and given back for the fourth, was refused all four
+and had only the first recorded. A later refusal may therefore leave no record, and it reads as an
+ordinary failure. A failed job unloads the process and restarts inference, and the next process may
+record a first refusal of its own. A failed load leaves the process in place with no model, and the
+next load, after the restart delay, goes to it, so failures in a row can pause inference as
+`inference_failed` and not as `memory_pressure`. The limit is on committed memory and not on the
+resident set, so it does not count the weights a model maps for reading, and the daemon's reading
+stays the measure of the resident set. A host that will not apply the limit says so on its standard
+error and keeps the daemon's reading as the only ender.
 
 CPU-only is two settings rather than one. Zero GPU layers keeps every layer's weights on the
 processor; turning the library's *operation* offload off keeps the arithmetic there too, because the
