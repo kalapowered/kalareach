@@ -874,6 +874,62 @@ async fn a_held_page_answers_at_its_bound() {
     assert!(answered.questions.records.is_empty() && answered.host_events.records.is_empty());
 }
 
+/// KR-PERF-003: the same request for a session whose journal nothing has been committed to since is
+/// answered with the page it was answered with, without the journal being read again; a commit
+/// makes the next page a read, and the page then carries what was committed.
+#[tokio::test]
+async fn kr_perf_003_an_empty_page_is_not_read_again_while_nothing_is_committed() {
+    let host = host().await;
+    let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
+
+    let first = page(&mut link, sources(0, 0, 0)).await;
+    let read_once = host.service.attention_pages_read();
+    assert_eq!(read_once, 1, "the first page is read from the journal");
+    for _ in 0..3 {
+        let again = page(&mut link, sources(0, 0, 0)).await;
+        assert_eq!(again.questions.head, first.questions.head);
+        assert_eq!(again.privacy_generation, first.privacy_generation);
+        assert!(again.questions.records.is_empty() && again.host_events.records.is_empty());
+    }
+    assert_eq!(
+        host.service.attention_pages_read(),
+        read_once,
+        "the same request, with nothing committed since, is not read again"
+    );
+
+    // A commit makes the next page a read, and the page carries what was committed.
+    let question = ask(&host, "a request", "which of the two?");
+    let after = page(&mut link, sources(0, 0, 0)).await;
+    assert_eq!(
+        after.questions.records.len(),
+        1,
+        "the question committed since the last page is on this one"
+    );
+    assert_eq!(after.questions.records[0].question_id, question.question_id);
+    assert_eq!(host.service.attention_pages_read(), read_once + 1);
+
+    // A page that carries a record is read each time it is asked for: it holds text that privacy
+    // mode may take away.
+    let carried = page(&mut link, sources(0, 0, 0)).await;
+    assert_eq!(carried.questions.records.len(), 1);
+    assert_eq!(host.service.attention_pages_read(), read_once + 2);
+
+    // Past that record the page is empty again, and a different request is a different page.
+    let past = page(&mut link, sources(after.questions.head.get(), 0, 0)).await;
+    assert!(past.questions.records.is_empty());
+    assert_eq!(host.service.attention_pages_read(), read_once + 3);
+    let again = page(&mut link, sources(after.questions.head.get(), 0, 0)).await;
+    assert!(again.questions.records.is_empty());
+    assert_eq!(
+        host.service.attention_pages_read(),
+        read_once + 3,
+        "and is kept as the last one was"
+    );
+    let other = page(&mut link, sources(after.questions.head.get(), 7, 0)).await;
+    assert!(other.questions.records.is_empty());
+    assert_eq!(host.service.attention_pages_read(), read_once + 4);
+}
+
 /// A newer request replaces a held one, which then answers nothing, even when something it
 /// would have answered with is committed afterwards.
 #[tokio::test]
