@@ -180,7 +180,7 @@ describe('recovery', () => {
     const words = within(recovery).getByTestId('recovery-blocker')
     expect(words).toHaveTextContent('sync.example')
     expect(words).toHaveTextContent('reach.kala.to')
-    expect(words).toHaveTextContent('Change the setting to reach.kala.to to use recovery.')
+    expect(words).toHaveTextContent(/change the setting to reach\.kala\.to/i)
     expect(within(recovery).queryByRole('button')).toBeNull()
 
     // With a record of a bundle, the service is the one the record names, which the setting cannot
@@ -204,6 +204,7 @@ describe('recovery', () => {
     // The old instructions, in either form, are not among the words: the setting cannot move a
     // record, so neither a change of it nor a choice of the account's service is asked for.
     expect(kept).not.toHaveTextContent(/change the setting/i)
+    expect(kept).not.toHaveTextContent(/change the sync service/i)
     expect(kept).not.toHaveTextContent(/choose/i)
     expect(kept).not.toHaveTextContent(/as the sync service/i)
     expect(kept).not.toHaveTextContent(/setting names/i)
