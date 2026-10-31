@@ -5751,8 +5751,8 @@ async fn until_the_carriers_first_pass_has_ended(rig: &Rig) {
     .await;
 }
 
-/// Raises the gate on the account token after the call's first request for one, and waits until the
-/// request after it is the one held. The call's check that a token can be had is that first request.
+/// Raises the gate on the account token once the carrier has settled, with one request let through:
+/// the call's check that a token can be had is that request, and the one after it is held.
 async fn hold_the_request_after_the_first_for_its_token(
     rig: &Rig,
 ) -> kr_controller::account::TokenRequestsHeld {
@@ -5782,6 +5782,7 @@ async fn a_fence_owed_while_the_retention_change_waits_for_its_token_stops_it() 
     let (rig, _) = a_host_to_set_up(&timer).await;
     let web = Arc::clone(rig.served.web());
     let made = rig.prepared_setup(archive_id(), false);
+    until_the_carriers_first_pass_has_ended(&rig).await;
     web.fail(STATUS, 1, Moment::Slow);
     let call = rig.enable_outcome_in_the_background(&made.params);
     within(
@@ -5825,6 +5826,7 @@ async fn a_fence_owed_while_the_call_waits_for_its_token_stops_the_bundle_write(
     let (rig, _) = a_host_to_set_up(&timer).await;
     let web = Arc::clone(rig.served.web());
     let made = rig.prepared_setup(archive_id(), false);
+    until_the_carriers_first_pass_has_ended(&rig).await;
     let tokens = rig.controller.host_account().hold_token_requests();
     let call = rig.enable_outcome_in_the_background(&made.params);
     until_a_request_waits_for_its_token(&rig).await;
@@ -5928,6 +5930,7 @@ async fn a_fence_owed_while_the_service_has_asked_to_be_left_alone_refuses_the_c
         rig.enable(&made.params).await,
         BackupEnableResult::Unknown { .. }
     ));
+    until_the_carriers_first_pass_has_ended(&rig).await;
     let tokens = rig.controller.host_account().hold_token_requests();
     let call = rig.enable_outcome_in_the_background(&made.params);
     until_a_request_waits_for_its_token(&rig).await;
