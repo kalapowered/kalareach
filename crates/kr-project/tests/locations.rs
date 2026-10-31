@@ -796,15 +796,7 @@ fn a_tree_removed_from_under_its_source_location_is_a_source_that_changed() {
 
     let refusal = fixture
         .service()
-        .workspace_remove(
-            &WorkspaceRemoveParams {
-                workspace_id: selected.workspace_id,
-                retention: RetentionPolicy::RemoveRetained,
-                through_location_id: Nullable(None),
-            },
-            kr_project::store::Performed::from(Some(&action("workspace.remove", 34)))
-                .bounded_by(grant),
-        )
+        .open_workspace_repository_for(selected.workspace_id, grant)
         .expect_err("a record whose tree is gone from under its location names nothing there");
 
     assert_eq!(refusal.code(), ErrorCode::SourceChanged, "{refusal}");
