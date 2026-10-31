@@ -5913,6 +5913,11 @@ async fn a_fence_owed_while_the_service_has_asked_to_be_left_alone_refuses_the_c
         rig.enable(&made.params).await,
         BackupEnableResult::Unknown { retry_after_seconds } if retry_after_seconds.0.is_some()
     ));
+    assert_eq!(
+        web.requests_to(SYNC),
+        1,
+        "the delay kept the control call from sending its bundle"
+    );
 }
 
 /// KR-REQ-09.09: a call that meets a fence while it waits on the service is refused for the fence
