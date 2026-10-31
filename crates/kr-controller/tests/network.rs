@@ -6291,31 +6291,37 @@ async fn watching_a_shared_screen(
 /// The worker detaches a connection's attachments when the host lets go of that connection's link,
 /// so the owner's own view of the session says when a device was released, whatever the device
 /// itself has been told.
+///
+/// The whole wait is bounded, each request included: the local client's request has no timer of
+/// its own, so a daemon that stopped answering would otherwise hold it for good.
 async fn waits_for_attachments(
     local: &mut LocalClient,
     session_id: SessionId,
     attachments: u64,
     why: &str,
 ) {
-    let deadline = tokio::time::Instant::now() + PATIENCE;
-    loop {
-        let read: SessionReadResult = local
-            .request(Method::SessionRead, &SessionReadParams { session_id })
-            .await
-            .expect("the call reaches the daemon")
-            .expect("the owner's connection is served")
-            .to_typed()
-            .expect("decodes");
-        if read.session.attachment_count.get() == attachments {
-            return;
+    let mut held = None;
+    let waited = tokio::time::timeout(PATIENCE, async {
+        loop {
+            let read: SessionReadResult = local
+                .request(Method::SessionRead, &SessionReadParams { session_id })
+                .await
+                .expect("the call reaches the daemon")
+                .expect("the owner's connection is served")
+                .to_typed()
+                .expect("decodes");
+            held = Some(read.session.attachment_count.get());
+            if held == Some(attachments) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "{why}: the session holds {} attachments, not {attachments}",
-            read.session.attachment_count.get()
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    })
+    .await;
+    assert!(
+        waited.is_ok(),
+        "{why}: after {PATIENCE:?} the session holds {held:?} attachments, not {attachments}"
+    );
 }
 
 /// Withdraws a share as the local owner.
