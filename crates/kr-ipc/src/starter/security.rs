@@ -10,14 +10,20 @@
 //! narrow: the starter's own entries with allowing entries left out, other than one for the
 //! owner's rights, and denying entries put in, still in the starter's order. The flags that say
 //! which children inherit an entry, and entries that only children inherit, are not compared,
-//! except in an entry for the owner's rights, which is compared whole.
+//! except in an allowing entry for the owner's rights, which is compared whole.
 //!
 //! Any other list is refused as well, whether or not it admits more, and the refusal says which
-//! it is. An object "admits more" when its text shows it: no access list, a null one, an allowing
-//! entry for a trustee that the starter's own allows nothing, a denying entry taken away, a lower
-//! integrity label. An object whose entries differ in any other way (other rights on an entry,
-//! another order, an entry more or less often) "is not one the starter accepts", because the text
-//! alone does not show that it admits more.
+//! it is. An object "admits more" when its entries show a loss that the starter's own does not
+//! have: no access list, a null one, an allowing entry for a trustee that the starter's own allows
+//! nothing (other than the owner's rights), a denying entry taken away, a lower integrity level or
+//! a weaker policy. That is a reading of the entries, not an evaluation of which entry decides for
+//! a given process, so an allowing entry behind a denying one is still called wider. An object
+//! whose entries differ in any other way (other rights on an entry, another order, an entry more
+//! or less often, an entry for the owner's rights left out) "is not one the starter accepts",
+//! because this module compares neither rights nor order.
+//!
+//! The text of an access list is checked against the system's own count of its entries, so that no
+//! text, whatever it holds, can be read as fewer entries than the list has.
 //!
 //! The text is what the system writes for a descriptor, `D:` and its entries for an access list or
 //! `S:` and its label entry for the integrity label. Nothing here calls the system, so it is read
@@ -29,6 +35,9 @@ use std::fmt;
 pub(super) struct Texts<'a> {
     /// The access list, for a descriptor asked for it alone.
     pub(super) access: &'a str,
+    /// How many entries the access list itself holds, as the system counts them, which the text
+    /// must account for.
+    pub(super) access_entries: usize,
     /// The integrity label, for a descriptor asked for it alone.
     pub(super) label: &'a str,
 }
@@ -106,8 +115,8 @@ impl Refusal {
 pub(super) fn require_no_more(own: &Texts<'_>, found: &Texts<'_>) -> Result<(), Stop> {
     let unreadable = |what: &'static str| move |why| Stop::Unreadable { what, why };
     let (own_list, found_list) = (
-        access_list(own.access).map_err(unreadable("access list"))?,
-        access_list(found.access).map_err(unreadable("access list"))?,
+        access_list_of(own.access, own.access_entries).map_err(unreadable("access list"))?,
+        access_list_of(found.access, found.access_entries).map_err(unreadable("access list"))?,
     );
     if let Some(refusal) = access_list_refusal(&own_list, &found_list) {
         return Err(Stop::Refused {
@@ -181,15 +190,40 @@ const IMPLICIT_LABEL: Label = Label {
 /// The policy bit that refuses a write from a lower level.
 const NO_WRITE_UP: u32 = 0x1;
 
-/// Reads the access list from the text of a descriptor asked for its access list alone.
+/// Reads the access list from the text of a descriptor asked for its access list alone, and
+/// requires the text to hold as many entries as the list itself does.
+///
+/// # Errors
+///
+/// Returns what was not understood when the text is not an access list, or that it holds another
+/// number of entries than the list.
+fn access_list_of(text: &str, entries: usize) -> Result<AccessList, String> {
+    let (list, written) = read_access_list(text)?;
+    if written != entries {
+        return Err(format!(
+            "the text holds {written} entries where the list holds {entries}: {:?}",
+            text.trim()
+        ));
+    }
+    Ok(list)
+}
+
+/// Reads the access list from the text alone.
+#[cfg(test)]
+fn access_list(text: &str) -> Result<AccessList, String> {
+    read_access_list(text).map(|(list, _)| list)
+}
+
+/// Reads the access list from the text of a descriptor asked for its access list alone, with the
+/// number of entries the text holds.
 ///
 /// # Errors
 ///
 /// Returns what was not understood when the text is not an access list.
-fn access_list(text: &str) -> Result<AccessList, String> {
+fn read_access_list(text: &str) -> Result<(AccessList, usize), String> {
     let text = text.trim();
     if text.is_empty() {
-        return Ok(AccessList::Absent);
+        return Ok((AccessList::Absent, 0));
     }
     let Some(rest) = text.strip_prefix("D:") else {
         return Err(format!("{text:?} does not begin with an access list"));
@@ -197,13 +231,15 @@ fn access_list(text: &str) -> Result<AccessList, String> {
     let (flags, entries) = rest.find('(').map_or((rest, ""), |at| rest.split_at(at));
     if flags.contains("NO_ACCESS_CONTROL") {
         return if entries.is_empty() {
-            Ok(AccessList::Null)
+            Ok((AccessList::Null, 0))
         } else {
             Err(format!("{text:?} has entries in a null access list"))
         };
     }
     let mut list = Vec::new();
-    for inner in parenthesised(entries)? {
+    let written = parenthesised(entries)?;
+    let count = written.len();
+    for inner in written {
         let mut fields = split_top_level(inner);
         if fields.len() < 6 {
             return Err(format!("the entry ({inner}) has too few fields"));
@@ -238,7 +274,7 @@ fn access_list(text: &str) -> Result<AccessList, String> {
             trustee,
         });
     }
-    Ok(AccessList::Entries(list))
+    Ok((AccessList::Entries(list), count))
 }
 
 /// Reads the integrity label from the text of a descriptor asked for its label alone.
@@ -420,15 +456,22 @@ fn outside_literals(text: &str) -> impl Iterator<Item = (usize, char)> + '_ {
 }
 
 /// The text inside each top-level pair of parentheses of `text`, which holds nothing else.
+///
+/// A string literal of a condition may hold parentheses, which do not count, and ends at the next
+/// double quote. A double quote outside an entry, and an entry or a literal that is not closed,
+/// are errors.
 fn parenthesised(text: &str) -> Result<Vec<&str>, String> {
-    if !text.matches('"').count().is_multiple_of(2) {
-        return Err(format!("{text:?} leaves a string open"));
-    }
     let mut entries = Vec::new();
     let mut depth = 0_u32;
     let mut start = 0;
-    for (index, character) in outside_literals(text) {
+    let mut inside = false;
+    for (index, character) in text.char_indices() {
         match character {
+            '"' if depth == 0 => {
+                return Err(format!("{text:?} has a string outside an entry"));
+            }
+            '"' => inside = !inside,
+            _ if inside => {}
             '(' => {
                 if depth == 0 {
                     start = index + 1;
@@ -449,8 +492,10 @@ fn parenthesised(text: &str) -> Result<Vec<&str>, String> {
             _ => {}
         }
     }
+    // A string that is never closed holds every parenthesis after it, so the entry it is in is
+    // never closed either.
     if depth != 0 {
-        return Err(format!("{text:?} leaves a parenthesis open"));
+        return Err(format!("{text:?} leaves a parenthesis or a string open"));
     }
     Ok(entries)
 }
@@ -538,6 +583,32 @@ mod tests {
     /// Refused although the text does not show that it admits more.
     fn not_accepted(own: &str, found: &str) -> bool {
         !why(own, found).admits_more
+    }
+
+    /// The number of entries a text of honest input holds, counted by its parentheses alone, as
+    /// the system counts the entries of the list it wrote the text from.
+    fn counted(access: &str) -> usize {
+        let mut depth = 0_u32;
+        let mut entries = 0;
+        for character in access.chars() {
+            match character {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    entries += usize::from(depth == 0);
+                }
+                _ => {}
+            }
+        }
+        entries
+    }
+
+    fn texts<'a>(access: &'a str, label: &'a str) -> Texts<'a> {
+        Texts {
+            access,
+            access_entries: counted(access),
+            label,
+        }
     }
 
     fn entries(text: &str) -> usize {
@@ -888,11 +959,8 @@ mod tests {
     fn an_object_is_used_only_when_its_access_list_and_its_label_are_acceptable() {
         let own_list = "D:(A;;0x1;;;SY)(A;;0x1;;;S-1-5-5-0-1)";
         let medium = "S:(ML;;NW;;;ME)";
-        let own = Texts {
-            access: own_list,
-            label: medium,
-        };
-        let found = |access, label| require_no_more(&own, &Texts { access, label });
+        let own = texts(own_list, medium);
+        let found = |access, label| require_no_more(&own, &texts(access, label));
         assert_eq!(found(own_list, medium), Ok(()));
         // Less of both, and the medium label that no label stands for.
         assert_eq!(found("D:(A;;0x1;;;SY)", ""), Ok(()));
@@ -942,16 +1010,74 @@ mod tests {
         );
     }
 
+    /// KR-REQ-03.24: a text is read only when it holds as many entries as the list it was written
+    /// from, so that whatever a string of a condition holds, no entry of the list goes unread: a
+    /// double quote inside a string, for which the grammar has no form, would otherwise end the
+    /// string early and hide the entries up to the next quote.
+    #[test]
+    fn a_text_that_holds_fewer_entries_than_the_list_is_not_read() {
+        let hiding = "D:(XD;;0x1;;;BG;(@User.X==\"a\"b\"))(A;;GA;;;WD)\
+                      (XD;;0x1;;;BG;(@User.X==\"c\"d\"))(A;;0x1;;;SY)";
+        // Read for itself the text has two entries, and the list it came from has four.
+        assert_eq!(entries(hiding), 2);
+        let own = texts("D:(A;;0x1;;;SY)", "");
+        let hidden = require_no_more(
+            &own,
+            &Texts {
+                access: hiding,
+                access_entries: 4,
+                label: "",
+            },
+        );
+        assert!(
+            matches!(&hidden, Err(stop) if stop.is_unreadable()),
+            "{hidden:?}"
+        );
+        // A text that holds the entries the list holds is read as before, and so is a null list.
+        let honest = "D:(A;;0x1;;;SY)(A;;0x1;;;WD)";
+        assert!(matches!(
+            require_no_more(&own, &texts(honest, "")),
+            Err(Stop::Refused { .. })
+        ));
+        let more = require_no_more(
+            &own,
+            &Texts {
+                access: honest,
+                access_entries: 1,
+                label: "",
+            },
+        );
+        assert!(
+            matches!(&more, Err(stop) if stop.is_unreadable()),
+            "{more:?}"
+        );
+        assert_eq!(
+            require_no_more(
+                &Texts {
+                    access: "D:NO_ACCESS_CONTROL",
+                    access_entries: 0,
+                    label: "",
+                },
+                &Texts {
+                    access: "D:(A;;0x1;;;SY)",
+                    access_entries: 1,
+                    label: "",
+                },
+            ),
+            Ok(())
+        );
+        // A string outside an entry is not skipped: it is an error, and so is one never closed.
+        assert!(access_list("D:(A;;0x1;;;SY)\"(A;;GA;;;WD)\"").is_err());
+        assert!(access_list("D:(A;;0x1;;;SY)(XA;;FX;;;WD;(@User.X==\"a))").is_err());
+    }
+
     /// KR-REQ-03.24: what a person reads says whether the object admits more, or is only one the
     /// starter does not accept.
     #[test]
     fn the_refusal_a_person_reads_says_whether_the_object_admits_more() {
-        let own = Texts {
-            access: "D:(A;;0xF;;;SY)",
-            label: "",
-        };
+        let own = texts("D:(A;;0xF;;;SY)", "");
         let said = |access| {
-            require_no_more(&own, &Texts { access, label: "" })
+            require_no_more(&own, &texts(access, ""))
                 .expect_err("refused")
                 .to_string()
         };

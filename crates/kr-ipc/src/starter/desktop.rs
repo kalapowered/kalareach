@@ -49,8 +49,9 @@ use windows_sys::Win32::Security::Authorization::{
     SE_WINDOW_OBJECT, SetSecurityInfo,
 };
 use windows_sys::Win32::Security::{
-    ACL, DACL_SECURITY_INFORMATION, InitializeSecurityDescriptor, LABEL_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SetSecurityDescriptorDacl,
+    ACL, ACL_SIZE_INFORMATION, AclSizeInformation, DACL_SECURITY_INFORMATION, GetAclInformation,
+    InitializeSecurityDescriptor, LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SetSecurityDescriptorDacl,
 };
 use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
 use windows_sys::Win32::System::StationsAndDesktops::{
@@ -414,10 +415,12 @@ impl Source {
         require_no_more(
             &Texts {
                 access: &own_access,
+                access_entries: self.access_entries()?,
                 label: &own_label,
             },
             &Texts {
                 access: &found_access,
+                access_entries: there.access_entries()?,
                 label: &found_label,
             },
         )
@@ -429,6 +432,30 @@ impl Source {
             };
             io::Error::new(kind, stop.to_string())
         })
+    }
+
+    /// How many entries this object's access list holds, as the system counts them, which the
+    /// text of the list must account for: a text that reads as fewer entries has hidden some.
+    fn access_entries(&self) -> io::Result<usize> {
+        if self.access.is_null() {
+            return Ok(0);
+        }
+        // SAFETY: all-zero is a valid value of this plain structure of counts.
+        let mut size: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: the list lives in this value's descriptor, and the structure is live and of the
+        // size given.
+        let read = unsafe {
+            GetAclInformation(
+                self.access,
+                (&raw mut size).cast(),
+                u32::try_from(size_of::<ACL_SIZE_INFORMATION>()).unwrap_or(0),
+                AclSizeInformation,
+            )
+        };
+        if read == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(usize::try_from(size.AceCount).unwrap_or(usize::MAX))
     }
 
     /// The text of one of this object's lists, as security descriptors are written in.
