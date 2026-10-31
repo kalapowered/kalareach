@@ -241,6 +241,41 @@ pub struct OutputHistory {
     times: Option<TimeIndex>,
     /// Whether the wall clock could be proved at the last append, which the rows record.
     clock_proven: bool,
+    /// What the environment's spools held when they were last measured for the host-wide cap.
+    host_reading: Option<HostReading>,
+}
+
+/// A measure of what every session on the host retains, and when it was taken.
+#[derive(Clone, Copy, Debug)]
+struct HostReading {
+    at: std::time::Instant,
+    /// What this session retained then.
+    session_bytes: u64,
+    /// What the host retained then, this session included.
+    host_bytes: u64,
+}
+
+/// How long a measure of the host's retained output stands for the next passes of a session whose
+/// own output has not changed.
+///
+/// Measuring means listing every session's spool and asking each file its size, and every live
+/// session does it on every pass of its maintenance, so twenty sessions made twenty times as many
+/// reads of the same directory each minute. A session whose own retained bytes are what they were
+/// has nothing new to give up for the host's cap unless another session has grown past it, and
+/// that session measures the host itself, on every pass that its own bytes have changed.
+const HOST_READING_STANDS_FOR: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Whether the host's retained output is to be measured again: it has not been, the session's own
+/// has changed since, or the measure is no longer one that stands.
+fn host_reading_due(
+    last: Option<HostReading>,
+    session_bytes: u64,
+    now: std::time::Instant,
+) -> bool {
+    last.is_none_or(|last| {
+        last.session_bytes != session_bytes
+            || now.saturating_duration_since(last.at) >= HOST_READING_STANDS_FOR
+    })
 }
 
 impl OutputHistory {
@@ -262,6 +297,7 @@ impl OutputHistory {
             evictions: VecDeque::new(),
             times: None,
             clock_proven: false,
+            host_reading: None,
         }
     }
 
@@ -935,7 +971,20 @@ impl OutputHistory {
         now_ms: TimestampMs,
         age_permitted: bool,
     ) -> Vec<Eviction> {
-        let host_bytes = retained_bytes_under(spools);
+        let session_bytes = self.retained_bytes();
+        let now = std::time::Instant::now();
+        let host_bytes = if host_reading_due(self.host_reading, session_bytes, now) {
+            let host_bytes = retained_bytes_under(spools);
+            self.host_reading = Some(HostReading {
+                at: now,
+                session_bytes,
+                host_bytes,
+            });
+            host_bytes
+        } else {
+            self.host_reading
+                .map_or(session_bytes, |reading| reading.host_bytes)
+        };
         self.apply_retention(retention, host_bytes, now_ms, age_permitted)
     }
 
@@ -3693,6 +3742,38 @@ mod tests {
     /// written through its handle is sized by the bytes written to it, so the retained output the
     /// 1 GiB host cap is held against is not undercounted while a spool is being written. Not shown
     /// here: the cap being applied to that figure.
+    /// KR-PERF-003: a session that is idle measures the host's retained output once in a while and
+    /// not on every pass of its maintenance, and measures again at once when its own output moved.
+    #[test]
+    fn kr_perf_003_the_host_is_measured_again_when_the_session_has_changed_or_the_measure_is_old() {
+        let started = std::time::Instant::now();
+        let reading = HostReading {
+            at: started,
+            session_bytes: 4_096,
+            host_bytes: 1_000_000,
+        };
+        assert!(
+            host_reading_due(None, 4_096, started),
+            "a session that has not measured the host does"
+        );
+        assert!(
+            !host_reading_due(Some(reading), 4_096, started + HOST_READING_STANDS_FOR / 2),
+            "an idle session does not, on the passes between"
+        );
+        assert!(
+            host_reading_due(
+                Some(reading),
+                4_097,
+                started + std::time::Duration::from_secs(1)
+            ),
+            "a session whose output has changed does at once"
+        );
+        assert!(
+            host_reading_due(Some(reading), 4_096, started + HOST_READING_STANDS_FOR),
+            "and an idle one does when the measure has stood long enough"
+        );
+    }
+
     #[test]
     fn the_host_measure_sizes_a_segment_that_is_open_for_append_by_the_bytes_written_to_it() {
         use std::io::Write as _;
