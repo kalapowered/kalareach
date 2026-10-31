@@ -942,22 +942,32 @@ pub fn remove_units_through(
     .collect();
     // Where each unit runs is read from the file the manager keeps for it, and not asked of the
     // manager: `systemctl show` of many units has the manager build every property of each of them,
-    // which is about four milliseconds of its one thread for each unit it holds, and every test
-    // that ends asks it of every unit every test on the machine has started and not yet ended.
-    // That is the machine's whole user manager busy for half a second at each test's end, and
-    // while it is, a launch waits behind the questions.
+    // which is about four milliseconds of its one thread for each unit it holds. Asked at the end
+    // of every test, of every unit every test on the machine has started and not yet ended, that
+    // keeps the machine's whole user manager busy for half a second at each test's end, and a
+    // launch waits behind the questions. A unit the manager holds with no file of its own was not
+    // made by a start of this host, so it is not this tree's; a file that cannot be read says
+    // nothing about the unit, which is counted as not established.
     let transient = std::path::Path::new(&runtime).join("systemd/transient");
     for unit in listed
         .lines()
         .filter_map(|line| line.split_whitespace().next())
     {
-        let Some(directory) = std::fs::read_to_string(transient.join(unit))
-            .ok()
-            .and_then(|file| {
-                file.lines()
-                    .find_map(|line| line.strip_prefix("WorkingDirectory="))
-                    .map(str::to_owned)
-            })
+        let file = match std::fs::read_to_string(transient.join(unit)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                left.push(format!(
+                    "where the systemd unit {unit} runs could not be read: {error}"
+                ));
+                continue;
+            }
+        };
+        // A unit file writes a `%` twice, since a single one starts a specifier.
+        let Some(directory) = file
+            .lines()
+            .find_map(|line| line.strip_prefix("WorkingDirectory="))
+            .map(|value| value.replace("%%", "%"))
         else {
             continue;
         };
