@@ -239,8 +239,26 @@ fn to_its_end(mut command: Command, bound: Duration) -> std::process::Output {
             None if begun.elapsed() < bound => std::thread::sleep(Duration::from_millis(5)),
             None => {
                 let _ = child.kill();
-                let _ = child.wait();
-                panic!("{what} did not end within {bound:?}");
+                // A killed process is collected within a time of its own, and a process that does
+                // not go (one stuck in the kernel) is said to still be there.
+                let gone = Instant::now() + Duration::from_secs(10);
+                let ended = loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => break true,
+                        Ok(None) if Instant::now() < gone => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Ok(None) | Err(_) => break false,
+                    }
+                };
+                panic!(
+                    "{what} did not end within {bound:?}{}",
+                    if ended {
+                        ""
+                    } else {
+                        ", and was still there 10 s after it was killed"
+                    }
+                );
             }
         }
     };
@@ -749,24 +767,60 @@ fn no_script_chooses_a_virtual_device_except_through_the_library() {
     );
 }
 
-/// The wait for a case's jobs sees them: a process that has the case's directory in its command line
-/// is over when the wait returns. A wait whose pattern matches nothing returns at once and shows
-/// nothing, and the record it then reads has not got the calls the job has yet to make.
+/// The wait for a case's jobs sees them: a process that has the case's directory in its command
+/// line is still there when the wait has looked three times, and the wait returns only once the
+/// process has gone. A wait whose pattern matches nothing returns at once and shows nothing, and
+/// the record it then reads has not got the calls the job has yet to make.
 #[test]
 fn the_wait_for_the_jobs_of_a_case_sees_a_process_that_names_the_cases_directory() {
     let directory = TempDir::new().expect("a directory");
     let root = directory.path();
+    let tools = root.join("tools");
+    let record = root.join("record");
+    let go = root.join("go");
     let marker = root.join("marker");
-    // A job that does its work a moment after it starts, and names the case's directory only in its
-    // command line, as the jobs of a script do.
+    // The look is the real one, and each look is a line of the record.
+    stand_in(&tools, "pgrep", &record, "exec pgrep \"$@\"");
+    // A job that goes on until it is let go, then does its work, and names the case's directory
+    // only in its command line, as the jobs of a script do.
     let mut job = Command::new("/bin/sh")
-        .args(["-c", "sleep 1; : > \"$1\"", "job"])
+        .args([
+            "-c",
+            "while [ ! -e \"$1\" ]; do sleep 0.05; done; : > \"$2\"",
+            "job",
+        ])
+        .arg(&go)
         .arg(&marker)
         .spawn()
         .expect("starts the job");
-    until_nothing_of_the_case_runs(root);
+    let looks = || {
+        fs::read_to_string(&record)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let returned_while_the_job_ran = std::thread::scope(|scope| {
+        let waiting =
+            scope.spawn(|| until_nothing_runs_in(&tools.join("pgrep"), root, JOBS_END_WITHIN));
+        // The job is let go when the wait has looked three times with the job running, or when the
+        // wait has returned without having waited for it.
+        while !waiting.is_finished() && looks() < 3 {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let early = waiting.is_finished();
+        fs::write(&go, "").expect("lets the job go");
+        waiting
+            .join()
+            .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+        early
+    });
     let recorded = marker.exists();
     let _ = job.wait();
+    assert!(
+        !returned_while_the_job_ran,
+        "the wait returned before it had looked three times, with a process that names the case's \
+         directory still running"
+    );
     assert!(
         recorded,
         "the wait returned while a process that names the case's directory was still running"
