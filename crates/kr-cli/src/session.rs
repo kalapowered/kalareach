@@ -1500,8 +1500,14 @@ const WATCHING_AFTER_A_REFUSAL: &str = "kr: the application in the session uses 
 /// What an attachment says when the thread that reads its console had not ended by the time the
 /// attachment did.
 const READER_STILL_RUNNING: &str = "kr: the part of this command that reads the console's keys had \
-     not ended when the terminal came back, so the next key you type may be lost, and the keys it \
-     had already taken were not counted.";
+     not ended when the terminal came back, so the next key you type may be lost, the console's \
+     input mode may change, and the keys it had already taken were not counted.";
+
+/// What an attachment says when that thread ended only after its read of the console was cancelled,
+/// which hands the next key typed to the read that was cancelled.
+const READER_CANCELLED: &str = "kr: the part of this command that reads the console's keys was in a \
+     read of the console when the terminal came back and had to be cancelled, so the next key you \
+     type may be lost.";
 
 /// What is added to either when something the person typed was lost with the refusal.
 const TYPED_KEYS_LOST: &str = "Keys typed just before the session refused them were lost: the batch \
@@ -1537,6 +1543,8 @@ fn after_the_reader_stops(
     let mut said: Vec<Shown> = fallback.finish(input, &stopped.left).into_iter().collect();
     if stopped.still_running {
         said.push(Shown::said(READER_STILL_RUNNING));
+    } else if stopped.cancelled {
+        said.push(Shown::said(READER_CANCELLED));
     }
     said
 }
@@ -1555,7 +1563,8 @@ impl Fallback {
     /// dropped, and returns what the attachment says after the terminal is the person's again, if it
     /// changed how it sends keys.
     ///
-    /// The reader must have stopped, so that nothing it read is still on its way.
+    /// The reader must have stopped, or the stop must have said that it had not, so that nothing it
+    /// read is still on its way.
     fn finish(
         &mut self,
         input: &mut tokio::sync::mpsc::UnboundedReceiver<TerminalInput>,
@@ -2397,8 +2406,8 @@ async fn drive(
                             continue;
                         }
                         // As for bytes: a person who asked to follow the live screen is taken back
-                        // to it by the first key they press. A key coming up, or a modifier going
-                        // down, is not one.
+                        // to it by the first key they press. A key coming up (an Alt with a
+                        // composed character apart), or a modifier going down, is not one.
                         if follow_live && showing_history && presses(&keys) {
                             window.return_to_live();
                         }
@@ -4062,7 +4071,7 @@ mod tests {
         // A reader that had not ended says so, whether or not the session refused anything.
         let running = Stopped {
             still_running: true,
-            left: Vec::new(),
+            ..Stopped::default()
         };
         let said = after_the_reader_stops(running, &mut Fallback::default(), &mut input);
         assert!(
@@ -4070,10 +4079,21 @@ mod tests {
             "{said:?}"
         );
 
+        // A reader that ended only after its read of the console was cancelled says so too.
+        let cancelled = Stopped {
+            cancelled: true,
+            ..Stopped::default()
+        };
+        let said = after_the_reader_stops(cancelled, &mut Fallback::default(), &mut input);
+        assert!(
+            said.len() == 1 && said[0].as_str().contains("cancelled"),
+            "{said:?}"
+        );
+
         // The half of a character the reader held is a key typed; a modifier on its own is not.
         let left = |read| Stopped {
-            still_running: false,
             left: vec![read],
+            ..Stopped::default()
         };
         let said = after_the_reader_stops(left(key(0, 0xd83d)), &mut spelling(), &mut input);
         assert!(
