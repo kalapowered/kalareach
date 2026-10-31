@@ -23,10 +23,10 @@
 //! recorded with the shortfall named and the target cannot fail the case. A run whose restored
 //! screen passes the case's checks records the figure beside the host it was taken on, in the form
 //! the other performance records take, before the target is asserted. The target is not the case's
-//! only limit on time: its own waits for the host (to settle after the first connection, and for
-//! the screen inside the timed span) have a liveness bound of 120 seconds, and the harness's dial
-//! and set-up have limits of their own, so a host that never answers fails the case whatever it
-//! lacks.
+//! only limit on time: each of its own waits for the host (to serve the worker's session, the
+//! attach and the subscription inside the timed span, and the screen after them) is bounded as a
+//! whole, the request to the host included, at 120 seconds, and the harness's dial and set-up have
+//! limits of their own, so a host that never answers fails the case whatever it lacks.
 
 #![cfg(unix)]
 
@@ -102,8 +102,9 @@ async fn restored(
 ) -> (Duration, String, RestorationStep) {
     // The events are read from before the subscription, so nothing it queues is missed.
     let mut events = session.events();
-    let attached: SessionAttachResult = session
-        .mutate(
+    let attached: SessionAttachResult = within_liveness(
+        "the host to answer the attach",
+        session.mutate(
             Method::SessionAttach,
             ActionTarget {
                 environment_id,
@@ -125,11 +126,12 @@ async fn restored(
                     .collect(),
             },
             DurationMs::new(120_000),
-        )
-        .await
-        .expect("the attach is settled")
-        .to_typed()
-        .expect("an attachment");
+        ),
+    )
+    .await
+    .expect("the attach is settled")
+    .to_typed()
+    .expect("an attachment");
 
     let mut restoration = Restoration::start(output_stream(), &session.cursors().await);
     let began = restoration.step();
@@ -140,10 +142,12 @@ async fn restored(
             &[EventStream::Output],
         )
         .expect("the stream is waiting to subscribe");
-    session
-        .subscribe_events(&params)
-        .await
-        .expect("the subscription succeeds");
+    within_liveness(
+        "the host to answer the subscription",
+        session.subscribe_events(&params),
+    )
+    .await
+    .expect("the subscription succeeds");
     restoration.subscribed().expect("the order is kept");
 
     let mut projection = Projection::new();
@@ -346,20 +350,29 @@ async fn a_paired_device_that_comes_back_has_a_painted_screen_inside_the_reconne
     host.stop().await;
 }
 
-/// Asks `check` until it answers, or the liveness bound runs out.
+/// Asks `check` until it answers, or the liveness bound runs out. The bound covers each call of
+/// `check` as well as the pauses between them, so a host that stops answering a call fails the
+/// wait instead of holding it.
 async fn until<T, Fut>(what: &str, mut check: impl FnMut() -> Fut) -> T
 where
     Fut: std::future::Future<Output = Option<T>>,
 {
-    let deadline = tokio::time::Instant::now() + LIVENESS;
-    loop {
-        if let Some(found) = check().await {
-            return found;
+    within_liveness(what, async {
+        loop {
+            if let Some(found) = check().await {
+                return found;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "waited {LIVENESS:?} for {what}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    })
+    .await
+}
+
+/// Runs one whole wait inside the liveness bound, and fails the case when the bound runs out. A
+/// request to the host has no timer of its own, so every wait for a host's answer goes through
+/// here.
+async fn within_liveness<T>(what: &str, wait: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(LIVENESS, wait)
+        .await
+        .unwrap_or_else(|_| panic!("waited {LIVENESS:?} for {what}"))
 }
