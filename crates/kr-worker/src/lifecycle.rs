@@ -69,9 +69,13 @@ pub const OBSERVE_INTERVAL: Duration = Duration::from_secs(1);
 ///
 /// One wake serves every question left without an event source: a process that started without
 /// producing output or consuming input, the login a desktop-bound session is tied to, and the root
-/// shell's status where a child signal was lost. On a host with a child signal this is the only
-/// thing an idle session wakes for, which is why it is this long.
-pub const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+/// shell's status where a child signal was lost. Each of them has something else that asks it when
+/// it matters, so the sweep is the backstop behind that, and a minute is long enough for it.
+pub const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The beat the idle clocks of a session fall on: a wait of this length or more ends on the latest
+/// multiple of it, counted from the wall clock, that it allows ([`Activity::on_the_beat`]).
+pub const BEAT: Duration = Duration::from_secs(30);
 
 /// How often the root shell is asked for its status where nothing reports its exit.
 ///
@@ -155,8 +159,8 @@ impl Activity {
     }
 
     /// Returns when a wait that is due at `due` and began at `after` ends, put on the session's
-    /// beat: the latest instant at or before `due` that is a whole number of
-    /// [`IDLE_SWEEP_INTERVAL`]s after the beat's start.
+    /// beat: the latest instant at or before `due` that is a whole number of [`BEAT`]s after the
+    /// beat's start.
     ///
     /// An idle session keeps several clocks of about that length, and each woke the host by
     /// itself: the sweep, the adoption watch's look, the daemon's held request, the maintenance
@@ -171,16 +175,16 @@ impl Activity {
         let Some(&start) = self.beat.get() else {
             return due;
         };
-        if due.saturating_duration_since(after) < IDLE_SWEEP_INTERVAL {
+        if due.saturating_duration_since(after) < BEAT {
             return due;
         }
         let Some(since) = due.checked_duration_since(start) else {
             return due;
         };
-        let beats = since.as_nanos() / IDLE_SWEEP_INTERVAL.as_nanos();
+        let beats = since.as_nanos() / BEAT.as_nanos();
         u32::try_from(beats)
             .ok()
-            .and_then(|beats| IDLE_SWEEP_INTERVAL.checked_mul(beats))
+            .and_then(|beats| BEAT.checked_mul(beats))
             .map_or(due, |offset| start + offset)
     }
 
@@ -292,8 +296,8 @@ impl Drop for Looking<'_> {
     }
 }
 
-/// Returns the latest instant at or before `now` that falls on a whole multiple of
-/// [`IDLE_SWEEP_INTERVAL`] on the wall clock.
+/// Returns the latest instant at or before `now` that falls on a whole multiple of [`BEAT`] on the
+/// wall clock.
 ///
 /// A session's beat counted from here is the same beat for every session host on this machine, and
 /// for the daemon that holds a request open to each of them. Counted from each host's own start
@@ -305,7 +309,7 @@ pub fn wall_beat_start(now: Instant) -> Instant {
     let since_epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
-    let into_beat = since_epoch.as_nanos() % IDLE_SWEEP_INTERVAL.as_nanos();
+    let into_beat = since_epoch.as_nanos() % BEAT.as_nanos();
     u64::try_from(into_beat)
         .ok()
         .and_then(|nanos| now.checked_sub(Duration::from_nanos(nanos)))
@@ -549,8 +553,8 @@ impl Supervision {
 #[cfg(test)]
 mod tests {
     use super::{
-        Activity, CHILD_POLL_INTERVAL, Cause, ChildExits, IDLE_SWEEP_INTERVAL, OBSERVE_INTERVAL,
-        Supervision, Sweep, Wake,
+        Activity, BEAT, CHILD_POLL_INTERVAL, Cause, ChildExits, IDLE_SWEEP_INTERVAL,
+        OBSERVE_INTERVAL, Supervision, Sweep, Wake,
     };
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -623,7 +627,7 @@ mod tests {
         let start = super::wall_beat_start(now);
         assert!(start <= now);
         assert!(
-            now.duration_since(start) < IDLE_SWEEP_INTERVAL,
+            now.duration_since(start) < BEAT,
             "it is the latest such instant"
         );
         // The wall clock at that instant is a whole number of half minutes, give or take the time
@@ -632,8 +636,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("after the epoch")
             .saturating_sub(now.duration_since(start));
-        let off = at_start.as_nanos() % IDLE_SWEEP_INTERVAL.as_nanos();
-        let off = off.min(IDLE_SWEEP_INTERVAL.as_nanos() - off);
+        let off = at_start.as_nanos() % BEAT.as_nanos();
+        let off = off.min(BEAT.as_nanos() - off);
         assert!(
             off < Duration::from_millis(250).as_nanos(),
             "{off} ns from a half minute"
@@ -647,8 +651,8 @@ mod tests {
         let started = Instant::now();
         let activity = Activity::new();
         assert_eq!(
-            activity.on_the_beat(started + IDLE_SWEEP_INTERVAL * 2, started),
-            started + IDLE_SWEEP_INTERVAL * 2,
+            activity.on_the_beat(started + BEAT * 4, started),
+            started + BEAT * 4,
             "nothing moves before the supervision has begun"
         );
         let mut sweep = Sweep::begin(Arc::clone(&activity), started, IDLE_SWEEP_INTERVAL);
@@ -660,27 +664,28 @@ mod tests {
         assert_eq!(
             sweep.next_observation(),
             started + IDLE_SWEEP_INTERVAL * 2,
-            "the next observation of a session that does nothing is the next beat"
+            "the next observation of a session that does nothing is on a beat, a sweep interval \
+             on at the most"
         );
 
-        // Any other clock of this length that began off the beat ends on the same one.
+        // Any other clock of a beat that began off the beat ends on the beat the sweep keeps.
         let began = started + Duration::from_secs(41);
-        let due = began + IDLE_SWEEP_INTERVAL;
+        let due = began + BEAT;
         assert_eq!(
             activity.on_the_beat(due, began),
-            started + IDLE_SWEEP_INTERVAL * 2,
-            "a look that began at another moment ends with the sweep"
+            started + BEAT * 2,
+            "a look that began at another moment ends on the beat"
         );
         assert_eq!(
-            activity.on_the_beat(due + IDLE_SWEEP_INTERVAL * 2, began),
-            started + IDLE_SWEEP_INTERVAL * 4,
+            activity.on_the_beat(due + BEAT * 2, began),
+            started + BEAT * 4,
             "and so does a longer one, on the latest beat it allows"
         );
         for offset in 0..30 {
             let began = started + Duration::from_millis(offset * 1_000 + 137);
-            let ends = activity.on_the_beat(began + IDLE_SWEEP_INTERVAL * 5, began);
+            let ends = activity.on_the_beat(began + BEAT * 5, began);
             assert!(
-                ends > began && ends <= began + IDLE_SWEEP_INTERVAL * 5,
+                ends > began && ends <= began + BEAT * 5,
                 "a wait is never put later than it was due, nor before it began"
             );
         }
@@ -752,7 +757,7 @@ mod tests {
     async fn a_host_with_no_child_signal_asks_the_shell_itself_rather_than_waiting_for_the_sweep() {
         // What a host without a child signal falls back to, which is the one thing that decides how
         // long an exit can go unnoticed there. It is the short poll, not the sweep: a session whose
-        // shell had left would otherwise stay live for half a minute.
+        // shell had left would otherwise stay live for a minute.
         #[cfg(unix)]
         {
             assert_eq!(
@@ -785,7 +790,7 @@ mod tests {
         // The backstop, exercised rather than asserted about: no child has ended, nothing has been
         // marked, and the wake still arrives and still observes. The sweep is dated an interval ago
         // so the deadline is already due, because a test that waited out the real one would take
-        // half a minute to say this.
+        // a minute to say this.
         let activity = Activity::new();
         let mut supervision = Supervision::begin(
             Arc::clone(&activity),
