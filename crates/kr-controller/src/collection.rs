@@ -18,11 +18,15 @@
 //! recovered is left to that recovery, and one whose lock another holds is left to the next pass.
 //!
 //! Live sessions apply the same bounds themselves, on their own tick, from a measure of the host's
-//! spools ([`kr_worker::history::retained_bytes_under`]) that a session whose own output has not
-//! moved keeps for minutes, since the session that grew past the cap measures it at once. The two
-//! parties act on their own sessions and each reads the whole environment's bytes, so the host can
-//! be briefly under the cap by what both gave up in the same minute, and is over it for no longer
-//! than the next pass of the session that grew.
+//! spools ([`kr_worker::history::retained_bytes_under`]) that a session that has taken no output
+//! keeps for minutes, since the session that grew past the cap measures it at once; the workers
+//! among themselves give up output for the cap one at a time, under a lock. The daemon takes no
+//! part in that lock: the two parties act on their own sessions and each reads the whole
+//! environment's bytes, so the host can be briefly under the cap by what both gave up in the same
+//! minute. It is over the cap for no longer than the first pass in which the session that grew
+//! gets the lock, unless that session cannot give up the excess, as when it holds less than the
+//! excess or has ended: the other sessions then find it when their measures, five to six minutes
+//! old, are taken again.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, PoisonError, Weak};

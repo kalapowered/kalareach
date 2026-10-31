@@ -4274,7 +4274,15 @@ for five minutes while the session has taken no output and takes again at once w
 only a session that takes output can take the host over the cap. The session's retained byte count
 is not what says so: after an eviction the resident window still holds bytes the spool gave up, and
 new output that fills it again leaves the count where it was while the files grow. A reading that
-finds the host over the cap is not kept. The control daemon applies it
+finds the host over the cap is not kept, and the worker that finds it gives up output under a lock
+on a file in the spools' directory, `host-cap.lock`, that every worker of the host takes without
+waiting. It reads the host again once it holds the lock, since the worker that held it before may
+have given up what the first reading found over, and it gives up what is then over. A worker that
+does not get the lock gives up nothing for the host's cap on that pass and measures again on its
+next, and a worker whose spool holds no output takes none. So workers whose passes fall together,
+as passes on the wall clock's half minutes do whatever the moments their sessions began at, give up
+the excess once and not once each. A worker of an earlier release takes no lock, so the exclusion is
+among the workers of this one. The control daemon applies the cap
 every minute to the sessions that have closed, taking the output of the session whose oldest segment
 was written longest ago first. The two keep no order between them, so a live session can give up
 output before a closed one does. The reading is the segment files, each sized by asking the file: a
@@ -4283,9 +4291,15 @@ bring up to date while a handle to the file is open, so the measure asks each fi
 that records where a spool's output got to is not counted, and neither is anything else beside the
 segments. Both parties read the whole environment's bytes and each acts on its own sessions, so in
 the minute the daemon and a worker both find the host over the cap they can both give up output,
-and the host is then under the cap by what both took; it is not over it for longer than a pass.
-Workers whose sessions began in the same half minute make their passes together, so several of
-them can find the host over the cap in one pass and each give up output.
+and the host is then under the cap by what both took. A worker that does not get the lock leaves
+the cap to the one that holds it, which gives up only its own output: when that is less than the
+excess the host stays over the cap by the rest until a later beat, at which another worker may hold
+the lock. A worker that cannot open or take the lock file at all gives up nothing for the cap and
+says why in the reason its pass left output behind. The host is over the cap for no longer than the
+first pass in which the session that grew gets the lock, unless that session cannot give up the
+excess, as when its worker has ended, it holds less than the excess, or it cannot write its
+boundary: the other workers keep a reading that found the host under the cap while they take no
+output, and find it over the cap when that reading, five to six minutes old, is taken again.
 
 Eviction is not quiet. A retention pass records the cursor range it took and the bound that took
 it, and a reader asking for a cursor inside that range is told both: `history.page` returns the
