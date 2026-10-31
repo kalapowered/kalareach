@@ -816,7 +816,7 @@ pub struct Stopped {
     /// Whether the reader was still running when the stop gave up waiting for it, so that it may
     /// hold keys it took from the console, which the stop cannot count.
     pub still_running: bool,
-    /// Whether the stop had to cancel a read of the console the reader was blocked in. The console
+    /// Whether the stop cancelled a read of the console the reader was blocked in. The console
     /// gives the next key to a read that was cancelled.
     pub cancelled: bool,
     /// What the reader had taken from the console and not handed on when it ended, the first half
@@ -832,8 +832,9 @@ pub(crate) struct Wakes {
     pub(crate) ask: Box<dyn Fn() + Send + Sync>,
     /// Ends the reader's wait so that it sees the stop.
     pub(crate) stop: Box<dyn Fn() + Send + Sync>,
-    /// Cancels the read of the console that the reader is blocked in.
-    pub(crate) cancel: Box<dyn Fn(&ReaderThread) + Send + Sync>,
+    /// Cancels the read of the console that the reader is blocked in, and says whether there was
+    /// one.
+    pub(crate) cancel: Box<dyn Fn(&ReaderThread) -> bool + Send + Sync>,
 }
 
 /// The thread that reads a console, which ends with what it had taken and not handed on.
@@ -847,8 +848,9 @@ pub struct ReaderStop {
     stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Wakes the thread out of its wait, to end.
     wake: Box<dyn Fn() + Send + Sync>,
-    /// Cancels the read of the console that the thread is blocked in, which nothing else wakes.
-    cancel: Box<dyn Fn(&ReaderThread) + Send + Sync>,
+    /// Cancels the read of the console that the thread is blocked in, which nothing else wakes, and
+    /// says whether there was one.
+    cancel: Box<dyn Fn(&ReaderThread) -> bool + Send + Sync>,
     /// The reading thread.
     thread: ReaderThread,
 }
@@ -885,8 +887,7 @@ impl ReaderStop {
                 };
             }
             if now >= cancel_from {
-                (self.cancel)(&self.thread);
-                cancelled = true;
+                cancelled |= (self.cancel)(&self.thread);
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -993,7 +994,7 @@ impl Outlet<'_> {
 /// therefore does not go on to read, ask or send when it is let go, unless it was already past the
 /// look for the stop; the stop says when it could not wait for a thread to end. What the thread
 /// had taken by then is what it returns, with the first half of a character it was holding, so that
-/// the caller can count it.
+/// the caller can count the records among it.
 #[cfg(any(not(unix), test))]
 fn read_console(
     console: &mut impl ConsoleInput,
@@ -1152,9 +1153,9 @@ impl NulKey {
 /// key are all kept as records the read passes over. A key coming up does not, except an Alt coming
 /// up with the character that was composed on the numeric keypad.
 ///
-/// The rule for a NUL leans to text, because a record wrongly taken for text only makes one read
-/// wait for the next key, and one wrongly taken for none is a key the person typed, taken off the
-/// queue and lost. It was found on one console build and one layout, and the layout asked is this
+/// The rule for a NUL leans to text, because a record wrongly taken for text makes one read wait for
+/// the next key (and a stop that has to cancel that read costs the key the console gives it), and
+/// one wrongly taken for none is a key the person typed, taken off the queue and lost. It was found on one console build and one layout, and the layout asked is this
 /// command's and not the console's. So a record is a NUL's when it is the key this command's layout
 /// names with any of the modifiers it names, and when it is the space bar or the '2' key with Ctrl,
 /// whatever the layout names or fails to name.
@@ -1857,8 +1858,10 @@ mod reader {
         woke: mpsc::Receiver<()>,
         /// Says that the stop has woken the reader.
         stopping: mpsc::Receiver<()>,
-        /// Says that the stop cancelled a read of the console.
+        /// Says that the stop asked to cancel a read of the console.
         cancelled: mpsc::Receiver<()>,
+        /// Whether a cancel finds a read of the console to cancel.
+        finds_a_read: Arc<std::sync::atomic::AtomicBool>,
         /// Says that the thread is held at the call the case asked for.
         held: mpsc::Receiver<()>,
         /// Lets the thread go from where it is held.
@@ -1906,6 +1909,7 @@ mod reader {
             let (woke_to, woke) = mpsc::channel();
             let (stopping_to, stopping) = mpsc::channel();
             let (cancelled_to, cancelled) = mpsc::channel();
+            let finds_a_read = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (arrived, held_at) = mpsc::channel();
             let (release, released) = mpsc::channel();
             let steps: Steps = Arc::default();
@@ -1949,10 +1953,14 @@ mod reader {
                         let _ = stopping_to.send(());
                     })
                 },
-                // The console of a case has no read that nothing else wakes; the case hears of a
-                // cancel.
-                cancel: Box::new(move |_| {
-                    let _ = cancelled_to.send(());
+                // The console of a case has no read that nothing else wakes, unless the case says it
+                // has; the case hears of every cancel.
+                cancel: Box::new({
+                    let finds_a_read = Arc::clone(&finds_a_read);
+                    move |_| {
+                        let _ = cancelled_to.send(());
+                        finds_a_read.load(std::sync::atomic::Ordering::SeqCst)
+                    }
                 }),
             };
             let (input, stop) = start_reader(console, &switch, reader_wakes);
@@ -1965,6 +1973,7 @@ mod reader {
                 woke,
                 stopping,
                 cancelled,
+                finds_a_read,
                 held: held_at,
                 release,
                 steps,
@@ -2010,13 +2019,14 @@ mod reader {
             self.steps.lock().expect("steps").clone()
         }
 
-        /// Waits for the thread to have read the console, within ten seconds.
-        fn waits_for_a_read(&self) {
+        /// Waits for the thread to end, within ten seconds, without making the stop.
+        fn waits_for_the_reader_to_end(&self) {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while !self.steps.lock().expect("steps").contains(&"keys") {
+            let thread = &self.stop.as_ref().expect("the stop is not made yet").thread;
+            while !thread.is_finished() {
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "the reader did not read in ten seconds"
+                    "the reader did not end in ten seconds"
                 );
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
@@ -2363,16 +2373,20 @@ mod reader {
         assert!(handed.is_empty(), "something was handed on: {handed:?}");
     }
 
-    /// What the reader read and could not send, because nobody receives it any more, is what it
-    /// leaves: every run of a read, the first among them.
+    /// What the reader took and could not send, because nobody receives it any more, is what it
+    /// leaves, and the reader ends by itself: every run of a read, the first among them; the text
+    /// it read; and the half of a character it holds for a request.
     #[test]
     fn what_a_reader_could_not_send_to_a_receiver_that_is_gone_is_left() {
         let one = key(u16::from(b'A'), u16::from(b'a'), true);
         let two = key(u16::from(b'B'), u16::from(b'b'), true);
+        let half = key(0, 0xd83d, true);
+
+        // Two runs of one read.
         let mut run = Run::start(true, vec![vec![vec![one], vec![two]]]);
         run.input.close();
         run.has_input();
-        run.waits_for_a_read();
+        run.waits_for_the_reader_to_end();
         let stopped = run.stops();
         assert!(!stopped.still_running);
         assert_eq!(
@@ -2382,6 +2396,25 @@ mod reader {
                 TerminalInput::Keys(vec![two])
             ]
         );
+
+        // The text of a console that spells its keys.
+        let mut run = Run::start(true, Vec::new());
+        run.switch.engage().expect("the console spells its keys");
+        run.input.close();
+        run.bytes.send(b"x".to_vec()).expect("the reader waits");
+        run.has_input();
+        run.waits_for_the_reader_to_end();
+        let stopped = run.stops();
+        assert_eq!(stopped.left, vec![TerminalInput::Bytes(b"x".to_vec())]);
+
+        // The half of a character handed on for a request: the request is not carried through.
+        let mut run = Run::started(true, Vec::new(), vec![half], true, false);
+        run.input.close();
+        assert!(run.switch.engage().is_err(), "the reader ended unasked");
+        run.waits_for_the_reader_to_end();
+        let stopped = run.stops();
+        assert_eq!(stopped.left, vec![TerminalInput::Keys(vec![half])]);
+        assert!(!run.steps.lock().expect("steps").contains(&"ask"));
     }
 
     /// A NUL the layout names on another key is text with any of the modifiers the layout names,
@@ -2424,10 +2457,33 @@ mod reader {
         );
     }
 
-    /// A stop that had to cancel a read of the console says so, even when the reader ended: the
-    /// console gives the next key to a read that was cancelled.
+    /// A stop that cancelled a read of the console says so, even when the reader ended: the console
+    /// gives the next key to a read that was cancelled.
     #[test]
     fn a_stop_that_cancelled_a_read_says_so() {
+        let down = key(u16::from(b'A'), u16::from(b'a'), true);
+        let mut run = Run::paused("keys", vec![vec![vec![down]]], Vec::new());
+        run.finds_a_read
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        run.has_input();
+        run.held.recv().expect("the reader is held after its read");
+        let stop = run.stop.take().expect("the stop is made once");
+        let stopped = std::thread::scope(|scope| {
+            let stopping = scope.spawn(move || stop.stop());
+            run.cancelled
+                .recv()
+                .expect("the stop asked to cancel a read");
+            run.release.send(()).expect("the reader is held");
+            stopping.join().expect("the stop ended")
+        });
+        assert!(!stopped.still_running, "the reader ended once released");
+        assert!(stopped.cancelled, "the stop cancelled a read");
+    }
+
+    /// A stop that asked to cancel and found no read to cancel does not say it cancelled one: the
+    /// reader was between two calls, and no key is at risk.
+    #[test]
+    fn a_stop_that_found_no_read_to_cancel_does_not_say_it_cancelled_one() {
         let down = key(u16::from(b'A'), u16::from(b'a'), true);
         let mut run = Run::paused("keys", vec![vec![vec![down]]], Vec::new());
         run.has_input();
@@ -2435,14 +2491,16 @@ mod reader {
         let stop = run.stop.take().expect("the stop is made once");
         let stopped = std::thread::scope(|scope| {
             let stopping = scope.spawn(move || stop.stop());
-            run.cancelled.recv().expect("the stop cancelled the read");
+            run.cancelled
+                .recv()
+                .expect("the stop asked to cancel a read");
             run.release.send(()).expect("the reader is held");
             stopping.join().expect("the stop ended")
         });
-        assert!(!stopped.still_running, "the reader ended once released");
-        assert!(stopped.cancelled, "the stop cancelled a read");
+        assert!(!stopped.still_running);
+        assert!(!stopped.cancelled, "there was no read to cancel");
 
-        // A reader that ended at once is not cancelled.
+        // A reader that ends at once is not cancelled either, whether or not the stop asked.
         let mut run = Run::start(true, Vec::new());
         assert!(!run.stops().cancelled);
     }

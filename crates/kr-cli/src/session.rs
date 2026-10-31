@@ -1505,9 +1505,9 @@ const READER_STILL_RUNNING: &str = "kr: the part of this command that reads the 
 
 /// What an attachment says when that thread ended only after its read of the console was cancelled,
 /// which hands the next key typed to the read that was cancelled.
-const READER_CANCELLED: &str = "kr: the part of this command that reads the console's keys was in a \
-     read of the console when the terminal came back and had to be cancelled, so the next key you \
-     type may be lost.";
+const READER_CANCELLED: &str = "kr: the part of this command that reads the console's keys was \
+     still in a read of the console when the attachment ended, so the command cancelled the read, \
+     and the next key you type may be lost.";
 
 /// What is added to either when something the person typed was lost with the refusal.
 const TYPED_KEYS_LOST: &str = "Keys typed just before the session refused them were lost: the batch \
@@ -1533,8 +1533,8 @@ struct Fallback {
 }
 
 /// What the attachment says once the thread that reads its console has been stopped: how it went on
-/// if the session refused its console keys, counting what the reader left, and that the thread had
-/// not ended if it had not.
+/// if the session refused its console keys, counting what the reader left, that the thread had not
+/// ended if it had not, and otherwise that a read of the console had to be cancelled if one was.
 fn after_the_reader_stops(
     stopped: crate::attach::Stopped,
     fallback: &mut Fallback,
@@ -1563,8 +1563,9 @@ impl Fallback {
     /// dropped, and returns what the attachment says after the terminal is the person's again, if it
     /// changed how it sends keys.
     ///
-    /// The reader must have stopped, or the stop must have said that it had not, so that nothing it
-    /// read is still on its way.
+    /// The reader must have stopped, so that nothing it read is still on its way. When the stop said
+    /// it had not, a send the reader was already past the look for the stop in can still arrive
+    /// after this, which the line about the reader says.
     fn finish(
         &mut self,
         input: &mut tokio::sync::mpsc::UnboundedReceiver<TerminalInput>,
@@ -4074,6 +4075,18 @@ mod tests {
             ..Stopped::default()
         };
         let said = after_the_reader_stops(running, &mut Fallback::default(), &mut input);
+        assert!(
+            said.len() == 1 && said[0].as_str().contains("had not ended"),
+            "{said:?}"
+        );
+
+        // A reader that had not ended and had a read cancelled says the first, once.
+        let both = Stopped {
+            still_running: true,
+            cancelled: true,
+            ..Stopped::default()
+        };
+        let said = after_the_reader_stops(both, &mut Fallback::default(), &mut input);
         assert!(
             said.len() == 1 && said[0].as_str().contains("had not ended"),
             "{said:?}"
