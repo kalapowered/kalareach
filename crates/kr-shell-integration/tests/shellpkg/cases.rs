@@ -428,14 +428,18 @@ pub fn a_child_shell_has_nothing_to_activate_from(kind: ShellKind) {
 ///
 /// A stop is over when the shell is stopped, not when `kill` has sent the signal: a shell that has
 /// not stopped yet reads what is typed at it and runs its keys before the request that was meant
-/// to be waiting for them is sent.
+/// to be waiting for them is sent. The kernel tells a parent that its child has stopped only once
+/// every thread of it has, so the wait is on that report; the state `ps` shows is the main thread's
+/// alone.
 ///
 /// # Panics
 ///
 /// Panics when the session has no process, `kill` cannot signal it, or a shell that was sent the
-/// stop is not stopped inside [`REPLY`].
+/// stop has not stopped inside [`REPLY`].
 #[cfg(unix)]
 fn signal_the_shell(session: &Session, signal: &str) {
+    use rustix::process::{Pid, WaitOptions, waitpid};
+
     let pid = session
         .child_pid()
         .expect("the shell's process has an identifier");
@@ -446,17 +450,19 @@ fn signal_the_shell(session: &Session, signal: &str) {
         .expect("kill runs");
     assert!(status.success(), "kill -{signal} {pid} failed");
     if signal == "STOP" {
+        let shell = i32::try_from(pid)
+            .ok()
+            .and_then(Pid::from_raw)
+            .expect("the shell's process identifier is a process");
         let deadline = Instant::now() + REPLY;
         loop {
-            let state = std::process::Command::new("ps")
-                .args(["-o", "stat=", "-p", &pid.to_string()])
-                .output()
-                .expect("ps runs");
-            if String::from_utf8_lossy(&state.stdout)
-                .trim()
-                .starts_with('T')
-            {
-                break;
+            match waitpid(Some(shell), WaitOptions::UNTRACED | WaitOptions::NOHANG) {
+                Ok(Some((_, status))) if status.stopped() => break,
+                Ok(Some((_, status))) => {
+                    panic!("the shell {pid} ended when it was sent the stop: {status:?}")
+                }
+                Ok(None) => {}
+                Err(error) => panic!("waiting for the shell {pid} to stop: {error}"),
             }
             assert!(
                 Instant::now() < deadline,
