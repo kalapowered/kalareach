@@ -24,9 +24,10 @@
 //! rule: a closure's list of what it left behind, and the members of the records in
 //! [`FAILURE_TEXTS`]. The places that hold a place on this host and no failure ([`HOST_PATHS`])
 //! are withheld as a path is, and the name of the desktop a session is bound to is told as the
-//! capability answers tell it ([`withheld_desktop_name`]). The reason an agent instance's rich
-//! mutations wait is told by what it says of the wait ([`suspension_for_a_device`]), in a result
-//! and in the refusal of a rich mutation.
+//! capability answers tell it ([`withheld_desktop_name`]). The owner's own local caller, whose
+//! actor holds the number of an account, is told as `local` ([`withheld_local_actor`]). The reason
+//! an agent instance's rich mutations wait is told by what it says of the wait
+//! ([`suspension_for_a_device`]), in a result and in the refusal of a rich mutation.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -898,10 +899,28 @@ fn shown_member(map: &CanonicalMap, key: &str, child: &CanonicalValue) -> Option
     {
         return withheld_desktop_name(name).map(CanonicalValue::Text);
     }
+    if let CanonicalValue::Text(actor) = child
+        && key == "actor_id"
+    {
+        return withheld_local_actor(actor).map(CanonicalValue::Text);
+    }
     if is_a_host_path(map, key) {
         return withheld_paths(child);
     }
     shown_value(child)
+}
+
+/// What a device is told in place of the actor of the owner's own local caller, or `None` when the
+/// actor is not one.
+///
+/// The host names that caller after the operating-system user it authenticated, so the actor holds
+/// the number of the account (`local:501`). A device is told `local`, the name the host gives that
+/// caller when it has no user to name. Another device's actor, and the actors the host composes
+/// from a device's identity, name no account.
+fn withheld_local_actor(actor: &str) -> Option<String> {
+    actor
+        .starts_with(kr_protocol::sharing::LOCAL_PRINCIPAL_PREFIX)
+        .then(|| "local".to_owned())
 }
 
 /// Whether the text under `key` in `map` is the name of the desktop a session is bound to: the
@@ -3497,6 +3516,28 @@ mod tests {
         // What the person typed and where it ran are shown to a device whose grant reaches the
         // command, as they are shown to the person: the grant decides, and this rule does not.
         assert_eq!(read_by_a_device(&read), read);
+    }
+
+    #[test]
+    fn the_actor_of_the_owners_local_caller_is_not_told_to_a_device_with_the_number_of_the_account()
+    {
+        use kr_protocol::question::{AnswerRecord, QuestionAnswer};
+        let answer = |actor: &str| AnswerRecord {
+            answer: QuestionAnswer::Decision { decided: true },
+            actor_id: kr_protocol::ids::ActorId::new(actor).expect("an actor"),
+            device_id: Nullable::null(),
+            question_revision: kr_protocol::ids::QuestionRevision::new(1),
+            answered_at_ms: kr_protocol::scalars::TimestampMs::new(2),
+        };
+        // The host names the owner's caller after the account it authenticated.
+        let owner = kr_protocol::sharing::local_actor(501);
+        assert!(owner.as_str().contains("501"), "{owner}");
+        let told = read_by_a_device(&answer(owner.as_str()));
+        assert_eq!(told, answer("local"));
+        // The actors that name no account are told as they are.
+        for actor in ["device:phone", "local"] {
+            assert_eq!(read_by_a_device(&answer(actor)), answer(actor), "{actor}");
+        }
     }
 
     #[test]
