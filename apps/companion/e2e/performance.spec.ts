@@ -156,7 +156,7 @@ async function startTiming(page: Page): Promise<void> {
           })
         )
         // The first key of a run. The read runs in this key's handler, so it is inside this key's
-        // own timed span: one key in 48, which does not move the median.
+        // own timed span: one key in 48, which moves the median by one place at most.
         if (keys.names.length === 1) keys.drawnAtFirstKey = keys.drawn()
       },
       true
