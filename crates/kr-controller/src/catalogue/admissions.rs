@@ -33,6 +33,20 @@ use super::native_bridge::NativeBridges;
 /// What room a part leaves for the frame's own encoding beyond its records.
 const PART_SLACK: usize = 1024;
 
+/// What the detail of an installation left out because its record cannot be handed to a worker
+/// says after the package, and before why.
+pub(crate) const UNRECORDABLE_CLAUSE: &str = " cannot be handed to a worker";
+
+/// The detail of an installation left out because its record cannot be handed to a worker, for
+/// `why`.
+pub(crate) fn unrecordable_detail(
+    plugin_id: &PluginId,
+    package_digest: PayloadDigest,
+    why: impl std::fmt::Display,
+) -> String {
+    format!("{plugin_id} at {package_digest}{UNRECORDABLE_CLAUSE}: {why}")
+}
+
 /// One environment's admissions at one revision, as records on the wire.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
@@ -321,10 +335,7 @@ pub fn wire(
             Err(why) => left_out.push(LeftOut {
                 plugin_id: package.plugin_id.clone(),
                 reason: PluginLeftOutReason::Unrecordable,
-                detail: format!(
-                    "{} at {} cannot be handed to a worker: {why}",
-                    package.plugin_id, package.package_digest
-                ),
+                detail: unrecordable_detail(&package.plugin_id, package.package_digest, why),
             }),
         }
     }

@@ -4342,9 +4342,7 @@ impl BrokerState {
             ));
         }
         if let Some(reason) = binding.rich_disabled.as_ref() {
-            return Err(BrokerError::UnsupportedCapability {
-                detail: format!("this binding's rich capabilities are disabled: {reason}"),
-            });
+            return Err(BrokerError::binding_disabled(reason));
         }
         let pending = self.resource(resource_id)?;
         if pending.state != PendingState::Pending {
@@ -5091,9 +5089,7 @@ impl BrokerState {
                 ),
             })?;
         if let Some(reason) = instance.suspension_reason() {
-            return Err(BrokerError::PreconditionFailed {
-                detail: format!("rich mutations are suspended: {reason}"),
-            });
+            return Err(BrokerError::mutations_suspended(reason));
         }
         if instance.binding_revision != target.binding_revision {
             return Err(BrokerError::StaleBinding {
@@ -5370,12 +5366,7 @@ impl BrokerState {
                     )));
                 }
                 if let Some(reason) = binding.rich_disabled.as_ref() {
-                    return Err(BrokerError::UnsupportedCapability {
-                        detail: format!(
-                            "the component answerable for this operation has had its rich \
-                             capabilities disabled: {reason}"
-                        ),
-                    });
+                    return Err(BrokerError::component_disabled(reason));
                 }
                 Ok(())
             }
@@ -5620,9 +5611,7 @@ impl BrokerState {
             )));
         }
         if let Some(reason) = binding.rich_disabled.as_ref() {
-            return Err(BrokerError::UnsupportedCapability {
-                detail: format!("this binding's rich capabilities are disabled: {reason}"),
-            });
+            return Err(BrokerError::binding_disabled(reason));
         }
         binding.grants.require(invocation.grant)?;
         let instance = self
@@ -5630,9 +5619,7 @@ impl BrokerState {
             .get(&invocation.application_instance_id)
             .ok_or_else(|| unknown_instance(invocation.application_instance_id))?;
         if let Some(reason) = instance.suspension_reason() {
-            return Err(BrokerError::PreconditionFailed {
-                detail: format!("rich mutations are suspended: {reason}"),
-            });
+            return Err(BrokerError::mutations_suspended(reason));
         }
         if instance.binding_revision != invocation.binding_revision {
             return Err(BrokerError::StaleBinding {
@@ -5862,9 +5849,7 @@ impl BrokerState {
             .get(&pending.resource.application_instance_id)
             .ok_or_else(|| unknown_instance(pending.resource.application_instance_id))?;
         if let Some(reason) = instance.suspension_reason() {
-            return Err(BrokerError::PreconditionFailed {
-                detail: format!("rich mutations are suspended: {reason}"),
-            });
+            return Err(BrokerError::mutations_suspended(reason));
         }
         if pending.resource.source_generation != instance.source_generation {
             return Err(BrokerError::StaleBinding {

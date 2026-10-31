@@ -190,9 +190,7 @@ impl BrokerState {
         // The component is not asked for an answer the second pass would refuse for these two
         // reasons; that pass checks both again.
         if let Some(reason) = instance.suspension_reason() {
-            return Err(BrokerError::PreconditionFailed {
-                detail: format!("rich mutations are suspended: {reason}"),
-            });
+            return Err(BrokerError::mutations_suspended(reason));
         }
         if instance.binding_revision != target.binding_revision {
             return Err(BrokerError::StaleBinding {

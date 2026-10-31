@@ -38,6 +38,12 @@ use kr_protocol::method::Method;
 use kr_protocol::scalars::Nullable;
 use kr_transport::preauth::{ConnectionPeer, PairingMethod, PairingSurface};
 
+use crate::catalogue::admissions::UNRECORDABLE_CLAUSE;
+use crate::supervision::windows::{
+    A_TASK_NAMED, COULD_NOT_LIST, DID_NOT_REGISTER, DID_NOT_REMOVE, DID_NOT_RUN, IS_REGISTERED,
+    NOT_THE_ONE_REGISTERED, READS_BACK_DIFFERENTLY,
+};
+
 /// What follows a clause kept from a message, or a description of what failed, to say why the rest
 /// is not here.
 const WHY_NOT_SHOWN: &str = "the detail names the host and is not sent to a paired device";
@@ -73,6 +79,10 @@ const COMMAND_WORDS: [&str; 6] = ["chmod", "chown", "sudo", "doas", "systemctl",
 /// it: that is a program's output, which can hold an account's name in a form the rule cannot find.
 /// The last two quote what a task holds, which was written by whoever registered it, where it
 /// differs from the one this installation registers.
+///
+/// The markers of the last seven are the wording the code that writes those refusals uses
+/// ([`crate::supervision::windows`]), so a change to a refusal there is a change to its marker here,
+/// and not a refusal the rule below would read as a message that names nothing.
 const KNOWN_REASONS: [(&[&str], &str); 9] = [
     (
         &["a filesystem is mounted at "],
@@ -83,37 +93,37 @@ const KNOWN_REASONS: [(&[&str], &str); 9] = [
         "the repository names objects outside the location the grant names",
     ),
     (
-        &["a task named ", " is registered "],
+        &[A_TASK_NAMED, IS_REGISTERED],
         "a task under this environment's name is not this installation's own, so the host left it \
          as it is",
     ),
     (
-        &["the Task Scheduler did not register "],
+        &[DID_NOT_REGISTER],
         "the Task Scheduler did not register the environment's task; what it reported is not sent \
          to a paired device",
     ),
     (
-        &["the Task Scheduler did not remove "],
+        &[DID_NOT_REMOVE],
         "the Task Scheduler did not remove the environment's task; what it reported is not sent \
          to a paired device",
     ),
     (
-        &["the Task Scheduler could not list "],
+        &[COULD_NOT_LIST],
         "the Task Scheduler could not list the environment's task; what it reported is not sent \
          to a paired device",
     ),
     (
-        &["the Task Scheduler did not run "],
+        &[DID_NOT_RUN],
         "the Task Scheduler did not run the environment's task; what it reported is not sent to a \
          paired device",
     ),
     (
-        &[" is not the one this installation registers ("],
+        &[NOT_THE_ONE_REGISTERED],
         "the environment's task is not the one this installation registers; what it holds is not \
          sent to a paired device",
     ),
     (
-        &[" was changed and reads back differently ("],
+        &[READS_BACK_DIFFERENTLY],
         "the environment's task was changed and reads back differently; what it holds is not sent \
          to a paired device",
     ),
@@ -141,8 +151,9 @@ const SELECTION_UNKNOWN: &str = "what became of the terminal's last request to c
                                  conversation is unknown, so which conversation it is in is \
                                  unknown";
 
-/// What the worker says before why rich mutations wait, in the refusal of one.
-const RICH_MUTATIONS_SUSPENDED: &str = "rich mutations are suspended: ";
+/// What the worker says before why rich mutations wait, in the refusal of one: the wording the
+/// worker writes it with, so a change there is a change here.
+const RICH_MUTATIONS_SUSPENDED: &str = kr_worker::broker::error::MUTATIONS_SUSPENDED_REFUSAL;
 
 /// What a device is told of a reason for the wait that the host does not know, before why it is not
 /// sent.
@@ -258,11 +269,14 @@ const FAILURE_TEXTS: [FailureText; 9] = [
 /// followed, after a colon, by words that are not the host's: a repository's statement of why it
 /// revoked a package, what was wrong with a package in the store, which limit it is past, and why
 /// it cannot be handed to a worker. The subject of each is the package and its hash.
+///
+/// Each is the wording of the code that writes the detail, so a change to a clause there is a
+/// change to the clause here.
 const LEFT_OUT_CLAUSES: [&str; 4] = [
-    " was revoked by its repository",
-    " is not whole in this host's store",
-    " is past a package limit in force",
-    " cannot be handed to a worker",
+    kr_plugin_catalogue::admission::REVOKED_CLAUSE,
+    kr_plugin_catalogue::admission::INCOMPLETE_CLAUSE,
+    kr_plugin_catalogue::admission::PAST_A_LIMIT_CLAUSE,
+    UNRECORDABLE_CLAUSE,
 ];
 
 /// A member of a protocol record that holds a place on this host as plain text, found by its key.
@@ -369,16 +383,18 @@ const OWN_ARGUMENT_REASONS: [(&str, Option<&str>); 13] = [
 ];
 
 /// The refusal of a call that a component answers for when the component has had its rich
-/// capabilities disabled, by its wording. The worker adds why after the colon, and that is a fault
-/// or a revocation in the component's or the runtime's words.
-const DISABLED_COMPONENT_REASONS: [(&str, Option<&str>); 2] = [
+/// capabilities disabled, by its beginning, and the sentence a device is told of each. The worker
+/// adds why after it, and that is a fault or a revocation in the component's or the runtime's
+/// words. The beginnings are the wording the worker writes the refusals with, so a change there is
+/// a change here.
+const DISABLED_COMPONENT_REASONS: [(&str, &str); 2] = [
     (
-        "this binding's rich capabilities are disabled: {..}",
-        Some("this binding's rich capabilities are disabled"),
+        kr_worker::broker::error::BINDING_DISABLED_REFUSAL,
+        "this binding's rich capabilities are disabled",
     ),
     (
-        "the component answerable for this operation has had its rich capabilities disabled: {..}",
-        Some("the component answerable for this operation has had its rich capabilities disabled"),
+        kr_worker::broker::error::COMPONENT_DISABLED_REFUSAL,
+        "the component answerable for this operation has had its rich capabilities disabled",
     ),
 ];
 
@@ -386,9 +402,10 @@ const DISABLED_COMPONENT_REASONS: [(&str, Option<&str>); 2] = [
 /// their wording, and the sentence a device is told of each. Most are the host's own and say what
 /// kind of thing stopped the action; the worker writes the runtime's own words, or the component's,
 /// after the colon of several of them, and those are another program's. A `{..}` stands for the
-/// rest of the message, whatever it says. A sentence with no slot at all is the host's own text and
-/// is sent as it is.
-const PLUGIN_ACTION_REASONS: [(&str, Option<&str>); 18] = [
+/// rest of the message, whatever it says, up to the end of the shape. A sentence with no slot at
+/// all is the host's own text and is sent as it is. The refusals of a component with its rich
+/// capabilities disabled are told too ([`DISABLED_COMPONENT_REASONS`]).
+const PLUGIN_ACTION_REASONS: [(&str, Option<&str>); 16] = [
     ("the plugin runtime is not connected", None),
     (
         "the component is disabled; the runtime's words are withheld for privacy mode",
@@ -449,8 +466,6 @@ const PLUGIN_ACTION_REASONS: [(&str, Option<&str>); 18] = [
         "the component could not be asked to prepare the action: {..}",
         Some("the component could not be asked to prepare the action"),
     ),
-    DISABLED_COMPONENT_REASONS[0],
-    DISABLED_COMPONENT_REASONS[1],
 ];
 
 /// The error `error` is for a device: itself when it names nothing of this host, and otherwise the
@@ -641,19 +656,32 @@ fn told_in_place_of_the_upstreams(method: Method, error: &ProtocolError) -> Opti
         ErrorCode::ResourceUnavailable | ErrorCode::UnsupportedCapability
             if method == Method::PluginActionInvoke =>
         {
-            of_the_hosts(&PLUGIN_ACTION_REASONS)
+            match disabled_component(&error.message) {
+                Some(kind) => Some(kind.to_owned()),
+                None => of_the_hosts(&PLUGIN_ACTION_REASONS),
+            }
         }
         // The component that read an approval can have been disabled for a fault it had, and the
         // worker says which after the colon.
         ErrorCode::UnsupportedCapability if method == Method::AgentApprovalRespond => {
-            DISABLED_COMPONENT_REASONS
-                .iter()
-                .find(|(shape, _)| fits_shape(shape, &error.message))
-                .and_then(|(_, kind)| *kind)
-                .map(str::to_owned)
+            disabled_component(&error.message).map(str::to_owned)
         }
         _ => None,
     }
+}
+
+/// The sentence a device is told when `message` is the refusal of a component that has had its rich
+/// capabilities disabled, which begins as [`DISABLED_COMPONENT_REASONS`] says and gives why after
+/// it. A refusal that gives no why is the host's other sentence and is not this one.
+fn disabled_component(message: &str) -> Option<&'static str> {
+    DISABLED_COMPONENT_REASONS
+        .iter()
+        .find(|(beginning, _)| {
+            message
+                .strip_prefix(beginning)
+                .is_some_and(|why| !why.is_empty())
+        })
+        .map(|(_, kind)| *kind)
 }
 
 /// Whether `message` is `shape` with one word of the argument, up to the next space, apostrophe or
@@ -2403,20 +2431,11 @@ mod tests {
         let name = task_name(kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid()));
         // What each command of the Task Scheduler's failure begins with, and what it was doing.
         let failures = [
-            (
-                format!("the Task Scheduler did not register {name}"),
-                "register",
-            ),
-            (
-                format!("the Task Scheduler did not remove {name}"),
-                "remove",
-            ),
-            (
-                "the Task Scheduler could not list its tasks".to_owned(),
-                "list",
-            ),
-            (format!("the Task Scheduler could not list {name}"), "list"),
-            (format!("the Task Scheduler did not run {name}"), "run"),
+            (format!("{DID_NOT_REGISTER}{name}"), "register"),
+            (format!("{DID_NOT_REMOVE}{name}"), "remove"),
+            (format!("{COULD_NOT_LIST}its tasks"), "list"),
+            (format!("{COULD_NOT_LIST}{name}"), "list"),
+            (format!("{DID_NOT_RUN}{name}"), "run"),
         ];
         // What it may say after: a bare account, an address, a line of an identity, a command.
         let said = [
@@ -2996,7 +3015,10 @@ mod tests {
                 ),
                 ("marguerite asked for this", "the detail is not sent"),
             ] {
-                let said = format!("rich mutations are suspended: {reason}");
+                // The refusal as the worker writes it.
+                let said = kr_worker::broker::BrokerError::mutations_suspended(reason)
+                    .to_protocol_error()
+                    .message;
                 let told = told_on(method, ErrorCode::DraftConflict, &said);
                 assert_eq!(told.code, ErrorCode::DraftConflict, "{method:?}");
                 if tells_the_owner_alone(&told.message)
@@ -3009,10 +3031,11 @@ mod tests {
                 }
             }
             // The host's own reason is told as it is written.
-            let own = format!(
-                "rich mutations are suspended: {}",
-                kr_worker::broker::THREAD_NOT_READ
-            );
+            let own = kr_worker::broker::BrokerError::mutations_suspended(
+                kr_worker::broker::THREAD_NOT_READ,
+            )
+            .to_protocol_error()
+            .message;
             assert_eq!(
                 told_on(method, ErrorCode::DraftConflict, &own).message,
                 own,
@@ -3085,7 +3108,11 @@ mod tests {
     #[test]
     fn why_the_admissions_leave_an_installation_out_is_told_without_the_words_after_the_hosts_clause()
      {
+        use crate::catalogue::admissions::unrecordable_detail;
         use kr_plugin_catalogue::admission::{NotAdmitted, NotAdmittedReason};
+        use kr_plugin_catalogue::{Resource, ResourceLimit, Stage};
+        use kr_plugin_sdk::catalogue::{RevocationReason, RevocationRecord};
+        use kr_plugin_sdk::text::Summary;
         use kr_protocol::catalogue::{PluginAdmission, PluginLeftOutReason};
         let plugin_id = kr_protocol::ids::PluginId::new("kalareach/claude-code").expect("an id");
         let package_digest = kr_plugin_sdk::digest::PayloadDigest::of(b"a package");
@@ -3102,7 +3129,25 @@ mod tests {
             }
             .detail()
         };
-        // The clause of the host's own wording is kept and what follows the colon is not.
+        // The clause of the host's own wording is kept and what follows the colon is not. Each
+        // detail is written by the code that writes it for a person.
+        let revoked = RevocationRecord {
+            reason: RevocationReason::Withdrawn,
+            revoked_at: kr_protocol::scalars::TimestampMs::new(1),
+            statement: Summary::new("net user marguerite").expect("a statement"),
+        };
+        let past_a_limit = ResourceLimit {
+            resource: Resource::PackageFiles,
+            limit: 4096,
+            requested: 5000,
+            stage: Stage::Declared,
+            subject: "marguerite's package".to_owned(),
+        };
+        let unrecordable = unrecordable_detail(
+            &plugin_id,
+            package_digest,
+            "/Users/marguerite/x is too long",
+        );
         for (reason, said, kept) in [
             (
                 PluginLeftOutReason::Incomplete,
@@ -3114,20 +3159,24 @@ mod tests {
             ),
             (
                 PluginLeftOutReason::Revoked,
-                format!("{subject} was revoked by its repository: net user marguerite"),
+                real(NotAdmittedReason::Revoked(revoked)),
                 format!("{subject} was revoked by its repository"),
             ),
             (
                 PluginLeftOutReason::PastALimit,
-                format!("{subject} is past a package limit in force: marguerite's 4096 files"),
+                real(NotAdmittedReason::PastALimit(past_a_limit)),
                 format!("{subject} is past a package limit in force"),
             ),
             (
                 PluginLeftOutReason::Unrecordable,
-                format!("{subject} cannot be handed to a worker: /Users/marguerite/x is too long"),
+                unrecordable,
                 format!("{subject} cannot be handed to a worker"),
             ),
         ] {
+            assert!(
+                said.len() > kept.len(),
+                "the detail goes on after the clause: {said}"
+            );
             let told = read_by_a_device(&left_out(reason, &said));
             assert_eq!(told, left_out(reason, &kept), "{said}");
         }
@@ -3179,8 +3228,8 @@ mod tests {
         for said in [
             // The launch refusal, then the command that mends it.
             format!(
-                "the environment's task {name} is not the one this installation registers \
-                 ({joined}): run kr host startup --set standalone to repair it"
+                "the environment's task {name}{NOT_THE_ONE_REGISTERED}{joined}): run kr host \
+                 startup --set standalone to repair it"
             ),
             // A change that read back differently.
             TaskError::ReadBack {
@@ -3208,11 +3257,14 @@ mod tests {
 
     #[test]
     fn what_disabled_the_component_of_an_approval_is_withheld_from_a_device() {
-        for said in [
-            "the component answerable for this operation has had its rich capabilities disabled: \
-             marguerite's decoder faulted",
-            "this binding's rich capabilities are disabled: revoked by marguerite@example.com",
+        use kr_worker::broker::BrokerError;
+        // The refusals as the worker writes them.
+        for refused in [
+            BrokerError::component_disabled("marguerite's decoder faulted"),
+            BrokerError::binding_disabled("revoked by marguerite@example.com"),
         ] {
+            let said = refused.to_protocol_error().message;
+            let said = said.as_str();
             let told = told_on(
                 Method::AgentApprovalRespond,
                 ErrorCode::UnsupportedCapability,
