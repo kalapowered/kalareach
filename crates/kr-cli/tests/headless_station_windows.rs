@@ -181,6 +181,56 @@ async fn a_logon_station_with_a_lower_integrity_label_refuses_the_start() {
     );
 }
 
+/// KR-REQ-03.24: a window station that exists already with a lower integrity label than the
+/// interactive station's, and whose list leaves the starter the right to change it, is used once
+/// the starter has put its own label on it, and the label it reads back is the interactive
+/// station's. Where the interactive station has no label there is none to put on it, and the
+/// station is refused for its label, as the case above refuses one the starter may not change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_logon_station_with_a_lower_label_that_the_starter_may_change_is_used() {
+    let _alone = ONE_AT_A_TIME.lock().await;
+    let host = WorkerHost::start().await;
+    the_starter_meets_the_stations_this_test_makes(&host).await;
+
+    let interactive = windows_station::interactive_label()
+        .unwrap_or_else(|error| panic!("the interactive station's label: {error}"));
+    let lowered = HeldStation::make_labelled(|own| own.to_owned(), UNTRUSTED_LABEL)
+        .unwrap_or_else(|error| panic!("a station with the lowest integrity label: {error}"));
+    assert!(
+        lowered.label.contains("S-1-16-0"),
+        "the station was made with another label than the lowest one: {:?}",
+        lowered.label
+    );
+    let created = host.kr_new(NATIVE).await;
+    if let Some(entry) = label_entry(&interactive) {
+        assert!(
+            created.succeeded(),
+            "a headless session was refused a station whose label the starter may raise to the \
+             interactive station's {interactive:?}: {}",
+            created.said()
+        );
+        let now = lowered
+            .label_now()
+            .unwrap_or_else(|error| panic!("the station's label now: {error}"));
+        assert_eq!(
+            label_entry(&now),
+            Some(entry),
+            "the starter did not put the interactive station's label on the station: {now:?}"
+        );
+    } else {
+        assert!(
+            !created.succeeded(),
+            "a headless session was started on a station with the lowest label where the \
+             interactive station has none to put on it: {interactive:?}"
+        );
+        let said = created.said();
+        assert!(
+            refused_for_the_station(&said) && said.contains("integrity label"),
+            "the refusal does not say that the integrity label admits more: {said}"
+        );
+    }
+}
+
 /// KR-REQ-03.24: a desktop that exists already on the logon's window station and admits more than
 /// the starter's own is refused, with the step named, and no worker is started on it. The desktop
 /// of a headless worker is named for its reservation, so the case takes a launch of a reservation
@@ -268,6 +318,12 @@ async fn an_entry_added_to_the_interactive_station_does_not_refuse_a_later_headl
     added
         .put_back()
         .unwrap_or_else(|error| panic!("the interactive station was not left as it was: {error}"));
+}
+
+/// The label entry of a label the system wrote, without the flags before it, or nothing when it
+/// holds none.
+fn label_entry(label: &str) -> Option<&str> {
+    label.find("(ML;").map(|at| &label[at..])
 }
 
 /// The station's access list without the entry for the administrators that applies to the station

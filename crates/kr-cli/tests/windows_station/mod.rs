@@ -111,6 +111,31 @@ impl HeldStation {
     }
 }
 
+impl HeldStation {
+    /// The station's integrity label as the system writes it now, or empty when it has none: the
+    /// starter may have changed it since the station was made.
+    ///
+    /// # Errors
+    ///
+    /// Returns what went wrong reading it.
+    pub fn label_now(&self) -> Result<String, String> {
+        let name = name_of(self.handle)?;
+        let reader = OpenStation::named(&name, READ_CONTROL)?;
+        label_text(reader.0)
+    }
+}
+
+/// The interactive window station's integrity label as the system writes it, or empty when it has
+/// none.
+///
+/// # Errors
+///
+/// Returns what went wrong reading it.
+pub fn interactive_label() -> Result<String, String> {
+    let interactive = Interactive::open(READ_CONTROL)?;
+    label_text(interactive.station)
+}
+
 impl Drop for HeldStation {
     fn drop(&mut self) {
         // SAFETY: the handle is this value's own, returned by the call that made it.
