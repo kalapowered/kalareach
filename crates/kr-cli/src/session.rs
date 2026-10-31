@@ -417,22 +417,29 @@ fn take_scroll_keys(
 /// A console reports a key coming up that went down before the attachment began to read, most often
 /// the Return that started the command. Sending that release tells the application a key came up
 /// that was never pressed, and a session that cannot spell records refuses the write for it. `down`
-/// is the keys whose press this attachment has sent, and the order of what is kept is the order it
-/// arrived in. A record with no key of its own (a character an input method committed, or none)
-/// cannot be matched to a press, and is kept.
+/// is the keys whose press this attachment has sent, each by its virtual key, its scan code and
+/// whether it is an enhanced key, since two keys report one virtual key (the left and right Shift,
+/// Ctrl and Alt) and only those tell them apart. The order of what is kept is the order it arrived
+/// in. A record with no key of its own (a character an input method committed, or none) cannot be
+/// matched to a press, and is kept.
 fn drop_unseen_releases(
     keys: Vec<kr_term::win32::KeyRecord>,
-    down: &mut Vec<u16>,
+    down: &mut Vec<(u16, u16, bool)>,
 ) -> Vec<kr_term::win32::KeyRecord> {
     keys.into_iter()
         .filter(|key| {
             if matches!(key.virtual_key, 0 | VK_PACKET) {
                 return true;
             }
-            let place = down.iter().position(|code| *code == key.virtual_key);
+            let which = (
+                key.virtual_key,
+                key.scan_code,
+                key.control_keys & kr_term::win32::control_keys::ENHANCED_KEY != 0,
+            );
+            let place = down.iter().position(|pressed| *pressed == which);
             if key.key_down {
                 if place.is_none() {
-                    down.push(key.virtual_key);
+                    down.push(which);
                 }
                 return true;
             }
@@ -1724,7 +1731,7 @@ async fn drive(
     // The scroll keys that are down now, each with whether this terminal took it.
     let mut scroll_keys_held: Vec<(u16, bool)> = Vec::new();
     // The keys whose press has been sent to the session and whose release is still to come.
-    let mut keys_down: Vec<u16> = Vec::new();
+    let mut keys_down: Vec<(u16, u16, bool)> = Vec::new();
     // Whether the console spells its keys itself now, because the session refused its records. The
     // records the reader read before that are dropped, and none are sent after it.
     let mut console_spells = false;
@@ -4133,6 +4140,68 @@ mod tests {
         assert_eq!(
             drop_unseen_releases(vec![a_up, a_down], &mut down),
             vec![a_down]
+        );
+    }
+
+    /// Two keys can report one virtual key: the left and right Shift, and the left and right Ctrl
+    /// and Alt, which the scan code and the enhanced flag tell apart. Each is seen going down and
+    /// coming up on its own, so the release of the second to come up is sent too, and the session
+    /// hears that it came up.
+    #[test]
+    fn two_keys_that_share_a_virtual_key_are_each_seen_coming_up() {
+        use kr_term::win32::KeyRecord;
+
+        const SHIFT: u16 = 0x10;
+        const CONTROL: u16 = 0x11;
+        const ENHANCED: u32 = 0x0100;
+        let key = |virtual_key: u16, scan_code: u16, control_keys: u32, key_down: bool| KeyRecord {
+            virtual_key,
+            scan_code,
+            unicode: 0,
+            key_down,
+            control_keys,
+            repeat: 1,
+        };
+
+        // The left and right Shift have scan codes of their own.
+        let shifts = |left_first: bool| {
+            let (first, second) = if left_first {
+                (0x2a, 0x36)
+            } else {
+                (0x36, 0x2a)
+            };
+            vec![
+                key(SHIFT, first, 0x10, true),
+                key(SHIFT, second, 0x10, true),
+                key(SHIFT, first, 0, false),
+                key(SHIFT, second, 0, false),
+            ]
+        };
+        for left_first in [true, false] {
+            let mut down = Vec::new();
+            let run = shifts(left_first);
+            assert_eq!(drop_unseen_releases(run.clone(), &mut down), run);
+            assert!(down.is_empty(), "both came up");
+        }
+
+        // The left and right Ctrl share a scan code, and the right one is the enhanced key.
+        let mut down = Vec::new();
+        let run = vec![
+            key(CONTROL, 0x1d, 0x08, true),
+            key(CONTROL, 0x1d, 0x04 | ENHANCED, true),
+            key(CONTROL, 0x1d, ENHANCED, false),
+            key(CONTROL, 0x1d, 0, false),
+        ];
+        assert_eq!(drop_unseen_releases(run.clone(), &mut down), run);
+        assert!(down.is_empty(), "both Ctrl came up");
+
+        // A key of the pair that came up without being seen going down is still not sent.
+        let right_up = key(SHIFT, 0x36, 0, false);
+        let left_down = key(SHIFT, 0x2a, 0x10, true);
+        assert_eq!(
+            drop_unseen_releases(vec![left_down, right_up], &mut down),
+            vec![left_down],
+            "the right Shift was never seen going down"
         );
     }
 
