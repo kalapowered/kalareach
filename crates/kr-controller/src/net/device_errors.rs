@@ -136,23 +136,40 @@ const FAILURE_TEXTS: [FailureText; 6] = [
     },
 ];
 
-/// The reasons the host gives, as its own, for refusing the argument of a call that reaches the
-/// agent of a session. A `{}` stands for one word of the argument.
+/// The host's own reasons for refusing the argument of a call that reaches the agent of a session,
+/// by the shape of their wording, and what a device is told of each.
 ///
-/// The worker puts the upstream's words under the same code with nothing before them, so the host's
-/// own reasons are told apart from them by their shape, and a message that is not one of these is
-/// the upstream's.
-const OWN_ARGUMENT_REASONS: [&str; 6] = [
-    "a prompt names either a draft or inline text",
-    "a prompt names a draft or inline text, not both",
-    "{} does not declare a parameter named {}",
-    "the parameter {} of {} does not accept this value",
-    "the package accepts {} bytes of an attachment and this one is {}",
-    "the package does not accept {} as an attachment",
+/// The worker puts the upstream's words under the same code with nothing before them, so the
+/// host's own reasons are told apart from them by their wording, and a message that is not one of
+/// these is the upstream's. A shape does not show where its words came from: a `{}` stands for any
+/// one word, which the upstream could have written. A reason whose shape holds only text of the
+/// host's own and numbers (`{n}`, digits) is sent as it is. Any other is recognised and the device
+/// is given the sentence beside it, which holds no word of the message.
+const OWN_ARGUMENT_REASONS: [(&str, Option<&str>); 6] = [
+    ("a prompt names either a draft or inline text", None),
+    ("a prompt names a draft or inline text, not both", None),
+    (
+        "the package accepts {n} bytes of an attachment and this one is {n}",
+        None,
+    ),
+    (
+        "{} does not declare a parameter named {}",
+        Some("the action does not declare a parameter that was sent"),
+    ),
+    (
+        "the parameter {} of {} does not accept this value",
+        Some("the action does not accept the value given for a parameter"),
+    ),
+    (
+        "the package does not accept {} as an attachment",
+        Some("the package does not accept this kind of attachment"),
+    ),
 ];
 
-/// The longest word of an argument that stands for a `{}` of an own reason.
+/// The longest word of an argument that stands for a `{}` of an own reason, and the most digits
+/// of a `{n}`.
 const LONGEST_ARGUMENT_WORD: usize = 128;
+const LONGEST_NUMBER: usize = 20;
 
 /// The error `error` is for a device: itself when it names nothing of this host, and otherwise the
 /// error the module note describes.
@@ -281,65 +298,77 @@ pub(crate) fn too_large_for_the_device(frame: &ControlFrame) -> Option<ControlFr
 ///
 /// An agent's refusal is the agent's own words about what it was asked, and they quote what it
 /// was working on. The worker gives them under the same code as its own refusals of the argument,
-/// so a refusal of the argument is kept when it is one of the host's own reasons
-/// ([`OWN_ARGUMENT_REASONS`]), which a device needs to correct what it sent, and every other
-/// refusal of the argument, of the agent itself, or an end that left the outcome unknown, is
-/// replaced by a sentence composed from its code. The code and the retry category stay.
+/// so a refusal of the argument is told as it is, or by its kind, when it is one of the host's own
+/// reasons ([`OWN_ARGUMENT_REASONS`]), which a device needs to correct what it sent, and every
+/// other refusal of the argument, of the agent itself, or an end that left the outcome unknown,
+/// is replaced by a sentence composed from its code. The code and the retry category stay.
 #[must_use]
 pub(crate) fn upstream_words(method: Option<Method>, frame: ControlFrame) -> ControlFrame {
     if !method.is_some_and(puts_to_the_agent) {
         return frame;
     }
-    match frame {
-        ControlFrame::Response(Response {
-            request_id,
-            outcome: Outcome::Error(error),
-        }) if may_carry_the_upstreams(&error) => ControlFrame::Response(Response {
-            request_id,
-            outcome: Outcome::Error(with_message(
-                &error,
-                sentence_for(error.code, WHY_WHATEVER_IT_SAYS),
-            )),
-        }),
-        other => other,
-    }
+    let ControlFrame::Response(Response {
+        request_id,
+        outcome: Outcome::Error(error),
+    }) = frame
+    else {
+        return frame;
+    };
+    let error = match told_in_place_of_the_upstreams(&error) {
+        Some(message) => with_message(&error, message),
+        None => error,
+    };
+    ControlFrame::Response(Response {
+        request_id,
+        outcome: Outcome::Error(error),
+    })
 }
 
-/// Whether `error`, the refusal of a call that reaches the agent of a session, can hold the
-/// upstream's words.
-fn may_carry_the_upstreams(error: &ProtocolError) -> bool {
+/// What a device is told in place of the message of `error`, the refusal of a call that reaches
+/// the agent of a session, or `None` when it is told the message itself.
+fn told_in_place_of_the_upstreams(error: &ProtocolError) -> Option<String> {
+    let from_the_code = || sentence_for(error.code, WHY_WHATEVER_IT_SAYS);
     match error.code {
-        ErrorCode::UpstreamUnavailable | ErrorCode::OutcomeUnknown => true,
-        ErrorCode::InvalidArgument => !is_an_own_reason(&error.message),
-        _ => false,
+        ErrorCode::UpstreamUnavailable | ErrorCode::OutcomeUnknown => Some(from_the_code()),
+        ErrorCode::InvalidArgument => match OWN_ARGUMENT_REASONS
+            .iter()
+            .find(|(shape, _)| fits_shape(shape, &error.message))
+        {
+            None => Some(from_the_code()),
+            Some((_, kind)) => kind.map(str::to_owned),
+        },
+        _ => None,
     }
-}
-
-/// Whether `message` is one of the host's own reasons for refusing an argument.
-fn is_an_own_reason(message: &str) -> bool {
-    OWN_ARGUMENT_REASONS
-        .iter()
-        .any(|shape| fits_shape(shape, message))
 }
 
 /// Whether `message` is `shape` with one word of the argument, up to the next space, in place of
-/// each `{}`.
+/// each `{}`, and a number in place of each `{n}`.
 fn fits_shape(shape: &str, message: &str) -> bool {
-    let mut pieces = shape.split("{}");
-    let Some(mut rest) = pieces.next().and_then(|first| message.strip_prefix(first)) else {
-        return false;
-    };
-    for piece in pieces {
-        let word = rest.find(char::is_whitespace).unwrap_or(rest.len());
-        if word == 0 || word > LONGEST_ARGUMENT_WORD {
-            return false;
-        }
-        let Some(after) = rest[word..].strip_prefix(piece) else {
+    let (mut shape, mut rest) = (shape, message);
+    while let Some(open) = shape.find('{') {
+        let Some(close) = shape[open..].find('}').map(|at| open + at) else {
             return false;
         };
-        rest = after;
+        let Some(after) = rest.strip_prefix(&shape[..open]) else {
+            return false;
+        };
+        let length = after.find(char::is_whitespace).unwrap_or(after.len());
+        let word = &after[..length];
+        let fits = match &shape[open + 1..close] {
+            "" => (1..=LONGEST_ARGUMENT_WORD).contains(&word.len()),
+            "n" => {
+                (1..=LONGEST_NUMBER).contains(&word.len())
+                    && word.bytes().all(|b| b.is_ascii_digit())
+            }
+            _ => false,
+        };
+        if !fits {
+            return false;
+        }
+        rest = &after[length..];
+        shape = &shape[close + 1..];
     }
-    rest.is_empty()
+    rest == shape
 }
 
 /// Whether `method` hands words to the agent of a session and takes its refusal back.
@@ -1641,30 +1670,49 @@ mod tests {
         };
         let neither = prompt(false, false).validate().expect_err("no prompt");
         let both = prompt(true, true).validate().expect_err("two prompts");
+        // Reasons made of the host's own text and numbers are sent as they are.
         for (method, message) in [
             (Method::AgentPromptSubmit, neither),
             (Method::AgentPromptQueue, both),
-            // The worker's refusals of an action's parameters and of an attachment it was offered.
-            (
-                Method::PluginActionInvoke,
-                "summarise does not declare a parameter named depth",
-            ),
-            (
-                Method::PluginActionInvoke,
-                "the parameter depth of summarise does not accept this value",
-            ),
+            // The worker's refusal of an attachment over the size a package accepts.
             (
                 Method::PluginActionInvoke,
                 "the package accepts 1048576 bytes of an attachment and this one is 2097152",
-            ),
-            (
-                Method::PluginActionInvoke,
-                "the package does not accept application/zip as an attachment",
             ),
         ] {
             let told = told_on(method, ErrorCode::InvalidArgument, message);
             assert_eq!(told.message, message, "{method:?}");
             assert_eq!(told.code, ErrorCode::InvalidArgument);
+        }
+        // The worker's refusals that quote a word of the argument are told by what they refuse,
+        // without the word.
+        for (message, kind, quoted) in [
+            (
+                "summarise does not declare a parameter named depth",
+                "does not declare a parameter",
+                "depth",
+            ),
+            (
+                "the parameter depth of summarise does not accept this value",
+                "does not accept the value",
+                "summarise",
+            ),
+            (
+                "the package does not accept application/zip as an attachment",
+                "does not accept this kind of attachment",
+                "zip",
+            ),
+        ] {
+            let told = told_on(
+                Method::PluginActionInvoke,
+                ErrorCode::InvalidArgument,
+                message,
+            );
+            assert_eq!(told.code, ErrorCode::InvalidArgument);
+            assert!(
+                told.message.contains(kind) && !told.message.contains(quoted),
+                "{message}: {told:?}"
+            );
         }
     }
 
@@ -1682,6 +1730,12 @@ mod tests {
             "invalid params: cwd must be inside the project",
             // The words of a reason of the host's, with more after them.
             "the package does not accept application/zip as an attachment, said marguerite",
+            // The words of a reason of the host's with the account in the place of a word of the
+            // argument, which the shape cannot tell from the argument's own word.
+            "the parameter marguerite of summarise does not accept this value",
+            "marguerite@example.com does not declare a parameter named depth",
+            "the package does not accept marguerite as an attachment",
+            "the package accepts marguerite bytes of an attachment and this one is 20",
         ] {
             let refused = upstream(said);
             assert_eq!(refused.code, ErrorCode::InvalidArgument);
