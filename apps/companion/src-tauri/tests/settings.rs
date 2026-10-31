@@ -1346,9 +1346,10 @@ async fn turning_sync_on_starts_a_collection_and_puts_the_settings_in_it_sealed(
 /// named one service keeps asking for that service after the setting names another. The rest of
 /// a step's calls (choosing between versions and dropping a copy, letting go of content that says
 /// what this computer says, the first object, following content refused to settings sealed again
-/// (in the step that sealed them and in the one after a stop), settling a write whose answer was
-/// lost, and the drafts' pulls, removals, copy drops and fences), and a computer that was taken
-/// out reading its offers and joining again, are held to the record's service by the cases below.
+/// (in the step that finds them refused and in the one after a stop), settling a write whose
+/// answer was lost, and the drafts' pulls, removals, copy drops and fences), and a computer that
+/// was taken out reading its offers and joining again, are held to the record's service by the
+/// cases below.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn settings_sync_talks_to_the_service_client_it_was_given_at_the_origin_its_record_names() {
     let computer = Computer::new().await;
@@ -2101,9 +2102,11 @@ async fn a_draft_whose_answer_was_lost_is_settled_at_the_service_the_record_name
         .say(environment, HostPrivacy::Off { generation: 1 });
     let page = &forked.page;
     let (draft, _) = page.write_draft(Some(&studio), "sent before the answer came back");
-    // The pass asks the collection once for the settings and then publishes the draft, so it is
-    // the second request.
-    forked.fork_service.web().fail(SYNC_PATH, 2, Moment::After);
+    // The first write the pass makes is the draft's publication. Its answer is lost.
+    forked
+        .fork_service
+        .web()
+        .fail_with_member(SYNC_PATH, "exchange", 1, Moment::After);
     page.drafts_on(true).expect("drafts sync is on");
     let elsewhere = forked.elsewhere();
     assert_eq!(

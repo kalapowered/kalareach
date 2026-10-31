@@ -604,10 +604,9 @@ fn the_application_reports_the_managed_services_it_holds_a_client_of() {
     // a call through it reaches that service, which answers, where a client with nothing
     // configured refuses.
     let app = mock_builder()
-        .manage(AccountSlot::ready(Arc::clone(&account)))
         .build(mock_context(noop_assets()))
         .expect("an application on the mock runtime");
-    let held = companion_tauri::services::held_by(app.handle(), &account);
+    let held = companion_tauri::services::held_by(app.handle(), &account).into_clients();
     let token = AccountToken::new("a-stub-access-token").expect("a token");
     tauri::async_runtime::block_on(async {
         held.account
