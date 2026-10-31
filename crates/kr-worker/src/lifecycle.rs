@@ -22,6 +22,13 @@
 //! terminal's foreground for a program the integration did not launch. It keeps a clock only while
 //! it has something to look at, and says what that leaves out.
 //!
+//! What is left on a clock is kept on one beat. The sweep, the adoption watch's look, the daemon's
+//! held request for the session's attention, the host's maintenance pass and the replacement of a
+//! connection's window are each about half a minute or more, and counted from the moments they
+//! began they woke an idle host at different instants, each time through the stages a timer that
+//! far off passes through. [`Activity::on_the_beat`] puts every wait of a whole beat or more at the
+//! latest beat it allows, counted from when the supervision began, so they wake the host together.
+//!
 //! The limits of the middle row are worth being exact about, because traffic is a *hint* rather
 //! than a proof and the observation it asks for is a sample rather than a record of what happened.
 //!
@@ -45,8 +52,8 @@
 //! terminal in either direction. Closure does not rest on any of it: it observes the boundary again
 //! as it asks the processes to stop, as it forces what is left, and as it writes the record.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
@@ -102,6 +109,8 @@ pub struct Activity {
     /// Whether the supervision is in the middle of a look at the session.
     #[cfg(feature = "testing")]
     looking: AtomicBool,
+    /// The instant the beat counts from: when the supervision began.
+    beat: OnceLock<Instant>,
 }
 
 /// One reader's mark.
@@ -137,6 +146,41 @@ impl Activity {
     #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// Counts the beat from `start`, unless it is counted from an earlier instant already.
+    fn anchor_beat(&self, start: Instant) {
+        let _ = self.beat.set(start);
+    }
+
+    /// Returns when a wait that is due at `due` and began at `after` ends, put on the session's
+    /// beat: the latest instant at or before `due` that is a whole number of
+    /// [`IDLE_SWEEP_INTERVAL`]s after the supervision began.
+    ///
+    /// An idle session keeps several clocks of about that length, and each woke the host by
+    /// itself: the sweep, the adoption watch's look, the daemon's held request, the maintenance
+    /// pass and the replacement of a connection's window. Counted from whenever each began, they
+    /// fell at different instants, and a timer that far off passes through the timer wheel in
+    /// stages that each wake the host. On one beat they wake it together, and the stages are
+    /// shared. A wait is never put later than it was due, and only a wait of a whole beat or more
+    /// is moved, so it always has a beat to land on after `after`. The supervision has not begun
+    /// when the beat is not counted yet, and then nothing moves.
+    #[must_use]
+    pub fn on_the_beat(&self, due: Instant, after: Instant) -> Instant {
+        let Some(&start) = self.beat.get() else {
+            return due;
+        };
+        if due.saturating_duration_since(after) < IDLE_SWEEP_INTERVAL {
+            return due;
+        }
+        let Some(since) = due.checked_duration_since(start) else {
+            return due;
+        };
+        let beats = since.as_nanos() / IDLE_SWEEP_INTERVAL.as_nanos();
+        u32::try_from(beats)
+            .ok()
+            .and_then(|beats| IDLE_SWEEP_INTERVAL.checked_mul(beats))
+            .map_or(due, |offset| start + offset)
     }
 
     /// Marks that the session accepted input or produced output, or that its shell's integration
@@ -266,7 +310,8 @@ impl Sweep {
     /// The boundary was recorded as it was established, so the first observation is due an interval
     /// from here rather than at once.
     #[must_use]
-    pub const fn begin(activity: Arc<Activity>, started: Instant, idle: Duration) -> Self {
+    pub fn begin(activity: Arc<Activity>, started: Instant, idle: Duration) -> Self {
+        activity.anchor_beat(started);
         Self {
             activity,
             observed: started,
@@ -300,12 +345,15 @@ impl Sweep {
     /// what notices that one is wanted.
     pub fn next_observation(&mut self) -> Instant {
         self.marked |= self.activity.take();
-        self.observed
-            + if self.marked {
-                OBSERVE_INTERVAL
-            } else {
-                self.idle
-            }
+        if self.marked {
+            self.observed + OBSERVE_INTERVAL
+        } else if self.idle == IDLE_SWEEP_INTERVAL {
+            self.activity
+                .on_the_beat(self.observed + self.idle, self.observed)
+        } else {
+            // A session given another interval keeps exactly that.
+            self.observed + self.idle
+        }
     }
 
     /// Whether the session has accepted input or produced output since the last observation.
@@ -539,8 +587,61 @@ mod tests {
         assert!(sweep.observation_due(started + OBSERVE_INTERVAL));
         assert_eq!(
             sweep.next_observation(),
-            started + OBSERVE_INTERVAL + IDLE_SWEEP_INTERVAL,
-            "and the mark is spent by the observation it caused"
+            started + IDLE_SWEEP_INTERVAL,
+            "and the mark is spent by the observation it caused, after which the sweep is back on \
+             the session's beat"
+        );
+    }
+
+    /// KR-PERF-003: an idle session's clocks of about half a minute each woke its host at
+    /// instants of their own. Put on one beat they wake it together.
+    #[test]
+    fn kr_perf_003_a_wait_of_a_beat_or_more_ends_on_the_sessions_beat() {
+        let started = Instant::now();
+        let activity = Activity::new();
+        assert_eq!(
+            activity.on_the_beat(started + IDLE_SWEEP_INTERVAL * 2, started),
+            started + IDLE_SWEEP_INTERVAL * 2,
+            "nothing moves before the supervision has begun"
+        );
+        let mut sweep = Sweep::begin(Arc::clone(&activity), started, IDLE_SWEEP_INTERVAL);
+
+        // The sweep itself: observed off the beat, it goes back onto it, never later than a full
+        // interval after the observation.
+        let observed = started + IDLE_SWEEP_INTERVAL + Duration::from_secs(7);
+        assert!(sweep.observation_due(observed));
+        assert_eq!(
+            sweep.next_observation(),
+            started + IDLE_SWEEP_INTERVAL * 2,
+            "the next observation of a session that does nothing is the next beat"
+        );
+
+        // Any other clock of this length that began off the beat ends on the same one.
+        let began = started + Duration::from_secs(41);
+        let due = began + IDLE_SWEEP_INTERVAL;
+        assert_eq!(
+            activity.on_the_beat(due, began),
+            started + IDLE_SWEEP_INTERVAL * 2,
+            "a look that began at another moment ends with the sweep"
+        );
+        assert_eq!(
+            activity.on_the_beat(due + IDLE_SWEEP_INTERVAL * 2, began),
+            started + IDLE_SWEEP_INTERVAL * 4,
+            "and so does a longer one, on the latest beat it allows"
+        );
+        for offset in 0..30 {
+            let began = started + Duration::from_millis(offset * 1_000 + 137);
+            let ends = activity.on_the_beat(began + IDLE_SWEEP_INTERVAL * 5, began);
+            assert!(
+                ends > began && ends <= began + IDLE_SWEEP_INTERVAL * 5,
+                "a wait is never put later than it was due, nor before it began"
+            );
+        }
+
+        // A wait shorter than a beat is the caller's own.
+        assert_eq!(
+            activity.on_the_beat(began + Duration::from_secs(29), began),
+            began + Duration::from_secs(29)
         );
     }
 

@@ -604,7 +604,11 @@ pub async fn watch_foreground(
         if command || identifying.is_some() || adoptions.holds_any() {
             pace.reason_at_look();
         }
-        let due = pace.due();
+        // A look as slow as the supervision's sweep falls on the session's beat, which the sweep
+        // keeps, so the two wake the host once.
+        let due = tokio::time::Instant::from_std(
+            activity.on_the_beat(pace.due().into_std(), pace.looked.into_std()),
+        );
         if pace.wait() <= WATCH_INTERVAL {
             // A mark made meanwhile is taken at the look rather than waking the watch early, so a
             // session that prints steadily is looked at once an interval and no more.
