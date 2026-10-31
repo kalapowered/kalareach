@@ -91,11 +91,15 @@ fn installation() -> &'static Path {
     })
 }
 
-/// Held by the cases that run a real container runtime and by the two cases that stand one in, so
-/// that these four do not run beside each other. Without it `podman exec` often stalled in the
-/// real-container cases on the build box, and with it they have passed; why is not known. Every call this harness makes to the runtime is bounded as well, so a stall under the
-/// lock fails the case that made the call and names it. A removal that stalls in `Drop` is
-/// recorded, not raised.
+/// Held by the four cases that start a container or put a stand-in for the container runtime first
+/// on `kr`'s path, so that these four do not run beside each other. The cases below that run a
+/// stand-in runtime of their own, in a directory of their own, share nothing with them and take no
+/// turn.
+///
+/// Without it `podman exec` stalled in the real-container cases of whole-suite runs on the build
+/// box, and with it they passed; what the stalled call waited for is not established. Every call
+/// this harness makes to the runtime is bounded as well, so a stall under the turn fails the case
+/// that made the call and names it. A removal that fails in `Drop` fails the case that passed.
 static CONTAINER_RUNTIME_TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// What a login in the destination gives the helper as its `HOME`.
