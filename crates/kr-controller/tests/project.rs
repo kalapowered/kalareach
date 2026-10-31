@@ -1475,9 +1475,9 @@ async fn a_daemon_starts_where_there_is_no_git() {
 }
 
 /// A Git that never answers holds nothing else: the daemon starts and answers, a request that
-/// needs Git is refused when Git has had the time it is given, a later request is refused the same
-/// way, and the daemon ends when it is interrupted, once the look under way has ended, with
-/// nothing the stand-in started left running.
+/// needs Git is refused when Git has had the time it is given, as a fault that passes, a later
+/// request is refused the same way, and the daemon ends when it is interrupted, once the look under
+/// way has ended, with nothing the stand-in started left running.
 ///
 /// The stand-in waits for much longer than a daemon gives Git, starts a process of its own to wait
 /// with, and writes a mark if it is ever allowed to finish.
@@ -1568,10 +1568,10 @@ async fn a_daemon_whose_git_never_answers_answers_refuses_and_ends_when_interrup
             .expect("the request task ends")
             .expect("the call reaches the daemon"),
     );
-    assert_eq!(refusal.code, ErrorCode::HostNotConfigured, "{refusal:?}");
+    assert_eq!(refusal.code, ErrorCode::UpstreamUnavailable, "{refusal:?}");
     assert!(
-        refusal.message.contains("did not answer"),
-        "the refusal says why: {}",
+        refusal.message.contains("did not answer") && !refusal.message.contains(install_step()),
+        "the refusal says why, and names no install: {}",
         refusal.message
     );
     assert_eq!(names_in(work.path()), Vec::<String>::new());
@@ -1584,7 +1584,7 @@ async fn a_daemon_whose_git_never_answers_answers_refuses_and_ends_when_interrup
             .expect("the request task ends")
             .expect("the call reaches the daemon"),
     );
-    assert_eq!(later.code, ErrorCode::HostNotConfigured, "{later:?}");
+    assert_eq!(later.code, ErrorCode::UpstreamUnavailable, "{later:?}");
 
     // And the daemon is interrupted while one more look is under way: it ends by itself, and what
     // the stand-in started goes with it.

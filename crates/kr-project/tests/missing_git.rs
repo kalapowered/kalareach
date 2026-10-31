@@ -180,73 +180,6 @@ fn until(what: &str, gone: impl Fn() -> bool) {
 
 #[cfg(unix)]
 #[test]
-fn a_git_that_never_answers_is_ended_with_what_it_started_and_refused() {
-    // A stand-in that waits on something that does not come, as an installer prompt does, and
-    // starts a process of its own to wait with. The bound is what ends it; the group it leads is
-    // what keeps the process it started from outliving it.
-    let directory = tempfile::tempdir().expect("a directory for this test");
-    let search = directory.path().join("search");
-    std::fs::create_dir(&search).expect("a search path of this test's own");
-    let (own, child, finished) = (
-        directory.path().join("own"),
-        directory.path().join("child"),
-        directory.path().join("finished"),
-    );
-    stand_in(
-        &search,
-        &format!(
-            "echo $$ > '{}'\nsleep 120 &\necho $! > '{}'\nwait\n: > '{}'",
-            own.display(),
-            child.display(),
-            finished.display()
-        ),
-    );
-    let profile = profile_waiting(directory.path(), &search, Duration::from_secs(3));
-
-    let refusal = profile
-        .git()
-        .expect_err("a Git that never answers is not Git");
-    assert!(
-        matches!(refusal, ProjectError::GitUnavailable { .. }),
-        "{refusal:?}"
-    );
-    assert_eq!(
-        refusal.code(),
-        kr_protocol::error::ErrorCode::HostNotConfigured
-    );
-    assert!(
-        refusal.to_string().contains("did not answer"),
-        "it says why: {refusal}"
-    );
-    for named in [&own, &child] {
-        let pid = std::fs::read_to_string(named)
-            .expect("the stand-in started before the bound ran out")
-            .trim()
-            .to_owned();
-        until(
-            &format!("process {pid} of the stand-in still runs after it was refused"),
-            || !exists(&pid),
-        );
-    }
-    assert!(
-        !finished.exists(),
-        "the stand-in was ended, and did not finish by itself"
-    );
-    // Nothing was kept: a Git that arrives is found by the next look.
-    let Ok(installed) = kr_project::git::GitProgram::discover() else {
-        return;
-    };
-    std::fs::remove_file(search.join("git")).expect("the stand-in goes");
-    std::os::unix::fs::symlink(installed.program(), search.join("git"))
-        .expect("Git is put on the search path");
-    assert_eq!(
-        profile.git().expect("the next look finds it").program(),
-        installed.program()
-    );
-}
-
-#[cfg(unix)]
-#[test]
 fn a_git_that_answers_with_more_than_a_version_and_a_directory_is_refused() {
     let directory = tempfile::tempdir().expect("a directory for this test");
     let search = directory.path().join("search");
@@ -274,7 +207,9 @@ fn a_git_that_answers_without_end_is_ended_where_its_output_passes_the_limit_and
     let search = directory.path().join("search");
     std::fs::create_dir(&search).expect("a search path of this test's own");
     stand_in(&search, "exec yes");
-    let profile = profile_waiting(directory.path(), &search, Duration::from_secs(5));
+    // The bound is a guard only: the limit ends the look long before it, and a look that waited for
+    // the bound would fail the case by saying so.
+    let profile = profile_waiting(directory.path(), &search, Duration::from_secs(60));
 
     let refusal = profile.git().expect_err("that is not an answer either");
     assert!(
@@ -418,8 +353,8 @@ fn requests_that_arrive_together_share_the_refusal_of_one_look() {
         for look in looks {
             let refusal = look.join().expect("the look ends");
             assert!(
-                matches!(refusal, ProjectError::GitUnavailable { .. }),
-                "{refusal:?}"
+                matches!(refusal, ProjectError::GitFailed { .. }),
+                "a look that ran out of time is a fault that passes: {refusal:?}"
             );
         }
     });
@@ -482,11 +417,11 @@ fn a_git_that_ends_first_leaves_nothing_running_and_costs_no_bound() {
 
 #[cfg(unix)]
 #[test]
-fn a_copy_of_git_that_does_not_answer_refuses_the_look_and_keeps_nothing() {
+fn a_copy_of_git_that_answers_with_more_than_it_is_asked_refuses_the_look_and_keeps_nothing() {
     // The program on the search path answers both questions. The copy of Git under the helper
     // directory it names does not: it is not a copy that answers differently, which would leave the
-    // program as the one that runs, but no answer, and a look that kept the program on the strength
-    // of it would keep one that cannot run Git.
+    // program as the one that runs, but an answer that is not one, and a look that kept the
+    // program on the strength of it would keep one that cannot run Git.
     let directory = tempfile::tempdir().expect("a directory for this test");
     let search = directory.path().join("search");
     let helpers = directory.path().join("helpers");
@@ -502,18 +437,19 @@ fn a_copy_of_git_that_does_not_answer_refuses_the_look_and_keeps_nothing() {
             helpers.display()
         ),
     );
-    stand_in(&helpers, "exec sleep 120");
-    let profile = profile_waiting(directory.path(), &search, Duration::from_secs(3));
+    stand_in(&helpers, "head -c 200000 /dev/zero | tr '\\0' x");
+    // The bound is a guard only: the copy's answer passes the limit at once.
+    let profile = profile_waiting(directory.path(), &search, Duration::from_secs(60));
 
     let refusal = profile
         .git()
-        .expect_err("a copy that never answers is no answer");
+        .expect_err("a copy that answers with more than it is asked is no answer");
     assert!(
         matches!(refusal, ProjectError::GitUnavailable { .. }),
         "{refusal:?}"
     );
     assert!(
-        refusal.to_string().contains("did not answer"),
+        refusal.to_string().contains("more than"),
         "it says why: {refusal}"
     );
     assert!(
