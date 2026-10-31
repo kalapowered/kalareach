@@ -5684,8 +5684,8 @@ on any host.
 A search that finds no usable Git is not kept, so a Git installed while the daemon runs is found by
 the first request that makes a look after the install, without a restart; a request that joined a
 look under way when Git was installed is refused with it, and its retry finds Git. On Linux a paired device
-stays refused the five repository operations until the next `kr doctor` repeats the proof, and the
-owner's requests do not wait for it. On a Mac without the Command Line Tools, each search starts
+stays refused the five repository operations and the four change-set methods above until the next
+`kr doctor` repeats the proof, and the owner's requests do not wait for it. On a Mac without the Command Line Tools, each search starts
 the stub that asks to install them.
 
 ### The boundary around a Git invocation
