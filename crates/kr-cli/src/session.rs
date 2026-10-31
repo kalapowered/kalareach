@@ -4088,8 +4088,10 @@ mod tests {
         };
         let said = after_the_reader_stops(both, &mut Fallback::default(), &mut input);
         assert!(
-            said.len() == 1 && said[0].as_str().contains("had not ended"),
-            "{said:?}"
+            said.len() == 1
+                && said[0].as_str().contains("input mode may change")
+                && !said[0].as_str().contains("asked the system to cancel"),
+            "the line for a reader that had not ended, and not the one for a cancel: {said:?}"
         );
 
         // A reader that ended only after a cancel of its read of the console was asked says so too.
@@ -4099,7 +4101,9 @@ mod tests {
         };
         let said = after_the_reader_stops(cancel_asked, &mut Fallback::default(), &mut input);
         assert!(
-            said.len() == 1 && said[0].as_str().contains("asked the system to cancel"),
+            said.len() == 1
+                && said[0].as_str().contains("asked the system to cancel")
+                && said[0].as_str().contains("next key you type may be lost"),
             "{said:?}"
         );
 
