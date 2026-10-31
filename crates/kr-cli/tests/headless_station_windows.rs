@@ -6,7 +6,14 @@
 //! the station back and refuses to start a worker on one that admits more than the starter's own
 //! station does, and starts it on one that admits less: the interactive station gains entries
 //! while a logon lasts (a "Run as different user" may add one for the account it starts a program
-//! as), and a station made before that has not the new entry.
+//! as), and a station made before that has not the new entry. A station that differs in a way the
+//! lists alone do not show to admit more, such as one entry with another mask, is refused too, and
+//! the refusal does not say that it admits more.
+//!
+//! The desktop is checked the same way. A desktop that exists already on the station keeps the
+//! security it was made with, so a desktop that admits more than the starter's own is refused. The
+//! name of a worker's desktop is not one a case can know, so the case asks the starter for a
+//! desktop of a name it chose, the way the daemon's task does.
 //!
 //! These cases change the security of objects that every headless start of this logon meets, so
 //! they run one at a time, and each puts back what it changed. They need a signed-in interactive
@@ -24,8 +31,11 @@ mod teardown;
 mod windows_session;
 mod windows_station;
 
+use std::path::Path;
+
+use kr_ipc::starter::{ChildCommand, ChildRefusal, StartedChild, current_session, end_process};
 use windows_session::WorkerHost;
-use windows_station::{EntryOnInteractive, HeldStation};
+use windows_station::{EntryOnInteractive, HeldDesktop, HeldStation};
 
 /// The arguments of a session that needs no shell package: these cases are about where its worker
 /// starts.
@@ -38,6 +48,14 @@ static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(())
 /// starter's own.
 fn refused_for_the_station(said: &str) -> bool {
     said.contains("check the window station's security") && said.contains("admits more")
+}
+
+/// What a refused start says when it was refused for a window station that is not one the starter
+/// accepts and that the lists alone do not show to admit more.
+fn not_accepted_for_the_station(said: &str) -> bool {
+    said.contains("check the window station's security")
+        && said.contains("is not one the starter accepts")
+        && !said.contains("admits more")
 }
 
 /// Holds a window station of the logon that admits everyone, where the starter's own does not, and
@@ -86,6 +104,136 @@ async fn a_logon_station_that_admits_more_than_the_starters_own_refuses_the_star
         "the start after the wider station was gone was refused: {}",
         after.said()
     );
+}
+
+/// KR-REQ-03.24: a window station that exists already and whose list is the starter's own with the
+/// mask of one entry narrowed is refused, and the refusal says that the station is not one the
+/// starter accepts and not that it admits more: a narrower mask admits less, which the lists alone
+/// do not show. Control: once it is gone the next start is not refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_logon_station_with_a_narrower_entry_is_refused_without_being_called_wider() {
+    let _alone = ONE_AT_A_TIME.lock().await;
+    let host = WorkerHost::start().await;
+    the_starter_meets_the_stations_this_test_makes(&host).await;
+
+    let narrower = HeldStation::make(with_a_narrower_entry)
+        .unwrap_or_else(|error| panic!("a station with a narrower entry: {error}"));
+    let refused = host.kr_new(NATIVE).await;
+    assert!(
+        !refused.succeeded(),
+        "a headless session was started on a window station that is not the starter's own: {}",
+        narrower.access_list
+    );
+    let said = refused.said();
+    assert!(
+        not_accepted_for_the_station(&said),
+        "the refusal does not say that the station is not one the starter accepts, or says that it \
+         admits more: {said}"
+    );
+
+    drop(narrower);
+    let after = host.kr_new(NATIVE).await;
+    assert!(
+        after.succeeded(),
+        "the start after the narrower station was gone was refused: {}",
+        after.said()
+    );
+}
+
+/// KR-REQ-03.24: a window station that exists already, with the starter's own access list and an
+/// integrity label below the starter's own, is refused for its label, with the step named, and
+/// the refusal says that it admits more. Control: once it is gone the next start is not refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_logon_station_with_a_lower_integrity_label_refuses_the_start() {
+    let _alone = ONE_AT_A_TIME.lock().await;
+    let host = WorkerHost::start().await;
+    the_starter_meets_the_stations_this_test_makes(&host).await;
+
+    let lower = HeldStation::make_labelled(|own| own.to_owned(), "S:(ML;;NW;;;LW)")
+        .unwrap_or_else(|error| panic!("a station with a low integrity label: {error}"));
+    assert!(
+        lower.label.contains("LW"),
+        "the station was made with another label than the low one: {:?}",
+        lower.label
+    );
+    let refused = host.kr_new(NATIVE).await;
+    assert!(
+        !refused.succeeded(),
+        "a headless session was started on a window station with a low integrity label: {}",
+        lower.label
+    );
+    let said = refused.said();
+    assert!(
+        refused_for_the_station(&said) && said.contains("integrity label"),
+        "the refusal does not say that the integrity label admits more: {said}"
+    );
+
+    drop(lower);
+    let after = host.kr_new(NATIVE).await;
+    assert!(
+        after.succeeded(),
+        "the start after the low-label station was gone was refused: {}",
+        after.said()
+    );
+}
+
+/// Starts a program that ends at once on the desktop `label` of this logon's window station, as the
+/// task's starter does for a headless worker.
+fn start_on_desktop(label: &str) -> Result<StartedChild, ChildRefusal> {
+    let system = std::env::var_os("SystemRoot").expect("the system directory");
+    let program = Path::new(&system).join("System32").join("cmd.exe");
+    kr_ipc::starter::start_child(&ChildCommand {
+        application: &program,
+        command_line: "cmd.exe /c exit 0",
+        directory: Path::new(&system),
+        environment: &[],
+        session: current_session().expect("this process's session"),
+        output: None,
+        own_desktop: Some(label),
+    })
+}
+
+/// KR-REQ-03.24: a desktop that exists already on the logon's window station and admits more than
+/// the starter's own is refused, with the step named, and no program is started on it. Control: a
+/// desktop that does not exist yet is made on the same station and a program starts on it, which
+/// shows that the starter meets the station this test holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_desktop_that_exists_already_and_admits_more_than_the_starters_own_refuses_the_start() {
+    const WIDER: &str = "kr-test-wider-desktop";
+    const FRESH: &str = "kr-test-fresh-desktop";
+    let _alone = ONE_AT_A_TIME.lock().await;
+
+    let station = HeldStation::make(|own| own.to_owned()).unwrap_or_else(|error| {
+        panic!("the logon's station as the starter would make it: {error}")
+    });
+    let wider = HeldDesktop::make(&station, WIDER, |own| format!("{own}(A;;0x1;;;WD)"))
+        .unwrap_or_else(|error| panic!("a desktop wider than the starter's own: {error}"));
+
+    let refused = start_on_desktop(WIDER).err().unwrap_or_else(|| {
+        panic!(
+            "a program was started on a desktop that admits everyone: {}",
+            wider.access_list
+        )
+    });
+    assert!(
+        refused.detail.contains("check the desktop's security"),
+        "the refusal does not say which check refused: {}",
+        refused.detail
+    );
+    assert!(
+        refused.remaining_pid.is_none(),
+        "a program was created for the refused start: {refused:?}"
+    );
+
+    let started = start_on_desktop(FRESH).unwrap_or_else(|refusal| {
+        panic!(
+            "the start on a desktop that does not exist yet was refused, so the starter may not meet \
+             the station this test holds ({}): {}",
+            station.access_list, refusal.detail
+        )
+    });
+    // The program ends by itself; a second end is not an error.
+    let _ = end_process(&started.identity);
 }
 
 /// KR-REQ-03.24: a window station that exists already and admits less than the starter's own, for
@@ -156,4 +304,34 @@ fn without_administrators(own: &str) -> String {
         from = at + TRUSTEE.len();
     }
     panic!("the interactive station has no entry for the administrators that applies to it: {own}")
+}
+
+/// The station's access list with the mask of its first allowing entry that has a hexadecimal mask
+/// narrowed by the lowest bit it holds.
+fn with_a_narrower_entry(own: &str) -> String {
+    let mut from = 0;
+    while let Some(at) = own[from..].find('(') {
+        let start = from + at;
+        let end = start
+            + own[start..]
+                .find(')')
+                .unwrap_or_else(|| panic!("the entry is not closed: {own}"));
+        let mut fields: Vec<&str> = own[start + 1..end].split(';').collect();
+        let mask = fields
+            .get(2)
+            .and_then(|rights| rights.strip_prefix("0x"))
+            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+            .filter(|mask| *mask != 0);
+        if let Some(mask) = mask
+            && fields.len() >= 6
+            && fields[0] == "A"
+            && !fields[1].contains("IO")
+        {
+            let narrower = format!("0x{:x}", mask & (mask - 1));
+            fields[2] = &narrower;
+            return format!("{}({}){}", &own[..start], fields.join(";"), &own[end + 1..]);
+        }
+        from = end + 1;
+    }
+    panic!("the interactive station has no allowing entry with a hexadecimal mask to narrow: {own}")
 }
