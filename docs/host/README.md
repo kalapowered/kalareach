@@ -3232,15 +3232,22 @@ host (the repository a clone from a location was made from), and the `endpoint` 
 is replaced by the withheld record of a path, and a list keeps its length. The name of the
 desktop a session is bound to (`desktop_session_id` in the session's `desktop`) spells out the
 account's name and number, so a device is given the marker the capability answers use, which says
-the session is bound to a desktop and not which one. A session's `cwd` and `shell_path`, the
-`command` and `cwd` of its last command block, a question's `executable`, an attachment's staged
-`host_path` and the `metadata_url` and `targets_url` of a catalogue are sent as they are: the
-specification shows them to the person on purpose, as part of how a session, a question, a manual
-attachment or a catalogue is described, and a device that may see a session sees its terminal. The
-command block reaches only a device whose grant keeps history from the moment the command started
-or earlier. A catalogue's two locations are a directory on this host when the catalogue is a local
-one; only a device that holds `host.manage` reads them, and an owner device rebuilds the digest of
-a trust plan from them. The
+the session is bound to a desktop and not which one. The `actor_id` of the owner's own local caller
+(`local:` and the number of an account) is sent as `local`; no request a device makes carries an
+actor, so nothing needs the number back. A session's `cwd` and `shell_path`, the `command` and `cwd`
+of its last command block, a question's `executable`, an attachment's staged `host_path`, the
+`command` of a materialisation (`changeset.read`) and in the offer of `shell.launch.surface`, and
+the `metadata_url` and `targets_url` of a catalogue are sent as they are: the specification shows
+them to the person on purpose, as part of how a session, a question, a manual attachment, a change,
+a launch or a catalogue is described, and a device that may see a session sees its terminal. Each
+reaches a device that holds the right of the method that reads it; the command block reaches only a
+device whose grant keeps history from the moment the command started or earlier. A catalogue's two
+locations are a directory on this host when the catalogue is a local one; only a device that holds
+`host.manage` reads them, and an owner device rebuilds the digest of a trust plan from them. The
+`disabled_reason` of a capability record in `plugin.capabilities` is a sentence of the host's; for
+a record of a signed qualification that is not usable it is followed by the statement of that
+qualification, which is the publisher's published text and not this host's, and is sent as it is.
+The
 `suspension_reason` of an agent instance's binding, which says why rich mutations wait, and the
 refusal of a rich mutation that repeats it, are sent as the host wrote them when the reason is one
 of the host's own sentences. Otherwise the device is told what kind of wait it was: the method of a
