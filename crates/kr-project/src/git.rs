@@ -5430,8 +5430,9 @@ mod tests {
             panic!("a pipe that would block the reads is not read, and the probe is refused");
         };
         assert!(
-            refusal.to_string().contains("without blocking"),
-            "it says why: {refusal}"
+            refusal.to_string().contains("without blocking")
+                && matches!(refusal, ProjectError::GitFailed { .. }),
+            "it says why, and it is the host's fault that passes: {refusal:?}"
         );
         let pid = number_of(&own);
         let alive = running(&pid);
@@ -5462,8 +5463,9 @@ mod tests {
             panic!("a child that cannot be waited on is refused");
         };
         assert!(
-            refusal.to_string().contains("could not be waited on"),
-            "it says why: {refusal}"
+            refusal.to_string().contains("could not be waited on")
+                && matches!(refusal, ProjectError::GitFailed { .. }),
+            "it says why, and it is the host's fault that passes: {refusal:?}"
         );
         let pid = number_of(&own);
         let left_alone = running(&pid);
@@ -5495,8 +5497,9 @@ mod tests {
             panic!("a pipe that would block the reads is not read, and the probe is refused");
         };
         assert!(
-            refusal.to_string().contains("without blocking"),
-            "it says why: {refusal}"
+            refusal.to_string().contains("without blocking")
+                && matches!(refusal, ProjectError::GitFailed { .. }),
+            "it says why, and it is the host's fault that passes: {refusal:?}"
         );
         let pid = number_of(&own);
         let left_alone = running(&pid);
@@ -5533,8 +5536,9 @@ mod tests {
             panic!("a child that cannot be waited on is refused");
         };
         assert!(
-            refusal.to_string().contains("could not be waited on"),
-            "it is refused for the question, which came first: {refusal}"
+            refusal.to_string().contains("could not be waited on")
+                && matches!(refusal, ProjectError::GitFailed { .. }),
+            "it is refused for the question, which came first: {refusal:?}"
         );
         let pid = number_of(&own);
         let left_alone = running(&pid);
@@ -5612,6 +5616,49 @@ mod tests {
         assert!(
             !finished.exists(),
             "the stand-in was ended, and did not finish by itself"
+        );
+
+        // Nothing of the refusal was kept: a Git that answers is found by the next look.
+        let helpers = directory.path().join("helpers");
+        std::fs::create_dir(&helpers).expect("a helper directory");
+        let helpers = helpers
+            .canonicalize()
+            .expect("the helper directory resolves");
+        std::fs::remove_file(search.join("git")).expect("the stand-in goes");
+        place_stand_in(
+            &search,
+            &format!(
+                "case \"$1\" in\n--exec-path) echo '{}' ;;\n--version) echo 'git version 2.50.1' ;;\nesac",
+                helpers.display()
+            ),
+        );
+        let found = installation.program().expect("the next look finds Git");
+        assert_eq!(
+            found.program(),
+            search
+                .join("git")
+                .canonicalize()
+                .expect("the program resolves")
+        );
+    }
+
+    /// A look whose time is used up before the program is asked is a fault that passes: nothing is
+    /// known of the program, which was never started.
+    #[test]
+    fn a_program_that_is_not_asked_because_the_time_is_used_up_is_a_fault_that_passes() {
+        let asked = ask(
+            Path::new("/nonexistent/git"),
+            &["--version"],
+            Instant::now(),
+        );
+
+        let Err(Asked::Overran(refusal)) = asked else {
+            panic!("a look with no time left refuses before it starts anything");
+        };
+        assert!(
+            matches!(refusal, ProjectError::GitFailed { .. })
+                && refusal.to_string().contains("was not asked"),
+            "{refusal:?}"
         );
     }
 
@@ -5727,7 +5774,7 @@ mod tests {
                         &["--version"],
                         Instant::now() + Duration::from_secs(120),
                     )
-                    .map_err(|asked| asked.into_error().to_string()),
+                    .map_err(Asked::into_error),
                 );
             });
             let outcome = ended.recv_timeout(Duration::from_secs(30));
@@ -5740,7 +5787,11 @@ mod tests {
         let refusal = outcome
             .expect("the probe was refused after the drain and not held until the deadline")
             .expect_err("a probe whose output is still held is refused");
-        assert!(refusal.contains("left its output open"), "{refusal}");
+        assert!(
+            refusal.to_string().contains("left its output open")
+                && matches!(refusal, ProjectError::GitUnavailable { .. }),
+            "what the program does is the program's, and stays so: {refusal:?}"
+        );
     }
 
     #[test]
