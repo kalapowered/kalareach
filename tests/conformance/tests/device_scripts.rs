@@ -201,27 +201,45 @@ fn copy_directory_into(root: &Path, relative: &str) {
 /// this is only what a loaded machine adds to the moments they need.
 const JOBS_END_WITHIN: Duration = Duration::from_secs(60);
 
+/// `path` as an extended regular expression that matches it as it is written and ends at the end
+/// of a name: the next character is not one a name is made of, or the line ends.
+fn as_a_directory_pattern(path: &Path) -> String {
+    let mut pattern = String::new();
+    for character in path.to_string_lossy().chars() {
+        if r"\.[]{}()*+?|^$".contains(character) {
+            pattern.push('\\');
+        }
+        pattern.push(character);
+    }
+    pattern.push_str("([^A-Za-z0-9._-]|$)");
+    pattern
+}
+
 /// Returns once no process has `root`, the directory the case made, in its command line: the script
 /// and every job it started from there (each runs a program of the case's own) are over, and the
 /// record holds every call they made.
 ///
 /// A job the script put in the background is not waited for by the script or by the case's read of
-/// its output, and a script that fails soon after starting the emulator can end first.
+/// its output, and a script that fails soon after starting the emulator can end first. A process
+/// that is being replaced by another program can show no command line for a moment, so the
+/// directory has to be found by no look twice, a moment apart, before the jobs count as over.
 fn until_nothing_of_the_case_runs(root: &Path) {
+    let pattern = as_a_directory_pattern(root);
     let begun = Instant::now();
-    loop {
+    let mut unseen = 0;
+    while unseen < 2 {
         let found = Command::new("pgrep")
             .arg("-f")
             .arg("--")
-            .arg(root)
+            .arg(&pattern)
             .stdout(std::process::Stdio::null())
             .status()
             .expect("pgrep lists the processes that name the case's directory");
         // 0 when some process matches, 1 when none does; anything else is pgrep's own failure.
         match found.code() {
-            Some(1) => return,
-            Some(0) => {}
-            other => panic!("pgrep ended with {other:?}"),
+            Some(1) => unseen += 1,
+            Some(0) => unseen = 0,
+            other => panic!("pgrep ended with {other:?} for {pattern}"),
         }
         assert!(
             begun.elapsed() < JOBS_END_WITHIN,
