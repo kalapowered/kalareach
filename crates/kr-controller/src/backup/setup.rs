@@ -239,8 +239,13 @@ impl Admitted {
         *self.refused.lock().unwrap_or_else(PoisonError::into_inner) = Some(refusal);
     }
 
-    /// Asks the admission before a step that sends a request or reads the delay the service named.
-    /// The refusal is kept for the call's end, and the answer returned here only stops the step.
+    /// Asks the admission before a step that sends a request, and so before the read of the delay
+    /// the service named with which that step begins. The refusal is kept for the call's end, and
+    /// the answer returned here only stops the step.
+    ///
+    /// The read of the delay that follows a read which found no bundle at the locator is the one
+    /// read of it with no ask before it: it sends nothing and builds an answer, which
+    /// [`Self::ended`] gives only after it asks once more.
     fn ask(&self) -> std::result::Result<(), Ended> {
         self.admission.stands().map_err(|refusal| {
             self.keep(refusal);
@@ -827,7 +832,9 @@ impl BackupSetup {
                     Err(declined(BackupEnableCause::BundleConflict {}))
                 }
             }
-            // Nothing there: the write did not apply, and the call cannot say why.
+            // Nothing there: the write did not apply, and the call cannot say why. The delay is
+            // read with no ask before it: no request follows, and an answer that tells a delay is
+            // given only after the admission is asked in `Admitted::ended`.
             Ok(SyncFetched::Absent { .. }) => Err(unknown(self.quiet.left())),
             Err(error) if error.code() == ErrorCode::UnknownSession => {
                 Err(declined(BackupEnableCause::TokenNotAccepted {}))
