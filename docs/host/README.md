@@ -3223,12 +3223,14 @@ what it was working on. The worker gives them as `INVALID_ARGUMENT`, `UPSTREAM_U
 `OUTCOME_UNKNOWN`, so on these methods a message with one of those codes is replaced by a sentence
 made from its code. The exception is the host's own reasons for refusing the device's argument,
 which the device needs to correct what it sent, and which are told apart by their wording and not
-by their code: a prompt that names neither a draft nor inline text or names both, a parameter an
-action does not declare or does not accept, and an attachment over the package's size or of a type
-it does not accept. The rule above still cuts any place such a reason quotes. The code and the retry
-category stay. A candidate that has not paired is never given what the pairing store or the
-rendezvous service reported. The owner at this machine is given the whole text, on the local
-socket.
+by their code. A prompt that names neither a draft nor inline text or names both, and an attachment
+over the size a package accepts, are sent as they are, since their words are the host's and numbers.
+A parameter an action does not declare or does not accept, and an attachment of a type the package
+does not accept, quote a word of the argument, which the upstream could have written in its place,
+so the device is told which of the three it was and not the word. The rule above still cuts any
+place a reason quotes. The code and the retry category stay. A candidate that has not paired is
+never given what the pairing store or the rendezvous service reported. The owner at this machine is
+given the whole text, on the local socket.
 
 What the grant decides, for every request:
 
