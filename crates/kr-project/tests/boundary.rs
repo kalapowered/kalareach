@@ -39,7 +39,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use kr_project::boundary::{ObjectIdentity, identity_of};
-use kr_project::git::{GitRequest, Interposition, RemoteAccess, RestrictedProfile};
+use kr_project::git::{GitRequest, Interposition, RemoteAccess};
 use kr_project::identity::OpenedRepository;
 use kr_project::workspace::{PreviewRequest, survey};
 use kr_protocol::project::{
@@ -1126,7 +1126,7 @@ fn a_kernel_without_the_interface_the_boundary_needs_runs_no_git_on_any_route() 
     let arguments: [&OsStr; 2] = [OsStr::new("status"), OsStr::new("--porcelain=v2")];
     let never_made = fixture.work().join("never-made");
     let nowhere = tempfile::tempdir().expect("a search path with no Git on it");
-    let searching = RestrictedProfile::prepare_on(
+    let searching = kr_project::git::RestrictedProfile::prepare_on(
         &fixture.work().join("searching"),
         fixture.environment_id(),
         Some(nowhere.path().as_os_str().to_owned()),
