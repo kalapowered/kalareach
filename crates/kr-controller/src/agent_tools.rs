@@ -2216,8 +2216,10 @@ mod tests {
     }
 
     /// KR-REQ-24.26: the directories this host keeps its installation records in are owner-only
-    /// whatever the mask of the process, because they are its own state. A directory the agent
-    /// reads its skill from is the agent's, and is made with the mode the mask gives it.
+    /// whatever the mask of the process, because they are its own state: the one an installation's
+    /// record is written in, and the one a retained action's record is written in below it. They
+    /// are made by different writers, so a tree of its own holds each. A directory the agent reads
+    /// its skill from is the agent's, and is made with the mode the mask gives it.
     #[cfg(unix)]
     #[test]
     fn the_directories_installation_records_are_kept_in_are_owner_only() {
@@ -2226,26 +2228,32 @@ mod tests {
         let mode =
             |path: &Path| std::fs::metadata(path).expect("made").permissions().mode() & 0o777;
         let _login = kr_ipc::testing::LoginUmask::hold();
+
+        // An installation writes its own record, in a state directory with no records yet.
         let tree = Tree::create();
-        let installer = tree.installer();
-        let params = params(AgentTarget::ClaudeCode, InstallScope::User);
+        tree.installer()
+            .install(&params(AgentTarget::ClaudeCode, InstallScope::User))
+            .expect("installs");
+        let records = tree.root.join("state").join("agent-tools");
+        assert_eq!(mode(&records), 0o700, "{}", records.display());
+        // The control: a directory in the agent's own tree gets the mask's mode, which is the mode
+        // the records' directory would have had.
+        let skills = tree.home().join(".claude/skills");
+        assert_eq!(mode(&skills), 0o755, "{}", skills.display());
+
+        // A retained action's record is written first, in another tree with none.
+        let other = Tree::create();
         let actor = kr_protocol::ids::ActorId::new("local:501").expect("a principal");
         let action =
             kr_protocol::ids::ActionId::new(kr_protocol::scalars::Uuid::from_bytes([8; 16]));
-
-        installer
+        other
+            .installer()
             .mark_dispatching(&actor, action, &digest_of(b"the payload"))
             .expect("the marker is written");
-        installer.install(&params).expect("installs");
-
-        let records = tree.root.join("state").join("agent-tools");
-        assert_eq!(mode(&records), 0o700, "{}", records.display());
-        let actions = records.join("actions");
-        assert_eq!(mode(&actions), 0o700, "{}", actions.display());
-        // The control: a directory in the agent's own tree gets the mask's mode, which is the mode
-        // these two would have had.
-        let skills = tree.home().join(".claude/skills");
-        assert_eq!(mode(&skills), 0o755, "{}", skills.display());
+        let records = other.root.join("state").join("agent-tools");
+        for made in [records.clone(), records.join("actions")] {
+            assert_eq!(mode(&made), 0o700, "{}", made.display());
+        }
     }
 
     /// Every file under `root`, with the digest of its contents.
