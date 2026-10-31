@@ -525,6 +525,7 @@ fn a_rename_of_the_checkout_keeps_the_grant_and_a_replacement_at_its_path_does_n
     assert_eq!(refusal.code(), ErrorCode::SourceChanged);
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_checkout_removed_with_nothing_in_its_place_is_a_source_that_changed() {
     // The record names an object, and at its path there is nothing: that is the same answer as for

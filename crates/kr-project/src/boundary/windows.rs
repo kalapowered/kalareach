@@ -285,7 +285,8 @@ impl Drop for OwnedSid {
 /// # Errors
 ///
 /// Returns [`ProjectError::GitUnavailable`] on every call while this platform runs no Git, before
-/// anything is built, and [`ProjectError::GitFailed`] when the container cannot be created, a
+/// anything is built, [`ProjectError::Destination`] when the path of the directory the invocation
+/// runs in cannot be named, and [`ProjectError::GitFailed`] when the container cannot be created, a
 /// grant cannot be made, the job cannot be built or the process cannot be started. Nothing here
 /// starts Git outside its container.
 pub fn start(invocation: &Invocation<'_>, confinement: &Confinement) -> Result<Spawned> {
