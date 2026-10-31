@@ -305,6 +305,15 @@ async fn kr_req_23_28_and_23_29_a_paired_device_reaches_every_catalogue_and_plug
     );
     assert_eq!(added.catalogue.catalogue_id, "development");
     assert_eq!(added.catalogue.generation, Nullable(None));
+    // Where a catalogue lives is shown to a device that may manage the host, as the host holds it,
+    // a directory on this machine included.
+    assert!(
+        published.metadata_url().starts_with("file:///"),
+        "{}",
+        published.metadata_url()
+    );
+    assert_eq!(added.catalogue.metadata_url, published.metadata_url());
+    assert_eq!(added.catalogue.targets_url, published.targets_url());
 
     // catalogue.sync verifies the published generation and activates its index.
     let synced: wire::CatalogueSyncResult = typed(
@@ -338,6 +347,8 @@ async fn kr_req_23_28_and_23_29_a_paired_device_reaches_every_catalogue_and_plug
         listed.catalogues[0].generation,
         Nullable(Some(RepositoryGeneration::new(1)))
     );
+    assert_eq!(listed.catalogues[0].metadata_url, published.metadata_url());
+    assert_eq!(listed.catalogues[0].targets_url, published.targets_url());
 
     // catalogue.pin holds it at the generation the device read.
     let pinned: wire::CataloguePinResult = typed(
