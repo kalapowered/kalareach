@@ -492,9 +492,12 @@ impl WorkerHost {
         self._task.supervisor(&self.tree.environment())
     }
 
-    /// A launch of a headless worker as the daemon builds one, for a reservation of its own, to
-    /// hand to [`Self::task_supervisor`]. The desktop it asks for is named for the reservation, so
-    /// a test that holds a desktop of that name is met by the starter that takes the launch.
+    /// A launch of a headless worker, built from the fields the daemon fills, for a reservation of
+    /// its own, to hand to [`Self::task_supervisor`]. The desktop it asks for is named for the
+    /// reservation, so a test that holds a desktop of that name is met by the starter that takes
+    /// the launch. The worker's directory is the tree's root, as no session of this launch has a
+    /// directory of its own, and the program is the tree's worker; a launch that reached a started
+    /// worker would need more.
     pub fn headless_launch(&self) -> kr_controller::supervision::WorkerLaunch {
         let environment = self.tree.environment();
         kr_controller::supervision::WorkerLaunch {
