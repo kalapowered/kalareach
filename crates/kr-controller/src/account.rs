@@ -349,6 +349,14 @@ impl HostAccount {
         }
     }
 
+    /// How many requests for a token the gate raised with [`Self::hold_token_requests_after`] has
+    /// still to let through, for a test that needs to know the request it holds is the one after.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn token_passes_left(&self) -> usize {
+        self.inner.passing.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Keeps a sign-in the service issued, as a finished browser sign-in would, for a test that
     /// is about what a call does with an account rather than about signing in.
     ///
