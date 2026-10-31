@@ -357,8 +357,8 @@ fn a_unit_the_manager_goes_on_having_is_left_however_often_it_is_asked() {
 /// manager of the machine's own: a runtime directory holding the manager's private socket and its
 /// transient unit files, and a tool that answers the teardown's questions from what a case wrote
 /// beside it. The tool lists the units in `listed`, answers a unit's working directory from
-/// `directory-of-<unit>` (nothing where the file is not there, and a failure where `fail-asking` is),
-/// records each unit it is told to stop in `stopped`, and says a unit it has stopped is gone.
+/// `directory-of-<unit>` (nothing where the file is not there, and a failure where `fail-asking`
+/// is), records each unit it is told to stop in `stopped`, and says a unit it has stopped is gone.
 #[cfg(target_os = "linux")]
 struct StandInManager {
     _directory: tempfile::TempDir,

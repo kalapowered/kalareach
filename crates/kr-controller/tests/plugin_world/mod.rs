@@ -342,8 +342,8 @@ pub struct HostEnding {
 }
 
 impl HostEnding {
-    /// Ends the hosts and takes their jobs away, giving the starts under way `starts_recorded_within`
-    /// to be recorded, and says what it could not establish as ended.
+    /// Ends the hosts and takes their jobs away, giving the starts under way
+    /// `starts_recorded_within` to be recorded, and says what it could not establish as ended.
     ///
     /// # Errors
     ///
