@@ -3179,6 +3179,12 @@ const PROBE_DRAIN: Duration = Duration::from_secs(1);
 /// How long a probe that was ended is waited for to be collected.
 const PROBE_REAP: Duration = Duration::from_secs(2);
 
+/// When the wait for a probe's output ends, for a probe that ended at `now`: [`PROBE_DRAIN`] after
+/// it, and never after the probe's own `deadline`.
+fn drain_until(now: Instant, deadline: Instant) -> Instant {
+    deadline.min(now + PROBE_DRAIN)
+}
+
 /// One pipe being read, and the bytes read so far.
 struct Reader {
     handle: std::thread::JoinHandle<Result<()>>,
@@ -3774,7 +3780,7 @@ fn ask(
     };
     // What the program wrote is read to its end, but a process that left the group may still hold
     // the pipe, so the wait for the end is short.
-    let drain = deadline.min(Instant::now() + PROBE_DRAIN);
+    let drain = drain_until(Instant::now(), deadline);
     loop {
         heard.take_in(drain);
         if heard.overflowed() {
@@ -3960,6 +3966,8 @@ fn gather(pipe: &mut impl std::io::Read, seen: &mut Bounded, deadline: Instant) 
                 if read > room {
                     seen.bytes.extend_from_slice(&buffer[..room]);
                     seen.truncated = true;
+                    #[cfg(test)]
+                    tests::PASSED_THE_LIMIT.with(|passed| passed.set(true));
                 } else {
                     seen.bytes.extend_from_slice(&buffer[..read]);
                 }
@@ -4013,7 +4021,10 @@ enum Ended {
 /// the number is still the child's own.
 fn has_ended(child: &mut std::process::Child) -> Ended {
     #[cfg(all(test, unix))]
-    if tests::WAIT_FAILS.with(std::cell::Cell::get) {
+    if tests::WAIT_FAILS.with(std::cell::Cell::get)
+        || (tests::WAIT_FAILS_PAST_THE_LIMIT.with(std::cell::Cell::get)
+            && tests::PASSED_THE_LIMIT.with(std::cell::Cell::get))
+    {
         return Ended::Failed(std::io::Error::from(rustix::io::Errno::CHILD));
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -5119,6 +5130,12 @@ mod tests {
         /// Set by a case to make the question whether a child has ended fail on its own thread, as
         /// it does for a child that something else in the process has collected.
         pub(super) static WAIT_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Set by a case to make that question fail on its own thread only once a probe's output
+        /// has passed the limit, as it does for a child that was collected elsewhere while it was
+        /// still writing.
+        pub(super) static WAIT_FAILS_PAST_THE_LIMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Set on a thread when a probe's output has passed the limit.
+        pub(super) static PASSED_THE_LIMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     /// A pipe whose writers are faster than its reader: whenever it is asked, it has something to
@@ -5173,11 +5190,11 @@ mod tests {
         assert!(seen.truncated, "what passed the limit is reported");
         assert_eq!(
             seen.bytes.len(),
-            PROBE_OUTPUT_LIMIT,
-            "the limit is what is kept"
+            64 * 1024,
+            "64 KiB, the limit the documents state, is what is kept"
         );
         assert!(
-            pipe.reads <= PROBE_OUTPUT_LIMIT / 4096 + 1,
+            pipe.reads <= 16 + 1,
             "the pass ended at the limit, after {} reads",
             pipe.reads
         );
@@ -5206,11 +5223,13 @@ mod tests {
         );
     }
 
-    /// An answer of exactly the limit is kept whole and is an answer; one byte more is too much.
+    /// An answer of exactly 64 KiB, the limit the documents state, is kept whole and is an answer;
+    /// one byte more is too much. The lengths are written out, so that a limit that moved is not
+    /// followed by the case.
     #[cfg(unix)]
     #[test]
     fn an_answer_of_exactly_the_limit_is_kept_whole_and_one_byte_more_is_too_much() {
-        for (length, too_much) in [(PROBE_OUTPUT_LIMIT, false), (PROBE_OUTPUT_LIMIT + 1, true)] {
+        for (length, too_much) in [(65_536, false), (65_537, true)] {
             let mut pipe = std::io::Cursor::new(vec![b'x'; length]);
             let mut seen = Bounded::default();
 
@@ -5221,17 +5240,33 @@ mod tests {
             );
 
             assert_eq!(seen.truncated, too_much, "{length} bytes");
-            assert_eq!(
-                seen.bytes.len(),
-                length.min(PROBE_OUTPUT_LIMIT),
-                "{length} bytes"
-            );
+            assert_eq!(seen.bytes.len(), length.min(65_536), "{length} bytes");
             assert_eq!(
                 matches!(left, Gathered::Closed),
                 !too_much,
                 "the end of {length} bytes is reached only when they are all an answer"
             );
         }
+    }
+
+    /// The wait for a probe's output after the probe has ended is the second the documents state,
+    /// and it does not outlast the time the probe was given. The figures are written out, so that a
+    /// bound that moved is not followed by the case.
+    #[test]
+    fn the_wait_for_a_probes_output_after_it_ended_is_a_second_and_never_past_its_deadline() {
+        let now = Instant::now();
+
+        assert_eq!(
+            drain_until(now, now + Duration::from_secs(60)),
+            now + Duration::from_secs(1),
+            "a probe with time left is waited for a second"
+        );
+        let soon = now + Duration::from_millis(300);
+        assert_eq!(
+            drain_until(now, soon),
+            soon,
+            "and one with less than a second left is waited for no longer than it has"
+        );
     }
 
     /// Whether a process with this identifier is running, which one that has ended and not yet been
@@ -5252,11 +5287,18 @@ mod tests {
     /// that neither reached.
     #[cfg(unix)]
     fn waiting_stand_in(directory: &Path, own: &Path) -> PathBuf {
+        writing_stand_in(directory, own, "")
+    }
+
+    /// As [`waiting_stand_in`], saying `output` on its standard output, a shell command, before it
+    /// waits.
+    #[cfg(unix)]
+    fn writing_stand_in(directory: &Path, own: &Path, output: &str) -> PathBuf {
         let (text, program) = (directory.join("git.text"), directory.join("git"));
         std::fs::write(
             &text,
             format!(
-                "#!/bin/sh\necho $$ > '{own}'\ni=0\n\
+                "#!/bin/sh\necho $$ > '{own}'\n{output}\ni=0\n\
                  while [ -d '{directory}' ] && [ ! -e '{release}' ] && [ $i -lt 2400 ]; \
                  do sleep 0.05; i=$((i+1)); done\n",
                 own = own.display(),
@@ -5381,6 +5423,44 @@ mod tests {
         assert!(
             refusal.to_string().contains("without blocking"),
             "it says why: {refusal}"
+        );
+        let pid = number_of(&own);
+        let left_alone = running(&pid);
+        let_go(directory.path());
+        assert!(left_alone, "the stand-in was signalled by its number");
+    }
+
+    /// The same holds when the output has passed the limit: whether the child is this process's own
+    /// is asked before the limit ends anything. Here the question fails only once the output has
+    /// passed the limit, so a probe that ended its child at the limit, ahead of that question,
+    /// would signal a number that may belong to another process by now.
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_whose_output_passed_the_limit_signals_nothing_by_number_when_its_child_cannot_be_waited_on()
+     {
+        let directory = tempfile::tempdir().expect("a directory for this test");
+        let own = directory.path().join("own");
+        let program = writing_stand_in(
+            directory.path(),
+            &own,
+            "head -c 200000 /dev/zero | tr '\\0' x",
+        );
+
+        PASSED_THE_LIMIT.with(|passed| passed.set(false));
+        WAIT_FAILS_PAST_THE_LIMIT.with(|fails| fails.set(true));
+        let asked = ask(
+            &program,
+            &["--version"],
+            Instant::now() + Duration::from_secs(60),
+        );
+        WAIT_FAILS_PAST_THE_LIMIT.with(|fails| fails.set(false));
+
+        let Err(Asked::Overran(refusal)) = asked else {
+            panic!("a child that cannot be waited on is refused");
+        };
+        assert!(
+            refusal.to_string().contains("could not be waited on"),
+            "it is refused for the question, which came first: {refusal}"
         );
         let pid = number_of(&own);
         let left_alone = running(&pid);
