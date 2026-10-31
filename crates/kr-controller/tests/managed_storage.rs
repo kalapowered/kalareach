@@ -6124,6 +6124,59 @@ async fn a_repeat_answered_from_the_recorded_setup_is_refused_when_a_fence_lands
     ));
 }
 
+/// KR-REQ-09.09: a repeat of a call that finished is answered from the setup it recorded when its
+/// deadline has passed, as a receipt outlives the deadline it was accepted under. The repeat waits
+/// behind a call of another kit, and the deadline passes while it waits: the other call is refused
+/// for it, and the repeat is answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeat_answered_from_the_recorded_setup_is_answered_when_its_deadline_has_passed() {
+    let (rig, _, clock) = a_host_to_set_up_on_a_clock(&HeldTimer::held()).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+    assert!(matches!(
+        rig.enable(&made.params).await,
+        BackupEnableResult::Enabled { .. }
+    ));
+
+    let replacement = rig.prepared_setup(archive_two(), true);
+    web.fail(SYNC, 1, Moment::Slow);
+    let holding = rig.enable_outcome_in_the_background(&replacement.params);
+    within(
+        "the replacement's bundle write",
+        web.requests_reach(SYNC, 2),
+    )
+    .await;
+    let repeat = rig.enable_outcome_in_the_background(&made.params);
+    within("both calls are told", async {
+        loop {
+            if let BackupSetupState::InProgress { kit_fingerprints } =
+                rig.backup_status().await.setup
+                && kit_fingerprints.len() == 2
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    clock.advance(Duration::from_millis(
+        kr_protocol::limits::DEFAULT_MUTATION_TTL.get() + 1_000,
+    ));
+    web.release_held();
+    let refusal = holding
+        .await
+        .expect("the call ends")
+        .expect_err("a call that has something to do is refused for its deadline");
+    assert!(refusal.message.contains("deadline"), "{}", refusal.message);
+    assert!(
+        matches!(
+            repeat.await.expect("the call ends"),
+            Ok(BackupEnableResult::Enabled { .. })
+        ),
+        "the repeat is answered from what the first call recorded"
+    );
+}
+
 /// `backup.status` says why a setup that is recorded cannot make backups: the account signed in is
 /// not the one it belongs to.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
