@@ -34,8 +34,9 @@ use kr_protocol::skill::{
 use serde_json::{Value, json};
 
 use crate::catalogue::files::{
-    PRIVATE, READABLE, create_directory_durably, digest_of, display, guard_access_controls, hex,
-    home_directory, missing_ancestors, read_digest, storage, sync_directory, write_atomically,
+    PRIVATE, READABLE, create_directory_durably, create_private_directory_durably, digest_of,
+    display, guard_access_controls, hex, home_directory, missing_ancestors, read_digest, storage,
+    sync_directory, write_atomically,
 };
 use crate::catalogue::native_bridge::json;
 use crate::error::{ControllerError, Result};
@@ -1435,7 +1436,7 @@ impl Installer {
     }
 
     fn write(&self, params: &AgentToolsParams, record: &InstallationRecord) -> Result<()> {
-        create_directory_durably(&self.records)?;
+        create_private_directory_durably(&self.records)?;
         let text = serde_json::to_string_pretty(record)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         write_atomically(
@@ -1658,8 +1659,9 @@ impl Installer {
         let path = self.action_path(actor_id, action_id);
         if let Some(parent) = path.parent() {
             // Every missing ancestor, each one's own entry made durable in the directory above it,
-            // before anything inside is claimed to be durable.
-            create_directory_durably(parent)?;
+            // before anything inside is claimed to be durable. They are this host's own records, so
+            // each is owner-only.
+            create_private_directory_durably(parent)?;
         }
         let text = serde_json::to_string_pretty(record)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
