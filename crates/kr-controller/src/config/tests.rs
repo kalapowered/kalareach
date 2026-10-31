@@ -1649,3 +1649,37 @@ fn an_agent_named_for_reduced_ownership_is_in_the_report_as_a_value_nothing_acts
     assert_eq!(row(&chosen).source, ValueSource::HostConfiguration);
     assert_eq!(row(&chosen).effect, ValueEffect::NoEffect);
 }
+
+/// KR-REQ-24.26: the directories this daemon makes for the configuration document, which on a
+/// Linux install lies outside its state directory, are owner-only whatever the mask of the
+/// process, and so is the document: it decides how this host behaves, and its directories are not
+/// for other accounts.
+#[cfg(unix)]
+#[test]
+fn the_directories_the_daemon_makes_for_its_configuration_document_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let _login = kr_ipc::testing::LoginUmask::hold();
+    let root = tempfile::tempdir().expect("a temporary directory");
+    let home = root.path().join("config").join("kalareach");
+    let own = home.join("environments").join("1a2b3c4d");
+    let document = own.join("config.json");
+
+    write_document(&document, b"{}").expect("the document is written");
+
+    for made in [
+        root.path().join("config"),
+        home.clone(),
+        home.join("environments"),
+        own,
+    ] {
+        let mode = std::fs::metadata(&made).expect("made").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "{}", made.display());
+    }
+    let mode = std::fs::metadata(&document)
+        .expect("the document")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "the document");
+}
