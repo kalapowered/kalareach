@@ -3218,39 +3218,43 @@ and one inside a result, such as the presentation error of a create. A receipt w
 replaced says so in `error_withheld`. A record that holds a failure as plain text is held to the
 rule by the member that carries it, in a result and in an announcement of any kind: the `reason` of
 a privacy step that could not answer and of a session's cleanup, the `detail` of a workspace, of a
-retained item and of a repository operation, the `refusal` of an agent instance, the `failure` of a
-fetch of the description model, and the `detail` of a plugin that the admissions leave out. The rest
-of the record is sent as it is. A place on this host that is no failure is withheld as a path, the
-way the directory of a materialisation is: the `display_path` of a repository or a working copy, the
-`retained_staging_paths` and `removed_staging_paths` of a repository operation, the `url` of a
-remote that is a place on this host (the repository a clone from a location was made from), the
-`endpoint` of a session, and the `executable` of a question's source. Each is replaced by the
-withheld record of a path, and a list keeps its length. A session's `cwd` and `shell_path` are sent
-as they are: they are part of how a session is described to the person it is shown to, and a device
-that may see a session sees its terminal. The `suspension_reason` of an agent instance's binding,
-which says why rich mutations wait, and the refusal of a rich mutation that repeats it, are sent as
-the host wrote them when the reason is one of the host's own sentences. Otherwise the device is told
-what kind of wait it was: the method of a request that the connector's table does not classify, and
-what stopped the worker taking a conversation, are not sent. What a closure records of a resource it
-left is held to the same rule and is replaced by the kind of resource. What the agent of a session
-says in refusing a prompt, a steer, a cancellation, an approval or a plugin's action is the agent's
-own words, and they quote what it was working on. The worker gives them as `INVALID_ARGUMENT`,
-`UPSTREAM_UNAVAILABLE` or `OUTCOME_UNKNOWN`, so on these methods a worker's message with one of
-those codes is replaced by a sentence made from its code. The daemon's own refusals of the same call
-are made before a worker is asked, and a device is told them as they are written. A plugin's action
-also meets the plugin runtime, whose words come as `RESOURCE_UNAVAILABLE` or
-`UNSUPPORTED_CAPABILITY`: the device is told which state the runtime or the component was in, and
-not what the runtime said, and the answer to an approval is told the same way when its component was
-disabled for a fault. The exception is the host's own reasons for refusing the device's argument,
-which the device needs to correct what it sent, and which are told apart by their wording and not by
-their code: a prompt that names neither a draft nor inline text or names both, a parameter an action
-does not declare, requires, supplies twice or does not accept, a value outside its bound, an action
-that names no attachment, and an attachment over the size a package accepts or of a type it does not
-accept. A reason that has no word of the argument in it is sent as the host wrote it. The others
-quote a word or a number of the argument, which the upstream could have written in its place, so the
-device is told which reason it was and not the word or the number. The code and the retry category
-stay. A candidate that has not paired is never given what the pairing store or the rendezvous
-service reported. The owner at this machine is given the whole text, on the local socket.
+retained item and of a repository operation, the `refusal` of an agent instance, and the `failure`
+of a fetch of the description model. The `detail` of a plugin that the admissions leave out is cut
+where the host's own clause ends, so a repository's statement of a revocation, or what was wrong
+with a package in the store, is not sent. The `failure_detail` of a draft's attachment can be the
+upstream's refusal, and none of it is sent. The rest of the record is sent as it is. A place on this
+host that is no failure is withheld as a path, the way the directory of a materialisation is: the
+`display_path` of a repository or a working copy, the `retained_staging_paths` and
+`removed_staging_paths` of a repository operation, the `url` of a remote that is a place on this
+host (the repository a clone from a location was made from), and the `endpoint` of a session. Each
+is replaced by the withheld record of a path, and a list keeps its length. A session's `cwd` and
+`shell_path`, a question's `executable` and an attachment's staged `host_path` are sent as they are:
+the specification shows them to the person on purpose, as part of how a session, a question or a
+manual attachment is described, and a device that may see a session sees its terminal. The
+`suspension_reason` of an agent instance's binding, which says why rich mutations wait, and the
+refusal of a rich mutation that repeats it, are sent as the host wrote them when the reason is one
+of the host's own sentences. Otherwise the device is told what kind of wait it was: the method of a
+request that the connector's table does not classify, and what stopped the worker taking a
+conversation, are not sent. What a closure records of a resource it left is held to the same rule
+and is replaced by the kind of resource. What the agent of a session says in refusing a prompt, a
+steer, a cancellation, an approval or a plugin's action is the agent's own words, and they quote
+what it was working on. The worker gives them as `INVALID_ARGUMENT`, `UPSTREAM_UNAVAILABLE` or
+`OUTCOME_UNKNOWN`, so on these methods a worker's message with one of those codes is replaced by a
+sentence made from its code. The daemon's own refusals of the same call are made before a worker is
+asked, and a device is told them as they are written. A plugin's action also meets the plugin
+runtime, whose words come as `RESOURCE_UNAVAILABLE` or `UNSUPPORTED_CAPABILITY`: the device is told
+which state the runtime or the component was in, and not what the runtime said, and the answer to an
+approval is told the same way when its component was disabled for a fault. The exception is the
+host's own reasons for refusing the device's argument, which the device needs to correct what it
+sent, and which are told apart by their wording and not by their code: a prompt that names neither a
+draft nor inline text or names both, a parameter an action does not declare, requires, supplies
+twice or does not accept, a value outside its bound, an action that names no attachment, and an
+attachment over the size a package accepts or of a type it does not accept. A reason that has no
+word of the argument in it is sent as the host wrote it. The others quote a word or a number of the
+argument, which the upstream could have written in its place, so the device is told which reason it
+was and not the word or the number. The code and the retry category stay. A candidate that has not
+paired is never given what the pairing store or the rendezvous service reported. The owner at this
+machine is given the whole text, on the local socket.
 
 What the grant decides, for every request:
 
