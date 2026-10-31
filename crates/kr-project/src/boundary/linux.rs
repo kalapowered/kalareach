@@ -220,8 +220,8 @@ fn kernel_interface() -> u32 {
 ///
 /// A remote operation needs the version that restricts addresses, a local one the version that
 /// mediates truncation. The refusal is that of a host that is not set up for the work, as a
-/// platform that runs no Git gives: nothing but another kernel changes what this one has, so a
-/// client is not told to try again, and a person is told what to use instead.
+/// platform that runs no Git gives: nothing the daemon does changes what this kernel offers it, so
+/// a client is not told to try again, and a person is told what to use instead.
 fn lacking(found: u32, remote: bool) -> Option<ProjectError> {
     let (needed, release, what) = if remote {
         (

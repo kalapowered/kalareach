@@ -158,7 +158,8 @@ pub(crate) fn no_git_refusal(why: &str) -> ProjectError {
 /// when it cannot.
 ///
 /// Said before Git is looked for, as [`NO_GIT`] is, and for the same reason: a host that cannot run
-/// Git answers the same way whether or not one is installed. Nothing but another kernel changes it,
+/// Git answers the same way whether or not one is installed. Nothing the daemon does changes it
+/// until the host does (another kernel, Landlock enabled at boot, a filter that allows the call),
 /// so it is not an upstream that may answer later. Only Linux asks its kernel; the other platforms'
 /// mechanisms need nothing of one.
 pub(crate) fn kernel_refusal() -> Option<ProjectError> {

@@ -781,8 +781,9 @@ enum Unfound {
     /// not run, is too old, or answers with more than it was asked. It stays so until the host
     /// changes, which is a host that is not set up for the work.
     Unusable(Diagnostic),
-    /// The look was cut short by something that passes: the time it was given ran out, or the host
-    /// was short of what it needs to ask. Nothing is known of the Git that was being asked, and
+    /// The look was cut short by something that passes: the time it was given ran out, the host was
+    /// short of what it needs to ask, it could not wait on, collect or read from the program, or
+    /// the look ended without an answer. Nothing is known of the Git that was being asked, and
     /// asking again later can find it.
     Passing(Diagnostic),
 }
@@ -3684,15 +3685,16 @@ fn handed_off_to(
 
 /// Why a question put to a program was not answered.
 enum Asked {
-    /// The program could not run, or ran and said no. A copy of Git that does this is not the
-    /// program, and the caller goes on without it.
+    /// The program could not run, though the host had what it needs to start it, or ran and said
+    /// no. A copy of Git that does this is not the program, and the caller goes on without it.
     Declined(ProjectError),
-    /// The program did not answer in the time it is given, answered with more than a version and a
-    /// directory, or left its output open; or this host could not wait on it or read its output
-    /// without blocking. The look is refused. What the program did is
-    /// [`ProjectError::GitUnavailable`], since it is not a program this host can run work through;
-    /// the time that ran out and the host's own shortage are [`ProjectError::GitFailed`], which
-    /// passes.
+    /// The look is refused. What the program did, answering with more than a version and a
+    /// directory or leaving its output open, is [`ProjectError::GitUnavailable`], since it is not a
+    /// program this host can run work through. What the host did, or the time that ran out, is
+    /// [`ProjectError::GitFailed`], which passes: the look was not made because the time was used
+    /// up, because the host was short of descriptors, processes or memory to start the program,
+    /// because the program did not answer in time, or because the host could not wait on it,
+    /// collect it, or switch or read its output.
     Overran(ProjectError),
 }
 
@@ -5726,8 +5728,7 @@ mod tests {
     }
 
     /// A program that ended and cannot be collected is the host's fault, and passes: nothing is
-    /// known of the program but that it ended. The group it led is ended first, as it is for one
-    /// that is collected.
+    /// known of the program but that it ended.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_child_that_cannot_be_collected_is_a_fault_that_passes() {

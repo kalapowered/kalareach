@@ -24,8 +24,9 @@ pipe is out of reach: the answer is refused after a second and this host closes 
 so this host holds nothing of the process. It may go on, and a write it makes to the closed pipe
 fails. A child that cannot be waited on is refused, and nothing is signalled by its number, which
 may be another process's by now. A program that does not answer in time, a child that cannot be
-waited on, and a host too short of descriptors, processes or memory to ask are faults that pass, and
-the look is refused as `UPSTREAM_UNAVAILABLE`; the other refusals are `HOST_NOT_CONFIGURED`. A look
+waited on or collected, output that cannot be read, and a host too short of descriptors, processes
+or memory to ask are faults that pass, and the look is refused as `UPSTREAM_UNAVAILABLE`; the other
+refusals are `HOST_NOT_CONFIGURED`. A look
 is made by one request at a time, and a request that arrives while one is under way waits for that
 look and shares its result, so a program that hangs is started once for all of them. A copy of Git
 under the helper directory that does not answer in time, or answers with more, refuses the whole
