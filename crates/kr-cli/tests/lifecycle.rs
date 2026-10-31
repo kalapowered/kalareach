@@ -5098,9 +5098,17 @@ fn end_the_pause_process_through(
     else {
         return Ok(());
     };
-    let identity = process_start_identity(number).map_err(|error| {
-        format!("the container runtime's pause process {number} could not be identified: {error}")
-    })?;
+    // A number the runtime left in its file for a process that has gone is the end the case wants;
+    // a process that cannot be told from a stranger is not left to a guess.
+    let identity = match kr_ipc::identity::query_process(number) {
+        kr_ipc::identity::ProcessQuery::Present(identity) => identity,
+        kr_ipc::identity::ProcessQuery::Gone => return Ok(()),
+        kr_ipc::identity::ProcessQuery::CannotEstablish(error) => {
+            return Err(format!(
+                "the container runtime's pause process {number} could not be identified: {error}"
+            ));
+        }
+    };
     let wanted = format!("XDG_RUNTIME_DIR={}", runtime.display());
     let started_here = std::fs::read(format!("/proc/{number}/environ")).is_ok_and(|environment| {
         environment
@@ -5201,6 +5209,23 @@ fn a_stop_that_is_refused_leaves_the_pause_process_and_is_reported() {
     let _ = pause.wait();
     let why = result.expect_err("a refusal is an error");
     assert!(why.contains("was not ended"), "{why}");
+}
+
+/// A number the runtime left in its file for a process that has gone is the end the case wants: it
+/// is not reported, and nothing is stopped.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_pause_process_that_has_already_gone_is_not_reported_and_nothing_is_stopped() {
+    let runtime = tempfile::tempdir().expect("a directory");
+    let mut pause = a_pause_process(runtime.path(), runtime.path());
+    let _ = pause.kill();
+    let _ = pause.wait();
+    end_the_pause_process_through(
+        runtime.path(),
+        |_| panic!("there is nothing to stop"),
+        Duration::from_secs(1),
+    )
+    .expect("a process that has gone is the end that was wanted");
 }
 
 /// A stop that was delivered and did not end the process within the time given is reported too.
