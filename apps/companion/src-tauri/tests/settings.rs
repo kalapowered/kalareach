@@ -1800,8 +1800,8 @@ async fn a_kept_copy_of_a_draft_is_dropped_through_the_client_at_the_service_the
 /// asking the service what it holds, and made, through the client the application was given, at the
 /// service the record names, after the setting names another. The draft is sent while its host is
 /// private, a publication of it has landed at the fork's service without a note here, and the store
-/// of another host cannot be read, so the draft's place is not known; the host lets it go, and the
-/// fork's service ends with none of it.
+/// of another host holds a record that cannot be read, so it is not known that nothing of the draft
+/// left; the host lets it go, and the fork's service ends with none of it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_removal_found_by_asking_the_service_goes_through_the_client_the_record_names() {
     let forked = Forked::new().await;
@@ -1822,7 +1822,8 @@ async fn a_removal_found_by_asking_the_service_goes_through_the_client_the_recor
     );
 
     // A publication of the draft has landed at the fork's service, and this computer holds no note
-    // of it. The store of another host cannot be read, so it is not known that nothing left.
+    // of it. The store of another host holds a record this build cannot read, so it is not known
+    // that nothing left.
     let held = page
         .app
         .state::<AppState>()
@@ -1833,14 +1834,19 @@ async fn a_removal_found_by_asking_the_service_goes_through_the_client_the_recor
         .claim_draft(&held.load(draft).expect("the draft"))
         .await;
     assert_eq!(elsewhere.draft_at(draft).await, Some(1));
-    let place = forked
+    let other = forked
         .computer
         .data
         .path()
         .join("settings-sync/drafts")
-        .join(unreadable.to_string());
-    std::fs::create_dir_all(&place).expect("a directory");
-    std::fs::write(place.join("store"), b"not a store").expect("a file");
+        .join(unreadable.to_string())
+        .join("store");
+    SyncStore::open(&other).expect("a store");
+    std::fs::write(
+        other.join("0b8a5a8a-0d73-4d62-9f1c-6a2f3a1c6d01.request"),
+        b"not a record",
+    )
+    .expect("a record this build cannot read");
 
     assert_eq!(page.discard_draft(draft, &version)["removed"], true);
     forked
