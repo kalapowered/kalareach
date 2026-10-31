@@ -4064,6 +4064,161 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// KR-REQ-24.26: an allow entry for an account not known to be this user's refuses a list
+    /// wherever it stands and whatever it grants. Each row is a way the rule could be weakened
+    /// into passing a list that lets another account in: skipping an entry that was inherited, one
+    /// that only what is made inside inherits, or one of no permissions; reading the allows only up
+    /// to the first deny; letting a later deny of the same name cancel an allow; and taking a
+    /// group that goes by this user's short name for this user.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_allow_entry_for_another_account_refuses_wherever_it_stands_and_whatever_it_grants() {
+        use exacl::{AclEntry, Flag, Perm};
+
+        let own = || vec!["someone".to_owned()];
+        let inside_only = Flag::FILE_INHERIT | Flag::DIRECTORY_INHERIT | Flag::ONLY_INHERIT;
+        let lists = [
+            (
+                "an inherited entry",
+                vec![AclEntry::allow_user("other", Perm::READ, Flag::INHERITED)],
+            ),
+            (
+                "an entry that only what is made inside inherits",
+                vec![AclEntry::allow_user("other", Perm::READ, inside_only)],
+            ),
+            (
+                "an entry of no permissions",
+                vec![AclEntry::allow_user("other", Perm::empty(), None)],
+            ),
+            (
+                "an allow that follows a deny",
+                vec![
+                    AclEntry::deny_user("someone", Perm::DELETE, None),
+                    AclEntry::allow_user("other", Perm::READ, None),
+                ],
+            ),
+            (
+                "an allow that a later deny of the same name cancels",
+                vec![
+                    AclEntry::allow_user("other", Perm::READ, None),
+                    AclEntry::deny_user("other", Perm::READ, None),
+                ],
+            ),
+            (
+                "a group that goes by this user's short name",
+                vec![AclEntry::allow_group("someone", Perm::READ, None)],
+            ),
+            (
+                "an allow for another account after this user's own",
+                vec![
+                    AclEntry::allow_user("someone", Perm::READ, None),
+                    AclEntry::allow_user("other", Perm::READ, None),
+                ],
+            ),
+        ];
+        for (what, entries) in lists {
+            assert!(
+                access_list_verdict(Ok(entries), own).is_some(),
+                "{what} refuses the list"
+            );
+        }
+    }
+
+    /// KR-REQ-24.26: an account whose name has a digit in it, or is not all digits, is known by
+    /// that name: only a name that is all digits, or the text of a GUID, is not.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_account_with_a_digit_in_its_name_is_still_known_by_its_name() {
+        for name in ["user1", "r2d2", "7zip"] {
+            let known = || {
+                names_of_this_user(Some(PasswdEntry {
+                    name: name.to_owned(),
+                    home: None,
+                }))
+            };
+            assert_eq!(known(), vec![name.to_owned()], "{name}");
+            let own = exacl::AclEntry::allow_user(name, exacl::Perm::READ, None);
+            assert_eq!(access_list_verdict(Ok(vec![own]), known), None, "{name}");
+        }
+    }
+
+    /// KR-REQ-24.26: the same weakenings, through the lists a directory carries. A list that the
+    /// system keeps as it was set refuses the directory, whatever its entries say.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_directory_whose_list_lets_another_account_in_by_any_entry_is_refused() {
+        use exacl::{AclEntry, Flag, Perm};
+
+        let root = temporary_root("access-list-entries");
+        let other = if current_uid() == 0 { "nobody" } else { "root" };
+        let inside_only = Flag::FILE_INHERIT | Flag::DIRECTORY_INHERIT | Flag::ONLY_INHERIT;
+        let lists = [
+            (
+                "an entry that only what is made inside inherits",
+                vec![AclEntry::allow_user(other, Perm::READ, inside_only)],
+            ),
+            (
+                "an entry of no permissions",
+                vec![AclEntry::allow_user(other, Perm::empty(), None)],
+            ),
+            (
+                "an allow that follows a deny",
+                vec![
+                    AclEntry::deny_group("everyone", Perm::DELETE, None),
+                    AclEntry::allow_user(other, Perm::READ, None),
+                ],
+            ),
+            (
+                "an allow that a later deny of the same name cancels",
+                vec![
+                    AclEntry::allow_user(other, Perm::READ, None),
+                    AclEntry::deny_user(other, Perm::READ, None),
+                ],
+            ),
+        ];
+        for (index, (what, entries)) in lists.iter().enumerate() {
+            let directory = root.join(format!("entries-{index}"));
+            create_private_tree(&root, &directory).expect("creates");
+            give_list(&directory, entries);
+            let error = create_private_tree(&root, &directory)
+                .expect_err(&format!("{what} refuses the directory"));
+            assert!(
+                matches!(error, IpcError::DirectoryAccessRefused { .. }),
+                "{what}: {error}"
+            );
+            assert_eq!(error.mending_command(), None, "{what}: {error}");
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// KR-REQ-24.26: a root made below a directory whose list is inheritable takes the entries of
+    /// that list, which the directory above a root is not checked for, and the root is refused for
+    /// them: an inherited entry is an entry.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_root_made_below_an_inheritable_entry_takes_it_and_is_refused() {
+        use exacl::{AclEntry, Flag, Perm};
+
+        let above = temporary_root("access-list-inherited");
+        let other = if current_uid() == 0 { "nobody" } else { "root" };
+        give_list(
+            &above,
+            &[AclEntry::allow_user(
+                other,
+                Perm::READ,
+                Flag::FILE_INHERIT | Flag::DIRECTORY_INHERIT,
+            )],
+        );
+        let root = above.join("kalareach");
+        let error = create_private_tree(&root, &root.join("run"))
+            .expect_err("a root that inherited an allow for another account is refused");
+        assert!(
+            matches!(error, IpcError::DirectoryAccessRefused { .. }),
+            "{error}"
+        );
+        std::fs::remove_dir_all(&above).ok();
+    }
+
     #[test]
     fn publication_is_atomic_and_owner_only() {
         let root = temporary_root("publish");
