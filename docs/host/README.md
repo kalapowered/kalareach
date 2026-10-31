@@ -3208,8 +3208,8 @@ clause that comes before the first such name, when there is one (`the host could
 session's directory`), and otherwise a sentence made from the code. Three refusals give a fixed
 reason, because their text names a place or an account: a filesystem mounted beneath the location a
 grant names and a repository whose alternates file names objects outside it, both told in terms of
-that location, and a worker that could not be started over a scheduled task another account holds
-under the environment's name. Text that already exists cannot be made again, so the rule holds where
+that location, and a worker that could not be started over a scheduled task under the
+environment's name that is not this installation's own. Text that already exists cannot be made again, so the rule holds where
 an error is written, whoever made it: a worker's, one a store kept, one a catalogue receipt holds,
 and one inside a result, such as the presentation error of a create. A receipt whose message was
 replaced says so in `error_withheld`. A record that holds a failure as plain text is held to the
