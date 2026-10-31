@@ -4,8 +4,8 @@
 //! KR-REQ-20.15 and 20.18: the recovery bundle is committed before the host's writer is declared
 //! recovery-enabled and before the host is set up under this computer's recovery, and bundle
 //! updates use the stable locator and compare-and-swap without
-//! reprinting the seed. KR-REQ-17.14: the sync service is a choice of its own, and the account's
-//! token goes only to the service the account is signed in to.
+//! reprinting the seed. The sync service is a choice of its own, and the account's token goes
+//! only to the service the account is signed in to.
 //!
 //! The companion runs on the mock runtime, its commands are called the way the page calls them,
 //! and its transport is the real one, talking over loopback to the stand-in `kr_service_stand_in`

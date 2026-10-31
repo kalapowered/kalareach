@@ -17,8 +17,8 @@
 //!
 //! KR-REQ-20.13: settings sync uses per-object revisions and compare-and-swap writes, keeps the
 //! content a refused write lost for the person to choose from instead of choosing by the clock, and
-//! never overwrites a host's grants. KR-REQ-18.05: encrypted settings sync. KR-REQ-17.14: the sync
-//! service is a client the application fills with the service it is set to use.
+//! never overwrites a host's grants. KR-REQ-18.05: encrypted settings sync. The sync service is a
+//! client the application fills with the service it is set to use.
 //!
 //! The companion runs on the mock runtime, its commands are called the way the page calls them,
 //! and its transport is the real one, talking over loopback to the stand-in `kr_service_stand_in`
