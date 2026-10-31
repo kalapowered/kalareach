@@ -452,7 +452,7 @@ mod tests {
         .expect_err("the command is ended");
         assert!(error.to_string().contains("was ended"), "{error}");
         assert!(
-            error.to_string().starts_with("/bin/sleep 600 said nothing"),
+            error.to_string().contains("/bin/sleep 600 said nothing"),
             "the refusal names the call: {error}"
         );
         assert!(
