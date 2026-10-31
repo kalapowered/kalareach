@@ -174,10 +174,11 @@ impl Supervisor {
     }
 }
 
-/// How long the starts under way when a world ends are given to be recorded: the longest the
-/// platform's service manager is given to answer one start (the Task Scheduler's 120 seconds), and
-/// a margin.
-const STARTS_RECORDED_WITHIN: Duration = Duration::from_secs(150);
+/// How long the starts under way when a world ends are given to be recorded: the longest one start
+/// can take where the service manager is the Task Scheduler (a query and a run of 120 seconds each,
+/// then the starter's reach and its three exchanges, 80 seconds in all), and a margin. A start that
+/// ends sooner ends the wait with it.
+const STARTS_RECORDED_WITHIN: Duration = Duration::from_secs(340);
 
 /// The supervisor a daemon is given, which a daemon started again on the same tree is given again.
 #[derive(Debug)]
