@@ -1139,23 +1139,24 @@ fn ceiling_above(tree: &AuthorisedDirectory) -> Option<PathBuf> {
 ///
 /// Nothing at the path is a tree that is no longer the object the record names, as a directory that
 /// took its place is, and is told as that: a source that changed, and not an argument the caller
-/// got wrong. Anything else that stops the open keeps the answer it always had.
+/// got wrong. The look for it is made first, so the answer is the one for what was seen there and
+/// not a guess from the failure of a later open. Anything else, and every failure of the open
+/// itself, keeps the answer it always had.
 fn open_recorded_root(
     environment_id: EnvironmentId,
     path: &Path,
     tree: RecordedIdentity,
 ) -> Result<AuthorisedDirectory> {
-    AuthorisedDirectory::open_root(environment_id, path).map_err(|refusal| {
-        let gone = matches!(
-            std::fs::symlink_metadata(path),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound
-        );
-        if gone {
-            not_the_recorded_tree(tree, path, &refusal)
-        } else {
-            refusal.into()
-        }
-    })
+    if matches!(
+        std::fs::symlink_metadata(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    ) {
+        let nothing = kr_transfer::Escape::NotFound {
+            component: path.display().to_string(),
+        };
+        return Err(not_the_recorded_tree(tree, path, &nothing));
+    }
+    Ok(AuthorisedDirectory::open_root(environment_id, path)?)
 }
 
 /// Returns the refusal for a directory that is not the working tree a record names.
