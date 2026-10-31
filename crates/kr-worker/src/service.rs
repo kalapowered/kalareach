@@ -208,15 +208,15 @@ struct EmptyPage {
     page: kr_protocol::attention::AttentionSourcePage,
 }
 
-/// What a request for a page asks, other than which request it is: everything the page is made
-/// from besides the journal.
+/// What a request for a page asks, other than which request it is: everything an empty page is
+/// made from besides the journal. The key the request names for fingerprints is not among them: it
+/// is applied to records, and a page kept has none, so the host holds no copy of it.
 #[derive(PartialEq, Eq)]
 struct AskedPage {
     questions_after: u64,
     approvals_after: u64,
     host_events_after: u64,
     max_records: u64,
-    fingerprint_key: [u8; 32],
     max_bytes: usize,
 }
 
@@ -227,7 +227,6 @@ impl AskedPage {
             approvals_after: request.approvals_after.get(),
             host_events_after: request.host_events_after.get(),
             max_records: request.max_records.get(),
-            fingerprint_key: *request.fingerprint_key.expose(),
             max_bytes,
         }
     }
