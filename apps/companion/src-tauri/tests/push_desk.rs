@@ -1146,6 +1146,44 @@ async fn the_push_desk_talks_to_the_gateway_client_it_was_given() {
     );
 }
 
+/// KR-REQ-17.14: a gateway factory that cannot make its client leaves the push service out of the
+/// set the Account sheet is reported over, and availability reports it as not configured; the error
+/// is dropped, and the desk is no less usable for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gateway_factory_that_cannot_make_its_client_is_reported_as_none_configured() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = phone_paired_with(&host, &owner, &[ActionRight::SessionView]).await;
+    let device = phone.companion.device();
+    let stand_in = kr_service_stand_in::serve().await;
+    let opened = open_replacing(
+        kr_protocol::service::GatewayOrigin::new(stand_in.origin()).expect("an origin"),
+        phone.data.path(),
+        &device,
+        &Receiver::new(FIRST_TOKEN),
+        Arc::new(HostLink(Arc::new(Mutex::new(Registered::default())))),
+        |_| -> Arc<GatewayFor> {
+            Arc::new(|_, _| Err("this phone cannot make a client of the gateway".to_owned()))
+        },
+    );
+
+    let state = AppState::new();
+    state.push_opened(Arc::clone(&opened.desk));
+    let held = companion_tauri::services::Held::of(
+        Some(&state),
+        None,
+        Arc::new(kr_client::services::NullService),
+    );
+    assert!(held.push.is_none(), "the factory made no client to hold");
+    assert!(
+        !held
+            .into_clients()
+            .availability_of(ManagedService::Push)
+            .configured,
+        "the application's set reports the push service as not configured"
+    );
+}
+
 /// KR-REQ-17.14: the reissue a device run asks for, which leaves the host holding a credential the
 /// gateway no longer accepts, is asked of the client the factory makes for the gateway the desk
 /// talks to. A fork's own client in that place receives the issue and the host is told nothing;

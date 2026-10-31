@@ -341,8 +341,9 @@ fn hand_off_asking(client: Client, redirect: Redirect, command: &str, scopes: &[
     assert!(views.contains(&AccountView::BrowserOpen), "{views:?}");
 }
 
-/// KR-REQ-17.19: the desktop hands the ceremony to the default browser and takes the answer on the
-/// registered loopback redirect.
+/// KR-REQ-17.19 and KR-REQ-17.14: the desktop hands the ceremony to the default browser and takes
+/// the answer on the registered loopback redirect, and the code is exchanged through the account
+/// client the application was given.
 #[test]
 fn the_desktop_hands_the_ceremony_to_the_browser_at_the_fixed_origin() {
     hand_off(Client::Desktop, Redirect::Loopback);
@@ -506,6 +507,32 @@ impl companion_tauri::services::SyncServices for Recording {
     }
 }
 
+/// A factory of sync clients that cannot make one.
+#[derive(Debug)]
+struct Unable;
+
+impl companion_tauri::services::SyncServices for Unable {
+    fn installation(
+        &self,
+        _origin: &kr_protocol::service::GatewayOrigin,
+    ) -> companion_tauri::error::Result<Arc<dyn kr_client::services::SharedSyncService>> {
+        Err(companion_tauri::error::CommandError::local_failure(
+            "this computer cannot make a client of the sync service",
+        ))
+    }
+
+    fn presenting(
+        &self,
+        _origin: &kr_protocol::service::GatewayOrigin,
+        _tokens: Arc<dyn kr_client::services::AccountTokenSource>,
+        _scope: &'static str,
+    ) -> companion_tauri::error::Result<Arc<dyn kr_client::services::SharedSyncService>> {
+        Err(companion_tauri::error::CommandError::local_failure(
+            "this computer cannot make a client of the sync service",
+        ))
+    }
+}
+
 /// The lines a page reads, as (service, configured, explanation).
 fn lines(answer: &serde_json::Value) -> Vec<(String, bool, String)> {
     answer
@@ -523,9 +550,11 @@ fn lines(answer: &serde_json::Value) -> Vec<(String, bool, String)> {
 }
 
 /// KR-REQ-17.14: the application says which managed services it holds a client of, in the words
-/// the library uses, and for a service it holds none of, what a person does instead. The sync line
-/// is derived from the factory the desks use, asked for the origin the setting names, so replacing
-/// the factory is what changes the line. A phone leaves relay leases out: the host keeps those.
+/// the library uses, and for a service it holds none of, what a person does instead. The account
+/// line is made over the client the application signs in through, which answers a call as that
+/// service does and not as a client with nothing configured. The sync line is derived from the
+/// factory the desks use, asked for the origin the setting names, so replacing the factory is what
+/// changes the line. A phone leaves relay leases out: the host keeps those.
 #[test]
 fn the_application_reports_the_managed_services_it_holds_a_client_of() {
     use kr_client::services::{ManagedService, ServiceClients};
@@ -570,6 +599,20 @@ fn the_application_reports_the_managed_services_it_holds_a_client_of() {
         }
     }
 
+    // The account the report is made over is the one the application signs in through: a call
+    // through it reaches that service, which answers, where a client with nothing configured
+    // refuses.
+    let held = companion_tauri::services::Held::of(None, None, account.service());
+    let token = AccountToken::new("a-stub-access-token").expect("a token");
+    tauri::async_runtime::block_on(async {
+        held.account
+            .as_ref()
+            .expect("the account's client")
+            .usage(&token)
+            .await
+    })
+    .expect("the account service answered");
+
     // With the sync service setting open and a factory of sync clients installed, the sync line is
     // held, and the factory was asked for the origin the setting names.
     let directory = tempfile::tempdir().expect("a directory");
@@ -586,7 +629,11 @@ fn the_application_reports_the_managed_services_it_holds_a_client_of() {
         asked: Mutex::new(Vec::new()),
     });
     state.sync_clients_replaced(Arc::clone(&recording) as _);
-    let held = lines(&invoke_in(account, Some(state), "account_services"));
+    let held = lines(&invoke_in(
+        Arc::clone(&account),
+        Some(state),
+        "account_services",
+    ));
     assert_eq!(
         held.iter().map(|(_, held, _)| *held).collect::<Vec<_>>(),
         [true, false, true, false]
@@ -595,5 +642,16 @@ fn the_application_reports_the_managed_services_it_holds_a_client_of() {
         *recording.asked.lock().expect("the record"),
         ["https://sync.example".to_owned()],
         "the line is made from the client at the origin the setting names"
+    );
+    // A factory that cannot make a client leaves the sync service out of the set: the error is
+    // dropped, and the line says none is configured.
+    let state = companion_tauri::state::AppState::new();
+    let setting = companion_tauri::sync_service::SyncService::open(directory.path());
+    state.sync_service_opened(Arc::new(setting));
+    state.sync_clients_replaced(Arc::new(Unable));
+    let unable = lines(&invoke_in(account, Some(state), "account_services"));
+    assert_eq!(
+        unable.iter().map(|(_, held, _)| *held).collect::<Vec<_>>(),
+        [true, false, false, false]
     );
 }
