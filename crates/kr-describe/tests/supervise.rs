@@ -2222,8 +2222,8 @@ fn a_start_that_panics_after_creating_the_process_leaves_no_held_process() {
         .take()
         .expect("the process was created");
     if kr_ipc::identity::process_state(&identity) != kr_ipc::identity::ProcessState::Ended {
-        // Ended through the identity, which holds the process it names open and leaves a process
-        // that has taken the identifier since alone.
+        // `stop_process` opens the process by its identifier and ends it only when its creation
+        // time is the identity's, so a process that has taken the identifier since is left alone.
         let _ = kr_ipc::identity::stop_process(&identity, kr_ipc::identity::Stop::Kill);
         panic!("the process the start created was left behind: {identity:?}");
     }
@@ -2767,10 +2767,11 @@ fn a_start_that_returns_after_creating_the_process_ends_it() {
     );
 }
 
-/// A process the system will not let run is not stopped by the end its reader tells of afterwards,
-/// when that end is told after the next process has started. A check starts a process at once, so
-/// the second check starts one before the first process's end has been handled; a load waits for
-/// the restart delay and would not meet it. The control is the answer of the second check.
+/// The end that the reader of a process the system would not let run tells is not taken for the end
+/// of the next process. A check starts a process at once, so the second check starts one while the
+/// first process's end is told and not yet handled; a load waits for the restart delay and would
+/// not meet it. The control is the answer of the second check, which the next process, still alive,
+/// gives.
 #[test]
 fn an_end_told_late_of_a_process_that_would_not_run_does_not_stop_the_next_process() {
     let (signed, weights) = tiny();
