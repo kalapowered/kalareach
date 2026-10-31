@@ -442,21 +442,25 @@ fn drop_unseen_releases(
 }
 
 /// Whether a run of key records holds a key the person pressed: one going down that is not a
-/// modifier or a lock. A release, a modifier on its own and a lock key are not typing.
+/// modifier or a lock, or an Alt coming up with the character composed on the numeric keypad, which
+/// the console reports on the Alt's release. Any other release, a modifier on its own and a lock key
+/// are not typing.
 fn presses(keys: &[kr_term::win32::KeyRecord]) -> bool {
     keys.iter().any(|key| {
-        key.key_down
-            && !matches!(
-                key.virtual_key,
-                VK_SHIFT
-                    | VK_CONTROL
-                    | VK_MENU
-                    | VK_LWIN
-                    | VK_RWIN
-                    | VK_CAPITAL
-                    | VK_NUMLOCK
-                    | VK_SCROLL
-            )
+        if !key.key_down {
+            return key.virtual_key == VK_MENU && key.unicode != 0;
+        }
+        !matches!(
+            key.virtual_key,
+            VK_SHIFT
+                | VK_CONTROL
+                | VK_MENU
+                | VK_LWIN
+                | VK_RWIN
+                | VK_CAPITAL
+                | VK_NUMLOCK
+                | VK_SCROLL
+        )
     })
 }
 
@@ -1509,8 +1513,9 @@ const WATCHING_WITHOUT_TYPING: &str = "`kr attach --no-probe` watches without ty
 struct Fallback {
     /// How it went on, once it did.
     how: Option<Spelling>,
-    /// Whether anything the person typed was lost in the change. A key coming up, a modifier on its
-    /// own and a lock key are not typing, so a refusal of only those loses nothing.
+    /// Whether anything the person typed was lost in the change. A key coming up (an Alt with a
+    /// composed character apart), a modifier on its own and a lock key are not typing, so a refusal
+    /// of only those loses nothing.
     typed_keys_lost: bool,
 }
 
@@ -1586,8 +1591,9 @@ impl Fallback {
 struct Write {
     /// The sequence number it was sent under.
     sequence: u64,
-    /// Whether it held something the person typed. A key coming up, a modifier on its own and a lock
-    /// key are not typing, so a write of only those is refused without anything being lost.
+    /// Whether it held something the person typed. A key coming up (an Alt with a composed character
+    /// apart), a modifier on its own and a lock key are not typing, so a write of only those is
+    /// refused without anything being lost.
     typed: bool,
     /// Whether it was console key records and not bytes.
     keys: bool,
@@ -2331,7 +2337,8 @@ async fn drive(
                 // The session is closing and refuses input. What is typed now goes nowhere, and
                 // the line this attachment ends with says so.
                 if closing {
-                    // A release or a modifier going down is not something typed.
+                    // A release (an Alt with a composed character apart) or a modifier going down is
+                    // not something typed.
                     undelivered |= match &read {
                         TerminalInput::Bytes(_) => true,
                         TerminalInput::Keys(keys) => presses(keys),
@@ -3543,6 +3550,23 @@ mod tests {
                 ran.said
             );
 
+            // A modifier was refused, and text composed with Alt on the numeric keypad was read
+            // since: it is the person's text, dropped, and the line counts it.
+            let ran = after_a_refusal(console_will_spell, |mut case| async move {
+                let shift = case.types(shift_down()).await;
+                case.types_without_waiting(alt_down());
+                case.types_without_waiting(alt_composed());
+                case.refuses(&shift, ErrorCode::InputIncompatible);
+                case.waits_for_the_console_to_be_asked().await;
+                case.hangs_up();
+            })
+            .await;
+            assert!(
+                ran.said[0].as_str().contains("were lost"),
+                "text composed with Alt was read since ({console_will_spell}): {:?}",
+                ran.said[0]
+            );
+
             // The same letter, with the session's closure ready beside the refusal: the attachment
             // ends before the loop takes the letter, and the line still counts it.
             let ran = wire::run_switched(true, console_will_spell, |mut case| async move {
@@ -3563,6 +3587,33 @@ mod tests {
                 ran.said
             );
         }
+    }
+
+    /// The Alt going down that the composed character's Alt comes up from.
+    #[cfg(unix)]
+    fn alt_down() -> crate::attach::TerminalInput {
+        crate::attach::TerminalInput::Keys(vec![kr_term::win32::KeyRecord {
+            virtual_key: super::VK_MENU,
+            scan_code: 0x38,
+            unicode: 0,
+            key_down: true,
+            control_keys: 0x02,
+            repeat: 1,
+        }])
+    }
+
+    /// An Alt coming up with the character composed on the numeric keypad, as the console reports
+    /// the text typed that way.
+    #[cfg(unix)]
+    fn alt_composed() -> crate::attach::TerminalInput {
+        crate::attach::TerminalInput::Keys(vec![kr_term::win32::KeyRecord {
+            virtual_key: super::VK_MENU,
+            scan_code: 0x38,
+            unicode: 0x00e9,
+            key_down: false,
+            control_keys: 0,
+            repeat: 1,
+        }])
     }
 
     /// A key going down at the console, as the case types it.
@@ -3945,6 +3996,31 @@ mod tests {
             assert!(!presses(&[key(lock, true)]), "{name} types nothing");
             assert!(presses(&[key(lock, true), key(u16::from(b'A'), true)]));
         }
+    }
+
+    /// An Alt coming up with the character composed on the numeric keypad is the text the person
+    /// typed: the console reports the character on the Alt's release. An Alt coming up with none is
+    /// a modifier like any other.
+    #[test]
+    fn an_alt_coming_up_with_a_composed_character_is_a_press() {
+        use kr_term::win32::KeyRecord;
+
+        let alt_up = |unicode: u16| KeyRecord {
+            virtual_key: 0x12,
+            scan_code: 0x38,
+            unicode,
+            key_down: false,
+            control_keys: 0,
+            repeat: 1,
+        };
+        assert!(presses(&[alt_up(0x00e9)]), "an é composed from 0233");
+        assert!(!presses(&[alt_up(0)]), "an Alt coming up on its own");
+        let a_up = KeyRecord {
+            virtual_key: u16::from(b'A'),
+            unicode: u16::from(b'a'),
+            ..alt_up(0)
+        };
+        assert!(!presses(&[a_up]), "another key coming up carries no text");
     }
 
     /// What the attachment says once the reader of its console has been stopped: that the reader had
