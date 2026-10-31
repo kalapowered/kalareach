@@ -82,10 +82,11 @@ pub const DIRECTORY: &str = "recovery";
 /// The record of the service named for this computer's bundle and its locator, in [`DIRECTORY`].
 const RECORD: &str = "recovery.json";
 
-/// Whose bundle the record is: written beside the record once this device's own first write has
-/// landed, so that deleting an account clears only a record that is that account's. A record with
-/// no such file (not yet kept, or adopted from an earlier write), or with one that names another
-/// bundle, has an owner no one knows.
+/// Whose bundle the record is: written beside the record once the answer to this device's own
+/// first write has come back, so that deleting an account clears only a record that is that
+/// account's. A record with no such file (not yet kept, kept by settling a write whose answer was
+/// lost, or adopted from an earlier write), or with one that names another bundle, has an owner no
+/// one knows.
 const OWNER: &str = "recovery-owner.json";
 
 /// The file a step holds a lock on for as long as it runs, in [`DIRECTORY`].

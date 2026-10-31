@@ -1148,7 +1148,7 @@ async fn the_push_desk_talks_to_the_gateway_client_it_was_given() {
 
 /// KR-REQ-17.14: a gateway factory that cannot make its client leaves the push service out of the
 /// set the Account sheet is reported over, and availability reports it as not configured; the error
-/// is dropped, and the desk is no less usable for it.
+/// is dropped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_gateway_factory_that_cannot_make_its_client_is_reported_as_none_configured() {
     let owner = DeviceKeys::generate().expect("keys");
