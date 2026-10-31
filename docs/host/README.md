@@ -5624,7 +5624,8 @@ operation row, a workspace or a directory. Those are `project.init`, `project.cl
 write a working tree: `changeset.capture`, `diff.apply`, `diff.revert` and `diff.read` of a working
 copy. The message ends with the step that installs Git: `xcode-select --install` on macOS and the
 system package manager on Linux. Windows runs no Git at all, so there it gives the platform's own
-refusal before it looks for Git, whether or not Git is installed, and names no install. The project
+refusal, under the same code, before it looks for Git, whether or not Git is installed, and names
+no install. A client does not send such a request again. The project
 methods and `changeset.capture` keep the refusal as the answer to the request's action identifier,
 so a request repeated after Git is installed carries a new identifier. `diff.apply` and
 `diff.revert` refuse before they claim their action and keep nothing. `project.list`,

@@ -147,7 +147,7 @@ pub const NO_GIT: Option<&str> = platform::NO_GIT;
 /// set up for the work, which a client does not send again, and not the one of an upstream that
 /// may answer later.
 pub(crate) fn no_git_refusal(why: &str) -> ProjectError {
-    ProjectError::GitFailed {
+    ProjectError::GitUnavailable {
         detail: format!("Git is not run on this platform: {why}").into(),
     }
 }
