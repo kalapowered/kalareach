@@ -539,10 +539,13 @@ mod tests {
         assert_eq!(closed.sequence.get(), renewed.sequence.get() + 1);
     }
 
-    /// KR-PERF-003: once every worker has the statement the publisher waits for minutes; while the
-    /// statement carries a lease it looks again at the lease's end, at either of its two ends, and
+    /// KR-PERF-003: the wait the publisher settles into once every worker has the statement. It is
+    /// minutes without a lease; with one it runs to the lease's end, at either of its two ends, and
     /// no later than half a minute on: a worker withdraws what its local owner holds when it is
-    /// told the lease has ended, or that another lease is live.
+    /// told the lease has ended, or that another lease is live. This shows that decision alone
+    /// ([`settled_wait`]). No case shows the publisher's use of it: the end-to-end cases that
+    /// present a short lease to a real worker (`tests/network.rs`) end access by the worker's own
+    /// clock, and do not depend on the statement the publisher sends at the lease's end.
     #[test]
     fn kr_perf_003_the_publisher_looks_again_when_the_lease_it_settled_on_ends() {
         use std::time::Duration;

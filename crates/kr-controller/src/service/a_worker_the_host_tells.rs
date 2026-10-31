@@ -431,8 +431,10 @@ async fn kr_perf_003_a_worker_is_owed_the_statement_until_it_has_acknowledged_th
 }
 
 /// KR-PERF-003: the publisher waits for minutes once every worker has the statement in force, so a
-/// worker that joins the directory is what wakes it: one that could not be told as it was made
-/// known is then told by the publisher in seconds and not when the long wait ends.
+/// worker that joins the directory is what wakes it. This counts the wake. That the wake reaches
+/// the publisher is shown by
+/// `a_statement_a_worker_did_not_acknowledge_is_sent_again_by_the_publisher_alone`, which fails
+/// when the notification is removed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_perf_003_a_worker_made_known_wakes_the_publisher() {
     use super::a_link_that_is_not_given_back::Served;

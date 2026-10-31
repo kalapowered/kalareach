@@ -937,7 +937,10 @@ mod tests {
     use super::{QuestionStep, next_question_step};
 
     /// KR-PERF-003: an idle daemon's question loop is woken for the moment a sweep is due and for
-    /// nothing in between, where it used to look at every pass.
+    /// nothing in between, where it used to look at every pass. This shows the loop's decision
+    /// ([`next_question_step`]). That the loop sweeps again after its wait is shown by the runtime
+    /// cases of `tests/gateway_answers.rs`, which fail when the wait never ends; no case shows that
+    /// it is woken for nothing in between.
     #[test]
     fn kr_perf_003_the_question_loop_waits_for_readiness_and_then_for_its_due_moment() {
         let now = tokio::time::Instant::now();
