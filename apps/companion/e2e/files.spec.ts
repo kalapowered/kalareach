@@ -79,7 +79,14 @@ test.describe('the desktop takes sessions in tabs, files on the draft and an exp
     })
     await expect(attached).toContainText('pasted-log.txt')
     await expect(page.getByTestId('composer-input')).toHaveValue('look at these')
-    expect(await page.evaluate(() => window.krTestHost?.uploaded.length)).toBe(2)
+    // A pasted file is on the draft from the moment it arrives, and its bytes are read before the
+    // host is asked to take them, so the host's record of the second upload follows what the page
+    // shows by as long as that read takes. The host's record is what is waited on.
+    await expect
+      .poll(() => page.evaluate(() => window.krTestHost?.uploaded.length), {
+        message: 'the host has taken both files'
+      })
+      .toBe(2)
     await page.screenshot({ path: shot('files-tabs-13.16') })
     // The two files and the paths the host gave them, with the draft's text, in view.
     await page.getByTestId('composer-input').scrollIntoViewIfNeeded()
