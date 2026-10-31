@@ -6968,11 +6968,16 @@ async fn a_suite_that_outlives_its_wait_is_stopped_and_records_no_result() {
     )
     .await;
     let running = run_from_another_task(&host, &document, "evt-tests");
-    // The suite has started once its session is there and has not closed.
+    // The suite has started once its session has a root process and has not closed: a session is
+    // listed from its reservation, before its worker has claimed it, and a node asked to stop then
+    // makes none.
     let started = std::time::Instant::now();
     loop {
         let sessions = all_sessions(&mut control).await;
-        if sessions.iter().any(|session| session.closure.0.is_none()) {
+        if sessions
+            .iter()
+            .any(|session| session.closure.0.is_none() && session.root_process.0.is_some())
+        {
             break;
         }
         assert!(
