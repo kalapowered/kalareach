@@ -3040,6 +3040,30 @@ mod tests {
         assert_eq!(every, vec![one, two]);
     }
 
+    /// KR-REQ-24.26: a store whose directory is not owner-only is refused with the reason the
+    /// refusal carries, in the words any other command says it in, and not as the "other error"
+    /// that an I/O failure carrying anything but a sentence of this program's own is said as.
+    #[test]
+    fn a_store_directory_that_is_not_owner_only_is_said_as_the_refusal_it_is() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("a directory for the store");
+        let root = directory.path().join("store");
+        std::fs::create_dir(&root).expect("the store's root");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).expect("opened");
+
+        let refused = Store::at(&root)
+            .create_directories()
+            .expect_err("a store directory others can read is refused");
+        let said = said(&refused).into_string();
+
+        assert!(said.contains("mode 0700, found owner"), "{said}");
+        assert!(
+            !said.contains("other error"),
+            "the reason was said as an ordinary failure: {said}"
+        );
+    }
+
     /// The store's record is read up to a size, and one that would be larger than that is not
     /// written: a record this host wrote and could not read again would end every later command.
     #[test]

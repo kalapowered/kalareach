@@ -9259,6 +9259,47 @@ async fn a_document_a_command_writes_under_another_configuration_home_is_checked
     assert!(output.status.success(), "the control: {said}");
 }
 
+/// KR-REQ-24.26: the directories a command makes for the configuration document it writes under a
+/// configuration home of its own are owner-only, whatever the mask of the process: the document
+/// decides how this host behaves, and its directories are not for other accounts.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_directories_a_command_makes_for_its_configuration_document_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let _login = kr_ipc::testing::LoginUmask::hold();
+    let host = Host::bare_as_a_default_install();
+    host.install(&Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1));
+    let home = host.scratch("command-home");
+    let config = host.scratch("command-config");
+    let state_home = host.tree.root().to_path_buf();
+    let output = host
+        .command(
+            &host.store.stable(Program::Kr),
+            &["host", "startup", "--set", "standalone", "--json"],
+        )
+        .env_remove("KR_STATE_DIR")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config)
+        .env("XDG_STATE_HOME", &state_home)
+        .stdin(Stdio::null())
+        .output()
+        .expect("kr runs");
+    assert!(
+        output.status.success(),
+        "kr host startup: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let environments = config.join("kalareach").join("environments");
+    let own = environments.join(kr_ipc::paths::short_prefix(host.tree.environment_id()));
+    assert!(own.join("config.json").exists(), "the command wrote here");
+    for made in [config.join("kalareach"), environments, own] {
+        let mode = std::fs::metadata(&made).expect("made").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "{}", made.display());
+    }
+}
+
 /// KR-REQ-26.10: a command that cannot register what it works in writes nothing and says so.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
