@@ -150,23 +150,25 @@ stops, so a limit that a part has is written in that part's own document.
   function. A generic alert is shown if the preview cannot be opened, if the host is unknown, or for
   anything a session itself said, which the seal never holds: [mobile](client/mobile.md).
 - **Attention.** One inbox for every session and workflow of an environment, with escalation rules,
-  quiet hours and review state, and a view of what changed since an actor's last visit. The view is
-  the host's own record of changes. The host will also respond to requests for a summary of what has
-  changed since the last visit, written by its own local model and kept apart from the changes
-  themselves, although no shipped client currently asks for these:
+  quiet hours and review state, and a view of what changed since an actor's last visit, which no
+  shipped client reads yet. The view is the host's own record of changes. The host will also
+  respond to requests for a summary of what has changed since the last visit, written by its own
+  local model and kept apart from the changes themselves, although no shipped client currently asks
+  for these:
   [host](host/README.md#attention-review-and-what-changed-since-a-visit) and
   [descriptions](describe/README.md).
 - **Sharing and control.** Grants scoped to environments and sessions, and a narrower grant that a
   holder can delegate. `kr share invite` offers one session to a paired device for a bounded period
   of time. The owner is shown the role and rights that will be offered before the invitation exists,
   except under `--yes --json` for an invitation that carries no consequence and no live screen,
-  which prints a document naming the role and actions after it creates the invitation. A phone
-  accepts the invitation, in the Offers view of the companion application. There is no accept
-  command in `kr share`, and the desktop companion does not have an Offers view. `kr share transfer`
-  hands control of a session to another device. A revocation completes through a barrier per worker.
-  To take control of typing, a controller must explicitly take an input lease:
-  [grants](host/README.md#grants-sharing-and-revocation), [pairing](pairing/README.md),
-  [who may type](host/README.md#who-may-type) and [cli](cli/README.md).
+  which prints a document after it creates the invitation, naming the role and, when the host's
+  reply to the creation arrives, the actions. A phone accepts the invitation, in the Offers view of
+  the companion application. There is no accept command in `kr share`, and the desktop companion
+  does not have an Offers view. `kr share transfer` hands control of a session to another device. A
+  revocation completes through a barrier per worker. To take control of typing, a controller must
+  explicitly take an input lease: [grants](host/README.md#grants-sharing-and-revocation),
+  [pairing](pairing/README.md), [who may type](host/README.md#who-may-type) and
+  [cli](cli/README.md).
 - **Automation.** Versioned workflows that react to verified events, under causal budgets and a
   declared grant: [automation](automation/README.md).
 - **Sync, recovery and backup.** Encrypted settings sync and the recovery kit are inside the shared
