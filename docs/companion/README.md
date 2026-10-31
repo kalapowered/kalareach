@@ -1018,10 +1018,10 @@ no request is made and the refusal names the setting. A sign-in that does not ca
 write the account's backup storage sends nothing either, and the person signs in again with that
 right. The record names the service the bundle is kept at, so choosing another sync service later
 does not move the bundle; the kit still points at the service it was made for, and the Account
-sheet says so. The same check runs at the record's service for each later step that reaches it
-(going on with a start that did not finish, settling a write, covering the host, listing the
-archives and making the offline copy): a record kept at one service is refused when the account is
-signed in at another, whatever the setting names. Saving the kit reaches no service, and the kit
+sheet says so. The same check is made for the record's service before each later step that would
+reach it (going on with a start that did not finish, settling a write, covering the host, listing
+the archives and making the offline copy): a record kept at one service is refused when the account
+is signed in at another, whatever the setting names. Saving the kit reaches no service, and the kit
 goes on naming the service the record names. A phone shows the setting and offers no recovery.
 
 ## The managed services the application holds
