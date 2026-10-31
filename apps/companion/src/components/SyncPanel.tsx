@@ -658,7 +658,7 @@ export function SyncPanel({
                     data-testid="recovery-blocker"
                     data-reason={blocker.reason}
                   >
-                    {describeBlocker(blocker)}
+                    {describeBlocker(blocker, recovery?.kept_at ?? null)}
                   </p>
                 ) : null}
                 {recovery?.state === 'off' ? (
