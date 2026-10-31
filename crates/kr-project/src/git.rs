@@ -1798,8 +1798,10 @@ impl RestrictedProfile {
             ));
         }
         // Git is looked for before anything of the invocation exists, so a host without a usable
-        // Git refuses here and leaves no directory behind. What is found is kept, and the steps
-        // below ask for it again without searching.
+        // Git refuses here and leaves no directory behind, as does a kernel that cannot build the
+        // boundary at all (one that cannot build it for a remote is refused when the boundary is
+        // built, below). What is found is kept, and the steps below ask for it again without
+        // searching.
         let git = self.git()?;
         // Opened once, here, and handed to the child. Everything the boundary is built from is
         // resolved in this moment rather than one after another.
@@ -3203,9 +3205,9 @@ const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(5);
 /// helper directory and its version, and the same two of the copy under that directory.
 ///
 /// Git answers these in milliseconds. A program that takes longer is not one this host can run
-/// work through: it is a stand-in waiting on something, such as an installer or a lookup that never
-/// returns. It is ended, with the processes in its group, and refused as unavailable. Ending it,
-/// and the wait for its output to close, take a few seconds more at most.
+/// work through yet: it is a stand-in waiting on something, such as an installer or a lookup that
+/// never returns. It is ended, with the processes in its group, and the look is refused as a fault
+/// that passes. Ending it, and the wait for its output to close, take a few seconds more at most.
 pub const PROBE_BOUND: Duration = Duration::from_secs(10);
 
 /// The most one of those answers may hold. A version and a directory are far shorter.

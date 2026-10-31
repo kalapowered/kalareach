@@ -78,9 +78,12 @@ impl Spawned {
 ///
 /// # Errors
 ///
-/// Returns [`ProjectError::GitFailed`] when the boundary cannot be prepared or the child cannot be
-/// started. A child whose boundary could not be applied never reaches `exec`: the failure comes
-/// back here as a start failure, so there is no case in which Git runs unenclosed.
+/// Returns the platform's own refusal when it cannot prepare the boundary this invocation needs:
+/// [`ProjectError::GitUnavailable`] for a host that is not set up for it, such as a Linux kernel
+/// without the interface a remote operation needs, and [`ProjectError::GitFailed`] for a fault that
+/// may pass. Returns [`ProjectError::GitFailed`] when the child cannot be started. A child whose
+/// boundary could not be applied never reaches `exec`: the failure comes back here as a start
+/// failure, so there is no case in which Git runs unenclosed.
 pub fn start(invocation: &Invocation<'_>, confinement: &Confinement) -> Result<Spawned> {
     // Everything the boundary needs is prepared while this is still an ordinary process: writing a
     // profile, opening the objects the rules are attached to, building a filter program. What is
