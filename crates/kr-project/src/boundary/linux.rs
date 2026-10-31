@@ -1285,6 +1285,14 @@ mod tests {
                     && said.contains("version 3 (Linux 6.2)"),
                 "it names what the kernel has and what the boundary needs: {said}"
             );
+            // A kernel that reports no interface may have one that a filter on this process
+            // blocks, so that is named among the causes, and the remedy is not only another kernel.
+            assert_eq!(
+                said.contains("blocked by a filter on this process"),
+                found == 0,
+                "version {found}: {said}"
+            );
+            assert!(said.ends_with("use a host that offers it"), "{said}");
         }
     }
 
