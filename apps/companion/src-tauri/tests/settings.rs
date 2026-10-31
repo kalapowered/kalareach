@@ -1609,6 +1609,10 @@ struct Forked {
     computer: Computer,
     fork_origin: GatewayOrigin,
     recorded: String,
+    /// What the clients had been asked for, and what the fork's service had received, when the
+    /// setting changed.
+    asked_by_then: usize,
+    arrived_by_then: usize,
 }
 
 impl Forked {
@@ -1627,6 +1631,8 @@ impl Forked {
         let chosen = serve().await;
         page.call("sync_service_set", json!({ "origin": chosen.origin() }))
             .expect("another service is chosen");
+        let (asked_by_then, arrived_by_then) =
+            (fork.asked().len(), fork_service.web().arrived().len());
         Self {
             computer,
             page,
@@ -1635,6 +1641,8 @@ impl Forked {
             fork,
             chosen,
             recorded,
+            asked_by_then,
+            arrived_by_then,
         }
     }
 
@@ -1648,18 +1656,19 @@ impl Forked {
     /// no request, and neither did the service the setting names now.
     fn only_the_fork_was_reached(&self) {
         assert!(
-            !self.fork.asked().is_empty()
+            self.fork.asked().len() > self.asked_by_then
                 && self
                     .fork
                     .asked()
                     .iter()
                     .all(|origin| *origin == self.recorded),
-            "{:?}: a client was asked for another service than the record names",
+            "{:?}: a client was asked for another service than the record names, or none was asked \
+             after the setting changed",
             self.fork.asked()
         );
         assert!(
-            !self.fork_service.web().arrived().is_empty(),
-            "the fork's service received the calls"
+            self.fork_service.web().arrived().len() > self.arrived_by_then,
+            "the fork's service received the calls after the setting changed"
         );
         assert!(
             self.computer.served.web().arrived().is_empty(),
@@ -1912,13 +1921,10 @@ async fn a_removal_for_no_host_goes_through_the_client_at_the_service_the_record
     forked.only_the_fork_was_reached();
 }
 
-/// KR-REQ-17.14: a copy the service kept of a refused settings write that the person already chose
-/// to have dropped, while the service could not be reached, is asked about again when the person
-/// asks again, through the client the application was given, at the service the record names,
-/// after the setting names another: the fork's service drops it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn asking_again_for_a_kept_copy_to_go_asks_the_service_the_record_names() {
-    let forked = Forked::new().await;
+/// A copy the fork's service kept of a refused settings write, as the page lists it: another device
+/// wrote first, and a change made here was refused. Returns the other device's store of the
+/// collection and the reference the copy is listed under.
+async fn with_a_copy_the_fork_kept(forked: &Forked) -> (Elsewhere, String) {
     let page = &forked.page;
     let elsewhere = forked.elsewhere();
     assert!(matches!(
@@ -1935,13 +1941,25 @@ async fn asking_again_for_a_kept_copy_to_go_asks_the_service_the_record_names() 
     let listed = kept_by_the_service(page);
     assert_eq!(listed.len(), 1, "{listed:?}");
     let reference = listed[0]["reference"].as_str().expect("a reference");
+    (elsewhere, reference.to_owned())
+}
+
+/// KR-REQ-17.14: a copy the service kept of a refused settings write that the person already chose
+/// to have dropped, while the service could not be reached, is asked about again when the person
+/// asks again, through the client the application was given, at the service the record names,
+/// after the setting names another: the fork's service drops it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn asking_again_for_a_kept_copy_to_go_asks_the_service_the_record_names() {
+    let forked = Forked::new().await;
+    let page = &forked.page;
+    let (elsewhere, reference) = with_a_copy_the_fork_kept(&forked).await;
     let settings = page.app.state::<AppState>().settings().expect("settings");
 
     // The fork's service cannot be reached: the choice is made, and nothing is dropped.
     forked.fork_service.web().fail(SYNC_PATH, 1, Moment::Before);
     assert!(
         !settings
-            .drop_sync_copy(reference)
+            .drop_sync_copy(&reference)
             .await
             .expect("the choice is recorded"),
         "the service has not said it dropped the copy"
@@ -1951,7 +1969,7 @@ async fn asking_again_for_a_kept_copy_to_go_asks_the_service_the_record_names() 
     // The person asks again. The choice was made before, so the service alone is asked.
     assert!(
         settings
-            .drop_sync_copy(reference)
+            .drop_sync_copy(&reference)
             .await
             .expect("the service is asked again"),
         "the service said it dropped the copy"
@@ -1960,6 +1978,104 @@ async fn asking_again_for_a_kept_copy_to_go_asks_the_service_the_record_names() 
         elsewhere.copies_kept().await,
         0,
         "the fork's service dropped the copy"
+    );
+    forked.only_the_fork_was_reached();
+}
+
+/// KR-REQ-17.14: the next step finishes a copy drop that could not be made, through the client the
+/// application was given, at the service the record names, after the setting names another, though
+/// the person asks for nothing again and has versions to choose between.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_step_finishes_a_copy_drop_the_service_could_not_be_reached_for_at_the_service_the_record_names()
+ {
+    let forked = Forked::new().await;
+    let page = &forked.page;
+    let (elsewhere, reference) = with_a_copy_the_fork_kept(&forked).await;
+    let settings = page.app.state::<AppState>().settings().expect("settings");
+
+    forked.fork_service.web().fail(SYNC_PATH, 1, Moment::Before);
+    assert!(
+        !settings
+            .drop_sync_copy(&reference)
+            .await
+            .expect("the choice is recorded"),
+        "the service has not said it dropped the copy"
+    );
+    assert_eq!(elsewhere.copies_kept().await, 1);
+
+    page.sync_now();
+    assert_eq!(
+        elsewhere.copies_kept().await,
+        0,
+        "the fork's service dropped the copy in the step"
+    );
+    assert_eq!(
+        page.view()["sync"]["conflicts"],
+        1,
+        "and the versions to choose between are still waiting"
+    );
+    forked.only_the_fork_was_reached();
+}
+
+/// KR-REQ-17.14: a settings write whose answer was lost is asked about, and settled, through the
+/// client the application was given, at the service the record names, after the setting names
+/// another: the write landed at the fork's service, and the next step finds that out there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settings_write_whose_answer_was_lost_is_settled_at_the_service_the_record_names() {
+    let forked = Forked::new().await;
+    let page = &forked.page;
+    let elsewhere = forked.elsewhere();
+    forked.fork_service.web().fail(SYNC_PATH, 1, Moment::After);
+    page.choose("light");
+    assert_eq!(
+        elsewhere.colour().await,
+        "light",
+        "the write landed at the fork's service"
+    );
+
+    let view = page.sync_now();
+    assert!(view["sync"]["problem"].is_null(), "{view}");
+    assert_eq!(view["sync"]["outstanding"], 0, "{view}");
+    forked.only_the_fork_was_reached();
+}
+
+/// KR-REQ-17.14: a draft publication whose answer was lost is asked about, and settled, through the
+/// client the application was given, at the service the record names, after the setting names
+/// another: the draft landed at the fork's service, and the next step finds that out there and
+/// keeps no copy of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_draft_whose_answer_was_lost_is_settled_at_the_service_the_record_names() {
+    let forked = Forked::new().await;
+    let (environment, studio) = host(1, "studio");
+    forked
+        .computer
+        .hosts
+        .say(environment, HostPrivacy::Off { generation: 1 });
+    let page = &forked.page;
+    let (draft, _) = page.write_draft(Some(&studio), "sent before the answer came back");
+    // The pass asks the collection once for the settings and then publishes the draft, so it is
+    // the second request.
+    forked.fork_service.web().fail(SYNC_PATH, 2, Moment::After);
+    page.drafts_on(true).expect("drafts sync is on");
+    let elsewhere = forked.elsewhere();
+    assert_eq!(
+        elsewhere.draft_at(draft).await,
+        Some(1),
+        "it landed at the fork's service"
+    );
+    assert!(
+        page.view()["sync"]["drafts"]["problem"].is_string(),
+        "the pass says it could not settle the publication: {}",
+        page.view()
+    );
+
+    let view = page.sync_now();
+    assert!(view["sync"]["drafts"]["problem"].is_null(), "{view}");
+    assert_eq!(
+        page.kept_drafts().len(),
+        1,
+        "and no copy of its own text was kept beside it: {:?}",
+        page.kept_drafts()
     );
     forked.only_the_fork_was_reached();
 }
