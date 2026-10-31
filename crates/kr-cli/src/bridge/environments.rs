@@ -209,20 +209,19 @@ fn resolve_container_target_through(
     let output = platform::run_bounded(runtime, &arguments, limit).map_err(|failure| {
         CliError::Usage(match failure {
             CallFailure::NotRun { error, .. } => shown!(
-                "{} could not be run to resolve the target to a container identifier ({}); pass \
-                 the identifier the runtime issued",
+                "{} could not be run to resolve the target to a container identifier ({})",
                 runtime,
                 Shown::io(&error)
             ),
             CallFailure::Deadline { .. } => shown!(
                 "{} container inspect, which resolves the target to a container identifier, did \
-                 not run to its end within {} seconds; pass the identifier the runtime issued",
+                 not run to its end within {} seconds",
                 runtime,
                 limit.as_secs()
             ),
             CallFailure::Unknown { error, .. } => shown!(
                 "{} container inspect, which resolves the target to a container identifier, \
-                 could not be waited for ({}); pass the identifier the runtime issued",
+                 could not be waited for ({})",
                 runtime,
                 Shown::io(&error)
             ),
@@ -524,8 +523,6 @@ mod tests {
         }
     }
 
-    /// A runtime that never answers ends the resolution of a target at its limit, and the refusal
-    /// names the call without repeating the target.
     /// A runtime that is not installed is refused as that, and not as a call that ran long.
     #[test]
     fn a_runtime_that_is_not_there_is_refused_as_not_run() {
@@ -541,6 +538,8 @@ mod tests {
         assert!(!said.contains("a-name-the-person-typed"), "{said}");
     }
 
+    /// A runtime that never answers ends the resolution of a target at its limit, and the refusal
+    /// names the call without repeating the target.
     #[cfg(unix)]
     #[test]
     fn a_runtime_that_never_answers_ends_the_resolution_of_a_target_and_the_refusal_names_the_call()
