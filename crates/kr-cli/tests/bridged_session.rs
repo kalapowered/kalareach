@@ -3204,7 +3204,12 @@ impl Runtime {
                 ],
                 self.slow,
             )
-            .unwrap_or_else(|why| panic!("{why}"));
+            .unwrap_or_else(|why| {
+                panic!(
+                    "{why}; a build that did not end may have left its working container, which \
+                     `{RUNTIME} ps --all --external` lists"
+                )
+            });
         assert!(
             built.status.success(),
             "the image that adds Git is built: {}",
@@ -3607,6 +3612,13 @@ fn a_removal_that_stalls_is_an_error_and_aborts_nothing_while_an_assertion_fails
         .remove()
         .expect_err("a removal that never ends is an error and not a panic");
     assert!(why.contains("\"rm\""), "the call is named: {why}");
+    assert!(
+        recorded_calls(directory.path())
+            .iter()
+            .any(|call| call.starts_with("rm ")
+                && call.ends_with(&format!(" -- {STAND_IN_CONTAINER_ID}"))),
+        "a container the runtime issued an identifier for is removed by it"
+    );
 
     let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         let _held = container;
@@ -3845,6 +3857,10 @@ fn an_image_build_that_never_ends_fails_the_case_and_names_the_build() {
         "the call and the bound it was given are named: {said}"
     );
     assert!(
+        said.contains("working container"),
+        "what a build that did not end may leave is named: {said}"
+    );
+    assert!(
         recorded_calls(directory.path())
             .iter()
             .any(|call| call.starts_with("build ")),
@@ -3920,6 +3936,28 @@ fn a_call_that_waits_for_the_turn_to_start_a_process_is_bounded_from_the_call() 
     holder.join().expect("the holder ended");
     let why = refused.expect_err("a call that could not start within its bound fails");
     assert!(why.contains("could not be started within"), "{why}");
+}
+
+/// A call that does not end within its bound is asked to end before it is killed, so that a
+/// program that cleans up after itself, as an image build does, is given the chance: a program that
+/// is killed outright leaves what it started.
+#[test]
+fn a_call_that_does_not_end_is_asked_to_end_before_it_is_killed() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let marker = directory.path().join("asked-to-end");
+    let mut command = std::process::Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg("trap ': > \"$1\"; kill $!; exit 0' TERM; sleep 30 & wait")
+        .arg("program")
+        .arg(&marker);
+    let why = user_manager::bounded(command, Duration::from_secs(1))
+        .expect_err("a call that outlasts its bound fails");
+    assert!(why.contains("did not end within"), "{why}");
+    assert!(
+        marker.exists(),
+        "the program was killed without being asked to end"
+    );
 }
 
 /// A run of `kr` that does not end within its bound fails the case that ran it, with the call
