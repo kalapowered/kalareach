@@ -15,9 +15,11 @@
  * The figure is a recording. Section 27 gives this target no number, and a bound on elapsed time
  * would judge the machine the run happens on as much as the interface, so the case asserts only
  * conditions: every key reached the composer in order and was timed, and the stream advanced on
- * the screen while the keys were typed. The only time limits are Playwright's: 90 seconds for the
- * case, which is raised from the default of 30 because a slower engine on a hosted runner draws
- * 4,000 nodes slowly, and the default 5 seconds for each `expect`. The readings are the
+ * the screen between the first key's event and the last key's timing. The only time limits are
+ * Playwright's: 90 seconds for the case, which is raised from the default of 30 because a slower
+ * engine on a hosted runner draws 4,000 nodes slowly, 60 seconds for the wait for that draw, which
+ * the case's limit does not reach by itself, and the default 5 seconds for each other `expect`.
+ * The readings are the
  * median of the keys in frame periods of the page's own idle frames and against the same keys with
  * a short history and nothing streaming; each is printed with the engine, the host it was taken on
  * and a verdict against the reference bounds below, and attached to the run. The verdict is for a
@@ -50,10 +52,25 @@ const PAUSE_MS = 40
 const REFERENCE_PERIODS = 4
 const REFERENCE_GROWTH = 3
 
+/** How long the 4,000-node history is given to reach the conversation's window. */
+const DRAW_MS = 60_000
+
 declare global {
   interface Window {
-    /** What the page has measured of its keys, and the stream it is running. */
-    krKeys?: { samples: number[]; names: string[]; pending: number; stop: () => void; drawn: () => number }
+    /**
+     * What the page has measured of its keys, and the stream it is running: where the stream had
+     * been drawn at the first key's event and at the moment the last key's timing was taken,
+     * each read in the page at that moment.
+     */
+    krKeys?: {
+      samples: number[]
+      names: string[]
+      pending: number
+      stop: () => void
+      drawn: () => number
+      drawnAtFirstKey: number
+      drawnAtLastTiming: number
+    }
   }
 }
 
@@ -113,7 +130,15 @@ async function framePeriod(page: Page): Promise<number> {
  */
 async function startTiming(page: Page): Promise<void> {
   await page.evaluate(() => {
-    const keys = { samples: [] as number[], names: [] as string[], pending: 0, stop: () => undefined, drawn: () => 0 }
+    const keys = {
+      samples: [] as number[],
+      names: [] as string[],
+      pending: 0,
+      stop: () => undefined,
+      drawn: () => 0,
+      drawnAtFirstKey: -1,
+      drawnAtLastTiming: -1
+    }
     window.krKeys = keys
     document.addEventListener(
       'keydown',
@@ -125,8 +150,14 @@ async function startTiming(page: Page): Promise<void> {
           requestAnimationFrame(() => {
             keys.samples.push(performance.now() - began)
             keys.pending -= 1
+            // Read after the key's own time is taken, and only when no key is waiting to be
+            // timed, so the last key's callback leaves the position at the moment it was timed.
+            if (keys.pending === 0) keys.drawnAtLastTiming = keys.drawn()
           })
         )
+        // The first key of a run, read after its frames are asked for, so the key's own time is
+        // not delayed by it.
+        if (keys.names.length === 1) keys.drawnAtFirstKey = keys.drawn()
       },
       true
     )
@@ -135,8 +166,9 @@ async function startTiming(page: Page): Promise<void> {
 
 /**
  * Types the keys and returns the time of each, once the last has been timed, with how far the
- * stream had been drawn when the first key went in, after the composer was emptied, and when the
- * last key's timing was read, in the same call as the times.
+ * stream had been drawn at the first key's event and at the moment the last key's timing was
+ * taken. Both positions are read in the page at those moments, so the stream cannot have moved
+ * between a timing and the reading of the position that goes with it.
  */
 async function typeKeys(page: Page): Promise<{ times: number[]; drawnBefore: number; drawnAfter: number }> {
   const composer = page.getByTestId('composer-input')
@@ -149,16 +181,18 @@ async function typeKeys(page: Page): Promise<{ times: number[]; drawnBefore: num
     if (window.krKeys) {
       window.krKeys.samples.length = 0
       window.krKeys.names.length = 0
+      window.krKeys.drawnAtFirstKey = -1
+      window.krKeys.drawnAtLastTiming = -1
     }
   })
-  const drawnBefore = await page.evaluate(() => window.krKeys?.drawn() ?? -1)
   await page.keyboard.type(KEYS, { delay: PAUSE_MS })
   await page.waitForFunction(() => window.krKeys?.pending === 0 && (window.krKeys?.samples.length ?? 0) > 0)
   const read = await page.evaluate(() => ({
     times: [...(window.krKeys?.samples ?? [])],
-    drawnAfter: window.krKeys?.drawn() ?? -1
+    drawnBefore: window.krKeys?.drawnAtFirstKey ?? -1,
+    drawnAfter: window.krKeys?.drawnAtLastTiming ?? -1
   }))
-  return { times: read.times, drawnBefore, drawnAfter: read.drawnAfter }
+  return { times: read.times, drawnBefore: read.drawnBefore, drawnAfter: read.drawnAfter }
 }
 
 test.describe('KR-PERF-008: input stays responsive while output streams over a large history', () => {
@@ -185,9 +219,11 @@ test.describe('KR-PERF-008: input stays responsive while output streams over a l
         } as never)
       }
     }, HISTORY)
+    // Drawing 4,000 nodes can take a slow engine well past an `expect`'s default 5 seconds, and the
+    // case's own limit does not reach this wait.
     await expect(
       page.getByTestId('conversation-scroll').locator(`[data-node-id="history-${HISTORY - 1}"]`)
-    ).toBeAttached()
+    ).toBeAttached({ timeout: DRAW_MS })
 
     // The stream: a fixed number of nodes in every animation frame, until it is stopped.
     await page.evaluate((perFrame) => {
@@ -262,9 +298,10 @@ test.describe('KR-PERF-008: input stays responsive while output streams over a l
     )
 
     // Every key reached the composer, in order, and the stream advanced on the screen between the
-    // moment the first key went in and the moment the last key's timing was read: a run where the keys finished before any of the stream
-    // reached the screen would report the same figures and mean something else. The readings above
-    // are recorded, and read by a person on a reference host.
+    // first key's event and the moment the last key's timing was taken, both positions read in the
+    // page at those moments: a run where the keys finished before any of the stream reached the
+    // screen would report the same figures and mean something else. The readings above are
+    // recorded, and read by a person on a reference host.
     expect(typed).toBe(KEYS)
     expect(await page.evaluate(() => window.krKeys?.names.join('') ?? '')).toBe(KEYS)
     expect(streamed).toHaveLength(KEYS.length)
