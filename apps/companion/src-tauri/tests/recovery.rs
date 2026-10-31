@@ -1838,7 +1838,7 @@ async fn signed_in_at(computer: &Computer, service: &Served, setting: &str) -> P
     page
 }
 
-/// Whether `words` name both services: the one a record is kept at and the one the account is
+/// Whether `words` name both services: the one a record names and the one the account is
 /// signed in to.
 fn names_both(words: &str, record: &str, account: &str) -> bool {
     words.contains(record) && words.contains(account)
@@ -1983,13 +1983,14 @@ async fn a_record_is_not_used_at_the_service_the_account_signed_in_to_in_its_pla
 
 /// KR-REQ-17.14: a record is used at the service it names and at no other, whatever the sync
 /// service setting names. With the record at one service and the account signed in at another, the
-/// setting naming the record's service or a third service changes nothing: going on with a record
-/// that is made and not kept, settling a write, covering the host, listing the archives and making
-/// the offline copy are each refused with the record's service and the account's named, the page is
-/// shown what is wrong, and nothing is sent to any of the three services, whether or not a write is
-/// waiting to be settled. The refusal does not say that the setting names the record's service, and
-/// does not tell the person to choose the account's service as the sync service, which cannot move
-/// a record.
+/// setting naming the record's service, the account's or a third service changes nothing: settling
+/// a write that has no answer, going on with a record that is made and not kept, and then, with
+/// the record kept, settling, covering the host (replacing it too), listing the archives and making
+/// the offline copy (of the bundle and of an archive) are each refused with the record's service
+/// and the account's named and the sign-in the person needs, the page is shown what is wrong, and
+/// nothing is sent to any of the three services. The refusal does not say that the setting names
+/// the record's service, and does not tell the person to choose the account's service as the sync
+/// service, which cannot move a record.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_record_is_refused_to_an_account_signed_in_elsewhere_whatever_the_setting_names() {
     let computer = Computer::new().await;
@@ -2003,6 +2004,7 @@ async fn a_record_is_refused_to_an_account_signed_in_elsewhere_whatever_the_sett
         json!({ "reason": "wrong_service", "sync_service": ours, "account": theirs });
     let settings = [
         computer.served.origin().to_owned(),
+        signed_in.origin().to_owned(),
         third.origin().to_owned(),
     ];
     let nothing_sent = |at_the_record: usize, setting: &str| {
@@ -2023,6 +2025,10 @@ async fn a_record_is_refused_to_an_account_signed_in_elsewhere_whatever_the_sett
     };
     let says_where = |words: &str| {
         assert!(names_both(words, &ours, &theirs), "{words}");
+        assert!(
+            words.contains(&format!("until this device is signed in to {ours}")),
+            "the refusal says where the person has to be signed in: {words}"
+        );
         assert!(
             !words.contains("setting names") && !words.contains(&format!("Choose {theirs}")),
             "the refusal does not say the setting names the record's service, or ask for another \
@@ -2230,6 +2236,26 @@ async fn a_record_is_read_and_covered_at_its_own_service_when_the_setting_names_
         export.service_origin,
         computer.served.origin(),
         "and it names that service, as a restore reads it"
+    );
+
+    // An archive the bundle does not name is asked about at the same service, and writes nothing.
+    let before = computer.served.web().arrived().len();
+    let unlisted = out.path().join("unlisted.krexport");
+    page.dialog_returns(&unlisted);
+    let refused = page
+        .call(
+            "recovery_export_offline",
+            json!({
+                "path": unlisted.to_string_lossy(),
+                "archive": "00000000-0000-4000-8000-000000000099"
+            }),
+        )
+        .expect_err("the bundle names no such archive");
+    assert_eq!(refused["code"], "PERMISSION_DENIED");
+    assert!(!unlisted.exists());
+    assert!(
+        computer.served.web().arrived().len() > before,
+        "the bundle was read at the service the record names"
     );
 
     let host = Host::new(&computer, computer.served.origin());
@@ -2539,8 +2565,8 @@ async fn a_replacement_cover_goes_through_the_clients_at_the_records_service_whe
 /// a record made and not kept, and a bundle at its locator that this computer's seed opens, put at
 /// the fork's service by an earlier run, the write is turned back as a conflict and the bundle is
 /// read there, with the record's origin asked for and the account presenting. Nothing is written
-/// over the bundle, and the service the record names and the one the setting names are sent
-/// nothing.
+/// over the bundle, the service the record names and the one the setting names are sent nothing,
+/// and the adopted bundle is noted as no account's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turning_recovery_on_adopts_an_earlier_write_at_the_records_service_when_the_setting_names_another()
  {
@@ -2613,6 +2639,20 @@ async fn turning_recovery_on_adopts_an_earlier_write_at_the_records_service_when
         setting.web().arrived().is_empty(),
         "the service the setting names was sent nothing"
     );
+
+    // An adopted bundle has no owner anyone knows: deleting the account that is signed in at the
+    // record's service does not clear the record.
+    let at_record = page
+        .account
+        .tokens()
+        .signed_in_mark(&ours)
+        .expect("the grant is read")
+        .expect("an account is signed in");
+    page.recovery
+        .account_deleted(at_record)
+        .await
+        .expect("nothing to clear");
+    assert_eq!(page.view()["state"], "on");
 }
 
 /// Recovery writes the account's backup storage, so a sign-in that is missing or does not carry
