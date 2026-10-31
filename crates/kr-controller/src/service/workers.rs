@@ -223,6 +223,9 @@ impl Controller {
             .lock()
             .await
             .insert(worker.clone(), described);
+        // A worker that has joined the directory is owed what the host's local owner may do, and
+        // the publisher, which waits for long once every worker has it, is told so.
+        self.local_access.wake();
         // Still in the section: a closure's tidying stops what these start, and it begins only once
         // the registry is let go, so none of it can be begun after it has been stopped.
         self.attention.watch(self.attention_reach(), worker.clone());

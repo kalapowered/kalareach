@@ -327,6 +327,9 @@ async fn a_statement_a_worker_did_not_acknowledge_is_sent_again_by_the_publisher
         fails_the_first_statement: true,
     })
     .await;
+    // The world lists its worker in the directory directly. Making a worker known tells the
+    // publisher that one has joined, which is all this does.
+    silent.controller.local_access.wake();
     // The first statement ends its link without an answer; the publisher sends the same statement
     // again on a link of its own, with nobody asking it to.
     until("the worker is sent the statement a second time", || {
@@ -385,6 +388,67 @@ async fn the_host_counts_the_workers_it_cannot_tell_and_not_those_it_has_told() 
     .await;
     assert_eq!(lacking(&silent).await, vec![claim.session_id]);
     silent.serving.abort();
+}
+
+/// KR-PERF-003: the publisher looks at the workers every few seconds only while one of them is owed
+/// the statement in force, and settles to a long wait once each has acknowledged it. A worker the
+/// daemon has not reached is owed it, a worker that acknowledged it is not, and the statement
+/// changing owes it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_perf_003_a_worker_is_owed_the_statement_until_it_has_acknowledged_the_one_in_force() {
+    let (silent, _recorded) = with_the_worker_not_told(Behaviour {
+        fails_the_first_statement: false,
+    })
+    .await;
+    let controller = &silent.controller;
+
+    // Reached, and known to state the capability, but not yet told the statement in force.
+    controller
+        .local_access
+        .note_worker(silent.session_id, true, None);
+    assert!(
+        controller.workers_owed_the_statement().await,
+        "a worker that has acknowledged nothing is owed the statement"
+    );
+
+    // Told it: nothing is owed, so the publisher has nothing to repeat.
+    controller.tell_workers().await;
+    assert!(
+        !controller.workers_owed_the_statement().await,
+        "a worker that acknowledged the statement in force is owed nothing"
+    );
+
+    // A worker whose level cannot read the statement is owed nothing either.
+    controller
+        .local_access
+        .note_worker(silent.session_id, false, None);
+    assert!(!controller.workers_owed_the_statement().await);
+
+    // And a worker the daemon has not reached is owed it.
+    controller.local_access.forget_worker(silent.session_id);
+    assert!(controller.workers_owed_the_statement().await);
+    silent.serving.abort();
+}
+
+/// KR-PERF-003: the publisher waits for minutes once every worker has the statement in force, so a
+/// worker that joins the directory is what wakes it: one that could not be told as it was made
+/// known is then told by the publisher in seconds and not when the long wait ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_perf_003_a_worker_made_known_wakes_the_publisher() {
+    use super::a_link_that_is_not_given_back::Served;
+
+    let world = Served::recorded().await;
+    world.forget_the_worker().await;
+    let before = world.controller.local_access.wakes();
+    world
+        .controller
+        .publish_worker(world.worker.clone(), None, &world.held().await)
+        .await
+        .expect("the worker is made known");
+    assert!(
+        world.controller.local_access.wakes() > before,
+        "making a worker known tells the publisher that the directory has a worker in it"
+    );
 }
 
 /// KR-REQ-17.54: a claim the daemon recovers is recorded before the worker is told anything, and
