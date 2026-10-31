@@ -589,9 +589,9 @@ async fn each_family_is_refused_what_the_daemon_does_not_have() {
 }
 
 /// KR-REQ-07.47: a host that cannot run Git says so under `HOST_NOT_CONFIGURED` with a sentence that
-/// says what a person does, and a command that runs Git shows that sentence and not the line the
-/// code carries elsewhere, "Change a setting on this device or on the host.", which no setting
-/// answers. A command that does not run Git keeps the line.
+/// says what a person does, and each of the nine commands that run Git shows that sentence and not
+/// the line the code carries elsewhere, "Change a setting on this device or on the host.", which no
+/// setting answers. A command that does not run Git keeps the line.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_that_cannot_run_git_is_said_in_its_own_words_and_not_asked_for_a_setting() {
     const CHANGE_A_SETTING: &str = "Change a setting on this device or on the host.";
@@ -605,10 +605,22 @@ async fn a_host_that_cannot_run_git_is_said_in_its_own_words_and_not_asked_for_a
         always(Err(ProtocolError::new(ErrorCode::HostNotConfigured, SAID))),
     );
 
+    let nowhere = nowhere.as_str();
     for line in [
-        vec!["project", "init", &nowhere],
+        vec!["project", "init", nowhere],
+        vec![
+            "project",
+            "clone",
+            "https://example.invalid/work.git",
+            nowhere,
+        ],
+        vec!["project", "adopt", nowhere],
+        vec!["workspace", "create", NOBODY, "--kind", "shared"],
         vec!["workspace", "remove", NOBODY],
+        vec!["changeset", "capture", NOBODY, "--label", "the work"],
         vec!["diff", "read", "--workspace", NOBODY],
+        vec!["diff", "apply", NOBODY, "1", "--to", "proposal"],
+        vec!["diff", "revert", NOBODY, "1", "--to", "proposal"],
     ] {
         let output = run_kr(&temp, &line);
         assert_eq!(output.status.code(), Some(8), "kr {}", line.join(" "));
@@ -634,6 +646,31 @@ async fn a_host_that_cannot_run_git_is_said_in_its_own_words_and_not_asked_for_a
     let said = String::from_utf8_lossy(&output.stderr).into_owned()
         + &String::from_utf8_lossy(&output.stdout);
     assert!(said.contains(CHANGE_A_SETTING), "{said}");
+    serving.abort();
+}
+
+/// KR-REQ-07.47: a command that runs Git is told what its code calls for when the refusal is not
+/// that of a host that cannot run Git: a look for Git that ran out of its time is a fault that
+/// passes, so a person is told to wait, and not left with the host's sentence alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fault_that_passes_in_a_command_that_runs_git_is_still_told_to_wait() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let nowhere = temp.root().join("nowhere").display().to_string();
+    let (_asked, serving) = scripted_daemon(
+        &temp,
+        always(Err(ProtocolError::new(
+            ErrorCode::UpstreamUnavailable,
+            "Git did not answer in time and was stopped",
+        ))),
+    );
+
+    let output = run_kr(&temp, &["project", "init", &nowhere]);
+
+    assert_eq!(output.status.code(), Some(8));
+    let said = String::from_utf8_lossy(&output.stderr).into_owned()
+        + &String::from_utf8_lossy(&output.stdout);
+    assert!(said.contains("Git did not answer in time"), "{said}");
+    assert!(said.contains("Wait a moment and try again."), "{said}");
     serving.abort();
 }
 
