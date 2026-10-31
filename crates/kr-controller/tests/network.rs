@@ -126,13 +126,16 @@ const THIRD_MARKER_COMMAND: &str = "printf 'kala%s-lastly\n' reach\n";
 
 /// The last word a session writes, and the command that writes it.
 ///
-/// Nothing follows it, not even a newline, and the shell these cases start has no prompt, so a
-/// device that has read the word has read everything the session produced and the subscription is
-/// quiet from then on: no frame is on its way to the device.
+/// Nothing follows it. The word has no newline, and the command ends by replacing the shell with
+/// `cat`, which writes nothing until it is given input. A shell that is still there may print
+/// something between two commands even when it has no prompt (a switch of the terminal's mode, for
+/// one), and that would be a later frame for a device that had read the word. With the shell gone
+/// there is none, so a device that has read the word has read everything the session produced and
+/// the subscription is quiet from then on.
 const SETTLED: &str = "kalareach-settled";
 
 /// The command that produces it.
-const SETTLED_COMMAND: &str = "printf 'kala%s-settled' reach\n";
+const SETTLED_COMMAND: &str = "printf 'kala%s-settled' reach; exec cat\n";
 
 /// Output the session writes before a device is paired, and what is typed to write it. Its marker
 /// never appears in the command's own echo.
@@ -1578,8 +1581,8 @@ async fn a_revoked_device_is_fenced_before_it_is_served_again() {
     let attached = attach(&session, host.environment_id, session_id).await;
 
     // The subscription is running and quiet: the device types a command whose output ends with a
-    // word of its own, and reads up to it. The shell has no prompt, so the word is the last thing
-    // the session writes, and no frame is waiting for the relay when the revocation lands.
+    // word of its own and leaves no shell to write after it, and reads up to the word. Nothing is
+    // on its way to the device, so no frame waits for the relay when the revocation lands.
     let seen = type_and_wait_for(
         &session,
         host.environment_id,
@@ -1591,7 +1594,7 @@ async fn a_revoked_device_is_fenced_before_it_is_served_again() {
     .await;
     assert!(
         seen.ends_with(SETTLED),
-        "the session wrote nothing after the word the device waited for: {seen:?}"
+        "the word the device waited for was not the last thing it read: {seen:?}"
     );
 
     // The device is revoked while its connection is authorised and its subscription is running,
