@@ -6969,7 +6969,8 @@ async fn a_suite_that_outlives_its_wait_is_stopped_and_records_no_result() {
     let running = run_from_another_task(&host, &document, "evt-tests");
     // The suite has started once its session has a root process and has not closed: a session is
     // listed from its reservation, before its worker has claimed it, and a node asked to stop then
-    // makes none.
+    // makes none. The harness allows a worker's launch as long as `MANAGER_HUNG_AFTER`, and the
+    // worker then reports itself.
     let started = std::time::Instant::now();
     loop {
         let sessions = all_sessions(&mut control).await;
@@ -6980,9 +6981,9 @@ async fn a_suite_that_outlives_its_wait_is_stopped_and_records_no_result() {
             break;
         }
         assert!(
-            started.elapsed() < LIVENESS,
+            started.elapsed() < MANAGER_HUNG_AFTER + LIVENESS,
             "waited {} s for the suite's session to start: {sessions:?}",
-            LIVENESS.as_secs()
+            (MANAGER_HUNG_AFTER + LIVENESS).as_secs()
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
