@@ -2479,6 +2479,9 @@ fn a_job_refused_for_its_size_leaves_the_process_and_counts_no_failure() {
 
 /// A resource pause while a job is in the process cancels it, keeps its place in the queue and
 /// ends the process; when the pause clears the job is described. Thermal pressure is the pause.
+///
+/// The process holds the job until the case has seen the pause end the process, so the job cannot
+/// be answered before the daemon has heard of the pause. The next process is not held.
 #[test]
 fn a_pause_while_a_job_runs_cancels_it_and_keeps_its_place() {
     let hot = HostConditions::measured(
@@ -2488,7 +2491,7 @@ fn a_pause_while_a_job_runs_cancels_it_and_keeps_its_place() {
         ThermalState::Critical,
     );
     let mut rig = Rig::new(&Script {
-        generate_ms: 3_000,
+        generate_until_released: true,
         ..Script::default()
     });
     queue(rig.service(), &session(1), Priority::Ordinary, at(0));
@@ -2498,6 +2501,7 @@ fn a_pause_while_a_job_runs_cancels_it_and_keeps_its_place() {
             .iter()
             .any(|report| matches!(report, Report::Unloaded { .. }))
     });
+    release_held_work(&rig.placed.directory("runtime"));
     assert!(
         outcomes(&reports).contains(&&Outcome::Requeued {
             session_id: session(1)
