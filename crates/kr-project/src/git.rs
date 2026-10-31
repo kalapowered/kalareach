@@ -3782,7 +3782,7 @@ fn ask(
                 // nothing else on this machine can be in it: whatever it left running is ended
                 // before the number can be given to anything else.
                 end_group(&child);
-                match child.wait() {
+                match collect(&mut child) {
                     Ok(status) => break status,
                     Err(error) => {
                         return Err(Asked::Overran(passing(format!(
@@ -3935,6 +3935,12 @@ impl Heard {
             let Some(pipe) = self.pipe.as_mut() else {
                 return;
             };
+            #[cfg(test)]
+            if tests::READ_FAILS.with(std::cell::Cell::get) {
+                self.pipe = None;
+                self.unreadable = Some(std::io::Error::from(rustix::io::Errno::IO));
+                return;
+            }
             match gather(pipe, &mut self.seen, deadline) {
                 Gathered::Open => {}
                 Gathered::Closed => self.pipe = None,
@@ -4124,6 +4130,17 @@ fn has_ended(child: &mut std::process::Child) -> Ended {
         Ok(None) => Ended::No,
         Err(error) => Ended::Failed(error),
     }
+}
+
+/// Collects a child that has ended and was left uncollected.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn collect(child: &mut std::process::Child) -> std::io::Result<std::process::ExitStatus> {
+    let collected = child.wait();
+    #[cfg(test)]
+    if tests::COLLECT_FAILS.with(std::cell::Cell::get) {
+        return Err(std::io::Error::from(rustix::io::Errno::CHILD));
+    }
+    collected
 }
 
 /// Ends the group the child led, which is every process it started that stayed in it.
@@ -5215,6 +5232,13 @@ mod tests {
         pub(super) static WAIT_FAILS_PAST_THE_LIMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Set on a thread when a probe's output has passed the limit.
         pub(super) static PASSED_THE_LIMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Set by a case to make the collection of a child that has ended fail on its own thread,
+        /// as it does for a child that something else in the process has collected.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        pub(super) static COLLECT_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Set by a case to make the read of a probe's output fail on its own thread, as it does
+        /// for a pipe the system can no longer read.
+        pub(super) static READ_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     /// A pipe whose writers are faster than its reader: whenever it is asked, it has something to
@@ -5688,6 +5712,63 @@ mod tests {
         };
         assert!(
             matches!(refusal, ProjectError::GitUnavailable { .. }),
+            "{refusal:?}"
+        );
+    }
+
+    /// A program that ended and cannot be collected is the host's fault, and passes: nothing is
+    /// known of the program but that it ended. The group it led is ended first, as it is for one
+    /// that is collected.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_child_that_cannot_be_collected_is_a_fault_that_passes() {
+        let directory = tempfile::tempdir().expect("a directory for this test");
+        let search = directory.path().join("search");
+        std::fs::create_dir(&search).expect("a search path of this test's own");
+        place_stand_in(&search, "echo 'git version 2.50.1'");
+
+        COLLECT_FAILS.with(|fails| fails.set(true));
+        let asked = ask(
+            &search.join("git"),
+            &["--version"],
+            Instant::now() + Duration::from_secs(60),
+        );
+        COLLECT_FAILS.with(|fails| fails.set(false));
+
+        let Err(Asked::Overran(refusal)) = asked else {
+            panic!("a child that cannot be collected is refused");
+        };
+        assert!(
+            refusal.to_string().contains("could not be collected")
+                && matches!(refusal, ProjectError::GitFailed { .. }),
+            "{refusal:?}"
+        );
+    }
+
+    /// Output that cannot be read is the host's fault, and passes, however the program that wrote
+    /// it ended: nothing is known of what it would have said.
+    #[cfg(unix)]
+    #[test]
+    fn output_that_cannot_be_read_is_a_fault_that_passes() {
+        let directory = tempfile::tempdir().expect("a directory for this test");
+        let search = directory.path().join("search");
+        std::fs::create_dir(&search).expect("a search path of this test's own");
+        place_stand_in(&search, "echo 'git version 2.50.1'");
+
+        READ_FAILS.with(|fails| fails.set(true));
+        let asked = ask(
+            &search.join("git"),
+            &["--version"],
+            Instant::now() + Duration::from_secs(60),
+        );
+        READ_FAILS.with(|fails| fails.set(false));
+
+        let Err(Asked::Overran(refusal)) = asked else {
+            panic!("output that cannot be read is refused");
+        };
+        assert!(
+            refusal.to_string().contains("could not read")
+                && matches!(refusal, ProjectError::GitFailed { .. }),
             "{refusal:?}"
         );
     }
