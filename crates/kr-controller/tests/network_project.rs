@@ -391,7 +391,7 @@ async fn every_project_method_a_device_may_reach_answers_it_and_the_owner_alike(
     for workspace in &mut owner_read.workspaces {
         withhold_the_place(&mut workspace.display_path);
     }
-    for operation in &mut owner_read.operation.0 {
+    if let Some(operation) = owner_read.operation.0.as_mut() {
         withhold_the_source(&mut operation.remote);
         operation
             .retained_staging_paths
@@ -4007,10 +4007,10 @@ fn withhold_the_place(place: &mut String) {
 
 /// The repository a clone was made from, when it is a place on the host, as a device is given it.
 fn withhold_the_source(remote: &mut Nullable<RemoteSpecification>) {
-    for remote in &mut remote.0 {
-        if remote.transport == RemoteTransport::LocalPath {
-            withhold_the_place(&mut remote.url);
-        }
+    if let Some(remote) = remote.0.as_mut()
+        && remote.transport == RemoteTransport::LocalPath
+    {
+        withhold_the_place(&mut remote.url);
     }
 }
 
