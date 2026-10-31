@@ -341,6 +341,8 @@ const VK_CAPITAL: u16 = 0x14;
 /// input method committed. Every such character has it, so the code says nothing of which key came
 /// up.
 const VK_PACKET: u16 = 0xe7;
+const VK_LWIN: u16 = 0x5b;
+const VK_RWIN: u16 = 0x5c;
 const VK_NUMLOCK: u16 = 0x90;
 const VK_SCROLL: u16 = 0x91;
 
@@ -446,7 +448,14 @@ fn presses(keys: &[kr_term::win32::KeyRecord]) -> bool {
         key.key_down
             && !matches!(
                 key.virtual_key,
-                VK_SHIFT | VK_CONTROL | VK_MENU | VK_CAPITAL | VK_NUMLOCK | VK_SCROLL
+                VK_SHIFT
+                    | VK_CONTROL
+                    | VK_MENU
+                    | VK_LWIN
+                    | VK_RWIN
+                    | VK_CAPITAL
+                    | VK_NUMLOCK
+                    | VK_SCROLL
             )
     })
 }
@@ -1373,6 +1382,7 @@ where
     // What the attachment has to say about its keys, which waits for the terminal to be the
     // person's again like everything else it says.
     let mut said_after: Vec<Shown> = Vec::new();
+    let mut fallback = Fallback::default();
     let outcome = drive(
         &mut client,
         &attaching,
@@ -1392,12 +1402,14 @@ where
         &mut display,
         options.follow_live,
         &switch,
-        &mut said_after,
+        &mut fallback,
     )
     .await;
     // The reader stops before anything else reads this terminal: a command that goes on after the
     // attachment must be the only reader of it.
     input_stop.stop();
+    // What it had read and the loop had not taken is dropped, and a typed key in it was lost.
+    said_after.extend(fallback.finish(&mut input));
 
     // The terminal comes back here on every path out of the loop, and the guard is released only
     // once it has.
@@ -1503,6 +1515,23 @@ enum Spelling {
 }
 
 impl Fallback {
+    /// Counts the records left in `input`, which are dropped, and returns what the attachment says
+    /// after the terminal is the person's again, if it changed how it sends keys.
+    ///
+    /// The reader must have stopped, so that nothing it read is still on its way.
+    fn finish(
+        &mut self,
+        input: &mut tokio::sync::mpsc::UnboundedReceiver<TerminalInput>,
+    ) -> Option<Shown> {
+        self.how?;
+        while let Ok(read) = input.try_recv() {
+            if let TerminalInput::Keys(keys) = read {
+                self.typed_keys_lost |= presses(&keys);
+            }
+        }
+        self.line()
+    }
+
     /// What the attachment says after the terminal is the person's again, if it changed how it
     /// sends keys.
     fn line(&self) -> Option<Shown> {
@@ -1618,64 +1647,15 @@ fn resizes_in_flight(
         .collect()
 }
 
-/// Runs the attachment's input, output and connection in one loop, and says afterwards how it went
-/// on if the session refused its console keys.
+/// Runs the attachment's input, output and connection in one loop.
+///
+/// `fallback` is what the loop learns of a refusal of its console keys; the caller says it once the
+/// terminal is the person's again, after the reader has stopped.
 #[expect(
     clippy::too_many_arguments,
     reason = "one attachment is its client, its session, its terminal and everything it started with"
 )]
 async fn drive(
-    client: &mut impl Link,
-    attaching: &Attaching,
-    owed: &mut UndeliveredTyping,
-    typed_during_the_probe: Vec<u8>,
-    attached: Attached,
-    input: &mut tokio::sync::mpsc::UnboundedReceiver<TerminalInput>,
-    output: &Arc<std::fs::File>,
-    terminal: &ControllingTerminal,
-    resized: Option<&mut WindowChanges>,
-    display: &mut crate::render::ProjectedDisplay,
-    follow_live: bool,
-    switch: &crate::attach::InputSwitch,
-    said_after: &mut Vec<Shown>,
-) -> AttachOutcome {
-    // What it cost is known only when the loop has ended: records are still being dropped until then.
-    let mut fallback = Fallback::default();
-    let outcome = drive_loop(
-        client,
-        attaching,
-        owed,
-        typed_during_the_probe,
-        attached,
-        &mut *input,
-        output,
-        terminal,
-        resized,
-        display,
-        follow_live,
-        switch,
-        &mut fallback,
-    )
-    .await;
-    // The records the reader had read and the loop had not taken when it ended are dropped with the
-    // rest, and a typed one is part of what was lost.
-    if fallback.how.is_some() {
-        while let Ok(read) = input.try_recv() {
-            if let TerminalInput::Keys(keys) = read {
-                fallback.typed_keys_lost |= presses(&keys);
-            }
-        }
-    }
-    said_after.extend(fallback.line());
-    outcome
-}
-
-/// The loop of [`drive`].
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one attachment is its client, its session, its terminal and everything it started with"
-)]
-async fn drive_loop(
     client: &mut impl Link,
     attaching: &Attaching,
     owed: &mut UndeliveredTyping,
@@ -2183,6 +2163,7 @@ async fn drive_loop(
                                     } else {
                                         // A console that will not spell its keys cannot be typed
                                         // at: the lease is handed back and the attachment watches.
+                                        fallback.how = Some(Spelling::Watching);
                                         if let Some(held) = epoch.take() {
                                             let request_id =
                                                 kr_protocol::ids::RequestId::new(next_request);
@@ -2205,7 +2186,6 @@ async fn drive_loop(
                                             }
                                             outstanding.insert(request_id, Outstanding::Ignored);
                                         }
-                                        fallback.how = Some(Spelling::Watching);
                                     }
                                 }
                                 // A refusal the session made whole: it took none of what was
@@ -3060,7 +3040,7 @@ mod tests {
                     )))
                 }
             });
-            let mut said_after = Vec::new();
+            let mut fallback = super::super::Fallback::default();
             // Held until the loop has ended: a wire the case let go of reads as a connection lost,
             // and the loop looks at the worker's side first.
             let keep_open = answers.clone();
@@ -3084,7 +3064,7 @@ mod tests {
                     &mut display,
                     false,
                     &switch,
-                    &mut said_after,
+                    &mut fallback,
                 ),
                 case
             );
@@ -3092,7 +3072,7 @@ mod tests {
             let sent = log.lock().expect("the log is not poisoned").clone();
             Ran {
                 outcome,
-                said: said_after,
+                said: fallback.finish(&mut input).into_iter().collect(),
                 sent,
             }
         }
@@ -3500,6 +3480,34 @@ mod tests {
                 "only the modifier was written: the record already read is not sent"
             );
 
+            // A modifier read since is no more typing than the one that was refused, whether the
+            // loop took it or it was left in the channel when the session closed.
+            let ran = after_a_refusal(console_will_spell, |mut case| async move {
+                let shift = case.types(shift_down()).await;
+                case.types_without_waiting(shift_down());
+                case.refuses(&shift, ErrorCode::InputIncompatible);
+                case.waits_for_the_console_to_be_asked().await;
+                case.hangs_up();
+            })
+            .await;
+            assert!(
+                !ran.said[0].as_str().contains("lost"),
+                "a modifier was read since ({console_will_spell}): {:?}",
+                ran.said[0]
+            );
+            let ran = wire::run_switched(true, console_will_spell, |mut case| async move {
+                let shift = case.types(shift_down()).await;
+                case.types_without_waiting(shift_down());
+                case.refuses(&shift, ErrorCode::InputIncompatible);
+                case.closes();
+            })
+            .await;
+            assert!(
+                ran.said.len() == 1 && !ran.said[0].as_str().contains("lost"),
+                "a modifier was left in the channel ({console_will_spell}): {:?}",
+                ran.said
+            );
+
             // The same letter, with the session's closure ready beside the refusal: the attachment
             // ends before the loop takes the letter, and the line still counts it.
             let ran = wire::run_switched(true, console_will_spell, |mut case| async move {
@@ -3883,8 +3891,14 @@ mod tests {
         assert!(presses(&[key(u16::from(b'A'), true)]));
         assert!(!presses(&[key(u16::from(b'A'), false)]), "a release");
         assert!(
-            !presses(&[key(0x10, true), key(0x11, true), key(0x12, true)]),
-            "modifiers"
+            !presses(&[
+                key(0x10, true),
+                key(0x11, true),
+                key(0x12, true),
+                key(0x5b, true),
+                key(0x5c, true)
+            ]),
+            "modifiers and the Windows keys"
         );
         assert!(presses(&[key(0x10, true), key(0x0d, true)]));
         assert!(!presses(&[]));
