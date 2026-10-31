@@ -1037,3 +1037,88 @@ async fn kr_req_11_26_a_request_of_a_generation_the_instance_has_left_is_not_giv
         "the component was given the request of the conversation that was left: {account}"
     );
 }
+
+/// A start of a plugin host still under way when a world ends is one the record does not hold yet,
+/// and the host it makes goes on running after the test: the world's teardown says so and does not
+/// pass for a world with nothing left, and says nothing once the start has been recorded.
+#[test]
+fn a_start_of_a_host_still_under_way_when_the_world_ends_is_reported() {
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::Duration;
+
+    use kr_controller::supervision::{
+        LaunchOutcome, ServiceLaunch, WorkerLaunch, WorkerSupervisor,
+    };
+
+    /// A service manager whose start does not return until it is told to.
+    #[derive(Debug)]
+    struct Slow {
+        entered: Mutex<mpsc::Sender<()>>,
+        released: Mutex<mpsc::Receiver<()>>,
+    }
+    impl WorkerSupervisor for Slow {
+        fn start(&self, _launch: &WorkerLaunch) -> LaunchOutcome {
+            LaunchOutcome::NotStarted {
+                detail: "this stand-in starts no worker".to_owned(),
+            }
+        }
+
+        fn start_service(&self, _launch: &ServiceLaunch) -> LaunchOutcome {
+            self.entered
+                .lock()
+                .expect("not poisoned")
+                .send(())
+                .expect("the case is listening");
+            let _ = self.released.lock().expect("not poisoned").recv();
+            LaunchOutcome::NotStarted {
+                detail: "this stand-in starts nothing".to_owned(),
+            }
+        }
+
+        fn describe(&self) -> &'static str {
+            "a service manager that is slow to answer"
+        }
+    }
+
+    let (entered, has_entered) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let tree = kr_ipc::testing::TempHost::create();
+    let supervisor = Arc::new(plugin_world::Supervisor {
+        launched: Mutex::new(None),
+        services: Arc::default(),
+        service: Box::new(Slow {
+            entered: Mutex::new(entered),
+            released: Mutex::new(released),
+        }),
+        host_arguments: Vec::new(),
+        gate: plugin_world::StartGate::default(),
+    });
+    let launch = ServiceLaunch {
+        label: "kr-plugin-host-6f0c2b1e-3a4d-4c5b-8e7f-0a1b2c3d4e5f".to_owned(),
+        program: "/bin/true".into(),
+        arguments: Vec::new(),
+        jobs_directory: tree.environment().jobs_dir(),
+        working_directory: tree.root().to_path_buf(),
+    };
+    let starting = {
+        let supervisor = Arc::clone(&supervisor);
+        std::thread::spawn(move || supervisor.start_service(&launch))
+    };
+    has_entered.recv().expect("the start is under way");
+    let ending = plugin_world::HostEnding {
+        services: Arc::clone(&supervisor.services),
+        environment: tree.environment(),
+        supervisor: Some(Arc::clone(&supervisor)),
+    };
+
+    let why = ending
+        .end(Duration::from_millis(300))
+        .expect_err("a start still under way is reported");
+    assert!(why.contains("1 starts of a host"), "{why}");
+
+    release.send(()).expect("the start is waiting");
+    starting.join().expect("the start ended");
+    ending
+        .end(Duration::from_secs(5))
+        .expect("a start that has been recorded is no reason to fail the world");
+}

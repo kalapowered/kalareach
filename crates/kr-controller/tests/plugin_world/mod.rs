@@ -341,12 +341,19 @@ pub struct HostEnding {
     pub supervisor: Option<Arc<Supervisor>>,
 }
 
-impl Drop for HostEnding {
-    fn drop(&mut self) {
+impl HostEnding {
+    /// Ends the hosts and takes their jobs away, giving the starts under way `starts_recorded_within`
+    /// to be recorded, and says what it could not establish as ended.
+    ///
+    /// # Errors
+    ///
+    /// Returns the hosts that were not seen to end, the jobs still registered with the service
+    /// manager, and the starts of a host still under way when the time was up.
+    pub fn end(&self, starts_recorded_within: Duration) -> Result<(), String> {
         let unrecorded = self
             .supervisor
             .as_ref()
-            .map_or(0, |supervisor| supervisor.close(STARTS_RECORDED_WITHIN));
+            .map_or(0, |supervisor| supervisor.close(starts_recorded_within));
         let mut hosts: Vec<ProcessStartIdentity> = Vec::new();
         let mut labels: Vec<String> = Vec::new();
         if let Ok(services) = self.services.lock() {
@@ -377,12 +384,25 @@ impl Drop for HostEnding {
             };
             left.extend(gone);
         }
-        assert!(
-            (left.is_empty() && running.is_empty() && unrecorded == 0) || std::thread::panicking(),
+        if left.is_empty() && running.is_empty() && unrecorded == 0 {
+            return Ok(());
+        }
+        Err(format!(
             "this test left plugin hosts that were not seen to end ({running:?}), jobs registered \
              with the service manager ({left:?}), or {unrecorded} starts of a host that were still \
-             under way {STARTS_RECORDED_WITHIN:?} after the world was closed to new ones"
-        );
+             under way {starts_recorded_within:?} after the world was closed to new ones"
+        ))
+    }
+}
+
+impl Drop for HostEnding {
+    fn drop(&mut self) {
+        // A test that already fails has said so, and a second panic would end the whole run.
+        if let Err(why) = self.end(STARTS_RECORDED_WITHIN)
+            && !std::thread::panicking()
+        {
+            panic!("{why}");
+        }
     }
 }
 
