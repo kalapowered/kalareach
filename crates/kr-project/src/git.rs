@@ -3755,16 +3755,9 @@ fn ask(
 
         command.process_group(0);
     }
-    let mut child = command.spawn().map_err(|error| {
-        let detail = format!("{described} could not run: {error}");
-        // A host that is out of descriptors, processes or memory says nothing about the program,
-        // so the look is refused rather than the program taken for one that cannot run.
-        if short_of_resources(&error) {
-            Asked::Overran(passing(detail))
-        } else {
-            Asked::Declined(unavailable(detail))
-        }
-    })?;
+    let mut child = command
+        .spawn()
+        .map_err(|error| could_not_run(&described, &error))?;
     let mut heard = match Heard::of(child.stdout.take()) {
         Ok(heard) => heard,
         Err(error) => {
@@ -3864,6 +3857,18 @@ fn ask(
         ))));
     }
     Ok(String::from_utf8_lossy(&answer.bytes).into_owned())
+}
+
+/// Returns what a failure to start a program is. A host that is out of descriptors, processes or
+/// memory says nothing about the program, so the look is refused as a fault that passes rather than
+/// the program taken for one that cannot run.
+fn could_not_run(described: &str, error: &std::io::Error) -> Asked {
+    let detail = Diagnostic::new(format!("{described} could not run: {error}"));
+    if short_of_resources(error) {
+        Asked::Overran(ProjectError::GitFailed { detail })
+    } else {
+        Asked::Declined(ProjectError::GitUnavailable { detail })
+    }
 }
 
 /// Whether a failure to start a program says the host, and not the program, is short of something.
@@ -5658,6 +5663,31 @@ mod tests {
         assert!(
             matches!(refusal, ProjectError::GitFailed { .. })
                 && refusal.to_string().contains("was not asked"),
+            "{refusal:?}"
+        );
+    }
+
+    /// A program that could not start because the host is out of descriptors is the host's fault
+    /// and passes, and the look is refused; one that is not there is not Git this host can run work
+    /// through, and the caller goes on without it.
+    #[cfg(unix)]
+    #[test]
+    fn a_program_that_could_not_start_for_want_of_descriptors_is_a_fault_that_passes() {
+        let short = std::io::Error::from_raw_os_error(libc::EMFILE);
+        let Asked::Overran(refusal) = could_not_run("git --version", &short) else {
+            panic!("a host out of descriptors refuses the look");
+        };
+        assert!(
+            matches!(refusal, ProjectError::GitFailed { .. }),
+            "{refusal:?}"
+        );
+
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let Asked::Declined(refusal) = could_not_run("git --version", &missing) else {
+            panic!("a program that is not there is declined");
+        };
+        assert!(
+            matches!(refusal, ProjectError::GitUnavailable { .. }),
             "{refusal:?}"
         );
     }
