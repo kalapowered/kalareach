@@ -54,6 +54,14 @@ fn the_reader_counts_a_byte_waiting_in_the_terminals_queue_as_input_it_has_not_t
     shellpkg::a_byte_waiting_in_the_terminals_queue_is_input_the_reader_has_not_taken(PWSH);
 }
 
+/// KR-REQ-08.49: bytes the runtime has read from the terminal and not handed on are input the
+/// reader has not taken.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn the_reader_counts_bytes_the_runtime_has_read_from_the_terminal_as_input_it_has_not_taken() {
+    shellpkg::bytes_the_runtime_has_read_from_the_terminal_are_input_the_reader_has_not_taken(PWSH);
+}
+
 /// KR-REQ-07.40: the module holds no secret bytes once the handshake is accepted.
 #[test]
 #[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]

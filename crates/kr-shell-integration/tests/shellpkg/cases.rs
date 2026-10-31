@@ -482,14 +482,19 @@ fn signal_the_shell(session: &Session, signal: &str) {
 /// later exchange says the queues are drained, so a reader that counts bytes it no longer holds is
 /// not the one that passes.
 ///
-/// PSReadLine is given two more steps and half a character instead. It draws every printable key
-/// it takes, and a draw after it was continued asks the terminal where the cursor is, from the same
-/// input its key thread is reading: the key thread takes the reply for keys, and the draw waits for
-/// good, or the draw takes keys ahead of the reply for part of it. Its key thread also queues every
+/// PSReadLine is given two more steps and half a character instead, and what the case shows for it
+/// is the count of the bytes the decoder holds. It draws every printable key it takes, and a draw
+/// after it was continued asks the terminal where the cursor is, from the same input its key thread
+/// is reading: the key thread takes the reply for keys, and the draw waits for good, or the draw
+/// takes keys ahead of the reply for part of it, and a device-attributes answer ahead of the reply
+/// gives .NET a column of 226222621 and the editor an exception. Its key thread also queues every
 /// key that is waiting in the first two milliseconds, so whether the editor is at a step with
 /// input left to read depends on how fast that went. A step draws nothing, and half a character is
-/// no key at all, so it stays unread whatever the timing: the editor meets the request at its last
-/// step with one byte it has not read, and nothing is drawn before the character is whole.
+/// no key at all, so it stays unread whatever the timing: the editor meets the request at a step
+/// with a byte it has not read, and nothing is drawn before the character is whole. The bytes of a
+/// host's answer that the runtime has read and not handed on are counted from its buffer, which
+/// [`bytes_the_runtime_has_read_from_the_terminal_are_input_the_reader_has_not_taken`] shows
+/// without an editor.
 ///
 /// # Panics
 ///
@@ -564,6 +569,51 @@ pub fn a_byte_waiting_in_the_terminals_queue_is_input_the_reader_has_not_taken(k
     );
 }
 
+/// KR-REQ-08.49: bytes the runtime has read from the terminal and has not handed on are input the
+/// reader has not taken.
+///
+/// The runtime reads its terminal in chunks, everything a host put there at once, and hands out
+/// one key at a time. What is left of a chunk is in the terminal's queue no more, in the decoder
+/// only when it is half a character, and in the editor's queue only when the editor has taken it
+/// from the runtime; the reader counts it from the runtime's buffer. This case has no editor and no
+/// key thread, so no timing decides what has been read. It types a key, a whole answer to a
+/// device-attributes query and a line end in one write, takes one key with
+/// `[Console]::ReadKey($true)`, and runs the module's count, which has to see the rest.
+///
+/// # Panics
+///
+/// Panics when the count after the key is nothing, or the terminal shows no count.
+#[cfg(unix)]
+pub fn bytes_the_runtime_has_read_from_the_terminal_are_input_the_reader_has_not_taken(
+    kind: ShellKind,
+) {
+    let package = Package::built(kind);
+    let module = package
+        .directory()
+        .join("modules/KalaReach.ShellBridge/KalaReach.ShellBridge.psd1")
+        .display()
+        .to_string();
+    let script = format!(
+        "Import-Module '{module}'; $module = Get-Module KalaReach.ShellBridge; \
+         Write-Output (('kr-be' + 'fore=[') + (& $module {{ Read-KrRuntimeUnread }}) + ']'); \
+         $key = [Console]::ReadKey($true); \
+         Write-Output (('kr-af' + 'ter=[') + (& $module {{ Read-KrRuntimeUnread }}) + ']')"
+    );
+    // The key, an answer to a primary device-attributes query, and the end of the line that makes
+    // all of it readable at once.
+    let shown = package.ask_with_input_typed_after(&script, "kr-before=[", b"x\x1b[?62;22c\n");
+    let count = shown
+        .split("kr-after=[")
+        .nth(1)
+        .and_then(|rest| rest.split(']').next())
+        .and_then(|count| count.parse::<u64>().ok());
+    assert!(
+        count.is_some_and(|count| count > 0),
+        "the answer and the line end the runtime read and has not handed on are input the reader \
+         has not taken: {shown:?}"
+    );
+}
+
 /// Types `unread` into the terminal of an idle reader that is stopped, asks it for its queues, and
 /// expects it to say they are not drained. Then types `completion`, which the reader needs to take
 /// what it has, and expects it to say they are.
@@ -589,9 +639,8 @@ fn unread_input_is_not_drained(kind: ShellKind, unread: &[u8], completion: &[u8]
 
     // An editor that asks where the cursor is once its prompt is drawn reads the reply from the
     // same input as its keys, a byte at a time. What is typed before it has the reply is taken for
-    // part of it, or the reply is taken for keys: with three answers to a device-attributes query
-    // ahead of it, .NET reads a column of 226222621 for PSReadLine, which ends with an exception.
-    // A person types after the reply, as `type_line` does, and so does this.
+    // part of it, or the reply is taken for keys. A person types after the reply, as `type_line`
+    // does, and so does this.
     if dialect(kind).types_at_the_prompt {
         assert!(
             session.wait_for_prompt(),
