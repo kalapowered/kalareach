@@ -79,10 +79,13 @@ fn job(workflow: &str, name: &str) -> String {
         .iter()
         .position(|line| *line == header)
         .unwrap_or_else(|| panic!("the workflow has a {name} job"));
+    // A comment line is no job's header, whatever it ends with: a job key below one belongs to the
+    // job above it.
     let is_job = |line: &str| {
         line.len() > 3
             && line.starts_with("  ")
             && !line.starts_with("   ")
+            && !line.trim_start().starts_with('#')
             && line.trim_end().ends_with(':')
     };
     let end = lines[start + 1..]
