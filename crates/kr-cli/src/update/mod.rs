@@ -93,12 +93,22 @@ pub fn said(error: &InstallError) -> Shown {
             operation,
             path,
             source,
-        } => shown!(
-            "{} {}: {}",
-            *operation,
-            Shown::root(path),
-            Shown::io(source)
-        ),
+        } => shown!("{} {}: {}", *operation, Shown::root(path), cause(source)),
+    }
+}
+
+/// What the I/O failure of one step of the store says.
+///
+/// A directory this host will not use is carried by the failure as the refusal it is, and is told
+/// as every other command tells it. Anything else is told by its kind, as an I/O failure always
+/// is: its payload can be anything.
+fn cause(source: &std::io::Error) -> Shown {
+    match source
+        .get_ref()
+        .and_then(|payload| payload.downcast_ref::<kr_ipc::IpcError>())
+    {
+        Some(refusal) => Shown::ipc(refusal),
+        None => Shown::io(source),
     }
 }
 
