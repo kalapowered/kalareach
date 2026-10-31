@@ -2213,6 +2213,39 @@ mod tests {
         }
     }
 
+    /// KR-REQ-24.26: the directories this host keeps its installation records in are owner-only
+    /// whatever the mask of the process, because they are its own state. A directory the agent
+    /// reads its skill from is the agent's, and is made with the mode the mask gives it.
+    #[cfg(unix)]
+    #[test]
+    fn the_directories_installation_records_are_kept_in_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mode =
+            |path: &Path| std::fs::metadata(path).expect("made").permissions().mode() & 0o777;
+        let _login = kr_ipc::testing::LoginUmask::hold();
+        let tree = Tree::create();
+        let installer = tree.installer();
+        let params = params(AgentTarget::ClaudeCode, InstallScope::User);
+        let actor = kr_protocol::ids::ActorId::new("local:501").expect("a principal");
+        let action =
+            kr_protocol::ids::ActionId::new(kr_protocol::scalars::Uuid::from_bytes([8; 16]));
+
+        installer
+            .mark_dispatching(&actor, action, &digest_of(b"the payload"))
+            .expect("the marker is written");
+        installer.install(&params).expect("installs");
+
+        let records = tree.root.join("state").join("agent-tools");
+        assert_eq!(mode(&records), 0o700, "{}", records.display());
+        let actions = records.join("actions");
+        assert_eq!(mode(&actions), 0o700, "{}", actions.display());
+        // The control: a directory in the agent's own tree gets the mask's mode, which is the mode
+        // these two would have had.
+        let skills = tree.home().join(".claude/skills");
+        assert_eq!(mode(&skills), 0o755, "{}", skills.display());
+    }
+
     /// Every file under `root`, with the digest of its contents.
     fn files_under(root: &Path) -> BTreeMap<PathBuf, Digest256> {
         let mut found = BTreeMap::new();
