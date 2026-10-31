@@ -1150,7 +1150,8 @@ async fn the_push_desk_talks_to_the_gateway_client_it_was_given() {
 /// gateway no longer accepts, is asked of the client the factory makes for the gateway the desk
 /// talks to. A fork's own client in that place receives the issue and the host is told nothing;
 /// the build's gateway is a stand-in on a loopback port, which a client made outside the factory
-/// would reach and which receives nothing here, and the factory is asked for that gateway alone.
+/// would reach and which receives nothing here, and the factory is asked for the gateway the device
+/// run's request file names, in place of the build's, and for that gateway alone.
 #[cfg(debug_assertions)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_runs_reissue_asks_the_client_the_factory_makes_for_the_gateway_the_desk_talks_to()
@@ -1165,7 +1166,7 @@ async fn a_device_runs_reissue_asks_the_client_the_factory_makes_for_the_gateway
     let stand_in = kr_service_stand_in::serve().await;
     let origin = kr_protocol::service::GatewayOrigin::new(stand_in.origin()).expect("an origin");
     let opened = open_replacing(
-        origin.clone(),
+        origin,
         phone.data.path(),
         &device,
         &Receiver::new(FIRST_TOKEN),
@@ -1192,6 +1193,15 @@ async fn a_device_runs_reissue_asks_the_client_the_factory_makes_for_the_gateway
         .list()
         .expect("the paired hosts")
         .remove(0);
+    // The device run names the gateway in a file of the application's data directory.
+    let named = kr_service_stand_in::serve().await;
+    let named_origin = kr_protocol::service::GatewayOrigin::new(named.origin()).expect("an origin");
+    std::fs::create_dir_all(phone.data.path().join("kr-probe")).expect("a directory");
+    std::fs::write(
+        phone.data.path().join("kr-probe").join("push-request.json"),
+        serde_json::to_vec(&json!({ "origin": named_origin.as_str() })).expect("a request"),
+    )
+    .expect("the device run's request");
 
     let reissued = opened.desk.reissue_unannounced(&paired).await;
     assert_eq!(
@@ -1201,13 +1211,14 @@ async fn a_device_runs_reissue_asks_the_client_the_factory_makes_for_the_gateway
     );
     assert_eq!(
         asked.lock().expect("the record").clone(),
-        vec![origin.as_str().to_owned()],
-        "the factory was asked for the gateway the desk talks to, and no other"
+        vec![named_origin.as_str().to_owned()],
+        "the factory was asked for the gateway the device run named, and no other"
     );
     assert!(
-        stand_in.web().arrived().is_empty(),
-        "{:?}: a request left for the build's gateway outside the factory",
-        stand_in.web().arrived()
+        stand_in.web().arrived().is_empty() && named.web().arrived().is_empty(),
+        "{:?} {:?}: a request left for a gateway outside the factory",
+        stand_in.web().arrived(),
+        named.web().arrived()
     );
     reissued.expect("the gateway issued the authorisation again");
     assert!(
