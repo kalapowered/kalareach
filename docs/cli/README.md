@@ -344,8 +344,9 @@ virtual-terminal input) between two of its reads of the console, and reads the t
 spells from then on with `ReadConsoleW`, so that the console's code page has no part in it. It sends
 that text as UTF-8, a NUL included and a held key as many times as the console spells it, and the
 session takes it in that encoding. The command reads nothing from the console while it changes the
-mode, and reads the console's text only when the console holds some, so ending the attachment
-cancels no read. The attachment keeps its input lease and invents no spelling. After the terminal is
+mode, and reads the console's text only when the console holds some, which it tells from the records
+the console keeps that make none (a key coming up, a modifier, the Apps key) by the key's character
+and virtual key. The attachment keeps its input lease and invents no spelling. After the terminal is
 the person's again, the command says once that its keys went as the console spells them, with the
 console's own modifier detail and without key releases. Keys typed just before the session refused
 them are lost, and the command says so only when a typed key was lost: a modifier on its own, a key
