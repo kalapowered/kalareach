@@ -1013,16 +1013,17 @@ answer never came back.
   this computer only: a paired host cannot be asked for its status.
 
 The bundle is reached with this device's signature and the account's token, and the token goes only
-to the service the account is signed in to. When the sync service setting names another service,
-no request is made and the refusal names the setting. A sign-in that does not carry the right to
-write the account's backup storage sends nothing either, and the person signs in again with that
-right. The record names the service the bundle is kept at, so choosing another sync service later
-does not move the bundle; the kit still points at the service it was made for, and the Account
-sheet says so. The same check is made for the record's service before each later step that would
-reach it (going on with a start that did not finish, settling a write, covering the host, listing
-the archives and making the offline copy): a record kept at one service is refused when the account
-is signed in at another, whatever the setting names. Saving the kit reaches no service, and the kit
-goes on naming the service the record names. A phone shows the setting and offers no recovery.
+to the service the account is signed in to. When recovery has no record yet and the sync service
+setting names another service than that one, no request is made and the refusal names the setting. A
+sign-in that does not carry the right to write the account's backup storage sends nothing either,
+and the person signs in again with that right. The record names the service the bundle is kept at,
+so choosing another sync service later does not move the bundle; the kit still points at the service
+it was made for, and the Account sheet says so. The same check is made for the record's service
+before each later step that would reach it (going on with a start that did not finish, settling a
+write, covering the host, listing the archives and making the offline copy): a record kept at one
+service is refused when the account is signed in at another, whatever the setting names. Saving the
+kit reaches no service, and the kit goes on naming the service the record names. A phone shows the
+setting and offers no recovery.
 
 ## The managed services the application holds
 
@@ -1077,17 +1078,18 @@ lease client for each account mark.
 The Account sheet lists, under "Managed services on this device", the services the application can
 hold a client of: account login, push registration, sync and backup, and managed inference. The
 `account_services` command puts clients into a `ServiceClients` (`services::Held::of`) and gives
-`ServiceClients::availability_of` for each. Only the account's client is one the application holds.
-`Held::of` asks the installed `SyncServices` for the sync client at the origin the setting names
-now, which after a change is not the origin of a record made earlier, and makes the push and
-inference clients again through `PushDesk::client` and `Calls::broker`. A service whose client
-exists reads as configured, which says nothing of whether a call will succeed. One with no client
-reads as the library says, with what a person can do instead. It has none when its desk is not
-open on this device, and also when its factory could not make the client: the error is dropped
+`ServiceClients::availability_of` for each. The account's client is the one the application holds.
+For each other service `Held::of` makes a request of the factory its desk uses, and a factory may
+answer with a client the desk already holds: of the installed `SyncServices` for the sync client at
+the origin the setting names now, which after a change is not the origin of a record made earlier,
+and through `PushDesk::client` and `Calls::broker` for the push and inference clients. A service
+whose client exists reads as configured, which says nothing of whether a call will succeed. One with
+no client reads as the library says, with what a person can do instead. It has none when its desk is
+not open on this device, and also when its factory could not make the client: the error is dropped
 (by `Held::of` for the sync client, by `PushDesk::client` for push and by `Calls::broker` for
-inference), and the sheet does not say why. The list asks no service, has no control, link or form, and
-nothing consults it before local work. The sheet leaves it out when the command fails. Under it the
-sheet says these are the managed services an app can use and that a host keeps its own relay
+inference), and the sheet does not say why. The list asks no service, has no control, link or form,
+and nothing consults it before local work. The sheet leaves it out when the command fails. Under it
+the sheet says these are the managed services an app can use and that a host keeps its own relay
 leases, so none is listed.
 
 ## What a phone reads once
