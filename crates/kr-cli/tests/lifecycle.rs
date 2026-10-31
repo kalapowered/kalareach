@@ -5058,6 +5058,32 @@ fn unmount(mount: &Path) -> Result<(), String> {
     Err(why)
 }
 
+/// Ends the process a rootless container runtime keeps beside its containers, if the application
+/// the case ran asked the runtime anything.
+///
+/// The runtime starts it in a session of its own, so the end of the application's group does not
+/// reach it, and it goes on holding the case's runtime directory long after the case. Its number
+/// is in the runtime directory, and it is ended only if it was started in that directory.
+fn end_the_container_runtimes_pause_process(runtime: &Path) {
+    let Some(pid) = std::fs::read_to_string(runtime.join("libpod/tmp/pause.pid"))
+        .ok()
+        .and_then(|text| text.trim().parse::<i32>().ok())
+        .and_then(rustix::process::Pid::from_raw)
+    else {
+        return;
+    };
+    let wanted = format!("XDG_RUNTIME_DIR={}", runtime.display());
+    let started_here =
+        std::fs::read(format!("/proc/{}/environ", pid.as_raw_nonzero())).is_ok_and(|environment| {
+            environment
+                .split(|byte| *byte == 0)
+                .any(|variable| variable == wanted.as_bytes())
+        });
+    if started_here {
+        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+    }
+}
+
 impl HeadlessEmulator {
     /// Runs `script` under `xvfb-run` and `dbus-run-session`, as the person `host` describes, with
     /// the variables the windows the application opens will run `kr` with: set before the bus
@@ -5126,6 +5152,7 @@ impl HeadlessEmulator {
             }
             let _ = child.wait();
         }
+        end_the_container_runtimes_pause_process(&self.root.join("xdg-runtime"));
         let table =
             |error: std::io::Error| format!("the table of mounts could not be read: {error}");
         let mut refused = Vec::new();
