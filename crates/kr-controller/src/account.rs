@@ -180,6 +180,9 @@ struct Inner {
     /// reached the gate.
     #[cfg(feature = "testing")]
     waiting: std::sync::atomic::AtomicUsize,
+    /// How many requests for a token pass the gate a test raised before the rest wait at it.
+    #[cfg(feature = "testing")]
+    passing: std::sync::atomic::AtomicUsize,
     #[cfg(feature = "testing")]
     loopback: Mutex<Option<std::net::SocketAddr>>,
 }
@@ -270,6 +273,8 @@ impl HostAccount {
                 #[cfg(feature = "testing")]
                 waiting: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(feature = "testing")]
+                passing: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(feature = "testing")]
                 loopback: Mutex::new(None),
             }),
         };
@@ -327,6 +332,17 @@ impl HostAccount {
     #[cfg(feature = "testing")]
     #[must_use]
     pub fn hold_token_requests(&self) -> TokenRequestsHeld {
+        self.hold_token_requests_after(0)
+    }
+
+    /// As [`Self::hold_token_requests`], after the next `passing` requests for a token have gone
+    /// through, for a test that needs a later request in a call to be the one that waits.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn hold_token_requests_after(&self, passing: usize) -> TokenRequestsHeld {
+        self.inner
+            .passing
+            .store(passing, std::sync::atomic::Ordering::SeqCst);
         self.inner.changing.send_replace(true);
         TokenRequestsHeld {
             inner: Arc::clone(&self.inner),
@@ -640,6 +656,9 @@ impl std::fmt::Debug for TokenRequestsHeld {
 #[cfg(feature = "testing")]
 impl Drop for TokenRequestsHeld {
     fn drop(&mut self) {
+        self.inner
+            .passing
+            .store(0, std::sync::atomic::Ordering::SeqCst);
         self.inner.changing.send_replace(false);
     }
 }
@@ -664,6 +683,18 @@ impl Drop for Change<'_> {
 }
 
 impl Inner {
+    /// Whether this request goes through a gate a test raised with a number of requests to let by.
+    #[cfg(feature = "testing")]
+    fn lets_one_pass(&self) -> bool {
+        self.passing
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |left| left.checked_sub(1),
+            )
+            .is_ok()
+    }
+
     /// Where the grant stands when no attempt is running.
     fn settled(&self) -> AccountState {
         let Some(held) = &self.held else {
@@ -1018,10 +1049,16 @@ impl HostTokens {
         let mut changing = self.inner.changing.subscribe();
         if *changing.borrow() {
             #[cfg(feature = "testing")]
-            let count = Some(&self.inner.waiting);
+            let passes = self.inner.lets_one_pass();
             #[cfg(not(feature = "testing"))]
-            let count = None;
-            until_down(count, &mut changing).await;
+            let passes = false;
+            if !passes {
+                #[cfg(feature = "testing")]
+                let count = Some(&self.inner.waiting);
+                #[cfg(not(feature = "testing"))]
+                let count = None;
+                until_down(count, &mut changing).await;
+            }
         }
         if self.inner.recover().await.is_err() {
             return Err(kr_client::ClientError::refusal(

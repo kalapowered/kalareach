@@ -5808,6 +5808,69 @@ async fn a_fence_owed_while_the_call_waits_for_its_token_stops_the_bundle_write(
     assert!(rig.controller.backup().setup().expect("a read").is_none());
 }
 
+/// KR-REQ-09.09: a fence this host comes to owe while the bundle write waits for its own token
+/// stops that write. The call's check that a token can be had goes through, so the request held is
+/// the write's, and it is the admission asked once its token is in hand that stops it: no request
+/// reaches the service. The control: with the fence let go, the same call writes the bundle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_owed_while_the_bundle_write_waits_for_its_own_token_stops_it() {
+    let timer = HeldTimer::held();
+    let (rig, _) = a_host_to_set_up(&timer).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+    let tokens = rig.controller.host_account().hold_token_requests_after(1);
+    let call = rig.enable_outcome_in_the_background(&made.params);
+    until_a_request_waits_for_its_token(&rig).await;
+    rig.controller.hold_fence(true);
+    drop(tokens);
+    let refusal = call
+        .await
+        .expect("the call ends")
+        .expect_err("the bundle write is refused while a fence is owed");
+    assert_eq!(refusal.code, ErrorCode::PermissionDenied);
+    assert!(refusal.message.contains("fence"), "{}", refusal.message);
+    assert_eq!(web.requests_to(SYNC), 0, "the bundle was not written");
+    assert_eq!(web.requests_to(MANIFEST), 0, "the writer was not enrolled");
+    assert!(rig.controller.backup().setup().expect("a read").is_none());
+
+    rig.controller.hold_fence(false);
+    assert!(matches!(
+        rig.enable(&made.params).await,
+        BackupEnableResult::Enabled { .. }
+    ));
+    assert_eq!(web.requests_to(SYNC), 1, "the control writes the bundle");
+}
+
+/// KR-REQ-09.09: a deadline that passes while the bundle write waits for its own token stops that
+/// write: the deadline is asked once the token is in hand, as the fence is. The control: the same
+/// call made again, with a deadline that stands, writes the bundle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deadline_that_passes_while_the_bundle_write_waits_for_its_own_token_stops_it() {
+    let (rig, _, clock) = a_host_to_set_up_on_a_clock(&HeldTimer::held()).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+    let tokens = rig.controller.host_account().hold_token_requests_after(1);
+    let call = rig.enable_outcome_in_the_background(&made.params);
+    until_a_request_waits_for_its_token(&rig).await;
+    clock.advance(Duration::from_millis(
+        kr_protocol::limits::DEFAULT_MUTATION_TTL.get() + 1_000,
+    ));
+    drop(tokens);
+    let refusal = call
+        .await
+        .expect("the call ends")
+        .expect_err("a call whose deadline has passed is refused");
+    assert!(refusal.message.contains("deadline"), "{}", refusal.message);
+    assert_eq!(web.requests_to(SYNC), 0, "the bundle was not written");
+    assert!(rig.controller.backup().setup().expect("a read").is_none());
+
+    assert!(matches!(
+        rig.enable(&made.params).await,
+        BackupEnableResult::Enabled { .. }
+    ));
+    assert_eq!(web.requests_to(SYNC), 1, "the control writes the bundle");
+}
+
 /// KR-REQ-09.09: a call that waits for its first token while the service has asked to be left
 /// alone, and meets a fence meanwhile, is refused for the fence and not told the delay. Nothing
 /// leaves in either case; the answer is what differs. The control: with the fence let go, the same
