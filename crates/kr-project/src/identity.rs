@@ -1139,24 +1139,31 @@ fn ceiling_above(tree: &AuthorisedDirectory) -> Option<PathBuf> {
 ///
 /// Nothing at the path is a tree that is no longer the object the record names, as a directory that
 /// took its place is, and is told as that: a source that changed, and not an argument the caller
-/// got wrong. The look for it is made first, so the answer is the one for what was seen there and
-/// not a guess from the failure of a later open. Anything else, and every failure of the open
-/// itself, keeps the answer it always had.
+/// got wrong. Nothing is what the open itself finds: the tree is gone, or the path is a link that
+/// leads nowhere, so a tree that goes between a look and an open is not a case of its own, because
+/// there is no look. Every other failure of the open keeps the answer it always had: a parent that
+/// is now a file, a link that cannot be followed, a directory this account cannot enter. They are
+/// the arguments a caller got wrong, and not a source that changed.
 fn open_recorded_root(
     environment_id: EnvironmentId,
     path: &Path,
     tree: RecordedIdentity,
 ) -> Result<AuthorisedDirectory> {
-    if matches!(
-        std::fs::symlink_metadata(path),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound
-    ) {
-        let nothing = kr_transfer::Escape::NotFound {
-            component: path.display().to_string(),
-        };
-        return Err(not_the_recorded_tree(tree, path, &nothing));
+    match cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority()) {
+        Ok(handle) => Ok(AuthorisedDirectory::from_handle(
+            environment_id,
+            handle,
+            path.to_path_buf(),
+        )?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let nothing = kr_transfer::Escape::NotFound {
+                component: path.display().to_string(),
+            };
+            Err(not_the_recorded_tree(tree, path, &nothing))
+        }
+        // Said by the one place that words an open's failure, as for every other root.
+        Err(_) => Ok(AuthorisedDirectory::open_root(environment_id, path)?),
     }
-    Ok(AuthorisedDirectory::open_root(environment_id, path)?)
 }
 
 /// Returns the refusal for a directory that is not the working tree a record names.
