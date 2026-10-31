@@ -1111,13 +1111,13 @@ fn a_start_of_a_host_still_under_way_when_the_world_ends_is_reported() {
         supervisor: Some(Arc::clone(&supervisor)),
     };
 
-    let why = ending
-        .end(Duration::from_millis(300))
-        .expect_err("a start still under way is reported");
-    assert!(why.contains("1 starts of a host"), "{why}");
-
+    let first = ending.end(Duration::from_millis(300));
+    // Let the start go before anything is asserted, so that a case that fails here does not wait
+    // for the world's teardown to give up on it.
     release.send(()).expect("the start is waiting");
     starting.join().expect("the start ended");
+    let why = first.expect_err("a start still under way is reported");
+    assert!(why.contains("1 starts of a host"), "{why}");
     ending
         .end(Duration::from_secs(5))
         .expect("a start that has been recorded is no reason to fail the world");
