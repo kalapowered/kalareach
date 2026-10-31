@@ -238,14 +238,17 @@ fn until_nothing_of_the_case_runs(root: &Path) {
         // 0 when some process matches, 1 when none does; anything else is pgrep's own failure.
         match found.code() {
             Some(1) => unseen += 1,
-            Some(0) => unseen = 0,
+            Some(0) => {
+                unseen = 0;
+                assert!(
+                    begun.elapsed() < JOBS_END_WITHIN,
+                    "something the script started in {} was still running {JOBS_END_WITHIN:?} after \
+                     it ended",
+                    root.display()
+                );
+            }
             other => panic!("pgrep ended with {other:?} for {pattern}"),
         }
-        assert!(
-            begun.elapsed() < JOBS_END_WITHIN,
-            "something the script started in {} was still running {JOBS_END_WITHIN:?} after it ended",
-            root.display()
-        );
         std::thread::sleep(Duration::from_millis(5));
     }
 }
