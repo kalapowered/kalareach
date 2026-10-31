@@ -131,7 +131,9 @@ const THIRD_MARKER_COMMAND: &str = "printf 'kala%s-lastly\n' reach\n";
 /// something between two commands even when it has no prompt (a switch of the terminal's mode, for
 /// one), and that would be a later frame for a device that had read the word. With the shell gone
 /// there is none, so a device that has read the word has read everything the session produced and
-/// the subscription is quiet from then on.
+/// the subscription is quiet from then on. That is the Unix form, in which the process replaces the
+/// shell in place; a Windows pseudo-console writes sequences of its own, and the case is not run
+/// there.
 const SETTLED: &str = "kalareach-settled";
 
 /// The command that produces it.
