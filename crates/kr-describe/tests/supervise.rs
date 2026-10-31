@@ -2193,11 +2193,11 @@ fn a_process_that_commits_memory_as_it_starts_is_refused_by_the_systems_limit() 
 }
 
 /// KR-REQ-22.10: a start that fails after it created the process leaves no process behind, even
-/// when it fails by a panic, and on Windows the process it created has not run. A process created
-/// held does not run, so it never reads that its owner has gone, and until it is in its job nothing
-/// but the start itself would end it. The start is made to panic at the last point before the limit. The process is read
-/// by its identifier and its start at that point, so that a process that takes the identifier
-/// afterwards is not taken for it, and is looked for as soon as the panic has been caught.
+/// when it fails by a panic. A process created held does not run, so it never reads that its owner
+/// has gone, and until it is in its job nothing but the start itself would end it. The start is
+/// made to panic at the last point before the limit. The process is read by its identifier and its
+/// start at that point, so that a process that takes the identifier afterwards is not taken for it,
+/// and is looked for as soon as the panic has been caught.
 #[cfg(windows)]
 #[test]
 fn a_start_that_panics_after_creating_the_process_leaves_no_held_process() {
@@ -2249,9 +2249,9 @@ fn the_process_ended_for_want_of_memory(rig: &Rig, reports: &[Report]) {
     assert_eq!(rig.driver.started(), 1, "and no other is started");
 }
 
-/// KR-REQ-22.10: a process whose frame stops short while the system has refused it memory ended for
-/// memory, whichever way the daemon saw it end. The control, a frame cut short with no refusal
-/// before it, is `a_frame_cut_short_ends_the_process`.
+/// KR-REQ-22.10: a process whose frame stops short while the system has refused it memory is taken
+/// to have ended for memory, whichever way the daemon saw it end. The control, a frame cut short
+/// with no refusal before it, is `a_frame_cut_short_ends_the_process`.
 #[test]
 fn a_frame_cut_short_after_the_system_refused_memory_ends_as_memory_pressure() {
     let mut rig = Rig::new(&Script {

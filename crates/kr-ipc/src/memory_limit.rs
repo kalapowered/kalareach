@@ -32,9 +32,9 @@
 //!
 //! The job ends the processes in it when its last handle closes. A process that was created held
 //! never runs, so it never reads the end of its input or the end of its owner, and nothing in it
-//! would end it: the job is what does, so an owner that ends, or that loses the limit before it
-//! lets the process run, does not leave a process that never ran. The owner keeps the limit for as
-//! long as the process lives.
+//! would end it: the job is what does, so an owner that ends once the process is in the job, or
+//! that loses the limit before it lets the process run, does not leave a process that never ran.
+//! The owner keeps the limit for as long as the process lives.
 //!
 //! [`around`]: MemoryLimit::around
 
@@ -575,11 +575,11 @@ mod tests {
     }
 
     /// The system refuses every commit a process makes past the limit, and on the build this was
-    /// tried on it records the first. The process asks four times: with nothing done between the first and the second, with a small
-    /// commit kept for the third, and with that commit given back for the fourth. The system
-    /// refuses each, and the limit says so after the first and once. What it holds after the
-    /// others is the system's to post and is printed, not required: on the build this was tried on
-    /// (Windows Server 2025, build 26100) it holds nothing for them.
+    /// tried on it records the first. The process asks four times: with nothing done between the
+    /// first and the second, with a small commit kept for the third, and with that commit given
+    /// back for the fourth. The system refuses each, and the limit says so after the first and
+    /// once. What it holds after the others is the system's to post and is printed, not required:
+    /// on the build this was tried on (Windows Server 2025, build 26100) it holds nothing for them.
     #[test]
     fn a_process_the_system_refuses_four_commits_is_refused_each_time_and_recorded_for_the_first() {
         use std::io::Write as _;
