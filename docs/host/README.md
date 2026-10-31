@@ -4270,9 +4270,11 @@ The host bound is applied from a reading of the environment's spool directories,
 writing at once can take the host past it until the next pass. It is not a reservation, and it is
 not enforced ahead of the write. Two parties apply it, each to its own sessions, from a reading of
 its own. A live session's worker applies it on its maintenance tick, from a reading that it keeps
-for five minutes while its own retained output has not changed and takes again at once when it
-has, because only a session whose output grows can take the host over the cap. A reading that finds
-the host over the cap is not kept. The control daemon applies it
+for five minutes while the session has taken no output and takes again at once when it has, because
+only a session that takes output can take the host over the cap. The session's retained byte count
+is not what says so: after an eviction the resident window still holds bytes the spool gave up, and
+new output that fills it again leaves the count where it was while the files grow. A reading that
+finds the host over the cap is not kept. The control daemon applies it
 every minute to the sessions that have closed, taking the output of the session whose oldest segment
 was written longest ago first. The two keep no order between them, so a live session can give up
 output before a closed one does. The reading is the segment files, each sized by asking the file: a

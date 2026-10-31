@@ -249,33 +249,31 @@ pub struct OutputHistory {
 #[derive(Clone, Copy, Debug)]
 struct HostReading {
     at: std::time::Instant,
-    /// What this session retained then.
-    session_bytes: u64,
+    /// Where this session's output had reached then.
+    output_end: u64,
     /// What the host retained then, this session included.
     host_bytes: u64,
 }
 
-/// How long a measure of the host's retained output stands for the next passes of a session whose
-/// own output has not changed.
+/// How long a measure of the host's retained output stands for the next passes of a session that
+/// has taken no output since.
 ///
 /// Measuring means listing every session's spool and asking each file its size, and every live
 /// session does it on every pass of its maintenance, so twenty sessions made twenty times as many
-/// reads of the same directory each minute. A session whose own retained bytes are what they were
-/// has nothing new to give up for the host's cap unless another session has grown past it, and
-/// that session measures the host itself, on every pass that its own bytes have changed. A reading
-/// that found the host over its cap, or was taken while the files lacked bytes the session counts,
-/// does not stand.
+/// reads of the same directory each minute. A session that has taken no output since has nothing
+/// new to give up for the host's cap unless another session has grown past it, and that session
+/// measures the host itself, on every pass after it took output. What says a session has taken
+/// output is the cursor its output has reached, and not its retained byte count: after an eviction
+/// its resident window still holds bytes the spool gave up, so new output that fills the window
+/// again leaves the count where it was while the files grow. A reading that found the host over
+/// its cap, or was taken while the files lacked bytes the spool counts as held, does not stand.
 const HOST_READING_STANDS_FOR: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
-/// Whether the host's retained output is to be measured again: it has not been, the session's own
-/// has changed since, or the measure is no longer one that stands.
-fn host_reading_due(
-    last: Option<HostReading>,
-    session_bytes: u64,
-    now: std::time::Instant,
-) -> bool {
+/// Whether the host's retained output is to be measured again: it has not been, the session has
+/// taken output since, or the measure is no longer one that stands.
+fn host_reading_due(last: Option<HostReading>, output_end: u64, now: std::time::Instant) -> bool {
     last.is_none_or(|last| {
-        last.session_bytes != session_bytes
+        last.output_end != output_end
             || now.saturating_duration_since(last.at) >= HOST_READING_STANDS_FOR
     })
 }
@@ -965,10 +963,10 @@ impl OutputHistory {
     /// The figure is a reading of `spools`, the directory that holds every session's spool, and
     /// not an authority: [`retained_bytes_under`] sizes each file by asking the file, and a file it
     /// cannot read counts as nothing, which evicts less and not more. A reading that found the
-    /// host under its cap stands for five minutes while the session's own retained
-    /// bytes are unchanged, since only a session whose bytes grow can take the host over its cap,
-    /// and it measures the host itself. The control daemon applies the same cap to the sessions
-    /// that have closed, from a reading of its own.
+    /// host under its cap stands for five minutes while the session has taken no output, since only
+    /// a session that takes output can take the host over its cap, and it measures the host
+    /// itself. The control daemon applies the same cap to the sessions that have closed, from a
+    /// reading of its own.
     pub fn apply_retention_to_host(
         &mut self,
         spools: &Path,
@@ -977,21 +975,22 @@ impl OutputHistory {
         age_permitted: bool,
     ) -> Vec<Eviction> {
         let session_bytes = self.retained_bytes();
+        let output_end = self.next_cursor;
         let now = std::time::Instant::now();
-        let host_bytes = if host_reading_due(self.host_reading, session_bytes, now) {
+        let host_bytes = if host_reading_due(self.host_reading, output_end, now) {
             // Asked before the files are read. The session is held, so no write is owed after this
             // and one that is in flight now is counted here, whether or not it ends while the files
             // are read.
             let files_hold_the_count = self.spool.as_ref().is_none_or(Spool::files_hold_the_count);
             let host_bytes = retained_bytes_under(spools);
             // A reading stands only when the next pass can rely on it. One taken while the files
-            // lack bytes the session counts leaves them out, and they arrive with the session's
-            // own figure unchanged. One that finds the host over its cap is the pass that gives
-            // output up, which may find nothing it can give; the next pass looks again.
+            // lack bytes the spool counts as held leaves them out, and they arrive with the
+            // session taking no output. One that finds the host over its cap is the pass that
+            // gives output up, which may find nothing it can give; the next pass looks again.
             self.host_reading = (files_hold_the_count && host_bytes <= retention.host_cap_bytes)
                 .then_some(HostReading {
                     at: now,
-                    session_bytes,
+                    output_end,
                     host_bytes,
                 });
             host_bytes
@@ -3774,7 +3773,7 @@ mod tests {
         let started = std::time::Instant::now();
         let reading = HostReading {
             at: started,
-            session_bytes: 4_096,
+            output_end: 4_096,
             host_bytes: 1_000_000,
         };
         assert!(
@@ -3842,9 +3841,61 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// KR-PERF-003: output a session appends is measured at once even when its retained byte count
+    /// has not moved. After an eviction for the host cap the resident window still holds the bytes
+    /// the spool gave up, so new output that fills the window again leaves the count where it was
+    /// while the files grow.
+    #[test]
+    fn kr_perf_003_a_session_measures_again_when_output_arrived_though_its_count_did_not_move() {
+        let root = spool_directory("host-reading-window");
+        let retention = OutputRetention::new(
+            std::time::Duration::from_secs(7 * 24 * 60 * 60),
+            100,
+            1 << 20,
+        );
+        let layout = || SpoolLayout::new(8, 1 << 20);
+        let mut other =
+            OutputHistory::with_spool(8, root.join("other.log"), layout()).expect("a spool");
+        other.append(&[b'o'; 96]);
+        let mut this =
+            OutputHistory::with_spool(8, root.join("this.log"), layout()).expect("a spool");
+        this.append(&[b't'; 8]);
+        let now = kr_ipc::now_ms();
+        let taken = this.apply_retention_to_host(&root, retention, now, true);
+        assert_eq!(
+            taken.len(),
+            1,
+            "the files hold 104 bytes under a cap of 100, and this session gives up its segment"
+        );
+        assert_eq!(
+            retained_bytes_under(&root),
+            96,
+            "the window still holds those 8 bytes, so the session's own count is still 8"
+        );
+        assert!(
+            this.apply_retention_to_host(&root, retention, now, true)
+                .is_empty(),
+            "the files hold 96 bytes, under the cap, and the reading of them stands"
+        );
+        this.append(&[b'u'; 8]);
+        assert_eq!(
+            this.retained_bytes(),
+            8,
+            "the window holds the newest 8 bytes, so the count has not moved"
+        );
+        assert_eq!(retained_bytes_under(&root), 104, "and the files hold 104");
+        assert!(
+            !this
+                .apply_retention_to_host(&root, retention, now, true)
+                .is_empty(),
+            "output that arrived is measured at once, whatever the count says"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// KR-PERF-003: a reading taken while a write to the spool is still to be made does not stand.
     /// The session counts the bytes of that write as held and the files do not have them yet, so
-    /// the files outgrow the reading once it is made, with the session's own figure unchanged.
+    /// the files outgrow the reading once it is made, with the session taking no output.
     #[test]
     fn kr_perf_003_a_reading_taken_with_a_write_still_to_be_made_does_not_stand() {
         let root = spool_directory("host-reading-owed");
@@ -3874,15 +3925,15 @@ mod tests {
             !owing
                 .apply_retention_to_host(&root, retention, now, true)
                 .is_empty(),
-            "the files hold 102 bytes, which the next pass finds although the session's own figure \
-             has not moved"
+            "the files hold 102 bytes, which the next pass finds although the session has taken no \
+             output"
         );
         std::fs::remove_dir_all(&root).ok();
     }
 
     /// KR-PERF-003: nor does a reading taken after a write to the spool failed and before the
     /// failure is settled. The spool then stops, and takes the output its window holds when the
-    /// pass resumes it, which grows the files with the session's own figure unchanged.
+    /// pass resumes it, which grows the files with the session taking no output.
     #[test]
     fn kr_perf_003_a_reading_taken_before_a_failed_write_is_settled_does_not_stand() {
         let root = spool_directory("host-reading-failed");
@@ -3913,8 +3964,8 @@ mod tests {
             !failing
                 .apply_retention_to_host(&root, retention, now, true)
                 .is_empty(),
-            "the files hold 102 bytes, which the next pass finds although the session's own \
-             figure has not moved"
+            "the files hold 102 bytes, which the next pass finds although the session has taken \
+             no output"
         );
         std::fs::remove_dir_all(&root).ok();
     }
