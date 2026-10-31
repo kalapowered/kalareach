@@ -208,6 +208,11 @@ type Ended = BackupEnableResult;
 /// admitted to refused with nothing on its path to notice, and this is the last point before the
 /// request leaves. The client reports the refusal as its own failure to send, so the admission's
 /// refusal is kept here and the call ends with it ([`Self::ended`]).
+///
+/// The renewal that asking for the token may start is not stopped by a lapse: a renewal under way
+/// is not dropped, because the account service treats a refresh token it already rotated as a
+/// replay and ends the sign-in. It changes only this host's own sign-in, and `backup.status`
+/// renews in the same way.
 struct Admitted {
     inner: Arc<dyn AccountTokenSource>,
     admission: Arc<dyn SetupAdmission>,
@@ -535,11 +540,14 @@ impl BackupSetup {
     /// # Errors
     ///
     /// Returns [`ControllerError::InvalidArgument`] for a call whose fingerprint is not the one its
-    /// recovery public key has, and the admission's refusal when it no longer stands as a request
-    /// to the service leaves or where the setup is to be recorded, or when a repeat is answered
-    /// from a setup already recorded and its registration is gone: nothing is recorded by the call
-    /// then, and what the service already holds is harmless, as after any call that ends before
-    /// the record. Every other way the call can end is one of its answers.
+    /// recovery public key has, and the admission's refusal when it no longer stands before a
+    /// request to the storage service leaves or where the setup is to be recorded, or when a repeat
+    /// is answered from a setup already recorded and its registration is gone: nothing is recorded
+    /// by the call then, and what the service already holds is harmless, as after any call that
+    /// ends before the record. A call that is declined before it sends anything, because another
+    /// setup is recorded, its keys changed or no account is signed in, is not asked: it states a
+    /// fact of this host, sends nothing and records nothing. Every other way the call can end is
+    /// one of its answers.
     pub async fn enable(
         &self,
         params: BackupEnableParams,
