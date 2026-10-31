@@ -5671,7 +5671,10 @@ async fn an_integration_failure_before_qualification_closes_the_creating_session
         outcome.close_session,
         Some(IntegrationLoss::PostStartupFailure)
     );
-    let record = tokio::time::timeout(SOON, wired.runtime.wait_closed())
+    // A close always spends the worker's drain, and one whose shell has not ended when it is asked
+    // spends the grace period before it forces it, so the wait is for as long as a close can take
+    // and not for the moments a quiet machine needs: it ends only a close that never comes.
+    let record = tokio::time::timeout(Duration::from_secs(30), wired.runtime.wait_closed())
         .await
         .expect("the session closed");
     assert_eq!(record.reason, ClosureReason::RootLaunchFailed);
