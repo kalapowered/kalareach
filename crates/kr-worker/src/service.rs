@@ -193,6 +193,46 @@ struct Owed {
     reach: kr_protocol::worker::RevisionReach,
 }
 
+/// The reading connection the control daemon's attention link reads the session's journal through,
+/// and the last page it read that carried nothing.
+struct AttentionReader {
+    journal: crate::journal::Journal,
+    empty: Option<EmptyPage>,
+}
+
+/// A page that carried no record, and what it was read under.
+struct EmptyPage {
+    /// The journal file's data version when the page was read.
+    version: i64,
+    asked: AskedPage,
+    page: kr_protocol::attention::AttentionSourcePage,
+}
+
+/// What a request for a page asks, other than which request it is: everything the page is made
+/// from besides the journal.
+#[derive(PartialEq, Eq)]
+struct AskedPage {
+    questions_after: u64,
+    approvals_after: u64,
+    host_events_after: u64,
+    max_records: u64,
+    fingerprint_key: [u8; 32],
+    max_bytes: usize,
+}
+
+impl AskedPage {
+    fn of(request: &kr_protocol::attention::AttentionSourcesRequest, max_bytes: usize) -> Self {
+        Self {
+            questions_after: request.questions_after.get(),
+            approvals_after: request.approvals_after.get(),
+            host_events_after: request.host_events_after.get(),
+            max_records: request.max_records.get(),
+            fingerprint_key: *request.fingerprint_key.expose(),
+            max_bytes,
+        }
+    }
+}
+
 /// The worker's endpoint server.
 pub struct WorkerService {
     runtime: Arc<SessionRuntime>,
@@ -254,7 +294,7 @@ pub struct WorkerService {
     /// The link reads beside the session rather than through it, so a page being read or held
     /// never waits for the session's lock and the session never waits for the link. It is opened
     /// on first use and again after a read fails.
-    attention_reader: Mutex<Option<crate::journal::Journal>>,
+    attention_reader: Mutex<Option<AttentionReader>>,
     /// Woken when the session's journal commits a host event, a privacy transition, or a
     /// transition of a pending approval the broker records.
     journal_changes: Option<Arc<tokio::sync::Notify>>,
@@ -268,6 +308,10 @@ pub struct WorkerService {
     /// begun to wait. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     held_attention_requests: std::sync::atomic::AtomicU64,
+    /// How many pages were read from the journal rather than answered from the last one nothing
+    /// had changed since. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    attention_pages_read: std::sync::atomic::AtomicU64,
     /// The newest broker record the page read at the latest wait had, whether or not the page
     /// carried it. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
@@ -565,6 +609,15 @@ impl WorkerService {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// How many pages of attention sources were read from the journal, for this host's own tests;
+    /// a page answered from the last one, because nothing was committed since, is not counted.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn attention_pages_read(&self) -> u64 {
+        self.attention_pages_read
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// The newest broker record the page read at the latest wait had: a record that a request
     /// found, and did not answer for, is behind this number, so a test that waits for it to reach
     /// a record knows the worker has read that record and held the request on it.
@@ -705,6 +758,8 @@ impl WorkerService {
             deadline_clock,
             #[cfg(feature = "testing")]
             held_attention_requests: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "testing")]
+            attention_pages_read: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "testing")]
             held_attention_approvals_head: std::sync::atomic::AtomicU64::new(0),
             attention_fence,
@@ -3554,6 +3609,15 @@ impl WorkerService {
         &self,
         read: impl FnOnce(&crate::journal::Journal) -> Result<T>,
     ) -> Result<T> {
+        self.with_attention_reader(|reader| read(&reader.journal))
+    }
+
+    /// Runs `read` on the attention link's reading connection, opening it first when it is not
+    /// open, and dropping it when the read fails.
+    fn with_attention_reader<T>(
+        &self,
+        read: impl FnOnce(&mut AttentionReader) -> Result<T>,
+    ) -> Result<T> {
         let mut reader =
             self.attention_reader
                 .lock()
@@ -3567,14 +3631,68 @@ impl WorkerService {
                         .to_owned(),
                 });
             };
-            *reader = Some(crate::journal::Journal::open_read_only(path)?);
+            *reader = Some(AttentionReader {
+                journal: crate::journal::Journal::open_read_only(path)?,
+                empty: None,
+            });
         }
-        let journal = reader.as_ref().expect("the reader was opened a moment ago");
-        let answer = read(journal);
+        let answer = read(reader.as_mut().expect("the reader was opened a moment ago"));
         if answer.is_err() {
             *reader = None;
         }
         answer
+    }
+
+    /// Reads one page of the attention sources past the cursors `request` names.
+    ///
+    /// A page that carries no record is a statement about the journal as it stood, so while no
+    /// other connection has committed to the file since, the same request is answered with it
+    /// again and the journal is not read. An idle session's journal is not written, and the
+    /// daemon's request for it is the same each time: reading it again is a dozen statements for
+    /// the answer it gave a moment ago. A page that carries a record is never kept, since it holds
+    /// text that privacy mode may take away; the next read of the journal is the one that knows.
+    fn read_attention_page(
+        &self,
+        request: &kr_protocol::attention::AttentionSourcesRequest,
+        built_at_boot_ms: u64,
+        max_bytes: usize,
+    ) -> Result<kr_protocol::attention::AttentionSourcePage> {
+        self.with_attention_reader(|reader| {
+            let asked = AskedPage::of(request, max_bytes);
+            // Taken before the journal is read, so a commit that lands while it is being read
+            // leaves a version that no later look matches.
+            let version = reader.journal.data_version().ok();
+            if let (Some(version), Some(kept)) = (version, reader.empty.as_ref())
+                && kept.version == version
+                && kept.asked == asked
+            {
+                let mut page = kept.page.clone();
+                page.request_id = request.request_id;
+                page.built_at_boot_ms = kr_protocol::scalars::U64::new(built_at_boot_ms);
+                return Ok(page);
+            }
+            #[cfg(feature = "testing")]
+            self.attention_pages_read
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let page = crate::attention_source::page(
+                &reader.journal,
+                request,
+                built_at_boot_ms,
+                max_bytes,
+            )?;
+            reader.empty = version
+                .filter(|_| {
+                    page.questions.records.is_empty()
+                        && page.approvals.records.is_empty()
+                        && page.host_events.records.is_empty()
+                })
+                .map(|version| EmptyPage {
+                    version,
+                    asked,
+                    page: page.clone(),
+                });
+            Ok(page)
+        })
     }
 
     /// Returns the privacy generation the session's journal holds, read through the attention
@@ -3721,9 +3839,7 @@ impl WorkerService {
                 .as_ref()
                 .map(|changes| changes.notified());
             let built_at = self.shared_clock.boot_elapsed_ms();
-            let mut page = match self.read_attention(|journal| {
-                crate::attention_source::page(journal, &request, built_at, pending.max_bytes)
-            }) {
+            let mut page = match self.read_attention_page(&request, built_at, pending.max_bytes) {
                 Ok(page) => page,
                 Err(error) => return Some(failure(request.request_id, &error.to_protocol_error())),
             };

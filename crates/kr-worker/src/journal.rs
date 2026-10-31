@@ -752,6 +752,20 @@ impl Journal {
             .transpose()
     }
 
+    /// SQLite's count of the commits other connections have made to this journal's file since
+    /// this connection began: the same number twice means nothing was committed between the two
+    /// readings. It says nothing of this connection's own commits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    pub fn data_version(&self) -> Result<i64> {
+        self.connection
+            .prepare_cached("PRAGMA data_version")
+            .and_then(|mut statement| statement.query_row([], |row| row.get(0)))
+            .map_err(|error| faulted(&self.health, error))
+    }
+
     /// Whether this journal's file holds a table.
     fn has_table(&self, name: &str) -> Result<bool> {
         let present: i64 = self
