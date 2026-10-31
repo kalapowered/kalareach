@@ -919,6 +919,7 @@ pub fn remove_units_in(
     if !runtime.join("systemd/private").exists() {
         return left;
     }
+    let began = Instant::now();
     let manager = || {
         let mut command = Command::new(systemctl);
         command.arg("--user");
@@ -993,12 +994,22 @@ pub fn remove_units_in(
                 // Asked as every other question that decides a unit's fate is: late answers are
                 // waited for and a failed one is asked again, so that a slow manager does not make
                 // the teardown blame a unit that was collected after the list was read.
-                match asked_again_until_answered(give_up_after, |bound| {
-                    run_bounded_output_within(
-                        manager().args(["show", "--property=WorkingDirectory", "--value", unit]),
-                        bound,
-                    )
-                }) {
+                // What is left of the time the whole teardown is given, so that a manager that
+                // answers none of these costs the teardown no more than it is given.
+                match asked_again_until_answered(
+                    give_up_after.saturating_sub(began.elapsed()),
+                    |bound| {
+                        run_bounded_output_within(
+                            manager().args([
+                                "show",
+                                "--property=WorkingDirectory",
+                                "--value",
+                                unit,
+                            ]),
+                            bound,
+                        )
+                    },
+                ) {
                     Ok(directory) if !inside_the_tree(directory.trim()) => continue,
                     Ok(_) => left.push(format!(
                         "the systemd unit {unit} runs in this tree and has no file in {}, where \
