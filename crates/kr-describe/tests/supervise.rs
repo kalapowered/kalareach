@@ -2193,18 +2193,21 @@ fn a_process_that_commits_memory_as_it_starts_is_refused_by_the_systems_limit() 
 /// KR-REQ-22.10: a start that fails after it created the process leaves no process behind, even
 /// when it fails by a panic, and on Windows the process it created has not run. A process created
 /// held does not run, so it never reads that its owner has gone, and nothing but the start itself
-/// would end it. The start is made to panic at the last point before the limit, and the process
-/// is looked for as soon as the panic has been caught.
+/// would end it. The start is made to panic at the last point before the limit. The process is read
+/// by its identifier and its start at that point, so that a process that takes the identifier
+/// afterwards is not taken for it, and is looked for as soon as the panic has been caught.
 #[cfg(windows)]
 #[test]
 fn a_start_that_panics_after_creating_the_process_leaves_no_held_process() {
     use kr_describe::testing::before_the_next_limit;
 
     let mut rig = Rig::limited(&Script::default(), ResourceSettings::default(), None, true);
-    let created = std::rc::Rc::new(std::cell::Cell::new(None));
+    let created = std::rc::Rc::new(std::cell::RefCell::new(None));
     let seen = std::rc::Rc::clone(&created);
     before_the_next_limit(move |pid| {
-        seen.set(Some(pid));
+        *seen.borrow_mut() = Some(
+            kr_ipc::identity::process_start_identity(pid).expect("the process the start created"),
+        );
         panic!("the start fails after it created the process, as a test asked");
     });
     queue(rig.service(), &session(1), Priority::Ordinary, at(0));
@@ -2212,12 +2215,15 @@ fn a_start_that_panics_after_creating_the_process_leaves_no_held_process() {
         rig.driver.turn(&roomy(), at(3_000))
     }));
     assert!(outcome.is_err(), "the start panicked");
-    let pid = sysinfo::Pid::from_u32(created.get().expect("the process was created"));
-    let mut system = sysinfo::System::new();
-    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
-    if let Some(left) = system.process(pid) {
-        left.kill();
-        panic!("the process the start created was left behind");
+    let identity = created
+        .borrow_mut()
+        .take()
+        .expect("the process was created");
+    if kr_ipc::identity::process_state(&identity) != kr_ipc::identity::ProcessState::Ended {
+        // Ended through the identity, which holds the process it names open and leaves a process
+        // that has taken the identifier since alone.
+        let _ = kr_ipc::identity::stop_process(&identity, kr_ipc::identity::Stop::Kill);
+        panic!("the process the start created was left behind: {identity:?}");
     }
 }
 
