@@ -38,7 +38,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use kr_client::services::ServiceSigner;
 use kr_delivery::destination::{DestinationId, DestinationRecord};
@@ -227,6 +227,9 @@ pub struct DeliveryRuntime {
     /// document selects one.
     mailbox: OnceLock<kr_protocol::service::GatewayOrigin>,
     recovered: AtomicBool,
+    /// Woken when recovery succeeds and when a transport is attached: the two things the question
+    /// loop waits for before its first sweep.
+    ready: Arc<tokio::sync::Notify>,
     /// What each paired device may still ask the gateway about a credential it hands over, for
     /// each kind of registration.
     confirmations:
@@ -272,6 +275,7 @@ impl DeliveryRuntime {
             pairings: OnceLock::new(),
             mailbox: OnceLock::new(),
             recovered: AtomicBool::new(false),
+            ready: Arc::new(tokio::sync::Notify::new()),
             confirmations: Mutex::new(std::collections::BTreeMap::new()),
             nonces: StatusBudget::new(CONFIRMATIONS_PER_HOST),
             sweeping: Mutex::new(()),
@@ -398,6 +402,7 @@ impl DeliveryRuntime {
             .is_ok();
         if attached {
             self.credentials.attach_renewal(senders);
+            self.ready.notify_one();
         }
         attached
     }
@@ -479,6 +484,7 @@ impl DeliveryRuntime {
         match tokio::task::spawn_blocking(move || recovering.recover()).await {
             Ok(Ok(_)) => {
                 self.recovered.store(true, Ordering::Release);
+                self.ready.notify_one();
                 true
             }
             Ok(Err(error)) => {
@@ -843,28 +849,76 @@ async fn drive_passes(runtime: Weak<DeliveryRuntime>, cadence: Cadence) {
     }
 }
 
-/// The question loop: a sweep whenever [`Cadence::questions`] has passed since the last one that
-/// could run, checked on every pass tick, until the runtime goes.
+/// What the question loop does next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuestionStep {
+    /// Wait until recovery has succeeded or a transport is attached.
+    AwaitReadiness,
+    /// Wait until the next sweep is due.
+    SleepUntil(tokio::time::Instant),
+    /// Sweep now.
+    Ask,
+}
+
+/// What the question loop does next, given whether it can ask at all, when it last did, and how
+/// long it leaves between sweeps. It is woken for nothing in between.
+fn next_question_step(
+    able: bool,
+    asked_at: Option<tokio::time::Instant>,
+    every: Duration,
+    now: tokio::time::Instant,
+) -> QuestionStep {
+    if !able {
+        return QuestionStep::AwaitReadiness;
+    }
+    match asked_at.map(|at| at + every) {
+        Some(due) if due > now => QuestionStep::SleepUntil(due),
+        _ => QuestionStep::Ask,
+    }
+}
+
+/// The question loop: a sweep as soon as the runtime has recovered and been given a transport, and
+/// the next one [`Cadence::questions`] after each, until the runtime goes.
+///
+/// It waits for the moment a sweep is due and for nothing else, so an idle host spends no wake on
+/// it between sweeps.
 async fn drive_questions(runtime: Weak<DeliveryRuntime>, cadence: Cadence) {
-    let mut ticker = tokio::time::interval(cadence.pass);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut asked_at: Option<Instant> = None;
+    let mut asked_at: Option<tokio::time::Instant> = None;
     loop {
-        ticker.tick().await;
-        let Some(runtime) = runtime.upgrade() else {
+        let Some(held) = runtime.upgrade() else {
             return;
         };
-        if !runtime.is_recovered() || !runtime.is_attached() {
-            continue;
-        }
-        if asked_at.is_some_and(|at| at.elapsed() < cadence.questions) {
-            continue;
-        }
-        let ran = tokio::task::spawn_blocking(move || runtime.ask())
-            .await
-            .unwrap_or(false);
-        if ran {
-            asked_at = Some(Instant::now());
+        // Taken before the checks, so a readiness that comes between them and the wait is kept.
+        let readiness = Arc::clone(&held.ready);
+        let ready = readiness.notified();
+        tokio::pin!(ready);
+        ready.as_mut().enable();
+        let able = held.is_recovered() && held.is_attached();
+        match next_question_step(
+            able,
+            asked_at,
+            cadence.questions,
+            tokio::time::Instant::now(),
+        ) {
+            QuestionStep::AwaitReadiness => {
+                drop(held);
+                ready.await;
+            }
+            QuestionStep::SleepUntil(due) => {
+                drop(held);
+                tokio::time::sleep_until(due).await;
+            }
+            QuestionStep::Ask => {
+                let ran = tokio::task::spawn_blocking(move || held.ask())
+                    .await
+                    .unwrap_or(false);
+                if ran {
+                    asked_at = Some(tokio::time::Instant::now());
+                } else {
+                    // Nothing to ask through yet: look again after a pass, not at once.
+                    tokio::time::sleep(cadence.pass).await;
+                }
+            }
         }
     }
 }
@@ -873,5 +927,46 @@ fn storage(error: kr_delivery::DeliveryError) -> crate::error::ControllerError {
     crate::error::ControllerError::Storage {
         operation: "read the configured delivery destinations",
         detail: error.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{QuestionStep, next_question_step};
+
+    /// KR-PERF-003: an idle daemon's question loop is woken for the moment a sweep is due and for
+    /// nothing in between, where it used to look at every pass.
+    #[test]
+    fn kr_perf_003_the_question_loop_waits_for_readiness_and_then_for_its_due_moment() {
+        let now = tokio::time::Instant::now();
+        let every = Duration::from_secs(300);
+
+        assert_eq!(
+            next_question_step(false, None, every, now),
+            QuestionStep::AwaitReadiness,
+            "before recovery or a transport it waits to be told"
+        );
+        assert_eq!(
+            next_question_step(false, Some(now), every, now),
+            QuestionStep::AwaitReadiness,
+            "and again if it has lost either"
+        );
+        assert_eq!(
+            next_question_step(true, None, every, now),
+            QuestionStep::Ask,
+            "the first sweep is made as soon as it can ask"
+        );
+        assert_eq!(
+            next_question_step(true, Some(now), every, now + every / 2),
+            QuestionStep::SleepUntil(now + every),
+            "after a sweep it waits for the whole of the next period, not for a look at each pass"
+        );
+        assert_eq!(
+            next_question_step(true, Some(now), every, now + every),
+            QuestionStep::Ask,
+            "and sweeps when the period is over"
+        );
     }
 }
