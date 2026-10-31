@@ -5672,8 +5672,9 @@ async fn an_integration_failure_before_qualification_closes_the_creating_session
         Some(IntegrationLoss::PostStartupFailure)
     );
     // A close always spends the worker's drain, and one whose shell has not ended when it is asked
-    // spends the grace period before it forces it, so the wait is for as long as a close can take
-    // and not for the moments a quiet machine needs: it ends only a close that never comes.
+    // spends the grace period before it forces it. Thirty seconds is the allowance this file's
+    // other waits for a close use: a close that takes longer fails the case, whether it comes late
+    // or never.
     let record = tokio::time::timeout(Duration::from_secs(30), wired.runtime.wait_closed())
         .await
         .expect("the session closed");

@@ -201,6 +201,66 @@ fn copy_directory_into(root: &Path, relative: &str) {
 /// this is only what a loaded machine adds to the moments they need.
 const JOBS_END_WITHIN: Duration = Duration::from_secs(60);
 
+/// How long a script is given to end. A script runs to the point where it starts the emulator, and
+/// the longest takes seconds; one that waits for a device that is not there waits for good.
+const SCRIPT_ENDS_WITHIN: Duration = Duration::from_secs(300);
+
+/// Runs `command` to its end within `bound`, ending it when it has not ended, and gives what it
+/// printed. A command that outlasts the bound, or that leaves something running which holds its
+/// output, fails the case with the command named, where a wait for it would hold the suite.
+fn to_its_end(mut command: Command, bound: Duration) -> std::process::Output {
+    use std::process::Stdio;
+
+    fn read_aside(
+        mut stream: impl std::io::Read + Send + 'static,
+    ) -> std::sync::mpsc::Receiver<Vec<u8>> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stream.read_to_end(&mut bytes);
+            let _ = sender.send(bytes);
+        });
+        receiver
+    }
+
+    let what = format!("{command:?}");
+    let begun = Instant::now();
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("{what} could not be started: {error}"));
+    let stdout = read_aside(child.stdout.take().expect("its standard output"));
+    let stderr = read_aside(child.stderr.take().expect("its standard error"));
+    let status = loop {
+        match child.try_wait().expect("its state") {
+            Some(status) => break status,
+            None if begun.elapsed() < bound => std::thread::sleep(Duration::from_millis(5)),
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{what} did not end within {bound:?}");
+            }
+        }
+    };
+    let rest = bound
+        .saturating_sub(begun.elapsed())
+        .max(Duration::from_secs(1));
+    let mut collect = |stream: &std::sync::mpsc::Receiver<Vec<u8>>| {
+        stream.recv_timeout(rest).unwrap_or_else(|_| {
+            panic!("{what} ended and something it started still holds its output after {rest:?}")
+        })
+    };
+    let out = collect(&stdout);
+    let err = collect(&stderr);
+    std::process::Output {
+        status,
+        stdout: out,
+        stderr: err,
+    }
+}
+
 /// `path` as an extended regular expression that matches it as it is written and ends at the end
 /// of a name: the next character is not one a name is made of, or the line ends.
 fn as_a_directory_pattern(path: &Path) -> String {
@@ -224,25 +284,30 @@ fn as_a_directory_pattern(path: &Path) -> String {
 /// that is being replaced by another program can show no command line for a moment, so the
 /// directory has to be found by no look twice, a moment apart, before the jobs count as over.
 fn until_nothing_of_the_case_runs(root: &Path) {
+    until_nothing_runs_in(Path::new("pgrep"), root, JOBS_END_WITHIN);
+}
+
+/// [`until_nothing_of_the_case_runs`], asking the processes' command lines of `pgrep`, a program
+/// that is given `ends_within` for the whole wait and for each look.
+fn until_nothing_runs_in(pgrep: &Path, root: &Path, ends_within: Duration) {
     let pattern = as_a_directory_pattern(root);
     let begun = Instant::now();
     let mut unseen = 0;
     while unseen < 2 {
-        let found = Command::new("pgrep")
-            .arg("-f")
-            .arg("--")
-            .arg(&pattern)
-            .stdout(std::process::Stdio::null())
-            .status()
-            .expect("pgrep lists the processes that name the case's directory");
+        let mut look = Command::new(pgrep);
+        look.arg("-f").arg("--").arg(&pattern);
+        let left = ends_within.saturating_sub(begun.elapsed());
+        // A look that blocks, on a process whose command line cannot be read, is bounded by what
+        // is left of the wait.
+        let found = to_its_end(look, left.max(Duration::from_secs(1))).status;
         // 0 when some process matches, 1 when none does; anything else is pgrep's own failure.
         match found.code() {
             Some(1) => unseen += 1,
             Some(0) => {
                 unseen = 0;
                 assert!(
-                    begun.elapsed() < JOBS_END_WITHIN,
-                    "something the script started in {} was still running {JOBS_END_WITHIN:?} after \
+                    begun.elapsed() < ends_within,
+                    "something the script started in {} was still running {ends_within:?} after \
                      it ended",
                     root.display()
                 );
@@ -481,7 +546,7 @@ fn run(
     for (name, value) in script.env.iter().chain(extra.iter()) {
         command.env(name, value);
     }
-    let output = command.output().expect("the script runs");
+    let output = to_its_end(command, SCRIPT_ENDS_WITHIN);
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
     // A script starts its emulator as a background job and may end before that job has run its
@@ -681,5 +746,52 @@ fn no_script_chooses_a_virtual_device_except_through_the_library() {
     assert_eq!(
         starting, cases,
         "the scripts that start a virtual device are the ones the cases run"
+    );
+}
+
+/// The wait for a case's jobs sees them: a process that has the case's directory in its command line
+/// is over when the wait returns. A wait whose pattern matches nothing returns at once and shows
+/// nothing, and the record it then reads has not got the calls the job has yet to make.
+#[test]
+fn the_wait_for_the_jobs_of_a_case_sees_a_process_that_names_the_cases_directory() {
+    let directory = TempDir::new().expect("a directory");
+    let root = directory.path();
+    let marker = root.join("marker");
+    // A job that does its work a moment after it starts, and names the case's directory only in its
+    // command line, as the jobs of a script do.
+    let mut job = Command::new("/bin/sh")
+        .args(["-c", "sleep 1; : > \"$1\"", "job"])
+        .arg(&marker)
+        .spawn()
+        .expect("starts the job");
+    until_nothing_of_the_case_runs(root);
+    let recorded = marker.exists();
+    let _ = job.wait();
+    assert!(
+        recorded,
+        "the wait returned while a process that names the case's directory was still running"
+    );
+}
+
+/// A look at the processes that never ends fails the case with the look named, in the time the
+/// wait is given, where a wait for it would hold the suite for good.
+#[test]
+fn a_look_at_the_processes_that_never_ends_fails_the_case_and_names_the_look() {
+    let directory = TempDir::new().expect("a directory");
+    let tools = directory.path().join("tools");
+    let record = directory.path().join("record");
+    stand_in(&tools, "pgrep", &record, "exec sleep 600");
+    let failed = std::panic::catch_unwind(|| {
+        until_nothing_runs_in(
+            &tools.join("pgrep"),
+            directory.path(),
+            Duration::from_secs(2),
+        );
+    });
+    let panic = failed.expect_err("a look that never ends fails the case");
+    let said = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(
+        said.contains("pgrep") && said.contains("did not end within"),
+        "{said}"
     );
 }
