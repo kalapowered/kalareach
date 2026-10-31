@@ -3738,10 +3738,6 @@ mod tests {
         std::fs::remove_dir_all(&directory).ok();
     }
 
-    /// KR-REQ-20.20, the part about the host cap's measure on Windows: a segment held open and
-    /// written through its handle is sized by the bytes written to it, so the retained output the
-    /// 1 GiB host cap is held against is not undercounted while a spool is being written. Not shown
-    /// here: the cap being applied to that figure.
     /// KR-PERF-003: a session that is idle measures the host's retained output once in a while and
     /// not on every pass of its maintenance, and measures again at once when its own output moved.
     #[test]
@@ -3774,6 +3770,10 @@ mod tests {
         );
     }
 
+    /// KR-REQ-20.20, the part about the host cap's measure on Windows: a segment held open and
+    /// written through its handle is sized by the bytes written to it, so the retained output the
+    /// 1 GiB host cap is held against is not undercounted while a spool is being written. Not shown
+    /// here: the cap being applied to that figure.
     #[test]
     fn the_host_measure_sizes_a_segment_that_is_open_for_append_by_the_bytes_written_to_it() {
         use std::io::Write as _;
