@@ -1606,6 +1606,18 @@ async fn left_by_an_earlier_run(
     kept: &RecoverySeed,
     sealed_under: &RecoverySeed,
 ) {
+    left_by_an_earlier_run_at(computer, &computer.served, kept, sealed_under).await;
+}
+
+/// As [`left_by_an_earlier_run`], with the bundle put at the service `put_at` through a second
+/// store, in the place of the service the record names: the way a fork's client of a service of its
+/// own took the earlier write while the record kept the origin it was made for.
+async fn left_by_an_earlier_run_at(
+    computer: &Computer,
+    put_at: &Served,
+    kept: &RecoverySeed,
+    sealed_under: &RecoverySeed,
+) {
     store_recovery_seed(&*computer.secrets, SEED_SCOPE, kept).expect("the seed is kept");
     // The directory an earlier run made: recovery keeps its records in an owner-only directory.
     kr_ipc::paths::create_private_directory(&computer.data.path().join("recovery"))
@@ -1620,7 +1632,7 @@ async fn left_by_an_earlier_run(
         .as_bytes(),
     )
     .expect("the record");
-    let origin = computer.origin();
+    let origin = GatewayOrigin::new(put_at.origin()).expect("an origin");
     let http = HttpService::with(
         origin.clone(),
         HttpDeadlines::default(),
@@ -2377,6 +2389,160 @@ async fn a_lost_write_is_settled_and_the_host_covered_at_the_records_service_whe
     assert!(
         asked.iter().all(|(origin, _)| *origin == ours),
         "{asked:?}: nothing was asked for the service the setting names"
+    );
+    assert!(
+        computer.served.web().arrived().is_empty(),
+        "the fork's service took the place of the service the record names"
+    );
+    assert!(
+        setting.web().arrived().is_empty(),
+        "the service the setting names was sent nothing"
+    );
+}
+
+/// KR-REQ-17.14: a host set up under another kit is replaced through the clients the application
+/// was given, and at the service the record names, when only the setting changes. With the record
+/// kept through a fork's client, the account signed in at the record's service and the setting
+/// naming another, covering the host with a replacement writes the bundle at the fork's service
+/// before the host is asked, as covering it without one does. Every ask of the clients is for the
+/// record's origin, and neither the service the record names nor the one the setting names is sent
+/// anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replacement_cover_goes_through_the_clients_at_the_records_service_when_the_setting_names_another()
+ {
+    let computer = Computer::new().await;
+    let fork_service = serve().await;
+    let setting = serve().await;
+    let (recording, page) =
+        with_an_unkept_record_and_the_setting_moved(&computer, &fork_service, &setting).await;
+    let ours = computer.served.origin().to_owned();
+    let on = page
+        .call("recovery_turn_on", json!({}))
+        .expect("recovery goes on with the record it began");
+    assert_eq!(on["state"], "on", "{on}");
+
+    let host = Host::new(&computer, computer.served.origin()).reading_bundles_at(&fork_service);
+    host.sets_up();
+    let earlier = kr_protocol::ids::ArchiveId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16]));
+    host.with_setup(BackupSetupState::Committed {
+        archive_id: earlier,
+        kit_fingerprint: "CCCC-DDDD".to_owned(),
+        recovery_public_key: another_recipient(),
+        enabled_at_ms: TimestampMs::new(1),
+        unusable: kr_protocol::scalars::Nullable::null(),
+    });
+    let written = writes_at(&fork_service);
+    let replaced = page
+        .recovery
+        .cover_host(&page.account, &host, true)
+        .await
+        .expect("the host is replaced");
+    assert!(
+        matches!(
+            replaced,
+            HostCoverView::Covered { replaced: Some(ref kit), already: false, .. }
+                if kit == "CCCC-DDDD"
+        ),
+        "{replaced:?}"
+    );
+    let sent = host.setups_sent();
+    assert_eq!(sent.len(), 1, "the host was asked once");
+    assert!(sent[0].0.replace, "the host was asked to replace");
+    assert_ne!(sent[0].0.archive_id, earlier, "a new archive");
+    assert!(
+        sent[0].1,
+        "the bundle was at the record's service when the host was asked"
+    );
+    assert!(
+        writes_at(&fork_service) > written,
+        "the bundle was written through the client the application was given"
+    );
+
+    let asked = recording.asked.lock().expect("the record").clone();
+    assert!(
+        asked.iter().all(|(origin, _)| *origin == ours),
+        "{asked:?}: nothing was asked for the service the setting names"
+    );
+    assert!(
+        computer.served.web().arrived().is_empty(),
+        "the fork's service took the place of the service the record names"
+    );
+    assert!(
+        setting.web().arrived().is_empty(),
+        "the service the setting names was sent nothing"
+    );
+}
+
+/// KR-REQ-17.14: turning recovery on adopts an earlier write that landed through the clients the
+/// application was given, and at the service the record names, when only the setting changes. With
+/// a record made and not kept, and a bundle at its locator that this computer's seed opens, put at
+/// the fork's service by an earlier run, the write is turned back as a conflict and the bundle is
+/// read there, with the record's origin asked for and the account presenting. Nothing is written
+/// over the bundle, and the service the record names and the one the setting names are sent
+/// nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turning_recovery_on_adopts_an_earlier_write_at_the_records_service_when_the_setting_names_another()
+ {
+    let computer = Computer::new().await;
+    let fork_service = serve().await;
+    let setting = serve().await;
+    let seed = RecoverySeed::generate().expect("a seed");
+    left_by_an_earlier_run_at(&computer, &fork_service, &seed, &seed).await;
+    let recording = Recording::at(
+        &fork_service,
+        computer.identity().keys.authorisation.clone(),
+    );
+    let page = computer.start_with(
+        account(&computer.origin(), Some(&RECOVERY_BACKUP_SCOPES)).await,
+        Some(Arc::clone(&recording) as _),
+    );
+    page.call("sync_service_set", json!({ "origin": setting.origin() }))
+        .expect("another service is chosen");
+    let ours = computer.served.origin().to_owned();
+    let view = page.view();
+    assert_eq!(view["state"], "unfinished", "{view}");
+    assert_eq!(view["kept_at"], host_of(&ours), "{view}");
+    assert_eq!(view["blocker"], Value::Null, "{view}");
+    let (_, held) = fork_service
+        .web()
+        .bundle_write(LOCATOR)
+        .expect("the earlier write landed at the fork's service");
+
+    let before = fork_service.web().arrived().len();
+    let on = page
+        .call("recovery_turn_on", json!({}))
+        .expect("recovery goes on from the earlier write");
+    assert_eq!(on["state"], "on", "{on}");
+    let arrived = fork_service.web().arrived();
+    let members = |member: &str| {
+        arrived[before..]
+            .iter()
+            .filter(|request| request.body.get(member).is_some())
+            .count()
+    };
+    assert_eq!(members("exchange"), 1, "the write was turned back once");
+    assert_eq!(
+        members("compare"),
+        1,
+        "the bundle was read at the fork's service"
+    );
+    assert!(
+        arrived[before..]
+            .iter()
+            .all(|request| request.token.as_deref() == Some(TOKEN)),
+        "every request carried the account's token"
+    );
+    assert_eq!(
+        fork_service.web().bundle_write(LOCATOR),
+        Some((1, held)),
+        "nothing was written over the bundle"
+    );
+    let asked = recording.asked.lock().expect("the record").clone();
+    assert!(
+        asked
+            .iter()
+            .all(|(origin, presenting)| *origin == ours && *presenting),
+        "{asked:?}: the bundle is read at the record's service, presenting the account"
     );
     assert!(
         computer.served.web().arrived().is_empty(),
