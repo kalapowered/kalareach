@@ -5666,16 +5666,19 @@ with it. A program that answers with more than a version and a directory is ende
 passes 64 KiB and refused. A process that has left the group and keeps the pipe is out of reach: the
 answer is refused after one more second and the daemon closes its end of the pipe, so the daemon
 holds nothing of the process. It may go on, and a write it makes to the closed pipe fails. A child
-the daemon cannot wait on is refused, and nothing is signalled by its number. The look is refused as
-above and nothing is kept. In a daemon that has started, what needs no Git is answered on every
-other connection while a look is under way; a connection whose request waits for the look waits with
-it. A request that needs Git waits for that look, and no other, and is refused with it, so the
-stand-in is started once for all of them. A request that arrives when no look is under way makes a
-look of its own. A start that needs Git makes one look for each need: on Linux the proof, and each
-interrupted apply that left staged paths. The daemon answers nothing until each has ended, so it can
-take ten seconds for each. An interrupt ends a daemon that has started once the look under way has
-ended; a termination signal ends it at once, as an interrupt or a termination signal ends one that
-is still starting, and leaves a stand-in then under way to end by itself.
+the daemon cannot wait on is refused, and nothing is signalled by its number. A program that never
+answers, a child the daemon cannot wait on, and a daemon too short of descriptors, processes or
+memory to ask are faults that pass: the look is refused with `UPSTREAM_UNAVAILABLE`. The other
+refusals above are `HOST_NOT_CONFIGURED`. Nothing is kept. In a daemon that has started, what needs
+no Git is answered on every other connection while a look is under way; a connection whose request
+waits for the look waits with it. A request that needs Git waits for that look, and no other, and is
+refused with it, so the stand-in is started once for all of them. A request that arrives when no
+look is under way makes a look of its own. A start that needs Git makes one look for each need: on
+Linux the proof, and each interrupted apply that left staged paths. The daemon answers nothing until
+each has ended, so it can take ten seconds for each. An interrupt ends a daemon that has started
+once the look under way has ended; a termination signal ends it at once, as an interrupt or a
+termination signal ends one that is still starting, and leaves a stand-in then under way to end by
+itself.
 
 A request that runs Git is then refused with `HOST_NOT_CONFIGURED` before it makes a repository, an
 operation row, a workspace or a directory. Those are `project.init`, `project.clone`,
@@ -5683,12 +5686,19 @@ operation row, a workspace or a directory. Those are `project.init`, `project.cl
 write a working tree: `changeset.capture`, `diff.apply`, `diff.revert` and `diff.read` of a working
 copy. The message ends with the step that installs Git: `xcode-select --install` on macOS and the
 system package manager on Linux. Windows runs no Git at all, so there it gives the platform's own
-refusal, under the same code, before it looks for Git, whether or not Git is installed, and names
-no install. A client does not send such a request again. The project methods and
-`changeset.capture` keep the refusal as the answer to the request's action identifier, so a request
-repeated after Git is installed carries a new identifier. `diff.apply` and `diff.revert` refuse
-before they claim their action and keep nothing. `project.list`, `project.read`,
-`workspace.list` and `workspace.read` read the project journal alone and answer as on any host.
+refusal, under the same code, before it looks for Git, whether or not Git is installed, and names no
+install. A Linux kernel with no Landlock interface, or one older than version 3 (Linux 6.2), gives
+the same refusal, under the same code and before Git is looked for. One older than version 4 (Linux
+6.7) gives it to a request that reaches a remote, when the request's invocation is built. The
+sentence says which version the kernel has and which the boundary needs. A machine whose system-call
+numbers this host does not hold is refused alike. A client does not send such a request again. A
+look that runs out of its time, or that the host is too short of descriptors, processes or memory to
+make, is not this refusal. It is `UPSTREAM_UNAVAILABLE`, a fault that passes, which a client may
+send again, and the sentence names no install. The project methods and `changeset.capture` keep the
+refusal as the answer to the request's action identifier, so a request repeated after Git is
+installed carries a new identifier. `diff.apply` and `diff.revert` refuse before they claim their
+action and keep nothing. `project.list`, `project.read`, `workspace.list` and `workspace.read` read
+the project journal alone and answer as on any host.
 
 A search that finds no usable Git is not kept, so a Git installed while the daemon runs is found by
 the first request that makes a look after the install, without a restart; a request that joined a
