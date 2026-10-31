@@ -1260,8 +1260,10 @@ impl SessionRuntime {
             });
             // Built here rather than by the caller: waiting for a child to end is the runtime's
             // own facility, and this is the task that does the waiting.
+            let started = Instant::now();
+            monitor_activity.anchor_beat(crate::lifecycle::wall_beat_start(started));
             let mut supervision =
-                crate::lifecycle::Supervision::begin(monitor_activity, Instant::now(), idle_sweep);
+                crate::lifecycle::Supervision::begin(monitor_activity, started, idle_sweep);
             // The shell is asked about once before anything is waited on, because the child signal
             // only reports what happens after it is open: a shell that ended in between is found
             // here instead. Nothing is observed on this first look; the boundary was recorded as it
