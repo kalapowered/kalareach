@@ -1017,8 +1017,11 @@ impl PushService for ForkPush {
 }
 
 /// KR-REQ-17.14: the push desk reaches the gateway through the client its factory makes. A fork's
-/// own client in that place receives the registration calls and the host is handed the credential
-/// that client's issue returned; the client the application's set holds for push is the one the
+/// own client in that place receives the registration calls and, when a choice of previews is told
+/// to the host after the registration, the issue that follows, and the host is handed the
+/// credential that client's issue returned; no other client is made for either. The build's gateway
+/// is a stand-in on a loopback port, which a client made outside the factory would reach and which
+/// receives nothing here. The set the Account sheet is reported over holds a client the same
 /// factory makes, and availability reports it as configured.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_push_desk_talks_to_the_gateway_client_it_was_given() {
@@ -1029,8 +1032,9 @@ async fn the_push_desk_talks_to_the_gateway_client_it_was_given() {
     let registered = Arc::new(Mutex::new(Registered::default()));
     let asked = Arc::new(Mutex::new(Vec::<String>::new()));
     let calls = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+    let stand_in = kr_service_stand_in::serve().await;
     let opened = open_replacing(
-        official_origin(),
+        kr_protocol::service::GatewayOrigin::new(stand_in.origin()).expect("an origin"),
         phone.data.path(),
         &device,
         &Receiver::new(FIRST_TOKEN),
@@ -1056,15 +1060,16 @@ async fn the_push_desk_talks_to_the_gateway_client_it_was_given() {
     opened.desk.enable(&reference).expect("the person asks");
     states_until(&opened.desk, |states| states == [PushState::On]).await;
 
-    let calls = calls.lock().expect("the record").clone();
+    let registration = calls.lock().expect("the record").clone();
     assert_eq!(
-        calls.first(),
+        registration.first(),
         Some(&"propose"),
-        "{calls:?}: the registration began at the fork's client"
+        "{registration:?}: the registration began at the fork's client"
     );
-    assert!(
-        calls.contains(&"issue"),
-        "{calls:?}: the credential was asked of the fork's client"
+    assert_eq!(
+        registration.iter().filter(|call| **call == "issue").count(),
+        1,
+        "{registration:?}: the credential was asked of the fork's client"
     );
     {
         let handed = registered.lock().expect("what was handed");
@@ -1076,7 +1081,48 @@ async fn the_push_desk_talks_to_the_gateway_client_it_was_given() {
         );
     }
 
-    // The client the application holds for push is the desk's: the factory makes it, for the same
+    // The person turns previews off. The host is told again under the registration it has, and the
+    // credential for that comes from the fork's client too.
+    opened
+        .desk
+        .set_previews(&reference, false)
+        .await
+        .expect("the person chooses");
+    let handed = || {
+        registered
+            .lock()
+            .expect("what was handed")
+            .credentials
+            .len()
+    };
+    eventually("the host was told of the choice", || {
+        handed() == 2 || !stand_in.web().arrived().is_empty()
+    })
+    .await;
+    assert!(
+        stand_in.web().arrived().is_empty(),
+        "{:?}: a request left for the build's gateway outside the factory",
+        stand_in.web().arrived()
+    );
+    states_until(&opened.desk, |states| states == [PushState::On]).await;
+    let told = calls.lock().expect("the record").clone();
+    assert_eq!(
+        told.iter().filter(|call| **call == "issue").count(),
+        2,
+        "{told:?}: telling the host of the choice asked the fork's client for a credential"
+    );
+    assert_eq!(
+        told.iter().filter(|call| **call == "propose").count(),
+        1,
+        "{told:?}: the token was not proposed again"
+    );
+    assert_eq!(
+        registered.lock().expect("what was handed").credentials[1].1["previews_enabled"],
+        false,
+        "and the host was handed the choice"
+    );
+
+    // The set the Account sheet is reported over holds a client the factory makes for the same
     // gateway, and availability reports the service as configured.
     let state = AppState::new();
     state.push_opened(Arc::clone(&opened.desk));
