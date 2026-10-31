@@ -1116,6 +1116,18 @@ fn windows() -> Vec<Step> {
         ),
         Step::cargo(
             Group::Rust,
+            "the daemon's side of the description process, with the process held behind its job's memory limit",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-describe",
+                "--test",
+                "supervise",
+            ],
+        ),
+        Step::cargo(
+            Group::Rust,
             "what a question's caller token reaches",
             &[
                 "test",
