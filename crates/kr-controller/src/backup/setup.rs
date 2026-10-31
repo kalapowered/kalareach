@@ -994,3 +994,104 @@ fn unknown(retry_after: Option<Duration>) -> BackupEnableResult {
         })),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use kr_protocol::host_account::SignInUnavailable;
+    use kr_protocol::ids::EnvironmentId;
+    use kr_protocol::scalars::{TimestampMs, Uuid};
+
+    use super::*;
+    use crate::testing::HeldTimer;
+
+    /// An admission that says whether the backup store was held when it was asked, and refuses.
+    struct StoreProbe {
+        backup: Arc<BackupService>,
+        held: Mutex<Option<bool>>,
+    }
+
+    impl SetupAdmission for StoreProbe {
+        fn stands(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn retained(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn admitted(&self, _write: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+            *self.held.lock().unwrap_or_else(PoisonError::into_inner) =
+                Some(self.backup.store.try_lock().is_err());
+            Err(ControllerError::PermissionDenied {
+                detail: "refused here".to_owned(),
+            })
+        }
+    }
+
+    /// The call that records a setup asks its admission inside the hold of the backup store, in the
+    /// order a change of privacy mode takes the two in. A change that holds the store waits for the
+    /// registration, so a call that held the registration and then waited for the store would wait
+    /// for the change, and the change for the call. The admission here is a probe that refuses, so
+    /// that nothing is written.
+    #[tokio::test]
+    async fn the_call_that_records_a_setup_is_admitted_inside_the_hold_of_the_store() {
+        let root = tempfile::tempdir().expect("a disposable directory");
+        let runtime = tempfile::tempdir().expect("a runtime directory");
+        let backup =
+            Arc::new(BackupService::in_memory(&root.path().join("backup")).expect("a service"));
+        let origin = GatewayOrigin::new("https://storage.example").expect("an origin");
+        let writer = AuthorisationKeyPair::generate().expect("a key");
+        let owner = AuthorisationKeyPair::generate().expect("a key");
+        let producer = StoredEnvelopeKeyPair::generate().expect("a key");
+        let made = kr_client::recovery::prepare_setup(&kr_client::recovery::SetupInputs {
+            origin: origin.as_str(),
+            archive_id: ArchiveId::new(Uuid::from_bytes([1; 16])),
+            writer: (writer.key_id(), *writer.public()),
+            producer: (producer.key_id(), *producer.public()),
+            enabled_at_ms: TimestampMs::new(1),
+            replace: false,
+        })
+        .expect("a setup is prepared");
+        let record = SetupRecord {
+            archive_id: made.params.archive_id,
+            origin: origin.as_str().to_owned(),
+            account_mark: [9; 32],
+            recovery_public_key: made.params.recovery_public_key,
+            kit_fingerprint: made.params.kit_fingerprint.clone(),
+            writer_key_id: writer.key_id(),
+            producer_key_id: producer.key_id(),
+            enabled_at_ms: made.params.enabled_at_ms,
+        };
+        let setup = BackupSetup::new(
+            origin,
+            None,
+            writer,
+            owner,
+            producer,
+            Arc::new(HostAccount::new(
+                Arc::new(kr_crypto::store::MemoryStore::default()),
+                EnvironmentId::new(Uuid::from_bytes([9; 16])),
+                runtime.path(),
+                Err(SignInUnavailable::NotUsable),
+                None,
+            )),
+            Arc::clone(&backup),
+            Arc::new(Quiet::new(HeldTimer::automatic())),
+        );
+        let probe = Arc::new(StoreProbe {
+            backup,
+            held: Mutex::new(None),
+        });
+
+        let refused = setup
+            .record(record, &made.params, Arc::clone(&probe) as _)
+            .await;
+
+        assert!(refused.is_err(), "the admission's refusal is the answer");
+        assert_eq!(
+            *probe.held.lock().unwrap_or_else(PoisonError::into_inner),
+            Some(true),
+            "the registration is taken while the store is held"
+        );
+    }
+}
