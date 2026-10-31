@@ -374,7 +374,7 @@ impl Journals {
     ///
     /// Returns [`ControllerError::Storage`] when it cannot be written.
     pub(super) fn save(&self, journal: &Journal) -> Result<()> {
-        files::create_directory_durably(&self.directory)?;
+        files::create_private_directory_durably(&self.directory)?;
         let text = serde_json::to_string_pretty(journal)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         files::write_atomically(

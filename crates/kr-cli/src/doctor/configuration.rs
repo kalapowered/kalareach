@@ -127,7 +127,7 @@ pub fn apply_over(
     configuration::still_current(&edited, &load(paths)).map_err(|refused| refusal(&refused))?;
     let path = document_path(paths);
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        let _ = kr_ipc::paths::create_dir_all_owner_only(parent);
     }
     kr_ipc::paths::write_owner_only_file(&path, edited.contents.as_bytes())
         .map_err(CliError::Ipc)?;
