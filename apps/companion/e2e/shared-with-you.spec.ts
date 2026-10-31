@@ -13,6 +13,7 @@
 
 import { expect, test, type Page } from '@playwright/test'
 
+import { PRESENTATION_DEADLINE } from './bounds'
 import { screenshotPath } from './evidence'
 import { overrunning, stopWrapping } from './layout'
 
@@ -127,21 +128,32 @@ async function readAgain(page: Page): Promise<void> {
   })
 }
 
+/** Waits until the card has come to rest over the screen, which it says of itself. */
+async function cardAtRest(page: Page): Promise<void> {
+  await expect(page.getByTestId('sheet')).toHaveAttribute('data-presentation', 'here', {
+    timeout: PRESENTATION_DEADLINE
+  })
+}
+
+/** Waits until the card has left and been taken away. */
+async function cardGone(page: Page): Promise<void> {
+  await expect(page.getByTestId('sheet')).toBeHidden({ timeout: PRESENTATION_DEADLINE })
+}
+
 /**
  * Answers the card an invitation has opened by pressing `control`, once the card has come to rest,
  * and waits for the card to go.
  *
- * Both controls act on a press that is released over them, so when the card moves out from under a
- * press that began on it, nothing is answered: a press that slid off is meant to do nothing. A card
- * in the last frames of its arrival can still pass the engine's own test for a steady target, which
- * compares two frames, so the press waits for what the card publishes about itself: that it is at
- * rest.
+ * Accept commits on a press that is released over it, and a press that slid off is meant to commit
+ * nothing, so a card that moves out from under a press that began on it answers nothing. The card's
+ * spring runs on the page's replaced clock and Playwright's test for a steady target compares two
+ * real frames, so a card still arriving can pass that test. The press therefore waits for what the
+ * card publishes about itself: that it is at rest.
  */
 async function answerOffer(page: Page, control: 'accept-offer' | 'not-now'): Promise<void> {
-  const sheet = page.getByTestId('sheet')
-  await expect(sheet).toHaveAttribute('data-presentation', 'here')
+  await cardAtRest(page)
   await page.getByTestId(control).click()
-  await expect(sheet).toBeHidden()
+  await cardGone(page)
 }
 
 /** Lets the page draw two frames, in which what was asked of it (a scroll, an insertion) has happened. */
@@ -176,9 +188,9 @@ async function withPill(page: Page, how: { invitations?: number; depth?: number 
 }
 
 /**
- * Waits until the engine has drawn a few frames of the page, which are its own and not the page's
- * clock (these cases replace that). A press is judged steady by comparing two of them, and an
- * engine that has just opened a page on a busy machine can draw none for seconds.
+ * Waits until the engine has called for a few animation frames of the page, which are its own and
+ * not the page's clock (these cases replace that). A press is judged steady by comparing two of
+ * them, and an engine that has just opened a page on a busy machine can call for none for seconds.
  */
 async function framesDrawn(page: Page): Promise<void> {
   await page.waitForFunction((seen) => ++seen.polls >= 3, { polls: 0 }, { polling: 'raf' })
@@ -293,7 +305,9 @@ for (const surface of ['ios', 'android'] as const) {
           await readAgain(page)
           await expect(page.locator('[data-offer]')).toHaveCount(3)
           await page.getByRole('button', { name: /shared session 5 with you/ }).click()
-          // The issuer withdraws it while the card is open.
+          // The issuer withdraws it while the card is open, and at rest: a read that finds the
+          // invitation gone closes the card, and the case answers it.
+          await cardAtRest(page)
           await page.evaluate((id) => {
             window.krTestHost?.sharing.withdrawOffer(id, 'this invitation was withdrawn')
           }, invitation)
@@ -317,7 +331,7 @@ for (const surface of ['ios', 'android'] as const) {
           await page.getByTestId('offers').getByRole('button').first().click()
           const card = page.getByTestId('offer-card')
           await expect(card).toBeVisible()
-          await expect(page.getByTestId('sheet')).toHaveAttribute('data-presentation', 'here')
+          await cardAtRest(page)
           expect(await overrunning(page, '[data-testid="offer-card"]')).toEqual([])
           const accept = page.getByTestId('accept-offer')
           const notNow = page.getByTestId('not-now')
@@ -583,7 +597,7 @@ test.describe('a message in passing over the card an invitation opens', () => {
     await page.getByRole('button', { name: /shared session 4 with you/ }).dispatchEvent('click')
     const accept = page.getByTestId('accept-offer')
     const notNow = page.getByTestId('not-now')
-    await expect(page.getByTestId('sheet')).toHaveAttribute('data-presentation', 'here')
+    await cardAtRest(page)
     await expect(accept).toBeVisible()
     await expect(toast).toBeVisible()
     await toast.dispatchEvent('pointerover', { pointerType: 'mouse', pointerId: 1 })
@@ -677,7 +691,7 @@ test.describe('a message in passing over the card an invitation opens', () => {
     await expect(toast).toHaveCount(0)
     expect(await footerTop(), 'the footer is where it is without the message').toBeCloseTo(withMessage, 0)
     await notNow.click()
-    await expect(page.getByTestId('sheet')).toBeHidden()
+    await cardGone(page)
   }
 
   for (const surface of ['ios', 'android'] as const) {
@@ -806,7 +820,7 @@ test.describe('a message in passing over the card an invitation opens', () => {
     await page.clock.runFor(1_500)
     await page.getByRole('button', { name: /shared session 4 with you/ }).dispatchEvent('click')
     await page.clock.runFor(1_000)
-    await expect(page.getByTestId('sheet')).toHaveAttribute('data-presentation', 'here')
+    await cardAtRest(page)
     await expect(toast).toBeVisible()
     expect(await toast.evaluate((element) => element.closest('[role="dialog"]') !== null)).toBe(true)
 
@@ -876,7 +890,7 @@ test.describe('a message in passing over the card an invitation opens', () => {
     // Held where it is, as a pointer resting on it holds it, while an item's card is opened over it.
     await toast.dispatchEvent('pointerover', { pointerType: 'mouse', pointerId: 1 })
     await page.locator('.m-list [data-attention]').first().click()
-    await expect(page.getByTestId('sheet')).toHaveAttribute('data-presentation', 'here')
+    await cardAtRest(page)
     await expect(toast).toBeVisible()
     expect(await toast.evaluate((element) => element.closest('[role="dialog"]') !== null)).toBe(true)
     const place = await page.evaluate(() => {
