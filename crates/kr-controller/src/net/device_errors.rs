@@ -174,53 +174,92 @@ struct FailureText {
     beside: &'static [(&'static str, Option<&'static str>)],
     /// What the text says, for the sentence a device is given when none of it can be kept.
     of: &'static str,
+    /// What is done with the text.
+    how: How,
+}
+
+/// What is done with the text of a member of [`FAILURE_TEXTS`].
+enum How {
+    /// The text is held to the rule an error's message is.
+    Rule,
+    /// The host's own clauses end where words that are not the host's begin, and the text is cut
+    /// at the end of the first of these it holds; a text that holds none is held to the rule.
+    CutAfter(&'static [&'static str]),
+    /// The text can be an upstream's own words or a quotation of them, whose names the rule cannot
+    /// find, so none of it is sent.
+    Whole,
 }
 
 /// The records whose members hold a failure as plain text, which no error carries: the reason a
 /// privacy step could not answer, what a workspace or a repository operation records of its own
 /// state, and why an agent instance's bridges are refused. A device reads them in results and in
 /// announcements, so they are held to the rule as an error's message is.
-const FAILURE_TEXTS: [FailureText; 8] = [
+const FAILURE_TEXTS: [FailureText; 9] = [
     FailureText {
         key: "reason",
         beside: &[("subsystem", None)],
         of: "what the subsystem's store reported",
+        how: How::Rule,
     },
     FailureText {
         key: "reason",
         beside: &[("state", Some("unavailable"))],
         of: "why the session's cleanup is unavailable",
+        how: How::Rule,
     },
     FailureText {
         key: "detail",
         beside: &[("kind", None), ("change_set_id", None)],
         of: "what the workspace holds",
+        how: How::Rule,
     },
     FailureText {
         key: "detail",
         beside: &[("display_path", None)],
         of: "why the workspace is in this state",
+        how: How::Rule,
     },
     FailureText {
         key: "detail",
         beside: &[("retained_staging_paths", None)],
         of: "why the operation ended",
+        how: How::Rule,
     },
     FailureText {
         key: "refusal",
         beside: &[("application_instance_id", None)],
         of: "why the instance's bridges are refused",
+        how: How::Rule,
     },
     FailureText {
         key: "failure",
         beside: &[("download", Some("failed"))],
         of: "why the fetch of the description model failed",
+        how: How::Rule,
     },
     FailureText {
         key: "detail",
         beside: &[("state", Some("left_out")), ("reason", None)],
         of: "why the admissions leave the installation out",
+        how: How::CutAfter(&LEFT_OUT_CLAUSES),
     },
+    FailureText {
+        key: "failure_detail",
+        beside: &[("handle", None), ("insertion_method", None)],
+        of: "why the attachment was not offered",
+        how: How::Whole,
+    },
+];
+
+/// The clauses of the host's own wording for an installation the admissions leave out that are
+/// followed, after a colon, by words that are not the host's: a repository's statement of why it
+/// revoked a package, what was wrong with a package in the store, which limit it is past, and why
+/// it cannot be handed to a worker. The subject of each is the package and its hash.
+const LEFT_OUT_CLAUSES: [&str; 4] = [
+    " was revoked by its repository",
+    " is not whole in this host's store",
+    " is past a package limit in force",
+    " cannot be handed to a worker",
 ];
 
 /// A member of a protocol record that holds a place on this host as plain text, found by its key.
@@ -234,13 +273,13 @@ struct HostPath {
 
 /// The members that hold a place on this host and no failure: where a repository or a working copy
 /// is, the staging paths an operation kept or removed, the repository a clone was made from, the
-/// socket of a session's worker and the program a question's source runs. A session's own working
-/// directory and shell are not among them: they are part of how the session is described to the
-/// person it is shown to, and a device that may see the session sees its terminal. A path under a
-/// home directory names the account, and a device cannot use one, so a device is given each as the
-/// withheld record of a path (the form the directory of a materialisation has), with the list of
-/// paths as long as it was.
-const HOST_PATHS: [HostPath; 6] = [
+/// socket of a session's worker. A session's own working directory and shell, and the executable a
+/// question's source runs, are not among them: the specification shows them to the person on
+/// purpose, as part of how a session or a question is described, and a device that may see the
+/// session sees its terminal. A path under a home directory names the account, and a device cannot
+/// use one, so a device is given each as the withheld record of a path (the form the directory of a
+/// materialisation has), with the list of paths as long as it was.
+const HOST_PATHS: [HostPath; 5] = [
     HostPath {
         key: "display_path",
         beside: &[("project_repository_id", None), ("environment_id", None)],
@@ -264,15 +303,6 @@ const HOST_PATHS: [HostPath; 6] = [
     HostPath {
         key: "endpoint",
         beside: &[("session", None)],
-    },
-    // The program a question's source is running, as the operating system names it.
-    HostPath {
-        key: "executable",
-        beside: &[
-            ("application_instance_id", None),
-            ("process", None),
-            ("connection_id", None),
-        ],
     },
 ];
 
@@ -806,10 +836,21 @@ fn shown_member(map: &CanonicalMap, key: &str, child: &CanonicalValue) -> Option
         return shown_survivors(child);
     }
     if let CanonicalValue::Text(text) = child
-        && let Some(of) = failure_text_of(map, key)
+        && let Some(field) = failure_field(map, key)
     {
-        let fixed = || format!("{of}; {WHY_NOT_SHOWN}");
-        return told_in_place(text, fixed).map(CanonicalValue::Text);
+        let fixed = || format!("{}; {WHY_NOT_SHOWN}", field.of);
+        let told = match field.how {
+            How::Rule => told_in_place(text, fixed),
+            How::CutAfter(clauses) => match clauses
+                .iter()
+                .find_map(|clause| text.find(clause).map(|at| at + clause.len()))
+            {
+                Some(end) => (end < text.len()).then(|| text[..end].to_owned()),
+                None => told_in_place(text, fixed),
+            },
+            How::Whole => Some(format!("{}; {WHY_WHATEVER_IT_SAYS}", field.of)),
+        };
+        return told.map(CanonicalValue::Text);
     }
     if let CanonicalValue::Text(text) = child
         && is_why_mutations_wait(map, key)
@@ -943,12 +984,12 @@ fn refusal_while_mutations_wait(reason: &str) -> Option<String> {
     }
 }
 
-/// What the text under `key` in `map` says, when it is a failure a record holds as plain text.
-fn failure_text_of(map: &CanonicalMap, key: &str) -> Option<&'static str> {
+/// The row of [`FAILURE_TEXTS`] for the text under `key` in `map`, when it is a failure a record
+/// holds as plain text.
+fn failure_field(map: &CanonicalMap, key: &str) -> Option<&'static FailureText> {
     FAILURE_TEXTS
         .iter()
         .find(|field| field.key == key && beside_holds(map, field.beside))
-        .map(|field| field.of)
 }
 
 /// The code and the message of `map`, when it is exactly the shape of a protocol error: the three
@@ -2775,6 +2816,12 @@ mod tests {
                 "rich capabilities are disabled",
             ),
             (
+                ErrorCode::UnsupportedCapability,
+                "the component answerable for this operation has had its rich capabilities \
+                 disabled: marguerite's decoder faulted",
+                "answerable for this operation",
+            ),
+            (
                 ErrorCode::ResourceUnavailable,
                 "12 actions are being prepared already, and this one was not reached in time",
                 "are being prepared already",
@@ -2902,17 +2949,26 @@ mod tests {
     fn the_refusal_of_a_rich_mutation_says_why_they_wait_without_the_words_of_the_reason() {
         let mut leaked = Vec::new();
         for method in THE_AGENT_METHODS {
-            for reason in [
-                A_CONVERSATION_LOCK_THAT_FAILED,
+            for (reason, kind) in [
+                (A_CONVERSATION_LOCK_THAT_FAILED, "cannot be bound here"),
                 // The method of a request that the connector's table does not classify is the
                 // upstream's: a bare name, an address, a command.
-                "marguerite is not classified by this connector's table, so what it changed is \
-                 unknown",
-                "marguerite@example.com is not classified by this connector's table, so what the \
-                 terminal asked for is unknown",
-                "net user marguerite is not classified by this connector's table, so what it \
-                 changed is unknown",
-                "marguerite asked for this",
+                (
+                    "marguerite is not classified by this connector's table, so what it changed \
+                     is unknown",
+                    "does not classify",
+                ),
+                (
+                    "marguerite@example.com is not classified by this connector's table, so what \
+                     the terminal asked for is unknown",
+                    "does not classify",
+                ),
+                (
+                    "net user marguerite is not classified by this connector's table, so what it \
+                     changed is unknown",
+                    "does not classify",
+                ),
+                ("marguerite asked for this", "the detail is not sent"),
             ] {
                 let said = format!("rich mutations are suspended: {reason}");
                 let told = told_on(method, ErrorCode::DraftConflict, &said);
@@ -2921,6 +2977,7 @@ mod tests {
                     || told.message.contains("example.com")
                     || told.message.contains("net user")
                     || !told.message.contains("rich mutations are suspended")
+                    || !told.message.contains(kind)
                 {
                     leaked.push(format!("{method:?}: {told:?}"));
                 }
@@ -3000,30 +3057,77 @@ mod tests {
     }
 
     #[test]
-    fn why_the_admissions_leave_an_installation_out_is_held_to_the_rule_by_its_key() {
+    fn why_the_admissions_leave_an_installation_out_is_told_without_the_words_after_the_hosts_clause()
+     {
+        use kr_plugin_catalogue::admission::{NotAdmitted, NotAdmittedReason};
         use kr_protocol::catalogue::{PluginAdmission, PluginLeftOutReason};
+        let plugin_id = kr_protocol::ids::PluginId::new("kalareach/claude-code").expect("an id");
+        let package_digest = kr_plugin_sdk::digest::PayloadDigest::of(b"a package");
+        let subject = format!("{plugin_id} at {package_digest}");
         let left_out = |reason, detail: &str| PluginAdmission::LeftOut {
             reason,
             detail: detail.to_owned(),
         };
+        let real = |reason: NotAdmittedReason| {
+            NotAdmitted {
+                plugin_id: plugin_id.clone(),
+                package_digest,
+                reason,
+            }
+            .detail()
+        };
+        // The clause of the host's own wording is kept and what follows the colon is not.
+        for (reason, said, kept) in [
+            (
+                PluginLeftOutReason::Incomplete,
+                real(NotAdmittedReason::Incomplete(
+                    "/Users/marguerite/.local/share/kr/plugins/9f2c/manifest.json does not parse"
+                        .to_owned(),
+                )),
+                format!("{subject} is not whole in this host's store"),
+            ),
+            (
+                PluginLeftOutReason::Revoked,
+                format!("{subject} was revoked by its repository: net user marguerite"),
+                format!("{subject} was revoked by its repository"),
+            ),
+            (
+                PluginLeftOutReason::PastALimit,
+                format!("{subject} is past a package limit in force: marguerite's 4096 files"),
+                format!("{subject} is past a package limit in force"),
+            ),
+            (
+                PluginLeftOutReason::Unrecordable,
+                format!("{subject} cannot be handed to a worker: /Users/marguerite/x is too long"),
+                format!("{subject} cannot be handed to a worker"),
+            ),
+        ] {
+            let told = read_by_a_device(&left_out(reason, &said));
+            assert_eq!(told, left_out(reason, &kept), "{said}");
+        }
+        // The host's own sentences that carry no words of another's are told as they were.
+        for (reason, said) in [
+            (
+                PluginLeftOutReason::Disabled,
+                real(NotAdmittedReason::Disabled),
+            ),
+            (
+                PluginLeftOutReason::NotAllowed,
+                real(NotAdmittedReason::NotAllowed),
+            ),
+        ] {
+            let plain = left_out(reason, &said);
+            assert_eq!(read_by_a_device(&plain), plain);
+        }
+        // A text of no wording the host knows is held to the rule.
         let told = read_by_a_device(&left_out(
-            PluginLeftOutReason::Incomplete,
-            "/Users/marguerite/.local/share/kr/plugins/9f2c/manifest.json does not parse: \
-             expected value",
+            PluginLeftOutReason::Unsupported,
+            "/Users/marguerite/x does not parse",
         ));
-        let PluginAdmission::LeftOut { reason, detail } = told else {
+        let PluginAdmission::LeftOut { detail, .. } = told else {
             panic!("a plugin left out");
         };
-        assert_eq!(reason, PluginLeftOutReason::Incomplete);
         assert!(!tells_the_owner_alone(&detail), "{detail}");
-        assert_eq!(
-            detail,
-            "why the admissions leave the installation out; the detail names the host and is not \
-             sent to a paired device"
-        );
-        // What names nothing is told as it was.
-        let plain = left_out(PluginLeftOutReason::Revoked, "the package 9f2c was revoked");
-        assert_eq!(read_by_a_device(&plain), plain);
     }
 
     #[test]
@@ -3171,6 +3275,7 @@ mod tests {
             )
         };
         let path = "/Users/marguerite/work/x";
+        let mut changed = Vec::new();
         for (what, carried) in [
             (
                 "a place with no repository around it",
@@ -3208,12 +3313,27 @@ mod tests {
                 ]),
             ),
             (
+                "a detail of a left-out state with no reason beside it",
+                record(&[("state", text("left_out")), ("detail", text(path))]),
+            ),
+            (
+                "a socket with no session around it",
+                record(&[("endpoint", text(path))]),
+            ),
+            (
+                "an attachment's failure with no attachment around it",
+                record(&[("failure_detail", text(path))]),
+            ),
+            (
                 "a failure of a fetch that is running",
                 record(&[("download", text("running")), ("failure", text(path))]),
             ),
         ] {
-            assert_eq!(shown_value(&carried), None, "{what}");
+            if shown_value(&carried).is_some() {
+                changed.push(what);
+            }
         }
+        assert!(changed.is_empty(), "left alone, but held: {changed:?}");
     }
 
     fn session_summary() -> kr_protocol::session::SessionSummary {
@@ -3279,7 +3399,7 @@ mod tests {
     }
 
     #[test]
-    fn the_program_a_questions_source_runs_is_withheld_from_a_device() {
+    fn the_program_a_questions_source_runs_reaches_a_device_as_it_is() {
         use kr_protocol::ids::{ApplicationInstanceId, ConnectionId};
         use kr_protocol::question::QuestionSource;
         use kr_protocol::scalars::Uuid;
@@ -3299,17 +3419,76 @@ mod tests {
             ancestry: true,
             agent_binding_revision: Nullable::null(),
         };
-        let device = read_by_a_device(&source(Some(program)));
-        assert_eq!(device.executable.0, Some(withheld_path(program)));
-        // The label the caller gave itself, which is shown as unverified, is not a place.
+        // The person is shown the program the host verified, and its full path, on purpose.
         assert_eq!(
-            device,
-            QuestionSource {
-                executable: Nullable::some(withheld_path(program)),
-                ..source(Some(program))
-            }
+            read_by_a_device(&source(Some(program))),
+            source(Some(program))
         );
-        // A source with no program named has none to withhold.
         assert_eq!(read_by_a_device(&source(None)), source(None));
+    }
+
+    fn draft_attachment(failure: Option<&str>) -> kr_protocol::transfer::DraftAttachment {
+        use kr_protocol::ids::{EnvironmentId, GrantId, TransferId};
+        use kr_protocol::scalars::{Digest256, TimestampMs, Uuid};
+        use kr_protocol::transfer::{
+            AttachmentHandle, AttachmentReadGrant, DraftAttachment, InsertionMethod, InsertionState,
+        };
+        let environment_id = EnvironmentId::new(Uuid::from_bytes([3; 16]));
+        let transfer_id = TransferId::new(Uuid::from_bytes([9; 16]));
+        DraftAttachment {
+            handle: AttachmentHandle {
+                environment_id,
+                transfer_id,
+                session_id: Nullable::null(),
+                byte_len: U64::new(10),
+                content_digest: Digest256::from_bytes([1; 32]),
+                declared_media_type: "text/plain".to_owned(),
+                original_file_name: "notes.txt".to_owned(),
+                preview: Nullable::null(),
+                presented_as_image: false,
+                published_at_ms: TimestampMs::new(1),
+                expires_at_ms: TimestampMs::new(2),
+                submitted: false,
+            },
+            insertion_method: InsertionMethod::ManualTerminalWorkflow,
+            state: InsertionState::Failed,
+            upstream_evidence: Nullable::null(),
+            failure_detail: Nullable::from(failure.map(str::to_owned)),
+            read_grant: Nullable::some(AttachmentReadGrant {
+                grant_id: GrantId::new(Uuid::from_bytes([8; 16])),
+                environment_id,
+                transfer_id,
+                insertion_method: InsertionMethod::ManualTerminalWorkflow,
+                host_path: "/Users/marguerite/.local/state/kr/staging/notes.txt".to_owned(),
+                expires_at_ms: TimestampMs::new(2),
+            }),
+            external_destination: Nullable::null(),
+        }
+    }
+
+    #[test]
+    fn why_an_attachment_was_not_offered_is_not_told_to_a_device_in_the_upstreams_words() {
+        // The worker writes the upstream's own refusal there, or a quotation of it: a bare name
+        // is not a path, a number or a command, so the rule for an error's message does not find it.
+        let owner = draft_attachment(Some(
+            "the upstream refused: marguerite@example.com may not attach net user marguerite",
+        ));
+        let device = read_by_a_device(&owner);
+        assert_eq!(
+            device.failure_detail.0.as_deref(),
+            Some("why the attachment was not offered; the detail is not sent to a paired device")
+        );
+        // The rest of the record is as it was. The staged file's path, which the person is shown
+        // to use in a terminal on purpose, is among it.
+        assert_eq!(
+            kr_protocol::transfer::DraftAttachment {
+                failure_detail: owner.failure_detail.clone(),
+                ..device
+            },
+            owner
+        );
+        // An attachment that did not fail has no failure to withhold.
+        let sound = draft_attachment(None);
+        assert_eq!(read_by_a_device(&sound), sound);
     }
 }
