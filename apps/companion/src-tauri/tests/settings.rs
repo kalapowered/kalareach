@@ -1796,57 +1796,62 @@ async fn a_kept_copy_of_a_draft_is_dropped_through_the_client_at_the_service_the
     forked.only_the_fork_was_reached();
 }
 
-/// KR-REQ-17.14: a removal the service is owed for a draft whose first publication lost its answer
-/// is found by asking the service what it holds, and made, through the client the application was
-/// given, at the service the record names, after the setting names another: the draft is sent
-/// while its host is private, the host lets it go, and the fork's service ends with none of it.
+/// KR-REQ-17.14: a removal owed for a draft whose place this computer has no note of is found by
+/// asking the service what it holds, and made, through the client the application was given, at the
+/// service the record names, after the setting names another. The draft is sent while its host is
+/// private, a publication of it has landed at the fork's service without a note here, and the store
+/// of another host cannot be read, so the draft's place is not known; the host lets it go, and the
+/// fork's service ends with none of it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_removal_found_by_asking_the_service_goes_through_the_client_the_record_names() {
     let forked = Forked::new().await;
     let (environment, studio) = host(1, "studio");
+    let (unreadable, _) = host(2, "laptop");
     forked
         .computer
         .hosts
-        .say(environment, HostPrivacy::Off { generation: 1 });
+        .say(environment, HostPrivacy::On { generation: 1 });
     let page = &forked.page;
-    let (draft, version) = page.write_draft(Some(&studio), "sent before the answer came back");
-    // The pass asks the collection once for the settings and then publishes the draft, so it is
-    // the second request.
-    forked.fork_service.web().fail(SYNC_PATH, 2, Moment::After);
+    let (draft, version) = page.write_draft(Some(&studio), "written for the studio");
     page.drafts_on(true).expect("drafts sync is on");
     let elsewhere = forked.elsewhere();
     assert_eq!(
         elsewhere.draft_at(draft).await,
-        Some(1),
-        "it landed at the fork's service"
+        None,
+        "the host is private, so nothing of the draft left"
     );
+
+    // A publication of the draft has landed at the fork's service, and this computer holds no note
+    // of it. The store of another host cannot be read, so it is not known that nothing left.
+    let held = page
+        .app
+        .state::<AppState>()
+        .drafts()
+        .store()
+        .expect("drafts");
+    elsewhere
+        .claim_draft(&held.load(draft).expect("the draft"))
+        .await;
+    assert_eq!(elsewhere.draft_at(draft).await, Some(1));
+    let place = forked
+        .computer
+        .data
+        .path()
+        .join("settings-sync/drafts")
+        .join(unreadable.to_string());
+    std::fs::create_dir_all(&place).expect("a directory");
+    std::fs::write(place.join("store"), b"not a store").expect("a file");
 
     assert_eq!(page.discard_draft(draft, &version)["removed"], true);
     forked
         .computer
         .hosts
-        .say(environment, HostPrivacy::On { generation: 2 });
-    page.sync_now();
-    assert_eq!(
-        elsewhere.draft_at(draft).await,
-        Some(1),
-        "the host is private, so the removal waits"
-    );
-    forked
-        .computer
-        .hosts
-        .say(environment, HostPrivacy::Off { generation: 3 });
-    page.sync_now();
+        .say(environment, HostPrivacy::Off { generation: 2 });
     page.sync_now();
     assert_eq!(
         elsewhere.draft_at(draft).await,
         None,
         "it was removed at the fork's service"
-    );
-    assert!(
-        page.kept_drafts().is_empty(),
-        "and it did not come back as a copy: {:?}",
-        page.kept_drafts()
     );
     forked.only_the_fork_was_reached();
 }
