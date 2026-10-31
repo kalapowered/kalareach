@@ -184,7 +184,9 @@ enum How {
     /// The text is held to the rule an error's message is.
     Rule,
     /// The host's own clauses end where words that are not the host's begin, and the text is cut
-    /// at the end of the first of these it holds; a text that holds none is held to the rule.
+    /// at the end of the one of these that begins first in it: the host's clause comes before any
+    /// words of another's, which can quote a clause of the host's own. A text that holds none is
+    /// held to the rule.
     CutAfter(&'static [&'static str]),
     /// The text can be an upstream's own words or a quotation of them, whose names the rule cannot
     /// find, so none of it is sent.
@@ -844,9 +846,10 @@ fn shown_member(map: &CanonicalMap, key: &str, child: &CanonicalValue) -> Option
             How::Rule => told_in_place(text, fixed),
             How::CutAfter(clauses) => match clauses
                 .iter()
-                .find_map(|clause| text.find(clause).map(|at| at + clause.len()))
+                .filter_map(|clause| text.find(clause).map(|at| (at, at + clause.len())))
+                .min()
             {
-                Some(end) => (end < text.len()).then(|| text[..end].to_owned()),
+                Some((_, end)) => (end < text.len()).then(|| text[..end].to_owned()),
                 None => told_in_place(text, fixed),
             },
             How::Whole => Some(format!("{}; {WHY_WHATEVER_IT_SAYS}", field.of)),
@@ -3589,5 +3592,56 @@ mod tests {
         // A session that is bound to none has none to withhold.
         let free = session_summary();
         assert_eq!(read_by_a_device(&free), free);
+    }
+
+    #[test]
+    fn the_admission_cut_is_made_at_the_earliest_clause_in_the_text() {
+        use kr_protocol::catalogue::{PluginAdmission, PluginLeftOutReason};
+        let subject = "kalareach/claude-code at 9f2c41";
+        let left_out = |reason, detail: &str| PluginAdmission::LeftOut {
+            reason,
+            detail: detail.to_owned(),
+        };
+        for (reason, said, kept) in [
+            // A store's own words after the colon quote a clause that comes later in the table.
+            (
+                PluginLeftOutReason::Incomplete,
+                format!(
+                    "{subject} is not whole in this host's store: \
+                     /Users/marguerite/.local/share/kr/plugins/9f2c41/manifest.json: unknown \
+                     field ` was revoked by its repository`"
+                ),
+                format!("{subject} is not whole in this host's store"),
+            ),
+            // A state directory named with the words of a later clause.
+            (
+                PluginLeftOutReason::Incomplete,
+                format!(
+                    "{subject} is not whole in this host's store: /Users/marguerite/state was \
+                     revoked by its repository/plugins/9f2c41/manifest.json does not parse"
+                ),
+                format!("{subject} is not whole in this host's store"),
+            ),
+            // A repository's statement that quotes a clause that comes earlier in the table.
+            (
+                PluginLeftOutReason::Revoked,
+                format!(
+                    "{subject} was revoked by its repository: marguerite wrote that it is not \
+                     whole in this host's store"
+                ),
+                format!("{subject} was revoked by its repository"),
+            ),
+            (
+                PluginLeftOutReason::PastALimit,
+                format!(
+                    "{subject} is past a package limit in force: marguerite's package cannot be \
+                     handed to a worker"
+                ),
+                format!("{subject} is past a package limit in force"),
+            ),
+        ] {
+            let told = read_by_a_device(&left_out(reason, &said));
+            assert_eq!(told, left_out(reason, &kept), "{said}");
+        }
     }
 }
