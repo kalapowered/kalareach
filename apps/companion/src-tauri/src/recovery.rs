@@ -28,9 +28,13 @@
 //!
 //! The bundle is reached with the device's signature and the account's token, and the token goes
 //! only to the service the account is signed in to. The sync service is a setting of its own
-//! ([`crate::sync_service`]); where it names another service than the account's, no request is
-//! made, and the refusal names the setting. A sign-in that does not carry the right to write the
-//! account's backup storage sends nothing either, and the page is told which of the two to mend.
+//! ([`crate::sync_service`]), and it decides where a record that does not exist yet is made: where
+//! it names another service than the account's, no request is made, and the refusal names the
+//! setting. A record names the service its bundle is kept at, and every later step is made there,
+//! whatever the setting names; where the account is signed in at another service than the record's,
+//! no request is made, and the refusal names the record's service, which the setting cannot move. A
+//! sign-in that does not carry the right to write the account's backup storage sends nothing
+//! either, and the page is told which of the two to mend.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -111,9 +115,10 @@ pub enum Blocker {
     SignedOut,
     /// The sign-in does not carry the right to write the account's backup storage.
     NeedsSignIn,
-    /// The sync service is not the service the account is signed in to.
+    /// The service recovery would use is not the service the account is signed in to.
     WrongService {
-        /// The sync service the setting names.
+        /// The service recovery would use: the one the sync service setting names while this
+        /// computer has no record of a bundle, and the one the record names after.
         sync_service: String,
         /// The service the account is signed in to.
         account: String,
@@ -376,7 +381,8 @@ impl std::fmt::Debug for Recovery {
 
 impl Recovery {
     /// Recovery kept under `data`, with the seed in `secrets` and the device's `key` signing for
-    /// the service `service` names.
+    /// the services it reaches. `service` is the sync service setting, which names the service a
+    /// record not yet made is made at; a record that exists names its own.
     ///
     /// # Errors
     ///
@@ -494,12 +500,12 @@ impl Recovery {
 
     /// Makes the recovery seed, keeps it in the secure store, and puts the first bundle at the
     /// sync service. Run again after a start that did not finish, it goes on from where that
-    /// stopped, with the locator it began with.
+    /// stopped, with the locator and the service it began with.
     ///
     /// # Errors
     ///
-    /// Returns a refusal when the account cannot be used at the service the setting names, nothing
-    /// having been made or sent; `OUTCOME_UNKNOWN` when the write was not answered, which has to be
+    /// Returns a refusal when the account cannot be used at the service the record names (the one
+    /// the setting names, when there is no record yet), nothing having been made or sent; `OUTCOME_UNKNOWN` when the write was not answered, which has to be
     /// settled before anything else is written; and a local failure otherwise.
     pub async fn turn_on(&self, account: &Account) -> Result<RecoveryView> {
         let _step = self.step().await?;
@@ -508,7 +514,7 @@ impl Recovery {
             Some(record) => record,
             None => {
                 let selected = self.service.origin();
-                refuse_if_blocked(account, &selected)?;
+                refuse_if_blocked(account, &selected, Named::BySetting)?;
                 let record = Record {
                     version: Record::VERSION,
                     service_origin: selected.as_str().to_owned(),
@@ -519,7 +525,7 @@ impl Recovery {
                 record
             }
         };
-        refuse_if_blocked(account, &record.origin()?)?;
+        refuse_if_blocked(account, &record.origin()?, Named::ByRecord)?;
         let seed = self.seed(true)?;
         let now = now();
         let tokens = Arc::new(MarkedTokens::new(account));
@@ -560,7 +566,7 @@ impl Recovery {
         let Some(mut record) = self.record()? else {
             return Err(CommandError::refused("recovery has not been turned on"));
         };
-        refuse_if_blocked(account, &record.origin()?)?;
+        refuse_if_blocked(account, &record.origin()?, Named::ByRecord)?;
         let seed = self.seed(false)?;
         let settled = {
             let mut store = self.store(&record, account)?;
@@ -773,7 +779,7 @@ impl Recovery {
             .filter(|record| record.kept)
             .ok_or_else(|| CommandError::refused("recovery has not been turned on"))?;
         let origin = record.origin()?;
-        refuse_if_blocked(account, &origin)?;
+        refuse_if_blocked(account, &origin, Named::ByRecord)?;
         let http = HttpService::with(
             origin.clone(),
             HttpDeadlines::default(),
@@ -819,7 +825,7 @@ impl Recovery {
             .record()?
             .filter(|record| record.kept)
             .ok_or_else(|| CommandError::refused("recovery has not been turned on"))?;
-        refuse_if_blocked(account, &record.origin()?)?;
+        refuse_if_blocked(account, &record.origin()?, Named::ByRecord)?;
         let seed = self.seed(false)?;
         let mut store = self.store(&record, account)?;
         cover_host_archive(host, &mut store, &seed, replace, now())
@@ -1054,11 +1060,23 @@ fn blocker(account: &Account, used: &GatewayOrigin) -> Option<Blocker> {
     None
 }
 
+/// What names the service an account is checked against.
+#[derive(Clone, Copy)]
+enum Named {
+    /// The sync service setting, for a record that is not made yet. Choosing another service
+    /// changes where the record is made.
+    BySetting,
+    /// The record, which says where the bundle is kept. Choosing another sync service does not
+    /// move the bundle.
+    ByRecord,
+}
+
 /// Refuses, before anything is made or sent, when the account cannot be used at `used`.
 ///
-/// A token goes only to the service its account is signed in to, so a sync service the setting
-/// names that is not that one is refused here, with the setting named.
-fn refuse_if_blocked(account: &Account, used: &GatewayOrigin) -> Result<()> {
+/// A token goes only to the service its account is signed in to, so a service that is not that one
+/// is refused here. The refusal says what named `used`: the setting, which the person can change
+/// while no record is made, or the record, which the person cannot move.
+fn refuse_if_blocked(account: &Account, used: &GatewayOrigin, named: Named) -> Result<()> {
     match blocker(account, used) {
         None => Ok(()),
         Some(Blocker::SignedOut) => Err(CommandError::refused(
@@ -1070,11 +1088,19 @@ fn refuse_if_blocked(account: &Account, used: &GatewayOrigin) -> Result<()> {
         Some(Blocker::WrongService {
             sync_service,
             account,
-        }) => Err(CommandError::refused(format!(
-            "the sync service setting names {sync_service}, which is not the service this device \
-             is signed in to ({account}), so the account's sign-in is not sent there. Choose \
-             {account} as the sync service to keep recovery data"
-        ))),
+        }) => Err(CommandError::refused(match named {
+            Named::BySetting => format!(
+                "the sync service setting names {sync_service}, which is not the service this \
+                 device is signed in to ({account}), so the account's sign-in is not sent there. \
+                 Choose {account} as the sync service to keep recovery data"
+            ),
+            Named::ByRecord => format!(
+                "this computer's recovery bundle is kept at {sync_service}, but this device is \
+                 signed in to {account}, and the account's sign-in is not sent to another service. \
+                 Recovery waits until this device is signed in to {sync_service}; choosing another \
+                 sync service does not move the bundle"
+            ),
+        })),
     }
 }
 

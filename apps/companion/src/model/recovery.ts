@@ -70,14 +70,26 @@ export function describeStaysAt(view: RecoveryView): string | null {
 /** What to do about a write that got no answer. */
 export const SETTLE_HELP = 'Nothing else is written until it is settled.'
 
-/** What stops the next step, and what to do about it. */
-export function describeBlocker(blocker: RecoveryBlocker): string {
+/**
+ * What stops the next step, and what to do about it. `keptAt` is where the bundle is kept, once this
+ * computer has a record of one: the service is then the record's, and choosing another sync service
+ * does not move it, so the person is not asked to.
+ */
+export function describeBlocker(blocker: RecoveryBlocker, keptAt: string | null): string {
   switch (blocker.reason) {
     case 'signed_out':
       return 'Sign in to use recovery. It keeps its bundle with your account.'
     case 'needs_sign_in':
       return 'This sign-in cannot keep recovery data. Sign in again to allow it.'
     case 'wrong_service':
+      if (keptAt !== null) {
+        return (
+          `Recovery keeps its bundle at ${blocker.sync_service}, but this device is signed in to ` +
+          `${blocker.account}, and your sign-in is not sent to another service. Recovery waits ` +
+          `until this device is signed in to ${blocker.sync_service}. Choosing another sync ` +
+          'service does not move the bundle.'
+        )
+      }
       return (
         `The sync service setting names ${blocker.sync_service}, which is not the service this ` +
         `device is signed in to (${blocker.account}), so your sign-in is not sent there. Change ` +

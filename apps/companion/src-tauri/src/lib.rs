@@ -863,7 +863,8 @@ pub fn start_sync_service<R: tauri::Runtime>(app: &tauri::AppHandle<R>, data: &s
 }
 
 /// Opens recovery over the records kept under `data`, with the seed in `identity`'s secret store
-/// and `identity`'s authorisation key signing for the sync service the setting names.
+/// and `identity`'s authorisation key signing for the service each step reaches: the one a record
+/// names, and for a record not yet made, the one the sync service setting names.
 ///
 /// # Errors
 ///

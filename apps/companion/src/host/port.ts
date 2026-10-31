@@ -331,7 +331,10 @@ export type RecoveryBlocker =
   | { readonly reason: 'needs_sign_in' }
   | {
       readonly reason: 'wrong_service'
-      /** The sync service the setting names. */
+      /**
+       * The service recovery would use: the one the sync service setting names while this computer
+       * has no record of a bundle, and the one the record names after.
+       */
       readonly sync_service: string
       /** The service the account is signed in to. */
       readonly account: string
