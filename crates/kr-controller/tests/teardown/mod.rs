@@ -895,14 +895,28 @@ pub fn remove_units_through(
     systemctl: &std::path::Path,
     give_up_after: Duration,
 ) -> Vec<String> {
-    let mut left = Vec::new();
     let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") else {
-        return left;
+        return Vec::new();
     };
-    if !std::path::Path::new(&runtime)
-        .join("systemd/private")
-        .exists()
-    {
+    remove_units_in(
+        std::path::Path::new(&runtime),
+        tree,
+        systemctl,
+        give_up_after,
+    )
+}
+
+/// [`remove_units_through`], for the user manager that keeps its private socket and its transient
+/// unit files in the runtime directory `runtime`.
+#[cfg(target_os = "linux")]
+pub fn remove_units_in(
+    runtime: &std::path::Path,
+    tree: &TempHost,
+    systemctl: &std::path::Path,
+    give_up_after: Duration,
+) -> Vec<String> {
+    let mut left = Vec::new();
+    if !runtime.join("systemd/private").exists() {
         return left;
     }
     let manager = || {
@@ -941,43 +955,67 @@ pub fn remove_units_through(
     .into_iter()
     .flatten()
     .collect();
+    let inside_the_tree = |directory: &str| {
+        !directory.is_empty()
+            && roots
+                .iter()
+                .any(|root| std::path::Path::new(directory).starts_with(root))
+    };
     // Where each unit runs is read from the file the manager keeps for it, and not asked of the
     // manager: `systemctl show` of many units has the manager build every property of each of them,
-    // which is about four milliseconds of its one thread for each unit it holds. Asked at the end
-    // of every test, of every unit every test on the machine has started and not yet ended, that
-    // keeps the machine's whole user manager busy for half a second at each test's end, and a
-    // launch waits behind the questions. A unit the manager holds with no file of its own was not
-    // made by a start of this host, so it is not this tree's; a file that cannot be read says
-    // nothing about the unit, which is counted as not established.
-    let transient = std::path::Path::new(&runtime).join("systemd/transient");
+    // which is about four milliseconds of its one thread for each unit it holds (a call over 130
+    // units took 0.65 to 0.75 s of the machine's whole user manager). Asked at the end of every
+    // test, of every unit every test on the machine has started and not yet ended, that keeps the
+    // manager busy for half a second at each test's end, and a launch waits behind the questions.
+    // A unit with no file is one a start of this host did not make, or one the manager collected
+    // after the list was read; the manager is asked about that one unit alone (about ten
+    // milliseconds), because a manager that keeps its files somewhere else than the runtime
+    // directory would otherwise make every unit read as one of no file, and the teardown would pass
+    // with the tree's units running. A file that cannot be read says nothing about the unit, which
+    // is counted as not established.
+    let transient = runtime.join("systemd/transient");
     for unit in listed
         .lines()
         .filter_map(|line| line.split_whitespace().next())
     {
-        let file = match std::fs::read_to_string(transient.join(unit)) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+        match std::fs::read_to_string(transient.join(unit)) {
+            Ok(file) => {
+                // A unit file writes a `%` twice, since a single one starts a specifier.
+                let directory = file
+                    .lines()
+                    .find_map(|line| line.strip_prefix("WorkingDirectory="))
+                    .map(|value| value.replace("%%", "%"));
+                if !directory.as_deref().is_some_and(inside_the_tree) {
+                    continue;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match run_bounded_output(manager().args([
+                    "show",
+                    "--property=WorkingDirectory",
+                    "--value",
+                    unit,
+                ])) {
+                    Ok(directory) if !inside_the_tree(directory.trim()) => continue,
+                    Ok(_) => left.push(format!(
+                        "the systemd unit {unit} runs in this tree and has no file in {}, where \
+                         this teardown reads where a unit runs from",
+                        transient.display()
+                    )),
+                    Err(error) => {
+                        left.push(format!(
+                            "where the systemd unit {unit} runs could not be asked: {error}"
+                        ));
+                        continue;
+                    }
+                }
+            }
             Err(error) => {
                 left.push(format!(
                     "where the systemd unit {unit} runs could not be read: {error}"
                 ));
                 continue;
             }
-        };
-        // A unit file writes a `%` twice, since a single one starts a specifier.
-        let Some(directory) = file
-            .lines()
-            .find_map(|line| line.strip_prefix("WorkingDirectory="))
-            .map(|value| value.replace("%%", "%"))
-        else {
-            continue;
-        };
-        if directory.is_empty()
-            || !roots
-                .iter()
-                .any(|root| std::path::Path::new(&directory).starts_with(root))
-        {
-            continue;
         }
         // Stopping the unit ends the process in it, which the manager does as its parent, and a
         // unit that failed is kept listed until it is reset.

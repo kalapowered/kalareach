@@ -352,3 +352,198 @@ fn a_unit_the_manager_goes_on_having_is_left_however_often_it_is_asked() {
     );
     drop(tree);
 }
+
+/// A user manager made of files, for the cases that need what the teardown reads from one and not a
+/// manager of the machine's own: a runtime directory holding the manager's private socket and its
+/// transient unit files, and a tool that answers the teardown's questions from what a case wrote
+/// beside it. The tool lists the units in `listed`, answers a unit's working directory from
+/// `directory-of-<unit>` (nothing where the file is not there, and a failure where `fail-asking` is),
+/// records each unit it is told to stop in `stopped`, and says a unit it has stopped is gone.
+#[cfg(target_os = "linux")]
+struct StandInManager {
+    _directory: tempfile::TempDir,
+    runtime: PathBuf,
+    tool: PathBuf,
+    here: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl StandInManager {
+    fn new() -> Self {
+        let directory = tempfile::TempDir::new().expect("a directory on the internal disk");
+        let runtime = directory.path().join("runtime");
+        std::fs::create_dir_all(runtime.join("systemd/transient")).expect("the manager's files");
+        std::fs::write(runtime.join("systemd/private"), "").expect("its socket's place");
+        let here = directory.path().join("tool");
+        std::fs::create_dir_all(&here).expect("the tool's directory");
+        let source = here.join("source");
+        std::fs::write(
+            &source,
+            r#"#!/bin/sh
+here="$(dirname "$0")"
+unit=""
+for argument in "$@"; do unit="$argument"; done
+case "$*" in
+  *list-units*) cat "$here/listed" 2>/dev/null ;;
+  *--property=LoadState*)
+    if grep -qx "$unit" "$here/stopped" 2>/dev/null; then echo not-found; else echo loaded; fi ;;
+  *--property=WorkingDirectory*)
+    [ -e "$here/fail-asking" ] && exit 1
+    cat "$here/directory-of-$unit" 2>/dev/null || echo ;;
+  *stop*) echo "$unit" >> "$here/stopped" ;;
+esac
+exit 0
+"#,
+        )
+        .expect("the tool is written");
+        let tool = here.join("systemctl");
+        kr_ipc::testing::place_program(&source, &tool);
+        Self {
+            _directory: directory,
+            runtime,
+            tool,
+            here,
+        }
+    }
+
+    /// Lists `unit` as one of the manager's.
+    fn lists(&self, unit: &str) {
+        use std::io::Write as _;
+        let mut listed = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.here.join("listed"))
+            .expect("the list");
+        writeln!(listed, "{unit} loaded active running").expect("a line");
+    }
+
+    /// Gives `unit` a transient file that says it runs in `directory`, as the manager writes one.
+    fn file(&self, unit: &str, directory: &std::path::Path) {
+        std::fs::write(
+            self.runtime.join("systemd/transient").join(unit),
+            format!(
+                "[Service]\nWorkingDirectory={}\n",
+                directory.display().to_string().replace('%', "%%")
+            ),
+        )
+        .expect("the unit's file");
+    }
+
+    /// Makes the manager say that `unit` runs in `directory`, whatever file it has.
+    fn says_it_runs_in(&self, unit: &str, directory: &std::path::Path) {
+        std::fs::write(
+            self.here.join(format!("directory-of-{unit}")),
+            format!("{}\n", directory.display()),
+        )
+        .expect("the manager's answer");
+    }
+
+    /// The units the teardown told the manager to stop.
+    fn stopped(&self) -> Vec<String> {
+        std::fs::read_to_string(self.here.join("stopped"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn remove_through(&self, tree: &kr_ipc::testing::TempHost) -> Vec<String> {
+        teardown::remove_units_in(
+            &self.runtime,
+            tree,
+            &self.tool,
+            std::time::Duration::from_secs(5),
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+const A_UNIT: &str = "kr-worker-6f0c2b1e-3a4d-4c5b-8e7f-0a1b2c3d4e5f.service";
+
+/// A unit file writes each `%` of a directory's name twice, since a single one starts a specifier,
+/// and the teardown reads the directory back as it was written: a tree whose name holds a `%` is
+/// still found.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_unit_that_runs_in_a_tree_whose_name_holds_a_percent_is_stopped() {
+    let parent = tempfile::Builder::new()
+        .prefix("p%q-")
+        .tempdir()
+        .expect("a directory with a percent in its name");
+    let tree = kr_ipc::testing::TempHost::create_in(parent.path());
+    let manager = StandInManager::new();
+    manager.lists(A_UNIT);
+    manager.file(A_UNIT, &tree.root().join("s"));
+    let left = manager.remove_through(&tree);
+    assert!(left.is_empty(), "{left:?}");
+    assert_eq!(manager.stopped(), [A_UNIT], "the unit was stopped");
+}
+
+/// A unit's file that cannot be read says nothing about where the unit runs, so the unit is not
+/// established as gone and the teardown says so, instead of passing for a tree with no unit.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_unit_file_that_cannot_be_read_leaves_the_unit_not_established() {
+    let tree = kr_ipc::testing::TempHost::create();
+    let manager = StandInManager::new();
+    manager.lists(A_UNIT);
+    // A directory where the file should be: reading it fails, and not because it is missing.
+    std::fs::create_dir(manager.runtime.join("systemd/transient").join(A_UNIT))
+        .expect("a directory in the file's place");
+    let left = manager.remove_through(&tree);
+    assert!(
+        left.iter().any(|what| what.contains("could not be read")),
+        "{left:?}"
+    );
+}
+
+/// A unit with no file that the manager still holds, running in the tree, shows that the teardown
+/// looks for the files in the wrong place: the unit is stopped all the same, and the teardown says
+/// where it looked, so the case that ended with units running does not pass.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_unit_in_the_tree_with_no_file_where_the_files_are_read_from_is_stopped_and_reported() {
+    let tree = kr_ipc::testing::TempHost::create();
+    let manager = StandInManager::new();
+    manager.lists(A_UNIT);
+    manager.says_it_runs_in(A_UNIT, &tree.root().join("s"));
+    let left = manager.remove_through(&tree);
+    assert!(
+        left.iter().any(|what| what.contains("has no file in")),
+        "{left:?}"
+    );
+    assert_eq!(manager.stopped(), [A_UNIT], "the unit was stopped");
+}
+
+/// A unit with no file is left alone when the manager no longer has it, or has it running anywhere
+/// but in the tree.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_unit_with_no_file_that_is_gone_or_runs_elsewhere_is_left_alone() {
+    let tree = kr_ipc::testing::TempHost::create();
+    let elsewhere = kr_ipc::testing::TempHost::create();
+    let manager = StandInManager::new();
+    let other = "kr-plugin-host-6f0c2b1e-3a4d-4c5b-8e7f-0a1b2c3d4e5f.service";
+    manager.lists(A_UNIT);
+    manager.lists(other);
+    manager.says_it_runs_in(other, elsewhere.root());
+    let left = manager.remove_through(&tree);
+    assert!(left.is_empty(), "{left:?}");
+    assert!(manager.stopped().is_empty(), "{:?}", manager.stopped());
+}
+
+/// A manager that cannot say where a unit with no file runs has not shown that the unit is not the
+/// tree's, so the teardown counts it as not established.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_unit_with_no_file_that_the_manager_cannot_place_is_not_established() {
+    let tree = kr_ipc::testing::TempHost::create();
+    let manager = StandInManager::new();
+    manager.lists(A_UNIT);
+    std::fs::write(manager.here.join("fail-asking"), "").expect("a mark");
+    let left = manager.remove_through(&tree);
+    assert!(
+        left.iter().any(|what| what.contains("could not be asked")),
+        "{left:?}"
+    );
+}
