@@ -3770,7 +3770,7 @@ fn ask(
             end_probe(child);
             return Err(too_much());
         }
-        if Instant::now() >= deadline {
+        if time_is_up(deadline) {
             end_probe(child);
             return Err(Asked::Overran(unavailable(format!(
                 "{described} did not answer in time and was stopped"
@@ -3988,6 +3988,17 @@ fn gather(pipe: &mut impl std::io::Read, seen: &mut Bounded, deadline: Instant) 
 /// Makes reads of a probe's pipe return at once when nothing has arrived.
 #[cfg(unix)]
 fn without_blocking(pipe: &std::process::ChildStdout) -> std::io::Result<()> {
+    // A case that ends a program by the time it is given needs the program to have started
+    // whatever the load of the machine: the loop that watches the time begins once the file the
+    // program writes last holds something.
+    #[cfg(test)]
+    if let Some(started) = tests::STARTS_FIRST.with(|started| started.borrow().clone()) {
+        let guard = Instant::now() + Duration::from_secs(30);
+        let written = || std::fs::metadata(&started).is_ok_and(|file| file.len() > 0);
+        while !written() && Instant::now() < guard {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
     #[cfg(test)]
     if let Some(after) = tests::SWITCH_FAILS.with(|fails| fails.borrow().clone()) {
         // The case that asks for the failure has its stand-in write its number to a file first, so
@@ -4013,6 +4024,15 @@ enum Ended {
     Collected(std::process::ExitStatus),
     /// The platform could not say, so whether the number is still the child's own is not known.
     Failed(std::io::Error),
+}
+
+/// Whether the time a probe was given is used up.
+fn time_is_up(deadline: Instant) -> bool {
+    #[cfg(all(test, unix))]
+    if tests::TIME_IS_UP.with(std::cell::Cell::get) {
+        return true;
+    }
+    Instant::now() >= deadline
 }
 
 /// Whether the child has ended, without collecting it where the platform can say so.
@@ -5130,6 +5150,12 @@ mod tests {
         /// Set by a case to make the question whether a child has ended fail on its own thread, as
         /// it does for a child that something else in the process has collected.
         pub(super) static WAIT_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Set by a case to make the time its own thread's probes are given used up as soon as the
+        /// loop that watches it begins, whatever the clock says.
+        pub(super) static TIME_IS_UP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Set by a case to hold its own thread's next probe, once its program is spawned, until the
+        /// file it names holds something.
+        pub(super) static STARTS_FIRST: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
         /// Set by a case to make that question fail on its own thread only once a probe's output
         /// has passed the limit, as it does for a child that was collected elsewhere while it was
         /// still writing.
@@ -5466,6 +5492,88 @@ mod tests {
         let left_alone = running(&pid);
         let_go(directory.path());
         assert!(left_alone, "the stand-in was signalled by its number");
+    }
+
+    /// A Git that never answers, as one waiting for an installer does, is ended by the time it is
+    /// given, with the process it started to wait with. That time running out is a fault that
+    /// passes, which a client sends the request again after, and it names no install step: nothing
+    /// is known of the Git that did not answer. The program is started before the time is read as
+    /// used up, so the case does not depend on how long the machine took to start it.
+    #[cfg(unix)]
+    #[test]
+    fn a_git_that_never_answers_is_ended_with_what_it_started_and_the_refusal_is_a_fault_that_passes()
+     {
+        let directory = tempfile::tempdir().expect("a directory for this test");
+        let search = directory.path().join("search");
+        std::fs::create_dir(&search).expect("a search path of this test's own");
+        let (own, child, finished) = (
+            directory.path().join("own"),
+            directory.path().join("child"),
+            directory.path().join("finished"),
+        );
+        place_stand_in(
+            &search,
+            &format!(
+                "sleep 120 &\necho $! > '{}'\necho $$ > '{}'\nwait\n: > '{}'",
+                child.display(),
+                own.display(),
+                finished.display()
+            ),
+        );
+        // The time is long, and used up by the case once the program has started: nothing here
+        // depends on how long the machine took.
+        let installation = Installation::looked_for_on(
+            Some(search.clone().into_os_string()),
+            Duration::from_secs(600),
+        );
+
+        STARTS_FIRST.with(|started| *started.borrow_mut() = Some(own.clone()));
+        TIME_IS_UP.with(|up| up.set(true));
+        let refusal = installation
+            .program()
+            .expect_err("a Git that never answers is no Git");
+        TIME_IS_UP.with(|up| up.set(false));
+        STARTS_FIRST.with(|started| *started.borrow_mut() = None);
+
+        assert!(
+            matches!(refusal, ProjectError::GitFailed { .. }),
+            "{refusal:?}"
+        );
+        assert_eq!(
+            refusal.code(),
+            kr_protocol::error::ErrorCode::UpstreamUnavailable
+        );
+        assert!(refusal.code().retry_category().permits_automatic_retry());
+        let said = refusal.to_string();
+        assert!(said.contains("did not answer"), "it says why: {said}");
+        assert!(!said.contains("Install"), "and names no step: {said}");
+        for named in [&own, &child] {
+            let pid = std::fs::read_to_string(named)
+                .expect("the program had started")
+                .trim()
+                .to_owned();
+            let guard = Instant::now() + Duration::from_secs(30);
+            while running(&pid) {
+                assert!(
+                    Instant::now() < guard,
+                    "process {pid} of the stand-in still runs after it was refused"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert!(
+            !finished.exists(),
+            "the stand-in was ended, and did not finish by itself"
+        );
+    }
+
+    /// Puts a `git` that is the script `body` on `search`, placed rather than written, so that no
+    /// descriptor of this process is open on the program for writing when it is started.
+    #[cfg(unix)]
+    fn place_stand_in(search: &Path, body: &str) {
+        let (text, program) = (search.join("git.text"), search.join("git"));
+        std::fs::write(&text, format!("#!/bin/sh\n{body}\n")).expect("the stand-in's text");
+        kr_ipc::testing::place_program(&text, &program);
     }
 
     /// A probe that is cut short after its child has ended, and before it is collected, has the
