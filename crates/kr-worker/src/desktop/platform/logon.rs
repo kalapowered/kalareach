@@ -316,7 +316,7 @@ mod tests {
         const CALLS: usize = 10_000;
         // Far under what the calls keep when they are not given back, and over the jitter of a
         // process that is doing nothing else.
-        const BOUND: usize = 512 * 1024;
+        const BOUND: usize = 256 * 1024;
         let session = kr_ipc::starter::current_session().expect("the process's own session");
         // The first calls set up what the calls themselves keep for good.
         for _ in 0..200 {
