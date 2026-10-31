@@ -23,6 +23,10 @@ use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::testing::PrivateTempDir;
 use kr_ipc::verify::ControllerIdentity;
+use kr_protocol::changeset::{
+    ChangesetCaptureParams, ChangesetCaptureResult, ChangesetReadParams, ChangesetReadResult,
+    DestinationClass, DiffApplyParams, DiffReadParams, FileGrant,
+};
 use kr_protocol::envelope::{ActionTarget, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{ActionId, BuildId, EnvironmentId, SessionId};
@@ -1270,6 +1274,63 @@ async fn remove_workspace(
         .expect("the call reaches the daemon")
 }
 
+/// A `changeset.capture` of everything a workspace holds, for the owner.
+#[cfg(unix)]
+fn capture_params(workspace_id: kr_protocol::ids::WorkspaceId) -> ChangesetCaptureParams {
+    ChangesetCaptureParams {
+        workspace_id,
+        change_set_id: Nullable::null(),
+        label: "the work".to_owned(),
+        policy: InclusionPolicy::base_only(),
+        grant: FileGrant::default(),
+        quiescence_declared: false,
+        required_consistency: Nullable::null(),
+        pin: false,
+        session_id: Nullable::null(),
+        workflow_run_id: Nullable::null(),
+        note: String::new(),
+    }
+}
+
+/// A `diff.apply` or `diff.revert` of one version as a proposal, which writes no working tree.
+#[cfg(unix)]
+fn proposal_params(
+    captured: &ChangesetCaptureResult,
+    workspace_id: kr_protocol::ids::WorkspaceId,
+) -> DiffApplyParams {
+    DiffApplyParams {
+        change_set_id: captured.version.change_set_id,
+        version: captured.version.version,
+        destination: DestinationClass::Proposal,
+        workspace_id: Nullable::some(workspace_id),
+        expected_reference: Nullable::null(),
+        affected: Vec::new(),
+        paths: Vec::new(),
+        preflight_only: false,
+        acknowledged_limitations: Vec::new(),
+    }
+}
+
+/// Asserts that a call was refused as a host with no usable Git refuses what runs it: under the
+/// code of a host that is not set up for it, ending with the step that installs Git.
+#[cfg(unix)]
+fn assert_refused_for_lack_of_git(
+    method: &str,
+    outcome: std::result::Result<ParamsValue, ProtocolError>,
+) {
+    let refusal = failure(outcome);
+    assert_eq!(
+        refusal.code,
+        ErrorCode::HostNotConfigured,
+        "{method}: {refusal:?}"
+    );
+    assert!(
+        refusal.message.contains(install_step()),
+        "{method} names the step that installs Git: {}",
+        refusal.message
+    );
+}
+
 /// A `project.init` in a directory of the person's, under an action of its own.
 #[cfg(unix)]
 fn init_params(environment_id: EnvironmentId, parent: &Path, name: &str) -> ProjectInitParams {
@@ -1626,6 +1687,19 @@ async fn a_workspace_is_read_and_kept_by_a_daemon_that_cannot_run_git() {
         .expect("a creation returns the workspace")
         .workspace_id;
     assert!(work.path().join("review/README.md").is_file());
+    // A version captured while Git runs, for what the daemon without Git is then asked about it.
+    let captured: ChangesetCaptureResult = typed(
+        &control
+            .mutate(
+                Method::ChangesetCapture,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(environment_id),
+                &capture_params(workspace),
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("changeset.capture succeeds"),
+    );
     drop(control);
     first
         .interrupt()
@@ -1692,6 +1766,63 @@ async fn a_workspace_is_read_and_kept_by_a_daemon_that_cannot_run_git() {
         WorkspaceState::Ready
     );
     assert!(work.path().join("review/README.md").is_file());
+
+    // The change-set methods that run Git on a working tree are refused the same way, and the one
+    // that reads a recorded version is answered.
+    assert_refused_for_lack_of_git(
+        "diff.read",
+        control
+            .request(
+                Method::DiffRead,
+                &DiffReadParams {
+                    workspace_id: Nullable::some(workspace),
+                    change_set_id: Nullable::null(),
+                    version: Nullable::null(),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_refused_for_lack_of_git(
+        "changeset.capture",
+        control
+            .mutate(
+                Method::ChangesetCapture,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(environment_id),
+                &capture_params(workspace),
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    for method in [Method::DiffApply, Method::DiffRevert] {
+        assert_refused_for_lack_of_git(
+            method.as_str(),
+            control
+                .mutate(
+                    method,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    ActionTarget::environment(environment_id),
+                    &proposal_params(&captured, workspace),
+                )
+                .await
+                .expect("the call reaches the daemon"),
+        );
+    }
+    let read: ChangesetReadResult = typed(
+        &control
+            .request(
+                Method::ChangesetRead,
+                &ChangesetReadParams {
+                    change_set_id: captured.version.change_set_id,
+                    version: Nullable::some(captured.version.version),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("changeset.read succeeds without Git"),
+    );
+    assert_eq!(read.version.content_digest, captured.version.content_digest);
 
     // Git is installed while the daemon runs, and the same removal, under an action of its own,
     // is served.
