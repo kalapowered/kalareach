@@ -124,6 +124,16 @@ const THIRD_MARKER: &str = "kalareach-lastly";
 /// The command that produces it.
 const THIRD_MARKER_COMMAND: &str = "printf 'kala%s-lastly\n' reach\n";
 
+/// The last word a session writes, and the command that writes it.
+///
+/// Nothing follows it, not even a newline, and the shell these cases start has no prompt, so a
+/// device that has read the word has read everything the session produced and the subscription is
+/// quiet from then on: no frame is on its way to the device.
+const SETTLED: &str = "kalareach-settled";
+
+/// The command that produces it.
+const SETTLED_COMMAND: &str = "printf 'kala%s-settled' reach\n";
+
 /// Output the session writes before a device is paired, and what is typed to write it. Its marker
 /// never appears in the command's own echo.
 const BEFORE_MARKER: &str = "kalareach-before";
@@ -1543,8 +1553,13 @@ async fn a_host_on_every_interface_hints_the_addresses_it_found_there() {
 /// worker lets go of a connection's attachments when the host lets go of its link, so the
 /// session's attachment count reaching none, and the device's own session reporting the connection
 /// closed, both before the device sends anything, show the connection ended on the revocation
-/// alone. A connection that is not fenced keeps its attachments and fails the case at that wait; a
-/// record that is not marked fails it at the reconnect.
+/// alone. A connection that is not fenced keeps its attachments, because the session stays silent
+/// and nothing else ends it, and fails the case at that wait; a record that is not marked fails it
+/// at the reconnect.
+///
+/// The device has read everything the session produced before it is revoked. Were a frame still on
+/// its way, the relay's own authority check would end the connection when that frame reached it,
+/// and the wait could not tell that apart from the revocation's fence.
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_revoked_device_is_fenced_before_it_is_served_again() {
@@ -1558,7 +1573,24 @@ async fn a_revoked_device_is_fenced_before_it_is_served_again() {
     let device = Device::create(&loopback()).await;
     let record = pair(&daemon, &device, &owner).await;
     let session = connect(&daemon, &device, &record).await;
-    let _attached = attach(&session, host.environment_id, session_id).await;
+    let attached = attach(&session, host.environment_id, session_id).await;
+
+    // The subscription is running and quiet: the device types a command whose output ends with a
+    // word of its own, and reads up to it. The shell has no prompt, so the word is the last thing
+    // the session writes, and no frame is waiting for the relay when the revocation lands.
+    let seen = type_and_wait_for(
+        &session,
+        host.environment_id,
+        session_id,
+        attached.typing,
+        SETTLED_COMMAND,
+        SETTLED,
+    )
+    .await;
+    assert!(
+        seen.ends_with(SETTLED),
+        "the session wrote nothing after the word the device waited for: {seen:?}"
+    );
 
     // The device is revoked while its connection is authorised and its subscription is running,
     // by the owner at the machine through `device.revoke`: the call a person makes.
