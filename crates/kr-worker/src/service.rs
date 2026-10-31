@@ -85,7 +85,7 @@ mod overtake;
 /// Half the window's validity, which is the schedule the transport uses: an attached terminal that
 /// stays open for hours never has to ask for a window, and never holds one that expired while its
 /// replacement was in flight. A connection that cannot first-admit a mutation keeps no such clock
-/// ([`ConnectionFacts::admits_mutations`]).
+/// (`ConnectionFacts::admits_mutations`).
 pub const WINDOW_RENEWAL: std::time::Duration =
     std::time::Duration::from_millis(MAX_WINDOW_VALIDITY.as_millis() as u64 / 2);
 
