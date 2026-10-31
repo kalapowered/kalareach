@@ -5118,6 +5118,13 @@ impl ProjectService {
             return Qualification::refused(Refusal::Platform, Refusal::Platform.text())
                 .with_narrowing(narrowing);
         }
+        // Asked first, as the invocation would be: a kernel without the confinement the rules need
+        // is that cause, and not a host that cannot name its Git's libraries, which `support_set`
+        // would say of it by asking for the Git first.
+        if let Some(refusal) = crate::boundary::kernel_refusal() {
+            return Qualification::refused(Refusal::Invocation, &refusal.to_string())
+                .with_narrowing(narrowing);
+        }
         if let Err(error) = self.profile.support_set() {
             return Qualification::refused(Refusal::SupportSet, &error.to_string())
                 .with_narrowing(narrowing);
