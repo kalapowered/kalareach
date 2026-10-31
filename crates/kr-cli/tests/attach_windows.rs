@@ -390,8 +390,94 @@ async fn the_releases_and_modifiers_of_an_attached_console_reach_the_application
 }
 
 /// The variable that makes this test binary, started in a console of its own, run the console half
-/// of [`a_console_asked_to_spell_its_keys_hands_the_reader_bytes_where_it_handed_records`].
+/// of one of the two probes below: the one that has the console spell its keys, or the one that
+/// stops a reader in a read of the console's text.
 const SPELL_PROBE: &str = "KR_ATTACH_SPELL_PROBE";
+
+/// This test binary, started in a console of its own to run the console half of a probe, with the
+/// keys pressed in that console by writing them in the documented record sequence.
+struct Probe {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    output: ConsoleOutput,
+    started: Instant,
+    /// Held open for as long as the console is wanted.
+    _master: Box<dyn portable_pty::MasterPty + Send>,
+}
+
+impl Probe {
+    /// Starts the test `name` of this binary, which runs its console half.
+    fn start(name: &str) -> Self {
+        let pty = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 100,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("opens a console");
+        let mut command = CommandBuilder::new(std::env::current_exe().expect("this test binary"));
+        command.args(["--exact", name, "--nocapture", "--test-threads=1"]);
+        command.env(SPELL_PROBE, "1");
+        let child = pty.slave.spawn_command(command).expect("starts the probe");
+        drop(pty.slave);
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> =
+            Arc::new(Mutex::new(pty.master.take_writer().expect("a writer")));
+        let output = ConsoleOutput::collect(
+            pty.master.try_clone_reader().expect("a reader"),
+            Arc::clone(&writer),
+        );
+        Self {
+            child,
+            writer,
+            output,
+            started: Instant::now(),
+            _master: pty.master,
+        }
+    }
+
+    /// Writes `bytes` to the console as the keys of its keyboard.
+    fn press(&self, bytes: &[u8]) {
+        let mut keyboard = self
+            .writer
+            .lock()
+            .expect("the console input is not poisoned");
+        keyboard.write_all(bytes).expect("writes the console input");
+        keyboard.flush().expect("flushes the console input");
+    }
+
+    /// Waits until the console shows `what`.
+    fn waits_for(&mut self, what: &str) {
+        let mut ended = false;
+        while !self.output.text().contains(what) {
+            // A probe that has ended can still have its last lines on their way to this side of the
+            // console, so the output is read once more before the end counts against the wait.
+            assert!(
+                !ended,
+                "the probe ended before the console showed {what:?}: {:?}",
+                self.output.text()
+            );
+            ended = self.child.try_wait().expect("the probe's state").is_some();
+            assert!(
+                self.started.elapsed() < LIVENESS_DEADLINE,
+                "waited for the console to show {what:?}: {:?}",
+                self.output.text()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Everything the console has shown.
+    fn shown(&self) -> String {
+        self.output.text()
+    }
+}
+
+impl Drop for Probe {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+    }
+}
 
 /// KR-REQ-08.53: a console the attachment asks to spell its keys itself spells them, and the reader
 /// that handed on the console's key records hands on the bytes it spelled from then on, as the
@@ -411,9 +497,11 @@ const SPELL_PROBE: &str = "KR_ATTACH_SPELL_PROBE";
 /// Ctrl+Z and gives `é` in the console's code page. The test then presses Ctrl+Space again as the
 /// only key the console holds, and expects its NUL: a reader that takes the record off the queue
 /// with those that make no text loses the key. Last, the test presses Ctrl on its own and the Apps
-/// key, which the console keeps as records that make no text, and the probe stops the reader and
-/// reads one more key itself: a reader left in a read of the console, or cancelled in the middle of
-/// one, leaves a pending read behind, and the console gives that read the next key.
+/// key, one record at a time, which the console keeps as records that make no text. The probe knows
+/// each has arrived and been taken by the console's own report of its queue, stops the reader once
+/// all four have, and reads one more key itself: a reader left in a read of the console, or
+/// cancelled in the middle of one, leaves a pending read behind, and the console gives that read
+/// the next key. The stop finds no read to cancel and says so.
 #[test]
 fn a_console_asked_to_spell_its_keys_hands_the_reader_bytes_where_it_handed_records() {
     if std::env::var_os(SPELL_PROBE).is_some() {
@@ -421,104 +509,67 @@ fn a_console_asked_to_spell_its_keys_hands_the_reader_bytes_where_it_handed_reco
         return;
     }
 
-    let pty = native_pty_system()
-        .openpty(PtySize {
-            rows: 24,
-            cols: 100,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .expect("opens a console");
-    let mut command = CommandBuilder::new(std::env::current_exe().expect("this test binary"));
-    command.args([
-        "--exact",
+    let mut probe = Probe::start(
         "a_console_asked_to_spell_its_keys_hands_the_reader_bytes_where_it_handed_records",
-        "--nocapture",
-        "--test-threads=1",
-    ]);
-    command.env(SPELL_PROBE, "1");
-    let mut child = pty.slave.spawn_command(command).expect("starts the probe");
-    drop(pty.slave);
-    let writer: Arc<Mutex<Box<dyn Write + Send>>> =
-        Arc::new(Mutex::new(pty.master.take_writer().expect("a writer")));
-    let output = ConsoleOutput::collect(
-        pty.master.try_clone_reader().expect("a reader"),
-        Arc::clone(&writer),
     );
-    let press = |bytes: &[u8]| {
-        let mut keyboard = writer.lock().expect("the console input is not poisoned");
-        keyboard.write_all(bytes).expect("writes the console input");
-        keyboard.flush().expect("flushes the console input");
-    };
-    let started = Instant::now();
-    let waits_for = |what: &str, child: &mut Box<dyn portable_pty::Child + Send + Sync>| {
-        let mut ended = false;
-        while !output.text().contains(what) {
-            // A probe that has ended can still have its last lines on their way to this side of the
-            // console, so the output is read once more before the end counts against the wait.
-            assert!(
-                !ended,
-                "the probe ended before the console showed {what:?}: {:?}",
-                output.text()
-            );
-            ended = child.try_wait().expect("the probe's state").is_some();
-            assert!(
-                started.elapsed() < LIVENESS_DEADLINE,
-                "waited for the console to show {what:?}: {:?}",
-                output.text()
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    };
-
-    waits_for("kr-probe:ready", &mut child);
+    probe.waits_for("kr-probe:ready");
     // The letter A, going down and coming up, as a console is written a key.
-    press(b"\x1b[65;30;97;1;0;1_");
-    press(b"\x1b[65;30;97;0;0;1_");
-    waits_for("kr-probe:switched", &mut child);
-    let before = output.text();
+    probe.press(b"\x1b[65;30;97;1;0;1_");
+    probe.press(b"\x1b[65;30;97;0;0;1_");
+    probe.waits_for("kr-probe:switched");
+    let before = probe.shown();
     assert!(
         before.contains("kr-probe:key:65:97:down"),
         "the letter was read as the record it is before the console spelled anything: {before:?}"
     );
     // The up arrow, Ctrl+Space, the letter A held down (one record that says it repeated three
     // times), Ctrl+Z, an `é` and the letter B, each going down and coming up.
-    press(b"\x1b[38;72;0;1;0;1_");
-    press(b"\x1b[38;72;0;0;0;1_");
-    press(b"\x1b[32;57;32;1;8;1_");
-    press(b"\x1b[32;57;32;0;8;1_");
-    press(b"\x1b[65;30;97;1;0;3_");
-    press(b"\x1b[65;30;97;0;0;1_");
-    press(b"\x1b[90;44;26;1;8;1_");
-    press(b"\x1b[90;44;26;0;8;1_");
-    press(b"\x1b[69;18;233;1;0;1_");
-    press(b"\x1b[69;18;233;0;0;1_");
-    press(b"\x1b[66;48;98;1;0;1_");
-    press(b"\x1b[66;48;98;0;0;1_");
-    waits_for("kr-probe:bytes:", &mut child);
+    probe.press(b"\x1b[38;72;0;1;0;1_");
+    probe.press(b"\x1b[38;72;0;0;0;1_");
+    probe.press(b"\x1b[32;57;32;1;8;1_");
+    probe.press(b"\x1b[32;57;32;0;8;1_");
+    probe.press(b"\x1b[65;30;97;1;0;3_");
+    probe.press(b"\x1b[65;30;97;0;0;1_");
+    probe.press(b"\x1b[90;44;26;1;8;1_");
+    probe.press(b"\x1b[90;44;26;0;8;1_");
+    probe.press(b"\x1b[69;18;233;1;0;1_");
+    probe.press(b"\x1b[69;18;233;0;0;1_");
+    probe.press(b"\x1b[66;48;98;1;0;1_");
+    probe.press(b"\x1b[66;48;98;0;0;1_");
+    probe.waits_for("kr-probe:bytes:");
     // Ctrl+Space as the only key the console holds. The console keeps it as a key going down with no
     // character, which a read of the console's text passes over unless the reader has told it apart
     // from a modifier: a reader that took it off the queue with the records that make no text never
     // sends its byte, and the person's key is gone.
-    press(b"\x1b[32;57;32;1;8;1_");
-    press(b"\x1b[32;57;32;0;8;1_");
-    waits_for("kr-probe:alone:", &mut child);
-    // Ctrl on its own, and the Apps key, once the reader has the letter: the console keeps each as a
-    // key going down and coming up that make no text, and a read of the console's text would wait
-    // for the next key. (Behind the letter in the same burst they are taken by the read that
-    // returns it.) The probe stops the reader once the console has been quiet for a second and
-    // holds nothing more.
-    press(b"\x1b[17;29;0;1;8;1_");
-    press(b"\x1b[17;29;0;0;0;1_");
-    press(b"\x1b[93;93;0;1;256;1_");
-    press(b"\x1b[93;93;0;0;256;1_");
-    waits_for("kr-probe:stopped", &mut child);
+    probe.press(b"\x1b[32;57;32;1;8;1_");
+    probe.press(b"\x1b[32;57;32;0;8;1_");
+    probe.waits_for("kr-probe:alone:");
+    // A letter going down and not coming up. The reader hands its text on after every record that
+    // came before it, the release of the Ctrl+Space among them, so when the probe has it nothing is
+    // on its way and nothing is in the queue; a release after it would be a record of its own.
+    probe.press(b"\x1b[69;18;101;1;0;1_");
+    probe.waits_for("kr-probe:watching");
+    // Ctrl on its own, and the Apps key, each going down and coming up, one record at a time: the
+    // console keeps each as a record that make no text, and a read of the console's text would
+    // wait for the next key. The probe has seen each taken before the next is pressed, so the
+    // reader has met every one of them with nothing else in the queue.
+    let last = [
+        &b"\x1b[17;29;0;1;8;1_"[..],
+        b"\x1b[17;29;0;0;0;1_",
+        b"\x1b[93;93;0;1;256;1_",
+        b"\x1b[93;93;0;0;256;1_",
+    ];
+    for (taken, record) in last.into_iter().enumerate() {
+        probe.press(record);
+        probe.waits_for(&format!("kr-probe:taken:{}", taken + 1));
+    }
+    probe.waits_for("kr-probe:stopped");
     // The reader has been stopped, so this key is the process's own to read. A reader left in its
     // read of the console's text would take it.
-    press(b"\x1b[67;46;99;1;0;1_");
-    press(b"\x1b[67;46;99;0;0;1_");
-    waits_for("kr-probe:done", &mut child);
-    let shown = output.text();
+    probe.press(b"\x1b[67;46;99;1;0;1_");
+    probe.press(b"\x1b[67;46;99;0;0;1_");
+    probe.waits_for("kr-probe:done");
+    let shown = probe.shown();
     let after = &shown[shown
         .find("kr-probe:switched")
         .expect("the switch is shown")..];
@@ -552,8 +603,9 @@ fn a_console_asked_to_spell_its_keys_hands_the_reader_bytes_where_it_handed_reco
         "a key was handed on as a record after the console spelled its keys: {after:?}"
     );
     assert!(
-        after.contains("kr-probe:stopped:ended"),
-        "the stop saw the reader end: {after:?}"
+        after.contains("kr-probe:stopped:ended:cancel_asked=false"),
+        "the stop found the reader ended, in no read of the console, and asked for no cancel: \
+         {after:?}"
     );
     assert!(
         after.contains("kr-probe:next:63"),
@@ -561,32 +613,167 @@ fn a_console_asked_to_spell_its_keys_hands_the_reader_bytes_where_it_handed_reco
     );
 }
 
-/// The console half of the test above, run in a console of its own.
-fn spell_probe_in_the_console() {
-    use kr_cli::attach::{TerminalInput, spawn_input_reader};
-    use kr_cli::platform::ControllingTerminal;
+/// KR-REQ-08.53: a stop that meets the reader in a read of the console's text ends the read, asks
+/// the system to cancel it, and says so.
+///
+/// A key going down with no character is taken for text when Ctrl is held and the key is not a
+/// modifier or a lock, because the console stores a NUL that way. The Apps key with Ctrl held is
+/// such a record that makes no text: the read the reader makes for it takes the record, passes over
+/// it and waits for the next key, and nothing but a cancel ends it. The probe, in a console of its
+/// own, starts the reader, has the console spell its keys, and presses Ctrl and then the Apps key
+/// with Ctrl held. The console reports its queue empty once the reader has taken each, which for the
+/// second is the reader inside its read. The stop then has to cancel that read: it ends the reader
+/// and reports that it asked the system to.
+#[test]
+fn a_stop_that_meets_a_read_of_the_consoles_text_cancels_it_and_says_so() {
+    if std::env::var_os(SPELL_PROBE).is_some() {
+        stop_probe_in_the_console();
+        return;
+    }
 
-    let console = ControllingTerminal::open().expect("this process has a console");
-    let _saved = console
-        .enter_record_mode()
-        .expect("the console takes record mode");
-    let switch = console.input_switch().expect("a switch over the console");
-    let handle = console.handle().try_clone().expect("a handle on the input");
-    let (mut input, stop) = spawn_input_reader(handle, &switch).expect("the reader starts");
-    let deadline = Instant::now() + LIVENESS_DEADLINE;
-    let mut next = || loop {
-        match input.try_recv() {
-            Ok(read) => return read,
-            Err(_) => {
-                assert!(Instant::now() < deadline, "the console gave no input");
-                std::thread::sleep(Duration::from_millis(10));
+    let mut probe =
+        Probe::start("a_stop_that_meets_a_read_of_the_consoles_text_cancels_it_and_says_so");
+    probe.waits_for("kr-probe:watching");
+    // Ctrl going down, which the reader takes off the queue without a read, and the Apps key going
+    // down with Ctrl held, which it reads the text of.
+    probe.press(b"\x1b[17;29;0;1;8;1_");
+    probe.waits_for("kr-probe:taken:1");
+    probe.press(b"\x1b[93;93;0;1;264;1_");
+    probe.waits_for("kr-probe:taken:2");
+    probe.waits_for("kr-probe:stopped");
+    let shown = probe.shown();
+    assert!(
+        shown.contains("kr-probe:stopped:ended:cancel_asked=true"),
+        "the stop ended the reader's read of the console and said it asked the system to cancel \
+         it: {shown:?}"
+    );
+}
+
+/// What the console half of a probe holds: the console taken as `kr attach` takes it, in record
+/// mode, and the reader over it.
+struct Reading {
+    console: kr_cli::platform::ControllingTerminal,
+    _saved: kr_cli::platform::SavedModes,
+    switch: kr_cli::attach::InputSwitch,
+    input: tokio::sync::mpsc::UnboundedReceiver<kr_cli::attach::TerminalInput>,
+    stop: kr_cli::attach::InputStop,
+    deadline: Instant,
+}
+
+impl Reading {
+    /// Takes the console and starts the reader over it.
+    fn start() -> Self {
+        use kr_cli::attach::spawn_input_reader;
+        use kr_cli::platform::ControllingTerminal;
+
+        let console = ControllingTerminal::open().expect("this process has a console");
+        let saved = console
+            .enter_record_mode()
+            .expect("the console takes record mode");
+        let switch = console.input_switch().expect("a switch over the console");
+        let handle = console.handle().try_clone().expect("a handle on the input");
+        let (input, stop) = spawn_input_reader(handle, &switch).expect("the reader starts");
+        Self {
+            console,
+            _saved: saved,
+            switch,
+            input,
+            stop,
+            deadline: Instant::now() + LIVENESS_DEADLINE,
+        }
+    }
+
+    /// The next thing the reader hands on.
+    fn read(&mut self) -> kr_cli::attach::TerminalInput {
+        loop {
+            match self.input.try_recv() {
+                Ok(read) => return read,
+                Err(_) => {
+                    assert!(Instant::now() < self.deadline, "the console gave no input");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
             }
         }
-    };
+    }
+
+    /// Stops the reader, shows what the stop found, and returns the console.
+    fn stops(self) -> kr_cli::platform::ControllingTerminal {
+        let stopped = self.stop.stop();
+        println!(
+            "kr-probe:stopped:{}:cancel_asked={}",
+            if stopped.still_running {
+                "running"
+            } else {
+                "ended"
+            },
+            stopped.cancel_asked
+        );
+        self.console
+    }
+}
+
+/// Counts the records that arrive in the console's queue and are taken off it, from the console's
+/// own report: its input handle is set while the queue holds a record and the queue is empty again
+/// once the reader has taken it. A record that makes no text is taken without a trace anywhere
+/// else, so this is how a probe knows one has arrived and been taken, and does not judge by the time
+/// that has passed that none is coming. Start it when the queue is empty and the next record is
+/// not yet pressed, and press one record at a time.
+struct Takes(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Takes {
+    fn watch(console: &kr_cli::platform::ControllingTerminal) -> Self {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        use kr_cli::windows::records::{RecordReader, WakeEvent};
+
+        let taken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let queue = RecordReader::over(
+            console
+                .handle()
+                .try_clone()
+                .expect("a handle to watch the queue with"),
+        );
+        let (stop, asked) = (
+            WakeEvent::new().expect("an event"),
+            WakeEvent::new().expect("an event"),
+        );
+        let (armed, started) = std::sync::mpsc::channel();
+        let count = Arc::clone(&taken);
+        std::thread::spawn(move || {
+            let _ = armed.send(());
+            while queue.wait(&stop, &asked, false).is_ok() {
+                while queue.waiting().unwrap_or(0) != 0 {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                count.fetch_add(1, SeqCst);
+            }
+        });
+        started.recv().expect("the watch started");
+        Self(taken)
+    }
+
+    /// Waits until `count` records have been taken since the watch began.
+    fn until(&self, count: usize) {
+        let deadline = Instant::now() + LIVENESS_DEADLINE;
+        while self.0.load(std::sync::atomic::Ordering::SeqCst) < count {
+            assert!(
+                Instant::now() < deadline,
+                "the reader took fewer than {count} records off the console"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+/// The console half of the test above, run in a console of its own.
+fn spell_probe_in_the_console() {
+    use kr_cli::attach::TerminalInput;
+
+    let mut reading = Reading::start();
     println!("kr-probe:ready");
     // Records until the letter comes up.
     loop {
-        match next() {
+        match reading.read() {
             TerminalInput::Keys(keys) => {
                 let mut up = false;
                 for key in keys {
@@ -605,13 +792,16 @@ fn spell_probe_in_the_console() {
             TerminalInput::Bytes(bytes) => println!("kr-probe:early:{}", hex(&bytes)),
         }
     }
-    switch.engage().expect("the console spells its keys");
+    reading
+        .switch
+        .engage()
+        .expect("the console spells its keys");
     println!("kr-probe:switched");
     // Whatever comes next is read until the last letter has: the arrow's three bytes, a NUL, the
     // letters of the held key, Ctrl+Z, the two bytes of `é` and the letter after.
     let mut spelled = Vec::new();
     while !spelled.ends_with(b"b") {
-        match next() {
+        match reading.read() {
             TerminalInput::Bytes(bytes) => spelled.extend(bytes),
             TerminalInput::Keys(keys) => {
                 for key in keys {
@@ -625,7 +815,7 @@ fn spell_probe_in_the_console() {
     // reader has to wait for.
     let mut alone = Vec::new();
     while alone.is_empty() {
-        match next() {
+        match reading.read() {
             TerminalInput::Bytes(bytes) => alone.extend(bytes),
             TerminalInput::Keys(keys) => {
                 for key in keys {
@@ -635,32 +825,28 @@ fn spell_probe_in_the_console() {
         }
     }
     println!("kr-probe:alone:{}", hex(&alone));
-    // The test now presses Ctrl on its own and the Apps key. The reader is stopped once the console
-    // has been quiet for a second and holds no input, which is when the reader has seen them.
-    let waiting = kr_cli::windows::records::RecordReader::over(
-        console
-            .handle()
-            .try_clone()
-            .expect("a handle to count with"),
-    );
-    let quiet_from = Instant::now();
-    while quiet_from.elapsed() < Duration::from_millis(1000) || waiting.waiting().unwrap_or(1) != 0
-    {
-        assert!(
-            quiet_from.elapsed() < LIVENESS_DEADLINE,
-            "the console never held no input"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let stopped = stop.stop();
-    println!(
-        "kr-probe:stopped:{}",
-        if stopped.still_running {
-            "running"
-        } else {
-            "ended"
+    // Then a letter going down and not coming up. The reader reads every record before it first, so
+    // once the letter has come nothing is left in the queue or on its way.
+    let mut barrier = Vec::new();
+    while barrier.is_empty() {
+        match reading.read() {
+            TerminalInput::Bytes(bytes) => barrier.extend(bytes),
+            TerminalInput::Keys(keys) => {
+                for key in keys {
+                    println!("kr-probe:key:{}:{}", key.virtual_key, key.unicode);
+                }
+            }
         }
-    );
+    }
+    let takes = Takes::watch(&reading.console);
+    println!("kr-probe:watching");
+    // Ctrl on its own and the Apps key, going down and coming up, pressed one at a time. The reader
+    // is stopped once the console has shown each was taken.
+    for taken in 1..=4 {
+        takes.until(taken);
+        println!("kr-probe:taken:{taken}");
+    }
+    let console = reading.stops();
     let mut next = [0_u8; 1];
     let mut input_handle = console.handle();
     input_handle
@@ -668,6 +854,24 @@ fn spell_probe_in_the_console() {
         .expect("the console hands the process the next key");
     println!("kr-probe:next:{}", hex(&next));
     println!("kr-probe:done");
+}
+
+/// The console half of the test of the stop, run in a console of its own.
+fn stop_probe_in_the_console() {
+    let reading = Reading::start();
+    reading
+        .switch
+        .engage()
+        .expect("the console spells its keys");
+    let takes = Takes::watch(&reading.console);
+    println!("kr-probe:watching");
+    // Ctrl, which the reader takes off the queue without a read, and the Apps key with Ctrl held,
+    // which it reads the text of: when the console shows that taken the reader is in the read.
+    takes.until(1);
+    println!("kr-probe:taken:1");
+    takes.until(2);
+    println!("kr-probe:taken:2");
+    let _console = reading.stops();
 }
 
 /// `bytes` as lower-case hexadecimal.
