@@ -575,8 +575,18 @@ later is required, because the profile rests on `GIT_CONFIG_GLOBAL` and `GIT_CON
 with no usable Git opens the service all the same. A request that runs Git is refused with
 `HOST_NOT_CONFIGURED` before it makes a repository, an operation row, a workspace or a directory,
 and the refusal names the step that installs Git. Windows runs no Git at all and says so under the
-same code, whether or not Git is installed, and names no step, since none changes it. A read of what
-the journal records still answers.
+same code, whether or not Git is installed, and names no step, since none changes it. A Linux kernel
+with no Landlock interface, or one older than version 3 (Linux 6.2), gets the same refusal before
+Git is looked for, and a request that reaches a remote on a kernel older than version 4 (Linux 6.7)
+gets it when its invocation is built. The sentence says which version the kernel has and which the
+boundary needs. A machine whose system-call numbers this host does not hold is refused alike. What a
+person can do about it is in that sentence: install Git where it names the step, or use a host whose
+kernel has the interface. After it the client adds its one line for this code, "Change a setting on
+this device or on the host.", and no setting changes these. The client's table has no other action
+for `HOST_NOT_CONFIGURED`, and none of its members says to install Git or to use another host. A
+look for Git that runs out of its time, or that the host is too short of descriptors, processes or
+memory to make, is a fault that passes. It is answered with `UPSTREAM_UNAVAILABLE`, which a client
+may send again, and it names no step. A read of what the journal records still answers.
 
 **What environment it runs in.** The child's environment is built from nothing and then filled in.
 Every variable Git reads that can name a program (`GIT_EXTERNAL_DIFF`, `GIT_SSH`, `GIT_SSH_COMMAND`,
@@ -853,10 +863,10 @@ names for the owner.
 | `PERMISSION_DENIED` | A cancellation of another actor's work that names no location; a caller bounded by a grant that names a location, or a location its grant does not own; a location that is not active, not authorised as the purpose asked for or does not contain the path; a repository operation for a paired device on a host that has not proved it confines what Git reads |
 | `ID_CONFLICT` | One action identifier used for two different requests |
 | `OUTCOME_UNKNOWN` | An interrupted publication this host cannot resolve, a reconciliation a daemon ended in the middle of, or an action a copy of itself is still performing |
-| `UPSTREAM_UNAVAILABLE` | A Git invocation failed, ran past its deadline, or produced more output than the host accepts |
+| `UPSTREAM_UNAVAILABLE` | A Git invocation failed, ran past its deadline, or produced more output than the host accepts; a look for Git that ran out of its time or of the host's descriptors, processes or memory |
 | `QUOTA_EXCEEDED` | An inclusion that would copy more than the host moves without being asked |
 | `OWNER_CONFIRMATION_REQUIRED` | A location decision whose proof is not an owner device's answer to the challenge it was given, whose owner device is no longer one, or whose named device no longer holds the keys the confirmation names |
-| `HOST_NOT_CONFIGURED` | Installed Git is missing or older than the profile needs, or the platform runs no Git at all, which no wait or install changes; a location decision on a host with no owner device to confirm it |
+| `HOST_NOT_CONFIGURED` | Installed Git is missing or older than the profile needs, or answers with more than it was asked, or the platform runs no Git at all, or a Linux kernel lacks the Landlock interface the boundary needs, which no wait or install changes; a location decision on a host with no owner device to confirm it |
 | `STORAGE_UNAVAILABLE` | The journal or the service's own directories |
 
 ## Change sets

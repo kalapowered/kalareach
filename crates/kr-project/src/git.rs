@@ -1694,7 +1694,11 @@ impl RestrictedProfile {
     ///
     /// Returns [`ProjectError::GitUnavailable`] when there is no usable Git, with the step that
     /// installs it, and, without that step, before any search where the platform runs no Git at all
-    /// and this profile holds no program it was handed. The search is made again at the next call.
+    /// and this profile holds no program it was handed. A Linux kernel that cannot build the
+    /// boundary refuses here whichever program the profile holds, with the version of the Landlock
+    /// interface it has and the version the boundary needs. Returns [`ProjectError::GitFailed`],
+    /// a fault that passes, when the look ran out of its time or of what the host needs to ask.
+    /// The search is made again at the next call.
     pub fn git(&self) -> Result<&GitProgram> {
         self.git.program()
     }

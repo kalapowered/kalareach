@@ -23,12 +23,15 @@ have exited with, and no more than that is kept. A process that has left the gro
 pipe is out of reach: the answer is refused after a second and this host closes its end of the pipe,
 so this host holds nothing of the process. It may go on, and a write it makes to the closed pipe
 fails. A child that cannot be waited on is refused, and nothing is signalled by its number, which
-may be another process's by now. A look is made by one request at a time, and a request that arrives
-while one is under way waits for that look and shares its result, so a program that hangs is started
-once for all of them. A copy of Git under the helper directory that does not answer in time, or
-answers with more, refuses the whole look. One that cannot run, or answers differently, leaves the
-program on the search path as the one that runs. A host that is short of descriptors, processes or
-memory when a copy is started refuses the look rather than taking the copy for one that cannot run.
+may be another process's by now. A program that does not answer in time, a child that cannot be
+waited on, and a host too short of descriptors, processes or memory to ask are faults that pass, and
+the look is refused as `UPSTREAM_UNAVAILABLE`; the other refusals are `HOST_NOT_CONFIGURED`. A look
+is made by one request at a time, and a request that arrives while one is under way waits for that
+look and shares its result, so a program that hangs is started once for all of them. A copy of Git
+under the helper directory that does not answer in time, or answers with more, refuses the whole
+look. One that cannot run, or answers differently, leaves the program on the search path as the one
+that runs. A host that is short of descriptors, processes or memory when a copy is started refuses
+the look rather than taking the copy for one that cannot run.
 
 ## Why there is one
 
@@ -134,13 +137,16 @@ of these falls back to reading the configuration and hoping.
 * **A kernel older than Linux 6.2** cannot mediate truncation, so a process could shorten a file the
   boundary never made writable. No Git is run there, and a bubblewrap container around the service
   does not change that: the refusal is about what this kernel can enforce rather than about what
-  surrounds the process. Supporting such a kernel means a different mechanism, not a wrapper.
+  surrounds the process. Supporting such a kernel means a different mechanism, not a wrapper. The
+  refusal is `HOST_NOT_CONFIGURED`, which a client does not send again, and it says which interface
+  version the kernel has and which the boundary needs. It is made before Git is looked for.
 * **A kernel older than Linux 6.7** has no rules for which addresses a process reaches, so an
-  operation that needs a remote is refused there. Local operations still run: their filesystem
-  confinement is the same, and the system-call filter that refuses them an internet socket does not
-  depend on the kernel's Landlock version.
+  operation that needs a remote is refused there, in the same way. Local operations still run: their
+  filesystem confinement is the same, and the system-call filter that refuses them an internet
+  socket does not depend on the kernel's Landlock version.
 * **A machine whose system calls this service does not hold the numbers for** refuses every
-  invocation rather than installing a filter that would not mean what it says.
+  invocation rather than installing a filter that would not mean what it says, as
+  `HOST_NOT_CONFIGURED`.
 * **A host with no launcher to apply a sandbox profile with**, or **no shell for an invocation that
   has to reach a repository**, refuses that invocation rather than running it unenclosed.
 * **A caller bounded by a grant, on macOS or Windows.** Neither confines what Git reads: no macOS
