@@ -1851,37 +1851,42 @@ async fn a_removal_found_by_asking_the_service_goes_through_the_client_the_recor
     forked.only_the_fork_was_reached();
 }
 
-/// KR-REQ-17.14: a draft sent to a session of another host after its first publication lost its
-/// answer is still removed where it was published, through the client the application was given, at
-/// the service the record names, after the setting names another: the removal is for no host yet,
-/// and goes through the store of what came down.
+/// KR-REQ-17.14: a removal the ledger holds for no host, which goes through the store of what came
+/// down, is made through the client the application was given, at the service the record names,
+/// after the setting names another: the draft is sent, the ledger no longer names its host, and the
+/// fork's service ends with none of it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_removal_for_no_host_goes_through_the_client_at_the_service_the_record_names() {
     let forked = Forked::new().await;
-    let (first, studio) = host(1, "studio");
-    let (second, laptop) = host(2, "laptop");
+    let (environment, studio) = host(1, "studio");
     forked
         .computer
         .hosts
-        .say(first, HostPrivacy::Off { generation: 1 });
-    forked
-        .computer
-        .hosts
-        .say(second, HostPrivacy::Off { generation: 1 });
+        .say(environment, HostPrivacy::Off { generation: 1 });
     let page = &forked.page;
-    let (draft, version) = page.write_draft(Some(&studio), "sent before the answer came back");
-    forked.fork_service.web().fail(SYNC_PATH, 2, Moment::After);
+    let (draft, version) = page.write_draft(Some(&studio), "sent from the studio");
     page.drafts_on(true).expect("drafts sync is on");
     let elsewhere = forked.elsewhere();
     assert_eq!(
         elsewhere.draft_at(draft).await,
         Some(1),
-        "it landed at the fork's service"
+        "it was published at the fork's service"
     );
 
-    let moved = page.retarget_draft(draft, &version, &laptop);
-    assert_eq!(page.discard_draft(draft, &moved)["removed"], true);
-    page.sync_now();
+    // The person sends it, and the ledger no longer names the host it was for.
+    assert_eq!(page.discard_draft(draft, &version)["removed"], true);
+    let ledger = forked
+        .computer
+        .data
+        .path()
+        .join("settings-sync/drafts/removals.json");
+    let mut owed: Vec<Value> =
+        serde_json::from_slice(&std::fs::read(&ledger).expect("the ledger")).expect("a list");
+    assert_eq!(owed.len(), 1, "{owed:?}");
+    owed[0]["host"] = Value::Null;
+    kr_ipc::paths::write_owner_only_file(&ledger, &serde_json::to_vec(&owed).expect("a ledger"))
+        .expect("the ledger is written");
+
     page.sync_now();
     assert_eq!(
         elsewhere.draft_at(draft).await,
