@@ -5954,10 +5954,10 @@ async fn a_fence_owed_while_the_service_has_asked_to_be_left_alone_refuses_the_c
 }
 
 /// KR-REQ-09.09: a call that meets a fence while it waits on the service is refused for the fence
-/// and not told a delay that was named meanwhile, at each place the call reads the delay: before the
-/// read of the storage state that follows the enrolment, and before the read that settles a bundle
-/// write. Nothing leaves in either case; the answer is what differs. The control: with the fence let
-/// go, the same call is told the delay.
+/// and not told a delay that was named meanwhile: before the read of the storage state that follows
+/// the enrolment, before the read that settles a bundle write, and in the answer of that read, which
+/// finds no bundle and tells the delay. Nothing more leaves in any case; the answer is what differs.
+/// The control: with the fence let go, the same call is told the delay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fence_owed_while_the_call_waits_on_the_service_refuses_it_and_does_not_tell_a_delay_named_meanwhile()
  {
@@ -6026,6 +6026,108 @@ async fn a_fence_owed_while_the_call_waits_on_the_service_refuses_it_and_does_no
         rig.enable(&made.params).await,
         BackupEnableResult::Unknown { retry_after_seconds } if retry_after_seconds.0.is_some()
     ));
+
+    // During the read that settles the bundle write, which finds the bundle absent: its answer
+    // tells the delay.
+    let (rig, _) = a_host_to_set_up(&HeldTimer::held()).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+    web.fail(SYNC, 1, Moment::Hold);
+    web.fail(SYNC, 2, Moment::Slow);
+    let call = rig.enable_outcome_in_the_background(&made.params);
+    within("the bundle write", web.requests_reach(SYNC, 1)).await;
+    web.release_held();
+    within("the read that settles it", web.requests_reach(SYNC, 2)).await;
+    web.fail(STATUS, 1, delay);
+    assert!(matches!(
+        rig.backup_status().await.storage,
+        BackupStorageState::Unread { .. }
+    ));
+    rig.controller.hold_fence(true);
+    web.release_held();
+    let refusal = call
+        .await
+        .expect("the call ends")
+        .expect_err("a call is refused while a fence is owed, whatever else it meets");
+    assert_eq!(refusal.code, ErrorCode::PermissionDenied);
+    assert!(refusal.message.contains("fence"), "{}", refusal.message);
+    assert_eq!(web.requests_to(MANIFEST), 0, "the writer was not enrolled");
+
+    rig.controller.hold_fence(false);
+    assert!(matches!(
+        rig.enable(&made.params).await,
+        BackupEnableResult::Unknown { retry_after_seconds } if retry_after_seconds.0.is_some()
+    ));
+}
+
+/// KR-REQ-09.09: a delay the service named while the call waits on it holds back the request that
+/// follows: the enrolment after the bundle write, the read of the storage state after the
+/// enrolment, and the retention change after that read. The call ends as unknown with the delay and
+/// the request does not leave. There is no fence in any of them, so it is the delay that decides.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delay_named_while_the_call_waits_on_the_service_holds_back_the_request_that_follows() {
+    let delay = Moment::Refuse {
+        status: 429,
+        code: "RATE_LIMITED",
+        retry_after_seconds: Some(30),
+    };
+
+    // During the bundle write: the enrolment.
+    let (rig, _) = a_host_to_set_up(&HeldTimer::held()).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+    web.fail(SYNC, 1, Moment::Slow);
+    let call = rig.enable_in_the_background(&made.params);
+    within("the bundle write", web.requests_reach(SYNC, 1)).await;
+    web.fail(STATUS, 1, delay);
+    rig.backup_status().await;
+    web.release_held();
+    assert!(matches!(
+        call.await.expect("the call ends"),
+        BackupEnableResult::Unknown { retry_after_seconds } if retry_after_seconds.0.is_some()
+    ));
+    assert_eq!(web.requests_to(MANIFEST), 0, "the writer was not enrolled");
+
+    // During the enrolment: the read of the storage state.
+    let (rig, _) = a_host_to_set_up(&HeldTimer::held()).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+    web.fail(MANIFEST, 1, Moment::Slow);
+    let call = rig.enable_in_the_background(&made.params);
+    within("the enrolment", web.requests_reach(MANIFEST, 1)).await;
+    web.fail(STATUS, 1, delay);
+    rig.backup_status().await;
+    let reads = web.requests_to(STATUS);
+    web.release_held();
+    assert!(matches!(
+        call.await.expect("the call ends"),
+        BackupEnableResult::Unknown { retry_after_seconds } if retry_after_seconds.0.is_some()
+    ));
+    assert_eq!(
+        web.requests_to(STATUS),
+        reads,
+        "the storage state was not read"
+    );
+
+    // During the read of the storage state: the retention change.
+    let (rig, _) = a_host_to_set_up(&HeldTimer::held()).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+    web.fail(STATUS, 1, Moment::Slow);
+    let call = rig.enable_in_the_background(&made.params);
+    within(
+        "the read of the storage state",
+        web.requests_reach(STATUS, 2),
+    )
+    .await;
+    web.fail(STATUS, 1, delay);
+    rig.backup_status().await;
+    web.release_held();
+    assert!(matches!(
+        call.await.expect("the call ends"),
+        BackupEnableResult::Unknown { retry_after_seconds } if retry_after_seconds.0.is_some()
+    ));
+    assert_eq!(web.requests_to(RETENTION), 0, "retention was not changed");
 }
 
 /// KR-REQ-09.09: a fence this host comes to owe while a call waits for another stops it before it
