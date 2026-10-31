@@ -413,3 +413,37 @@ fn read(path: &Path, text: &str) -> Result<Journal> {
     serde_json::from_value(value)
         .map_err(|error| ControllerError::InvalidArgument(format!("{}: {error}", path.display())))
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// KR-REQ-24.26: the directory of the journals is this host's own, inside its state directory,
+    /// and is made owner-only whatever the mask of the process that makes it; one an earlier
+    /// release made with the mask's mode is used as it is.
+    #[test]
+    fn the_directory_of_the_journals_is_made_owner_only_under_a_login_mask() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _login = kr_ipc::testing::LoginUmask::hold();
+        let state = tempfile::tempdir().expect("a state directory");
+        let plugin = PluginId::new("a-bridge".to_owned()).expect("a plugin identifier");
+        let journal = Journal::new(&plugin);
+        let mode_of =
+            |path: &Path| std::fs::metadata(path).expect("made").permissions().mode() & 0o777;
+
+        let made = state.path().join("native-bridges");
+        Journals::new(made.clone())
+            .save(&journal)
+            .expect("the journal is written");
+        assert_eq!(mode_of(&made), 0o700, "{}", made.display());
+
+        let earlier = state.path().join("earlier");
+        std::fs::create_dir(&earlier).expect("made by an earlier release");
+        std::fs::set_permissions(&earlier, std::fs::Permissions::from_mode(0o755)).expect("opened");
+        Journals::new(earlier.clone())
+            .save(&journal)
+            .expect("a directory an earlier release made is used as it is");
+        assert_eq!(mode_of(&earlier), 0o755, "{}", earlier.display());
+    }
+}
