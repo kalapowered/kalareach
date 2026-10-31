@@ -119,8 +119,9 @@ impl Text {
 
 /// Returns whether a record is an Alt coming up with the character composed on the numeric keypad.
 ///
-/// The console reports that character on the release of the Alt and on no other record, so it is
-/// the one key coming up that carries text.
+/// The console reports that character on the release of the Alt, so this is the one release that
+/// is text rather than the end of a press. The release of any other key carries the character the
+/// key made going down, which has been spelled already.
 const fn composed_with_alt(record: &KeyRecord) -> bool {
     !record.key_down && record.virtual_key == VK_MENU && record.unicode != 0
 }
@@ -129,10 +130,10 @@ const fn composed_with_alt(record: &KeyRecord) -> bool {
 ///
 /// A key coming up produces nothing: legacy input has no way to say so, and the encoder refuses to
 /// invent one. The one exception is an Alt coming up with the character composed on the numeric
-/// keypad, which is that character. A key the encoder cannot spell produces nothing rather than something else. A repeat
-/// count is applied to whatever the key produced, character or sequence. A character outside the
-/// basic plane is two records, the high surrogate then the low one, and the pair is repeated as one
-/// character.
+/// keypad, which is that character. A key the encoder cannot spell produces nothing rather than
+/// something else. A repeat count is applied to whatever the key produced, character or sequence. A
+/// character outside the basic plane is two records, the high surrogate then the low one, and the
+/// pair is repeated as one character.
 ///
 /// The output never passes `limit` bytes, and the bound is checked before each append, the buffers
 /// of text waiting to be written included, so a record with a repeat count of 65,535 is refused at
@@ -224,9 +225,11 @@ pub fn legacy_within(
             continue;
         }
         // A key interrupts the text around it, so what is pending is written before its sequence
-        // rather than after.
-        text.write(&mut output)?;
+        // rather than after. A key with no sequence interrupts nothing: the Alt and the keypad
+        // digits of a character composed in two parts come between its halves, and a half written
+        // at the first of them would be replaced.
         if let Some(bytes) = encoded_key(key, application_cursor_keys) {
+            text.write(&mut output)?;
             for _ in 0..key.repeat.max(1) {
                 output.push_slice(&bytes)?;
             }

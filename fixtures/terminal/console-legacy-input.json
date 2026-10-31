@@ -164,6 +164,294 @@
       "bytes": "f09f9880"
     },
     {
+      "id": "alt-keypad-composed-character-is-the-character",
+      "covers": "KR-REQ-08.53",
+      "why": "A character composed with Alt on the numeric keypad (Alt and 0233) is on the record of the Alt coming up, and is that character; the keypad digits, no key of the keyboard's own, say nothing.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 18,
+          "scan_code": 56,
+          "unicode": 0,
+          "key_down": true,
+          "control_keys": 34,
+          "repeat": 1
+        },
+        {
+          "virtual_key": 96,
+          "scan_code": 82,
+          "unicode": 0,
+          "key_down": true,
+          "control_keys": 34,
+          "repeat": 1
+        },
+        {
+          "virtual_key": 96,
+          "scan_code": 82,
+          "unicode": 0,
+          "key_down": false,
+          "control_keys": 34,
+          "repeat": 1
+        },
+        {
+          "virtual_key": 98,
+          "scan_code": 80,
+          "unicode": 0,
+          "key_down": true,
+          "control_keys": 34,
+          "repeat": 1
+        },
+        {
+          "virtual_key": 98,
+          "scan_code": 80,
+          "unicode": 0,
+          "key_down": false,
+          "control_keys": 34,
+          "repeat": 1
+        },
+        {
+          "virtual_key": 99,
+          "scan_code": 81,
+          "unicode": 0,
+          "key_down": true,
+          "control_keys": 34,
+          "repeat": 1
+        },
+        {
+          "virtual_key": 99,
+          "scan_code": 81,
+          "unicode": 0,
+          "key_down": false,
+          "control_keys": 34,
+          "repeat": 1
+        },
+        {
+          "virtual_key": 99,
+          "scan_code": 81,
+          "unicode": 0,
+          "key_down": true,
+          "control_keys": 34,
+          "repeat": 1
+        },
+        {
+          "virtual_key": 99,
+          "scan_code": 81,
+          "unicode": 0,
+          "key_down": false,
+          "control_keys": 34,
+          "repeat": 1
+        },
+        {
+          "virtual_key": 18,
+          "scan_code": 56,
+          "unicode": 233,
+          "key_down": false,
+          "control_keys": 32,
+          "repeat": 1
+        }
+      ],
+      "bytes": "c3a9"
+    },
+    {
+      "id": "alt-keypad-composed-character-with-alt-still-in-the-state-is-not-a-chord",
+      "covers": "KR-REQ-08.53",
+      "why": "The Alt may still be in the state of the record that carries the character, and the character is then still the character and not a key held with Alt.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 18,
+          "scan_code": 56,
+          "unicode": 233,
+          "key_down": false,
+          "control_keys": 34,
+          "repeat": 1
+        }
+      ],
+      "bytes": "c3a9"
+    },
+    {
+      "id": "alt-keypad-composed-character-is-repeated-by-its-count",
+      "covers": "KR-REQ-08.53",
+      "why": "The repeat count of the record that carries the character repeats the character.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 18,
+          "scan_code": 56,
+          "unicode": 233,
+          "key_down": false,
+          "control_keys": 32,
+          "repeat": 3
+        }
+      ],
+      "bytes": "c3a9c3a9c3a9"
+    },
+    {
+      "id": "alt-keypad-composed-character-keeps-the-order-of-the-text-around-it",
+      "covers": "KR-REQ-08.53",
+      "why": "The text before and after it is spelled in the order of the records.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 65,
+          "scan_code": 30,
+          "unicode": 97,
+          "key_down": true,
+          "control_keys": 0,
+          "repeat": 1
+        },
+        {
+          "virtual_key": 65,
+          "scan_code": 30,
+          "unicode": 97,
+          "key_down": false,
+          "control_keys": 0,
+          "repeat": 1
+        },
+        {
+          "virtual_key": 18,
+          "scan_code": 56,
+          "unicode": 233,
+          "key_down": false,
+          "control_keys": 32,
+          "repeat": 1
+        },
+        {
+          "virtual_key": 66,
+          "scan_code": 48,
+          "unicode": 98,
+          "key_down": true,
+          "control_keys": 0,
+          "repeat": 1
+        },
+        {
+          "virtual_key": 66,
+          "scan_code": 48,
+          "unicode": 98,
+          "key_down": false,
+          "control_keys": 0,
+          "repeat": 1
+        }
+      ],
+      "bytes": "61c3a962"
+    },
+    {
+      "id": "alt-coming-up-with-no-character-says-nothing",
+      "covers": "KR-REQ-08.53",
+      "why": "An Alt that came up with no character composed is a modifier like any other: nothing is spelled.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 18,
+          "scan_code": 56,
+          "unicode": 0,
+          "key_down": true,
+          "control_keys": 34,
+          "repeat": 1
+        },
+        {
+          "virtual_key": 18,
+          "scan_code": 56,
+          "unicode": 0,
+          "key_down": false,
+          "control_keys": 32,
+          "repeat": 1
+        }
+      ],
+      "bytes": ""
+    },
+    {
+      "id": "alt-keypad-composed-surrogate-halves-are-one-character",
+      "covers": "KR-REQ-08.53",
+      "why": "A character outside the basic plane composed from the keypad is two Alt releases, one for each half, with the press and the digits of the second between them; the halves are one character, U+1F600, and the press and the digits spell nothing.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 18,
+          "scan_code": 56,
+          "unicode": 0,
+          "key_down": true,
+          "control_keys": 34,
+          "repeat": 1
+        },
+        {
+          "virtual_key": 101,
+          "scan_code": 76,
+          "unicode": 0,
+          "key_down": true,
+          "control_keys": 34,
+          "repeat": 1
+        },
+        {
+          "virtual_key": 101,
+          "scan_code": 76,
+          "unicode": 0,
+          "key_down": false,
+          "control_keys": 34,
+          "repeat": 1
+        },
+        {
+          "virtual_key": 18,
+          "scan_code": 56,
+          "unicode": 55357,
+          "key_down": false,
+          "control_keys": 32,
+          "repeat": 1
+        },
+        {
+          "virtual_key": 18,
+          "scan_code": 56,
+          "unicode": 0,
+          "key_down": true,
+          "control_keys": 34,
+          "repeat": 1
+        },
+        {
+          "virtual_key": 101,
+          "scan_code": 76,
+          "unicode": 0,
+          "key_down": true,
+          "control_keys": 34,
+          "repeat": 1
+        },
+        {
+          "virtual_key": 101,
+          "scan_code": 76,
+          "unicode": 0,
+          "key_down": false,
+          "control_keys": 34,
+          "repeat": 1
+        },
+        {
+          "virtual_key": 18,
+          "scan_code": 56,
+          "unicode": 56832,
+          "key_down": false,
+          "control_keys": 32,
+          "repeat": 1
+        }
+      ],
+      "bytes": "f09f9880"
+    },
+    {
       "id": "lone-high-surrogate-is-replaced",
       "covers": "KR-REQ-08.53",
       "why": "A high surrogate with no low one is replaced by U+FFFD, not dropped and not sent broken.",
