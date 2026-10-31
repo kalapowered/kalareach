@@ -343,14 +343,14 @@ that text as UTF-8, a NUL included and a held key as many times as the console s
 session takes it in that encoding. The command reads nothing from the console while it changes the
 mode, and reads the console's text only when the console holds some, which it tells from the records
 the console keeps that make none (a key coming up, a modifier, the Apps key) by the key's character
-and virtual key. A key going down with no character counts as text when it is the key the keyboard
-layout names for a NUL, with any of the modifiers the layout names, and when it is the space bar or
-the 2 key with Ctrl, whatever the layout names or fails to name. The rule leans to text on purpose.
-A record wrongly taken for text makes one read wait for the next key, and if the stop comes first it
-has to cancel that read, which costs the key the console gives it and which the command says; a
-record wrongly taken for none is a key the person typed, lost. The rule was run on Windows build
-26100 with a US layout only, and no older build was run. The layout it asks is the command's own,
-which the console's may not match. The attachment keeps its input lease and invents no spelling. The
+and virtual key. A key going down with no character counts as text when Ctrl is held and the key is
+not a modifier or a lock, which is how the console stores a NUL (Ctrl+Space and Ctrl+@) on whichever
+key its layout names for one, or on none. The command names no key, because the console's layout may
+not be the command's. The rule leans to text on purpose. A record wrongly taken for text makes one
+read wait for the next key, and if the stop comes first it has to cancel that read, which costs the
+key the console gives it and which the command says; a record wrongly taken for none is a key the
+person typed, lost. The rule was run on Windows build 26100 with a US layout only, and no older
+build or other layout was run. The attachment keeps its input lease and invents no spelling. The
 command stops its reader before the terminal is the person's again. The reader looks for the stop
 before each read of the console, before it asks the console to spell its keys and before each send,
 and a reader that has seen the stop does none of them. One that is already inside one of those calls
