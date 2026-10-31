@@ -471,6 +471,15 @@ impl Probe {
     fn shown(&self) -> String {
         self.output.text()
     }
+
+    /// Prints the lines the probe showed, which a run with `--nocapture` then keeps in its log.
+    fn report(&self) {
+        for line in self.output.text().lines() {
+            if let Some(at) = line.find("kr-probe:") {
+                println!("{}", &line[at..]);
+            }
+        }
+    }
 }
 
 impl Drop for Probe {
@@ -611,6 +620,7 @@ fn a_console_asked_to_spell_its_keys_hands_the_reader_bytes_where_it_handed_reco
         after.contains("kr-probe:next:63"),
         "the key typed after the reader was stopped reached the process and not the reader: {after:?}"
     );
+    probe.report();
 }
 
 /// KR-REQ-08.53: a stop that meets the reader in a read of the console's text ends the read, asks
@@ -647,6 +657,7 @@ fn a_stop_that_meets_a_read_of_the_consoles_text_cancels_it_and_says_so() {
         "the stop ended the reader's read of the console and said it asked the system to cancel \
          it: {shown:?}"
     );
+    probe.report();
 }
 
 /// What the console half of a probe holds: the console taken as `kr attach` takes it, in record
