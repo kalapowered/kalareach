@@ -96,9 +96,18 @@ impl WakeEvent {
     }
 }
 
+#[link(name = "user32")]
+unsafe extern "system" {
+    /// The virtual key and modifiers that give a character in the current keyboard layout, in the
+    /// low and high byte of the answer, or -1 where there is none.
+    safe fn VkKeyScanW(character: u16) -> i16;
+}
+
 /// The console input this attachment reads.
 pub struct RecordReader {
     handle: std::fs::File,
+    /// The key a NUL comes out of the console as in this layout.
+    nul: Option<crate::attach::NulKey>,
     /// The first half of a character outside the basic plane whose second half has not arrived.
     ///
     /// One read of the console can end between the two halves, and sending each read on its own
@@ -109,9 +118,10 @@ pub struct RecordReader {
 impl RecordReader {
     /// Opens the console's input for reading records.
     #[must_use]
-    pub const fn over(handle: std::fs::File) -> Self {
+    pub fn over(handle: std::fs::File) -> Self {
         Self {
             handle,
+            nul: crate::attach::NulKey::named_by(VkKeyScanW(0)),
             pairs: PairHold::new(),
         }
     }
@@ -143,8 +153,8 @@ impl RecordReader {
                 [Woken::Stop, Woken::Console, Woken::Asked],
             )
         };
-        // SAFETY: all three handles are open for the call, the first and third the events' and the
-        // second this reader's own, and the array holds exactly the three the count names.
+        // SAFETY: all three handles are open for the call, two the events' and one this reader's
+        // own, and the array holds exactly the three the count names.
         let woken = unsafe { WaitForMultipleObjects(3, handles.as_ptr(), 0, INFINITE) };
         let index = woken.wrapping_sub(WAIT_OBJECT_0) as usize;
         match kinds.get(index) {
@@ -314,10 +324,11 @@ impl RecordReader {
     /// Says whether the console holds text, which a read of it answers at once.
     ///
     /// A console that spells its keys itself keeps what it has not handed over as records, and a
-    /// read of its text passes over the records that make none (a key coming up, a modifier or a
-    /// lock going down, a resize, a focus change) and then waits for one that does. So the records
-    /// that make none are taken off the front of the queue here, and the console reports no input
-    /// until there is some that does. It must be the only reader of the console.
+    /// read of its text passes over the records that make none (a key coming up, a key going down
+    /// with no character that is not the NUL's, a resize, a focus change) and then waits for one that
+    /// does. So when none of the records held makes text they are all taken off the queue here, and
+    /// the console reports no input until there is some that does. It must be the only reader of the
+    /// console.
     ///
     /// # Errors
     ///
@@ -354,7 +365,17 @@ impl RecordReader {
                     record.Event.KeyEvent.uChar.UnicodeChar,
                 )
             };
-            crate::attach::key_can_make_text(key.wVirtualKeyCode, key.bKeyDown != 0, unicode)
+            crate::attach::key_can_make_text(
+                &KeyRecord {
+                    virtual_key: key.wVirtualKeyCode,
+                    scan_code: key.wVirtualScanCode,
+                    unicode,
+                    key_down: key.bKeyDown != 0,
+                    control_keys: key.dwControlKeyState,
+                    repeat: key.wRepeatCount,
+                },
+                self.nul,
+            )
         });
         if makes_text || peeked == 0 {
             return Ok(makes_text);
