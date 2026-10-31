@@ -559,7 +559,7 @@ fn a_console_asked_to_spell_its_keys_hands_the_reader_bytes_where_it_handed_reco
     probe.press(b"\x1b[69;18;101;1;0;1_");
     probe.waits_for("kr-probe:watching");
     // Ctrl on its own, and the Apps key, each going down and coming up, one record at a time: the
-    // console keeps each as a record that make no text, and a read of the console's text would
+    // console keeps each as a record that makes no text, and a read of the console's text would
     // wait for the next key. The probe has seen each taken before the next is pressed, so the
     // reader has met every one of them with nothing else in the queue.
     let last = [
@@ -629,11 +629,11 @@ fn a_console_asked_to_spell_its_keys_hands_the_reader_bytes_where_it_handed_reco
 /// A key going down with no character is taken for text when Ctrl is held and the key is not a
 /// modifier or a lock, because the console stores a NUL that way. The Apps key with Ctrl held is
 /// such a record that makes no text: the read the reader makes for it takes the record, passes over
-/// it and waits for the next key, and nothing but a cancel ends it. The probe, in a console of its
-/// own, starts the reader, has the console spell its keys, and presses Ctrl and then the Apps key
-/// with Ctrl held. The console reports its queue empty once the reader has taken each, which for the
-/// second is the reader inside its read. The stop then has to cancel that read: it ends the reader
-/// and reports that it asked the system to.
+/// it and waits for the next key with text, so only a cancel ends it. The probe, in a console of
+/// its own, starts the reader, has the console spell its keys, and presses Ctrl and then the Apps
+/// key with Ctrl held. The console reports its queue empty once the reader has taken each, which
+/// for the second is the reader inside its read. The stop then has to cancel that read: it ends the
+/// reader and reports that it asked the system to.
 #[test]
 fn a_stop_that_meets_a_read_of_the_consoles_text_cancels_it_and_says_so() {
     if std::env::var_os(SPELL_PROBE).is_some() {
@@ -753,7 +753,11 @@ impl Takes {
         std::thread::spawn(move || {
             let _ = armed.send(());
             while queue.wait(&stop, &asked, false).is_ok() {
-                while queue.waiting().unwrap_or(0) != 0 {
+                while queue
+                    .waiting()
+                    .expect("the console counts its input events")
+                    != 0
+                {
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 count.fetch_add(1, SeqCst);
@@ -776,7 +780,7 @@ impl Takes {
     }
 }
 
-/// The console half of the test above, run in a console of its own.
+/// The console half of the test that has the console spell its keys, run in a console of its own.
 fn spell_probe_in_the_console() {
     use kr_cli::attach::TerminalInput;
 
