@@ -1016,16 +1016,19 @@ The bundle is reached with this device's signature and the account's token, and 
 to the service the account is signed in to. When recovery has no record yet and the sync service
 setting names another service than that one, no request is made and the refusal names the setting. A
 sign-in that does not carry the right to write the account's backup storage sends nothing either,
-and the person signs in again with that right. The record names the service the bundle is kept at,
-so choosing another sync service later does not move the bundle; the kit still points at the service
-it was made for, and the Account sheet says so. The same check is made for the record's service
-before each later step that would reach it (going on with a start that did not finish, settling a
-write, covering the host, listing the archives and making the offline copy): a record that names
-one service is refused when the account is signed in at another, whatever the setting names. That
-refusal names the service the record names and the one the account is signed in to, and says
-that recovery waits for a sign-in at the record's service; it does not ask for a change of the
-setting, which cannot move the bundle. Saving the kit reaches no service, and the kit goes on naming
-the service the record names. A phone shows the setting and offers no recovery.
+and the person signs in again with that right. The record names the service for the bundle from
+before the first write leaves, so choosing another sync service later does not move the bundle; the
+kit still points at the service it was made for, and the Account sheet says so. The same check is
+made for the record's service before each later step that would reach it (going on with a start
+that did not finish, settling a write, covering the host, listing the archives and making the
+offline copy): a record that names one service is refused when the account is signed in at
+another, whatever the setting names. That refusal names the service the record names and the one
+the account is signed in to, and says that recovery waits for a sign-in at the record's service; it
+does not ask for a change of the setting, which cannot move the bundle. A record that is made and
+not kept is finished only by a build whose account origin is the record's service: nothing in the
+application clears it, and deleting the account clears only a record whose owner is noted, which a
+record not yet kept never has. Saving the kit reaches no service, and the kit goes on naming the
+service the record names. A phone shows the setting and offers no recovery.
 
 ## The managed services the application holds
 

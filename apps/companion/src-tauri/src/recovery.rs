@@ -15,7 +15,7 @@
 //!   to the store before anything is sent, and read from it for each step; nothing holds it
 //!   between steps, and the page never sees it.
 //! * **The record** is `recovery/recovery.json` in the application's data directory: the service
-//!   the bundle is kept at, its locator, and whether the first write is known to have landed. It is
+//!   named for the bundle, its locator, and whether the first write is known to have landed. It is
 //!   made, flushed to disk and renamed into place before the first write leaves, because a write
 //!   that landed under a locator this device had not kept would be a bundle nobody could find. It
 //!   holds nothing secret. Turning recovery on makes the record, then makes or reads the seed, then
@@ -30,11 +30,11 @@
 //! only to the service the account is signed in to. The sync service is a setting of its own
 //! ([`crate::sync_service`]), and it decides where a record that does not exist yet is made: where
 //! it names another service than the account's, no request is made, and the refusal names the
-//! setting. A record names the service its bundle is kept at, and every later step is made there,
-//! whatever the setting names; where the account is signed in at another service than the record's,
-//! no request is made, and the refusal names the record's service, which the setting cannot move. A
-//! sign-in that does not carry the right to write the account's backup storage sends nothing
-//! either, and the page is told which of the two to mend.
+//! setting. A record names the service for its bundle from before the first write leaves, and every
+//! later step is made there, whatever the setting names; where the account is signed in at another
+//! service than the record's, no request is made, and the refusal names the record's service,
+//! which the setting cannot move. A sign-in that does not carry the right to write the account's
+//! backup storage sends nothing either, and the page is told which of the two to mend.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -273,7 +273,7 @@ impl From<HostCover> for HostCoverView {
 struct Record {
     /// The format of this record.
     version: u32,
-    /// The service the bundle is kept at, as the kit names it.
+    /// The service named for the bundle, as the kit names it.
     service_origin: String,
     /// The stable locator of the bundle.
     bundle_locator: String,
@@ -1067,8 +1067,8 @@ enum Named {
     /// The sync service setting, for a record that is not made yet. Choosing another service
     /// changes where the record is made.
     BySetting,
-    /// The record, which says where the bundle is kept. Choosing another sync service does not
-    /// move the bundle.
+    /// The record, which names the service for the bundle from before the first write leaves.
+    /// Choosing another sync service does not move the bundle.
     ByRecord,
 }
 
