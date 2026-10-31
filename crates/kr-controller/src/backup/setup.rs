@@ -209,10 +209,10 @@ type Ended = BackupEnableResult;
 /// request leaves. The client reports the refusal as its own failure to send, so the admission's
 /// refusal is kept here and the call ends with it ([`Self::ended`]).
 ///
-/// The renewal that asking for the token may start is not stopped by a lapse: a renewal under way
-/// is not dropped, because the account service treats a refresh token it already rotated as a
-/// replay and ends the sign-in. It changes only this host's own sign-in, and `backup.status`
-/// renews in the same way.
+/// The work that asking for the token may start is not stopped by a lapse: it renews this host's
+/// own sign-in and sends the revocations the host had queued. A renewal under way is not dropped,
+/// because the account service treats a refresh token it already rotated as a replay and ends the
+/// sign-in. `backup.status` renews in the same way.
 struct Admitted {
     inner: Arc<dyn AccountTokenSource>,
     admission: Arc<dyn SetupAdmission>,
@@ -250,16 +250,26 @@ impl Admitted {
 
     /// How the call ends when a step did not go on with `answer`: with the admission's refusal when
     /// that is what stopped a request, and otherwise with the step's own answer.
+    ///
+    /// An answer that tells a delay is given only to a call whose admission still stands: a fence
+    /// that landed while the request was out refuses the call, as it does a call that meets a delay
+    /// before a request.
     fn ended(&self, answer: Ended) -> std::result::Result<Step, Ended> {
-        match self
+        if let Some(refusal) = self
             .refused
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()
         {
-            Some(refusal) => Ok(Step::Stopped(refusal)),
-            None => Err(answer),
+            return Ok(Step::Stopped(refusal));
         }
+        if matches!(&answer, BackupEnableResult::Unknown { retry_after_seconds }
+            if retry_after_seconds.0.is_some())
+            && let Err(refusal) = self.admission.stands()
+        {
+            return Ok(Step::Stopped(refusal));
+        }
+        Err(answer)
     }
 }
 
@@ -544,10 +554,10 @@ impl BackupSetup {
     /// request to the storage service leaves or where the setup is to be recorded, or when a repeat
     /// is answered from a setup already recorded and its registration is gone: nothing is recorded
     /// by the call then, and what the service already holds is harmless, as after any call that
-    /// ends before the record. A call that is declined before it sends anything, because another
-    /// setup is recorded, its keys changed or no account is signed in, is not asked: it states a
-    /// fact of this host, sends nothing and records nothing. Every other way the call can end is
-    /// one of its answers.
+    /// ends before the record. A call that ends before its first request, because another setup is
+    /// recorded, its keys changed, its bundle is too large, no usable account is signed in or the
+    /// record of the setup could not be read, is not asked: it sends nothing and records no setup.
+    /// Every other way the call can end is one of its answers.
     pub async fn enable(
         &self,
         params: BackupEnableParams,
@@ -662,13 +672,15 @@ impl BackupSetup {
         // The admission is asked before each request to the storage service, and not once at the
         // call's start: the wait for another call, for a token and for each earlier request can
         // outlast a fence this host comes to owe or the registration the call was made under. It is
-        // asked just before the request is prepared, ahead of the delay the service named, so that
-        // a call that meets both is refused and not told the delay ([`Self::before_a_request`]),
-        // and a request that carries a token asks it again once the token is in hand
-        // ([`Admitted`]), the last point before the request leaves. The check above that a token
-        // can be had, and the renewal of the host's own sign-in that it may make, come before the
-        // first: that is no request to the storage service, and a renewal under way is not dropped,
-        // so a lapse does not stop it.
+        // asked just before the request is prepared, ahead of the delay the service named
+        // ([`Self::before_a_request`]), and a request that carries a token asks it again once the
+        // token is in hand ([`Admitted`]), the last point before the request leaves. A call that
+        // meets a fence and a delay is refused and not told the delay: an answer that tells one is
+        // given only after the admission is asked once more ([`Admitted::ended`]). The check above
+        // that a token can be had comes before the first ask, with the work of the host's own
+        // sign-in that it may start, a renewal and the revocations the host had queued: that is no
+        // request to the storage service, and a renewal under way is not dropped, so a lapse does
+        // not stop it.
         let tokens = Arc::new(Admitted::over(tokens, Arc::clone(admission)));
         // 2. The bundle first.
         if let Err(done) = self.write_bundle(params, mark, &tokens).await {
@@ -867,7 +879,8 @@ impl BackupSetup {
     /// Turns managed backup storage on when it is off, against the revision just read.
     ///
     /// The read of the storage state can last as long as the host bounds a request, so the
-    /// admission is asked again as the change leaves, once its token is in hand.
+    /// admission and the delay are asked again before the change, and the admission once more as
+    /// the change leaves, once its token is in hand.
     async fn turn_storage_on(
         &self,
         mark: kr_client::services::AccountMark,
@@ -885,6 +898,7 @@ impl BackupSetup {
             if status.backup == BackupState::On {
                 return Ok(());
             }
+            self.before_a_request(tokens)?;
             match storage
                 .set_retention(&RetentionChange {
                     backup: BackupState::On,
