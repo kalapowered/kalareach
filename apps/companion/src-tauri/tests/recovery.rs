@@ -2257,6 +2257,14 @@ async fn recovery_goes_on_with_an_unkept_record_at_its_own_service_when_the_sett
     let (recording, page) =
         with_an_unkept_record_and_the_setting_moved(&computer, &fork_service, &setting).await;
     let ours = computer.served.origin().to_owned();
+    let first = fork_service
+        .web()
+        .arrived()
+        .iter()
+        .find(|request| request.body.get("exchange").is_some())
+        .expect("the first write")
+        .body["exchange"]["locator"]
+        .clone();
 
     let written = writes_at(&fork_service);
     let on = page
@@ -2271,6 +2279,10 @@ async fn recovery_goes_on_with_an_unkept_record_at_its_own_service_when_the_sett
         .find(|request| request.body.get("exchange").is_some())
         .expect("the write");
     assert_eq!(write.body["exchange"]["kind"], "recovery_bundle");
+    assert_eq!(
+        write.body["exchange"]["locator"], first,
+        "the write keeps the locator of the record it began"
+    );
     assert_eq!(write.token.as_deref(), Some(TOKEN));
     let asked = recording.asked.lock().expect("the record").clone();
     assert!(
