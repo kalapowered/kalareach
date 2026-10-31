@@ -2707,8 +2707,51 @@ fn a_frame_thread_that_cannot_start_leaves_no_process_behind() {
     }
 }
 
-/// A process the system will not let run is ended and collected, and the end its reader tells of
-/// afterwards is not taken for the end of the next process. A check starts a process at once, so
+/// A start that returns after it created the process ends and collects the process. The system
+/// will not let it run, so the start returns an error with the process there and its pipes in the
+/// hands of the threads that carry its frames. The process is made to outlive the end of its input,
+/// as one stuck inside a read does, so that only the start can end it before the daemon goes. It is
+/// looked for by its identifier and its start as soon as the call returns: the control is the same
+/// process, found running at the point the system refuses it.
+#[test]
+fn a_start_that_returns_after_creating_the_process_ends_and_collects_it() {
+    let mut rig = Rig::new(&Script {
+        wedge_input_after: Some(0),
+        ..Script::default()
+    });
+    let created = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let seen = std::rc::Rc::clone(&created);
+    refuse_to_let_the_process_run(move |pid| {
+        let identity =
+            kr_ipc::identity::process_start_identity(pid).expect("the process the start created");
+        assert_eq!(
+            kr_ipc::identity::process_state(&identity),
+            kr_ipc::identity::ProcessState::Running,
+            "the process is there when the system refuses it"
+        );
+        *seen.borrow_mut() = Some(identity);
+    });
+    queue(rig.service(), &session(1), Priority::Ordinary, at(0));
+    let reports = rig.driver.turn(&roomy(), at(3_000)).expect("a turn");
+    assert!(
+        outcomes(&reports).contains(&&Outcome::ProcessEnded {
+            why: ProcessEnd::CouldNotStart
+        }),
+        "{reports:?}"
+    );
+    let identity = created
+        .borrow_mut()
+        .take()
+        .expect("the process was created");
+    assert_eq!(
+        kr_ipc::identity::process_state(&identity),
+        kr_ipc::identity::ProcessState::Ended,
+        "the start left the process it created behind: {identity:?}"
+    );
+}
+
+/// A process the system will not let run is not stopped by the end its reader tells of afterwards,
+/// when that end is told after the next process has started. A check starts a process at once, so
 /// the second check starts one before the first process's end has been handled; a load waits for
 /// the restart delay and would not meet it. The control is the answer of the second check.
 #[test]
@@ -2718,7 +2761,7 @@ fn an_end_told_late_of_a_process_that_would_not_run_does_not_stop_the_next_proce
     let files = rig.placed.directory("files");
     std::fs::write(files.join("right"), &weights).expect("the right file");
 
-    refuse_to_let_the_process_run();
+    refuse_to_let_the_process_run(|_| {});
     let reports = rig
         .driver
         .verify(&check(1, files.join("right"), 60_000), at(0))
@@ -2733,7 +2776,7 @@ fn an_end_told_late_of_a_process_that_would_not_run_does_not_stop_the_next_proce
         )],
         "{reports:?}"
     );
-    assert_eq!(rig.driver.pid(), None, "the process is gone");
+    assert_eq!(rig.driver.pid(), None, "the driver holds no process");
     // The first process's reader tells of its end on a thread of its own. The end is waited for and
     // not handled, so the second check starts its process with the end still to be handled.
     assert!(

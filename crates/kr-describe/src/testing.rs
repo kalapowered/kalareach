@@ -76,10 +76,8 @@ pub(crate) fn thread_start_refused(name: &str) -> bool {
     })
 }
 
-/// What runs before a process is put behind the system's memory limit, given the process's
-/// identifier.
-#[cfg(windows)]
-type LimitHook = Box<dyn FnOnce(u32)>;
+/// What runs at a point in the start of a process, given the process's identifier.
+type ProcessHook = Box<dyn FnOnce(u32)>;
 
 thread_local! {
     /// Whether a driver on this thread fails to read its own start identity next.
@@ -97,11 +95,12 @@ thread_local! {
     /// What runs the next time a driver on this thread is about to put its process behind the
     /// system's memory limit.
     #[cfg(windows)]
-    static BEFORE_LIMIT: std::cell::RefCell<Option<LimitHook>> =
+    static BEFORE_LIMIT: std::cell::RefCell<Option<ProcessHook>> =
         const { std::cell::RefCell::new(None) };
 
-    /// Whether a driver on this thread is refused when it next lets its process run.
-    static LET_RUN_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// What runs, and refuses, the next time a driver on this thread lets its process run.
+    static LET_RUN_REFUSED: std::cell::RefCell<Option<ProcessHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Runs `hook`, given the identifier of the process, the next time a driver on this thread is about
@@ -138,14 +137,20 @@ pub(crate) fn memory_refusal_taken() -> bool {
 
 /// Makes the next time a driver on this thread lets its process run fail as a request the
 /// operating system would not grant, after the process was created and its pipes were handed to
-/// the threads that carry its frames.
-pub fn refuse_to_let_the_process_run() {
-    LET_RUN_REFUSED.with(|refused| refused.set(true));
+/// the threads that carry its frames. `seen` is called first, with the identifier of the process,
+/// which is there and has not been ended: what lets a test look for it afterwards.
+pub fn refuse_to_let_the_process_run(seen: impl FnOnce(u32) + 'static) {
+    LET_RUN_REFUSED.with(|refused| *refused.borrow_mut() = Some(Box::new(seen)));
 }
 
-/// Returns whether letting the process run is to fail, which it does once.
-pub(crate) fn let_run_refused() -> bool {
-    LET_RUN_REFUSED.with(|refused| refused.replace(false))
+/// Returns whether letting the process with the identifier `pid` run is to fail, which it does
+/// once, after calling the function [`refuse_to_let_the_process_run`] was given.
+pub(crate) fn let_run_refused(pid: u32) -> bool {
+    let Some(seen) = LET_RUN_REFUSED.with(|refused| refused.borrow_mut().take()) else {
+        return false;
+    };
+    seen(pid);
+    true
 }
 
 /// Makes the next reading of its own start identity, by a driver on this thread, fail as a query

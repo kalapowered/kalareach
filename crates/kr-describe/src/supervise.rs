@@ -845,7 +845,7 @@ impl Driver {
     /// Lets the process run, when it was created held. Says why the system would not.
     fn let_run(&self, child: &Child) -> std::result::Result<(), &'static str> {
         #[cfg(feature = "testing")]
-        if crate::testing::let_run_refused() {
+        if crate::testing::let_run_refused(child.id()) {
             return Err("a test asked for it to be refused");
         }
         self.resume_held(child)
