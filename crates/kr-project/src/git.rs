@@ -858,9 +858,7 @@ impl Installation {
         // built around a program it was handed has one to give wherever it is, and a profile that
         // has to look runs no Git on a platform that runs none, installed or not.
         if let Some(why) = crate::boundary::NO_GIT {
-            return Err(ProjectError::GitFailed {
-                detail: format!("Git is not run on this platform: {why}").into(),
-            });
+            return Err(crate::boundary::no_git_refusal(why));
         }
         let mut current = self
             .current

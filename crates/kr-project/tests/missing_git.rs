@@ -72,8 +72,13 @@ fn assert_refused_for_lack_of_git(refusal: &ProjectError) {
 /// names no install.
 #[cfg(windows)]
 fn assert_refused_for_lack_of_git(refusal: &ProjectError) {
+    assert_eq!(
+        refusal.code(),
+        kr_protocol::error::ErrorCode::HostNotConfigured,
+        "{refusal:?}"
+    );
     assert!(
-        matches!(refusal, ProjectError::GitFailed { .. }),
+        !refusal.code().retry_category().permits_automatic_retry(),
         "{refusal:?}"
     );
     let said = refusal.to_string();

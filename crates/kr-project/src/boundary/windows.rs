@@ -289,9 +289,7 @@ impl Drop for OwnedSid {
 /// its container.
 pub fn start(invocation: &Invocation<'_>, confinement: &Confinement) -> Result<Spawned> {
     if let Some(why) = NO_GIT {
-        return Err(ProjectError::GitFailed {
-            detail: format!("{} is not run: {why}", invocation.described).into(),
-        });
+        return Err(super::no_git_refusal(why));
     }
     let container = build(confinement)?;
     let job = job_object()?;
