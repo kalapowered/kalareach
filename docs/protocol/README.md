@@ -426,7 +426,7 @@ service or configuration is.
 | --- | --- | --- |
 | A pairing invitation | Five minutes, single use | [Pairing](../pairing/README.md) |
 | An owner-confirmation challenge | Two minutes, single use | [Pairing](../pairing/README.md) |
-| An action window | At most five minutes, issued for one connection and the host's boot, and replaced on the live connection at half its validity | [Action windows](../transport/README.md#action-windows) |
+| An action window | At most five minutes, issued for one connection and the host's boot, and replaced on the live connection that can admit a mutation at half its validity or a little sooner | [Action windows](../transport/README.md#action-windows) |
 | A mutation's lifetime | Requested as a time to live, two minutes by default and five minutes at most. The accepted deadline is the earliest of the window's expiry, the receipt time plus the requested lifetime and any authority deadline | [Action windows](../transport/README.md#action-windows) |
 | The remote dispatch lease | At most five seconds, taken when the daemon forwards an action, and held by the worker as well as the daemon | [The remote dispatch lease](../transport/README.md#the-remote-dispatch-lease) |
 | A membership lease, and a policy-authority head | At most fifteen minutes; a lease is refreshed every five | [Account authority objects](#account-authority-objects) |

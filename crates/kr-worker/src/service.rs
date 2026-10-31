@@ -210,7 +210,7 @@ struct EmptyPage {
 
 /// What a request for a page asks, other than which request it is: everything an empty page is
 /// made from besides the journal. The key the request names for fingerprints is not among them: it
-/// is applied to records, and a page kept has none, so the host holds no copy of it.
+/// is applied to records, and a page kept has none, so the reader keeps no copy of it.
 #[derive(PartialEq, Eq)]
 struct AskedPage {
     questions_after: u64,
@@ -10074,8 +10074,8 @@ pub struct ConnectionFacts {
 impl ConnectionFacts {
     /// Whether this connection can first-admit a mutation under an action window of its own.
     ///
-    /// The control daemon's attention, descriptions and checks connections carry one kind of read
-    /// each and are refused anything else, so a window renewed on one is never presented.
+    /// The control daemon's attention, descriptions and checks connections carry one kind of
+    /// request each and are refused anything else, so a window renewed on one is never presented.
     fn admits_mutations(&self) -> bool {
         !(self.controller
             && matches!(

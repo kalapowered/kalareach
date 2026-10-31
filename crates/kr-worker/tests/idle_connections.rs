@@ -12,8 +12,8 @@
 //! asserted here.
 //!
 //! The other clock a connection keeps is the replacement of its action window, which a connection
-//! needs only if it can first-admit a mutation. The daemon's attention and descriptions
-//! connections carry one kind of read each and are refused anything else, so they keep no such
+//! needs only if it can first-admit a mutation. The daemon's attention, descriptions and checks
+//! connections carry one kind of request each and are refused anything else, so they keep no such
 //! clock; a command line and the daemon's authority connection do.
 //!
 //! This uses a real worker service on its real endpoint and a real shell. The keepalive's period
@@ -382,7 +382,7 @@ async fn only_a_bridges_connection_is_sent_a_keepalive() {
 }
 
 /// A connection that can admit a mutation is sent a replacement window on a clock, and a connection
-/// of the daemon's that carries one kind of read and is refused anything else is not: nothing it
+/// of the daemon's that carries one kind of request and is refused anything else is not: nothing it
 /// could do would present the window. The connections are opened before the last one is, so its
 /// being sent its eighth window means each of them has had the same chances to be sent eight.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -396,6 +396,10 @@ async fn kr_perf_003_only_a_connection_that_can_admit_a_mutation_is_sent_a_repla
         (
             "the daemon's descriptions connection",
             daemon(&host, ControllerConnectionRole::Descriptions).await,
+        ),
+        (
+            "the daemon's checks connection",
+            daemon(&host, ControllerConnectionRole::Checks).await,
         ),
     ];
     let mut renewed = vec![

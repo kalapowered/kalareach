@@ -358,8 +358,8 @@ async fn a_closed_session_whose_workers_process_still_runs_is_left_alone_until_i
 
 /// KR-REQ-20.20: the host-wide cap holds with live sessions and closed ones together. The spools of
 /// two closed sessions and of a session that is live add up to 120 bytes under a cap of 64. The
-/// daemon takes the oldest closed output first, down to the cap; a live session's own pass, from the
-/// same reading of the host, then finds nothing over. In the other order the live session gives up
+/// daemon takes the oldest closed output first, down to the cap; a live session's own pass, from a
+/// reading of its own, then finds nothing over. In the other order the live session gives up
 /// its output first and the daemon takes the rest of the excess, and the host is under the cap
 /// either way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

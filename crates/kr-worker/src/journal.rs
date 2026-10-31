@@ -752,9 +752,10 @@ impl Journal {
             .transpose()
     }
 
-    /// SQLite's count of the commits other connections have made to this journal's file since
-    /// this connection began: the same number twice means nothing was committed between the two
-    /// readings. It says nothing of this connection's own commits.
+    /// SQLite's token for the commits other connections have made to this journal's file: it
+    /// changes when any other connection commits, and the same number twice means nothing was
+    /// committed between the two readings. It is not a count, and it says nothing of this
+    /// connection's own commits.
     ///
     /// # Errors
     ///

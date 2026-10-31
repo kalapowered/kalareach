@@ -586,7 +586,9 @@ or a forbidden ingress is denied whatever rights the caller holds) and then appl
 A window is a freshness resource, not a permission. The host issues one per authorised connection,
 bound to that connection and to the host's boot identity, and renews it on the live connection
 without being asked: a renewal arrives as `ControlEvent::ActionWindowRenewed` at half the window's
-validity.
+validity or a little sooner. A connection that admits no mutation is sent no renewal, only the
+window its hello carries: the control daemon's connections to a session for attention,
+descriptions and checks carry one kind of request each, and no window would be presented on them.
 
 The window a client receives carries a *duration*, not an absolute deadline. The client schedules
 its renewal from that duration; the authoritative deadline lives on the host's suspend-aware

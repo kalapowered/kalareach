@@ -2742,8 +2742,10 @@ directly rather than reimplemented for the local path, and both are measured on 
 suspend-aware continuous clock (`kr_transport::clock`).
 
 * The daemon and each worker issue one action window per authenticated connection, bound to that
-  connection and to the host's boot. A window is replaced on the live connection at half its
-  validity, without being asked for, and arrives as `ControlEvent::ActionWindowRenewed`. A window
+  connection and to the host's boot. A window is replaced on a live connection that can admit a
+  mutation at half its validity or a little sooner, without being asked for, and arrives as
+  `ControlEvent::ActionWindowRenewed`. A worker sends none on the daemon's attention, descriptions
+  and checks connections, which carry one kind of request each. A window
   from another connection, or from before a restart, first-admits nothing.
 * The accepted deadline of a mutation is the earliest of the window's expiry, the time the mutation
   was received plus the requested lifetime, and any applicable authority deadline. The time of
@@ -4174,8 +4176,11 @@ first append after it is let go writes it and gives up the oldest segments.
 
 The host bound is applied from a reading of the environment's spool directories, so two sessions
 writing at once can take the host past it until the next pass. It is not a reservation, and it is
-not enforced ahead of the write. Two parties apply it, each to its own sessions, from the same
-reading. A live session's worker applies it on its maintenance tick. The control daemon applies it
+not enforced ahead of the write. Two parties apply it, each to its own sessions, from a reading of
+its own. A live session's worker applies it on its maintenance tick, from a reading that it keeps
+for five minutes while its own retained output has not changed and takes again at once when it
+has, because only a session whose output grows can take the host over the cap. A reading that finds
+the host over the cap is not kept. The control daemon applies it
 every minute to the sessions that have closed, taking the output of the session whose oldest segment
 was written longest ago first. The two keep no order between them, so a live session can give up
 output before a closed one does. The reading is the segment files, each sized by asking the file: a
@@ -4185,6 +4190,8 @@ that records where a spool's output got to is not counted, and neither is anythi
 segments. Both parties read the whole environment's bytes and each acts on its own sessions, so in
 the minute the daemon and a worker both find the host over the cap they can both give up output,
 and the host is then under the cap by what both took; it is not over it for longer than a pass.
+Workers whose sessions began in the same half minute make their passes together, so several of
+them can find the host over the cap in one pass and each give up output.
 
 Eviction is not quiet. A retention pass records the cursor range it took and the bound that took
 it, and a reader asking for a cursor inside that range is told both: `history.page` returns the
@@ -5469,7 +5476,7 @@ So every wait in a worker is on something that happens rather than on a clock.
 | the processes the session owns | input the session accepted and output it produced, which is where a new process usually comes from | the same sweep, for everything that comes from neither |
 | the login a desktop-bound session is tied to | nothing this host can subscribe to, so it is asked on every wake: one kernel query about the process that owns the login session, at most once a second | the same sweep |
 | a held paste prefix | its own deadline, which exists only while a prefix is held | nothing |
-| an attached view | the frames its connection carries | every view has the 150-second window renewal; a connection a process bridge made also gets a keepalive every ten seconds, which its invoker reads for silence |
+| an attached view | the frames its connection carries | every view has a window renewal at least every 150 seconds; a connection a process bridge made also gets a keepalive every ten seconds, which its invoker reads for silence |
 
 The sweep is a window rather than a guarantee, and it is worth saying exactly what that costs. A
 process that starts and ends between two observations of the ownership boundary is not in the
