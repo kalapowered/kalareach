@@ -1280,8 +1280,8 @@ pub fn spawn_input_reader(
 /// down or came up, the modifier state and a repeat count, and the session spells it as its
 /// terminal asked for. A record that is not a key is not read as input.
 ///
-/// Once `switch` has the console spell its keys itself, the thread reads the console's bytes
-/// instead, as a command that reads a terminal does, and hands those on.
+/// Once `switch` has the console spell its keys itself, the thread reads the text the console
+/// spells instead, with `ReadConsoleW`, and hands it on as UTF-8.
 ///
 /// The thread ends when the console's input does, when a batch has nowhere to go, or when the
 /// returned [`InputStop`] is used. While it reads records it waits for the console, the switch and

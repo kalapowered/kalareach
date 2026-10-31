@@ -514,7 +514,7 @@ fn a_console_asked_to_spell_its_keys_hands_the_reader_bytes_where_it_handed_reco
     press(b"\x1b[93;93;0;0;256;1_");
     waits_for("kr-probe:stopped", &mut child);
     // The reader has been stopped, so this key is the process's own to read. A reader left in its
-    // read of the console's bytes would take it.
+    // read of the console's text would take it.
     press(b"\x1b[67;46;99;1;0;1_");
     press(b"\x1b[67;46;99;0;0;1_");
     waits_for("kr-probe:done", &mut child);
