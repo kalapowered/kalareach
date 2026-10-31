@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 
 use kr_protocol::identity::{EnvironmentAccess, EnvironmentEnrolment, EnvironmentPresence};
 
-use crate::bridge::launch::{self, CONTAINER_RUNTIME, Observation};
+use crate::bridge::launch::{self, Observation};
 use crate::bridge::store::Observer;
 use crate::error::{ControllerError, Result};
 
@@ -234,7 +234,65 @@ enum Ending {
     /// The deadline passed while it was still running.
     Deadline,
     /// This host could not tell whether it was still running.
-    Unknown(String),
+    Unknown(std::io::Error),
+}
+
+/// Why a call run within a limit gave no answer. Each names the call by its program and verbs, as
+/// [`named`] says, and none repeats a value after them.
+#[derive(Debug)]
+pub enum CallFailure {
+    /// The program could not be started.
+    NotRun {
+        /// The call.
+        call: String,
+        /// What the operating system said.
+        error: std::io::Error,
+    },
+    /// The limit passed while the call was still running, and it was ended.
+    Deadline {
+        /// The call.
+        call: String,
+        /// The limit it was given.
+        limit: std::time::Duration,
+        /// Whether the ending was seen.
+        ended: bool,
+    },
+    /// This host could not tell whether the call was still running.
+    Unknown {
+        /// The call.
+        call: String,
+        /// What the operating system said.
+        error: std::io::Error,
+    },
+}
+
+impl std::fmt::Display for CallFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotRun { call, error } => write!(formatter, "{call} could not be run: {error}"),
+            Self::Deadline { call, limit, ended } => write!(
+                formatter,
+                "{call} said nothing for {} seconds and {}",
+                limit.as_secs(),
+                if *ended {
+                    "was ended"
+                } else {
+                    "could not be ended"
+                }
+            ),
+            Self::Unknown { call, error } => {
+                write!(formatter, "{call} could not be waited for: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CallFailure {}
+
+impl From<CallFailure> for ControllerError {
+    fn from(failure: CallFailure) -> Self {
+        Self::supervision(failure.to_string())
+    }
 }
 
 /// What a refusal names a call by: the program and the words after it up to the first option,
@@ -267,13 +325,13 @@ fn named(program: &str, arguments: &[String]) -> String {
 ///
 /// # Errors
 ///
-/// Returns a supervision failure that names the call when the program could not be run, could not
-/// be waited for, or did not end within `limit` and was ended.
+/// Returns the failure, naming the call, when the program could not be run, could not be waited
+/// for, or did not end within `limit` and was ended.
 pub fn run_bounded(
     program: &str,
     arguments: &[String],
     limit: std::time::Duration,
-) -> Result<std::process::Output> {
+) -> std::result::Result<std::process::Output, CallFailure> {
     let deadline = std::time::Instant::now() + limit;
     let call = named(program, arguments);
     let mut child = Command::new(program)
@@ -282,8 +340,9 @@ pub fn run_bounded(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| {
-            ControllerError::supervision(format!("{call} could not be run: {error}"))
+        .map_err(|error| CallFailure::NotRun {
+            call: call.clone(),
+            error,
         })?;
     let reading_out = read_in_the_background(child.stdout.take());
     let reading_err = read_in_the_background(child.stderr.take());
@@ -299,7 +358,7 @@ pub fn run_bounded(
             }
             // A child whose state cannot be read is still a child this call started, so it is
             // ended and collected like one rather than left behind with the failure.
-            Err(error) => break Ending::Unknown(error.to_string()),
+            Err(error) => break Ending::Unknown(error),
         }
     };
     // Only the child this call started, and by the handle it holds. Ending it says whether the
@@ -317,18 +376,8 @@ pub fn run_bounded(
             stdout,
             stderr,
         }),
-        Ending::Deadline => Err(ControllerError::supervision(format!(
-            "{call} said nothing for {} seconds and {}",
-            limit.as_secs(),
-            if ended {
-                "was ended"
-            } else {
-                "could not be ended"
-            }
-        ))),
-        Ending::Unknown(error) => Err(ControllerError::supervision(format!(
-            "{call} could not be waited for: {error}"
-        ))),
+        Ending::Deadline => Err(CallFailure::Deadline { call, limit, ended }),
+        Ending::Unknown(error) => Err(CallFailure::Unknown { call, error }),
     }
 }
 
@@ -374,17 +423,6 @@ fn run_within(
         code: output.status.code(),
         text,
     })
-}
-
-/// Returns whether this host has the container runtime an enrolled container needs.
-///
-/// A host without it can still list and forget its enrolled containers: what it cannot do is
-/// observe or start one, and the answer says so by name rather than reporting the container
-/// stopped.
-#[must_use]
-pub fn container_runtime_present() -> bool {
-    run_bounded(CONTAINER_RUNTIME, &["--version".to_owned()], PLATFORM_LIMIT)
-        .is_ok_and(|output| output.status.success())
 }
 
 /// Reads one distribution's state out of the two listings of names `wsl.exe` prints.
@@ -465,6 +503,51 @@ mod tests {
             "it returned after {:?}",
             started.elapsed()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_refusal_names_the_call_by_what_it_asked_and_repeats_no_value() {
+        // The words after the first option are what the call was given to work on: a name, a user,
+        // a path. They are the person's, and a refusal is shown and logged.
+        let error = super::run_bounded(
+            "/bin/sh",
+            &[
+                "-c".to_owned(),
+                "exec sleep 600".to_owned(),
+                "a-value-the-person-typed".to_owned(),
+            ],
+            std::time::Duration::from_millis(200),
+        )
+        .expect_err("the command is ended");
+        assert!(
+            matches!(error, super::CallFailure::Deadline { ended: true, .. }),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("/bin/sh -c said nothing"),
+            "{error}"
+        );
+        assert!(
+            !error.to_string().contains("a-value-the-person-typed"),
+            "{error}"
+        );
+        assert!(!error.to_string().contains("exec sleep"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_program_that_is_not_there_is_not_run_and_the_failure_says_so() {
+        let error = super::run_bounded(
+            "/nonexistent-runtime/podman",
+            &["--version".to_owned()],
+            std::time::Duration::from_secs(5),
+        )
+        .expect_err("there is nothing to run");
+        let super::CallFailure::NotRun { error: why, .. } = &error else {
+            panic!("the program was not run: {error}");
+        };
+        assert_eq!(why.kind(), std::io::ErrorKind::NotFound, "{error}");
     }
 
     #[cfg(unix)]

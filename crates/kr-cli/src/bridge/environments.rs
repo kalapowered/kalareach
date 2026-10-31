@@ -18,7 +18,7 @@ use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, TimestampMs};
 
 use kr_controller::bridge::launch::CONTAINER_RUNTIME;
-use kr_controller::bridge::platform::{self, PLATFORM_LIMIT};
+use kr_controller::bridge::platform::{self, CallFailure, PLATFORM_LIMIT};
 
 use crate::cli::{
     BridgeEnrolArguments, BridgeForgetArguments, BridgeListArguments, BridgeRefreshArguments,
@@ -196,9 +196,9 @@ fn resolve_container_target(target: &str) -> Result<String> {
 /// [`resolve_container_target`], through the container runtime `runtime` and for no longer than
 /// `limit`.
 ///
-/// The runtime is asked while the daemon's record of enrolled environments may be wanted by
-/// another command, so a runtime that never answers must not hold this one: the call is ended at
-/// the limit, and the refusal names it.
+/// A runtime that never answers must not hold this command for good: the call is ended at the
+/// limit, and the refusal names it. A runtime that is not there, or that this host could not wait
+/// for, is refused as that and not as a call that ran long.
 fn resolve_container_target_through(
     runtime: &'static str,
     limit: std::time::Duration,
@@ -206,14 +206,27 @@ fn resolve_container_target_through(
 ) -> Result<String> {
     let arguments =
         ["container", "inspect", "--format", "{{.Id}}", "--", target].map(str::to_owned);
-    let output = platform::run_bounded(runtime, &arguments, limit).map_err(|error| {
-        CliError::Usage(shown!(
-            "{} container inspect, which resolves the target to a container identifier, did not \
-             run to its end within {} seconds ({}); pass the identifier the runtime issued",
-            runtime,
-            limit.as_secs(),
-            error.code()
-        ))
+    let output = platform::run_bounded(runtime, &arguments, limit).map_err(|failure| {
+        CliError::Usage(match failure {
+            CallFailure::NotRun { error, .. } => shown!(
+                "{} could not be run to resolve the target to a container identifier ({}); pass \
+                 the identifier the runtime issued",
+                runtime,
+                Shown::io(&error)
+            ),
+            CallFailure::Deadline { .. } => shown!(
+                "{} container inspect, which resolves the target to a container identifier, did \
+                 not run to its end within {} seconds; pass the identifier the runtime issued",
+                runtime,
+                limit.as_secs()
+            ),
+            CallFailure::Unknown { error, .. } => shown!(
+                "{} container inspect, which resolves the target to a container identifier, \
+                 could not be waited for ({}); pass the identifier the runtime issued",
+                runtime,
+                Shown::io(&error)
+            ),
+        })
     })?;
     // Neither the target nor what the runtime printed is repeated: the target is what was typed,
     // and the runtime's own output is whatever it chose to say.
@@ -513,6 +526,21 @@ mod tests {
 
     /// A runtime that never answers ends the resolution of a target at its limit, and the refusal
     /// names the call without repeating the target.
+    /// A runtime that is not installed is refused as that, and not as a call that ran long.
+    #[test]
+    fn a_runtime_that_is_not_there_is_refused_as_not_run() {
+        let refused = resolve_container_target_through(
+            "/nonexistent-runtime/podman",
+            std::time::Duration::from_secs(5),
+            "a-name-the-person-typed",
+        )
+        .expect_err("there is nothing to run");
+        let said = refused.to_string();
+        assert!(said.contains("could not be run"), "{said}");
+        assert!(!said.contains("within"), "{said}");
+        assert!(!said.contains("a-name-the-person-typed"), "{said}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_runtime_that_never_answers_ends_the_resolution_of_a_target_and_the_refusal_names_the_call()

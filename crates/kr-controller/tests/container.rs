@@ -15,12 +15,10 @@ mod net_support;
 use std::io::Write as _;
 use std::process::Output;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kr_controller::bridge::launch;
-use kr_controller::bridge::platform::{
-    PLATFORM_LIMIT, PlatformObserver, container_runtime_present, run_bounded,
-};
+use kr_controller::bridge::platform::{CallFailure, PLATFORM_LIMIT, PlatformObserver, run_bounded};
 use kr_controller::bridge::store::Observer;
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::identity::{
@@ -35,10 +33,23 @@ use kr_protocol::scalars::{Nullable, TimestampMs, Uuid};
 /// A small image with a shell, which every one of these starts a sleeping process in.
 const IMAGE: &str = "docker.io/library/alpine:3.20";
 
-/// Returns false and says why when this machine has no container runtime.
+/// Returns false and says why when this machine has no container runtime. A runtime that is there
+/// and does not answer its version is not a missing one: it fails the case, with the call named,
+/// where a skip would pass every case that needs it.
 fn runtime_available(suite: &str) -> bool {
-    if container_runtime_present() {
-        return true;
+    match run_bounded(
+        launch::CONTAINER_RUNTIME,
+        &["--version".to_owned()],
+        PLATFORM_LIMIT,
+    ) {
+        Ok(output) if output.status.success() => return true,
+        Ok(output) => panic!(
+            "{} is installed and failed its version: {}",
+            launch::CONTAINER_RUNTIME,
+            printed(&output)
+        ),
+        Err(CallFailure::NotRun { error, .. }) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(failure) => panic!("{failure}"),
     }
     eprintln!(
         "{suite}: skipped, because {} is not installed on this machine",
@@ -57,7 +68,7 @@ fn runtime_within(arguments: &[&str], bound: Duration) -> Result<Output, String>
         .iter()
         .map(|argument| (*argument).to_owned())
         .collect();
-    run_bounded(launch::CONTAINER_RUNTIME, &arguments, bound).map_err(|error| error.to_string())
+    run_bounded(launch::CONTAINER_RUNTIME, &arguments, bound).map_err(|failure| failure.to_string())
 }
 
 /// Runs the container runtime once, and fails the case if the call does not end.
@@ -124,9 +135,15 @@ fn container_identifier(stdout: &[u8]) -> Result<String, String> {
     }
 }
 
-/// A container this test made, removed when the test ends however it ends.
+/// How long a removal that does not end is asked again: far longer than a call that answers takes,
+/// and short of a runtime that has stopped answering.
+const REMOVAL_WITHIN: Duration = Duration::from_secs(300);
+
+/// A container this test made, removed when the test ends by any way that runs destructors. A test
+/// binary that is killed runs none, and leaves the container.
 struct Container {
     name: String,
+    /// The identifier the runtime issued, empty until it has issued one.
     id: String,
 }
 
@@ -134,6 +151,13 @@ impl Container {
     /// Starts a container that does nothing but stay alive.
     fn start(name: &str) -> Self {
         image_present();
+        // The guard exists before the call that can make the container: a call that makes it and
+        // then stalls, or prints no identifier, still leaves a guard that removes it by the name
+        // given here.
+        let mut container = Self {
+            name: name.to_owned(),
+            id: String::new(),
+        };
         let output = runtime(&[
             "run",
             "--detach",
@@ -150,15 +174,18 @@ impl Container {
             "the container starts: {}",
             printed(&output)
         );
-        let id = container_identifier(&output.stdout).unwrap_or_else(|refusal| {
-            // There is no identifier to remove it by, so the container goes by the name this test
-            // gave it a moment ago.
-            let _ = runtime_within(&["rm", "--force", "--", name], PLATFORM_LIMIT);
-            panic!("{refusal}")
-        });
-        Self {
-            name: name.to_owned(),
-            id,
+        container.id =
+            container_identifier(&output.stdout).unwrap_or_else(|refusal| panic!("{refusal}"));
+        container
+    }
+
+    /// What names the container to the runtime: the identifier it issued, and until it has issued
+    /// one, the name this test gave it.
+    fn target(&self) -> &str {
+        if self.id.is_empty() {
+            &self.name
+        } else {
+            &self.id
         }
     }
 
@@ -175,26 +202,46 @@ impl Container {
             approved_at_ms: TimestampMs::new(0),
         }
     }
+
+    /// Removes the container, or says why it could not. A removal can be asked again and a loaded
+    /// machine's runtime can take longer than one call is given, so a call that does not end is
+    /// asked again until [`REMOVAL_WITHIN`]; a refusal is not.
+    fn remove(&self) -> Result<(), String> {
+        let until = Instant::now() + REMOVAL_WITHIN;
+        loop {
+            match runtime_within(
+                &[
+                    "rm",
+                    "--force",
+                    "--ignore",
+                    "--time",
+                    "0",
+                    "--",
+                    self.target(),
+                ],
+                PLATFORM_LIMIT,
+            ) {
+                Ok(output) if output.status.success() => return Ok(()),
+                Ok(output) => return Err(printed(&output)),
+                Err(why) if Instant::now() >= until => return Err(why),
+                Err(_) => std::thread::sleep(Duration::from_millis(200)),
+            }
+        }
+    }
 }
 
 impl Drop for Container {
     fn drop(&mut self) {
-        // Only what this test made, and by the identifier it recorded rather than by a name
-        // somebody else might now hold. A container the case itself removed is not one to
-        // complain of. A removal that fails is recorded, and fails a case that passed; a case that is already failing has said so, and a second panic would end the
-        // whole test binary.
-        let removed = runtime_within(
-            &["rm", "--force", "--ignore", "--", &self.id],
-            PLATFORM_LIMIT,
-        );
-        let why = match removed {
-            Ok(output) if output.status.success() => return,
-            Ok(output) => printed(&output),
-            Err(why) => why,
+        // A container the case itself removed is not one to complain of. A removal that fails is
+        // recorded, and fails a case that passed; a case that is already failing has said so, and
+        // a second panic would end the whole test binary.
+        let Err(why) = self.remove() else {
+            return;
         };
         let record = format!(
             "the container {} ({}) was not removed and may still be running: {why}",
-            self.name, self.id
+            self.name,
+            self.target()
         );
         let _ = writeln!(std::io::stderr(), "{record}");
         if !std::thread::panicking() {
