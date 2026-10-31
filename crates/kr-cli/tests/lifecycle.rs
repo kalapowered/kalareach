@@ -5063,24 +5063,27 @@ fn unmount(mount: &Path) -> Result<(), String> {
 ///
 /// The runtime starts it in a session of its own, so the end of the application's group does not
 /// reach it, and it goes on holding the case's runtime directory long after the case. Its number
-/// is in the runtime directory, and it is ended only if it was started in that directory.
+/// is in the runtime directory, and it is ended only if it was started in that directory. The
+/// process is taken by its start identity before its environment is read, and ended by that
+/// identity, so a number that passes to another process between the steps is left alone.
 fn end_the_container_runtimes_pause_process(runtime: &Path) {
-    let Some(pid) = std::fs::read_to_string(runtime.join("libpod/tmp/pause.pid"))
+    let Some(number) = std::fs::read_to_string(runtime.join("libpod/tmp/pause.pid"))
         .ok()
-        .and_then(|text| text.trim().parse::<i32>().ok())
-        .and_then(rustix::process::Pid::from_raw)
+        .and_then(|text| text.trim().parse::<u32>().ok())
     else {
         return;
     };
+    let Ok(identity) = process_start_identity(number) else {
+        return;
+    };
     let wanted = format!("XDG_RUNTIME_DIR={}", runtime.display());
-    let started_here =
-        std::fs::read(format!("/proc/{}/environ", pid.as_raw_nonzero())).is_ok_and(|environment| {
-            environment
-                .split(|byte| *byte == 0)
-                .any(|variable| variable == wanted.as_bytes())
-        });
+    let started_here = std::fs::read(format!("/proc/{number}/environ")).is_ok_and(|environment| {
+        environment
+            .split(|byte| *byte == 0)
+            .any(|variable| variable == wanted.as_bytes())
+    });
     if started_here {
-        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        let _ = kr_ipc::identity::stop_process(&identity, kr_ipc::identity::Stop::Kill);
     }
 }
 
