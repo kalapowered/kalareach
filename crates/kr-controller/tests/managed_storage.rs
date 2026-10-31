@@ -5907,6 +5907,26 @@ async fn a_deadline_that_passes_while_the_bundle_write_waits_for_its_own_token_s
     assert_eq!(web.requests_to(SYNC), 1, "the control writes the bundle");
 }
 
+/// The service names `delay` to a look at its storage state that the owner makes with
+/// `backup.status`, and the host owes it from then on. The case goes on from here only if it does:
+/// the look bounds its wait for the service in real time and, when that bound passes, says nothing
+/// was read and owes nothing, and a case that went on from such a look would fail at a later step
+/// that needs the delay, for a reason that is not the one that happened.
+async fn the_service_names_a_delay_to_a_look_at_its_storage_state(rig: &Rig, delay: Moment) {
+    rig.served.web().fail(STATUS, 1, delay);
+    let storage = rig.backup_status().await.storage;
+    assert!(
+        rig.controller
+            .backup_runtime()
+            .expect("a carrier")
+            .quiet()
+            .left()
+            .is_some(),
+        "the look at the storage state did not leave the delay the service named owed; it said \
+         {storage:?}, as it does when its wait for the service passes the bound it keeps"
+    );
+}
+
 /// KR-REQ-09.09: a call that waits for its first token while the service has asked to be left
 /// alone, and meets a fence meanwhile, is refused for the fence and not told the delay. Nothing
 /// leaves in either case; the answer is what differs. The control: with the fence let go, the same
@@ -5979,11 +5999,7 @@ async fn a_fence_owed_while_the_call_waits_on_the_service_refuses_it_and_does_no
     let call = rig.enable_outcome_in_the_background(&made.params);
     within("the enrolment", web.requests_reach(MANIFEST, 1)).await;
     // The owner's look at the storage state meets the delay, which the host owes from then on.
-    web.fail(STATUS, 1, delay);
-    assert!(matches!(
-        rig.backup_status().await.storage,
-        BackupStorageState::Unread { .. }
-    ));
+    the_service_names_a_delay_to_a_look_at_its_storage_state(&rig, delay).await;
     rig.controller.hold_fence(true);
     web.release_held();
     let refusal = call
@@ -6009,11 +6025,7 @@ async fn a_fence_owed_while_the_call_waits_on_the_service_refuses_it_and_does_no
     web.fail(SYNC, 1, Moment::Hold);
     let call = rig.enable_outcome_in_the_background(&made.params);
     within("the bundle write", web.requests_reach(SYNC, 1)).await;
-    web.fail(STATUS, 1, delay);
-    assert!(matches!(
-        rig.backup_status().await.storage,
-        BackupStorageState::Unread { .. }
-    ));
+    the_service_names_a_delay_to_a_look_at_its_storage_state(&rig, delay).await;
     rig.controller.hold_fence(true);
     web.release_held();
     let refusal = call
@@ -6042,11 +6054,7 @@ async fn a_fence_owed_while_the_call_waits_on_the_service_refuses_it_and_does_no
     within("the bundle write", web.requests_reach(SYNC, 1)).await;
     web.release_held();
     within("the read that settles it", web.requests_reach(SYNC, 2)).await;
-    web.fail(STATUS, 1, delay);
-    assert!(matches!(
-        rig.backup_status().await.storage,
-        BackupStorageState::Unread { .. }
-    ));
+    the_service_names_a_delay_to_a_look_at_its_storage_state(&rig, delay).await;
     rig.controller.hold_fence(true);
     web.release_held();
     let refusal = call
@@ -6208,19 +6216,15 @@ async fn a_deadline_that_passes_while_the_call_waits_on_the_service_refuses_it_a
     within("the bundle write", web.requests_reach(SYNC, 1)).await;
     web.release_held();
     within("the read that settles it", web.requests_reach(SYNC, 2)).await;
-    web.fail(
-        STATUS,
-        1,
+    the_service_names_a_delay_to_a_look_at_its_storage_state(
+        &rig,
         Moment::Refuse {
             status: 429,
             code: "RATE_LIMITED",
             retry_after_seconds: Some(30),
         },
-    );
-    assert!(matches!(
-        rig.backup_status().await.storage,
-        BackupStorageState::Unread { .. }
-    ));
+    )
+    .await;
     clock.advance(Duration::from_millis(
         kr_protocol::limits::DEFAULT_MUTATION_TTL.get() + 1_000,
     ));
@@ -6293,8 +6297,7 @@ async fn a_delay_named_while_the_call_waits_on_the_service_holds_back_the_reques
     web.fail(SYNC, 1, Moment::Slow);
     let call = rig.enable_in_the_background(&made.params);
     within("the bundle write", web.requests_reach(SYNC, 1)).await;
-    web.fail(STATUS, 1, delay);
-    rig.backup_status().await;
+    the_service_names_a_delay_to_a_look_at_its_storage_state(&rig, delay).await;
     web.release_held();
     assert!(matches!(
         call.await.expect("the call ends"),
@@ -6309,8 +6312,7 @@ async fn a_delay_named_while_the_call_waits_on_the_service_holds_back_the_reques
     web.fail(MANIFEST, 1, Moment::Slow);
     let call = rig.enable_in_the_background(&made.params);
     within("the enrolment", web.requests_reach(MANIFEST, 1)).await;
-    web.fail(STATUS, 1, delay);
-    rig.backup_status().await;
+    the_service_names_a_delay_to_a_look_at_its_storage_state(&rig, delay).await;
     let reads = web.requests_to(STATUS);
     web.release_held();
     assert!(matches!(
@@ -6334,8 +6336,7 @@ async fn a_delay_named_while_the_call_waits_on_the_service_holds_back_the_reques
         web.requests_reach(STATUS, 2),
     )
     .await;
-    web.fail(STATUS, 1, delay);
-    rig.backup_status().await;
+    the_service_names_a_delay_to_a_look_at_its_storage_state(&rig, delay).await;
     web.release_held();
     assert!(matches!(
         call.await.expect("the call ends"),
