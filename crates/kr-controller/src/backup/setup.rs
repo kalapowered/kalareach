@@ -299,7 +299,8 @@ enum Step {
     /// The service holds the bundle, the enrolment and the retention switch, and this setup is
     /// what remains to be recorded.
     Record(SetupRecord),
-    /// The admission stopped the call: a request did not leave, or a repeat was not answered.
+    /// The admission stopped the call: a request did not leave, a repeat was not answered, or an
+    /// answer that tells a delay was not given.
     Stopped(ControllerError),
 }
 
@@ -551,13 +552,16 @@ impl BackupSetup {
     ///
     /// Returns [`ControllerError::InvalidArgument`] for a call whose fingerprint is not the one its
     /// recovery public key has, and the admission's refusal when it no longer stands before a
-    /// request to the storage service leaves or where the setup is to be recorded, or when a repeat
-    /// is answered from a setup already recorded and its registration is gone: nothing is recorded
-    /// by the call then, and what the service already holds is harmless, as after any call that
-    /// ends before the record. A call that ends before its first request, because another setup is
-    /// recorded, its keys changed, its bundle is too large, no usable account is signed in or the
-    /// record of the setup could not be read, is not asked: it sends nothing and records no setup.
-    /// Every other way the call can end is one of its answers.
+    /// request to the storage service leaves, where the setup is to be recorded, when a repeat is
+    /// answered from a setup already recorded and its registration is gone or a fence is owed, and
+    /// when the call would otherwise be told a delay the service named: nothing is recorded by the
+    /// call then, and what the service already holds is harmless, as after any call that ends
+    /// before the record. Every other way the call can end is one of its answers, and a decline or
+    /// an unknown that tells no delay is given without asking the admission again. A call that
+    /// ends so before its first request, because another setup is recorded, its keys changed,
+    /// its bundle is too large, another account is signed in, no usable account is signed in or
+    /// the record of the setup could not be read, sends nothing to the storage service and records
+    /// no setup.
     pub async fn enable(
         &self,
         params: BackupEnableParams,
@@ -917,8 +921,11 @@ impl BackupSetup {
     }
 
     /// Ends the call, without a request, if the admission it was made under no longer stands or the
-    /// service asked to be left alone. The admission is asked first, so that a call that meets both
-    /// is refused and not told the delay.
+    /// service asked to be left alone. The admission is asked first. That stops the enrolment,
+    /// which carries no token, and keeps a call that no longer stands from asking for a token, and
+    /// with it from waiting for the account's lock or starting a renewal. A call that meets both is
+    /// refused and not told the delay in either order, because [`Admitted::ended`] asks again
+    /// before it gives an answer that tells one.
     fn before_a_request(&self, tokens: &Admitted) -> std::result::Result<(), Ended> {
         tokens.ask()?;
         match self.quiet.left() {
