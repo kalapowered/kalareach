@@ -146,12 +146,13 @@ struct StartState {
 
 impl Supervisor {
     /// Starts nothing from here on, and waits, within `bound`, for the starts already under way to
-    /// have been recorded in [`Supervisor::services`].
+    /// have been recorded in [`Supervisor::services`]. Returns how many are still under way.
     ///
     /// The daemon is still running when a test ends, and a request it was answering can have
     /// begun a start that the record does not hold yet; read then, the record misses a host that
     /// goes on running after the test.
-    pub fn close(&self, bound: Duration) {
+    #[must_use]
+    pub fn close(&self, bound: Duration) -> usize {
         let deadline = std::time::Instant::now() + bound;
         let mut state = self
             .gate
@@ -169,8 +170,14 @@ impl Supervisor {
                 Err(poisoned) => poisoned.into_inner().0,
             };
         }
+        state.under_way
     }
 }
+
+/// How long the starts under way when a world ends are given to be recorded: the longest the
+/// platform's service manager is given to answer one start (the Task Scheduler's 120 seconds), and
+/// a margin.
+const STARTS_RECORDED_WITHIN: Duration = Duration::from_secs(150);
 
 /// The supervisor a daemon is given, which a daemon started again on the same tree is given again.
 #[derive(Debug)]
@@ -335,9 +342,10 @@ pub struct HostEnding {
 
 impl Drop for HostEnding {
     fn drop(&mut self) {
-        if let Some(supervisor) = &self.supervisor {
-            supervisor.close(Duration::from_secs(30));
-        }
+        let unrecorded = self
+            .supervisor
+            .as_ref()
+            .map_or(0, |supervisor| supervisor.close(STARTS_RECORDED_WITHIN));
         let mut hosts: Vec<ProcessStartIdentity> = Vec::new();
         let mut labels: Vec<String> = Vec::new();
         if let Ok(services) = self.services.lock() {
@@ -369,9 +377,10 @@ impl Drop for HostEnding {
             left.extend(gone);
         }
         assert!(
-            (left.is_empty() && running.is_empty()) || std::thread::panicking(),
-            "this test left plugin hosts that were not seen to end ({running:?}) or jobs registered \
-             with the service manager ({left:?})"
+            (left.is_empty() && running.is_empty() && unrecorded == 0) || std::thread::panicking(),
+            "this test left plugin hosts that were not seen to end ({running:?}), jobs registered \
+             with the service manager ({left:?}), or {unrecorded} starts of a host that were still \
+             under way {STARTS_RECORDED_WITHIN:?} after the world was closed to new ones"
         );
     }
 }
