@@ -609,8 +609,11 @@ impl GitProgram {
     /// # Errors
     ///
     /// Returns [`ProjectError::GitUnavailable`] when Git is not installed, cannot be resolved to
-    /// an absolute path, does not answer within [`PROBE_BOUND`], or is older than
+    /// an absolute path, answers with more than it was asked, or is older than
     /// [`MINIMUM_GIT_VERSION`]. The message ends with the step that installs Git on this platform.
+    /// Returns [`ProjectError::GitFailed`] when Git does not answer within [`PROBE_BOUND`] or the
+    /// host is short of what it needs to ask: a fault that passes, and says nothing of the Git
+    /// that was being asked.
     pub fn discover() -> Result<Self> {
         Self::discover_on(std::env::var_os("PATH").as_deref(), PROBE_BOUND)
     }
@@ -630,9 +633,10 @@ impl GitProgram {
     ///
     /// # Errors
     ///
-    /// Returns [`ProjectError::GitUnavailable`] when the path cannot be resolved, when Git does not
-    /// answer within [`PROBE_BOUND`] or the answer is more than a version and a directory, or when
-    /// the version is older than [`MINIMUM_GIT_VERSION`].
+    /// Returns [`ProjectError::GitUnavailable`] when the path cannot be resolved, when the answer
+    /// is more than a version and a directory, or when the version is older than
+    /// [`MINIMUM_GIT_VERSION`], and [`ProjectError::GitFailed`] when Git does not answer within
+    /// [`PROBE_BOUND`] or the host is short of what it needs to ask.
     pub fn at(path: &Path) -> Result<Self> {
         Self::at_within(path, PROBE_BOUND)
     }
@@ -770,18 +774,50 @@ struct Installation {
     current: Mutex<Option<Arc<Look>>>,
 }
 
+/// Why a look for Git found none, which says whether looking again can help.
+#[derive(Clone, Debug)]
+enum Unfound {
+    /// There is no Git this host can run work through: none is installed, or the one that is does
+    /// not run, is too old, or answers with more than it was asked. It stays so until the host
+    /// changes, which is a host that is not set up for the work.
+    Unusable(Diagnostic),
+    /// The look was cut short by something that passes: the time it was given ran out, or the host
+    /// was short of what it needs to ask. Nothing is known of the Git that was being asked, and
+    /// asking again later can find it.
+    Passing(Diagnostic),
+}
+
+impl Unfound {
+    /// Returns the class of a failure that a look ended with.
+    fn of(error: ProjectError) -> Self {
+        match error {
+            ProjectError::GitFailed { detail } => Self::Passing(detail),
+            ProjectError::GitUnavailable { detail } => Self::Unusable(detail),
+            other => Self::Unusable(Diagnostic::new(other.to_string())),
+        }
+    }
+
+    /// Returns the refusal a request is answered with.
+    fn into_error(self) -> ProjectError {
+        match self {
+            Self::Unusable(detail) => ProjectError::GitUnavailable { detail },
+            Self::Passing(detail) => ProjectError::GitFailed { detail },
+        }
+    }
+}
+
 /// One look for Git, and what it came to.
 #[derive(Debug, Default)]
 struct Look {
     /// `None` while the look is under way, then `Ok` for a look that found Git, which is kept in
     /// the installation, or the refusal it ended with.
-    outcome: Mutex<Option<std::result::Result<(), Diagnostic>>>,
+    outcome: Mutex<Option<std::result::Result<(), Unfound>>>,
     ended: std::sync::Condvar,
 }
 
 impl Look {
     /// Ends the look with `outcome` and wakes everything that waited for it.
-    fn end(&self, outcome: std::result::Result<(), Diagnostic>) {
+    fn end(&self, outcome: std::result::Result<(), Unfound>) {
         let mut held = self
             .outcome
             .lock()
@@ -793,7 +829,7 @@ impl Look {
     }
 
     /// Waits for the look to end, and returns what it came to.
-    fn wait(&self) -> std::result::Result<(), Diagnostic> {
+    fn wait(&self) -> std::result::Result<(), Unfound> {
         let mut held = self
             .outcome
             .lock()
@@ -825,9 +861,9 @@ impl Drop for Making<'_> {
             .current
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        self.look.end(Err(Diagnostic::new(
+        self.look.end(Err(Unfound::Unusable(Diagnostic::new(
             "the look for Git ended without an answer",
-        )));
+        ))));
     }
 }
 
@@ -882,7 +918,7 @@ impl Installation {
                     .ok_or_else(|| ProjectError::GitUnavailable {
                         detail: Diagnostic::new("the look for Git ended without an answer"),
                     }),
-                Err(detail) => Err(ProjectError::GitUnavailable { detail }),
+                Err(unfound) => Err(unfound.into_error()),
             };
         }
         let look = Arc::new(Look::default());
@@ -899,12 +935,9 @@ impl Installation {
                 Ok(kept)
             }
             Err(error) => {
-                let refusal = match error {
-                    ProjectError::GitUnavailable { detail } => detail,
-                    other => Diagnostic::new(other.to_string()),
-                };
-                making.look.end(Err(refusal.clone()));
-                Err(ProjectError::GitUnavailable { detail: refusal })
+                let unfound = Unfound::of(error);
+                making.look.end(Err(unfound.clone()));
+                Err(unfound.into_error())
             }
         }
     }
@@ -3653,7 +3686,10 @@ enum Asked {
     Declined(ProjectError),
     /// The program did not answer in the time it is given, answered with more than a version and a
     /// directory, or left its output open; or this host could not wait on it or read its output
-    /// without blocking. It is not a program this host can run work through.
+    /// without blocking. The look is refused. What the program did is
+    /// [`ProjectError::GitUnavailable`], since it is not a program this host can run work through;
+    /// the time that ran out and the host's own shortage are [`ProjectError::GitFailed`], which
+    /// passes.
     Overran(ProjectError),
 }
 
@@ -3688,11 +3724,17 @@ fn ask(
         redact(&program.display().to_string()),
         redact(&arguments.join(" "))
     );
+    // What is wrong with the program is the program's: it is not Git this host can run work
+    // through, until the host changes. What stopped the look from asking, the time it was given or
+    // the host's own shortage, passes, and the Git behind it is not known to be anything.
     let unavailable = |detail: String| ProjectError::GitUnavailable {
         detail: detail.into(),
     };
+    let passing = |detail: String| ProjectError::GitFailed {
+        detail: detail.into(),
+    };
     if Instant::now() >= deadline {
-        return Err(Asked::Overran(unavailable(format!(
+        return Err(Asked::Overran(passing(format!(
             "{described} was not asked: Git had used the time it is given to answer"
         ))));
     }
@@ -3713,20 +3755,20 @@ fn ask(
         command.process_group(0);
     }
     let mut child = command.spawn().map_err(|error| {
-        let detail = unavailable(format!("{described} could not run: {error}"));
+        let detail = format!("{described} could not run: {error}");
         // A host that is out of descriptors, processes or memory says nothing about the program,
         // so the look is refused rather than the program taken for one that cannot run.
         if short_of_resources(&error) {
-            Asked::Overran(detail)
+            Asked::Overran(passing(detail))
         } else {
-            Asked::Declined(detail)
+            Asked::Declined(unavailable(detail))
         }
     })?;
     let mut heard = match Heard::of(child.stdout.take()) {
         Ok(heard) => heard,
         Err(error) => {
             end_if_own(child);
-            return Err(Asked::Overran(unavailable(format!(
+            return Err(Asked::Overran(passing(format!(
                 "{described} was refused because its output could not be read without blocking: {error}"
             ))));
         }
@@ -3749,7 +3791,7 @@ fn ask(
                 match child.wait() {
                     Ok(status) => break status,
                     Err(error) => {
-                        return Err(Asked::Overran(unavailable(format!(
+                        return Err(Asked::Overran(passing(format!(
                             "{described} could not be collected: {error}"
                         ))));
                     }
@@ -3762,7 +3804,7 @@ fn ask(
             // collected by something else here, and its number may belong to another process by
             // now. So nothing is signalled by it, and the child is let go with its pipe.
             Ended::Failed(error) => {
-                return Err(Asked::Overran(unavailable(format!(
+                return Err(Asked::Overran(passing(format!(
                     "{described} could not be waited on: {error}"
                 ))));
             }
@@ -3777,7 +3819,7 @@ fn ask(
         }
         if time_is_up(deadline) {
             end_probe(child);
-            return Err(Asked::Overran(unavailable(format!(
+            return Err(Asked::Overran(passing(format!(
                 "{described} did not answer in time and was stopped"
             ))));
         }
@@ -3802,7 +3844,7 @@ fn ask(
         std::thread::sleep(Duration::from_millis(5));
     }
     let answer = heard.answer(&described, deadline).map_err(|error| {
-        Asked::Overran(unavailable(format!(
+        Asked::Overran(passing(format!(
             "{described} produced output this host could not read: {error}"
         )))
     })?;
@@ -5732,9 +5774,9 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     impl Drop for EndsWhenDropped<'_> {
         fn drop(&mut self) {
-            self.0.end(Err(Diagnostic::new(
+            self.0.end(Err(Unfound::Unusable(Diagnostic::new(
                 "the case stopped before the look ended",
-            )));
+            ))));
         }
     }
 
@@ -5781,7 +5823,9 @@ mod tests {
             let second = Arc::new(Look::default());
             let _ends_second = EndsWhenDropped(&second);
             *installation.current.lock().expect("the slot") = Some(Arc::clone(&second));
-            first.end(Err(Diagnostic::new("the first look was refused")));
+            first.end(Err(Unfound::Unusable(Diagnostic::new(
+                "the first look was refused",
+            ))));
 
             let told = answered
                 .recv_timeout(Duration::from_secs(30))
