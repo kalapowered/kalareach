@@ -1855,24 +1855,25 @@ fn names_both(words: &str, record: &str, account: &str) -> bool {
 }
 
 /// Whether `words` tell the person that the setting names the record's service, or to choose or
-/// change the sync service: what a record that exists cannot be moved by.
+/// change the setting or the sync service: what a record that exists cannot be moved by.
 fn asks_for_another_setting(words: &str) -> bool {
     let words = words.to_lowercase();
     [
         "setting names",
         "choose",
         "change the setting",
+        "change the sync service",
         "as the sync service",
     ]
     .iter()
     .any(|instruction| words.contains(instruction))
 }
 
-/// KR-REQ-17.14: a record goes on naming the service its bundle is kept at when the account is
+/// KR-REQ-17.14: a record goes on naming the service named for its bundle when the account is
 /// signed in at another service and the setting names that one. The page is shown what is wrong
 /// for a record that is made and not kept and for one that is kept, the same account at the
 /// record's service goes on with the record, and the kit, saved as text or as a QR code, names the
-/// service the bundle is kept at and the locator it began with. Sending nothing to either
+/// service the record names and the locator it began with. Sending nothing to either
 /// service is held for each step by the case below.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_record_keeps_naming_its_service_and_its_kit_when_the_account_signs_in_elsewhere() {
