@@ -574,8 +574,9 @@ starts), and its own `--exec-path` is recorded with it. Both are passed explicit
 later is required, because the profile rests on `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM`. A host
 with no usable Git opens the service all the same. A request that runs Git is refused with
 `HOST_NOT_CONFIGURED` before it makes a repository, an operation row, a workspace or a directory,
-and the refusal names the step that installs Git. Windows runs no Git at all and says so, whether or
-not Git is installed. A read of what the journal records still answers.
+and the refusal names the step that installs Git. Windows runs no Git at all and says so under the
+same code, whether or not Git is installed, and names no step, since none changes it. A read of what
+the journal records still answers.
 
 **What environment it runs in.** The child's environment is built from nothing and then filled in.
 Every variable Git reads that can name a program (`GIT_EXTERNAL_DIFF`, `GIT_SSH`, `GIT_SSH_COMMAND`,
@@ -855,7 +856,7 @@ names for the owner.
 | `UPSTREAM_UNAVAILABLE` | A Git invocation failed, ran past its deadline, or produced more output than the host accepts |
 | `QUOTA_EXCEEDED` | An inclusion that would copy more than the host moves without being asked |
 | `OWNER_CONFIRMATION_REQUIRED` | A location decision whose proof is not an owner device's answer to the challenge it was given, whose owner device is no longer one, or whose named device no longer holds the keys the confirmation names |
-| `HOST_NOT_CONFIGURED` | Installed Git is missing or older than the profile needs; a location decision on a host with no owner device to confirm it |
+| `HOST_NOT_CONFIGURED` | Installed Git is missing or older than the profile needs, or the platform runs no Git at all, which no wait or install changes; a location decision on a host with no owner device to confirm it |
 | `STORAGE_UNAVAILABLE` | The journal or the service's own directories |
 
 ## Change sets

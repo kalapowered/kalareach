@@ -152,7 +152,7 @@ pub enum ProjectError {
         /// Which key, and why.
         detail: Diagnostic,
     },
-    /// Installed Git could not be used.
+    /// Installed Git could not be used, or the platform runs none.
     GitUnavailable {
         /// What went wrong.
         detail: Diagnostic,
