@@ -4286,6 +4286,95 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// KR-PERF-003: nor does a reading taken while the spool is stopped. A write to the spool that
+    /// stopped part way leaves the spool stopped with the bytes it could not write in the window,
+    /// and the pass that reads the host resumes it, which writes those bytes to the files while the
+    /// session takes no output.
+    #[test]
+    fn kr_perf_003_a_reading_taken_while_the_spool_is_stopped_does_not_stand() {
+        let root = spool_directory("host-reading-stopped");
+        let retention = OutputRetention::new(
+            std::time::Duration::from_secs(7 * 24 * 60 * 60),
+            100,
+            1 << 20,
+        );
+        let layout = || SpoolLayout::new(8, 1 << 20);
+        let mut other =
+            OutputHistory::with_spool(8, root.join("other.log"), layout()).expect("a spool");
+        other.append(&[b'o'; 94]);
+        let mut stopped =
+            OutputHistory::with_spool(64, root.join("stopped.log"), layout()).expect("a spool");
+        stopped.append(b"abcd");
+        stopped.spool.as_mut().expect("a spool").short_write = Some(2);
+        stopped.append(b"efgh");
+        assert!(stopped.suspended().is_some(), "the write stopped part way");
+        let now = kr_ipc::now_ms();
+        assert!(
+            stopped
+                .apply_retention_to_host(&root, retention, now, true)
+                .is_empty(),
+            "the files hold 98 bytes, under a cap of 100"
+        );
+        assert!(
+            stopped.suspended().is_none(),
+            "and the pass lets the spool take output again, which writes the window's bytes"
+        );
+        assert_eq!(retained_bytes_under(&root), 102);
+        assert!(
+            !stopped
+                .apply_retention_to_host(&root, retention, now, true)
+                .is_empty(),
+            "the files hold 102 bytes, which the next pass finds although the session has taken no \
+             output"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// KR-PERF-003: a pass that finds the host over its cap and can give nothing up leaves no
+    /// reading behind. Here the boundary cannot be written, so nothing is removed, and the host
+    /// grows before the next pass, which has to give up what it is over by then.
+    #[test]
+    fn kr_perf_003_a_pass_that_finds_the_host_over_its_cap_and_gives_nothing_up_looks_again() {
+        let root = spool_directory("host-reading-nothing");
+        let retention = OutputRetention::new(
+            std::time::Duration::from_secs(7 * 24 * 60 * 60),
+            100,
+            1 << 20,
+        );
+        let layout = || SpoolLayout::new(8, 1 << 20);
+        let mut other =
+            OutputHistory::with_spool(8, root.join("other.log"), layout()).expect("a spool");
+        other.append(&[b'o'; 80]);
+        let mut this =
+            OutputHistory::with_spool(8, root.join("this.log"), layout()).expect("a spool");
+        this.append(&[b't'; 64]);
+        let now = kr_ipc::now_ms();
+
+        // Something holds the place of the boundary, so the pass cannot write it.
+        let boundary = root.join("this.log").join(BOUNDARY_FILE);
+        std::fs::create_dir(&boundary).expect("a directory where the boundary goes");
+        assert!(
+            this.apply_retention_to_host(&root, retention, now, true)
+                .is_empty(),
+            "the host holds 144 bytes under a cap of 100, and nothing may be removed"
+        );
+        assert_eq!(retained_bytes_under(&root), 144);
+
+        std::fs::remove_dir(&boundary).expect("the place is free again");
+        other.append(&[b'o'; 16]);
+        let given_up: u64 = this
+            .apply_retention_to_host(&root, retention, now, true)
+            .iter()
+            .map(|eviction| eviction.bytes)
+            .sum();
+        assert_eq!(
+            given_up, 64,
+            "the next pass reads the host as it is now, 160 bytes, and gives up the 60 it is over by \
+             to the segment"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// KR-REQ-20.20, the part about the host cap's measure on Windows: a segment held open and
     /// written through its handle is sized by the bytes written to it, so the retained output the
     /// 1 GiB host cap is held against is not undercounted while a spool is being written. Not shown
