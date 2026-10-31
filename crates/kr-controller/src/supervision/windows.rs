@@ -535,6 +535,56 @@ pub(crate) const NOT_THE_ONE_REGISTERED: &str = " is not the one this installati
 /// What a change to the task says when it read back differently, before the differences.
 pub(crate) const READS_BACK_DIFFERENTLY: &str = " was changed and reads back differently (";
 
+/// What a person does about a task that is missing, foreign or not this installation's.
+#[cfg(any(windows, test))]
+pub(crate) const SETUP_ACTION: &str = "run kr host startup --set standalone";
+
+/// The failure to register the environment's task `name`, which the Task Scheduler's own words
+/// follow.
+#[cfg(any(windows, test))]
+pub(crate) fn did_not_register(name: &str) -> String {
+    format!("{DID_NOT_REGISTER}{name}")
+}
+
+/// The failure to remove the environment's task `name`, which the Task Scheduler's own words
+/// follow.
+#[cfg(any(windows, test))]
+pub(crate) fn did_not_remove(name: &str) -> String {
+    format!("{DID_NOT_REMOVE}{name}")
+}
+
+/// The failure to list the environment's task `name`, which the Task Scheduler's own words follow.
+#[cfg(any(windows, test))]
+pub(crate) fn could_not_list(name: &str) -> String {
+    format!("{COULD_NOT_LIST}{name}")
+}
+
+/// The failure to list the tasks, which the Task Scheduler's own words follow.
+#[cfg(any(windows, test))]
+pub(crate) fn could_not_list_tasks() -> String {
+    format!("{COULD_NOT_LIST}its tasks")
+}
+
+/// The failure to run the environment's task `name`, which the Task Scheduler's own words follow.
+#[cfg(any(windows, test))]
+pub(crate) fn did_not_run(name: &str) -> String {
+    format!("{DID_NOT_RUN}{name}")
+}
+
+/// What a launch says of the environment's task `name` when it differs from the one this
+/// installation registers in `differences`, and what a person does about it.
+#[cfg(any(windows, test))]
+pub(crate) fn task_differs(name: &str, differences: &[Difference]) -> String {
+    format!(
+        "the environment's task {name}{NOT_THE_ONE_REGISTERED}{}): {SETUP_ACTION} to repair it",
+        differences
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ")
+    )
+}
+
 /// A task under an environment's name that is not that environment's own. It is never replaced
 /// or removed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1081,9 +1131,9 @@ pub use self::platform::{
 #[cfg(windows)]
 mod platform {
     use super::{
-        Asked, COULD_NOT_LIST, DID_NOT_REGISTER, DID_NOT_REMOVE, DID_NOT_RUN, Foreign,
-        ForeignReason, LastResult, Outcome, RegisteredTask, Standing, TaskChange, TaskDefinition,
-        TaskError, decode_output, last_result_in,
+        Asked, Foreign, ForeignReason, LastResult, Outcome, RegisteredTask, Standing, TaskChange,
+        TaskDefinition, TaskError, could_not_list, could_not_list_tasks, decode_output,
+        did_not_register, did_not_remove, did_not_run, last_result_in,
     };
     use crate::supervision::{RunFailure, TASK_SCHEDULER_BOUND, command_within};
 
@@ -1180,11 +1230,7 @@ mod platform {
     fn is_listed(name: &str) -> Result<bool, TaskError> {
         let output = schtasks_within(Asked::List, &["/Query", "/FO", "CSV", "/NH"])?;
         if !output.status.success() {
-            return Err(refused(
-                Asked::List,
-                &format!("{COULD_NOT_LIST}its tasks"),
-                &output,
-            ));
+            return Err(refused(Asked::List, &could_not_list_tasks(), &output));
         }
         let wanted = format!("\\{name}");
         Ok(decode_output(&output.stdout).lines().any(|line| {
@@ -1453,7 +1499,7 @@ mod platform {
             if !output.status.success() {
                 return Err(refused(
                     Asked::Register,
-                    &format!("{DID_NOT_REGISTER}{}", definition.name),
+                    &did_not_register(&definition.name),
                     &output,
                 ));
             }
@@ -1480,7 +1526,7 @@ mod platform {
         if !output.status.success() {
             return Err(refused(
                 Asked::Remove,
-                &format!("{DID_NOT_REMOVE}{}", definition.name),
+                &did_not_remove(&definition.name),
                 &output,
             ));
         }
@@ -1501,7 +1547,7 @@ mod platform {
         if !output.status.success() {
             return Err(refused(
                 Asked::Query,
-                &format!("{COULD_NOT_LIST}{}", definition.name),
+                &could_not_list(&definition.name),
                 &output,
             ));
         }
@@ -1532,8 +1578,8 @@ mod platform {
             return Ok(());
         }
         Err(RunFailure::Failed(format!(
-            "{DID_NOT_RUN}{}: {}",
-            definition.name,
+            "{}: {}",
+            did_not_run(&definition.name),
             decode_output(&output.stderr).trim()
         )))
     }
@@ -1703,7 +1749,7 @@ mod launching {
     use kr_protocol::ids::EnvironmentId;
     use serde::{Deserialize, Serialize};
 
-    use super::{NOT_THE_ONE_REGISTERED, Standing, TaskDefinition, run, standing};
+    use super::{SETUP_ACTION, Standing, TaskDefinition, run, standing, task_differs};
     use kr_protocol::identity::WorkerProfile;
 
     use crate::supervision::{
@@ -1733,9 +1779,6 @@ mod launching {
 
     /// How long a starter is given to create the process and report it.
     const REPORT_BOUND: Duration = Duration::from_secs(30);
-
-    /// What a person does about a task that is missing, foreign or not this installation's.
-    const SETUP_ACTION: &str = "run kr host startup --set standalone";
 
     /// What a starter says first: the exchange it speaks and the environment it serves.
     #[derive(Debug, Serialize, Deserialize)]
@@ -1924,16 +1967,7 @@ mod launching {
             match standing(&self.expected) {
                 Ok(Standing::Owned(differences)) if differences.is_empty() => {}
                 Ok(Standing::Owned(differences)) => {
-                    return not_started(format!(
-                        "the environment's task {}{NOT_THE_ONE_REGISTERED}{}): \
-                         {SETUP_ACTION} to repair it",
-                        self.expected.name,
-                        differences
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>()
-                            .join("; ")
-                    ));
+                    return not_started(task_differs(&self.expected.name, &differences));
                 }
                 Ok(Standing::Absent) => {
                     return not_started(format!(
