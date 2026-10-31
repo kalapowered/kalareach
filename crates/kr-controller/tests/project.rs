@@ -23,6 +23,7 @@ use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::testing::PrivateTempDir;
 use kr_ipc::verify::ControllerIdentity;
+#[cfg(unix)]
 use kr_protocol::changeset::{
     ChangesetCaptureParams, ChangesetCaptureResult, ChangesetReadParams, ChangesetReadResult,
     DestinationClass, DiffApplyParams, DiffReadParams, FileGrant,
