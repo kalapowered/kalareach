@@ -96,19 +96,9 @@ impl WakeEvent {
     }
 }
 
-#[link(name = "user32")]
-unsafe extern "system" {
-    /// The virtual key and modifiers that give a character in the current keyboard layout, in the
-    /// low and high byte of the answer, or -1 where there is none.
-    safe fn VkKeyScanW(character: u16) -> i16;
-}
-
 /// The console input this attachment reads.
 pub struct RecordReader {
     handle: std::fs::File,
-    /// The key a NUL comes out of the console as in the layout of the thread that opened this
-    /// reader, which is not necessarily the console's.
-    nul: Option<crate::attach::NulKey>,
     /// The first half of a character outside the basic plane whose second half has not arrived.
     ///
     /// One read of the console can end between the two halves, and sending each read on its own
@@ -122,7 +112,6 @@ impl RecordReader {
     pub fn over(handle: std::fs::File) -> Self {
         Self {
             handle,
-            nul: crate::attach::NulKey::named_by(VkKeyScanW(0)),
             pairs: PairHold::new(),
         }
     }
@@ -366,17 +355,14 @@ impl RecordReader {
                     record.Event.KeyEvent.uChar.UnicodeChar,
                 )
             };
-            crate::attach::key_can_make_text(
-                &KeyRecord {
-                    virtual_key: key.wVirtualKeyCode,
-                    scan_code: key.wVirtualScanCode,
-                    unicode,
-                    key_down: key.bKeyDown != 0,
-                    control_keys: key.dwControlKeyState,
-                    repeat: key.wRepeatCount,
-                },
-                self.nul,
-            )
+            crate::attach::key_can_make_text(&KeyRecord {
+                virtual_key: key.wVirtualKeyCode,
+                scan_code: key.wVirtualScanCode,
+                unicode,
+                key_down: key.bKeyDown != 0,
+                control_keys: key.dwControlKeyState,
+                repeat: key.wRepeatCount,
+            })
         });
         if makes_text || peeked == 0 {
             return Ok(makes_text);
