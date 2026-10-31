@@ -5246,9 +5246,10 @@ mod tests {
         !state.trim().is_empty() && !state.trim().starts_with('Z')
     }
 
-    /// A stand-in that writes its number to `own` and then waits until a case lets it go with
-    /// [`let_go`], placed as the program a case asks. It ends by itself only when it is let go; a
-    /// guard of two minutes ends one that a failed case forgot.
+    /// A stand-in that writes its number to `own` and then waits, placed as the program a case
+    /// asks. It ends when a case lets it go with [`let_go`], or when `directory` is gone, as it is
+    /// when the case ends and the directory is removed with it; a guard of two minutes ends one
+    /// that neither reached.
     #[cfg(unix)]
     fn waiting_stand_in(directory: &Path, own: &Path) -> PathBuf {
         let (text, program) = (directory.join("git.text"), directory.join("git"));
@@ -5256,8 +5257,10 @@ mod tests {
             &text,
             format!(
                 "#!/bin/sh\necho $$ > '{own}'\ni=0\n\
-                 while [ ! -e '{release}' ] && [ $i -lt 2400 ]; do sleep 0.05; i=$((i+1)); done\n",
+                 while [ -d '{directory}' ] && [ ! -e '{release}' ] && [ $i -lt 2400 ]; \
+                 do sleep 0.05; i=$((i+1)); done\n",
                 own = own.display(),
+                directory = directory.display(),
                 release = directory.join("release").display(),
             ),
         )
@@ -5266,8 +5269,9 @@ mod tests {
         program
     }
 
-    /// Lets go what a case holds in `directory`, which ends it by its own means: no process is
-    /// signalled by a number that may belong to another by now.
+    /// Lets go what a case holds in `directory`, which then ends by its own means: no process is
+    /// signalled by a number that may belong to another by now. What has not looked for the
+    /// release when the case ends is ended by the removal of the directory instead.
     #[cfg(unix)]
     fn let_go(directory: &Path) {
         std::fs::write(directory.join("release"), "").expect("what the case holds is let go");
@@ -5457,7 +5461,8 @@ mod tests {
             &holder,
             "use POSIX ();\nPOSIX::setsid();\nopen(my $out, '>', $ARGV[0]) or die;\n\
              print $out $$;\nclose($out);\nmy $i = 0;\n\
-             while (!-e $ARGV[1] && $i++ < 2400) { select(undef, undef, undef, 0.05); }\n",
+             while (-d $ARGV[2] && !-e $ARGV[1] && $i++ < 2400) {\n\
+             select(undef, undef, undef, 0.05); }\n",
         )
         .expect("the holder's text");
         // The stand-in ends once the holder has left the group, so that ending the group cannot
@@ -5466,11 +5471,12 @@ mod tests {
         std::fs::write(
             &text,
             format!(
-                "#!/bin/sh\n/usr/bin/perl '{holder}' '{own}' '{release}' &\ni=0\n\
+                "#!/bin/sh\n/usr/bin/perl '{holder}' '{own}' '{release}' '{directory}' &\ni=0\n\
                  while [ ! -s '{own}' ] && [ $i -lt 2400 ]; do sleep 0.02; i=$((i+1)); done\n",
                 holder = holder.display(),
                 own = own.display(),
                 release = release.display(),
+                directory = directory.path().display(),
             ),
         )
         .expect("the stand-in's text");
@@ -5489,7 +5495,8 @@ mod tests {
                 );
             });
             let outcome = ended.recv_timeout(Duration::from_secs(30));
-            // The holder ends by itself, whatever the outcome, and the pipe closes with it.
+            // The holder ends by itself, whatever the outcome, when it is let go or when the
+            // directory is removed with the case, and the pipe closes with it.
             let_go(directory.path());
             outcome
         });
