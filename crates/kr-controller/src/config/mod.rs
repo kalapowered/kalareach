@@ -616,7 +616,7 @@ fn write(paths: &EnvironmentPaths, edited: &Edited) -> Result<()> {
     configuration::still_current(edited, &kr_worker::config::load(paths)).map_err(refused)?;
     let path = kr_worker::config::document_path(paths);
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        let _ = kr_ipc::paths::create_dir_all_owner_only(parent);
     }
     kr_ipc::paths::write_owner_only_file(&path, edited.contents.as_bytes())
         .map_err(ControllerError::Ipc)
