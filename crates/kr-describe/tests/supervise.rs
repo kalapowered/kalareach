@@ -2580,10 +2580,13 @@ fn a_cancelled_job_whose_process_crashes_is_not_retried() {
 /// the service cancels the job there at once rather than wait for an answer it would refuse. The
 /// process stays, and the new revision is described once the session's cooldown has passed. The
 /// control is a change still inside its debounce, which leaves the job to publish.
+///
+/// The process holds the job until the case has seen the cancellation end it, so the job cannot be
+/// answered before the cancellation reaches it. The job of the new revision is not held.
 #[test]
 fn a_change_that_settles_while_a_job_runs_cancels_it_in_the_process() {
     let mut rig = Rig::new(&Script {
-        generate_ms: 2_000,
+        generate_until_released: true,
         ..Script::default()
     });
     queue(rig.service(), &session(1), Priority::Ordinary, at(0));
@@ -2598,6 +2601,7 @@ fn a_change_that_settles_while_a_job_runs_cancels_it_in_the_process() {
     let reports = rig.until(&roomy(), at(5_100), "the cancelled job", |reports, _| {
         a_job_ended(reports)
     });
+    release_held_work(&rig.placed.directory("runtime"));
     // The process answered the cancellation: an answer that finished the job would have been
     // refused as a changed context instead.
     assert_eq!(
