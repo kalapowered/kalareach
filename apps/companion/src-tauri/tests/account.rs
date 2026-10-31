@@ -550,11 +550,12 @@ fn lines(answer: &serde_json::Value) -> Vec<(String, bool, String)> {
 }
 
 /// KR-REQ-17.14: the application says which managed services it holds a client of, in the words
-/// the library uses, and for a service it holds none of, what a person does instead. The account
-/// line is made over the client the application signs in through, which answers a call as that
-/// service does and not as a client with nothing configured. The sync line is derived from the
-/// factory the desks use, asked for the origin the setting names, so replacing the factory is what
-/// changes the line. A phone leaves relay leases out: the host keeps those.
+/// the library uses, and for a service it holds none of, what a person does instead. The set the
+/// report is made over holds, for the account, the client the application signs in through, which
+/// answers a call as that service does and not as a client with nothing configured. The sync line
+/// is derived from the factory the desks use, asked for the origin the setting names, so replacing
+/// the factory is what changes the line, and a factory that cannot make a client leaves the line
+/// unconfigured. A phone leaves relay leases out: the host keeps those.
 #[test]
 fn the_application_reports_the_managed_services_it_holds_a_client_of() {
     use kr_client::services::{ManagedService, ServiceClients};
@@ -599,10 +600,14 @@ fn the_application_reports_the_managed_services_it_holds_a_client_of() {
         }
     }
 
-    // The account the report is made over is the one the application signs in through: a call
-    // through it reaches that service, which answers, where a client with nothing configured
-    // refuses.
-    let held = companion_tauri::services::Held::of(None, None, account.service());
+    // The account in the set the report is made over is the one the application signs in through:
+    // a call through it reaches that service, which answers, where a client with nothing
+    // configured refuses.
+    let app = mock_builder()
+        .manage(AccountSlot::ready(Arc::clone(&account)))
+        .build(mock_context(noop_assets()))
+        .expect("an application on the mock runtime");
+    let held = companion_tauri::services::held_by(app.handle(), &account);
     let token = AccountToken::new("a-stub-access-token").expect("a token");
     tauri::async_runtime::block_on(async {
         held.account
