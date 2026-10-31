@@ -3229,10 +3229,18 @@ host that is no failure is withheld as a path, the way the directory of a materi
 `display_path` of a repository or a working copy, the `retained_staging_paths` and
 `removed_staging_paths` of a repository operation, the `url` of a remote that is a place on this
 host (the repository a clone from a location was made from), and the `endpoint` of a session. Each
-is replaced by the withheld record of a path, and a list keeps its length. A session's `cwd` and
-`shell_path`, a question's `executable` and an attachment's staged `host_path` are sent as they are:
-the specification shows them to the person on purpose, as part of how a session, a question or a
-manual attachment is described, and a device that may see a session sees its terminal. The
+is replaced by the withheld record of a path, and a list keeps its length. The name of the
+desktop a session is bound to (`desktop_session_id` in the session's `desktop`) spells out the
+account's name and number, so a device is given the marker the capability answers use, which says
+the session is bound to a desktop and not which one. A session's `cwd` and `shell_path`, the
+`command` and `cwd` of its last command block, a question's `executable`, an attachment's staged
+`host_path` and the `metadata_url` and `targets_url` of a catalogue are sent as they are: the
+specification shows them to the person on purpose, as part of how a session, a question, a manual
+attachment or a catalogue is described, and a device that may see a session sees its terminal. The
+command block reaches only a device whose grant keeps history from the moment the command started
+or earlier. A catalogue's two locations are a directory on this host when the catalogue is a local
+one; only a device that holds `host.manage` reads them, and an owner device rebuilds the digest of
+a trust plan from them. The
 `suspension_reason` of an agent instance's binding, which says why rich mutations wait, and the
 refusal of a rich mutation that repeats it, are sent as the host wrote them when the reason is one
 of the host's own sentences. Otherwise the device is told what kind of wait it was: the method of a

@@ -3474,6 +3474,32 @@ mod tests {
     }
 
     #[test]
+    fn the_last_command_of_a_session_reaches_a_device_as_it_is() {
+        use kr_protocol::root::{CwdRevision, PromptGeneration, RootCommandBlockParams};
+        let command = "cd /Users/marguerite/work && sudo make install";
+        let read = kr_protocol::session::SessionReadResult {
+            session: session_summary(),
+            endpoint: Nullable::null(),
+            launch_profile: Nullable::null(),
+            last_command_block: Nullable::some(RootCommandBlockParams {
+                session_id: session_summary().session_id,
+                prompt_generation: PromptGeneration(U64::new(1)),
+                command: command.to_owned(),
+                started_at_ms: kr_protocol::scalars::TimestampMs::new(2),
+                duration_ms: Nullable::null(),
+                exit_status: Nullable::null(),
+                cwd: "/Users/marguerite/work".to_owned(),
+                cwd_revision: CwdRevision(U64::new(1)),
+            }),
+            outstanding_launches: Nullable::null(),
+            metrics: None,
+        };
+        // What the person typed and where it ran are shown to a device whose grant reaches the
+        // command, as they are shown to the person: the grant decides, and this rule does not.
+        assert_eq!(read_by_a_device(&read), read);
+    }
+
+    #[test]
     fn the_program_a_questions_source_runs_reaches_a_device_as_it_is() {
         use kr_protocol::ids::{ApplicationInstanceId, ConnectionId};
         use kr_protocol::question::QuestionSource;
