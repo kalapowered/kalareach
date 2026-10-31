@@ -64,15 +64,16 @@ to be this user is refused with no command, since `chmod 700` leaves the list as
 itself meets the refusal, as `kr host startup` and `kr host install` do when they make a directory,
 it says that the directory's owner or its access list is not known to keep other accounts out.
 `session.create` shows a local client the daemon's own text instead: the directory, and what its
-access list said. A paired device is told the reason without either. The rule is conservative. An
-allow entry that grants nothing, an allow that a deny before it cancels, an entry for a group of one
-and an entry that only what is made inside inherits refuse the directory as well. So does an entry
-for this user when the account's name is a number or the text of a GUID, or the system has no record
-of it, since the list names a user number or an identity without a record by that number or text. A
-list that cannot be read is refused alike, except on a file system that keeps no lists. Either is
-passed again once its owner and mode are right and every allow entry of its readable list is known
-to be this user's. The check is the host's own, so the directories that the macOS companion makes
-through `create_private_directory` get it too.
+access list said. A paired device is told only that the host could not make the session's directory,
+and neither which directory nor why. The rule is conservative. An allow entry that grants nothing,
+an allow that a deny before it cancels, an entry for a group of one and an entry that only what is
+made inside inherits refuse the directory as well. So does an entry for this user when the account's
+name is a number or the text of a GUID, or the system has no record of it, since the list names a
+user number or an identity without a record by that number or text. A list that cannot be read is
+refused alike, except on a file system that keeps no lists. Either is passed again once its owner
+and mode are right and every allow entry of its readable list is known to be this user's. The check
+is the host's own, so the directories that the macOS companion makes through
+`create_private_directory` get it too.
 
 On Linux, $XDG_RUNTIME_DIR/kalareach is the default runtime root, unless that directory would end up
 in a location shared between all WSL distros. WSLg sets $XDG_RUNTIME_DIR to /mnt/wslg/runtime-dir,
