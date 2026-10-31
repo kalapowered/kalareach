@@ -344,7 +344,7 @@ export type RecoveryBlocker =
 export interface RecoveryView {
   readonly sync_service: SyncServiceView
   readonly state: RecoveryState
-  /** The host of the service the bundle is kept at, once recovery has been turned on. */
+  /** The host of the service the record names, once recovery has been started. */
   readonly kept_at: string | null
   readonly blocker: RecoveryBlocker | null
 }
