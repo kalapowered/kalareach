@@ -1771,10 +1771,9 @@ async fn a_step_holds_the_lock_another_companion_waits_on_while_it_runs() {
 /* The account's token                                                         */
 /* -------------------------------------------------------------------------- */
 
-/// KR-REQ-17.14: the sync service is a choice of its own, and the account's token goes only to the
-/// service the account is signed in to. A sync service setting that names another is refused with
-/// the setting named, and nothing is sent. The case reads no client the application was given and
-/// no line of what is available.
+/// The sync service is a choice of its own, and the account's token goes only to the service the
+/// account is signed in to. A sync service setting that names another is refused with the setting
+/// named, and nothing is sent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_account_token_goes_only_to_the_service_the_account_is_signed_in_to() {
     let computer = Computer::new().await;
