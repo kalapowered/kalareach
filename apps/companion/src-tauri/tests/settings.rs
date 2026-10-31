@@ -1337,12 +1337,15 @@ async fn turning_sync_on_starts_a_collection_and_puts_the_settings_in_it_sealed(
 }
 
 /// KR-REQ-17.14: settings sync reaches the sync service through the clients the application was
-/// given, at the origin its record names, for the settings, the drafts and the members alike. A
-/// fork's service in that place receives every call, a draft's publication, a device shared with,
-/// an offer read and a join among them, and the service the setting names receives none. A record
-/// made while the setting named one service keeps asking for that service after the setting names
-/// another, whether a step settles the settings, turns sync on again, shares with a device, takes
-/// one out, records a revocation or lets go of the outcomes.
+/// given, at the origin its record names. A fork's service in that place receives the calls of a
+/// step, of turning sync on, of a draft's publication and its next version, of sharing with a
+/// device and taking one out and of recording a revocation, and the service the setting names
+/// receives none; the factory is asked for the record's origin alone when the person lets go of
+/// the outcomes, which sends no request. A computer that holds no record reads its offers and
+/// joins at the service its own setting names. A record made while the setting named one service
+/// keeps asking for that service after the setting names another. Choosing between versions and
+/// dropping a copy the service kept, and a computer that was taken out reading its offers and
+/// joining again, are held to the record's service by the cases below.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn settings_sync_talks_to_the_service_client_it_was_given_at_the_origin_its_record_names() {
     let computer = Computer::new().await;
@@ -1475,6 +1478,113 @@ async fn settings_sync_talks_to_the_service_client_it_was_given_at_the_origin_it
         phone_fork.asked().iter().all(|origin| *origin == recorded),
         "{:?}: the phone asked for the service its own setting names",
         phone_fork.asked()
+    );
+    assert!(
+        computer.served.web().arrived().is_empty(),
+        "the fork's service took the place of the service the record names"
+    );
+    assert!(
+        chosen.web().arrived().is_empty(),
+        "the service the setting names now received none"
+    );
+}
+
+/// KR-REQ-17.14: the person's choice between versions and the drop of a copy the service kept are
+/// asked of the service the record names, after the setting names another. A change made here
+/// while another device changed the same setting is kept at the fork's service. Keeping this
+/// computer's settings, with the service's copy still there, lets that copy go there and sends the
+/// choice there; a second refused change leaves a copy there that is dropped when the person asks.
+/// The service the setting names now receives none, and the record goes on naming the first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_choice_between_versions_and_a_dropped_copy_go_to_the_service_the_record_names() {
+    let computer = Computer::new().await;
+    let fork_service = serve().await;
+    let fork_origin = GatewayOrigin::new(fork_service.origin()).expect("an origin");
+    let fork = Fork::at(
+        &fork_service,
+        computer.identity().keys.authorisation.clone(),
+    );
+    let page = computer.start_with(Some(Arc::clone(&fork) as _));
+    page.choose("dark");
+    page.turn_on();
+    let recorded = computer.served.origin().to_owned();
+
+    // The setting now names a service that is not the one the record names.
+    let chosen = serve().await;
+    page.call("sync_service_set", json!({ "origin": chosen.origin() }))
+        .expect("another service is chosen");
+    assert_eq!(
+        page.view()["sync"]["kept_at"],
+        recorded.replace("http://", ""),
+        "the record goes on naming the service it was made at"
+    );
+
+    // Another device writes at the fork's service first, and a change made here is refused there.
+    let elsewhere = computer.elsewhere_over(&fork_origin, 0);
+    assert!(matches!(
+        elsewhere.write("light").await,
+        Published::Accepted { .. }
+    ));
+    let view = page.choose("system");
+    assert_eq!(view["sync"]["conflicts"], 1, "{view}");
+    assert_eq!(
+        elsewhere.copies_kept().await,
+        1,
+        "the fork's service kept a copy of the refused write"
+    );
+
+    // The person keeps this computer's settings, with the service's copy still there: the fork's
+    // service lets the copy go and holds the choice.
+    let view = page
+        .call(
+            "settings_conflict_resolve",
+            json!({ "keep": { "choice": "mine" } }),
+        )
+        .expect("the choice is recorded");
+    assert_eq!(view["colour_mode"], "system", "{view}");
+    assert_eq!(view["sync"]["conflicts"], 0, "{view}");
+    assert!(view["sync"]["problem"].is_null(), "{view}");
+    assert_eq!(
+        elsewhere.copies_kept().await,
+        0,
+        "the fork's service let its copy go"
+    );
+    assert_eq!(
+        elsewhere.colour().await,
+        "system",
+        "the choice reached the fork's service"
+    );
+
+    // Another refused change leaves another copy, and the person has it dropped without choosing:
+    // the fork's service is asked, and drops it.
+    assert!(matches!(
+        elsewhere.write("light").await,
+        Published::Accepted { .. }
+    ));
+    let view = page.choose("dark");
+    assert_eq!(view["sync"]["conflicts"], 1, "{view}");
+    let listed = kept_by_the_service(&page);
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    let reference = listed[0]["reference"].as_str().expect("a reference");
+    let settings = page.app.state::<AppState>().settings().expect("settings");
+    assert!(
+        settings
+            .drop_sync_copy(reference)
+            .await
+            .expect("the copy is dropped"),
+        "the service said it dropped the copy"
+    );
+    assert_eq!(
+        elsewhere.copies_kept().await,
+        0,
+        "the fork's service dropped the copy"
+    );
+    assert!(kept_by_the_service(&page).is_empty());
+
+    assert!(
+        fork.asked().iter().all(|origin| *origin == recorded),
+        "{:?}: nothing was asked for the service the setting names now",
+        fork.asked()
     );
     assert!(
         computer.served.web().arrived().is_empty(),
@@ -4818,6 +4928,139 @@ async fn a_record_naming_another_collection_than_the_membership_is_put_right() {
     let view = phone.sync_now();
     assert_eq!(sync_record(&other)["collection_id"], joined);
     assert_eq!(view["colour_mode"], "dark", "{view}");
+}
+
+/// Two computers that share their settings through a sync service of a fork's own, each reaching
+/// it through a client the fork supplies: the first has sync on and shared with the second, and the
+/// second has joined. Each computer's record names the service its setting names, which is not the
+/// fork's.
+async fn sharing_through_a_fork(
+    this: &Computer,
+    other: &Computer,
+) -> (Page, Page, Served, Arc<Fork>) {
+    let fork_service = serve().await;
+    let this_fork = Fork::at(&fork_service, this.identity().keys.authorisation.clone());
+    let phone_fork = Fork::at(&fork_service, other.identity().keys.authorisation.clone());
+    let page = this.start_with(Some(this_fork as _));
+    page.choose("dark");
+    page.turn_on();
+    let phone = other.start_with(Some(Arc::clone(&phone_fork) as _));
+    let shown = page.devices_refresh();
+    page.share(&reference_of(&shown["candidates"], "the-phone"))
+        .expect("shared with the phone");
+    phone
+        .join(&first_reference(&phone.devices_refresh()["offers"]))
+        .expect("the phone joins");
+    page.sync_now();
+    assert_eq!(phone.sync_now()["colour_mode"], "dark");
+    (page, phone, fork_service, phone_fork)
+}
+
+/// KR-REQ-17.14: a computer that was taken out of the shared settings holds a record, and reads its
+/// offers, joins and writes the record of the join at the service that record names, though its
+/// setting names another by then. The fork's service receives the reads and the join, the service
+/// the setting names receives none, and the new record names the service the old one did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_computer_taken_out_reads_its_offers_and_joins_at_the_service_its_record_names() {
+    let (this, other) = two_computers().await;
+    let (page, phone, _fork_service, phone_fork) = sharing_through_a_fork(&this, &other).await;
+    let recorded = other.served.origin().to_owned();
+    assert_eq!(sync_record(&other)["service_origin"], recorded);
+
+    // The first computer takes the phone out and writes what the phone does not read, and the
+    // phone's setting names another service.
+    page.unshare(&reference_of(&page.devices()["members"], "the-phone"))
+        .expect("the phone is taken out");
+    page.choose("light");
+    let chosen = serve().await;
+    phone
+        .call("sync_service_set", json!({ "origin": chosen.origin() }))
+        .expect("another service is chosen");
+
+    // The person shares with the phone again. The phone, which holds a record and is out of the
+    // collection, looks for the offers at the service its record names, and joins there.
+    let shown = page.devices_refresh();
+    page.share(&reference_of(&shown["candidates"], "the-phone"))
+        .expect("shared with the phone again");
+    let offers = phone.devices_refresh();
+    assert_eq!(
+        offers["offers"].as_array().expect("offers").len(),
+        1,
+        "the offer was read at the fork's service: {offers}"
+    );
+    phone
+        .join(&first_reference(&offers["offers"]))
+        .expect("the phone joins again through the fork's service");
+    assert_eq!(
+        sync_record(&other)["service_origin"],
+        recorded,
+        "the record the join wrote names the service the old one did"
+    );
+    page.sync_now();
+    let view = phone.sync_now();
+    assert_eq!(view["colour_mode"], "light", "{view}");
+    assert_eq!(
+        view["sync"]["kept_at"],
+        recorded.replace("http://", ""),
+        "{view}"
+    );
+
+    assert!(
+        phone_fork.asked().iter().all(|origin| *origin == recorded),
+        "{:?}: the phone asked for the service its setting names",
+        phone_fork.asked()
+    );
+    assert!(
+        this.served.web().arrived().is_empty(),
+        "the fork's service took the place of the service the records name"
+    );
+    assert!(
+        chosen.web().arrived().is_empty(),
+        "the service the setting names now received none"
+    );
+}
+
+/// KR-REQ-17.14: a record that names another collection than the membership says the computer is in
+/// is put right at the service the record names, not at the one the setting names by then.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_record_put_right_goes_on_naming_the_service_it_was_made_at() {
+    let (this, other) = two_computers().await;
+    let (_page, phone, fork_service, _) = sharing_through_a_fork(&this, &other).await;
+    let recorded = other.served.origin().to_owned();
+    let joined = sync_record(&other)["collection_id"].clone();
+    drop(phone);
+
+    // The step stopped before the record was written: it still names a collection of its own.
+    let path = other.data.path().join("settings-sync").join("sync.json");
+    let mut record = sync_record(&other);
+    record["collection_id"] = json!("00000000-0000-4000-8000-000000000001");
+    std::fs::write(&path, serde_json::to_vec(&record).expect("a record")).expect("written");
+
+    // The application starts again with a setting that names another service.
+    let phone_fork = Fork::at(&fork_service, other.identity().keys.authorisation.clone());
+    let phone = other.start_with(Some(Arc::clone(&phone_fork) as _));
+    let chosen = serve().await;
+    phone
+        .call("sync_service_set", json!({ "origin": chosen.origin() }))
+        .expect("another service is chosen");
+    let view = phone.sync_now();
+    assert_eq!(view["colour_mode"], "dark", "{view}");
+    let put_right = sync_record(&other);
+    assert_eq!(put_right["collection_id"], joined);
+    assert_eq!(
+        put_right["service_origin"], recorded,
+        "the record put right names the service it was made at"
+    );
+    phone.sync_now();
+    assert!(
+        phone_fork.asked().iter().all(|origin| *origin == recorded),
+        "{:?}: the phone asked for the service its setting names",
+        phone_fork.asked()
+    );
+    assert!(
+        chosen.web().arrived().is_empty(),
+        "the service the setting names now received none"
+    );
 }
 
 /// A draft another device sealed before this computer joined is one this computer cannot read yet.
