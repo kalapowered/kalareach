@@ -740,7 +740,9 @@ impl ReaderLine {
                 {
                     Err(gone())
                 } else {
-                    self.answers.recv().unwrap_or_else(|_| Err(gone()))
+                    self.answers
+                        .recv_timeout(READER_ANSWER_WAIT)
+                        .unwrap_or_else(|_| Err(gone()))
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(gone()),
@@ -829,7 +831,8 @@ fn start_reader<C: ConsoleInput + Send + 'static>(
 /// its keys, between two reads, and reads its text from then on as it comes, none of it turned into
 /// anything. A console that would not spell its keys goes on being read as records. The thread is
 /// only ever waiting for the console and for the stop together, and reads the console only when it
-/// has something to give, so the stop never has to cancel a read.
+/// holds text, so the stop has no read to cancel unless the console keeps a record that the test of
+/// `key_can_make_text` has not met.
 #[cfg(any(not(unix), test))]
 fn read_console(
     console: &mut impl ConsoleInput,
@@ -872,13 +875,19 @@ fn read_console(
                 }
             }
             Ok(Woken::Asked) => {
-                // A request the switch withdrew while it waited is not made.
+                // A request the switch withdrew while it waited is not made. The withdrawal is
+                // cleared, unless a newer request has already replaced it.
                 if switching
                     .state
                     .compare_exchange(request::PENDING, request::TAKEN, SeqCst, SeqCst)
                     .is_err()
                 {
-                    switching.state.store(request::IDLE, SeqCst);
+                    let _ = switching.state.compare_exchange(
+                        request::WITHDRAWN,
+                        request::IDLE,
+                        SeqCst,
+                        SeqCst,
+                    );
                     continue;
                 }
                 // The half of a character the reader held is the last record it will read, and
@@ -890,42 +899,77 @@ fn read_console(
                 // A console that already spells its keys is not asked again.
                 let answer = if spelled { Ok(()) } else { (switching.ask)() };
                 spelled = answer.is_ok();
-                let _ = switching.answers.send(answer);
+                // The request is over before its answer can be heard, so that the next one is not
+                // taken for this one.
                 switching.state.store(request::IDLE, SeqCst);
+                let _ = switching.answers.send(answer);
             }
             Ok(Woken::Stop) | Err(_) => return,
         }
     }
 }
 
-/// Whether a key record can make text in a console that spells its keys itself.
+/// The key and modifiers the console spells a NUL with, as `VkKeyScanW(0)` names them.
 ///
-/// A key coming up does not, and neither does a modifier or a lock going down: the console keeps
-/// those as records and a read of its text passes over them. Every other key going down does,
-/// Ctrl+Space (a NUL) among them, which has no character in its record and is told from them by its
-/// virtual key.
+/// The console keeps a key going down that has no character in its queue and a read of its text
+/// passes over it and waits, except for this one: it is what Ctrl+Space and Ctrl+@ come out as.
+#[cfg(any(not(unix), test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NulKey {
+    virtual_key: u16,
+    shift: bool,
+    control: bool,
+    alt: bool,
+}
+
+#[cfg(any(not(unix), test))]
+impl NulKey {
+    /// The key `scan` (the answer of `VkKeyScanW(0)`) names: the virtual key in its low byte and
+    /// the modifiers in its high one. None where the layout has no such key.
+    #[must_use]
+    pub(crate) const fn named_by(scan: i16) -> Option<Self> {
+        if scan == -1 {
+            return None;
+        }
+        let [low, high] = scan.to_le_bytes();
+        Some(Self {
+            virtual_key: low as u16,
+            shift: high & 1 != 0,
+            control: high & 2 != 0,
+            alt: high & 4 != 0,
+        })
+    }
+}
+
+/// Whether a key record can make text in a console that spells its keys itself, which is whether a
+/// read of that text would return for it and not pass over it and wait.
+///
+/// A key going down that has a character does. One that has none does only if it is the key a NUL
+/// comes out as, with its modifiers; Shift, Ctrl, Alt, the Windows key, the locks, the Apps key, a
+/// media key and a dead key are all kept as records the read passes over. A key coming up does not,
+/// except an Alt coming up with the character that was composed on the numeric keypad.
 #[cfg(any(not(unix), test))]
 #[must_use]
-pub(crate) const fn key_can_make_text(virtual_key: u16, key_down: bool, unicode: u16) -> bool {
-    /// Shift, Ctrl, Alt, the Windows keys, Caps Lock, Num Lock and Scroll Lock, with the left and
-    /// right variants of the first three.
-    const MAKE_NONE: [u16; 14] = [
-        0x10, 0x11, 0x12, 0x5b, 0x5c, 0x14, 0x90, 0x91, 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5,
-    ];
-    if !key_down {
-        return false;
+pub(crate) fn key_can_make_text(key: &kr_term::win32::KeyRecord, nul: Option<NulKey>) -> bool {
+    use kr_term::win32::control_keys::{
+        LEFT_ALT_PRESSED, LEFT_CTRL_PRESSED, RIGHT_ALT_PRESSED, RIGHT_CTRL_PRESSED, SHIFT_PRESSED,
+    };
+
+    /// The Alt key's virtual key.
+    const MENU: u16 = 0x12;
+    if !key.key_down {
+        return key.virtual_key == MENU && key.unicode != 0;
     }
-    if unicode != 0 {
+    if key.unicode != 0 {
         return true;
     }
-    let mut at = 0;
-    while at < MAKE_NONE.len() {
-        if MAKE_NONE[at] == virtual_key {
-            return false;
-        }
-        at += 1;
-    }
-    true
+    nul.is_some_and(|nul| {
+        let held = key.control_keys;
+        key.virtual_key == nul.virtual_key
+            && (!nul.shift || held & SHIFT_PRESSED != 0)
+            && (!nul.control || held & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED) != 0)
+            && (!nul.alt || held & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED) != 0)
+    })
 }
 
 /// The UTF-8 of the UTF-16 units a console spelled, with a high surrogate that ended the read kept
@@ -1516,8 +1560,8 @@ mod reader {
     use tokio::sync::mpsc::UnboundedReceiver;
 
     use super::{
-        ConsoleInput, InputSwitch, READS_BEFORE_A_REQUEST, TerminalInput, Woken, key_can_make_text,
-        start_reader, utf8_of_console_text,
+        ConsoleInput, InputSwitch, NulKey, READS_BEFORE_A_REQUEST, TerminalInput, Woken,
+        key_can_make_text, start_reader, utf8_of_console_text,
     };
     use crate::error::{CliError, Result};
 
@@ -1525,9 +1569,13 @@ mod reader {
     type Steps = Arc<Mutex<Vec<&'static str>>>;
 
     /// A console that answers a wait with what the case sent it, hands over the key records the
-    /// case scripted, and hands over the bytes the case sends.
+    /// case scripted, and hands over the bytes the case sends. A request goes ahead of the input
+    /// the console holds only when the reader says it should.
     struct Scripted {
         wakes: mpsc::Receiver<Woken>,
+        pending: VecDeque<Woken>,
+        /// Holds the reader back from its first wait until the case has queued what it wants.
+        start: Option<mpsc::Receiver<()>>,
         keys: VecDeque<Vec<Vec<KeyRecord>>>,
         held: Vec<KeyRecord>,
         bytes: mpsc::Receiver<Vec<u8>>,
@@ -1536,11 +1584,28 @@ mod reader {
 
     impl ConsoleInput for Scripted {
         fn wait(&mut self, requests_first: bool) -> Result<Woken> {
-            let woken = self.wakes.recv().unwrap_or(Woken::Stop);
+            if let Some(start) = self.start.take() {
+                let _ = start.recv();
+            }
+            while let Ok(woken) = self.wakes.try_recv() {
+                self.pending.push_back(woken);
+            }
+            if self.pending.is_empty() {
+                match self.wakes.recv() {
+                    Ok(woken) => self.pending.push_back(woken),
+                    Err(_) => return Ok(Woken::Stop),
+                }
+            }
+            let request = requests_first
+                .then(|| self.pending.iter().position(|woken| *woken == Woken::Asked))
+                .flatten();
             if requests_first {
                 self.steps.lock().expect("steps").push("requests first");
             }
-            Ok(woken)
+            Ok(match request {
+                Some(at) => self.pending.remove(at).expect("it is there"),
+                None => self.pending.pop_front().expect("something is pending"),
+            })
         }
 
         fn keys(&mut self) -> Result<Vec<Vec<KeyRecord>>> {
@@ -1564,6 +1629,10 @@ mod reader {
         switch: InputSwitch,
         wakes: mpsc::Sender<Woken>,
         bytes: mpsc::Sender<Vec<u8>>,
+        /// Lets a reader that was held back start.
+        go: mpsc::Sender<()>,
+        /// Says that the switch has woken the reader.
+        woke: mpsc::Receiver<()>,
         steps: Steps,
         thread: std::thread::JoinHandle<()>,
     }
@@ -1576,9 +1645,12 @@ mod reader {
             keys: Vec<Vec<Vec<KeyRecord>>>,
             held: Vec<KeyRecord>,
             wake_reaches_the_reader: bool,
+            held_back: bool,
         ) -> Self {
             let (wakes, heard) = mpsc::channel();
             let (bytes, spelled) = mpsc::channel();
+            let (go, start) = mpsc::channel();
+            let (woke_to, woke) = mpsc::channel();
             let steps: Steps = Arc::default();
             let asked = Arc::clone(&steps);
             let switch = InputSwitch::new(move || {
@@ -1591,6 +1663,8 @@ mod reader {
             });
             let console = Scripted {
                 wakes: heard,
+                pending: VecDeque::new(),
+                start: held_back.then_some(start),
                 keys: keys.into(),
                 held,
                 bytes: spelled,
@@ -1602,6 +1676,7 @@ mod reader {
                     if wake_reaches_the_reader {
                         let _ = wakes.send(Woken::Asked);
                     }
+                    let _ = woke_to.send(());
                 })
             };
             let (input, thread) = start_reader(console, &switch, wake);
@@ -1610,13 +1685,15 @@ mod reader {
                 switch,
                 wakes,
                 bytes,
+                go,
+                woke,
                 steps,
                 thread,
             }
         }
 
         fn start(will_spell: bool, keys: Vec<Vec<Vec<KeyRecord>>>) -> Self {
-            Self::started(will_spell, keys, Vec::new(), true)
+            Self::started(will_spell, keys, Vec::new(), true, false)
         }
 
         /// The console has input to read.
@@ -1748,26 +1825,34 @@ mod reader {
     }
 
     /// A console that keeps having input is read a few times and then the request that has waited
-    /// is heard: the reader asks to hear requests first once, after that many reads in a row.
+    /// is heard, before the input that is still there.
     #[test]
     fn a_console_that_never_stops_having_input_cannot_keep_a_request_from_being_heard() {
-        let run = Run::start(true, Vec::new());
-        for _ in 0..READS_BEFORE_A_REQUEST + 2 {
+        let reads = READS_BEFORE_A_REQUEST + 6;
+        let run = Run::started(true, Vec::new(), Vec::new(), true, true);
+        for _ in 0..reads {
             run.has_input();
         }
-        run.has_input();
+        // The request goes in behind all of it, and then the reader is let go.
+        std::thread::scope(|scope| {
+            let asking = scope.spawn(|| run.switch.engage());
+            run.woke.recv().expect("the switch woke the reader");
+            run.go.send(()).expect("the reader waits");
+            asking
+                .join()
+                .expect("the switch ended")
+                .expect("the request was heard");
+        });
         let steps = run.ends();
-        let first = steps
-            .iter()
-            .position(|step| *step == "requests first")
-            .expect("the reader asked to hear requests first");
+        let asked = steps.iter().position(|step| *step == "ask").expect("asked");
         assert_eq!(
-            steps[..first]
+            steps[..asked]
                 .iter()
                 .filter(|step| **step == "keys")
                 .count(),
             usize::try_from(READS_BEFORE_A_REQUEST).expect("a small number"),
-            "after that many reads of the console in a row: {steps:?}"
+            "the request was heard after that many reads of the console in a row, with input \
+             still waiting: {steps:?}"
         );
     }
 
@@ -1776,7 +1861,7 @@ mod reader {
     #[test]
     fn a_request_that_timed_out_does_not_take_effect_later() {
         // The wake never reaches the reader, as if it were busy with something else.
-        let run = Run::started(true, Vec::new(), Vec::new(), false);
+        let run = Run::started(true, Vec::new(), Vec::new(), false, false);
         assert!(run.switch.engage().is_err(), "nobody answered");
         // The reader hears the wake late.
         run.wakes.send(Woken::Asked).expect("the reader waits");
@@ -1787,12 +1872,30 @@ mod reader {
         );
     }
 
+    /// Requests one after another are each answered: the reader has finished with one before the
+    /// answer to it can be heard, so that the next is not taken for it.
+    #[test]
+    fn requests_one_after_another_are_each_answered() {
+        let run = Run::start(true, Vec::new());
+        for round in 0..2000 {
+            run.switch
+                .engage()
+                .unwrap_or_else(|error| panic!("request {round} was not answered: {error}"));
+        }
+        let steps = run.ends();
+        assert_eq!(
+            steps.iter().filter(|step| **step == "ask").count(),
+            1,
+            "a console that spells its keys is asked once"
+        );
+    }
+
     /// The first half of a character the reader holds when it switches is handed on, to be dropped
     /// and counted with the records already read, and not lost without a trace.
     #[test]
     fn a_half_held_at_the_switch_is_handed_on_to_be_counted() {
         let half = key(0, 0xd83d, true);
-        let mut run = Run::started(true, Vec::new(), vec![half], true);
+        let mut run = Run::started(true, Vec::new(), vec![half], true, false);
         run.switch.engage().expect("the console spells its keys");
         assert_eq!(run.next(), TerminalInput::Keys(vec![half]));
         run.ends();
@@ -1821,17 +1924,48 @@ mod reader {
         );
     }
 
-    /// Ctrl+Space is a key going down with no character, and is told from the modifiers and the locks
-    /// that make no text by its virtual key. A key coming up makes none.
+    /// A key going down with no character makes text only if it is the key a NUL comes out as, and a
+    /// key coming up makes none unless it is an Alt coming up with a composed character.
     #[test]
-    fn a_key_that_makes_no_text_is_told_from_ctrl_space() {
-        const SPACE: u16 = 0x20;
-        for modifier in [0x10, 0x11, 0x12, 0x5b, 0x5c, 0x14, 0x90, 0x91, 0xa0, 0xa5] {
-            assert!(!key_can_make_text(modifier, true, 0), "{modifier:#x}");
+    fn only_a_key_the_console_reads_as_text_makes_text() {
+        // What the console stores for Ctrl+Space and Ctrl+@ on a US layout: the '2' key, with Ctrl and
+        // Shift. `VkKeyScanW(0)` answers 0x0332 there.
+        let nul = NulKey::named_by(0x0332);
+        assert_eq!(nul.map(|nul| nul.virtual_key), Some(0x32));
+        let stored = KeyRecord {
+            control_keys: 0x08 | 0x10,
+            ..key(0x32, 0, true)
+        };
+        assert!(key_can_make_text(&stored, nul), "the NUL");
+        assert!(
+            !key_can_make_text(
+                &KeyRecord {
+                    control_keys: 0,
+                    ..stored
+                },
+                nul
+            ),
+            "the same key without its modifiers"
+        );
+        assert!(
+            !key_can_make_text(&stored, None),
+            "a layout with no NUL key"
+        );
+        // Keys the console keeps as records that a read of its text passes over.
+        for none in [
+            0x10, 0x11, 0x12, 0x5b, 0x14, 0x90, 0x5d, 0x7c, 0xaf, 0xe7, 0xff,
+        ] {
+            assert!(!key_can_make_text(&key(none, 0, true), nul), "{none:#x}");
         }
-        assert!(key_can_make_text(SPACE, true, 0), "Ctrl+Space");
-        assert!(key_can_make_text(0x41, true, 0x61), "a letter");
-        assert!(!key_can_make_text(0x41, false, 0x61), "a letter coming up");
-        assert!(!key_can_make_text(SPACE, false, 0), "Ctrl+Space coming up");
+        assert!(key_can_make_text(&key(0, 0x61, true), nul), "a character");
+        assert!(
+            !key_can_make_text(&key(0x41, 0x61, false), nul),
+            "a character coming up"
+        );
+        assert!(
+            key_can_make_text(&key(0x12, 0x00e9, false), nul),
+            "an Alt coming up with the character composed on the keypad"
+        );
+        assert!(!key_can_make_text(&key(0x12, 0, false), nul), "an Alt");
     }
 }

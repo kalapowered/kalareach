@@ -408,9 +408,9 @@ const SPELL_PROBE: &str = "KR_ATTACH_SPELL_PROBE";
 /// writes the keys in the documented record sequence, and expects the records first and the text
 /// after. A switch that changed nothing leaves the arrow a record, a reader that turned the records
 /// of the keys going down into bytes loses the NUL, one that reads the console's bytes loses the
-/// Ctrl+Z and gives `é` in the console's code page. Last, the test presses Ctrl on its own, which
-/// the console keeps as records that make no text, and the probe stops the reader and reads one more
-/// key itself: a reader left in a read of the console, or cancelled in the middle of one, leaves a
+/// Ctrl+Z and gives `é` in the console's code page. Last, the test presses Ctrl on its own and the
+/// Apps key, which the console keeps as records that make no text, and the probe stops the reader
+/// and reads one more key itself: a reader left in a read of the console, or cancelled in the middle of one, leaves a
 /// pending read behind, and the console gives that read the next key.
 #[test]
 fn a_console_asked_to_spell_its_keys_hands_the_reader_bytes_where_it_handed_records() {
@@ -493,11 +493,14 @@ fn a_console_asked_to_spell_its_keys_hands_the_reader_bytes_where_it_handed_reco
     press(b"\x1b[69;18;233;0;0;1_");
     press(b"\x1b[66;48;98;1;0;1_");
     press(b"\x1b[66;48;98;0;0;1_");
-    waits_for("kr-probe:bytes:", &mut child);
-    // Ctrl on its own: the console keeps it as a key going down and coming up that make no text,
-    // and a read of the console's text would wait for the next key.
+    // Ctrl on its own, and the Apps key, right behind the letter: the console keeps each as a key
+    // going down and coming up that make no text, and a read of the console's text would wait for
+    // the next key. The probe stops the reader once it has seen the letter and the console holds
+    // nothing more.
     press(b"\x1b[17;29;0;1;8;1_");
     press(b"\x1b[17;29;0;0;0;1_");
+    press(b"\x1b[93;93;0;1;256;1_");
+    press(b"\x1b[93;93;0;0;256;1_");
     waits_for("kr-probe:stopped", &mut child);
     // The reader has been stopped, so this key is the process's own to read. A reader left in its
     // read of the console's bytes would take it.
@@ -594,8 +597,9 @@ fn spell_probe_in_the_console() {
         }
     }
     println!("kr-probe:bytes:{}", hex(&spelled));
-    // The test now presses Ctrl on its own. The reader is stopped once the console has been quiet
-    // for a while and holds no input, which is when the reader has seen it.
+    // The test has pressed Ctrl on its own and the Apps key right behind the letter. The reader is
+    // stopped once the console has been quiet for a while and holds no input, which is when the
+    // reader has seen them.
     let waiting = kr_cli::windows::records::RecordReader::over(
         console
             .handle()
