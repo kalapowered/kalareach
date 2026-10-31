@@ -122,8 +122,8 @@ pub const APPLICABLE: [ManagedService; 4] = [
 ];
 
 /// The clients the Account sheet reports over. The account's is the one the application holds; the
-/// others are made for the report by the factories the desks use ([`Held::of`]), so they are not
-/// the clients a desk is using now.
+/// others are asked for afresh from the factories the desks use ([`Held::of`]), and a factory may
+/// answer with a client a desk holds.
 #[derive(Default)]
 pub struct Held {
     /// The client of the account service.
