@@ -105,8 +105,9 @@ fn up_arrow(repeat: u16) -> KeyRecord {
 ///
 /// KR-REQ-08.54, the part about the legacy VT input path: what a record becomes in it is its text
 /// and nothing else, so no scan code is sent. A repeat is that many characters, a key coming up
-/// says nothing, a dead key carries no character and a surrogate pair is put back together as its
-/// character. The cases are in the fixture, by name.
+/// says nothing (an Alt coming up with a composed character apart), a dead key carries no
+/// character and a surrogate pair is put back together as its character. The cases are in the
+/// fixture, by name.
 #[test]
 fn records_are_spelled_as_the_legacy_input_a_terminal_would_have_sent() {
     let document = fixture("console-legacy-input.json");
@@ -132,6 +133,41 @@ fn records_are_spelled_as_the_legacy_input_a_terminal_would_have_sent() {
             _ => panic!("{id} says both what it spells and that it is refused, or neither"),
         }
     }
+}
+
+/// KR-REQ-08.53: a character composed with Alt on the numeric keypad (Alt and 0233) is on the record
+/// of the Alt coming up and on no other, so the legacy input a session is sent for it is that
+/// character, where any other key coming up says nothing. The Alt may still be in the state the
+/// record carries, and the character is then still the character and not a key held with Alt.
+#[test]
+fn a_character_composed_with_alt_on_the_keypad_is_spelled_where_the_alt_comes_up() {
+    const LEFT_ALT_PRESSED: u32 = 0x0002;
+    let alt_up = |unicode: u16, control_keys: u32| KeyRecord {
+        virtual_key: 0x12,
+        scan_code: 0x38,
+        unicode,
+        key_down: false,
+        control_keys,
+        repeat: 1,
+    };
+    let spelled = |records: &[KeyRecord]| legacy_within(records, &ordinary(), LIMIT);
+
+    assert_eq!(spelled(&[alt_up(0x00e9, 0)]).as_deref(), Ok("é".as_bytes()));
+    assert_eq!(
+        spelled(&[alt_up(0x00e9, LEFT_ALT_PRESSED)]).as_deref(),
+        Ok("é".as_bytes()),
+        "the Alt still in the record's state"
+    );
+    // The characters around it keep their order.
+    let a = typed(u16::from(b'a'), 1);
+    let b = typed(u16::from(b'b'), 1);
+    assert_eq!(
+        spelled(&[a, released(a), alt_up(0x00e9, 0), b, released(b)]).as_deref(),
+        Ok("aéb".as_bytes())
+    );
+    // An Alt coming up with no character composed says nothing, and neither does another key.
+    assert_eq!(spelled(&[alt_up(0, 0)]).as_deref(), Ok(&[][..]));
+    assert_eq!(spelled(&[released(a)]).as_deref(), Ok(&[][..]));
 }
 
 /// The records the wire carries are the ones the console reported: the fixture of the win32 input
