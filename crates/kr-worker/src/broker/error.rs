@@ -157,7 +157,46 @@ pub enum BrokerError {
     },
 }
 
+/// What the refusal of a rich mutation says before why rich mutations are suspended.
+///
+/// Every refusal of a rich mutation while its instance waits is this and the reason the instance
+/// holds, so a host that tells a paired device the reason tells it in the refusal too.
+pub const MUTATIONS_SUSPENDED_REFUSAL: &str = "rich mutations are suspended: ";
+
+/// What a call that meets a binding with its rich capabilities disabled says before the fault or
+/// the revocation that disabled them.
+pub const BINDING_DISABLED_REFUSAL: &str = "this binding's rich capabilities are disabled: ";
+
+/// What a call that a component with its rich capabilities disabled would answer says before the
+/// fault or the revocation that disabled them.
+pub const COMPONENT_DISABLED_REFUSAL: &str =
+    "the component answerable for this operation has had its rich capabilities disabled: ";
+
 impl BrokerError {
+    /// The refusal of a rich mutation while its instance's rich mutations are suspended for
+    /// `reason`.
+    pub fn mutations_suspended(reason: impl std::fmt::Display) -> Self {
+        Self::PreconditionFailed {
+            detail: format!("{MUTATIONS_SUSPENDED_REFUSAL}{reason}"),
+        }
+    }
+
+    /// The refusal of a call that meets a binding with its rich capabilities disabled for
+    /// `reason`.
+    pub fn binding_disabled(reason: impl std::fmt::Display) -> Self {
+        Self::UnsupportedCapability {
+            detail: format!("{BINDING_DISABLED_REFUSAL}{reason}"),
+        }
+    }
+
+    /// The refusal of a call that a component with its rich capabilities disabled for `reason`
+    /// would answer.
+    pub fn component_disabled(reason: impl std::fmt::Display) -> Self {
+        Self::UnsupportedCapability {
+            detail: format!("{COMPONENT_DISABLED_REFUSAL}{reason}"),
+        }
+    }
+
     /// Builds a ledger failure from anything that can describe itself.
     pub fn ledger(detail: impl std::fmt::Display) -> Self {
         Self::LedgerUnavailable {

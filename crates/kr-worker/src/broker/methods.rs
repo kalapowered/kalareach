@@ -2289,9 +2289,7 @@ impl Broker {
             .get(&application_instance_id)
             .ok_or_else(|| crate::broker::unknown_instance(application_instance_id))?;
         if let Some(reason) = instance.suspension_reason() {
-            return Err(BrokerError::PreconditionFailed {
-                detail: format!("rich mutations are suspended: {reason}"),
-            });
+            return Err(BrokerError::mutations_suspended(reason));
         }
         if instance.binding_revision != admitted.binding_revision() {
             return Err(BrokerError::StaleBinding {
@@ -2463,9 +2461,7 @@ impl crate::broker::BrokerState {
         }
         binding.grants.require(registered.grant)?;
         if let Some(reason) = binding.rich_disabled.as_ref() {
-            return Err(BrokerError::UnsupportedCapability {
-                detail: format!("this binding's rich capabilities are disabled: {reason}"),
-            });
+            return Err(BrokerError::binding_disabled(reason));
         }
         let instance = self
             .instances

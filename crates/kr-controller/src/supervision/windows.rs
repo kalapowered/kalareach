@@ -509,6 +509,32 @@ pub enum ForeignReason {
     },
 }
 
+/// What the failure to register the environment's task begins with, before the task's name.
+pub(crate) const DID_NOT_REGISTER: &str = "the Task Scheduler did not register ";
+
+/// What the failure to remove the environment's task begins with, before the task's name.
+pub(crate) const DID_NOT_REMOVE: &str = "the Task Scheduler did not remove ";
+
+/// What the failure to list the environment's task begins with, before the task's name.
+pub(crate) const COULD_NOT_LIST: &str = "the Task Scheduler could not list ";
+
+/// What the failure to run the environment's task begins with, before the task's name.
+pub(crate) const DID_NOT_RUN: &str = "the Task Scheduler did not run ";
+
+/// What the refusal to use a task under the environment's name that is not its own begins with,
+/// before the task's name.
+pub(crate) const A_TASK_NAMED: &str = "a task named ";
+
+/// What follows the name of that task, before whose it is.
+pub(crate) const IS_REGISTERED: &str = " is registered ";
+
+/// What a task that is the environment's own says of how it differs from the one this
+/// installation registers, before the differences.
+pub(crate) const NOT_THE_ONE_REGISTERED: &str = " is not the one this installation registers (";
+
+/// What a change to the task says when it read back differently, before the differences.
+pub(crate) const READS_BACK_DIFFERENTLY: &str = " was changed and reads back differently (";
+
 /// A task under an environment's name that is not that environment's own. It is never replaced
 /// or removed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -526,18 +552,18 @@ impl std::fmt::Display for Foreign {
         match &self.reason {
             ForeignReason::Unreadable { said } => write!(
                 formatter,
-                "a task named {} is registered and this user cannot read it ({said})",
+                "{A_TASK_NAMED}{}{IS_REGISTERED}and this user cannot read it ({said})",
                 self.name
             ),
             ForeignReason::Account { user, description } => write!(
                 formatter,
-                "a task named {} is registered for {user} with the description {description:?}, \
+                "{A_TASK_NAMED}{}{IS_REGISTERED}for {user} with the description {description:?}, \
                  which is not this user's task for environment {}",
                 self.name, self.environment_id
             ),
             ForeignReason::Environment { description } => write!(
                 formatter,
-                "a task named {} is registered for this user with the description \
+                "{A_TASK_NAMED}{}{IS_REGISTERED}for this user with the description \
                  {description:?}, which is not the task of environment {}",
                 self.name, self.environment_id
             ),
@@ -918,7 +944,7 @@ impl std::fmt::Display for TaskError {
                 match found {
                     ReadBack::Differs(differences) => write!(
                         formatter,
-                        "{name} was changed and reads back differently ({})",
+                        "{name}{READS_BACK_DIFFERENTLY}{})",
                         differences
                             .iter()
                             .map(ToString::to_string)
@@ -1055,8 +1081,9 @@ pub use self::platform::{
 #[cfg(windows)]
 mod platform {
     use super::{
-        Asked, Foreign, ForeignReason, LastResult, Outcome, RegisteredTask, Standing, TaskChange,
-        TaskDefinition, TaskError, decode_output, last_result_in,
+        Asked, COULD_NOT_LIST, DID_NOT_REGISTER, DID_NOT_REMOVE, DID_NOT_RUN, Foreign,
+        ForeignReason, LastResult, Outcome, RegisteredTask, Standing, TaskChange, TaskDefinition,
+        TaskError, decode_output, last_result_in,
     };
     use crate::supervision::{RunFailure, TASK_SCHEDULER_BOUND, command_within};
 
@@ -1155,7 +1182,7 @@ mod platform {
         if !output.status.success() {
             return Err(refused(
                 Asked::List,
-                "the Task Scheduler could not list its tasks",
+                &format!("{COULD_NOT_LIST}its tasks"),
                 &output,
             ));
         }
@@ -1426,7 +1453,7 @@ mod platform {
             if !output.status.success() {
                 return Err(refused(
                     Asked::Register,
-                    &format!("the Task Scheduler did not register {}", definition.name),
+                    &format!("{DID_NOT_REGISTER}{}", definition.name),
                     &output,
                 ));
             }
@@ -1453,7 +1480,7 @@ mod platform {
         if !output.status.success() {
             return Err(refused(
                 Asked::Remove,
-                &format!("the Task Scheduler did not remove {}", definition.name),
+                &format!("{DID_NOT_REMOVE}{}", definition.name),
                 &output,
             ));
         }
@@ -1474,7 +1501,7 @@ mod platform {
         if !output.status.success() {
             return Err(refused(
                 Asked::Query,
-                &format!("the Task Scheduler could not list {}", definition.name),
+                &format!("{COULD_NOT_LIST}{}", definition.name),
                 &output,
             ));
         }
@@ -1505,7 +1532,7 @@ mod platform {
             return Ok(());
         }
         Err(RunFailure::Failed(format!(
-            "the Task Scheduler did not run {}: {}",
+            "{DID_NOT_RUN}{}: {}",
             definition.name,
             decode_output(&output.stderr).trim()
         )))
@@ -1676,7 +1703,7 @@ mod launching {
     use kr_protocol::ids::EnvironmentId;
     use serde::{Deserialize, Serialize};
 
-    use super::{Standing, TaskDefinition, run, standing};
+    use super::{NOT_THE_ONE_REGISTERED, Standing, TaskDefinition, run, standing};
     use kr_protocol::identity::WorkerProfile;
 
     use crate::supervision::{
@@ -1898,7 +1925,7 @@ mod launching {
                 Ok(Standing::Owned(differences)) if differences.is_empty() => {}
                 Ok(Standing::Owned(differences)) => {
                     return not_started(format!(
-                        "the environment's task {} is not the one this installation registers ({}): \
+                        "the environment's task {}{NOT_THE_ONE_REGISTERED}{}): \
                          {SETUP_ACTION} to repair it",
                         self.expected.name,
                         differences

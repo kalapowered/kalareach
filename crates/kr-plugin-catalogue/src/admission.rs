@@ -239,6 +239,18 @@ pub struct NotAdmitted {
     pub reason: NotAdmittedReason,
 }
 
+/// What [`NotAdmitted::detail`] says of a package whose repository revoked it, after the package,
+/// and before the repository's own statement.
+pub const REVOKED_CLAUSE: &str = " was revoked by its repository";
+
+/// What [`NotAdmitted::detail`] says of a package that is not whole in this host's store, after the
+/// package, and before what was wrong with it.
+pub const INCOMPLETE_CLAUSE: &str = " is not whole in this host's store";
+
+/// What [`NotAdmitted::detail`] says of a package that is past a limit, after the package, and
+/// before which limit.
+pub const PAST_A_LIMIT_CLAUSE: &str = " is past a package limit in force";
+
 impl NotAdmitted {
     /// Says why, for a person.
     #[must_use]
@@ -249,10 +261,9 @@ impl NotAdmitted {
             NotAdmittedReason::NotAllowed => {
                 format!("{subject} is not among the adapters this organisation allows")
             }
-            NotAdmittedReason::Revoked(record) => format!(
-                "{subject} was revoked by its repository: {}",
-                record.statement.as_str()
-            ),
+            NotAdmittedReason::Revoked(record) => {
+                format!("{subject}{REVOKED_CLAUSE}: {}", record.statement.as_str())
+            }
             NotAdmittedReason::Unsupported {
                 what,
                 host,
@@ -271,10 +282,10 @@ impl NotAdmitted {
                 }
             }
             NotAdmittedReason::Incomplete(detail) => {
-                format!("{subject} is not whole in this host's store: {detail}")
+                format!("{subject}{INCOMPLETE_CLAUSE}: {detail}")
             }
             NotAdmittedReason::PastALimit(limit) => {
-                format!("{subject} is past a package limit in force: {limit}")
+                format!("{subject}{PAST_A_LIMIT_CLAUSE}: {limit}")
             }
         }
     }
