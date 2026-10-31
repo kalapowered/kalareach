@@ -426,9 +426,14 @@ pub fn a_child_shell_has_nothing_to_activate_from(kind: ShellKind) {
 
 /// Stops or continues the shell a session started, by the process identifier the session holds.
 ///
+/// A stop is over when the shell is stopped, not when `kill` has sent the signal: a shell that has
+/// not stopped yet reads what is typed at it and runs its keys before the request that was meant
+/// to be waiting for them is sent.
+///
 /// # Panics
 ///
-/// Panics when the session has no process or `kill` cannot signal it.
+/// Panics when the session has no process, `kill` cannot signal it, or a shell that was sent the
+/// stop is not stopped inside [`REPLY`].
 #[cfg(unix)]
 fn signal_the_shell(session: &Session, signal: &str) {
     let pid = session
@@ -440,6 +445,26 @@ fn signal_the_shell(session: &Session, signal: &str) {
         .status()
         .expect("kill runs");
     assert!(status.success(), "kill -{signal} {pid} failed");
+    if signal == "STOP" {
+        let deadline = Instant::now() + REPLY;
+        loop {
+            let state = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .expect("ps runs");
+            if String::from_utf8_lossy(&state.stdout)
+                .trim()
+                .starts_with('T')
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the shell {pid} was sent the stop and is not stopped"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 /// KR-REQ-08.49: bytes the host put into the terminal that no one typed are input the reader has
@@ -457,14 +482,28 @@ fn signal_the_shell(session: &Session, signal: &str) {
 /// later exchange says the queues are drained, so a reader that counts bytes it no longer holds is
 /// not the one that passes.
 ///
+/// PSReadLine is given two more steps and half a character instead. It draws every printable key
+/// it takes, and a draw after it was continued asks the terminal where the cursor is, from the same
+/// input its key thread is reading: the key thread takes the reply for keys, and the draw waits for
+/// good, or the draw takes keys ahead of the reply for part of it. Its key thread also queues every
+/// key that is waiting in the first two milliseconds, so whether the editor is at a step with
+/// input left to read depends on how fast that went. A step draws nothing, and half a character is
+/// no key at all, so it stays unread whatever the timing: the editor meets the request at its last
+/// step with one byte it has not read, and nothing is drawn before the character is whole.
+///
 /// # Panics
 ///
 /// Panics when the reader says its terminal's typeahead is drained with the answer unread, or says
 /// it is not after it has taken the answer.
 #[cfg(unix)]
 pub fn bytes_the_host_put_into_the_terminal_are_input_the_reader_has_not_taken(kind: ShellKind) {
-    // Three answers a terminal gives to a primary device-attributes query.
-    unread_input_is_not_drained(kind, b"\x1b[?62;22c\x1b[?62;22c\x1b[?62;22c", b"");
+    if kind == ShellKind::PowerShell {
+        // Two steps, and the first byte of "\u{e9}" in UTF-8 with its second to follow.
+        unread_input_is_not_drained(kind, b"\x06\x06\xc3", b"\xa9");
+    } else {
+        // Three answers a terminal gives to a primary device-attributes query.
+        unread_input_is_not_drained(kind, b"\x1b[?62;22c\x1b[?62;22c\x1b[?62;22c", b"");
+    }
 }
 
 /// KR-REQ-08.49: the first byte of a character the terminal delivered in two parts is input the
@@ -547,6 +586,25 @@ fn unread_input_is_not_drained(kind: ShellKind, unread: &[u8], completion: &[u8]
             )
         },
     );
+
+    // An editor that asks where the cursor is once its prompt is drawn reads the reply from the
+    // same input as its keys, a byte at a time. What is typed before it has the reply is taken for
+    // part of it, or the reply is taken for keys: with three answers to a device-attributes query
+    // ahead of it, .NET reads a column of 226222621 for PSReadLine, which ends with an exception.
+    // A person types after the reply, as `type_line` does, and so does this.
+    if dialect(kind).types_at_the_prompt {
+        assert!(
+            session.wait_for_prompt(),
+            "the shell drew no prompt to put {unread:?} behind:\n{}",
+            session.terminal_output()
+        );
+        assert!(
+            session.wait_for_editor_reading(),
+            "the editor never asked where the cursor was after the prompt, to put {unread:?} \
+             behind:\n{}",
+            session.terminal_output()
+        );
+    }
 
     signal_the_shell(&session, "STOP");
     // A reader that answers only when it steps meets its mailbox at the step a person gives it by
