@@ -81,12 +81,25 @@ test.describe('the desktop takes sessions in tabs, files on the draft and an exp
     await expect(page.getByTestId('composer-input')).toHaveValue('look at these')
     // A pasted file is on the draft from the moment it arrives, and its bytes are read before the
     // host is asked to take them, so the host's record of the second upload follows what the page
-    // shows by as long as that read takes. The host's record is what is waited on.
+    // shows by as long as that read takes. What is waited on is the host's record of exactly these
+    // two files, in the order they came, and not a count that a third upload would also reach.
     await expect
-      .poll(() => page.evaluate(() => window.krTestHost?.uploaded.length), {
-        message: 'the host has taken both files'
+      .poll(() => page.evaluate(() => window.krTestHost?.uploaded), {
+        message: 'the host has taken the dropped file and the pasted one'
       })
-      .toBe(2)
+      .toEqual(['/tmp/release-notes.png', 'pasted-log.txt'])
+    // The host gives the two files one draft and a path each, which the draft shows under the
+    // files: the pictures below are of that, so they are taken once both paths are drawn.
+    const paths = page.getByTestId('attachment-path')
+    await expect(paths).toHaveCount(2)
+    await expect(paths.first()).toContainText('release-notes.png')
+    await expect(paths.last()).toContainText('pasted-log.txt')
+    const draft = await page.evaluate(() => ({
+      made: window.krTestHost?.hostDrafts.made.map((each) => each.draft_id),
+      bound: window.krTestHost?.hostDrafts.bound.map((each) => each.draft_id)
+    }))
+    expect(draft.made, 'the host made one draft for the session').toHaveLength(1)
+    expect(draft.bound, 'and bound both files to it').toEqual([draft.made?.[0], draft.made?.[0]])
     await page.screenshot({ path: shot('files-tabs-13.16') })
     // The two files and the paths the host gave them, with the draft's text, in view.
     await page.getByTestId('composer-input').scrollIntoViewIfNeeded()
