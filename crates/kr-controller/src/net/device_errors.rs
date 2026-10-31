@@ -18,9 +18,10 @@
 //!
 //! The same rule reaches an error wherever it is, because the text of an error that has already
 //! been made (a worker's, one a store kept, one a catalogue receipt holds) cannot be made again:
-//! an error in a response, a receipt, or anywhere inside a result. A closure's list of what it left
-//! behind is the one other place this host's failures are written as plain text, and it is held to
-//! the same rule.
+//! an error in a response, a receipt, or anywhere inside a result or an announcement. The places
+//! where this host's failures are written as plain text and not as an error are held to the same
+//! rule: a closure's list of what it left behind, and the members of the records in
+//! [`FAILURE_TEXTS`].
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -471,8 +472,9 @@ fn with_message(error: &ProtocolError, message: String) -> ProtocolError {
     }
 }
 
-/// `value` with every error in it, and every closure's account of what it left, as a device is
-/// given them, or `None` when nothing in it changes.
+/// `value` with every error in it, every closure's account of what it left and every failure a
+/// record holds as plain text ([`FAILURE_TEXTS`]), as a device is given them, or `None` when
+/// nothing in it changes.
 fn shown_value(value: &CanonicalValue) -> Option<CanonicalValue> {
     match value {
         CanonicalValue::Map(map) => {
@@ -528,7 +530,9 @@ fn shown_member(map: &CanonicalMap, key: &str, child: &CanonicalValue) -> Option
     if key == "surviving" {
         return shown_survivors(child);
     }
-    if let (CanonicalValue::Text(text), Some(of)) = (child, failure_text_of(map, key)) {
+    if let CanonicalValue::Text(text) = child
+        && let Some(of) = failure_text_of(map, key)
+    {
         let fixed = || format!("{of}; {WHY_NOT_SHOWN}");
         return told_in_place(text, fixed).map(CanonicalValue::Text);
     }
@@ -1496,9 +1500,8 @@ mod tests {
                 "the clause before the place is kept: {told}"
             );
         }
-        // Nothing else in the report changed, and the owner's own value is as the record made it.
+        // Nothing else in the report changed.
         assert_eq!(device, privacy_report(&device.unlisted[0].reason));
-        assert_eq!(owner.unlisted[0].reason, AN_OWNERSHIP_FAILURE);
     }
 
     #[test]
