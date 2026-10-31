@@ -1314,7 +1314,22 @@ impl ProjectService {
         if let Some(admission) = admission.as_ref() {
             admission.admit()?;
         }
-        let work_tree = location.handle().subdirectory(relative)?;
+        let work_tree = match location.handle().subdirectory(relative) {
+            Ok(work_tree) => work_tree,
+            // Nothing at the name is a tree that is gone from its place, told as a tree that was
+            // replaced is when a record names it.
+            Err(refusal @ kr_transfer::Escape::NotFound { .. }) => {
+                return Err(match recorded {
+                    Some(recorded) => crate::identity::not_the_recorded_tree(
+                        recorded.tree,
+                        &location.handle().host_path(relative),
+                        &refusal,
+                    ),
+                    None => refusal.into(),
+                });
+            }
+            Err(refusal) => return Err(refusal.into()),
+        };
         let tree = match recorded {
             Some(recorded) => crate::identity::decide_tree_before_git(&work_tree, recorded.tree)?,
             None => Settled::AsRecorded,

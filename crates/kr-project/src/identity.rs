@@ -364,7 +364,10 @@ impl OpenedRepository {
         path: &Path,
         recorded: Option<RecordedTree>,
     ) -> Result<(Self, Decided)> {
-        let work_tree = AuthorisedDirectory::open_root(environment_id, path)?;
+        let work_tree = match recorded {
+            Some(recorded) => open_recorded_root(environment_id, path, recorded.tree)?,
+            None => AuthorisedDirectory::open_root(environment_id, path)?,
+        };
         let ceiling = match recorded {
             Some(recorded) => {
                 // A tree this host made is at its own place and nowhere below it, and so is a
@@ -1130,6 +1133,29 @@ fn require_within(
 fn ceiling_above(tree: &AuthorisedDirectory) -> Option<PathBuf> {
     let above = path_of(tree).ok()?.parent()?.to_path_buf();
     (!above.to_string_lossy().contains(crate::git::PATH_SEPARATOR)).then_some(above)
+}
+
+/// Opens the directory at the path a record names for its tree.
+///
+/// Nothing at the path is a tree that is no longer the object the record names, as a directory that
+/// took its place is, and is told as that: a source that changed, and not an argument the caller
+/// got wrong. Anything else that stops the open keeps the answer it always had.
+fn open_recorded_root(
+    environment_id: EnvironmentId,
+    path: &Path,
+    tree: RecordedIdentity,
+) -> Result<AuthorisedDirectory> {
+    AuthorisedDirectory::open_root(environment_id, path).map_err(|refusal| {
+        let gone = matches!(
+            std::fs::symlink_metadata(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        );
+        if gone {
+            not_the_recorded_tree(tree, path, &refusal)
+        } else {
+            refusal.into()
+        }
+    })
 }
 
 /// Returns the refusal for a directory that is not the working tree a record names.
